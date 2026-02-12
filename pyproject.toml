@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bgkit"
+version = "0.1.0"
+description = "Background Knowledge Interaction Transformer"
+readme = "docs/01_overview.md"
+requires-python = ">=3.11,<3.13"
+license = "MIT"
+dependencies = [
+    "transformers>=4.51",
+    "accelerate>=1.2",
+    "peft>=0.14",
+    "bitsandbytes",
+    "safetensors",
+    "einops",
+    "datasets>=3.0",
+    "tokenizers",
+    "gitpython",
+    "pygit2",
+    "hydra-core>=1.3",
+    "omegaconf",
+    "wandb",
+    "numpy",
+    "tqdm",
+    "rich",
+    "structlog",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "pre-commit",
+    "jupyterlab",
+    "matplotlib",
+]
+eval = [
+    "sentence-transformers>=2.7",
+    "faiss-cpu",
+]
+
+[dependency-groups]
+torch = ["torch>=2.5"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bgkit"]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
+ignore = ["N812"]  # Allow `import torch.nn.functional as F` (PyTorch convention)
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["F401"]  # Allow unused imports in tests (used for side effects)
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow",
+    "gpu: marks tests requiring GPU",
+    "integration: integration tests",
+    "smoke: smoke tests (1-step training)",
+]

@@ -1,0 +1,26 @@
+# DGX Spark compute configuration
+# Blackwell GB10, 128GB unified memory, sm_121, 273 GB/s bandwidth
+compute:
+  device: cuda
+  # Mixed precision -- BF16 default (MXFP8/MXFP4 not supported on sm_121)
+  mixed_precision: bf16
+  # Gradient checkpointing across BgKIT levels and target LLM
+  gradient_checkpointing: true
+  # Conservative defaults -- must be profiled on actual hardware
+  max_seq_len: 8192
+  microbatch_size: 1
+  gradient_accumulation_steps: 8
+  # Effective batch size = microbatch * gradient_accumulation = 8
+  # Optimizer: 8-bit AdamW to reduce memory
+  optimizer: adamw_bnb_8bit
+  optimizer_kwargs:
+    lr: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+  # Gradient clipping
+  max_grad_norm: 1.0
+  # Attention: use PyTorch SDPA (flash-attn not supported on sm_121)
+  attention_implementation: sdpa
+  # Dataloader
+  num_workers: 4
+  pin_memory: false  # unified memory, pinning not applicable

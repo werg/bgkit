@@ -1,0 +1,11 @@
+# Ablation suite configuration
+eval:
+  ablation:
+    conditions:
+      - present   # Normal survivors
+      - zeroed    # All survivor embeddings set to zero
+      - noise     # Random Gaussian noise
+    # Number of evaluation examples
+    num_examples: 500
+    # Run after every N training steps
+    run_every: 10000

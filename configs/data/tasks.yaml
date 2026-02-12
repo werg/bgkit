@@ -1,0 +1,15 @@
+# Task construction configuration
+tasks:
+  # Fraction of tasks without BgKIT injection (baselines)
+  no_injection_fraction: 0.30
+  # Task tier definitions
+  tiers:
+    tier1_retrieval:
+      weight: 0.45
+      description: "Produce tool calls to read the right files"
+    tier2_structural_qa:
+      weight: 0.35
+      description: "Structural questions from BgKIT context"
+    tier3_full_agentic:
+      weight: 0.20
+      description: "Multi-step tool calls and diffs"

@@ -1,0 +1,19 @@
+# Commit filtering rules
+commits:
+  exclude_merges: true
+  max_files_changed: 50
+  max_diff_lines: 5000
+  min_diff_lines: 3
+  exclude_patterns:
+    - "*.lock"
+    - "*.generated.*"
+    - "__generated__/*"
+    - "*.min.js"
+    - "*.min.css"
+    - "vendor/*"
+    - "node_modules/*"
+  prefer_cross_file: true
+  # Commit reproduction data: serialize as standalone documents
+  commit_reproduction:
+    enabled: true
+    max_diff_tokens: 4096

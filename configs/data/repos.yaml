@@ -1,0 +1,33 @@
+# Repository dataset configuration
+repos:
+  data_dir: ${oc.env:DATA_DIR,./data/repos}
+  # Max files per repo for L1 processing
+  max_files_per_repo: 2000
+  # File extensions to include
+  include_extensions:
+    - .py
+    - .js
+    - .ts
+    - .tsx
+    - .jsx
+    - .java
+    - .go
+    - .rs
+    - .c
+    - .cpp
+    - .h
+    - .hpp
+    - .rb
+    - .php
+    - .swift
+    - .kt
+    - .scala
+    - .md
+    - .txt
+    - .yaml
+    - .yml
+    - .toml
+    - .json
+  # File size limits
+  max_file_size_bytes: 1048576  # 1MB
+  min_file_size_bytes: 10

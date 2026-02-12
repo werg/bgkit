@@ -1,0 +1,39 @@
+# Phase 2: End-to-end injection training
+training:
+  phase: phase2
+  max_steps: 100000
+  warmup_steps: 5000
+
+  # Learning rates (asymmetric)
+  lr:
+    lora: 2.0e-4
+    projection: 1.0e-4
+    bgkit: 1.0e-5  # Only if unfrozen
+
+  # Data mix
+  data_mix:
+    injection_fraction: 0.65  # Tasks with BgKIT encodings
+    description_regularizer: 0.05
+    no_injection_fraction: 0.30
+
+  # Curriculum: Tier 1/2 -> Tier 3
+  curriculum:
+    warmup_steps: 5000
+    transition_steps: 50000
+
+  # Freeze config (key experiment: frozen vs unfrozen BgKIT)
+  freeze:
+    ice: true
+    bgkit: true  # Start frozen; compare against unfrozen
+    decoder: false  # Co-trains as regularizer
+    target_lm_base: true  # Base weights frozen (4-bit)
+    target_lm_lora: false  # LoRA adapters train
+
+  # Reconstruction decoder regularizer
+  decoder_regularizer:
+    enabled: true
+    weight: 0.1
+    subset_fraction: 0.2  # Run decoder on 20% of examples
+
+  eval_every: 2000
+  save_every: 10000

@@ -58,7 +58,7 @@ Repository file contents are the focus of v1. Other sources are extensions using
 
 ## Deployment
 
-BgKIT runs as a **preprocessing service**, decoupled from the serving stack. Projected vectors are injected via existing multimodal embedding infrastructure in vLLM and llama.cpp (the LLaVA image patch pathway). No patches to the inference runtime are required.
+BgKIT runs as a **preprocessing service**, decoupled from the serving stack. Projected vectors are injected via existing multimodal embedding infrastructure using the LLaVA image patch pathway. On standard hardware, both vLLM and llama.cpp support this pathway. On the DGX Spark (Blackwell GB10, ARM64 + sm_121), llama.cpp is the more reliable option — vLLM requires building from source with sm_121 patches, does not support CUDA graphs on this architecture (`--enforce-eager` required, ~20–30% throughput penalty), and has limited ARM64 testing. llama.cpp's GGUF-based inference is better tested on DGX Spark and avoids these issues. No patches to either inference runtime are required for BgKIT injection itself — the multimodal embedding pathway is standard.
 
 Level 0 is re-run per changed file only. Level 1 requires full recomputation but can be cached and updated on request. KV cache entries for BgKIT positions persist across agent turns until refreshed.
 

@@ -1,0 +1,22 @@
+# BgKIT top-level Hydra config
+defaults:
+  - model/bgkit
+  - model/ice
+  - model/decoder
+  - model/projection
+  - model/target_lm
+  - data/repos
+  - data/commits
+  - data/tasks
+  - compute/dgx_spark
+  - _self_
+
+seed: 42
+project_name: bgkit
+run_name: null  # auto-generated if null
+
+wandb:
+  enabled: true
+  project: bgkit
+  entity: null
+  tags: []

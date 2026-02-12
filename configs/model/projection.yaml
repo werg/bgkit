@@ -1,0 +1,5 @@
+# Projection MLP: BgKIT -> target LLM
+projection:
+  input_dim: 1024   # BgKIT hidden dim (Qwen3-Embedding-0.6B)
+  output_dim: 2048  # Target LLM hidden dim (Qwen3-Coder-Next)
+  hidden_dim: 2048

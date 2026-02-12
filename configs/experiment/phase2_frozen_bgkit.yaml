@@ -1,0 +1,10 @@
+# Full experiment preset: Phase 2 with frozen BgKIT
+defaults:
+  - /config
+  - /training/phase2
+  - _self_
+
+run_name: phase2_frozen_bgkit
+training:
+  freeze:
+    bgkit: true

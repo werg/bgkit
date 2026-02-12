@@ -1,0 +1,25 @@
+# Target LLM: Qwen3-Coder-Next
+# 80B total / 3B active MoE, hidden dim 2048
+# 48-layer hybrid: 12x(3x gated DeltaNet-MoE + 1x gated attention-MoE)
+# 512 experts, 10 active + 1 shared per token, 256K context
+target_lm:
+  model_name: Qwen/Qwen3-Coder-Next  # placeholder -- actual HF name TBD
+  hidden_dim: 2048
+  num_layers: 48
+  num_attention_layers: 12  # gated attention layers (rest are gated DeltaNet)
+  context_length: 262144
+  # Quantization for memory-constrained training
+  quantization:
+    load_in_4bit: true
+    bnb_4bit_compute_dtype: bfloat16
+    bnb_4bit_quant_type: nf4
+    bnb_4bit_use_double_quant: true
+  # LoRA configuration
+  lora:
+    rank: 64
+    alpha: 128
+    dropout: 0.05
+    # Start with attention layers only; experiment with +DeltaNet layers
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    # Experimental: DeltaNet projection matrices
+    # target_modules_extended: ["q_proj", "k_proj", "v_proj", "o_proj", "delta_proj"]

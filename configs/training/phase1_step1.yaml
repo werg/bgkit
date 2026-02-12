@@ -1,0 +1,10 @@
+# Phase 1 Step 1: Decoder initialization on uncompressed output
+training:
+  phase: phase1_step1
+  max_steps: 20000
+  lr: 1.0e-4
+  warmup_steps: 1000
+  # No compression -- full BgKIT output passed to decoder
+  compression: false
+  eval_every: 1000
+  save_every: 5000

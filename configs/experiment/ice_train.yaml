@@ -1,0 +1,7 @@
+# Full experiment preset: ICE training
+defaults:
+  - /config
+  - /training/ice
+  - _self_
+
+run_name: ice_train

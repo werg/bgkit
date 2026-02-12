@@ -215,19 +215,32 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 **Mitigation:** Monitor performance on the no-injection subset throughout training. If no-injection performance drops below the starting baseline, increase the no-injection data fraction. The tool-call framing helps — the model should learn that the absence of a tool response means the tool wasn't called, not that information is missing.
 
-### 5.7 Target LLM Brittleness
+### 5.7 Hybrid DeltaNet Architecture and Dense Injection
+
+**Risk:** Qwen3-Coder-Next uses a hybrid architecture where 36 of 48 layers are gated DeltaNet (linear attention with a delta update rule) and only 12 are gated softmax attention. The BgKIT injection design assumes the target LLM can freely attend to injected tool-call positions, which is naturally true for softmax attention layers (any position can attend to any other). DeltaNet layers instead compress context into a fixed-size recurrent state via a delta rule — information from early positions (where BgKIT vectors are injected) may be progressively overwritten as later tokens are processed, degrading the model's ability to use BgKIT context in deeper DeltaNet layers.
+
+**Mitigation options:**
+
+- **Monitor per-layer attention to BgKIT positions.** In the 12 softmax attention layers, measure attention weight on BgKIT positions directly. In DeltaNet layers, probe whether BgKIT-derived information persists in the recurrent state by comparing outputs with vs. without BgKIT injection.
+- **Repeated injection.** Insert BgKIT tool-call frames at multiple positions in the input sequence (not just the beginning) so that DeltaNet layers encounter BgKIT vectors at various points and can refresh their recurrent state.
+- **Target LoRA at attention layers preferentially.** The 12 gated attention layers are the primary pathway for the model to "look up" BgKIT information. LoRA on these layers may matter more than on DeltaNet layers for injection quality.
+- **Evaluate DeltaNet-only vs. attention-only ablation.** If the model only uses BgKIT through the attention layers and DeltaNet layers ignore it, that's acceptable — it just means BgKIT's effective depth is 12 layers, not 48.
+
+**Severity:** Unknown until tested. This is the most architecturally novel risk in v1 — previous dense injection work (LLaVA, etc.) targeted pure-attention transformers.
+
+### 5.8 Target LLM Brittleness
 
 **Risk:** The entire projection pipeline is trained against a specific target LLM's embedding space. If that model's architecture or embedding space changes in the next release, everything from Phase 1 Step 3 onward needs retraining.
 
 **Mitigation:** Multi-target projection (Section 1.1) helps BgKIT's internal representations stay target-agnostic. But in v1, this risk is accepted. The key question is whether BgKIT's output space is stable enough that adapting to a new target requires only a fresh projection MLP (cheap) rather than full Phase 2 retraining (expensive).
 
-### 5.8 Decoder Co-Adaptation
+### 5.9 Decoder Co-Adaptation
 
 **Risk:** The decoder learns to read poor BgKIT embeddings rather than BgKIT learning to produce good ones. Reconstruction loss decreases, but survivor quality is bad.
 
 **Mitigation:** Tracked in the training plan via survivor embedding diagnostics. If cosine similarity to nearest token embeddings collapses while reconstruction loss keeps improving, the decoder is compensating. Switch to constrained decoder (Section 4.1, option b) if observed.
 
-### 5.9 Distillation Data Quality
+### 5.10 Distillation Data Quality
 
 **Risk:** Distillation trajectories from a stronger teacher model may contain reasoning that references fine-grained details unrecoverable from BgKIT vectors. Subtle data quality issues.
 
@@ -251,6 +264,16 @@ Level 0 is re-run per changed file only. Level 1 requires full recomputation but
 
 For repositories exceeding the level 1 context budget: increase compression ratio, filter to relevant modules (reintroduces retrieval), or defer to a level 2 pass over level 1 batches. The right answer depends on v1 results.
 
+### 6.4 Deployment Inference on DGX Spark
+
+BgKIT deployment requires the target LLM to accept projected vectors via the LLaVA multimodal embedding pathway. Two inference runtimes support this:
+
+**llama.cpp (recommended for DGX Spark).** Well-tested on ARM64 + Blackwell. GGUF quantized models load directly. The multimodal embedding pathway (used for LLaVA image patches) is the injection point for BgKIT vectors. Stable, no build patches required.
+
+**vLLM.** Requires building from source with sm_121 (Blackwell GB10) patches — standard pip wheels don't support this compute capability. CUDA graphs are not supported on sm_121, requiring `--enforce-eager` mode with a ~20–30% throughput penalty. ARM64 support has limited testing. When it works, vLLM's continuous batching and OpenAI-compatible API are convenient, but the build and maintenance burden is high on this hardware.
+
+**Recommendation:** Use llama.cpp for DGX Spark inference. If vLLM is needed for its batching/API features (e.g., serving multiple concurrent agent sessions), build and test it as a separate effort after v1 training validates the approach.
+
 ---
 
 ## 7. Additional Ablations
@@ -265,6 +288,8 @@ Beyond the mandatory survivors-present vs. zeroed ablation:
 - (f) Decoder adaptation: full fine-tuning vs. high-rank LoRA (if both trained in Phase 1).
 - (g) Individual knowledge source ablation (when additional sources are added).
 - (h) With vs. without compression prompt at level 1.
+- (i) BgKIT information utilization in gated attention vs. gated DeltaNet layers — does disabling LoRA on DeltaNet layers affect BgKIT-dependent performance?
+- (j) BgKIT tool-call frame placement: beginning-only vs. distributed across the input sequence (relevant to DeltaNet recurrent state retention, see Section 5.7).
 
 ---
 

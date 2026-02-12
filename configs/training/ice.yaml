@@ -1,0 +1,10 @@
+# ICE training configuration
+training:
+  phase: ice
+  max_steps: 50000
+  lr: 3.0e-4
+  warmup_steps: 1000
+  # Uniformity regularizer weight
+  uniformity_reg_weight: 0.1
+  eval_every: 1000
+  save_every: 5000

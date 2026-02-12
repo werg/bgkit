@@ -1,0 +1,45 @@
+.PHONY: install test test-unit test-integration test-smoke lint format train eval ablation docker-build
+
+install:
+	uv sync --group torch --extra dev --extra eval
+
+test: test-unit
+
+test-unit:
+	uv run pytest tests/unit -v
+
+test-integration:
+	uv run pytest tests/integration -v -m integration
+
+test-smoke:
+	uv run pytest tests/smoke -v -m smoke
+
+lint:
+	uv run ruff check src/ tests/ scripts/
+
+format:
+	uv run ruff format src/ tests/ scripts/
+
+typecheck:
+	uv run mypy src/bgkit/
+
+train:
+	uv run python scripts/train.py $(ARGS)
+
+eval:
+	uv run python scripts/evaluate.py $(ARGS)
+
+ablation:
+	uv run python scripts/run_ablation.py $(ARGS)
+
+quality-gate:
+	uv run python scripts/run_quality_gate.py $(ARGS)
+
+profile:
+	uv run python scripts/profile_compute.py
+
+docker-build:
+	docker build -f docker/Dockerfile -t bgkit:latest .
+
+docker-build-data:
+	docker build -f docker/Dockerfile.data -t bgkit-data:latest .

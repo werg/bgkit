@@ -12,11 +12,11 @@ This plan covers training BgKIT for a single knowledge source (repository file c
 
 | Component | Base | Parameters | Role |
 |---|---|---|---|
-| BgKIT | Qwen3-Embedding-0.6B | ~600M | Compressor (shared weights, levels 0 and 1) |
+| BgKIT | Qwen3-Embedding-0.6B | ~600M | Compressor (shared weights, levels 0 and 1). Hidden dim 1024. |
 | Reconstruction decoder | Qwen3-0.6B | ~600M | Co-trained decoder, provides primary training signal |
 | ICE | Custom 1D CNN | ~2–5M | Information content estimator for budget allocation |
-| Projection MLP | New | ~10M | Maps BgKIT output → Qwen3-Coder-Next embedding space |
-| Target LLM | Qwen3-Coder-Next | LoRA only | Learns to attend to and use injected vectors |
+| Projection MLP | New | ~10M | Maps BgKIT output (dim 1024) → target LLM embedding space (dim 2048) |
+| Target LLM | Qwen3-Coder-Next | QLoRA only | 80B total / 3B active MoE. 48-layer hybrid: 12 × (3 × gated DeltaNet-MoE + 1 × gated attention-MoE). 512 experts, 10 active + 1 shared per token. 256K context. Hidden dim 2048. Loaded in 4-bit (~40 GB) due to memory constraints; LoRA adapters train in BF16. |
 
 ## Data
 
@@ -105,11 +105,14 @@ Before proceeding to Phase 2, verify:
 
 **Configuration:**
 
-- LoRA on Qwen3-Coder-Next's shared attention layers (rank 32–64).
+- Qwen3-Coder-Next loaded in 4-bit quantization (QLoRA). The full 80B parameters at FP16 (~160 GB) exceed the DGX Spark's 128 GB unified memory; 4-bit quantization (~40 GB) leaves room for BgKIT, the decoder, optimizer states, and activations.
+- LoRA adapters (rank 32–64, BF16) on both gated attention and gated DeltaNet layers. Qwen3-Coder-Next's hybrid architecture has only 12 gated attention layers out of 48 — the remaining 36 gated DeltaNet layers use linear attention and may require LoRA on different parameter targets (e.g., the delta rule projection matrices rather than QKV). Which layers and parameter matrices to target is an early experiment; start with attention layers only and compare against attention + DeltaNet.
 - Projection MLP warm-initialized from Phase 1.
 - Training objective: next-token prediction on target outputs with BgKIT tool-call frames in the input.
 - The reconstruction decoder continues to co-train on a portion of examples as a regularizer.
 - Full backpropagation from the LLM's loss through projection MLP, through level 1, through level 0. Gradient checkpointing across levels.
+
+**DeltaNet interaction note:** Qwen3-Coder-Next processes 75% of layers via gated DeltaNet (linear attention with a delta update rule) rather than softmax attention. BgKIT vectors are injected as tool-call response tokens and must be useful to both layer types. DeltaNet layers compress context into a fixed-size recurrent state — injected vectors seen early in the sequence may be "overwritten" by later tokens in ways that differ from softmax attention's direct lookup. This is a key architectural interaction to monitor: if the model struggles to attend to BgKIT positions in DeltaNet layers, consider (a) placing BgKIT tool-call frames at multiple positions in the input rather than just the beginning, or (b) targeting LoRA specifically at the 12 gated attention layers which can attend to any position directly.
 
 **BgKIT freezing decision:** Evaluate both frozen BgKIT (train only projection MLP + LoRA) and unfrozen BgKIT (end-to-end). If frozen produces comparable downstream performance, prefer it. This is a key early experiment in Phase 2.
 
@@ -135,10 +138,25 @@ BgKIT must beat (a) to justify its complexity.
 
 **Mandatory ablation after every training stage:** BgKIT survivors present vs. zeroed vs. random noise. The gap is the value signal. If the gap is negligible, stop.
 
+## Kernel Optimizations
+
+Both BgKIT (Qwen3-Embedding-0.6B) and the reconstruction decoder (Qwen3-0.6B) use RMSNorm and SwiGLU, which have well-known fused Triton kernel implementations. The target LLM's cross-entropy loss is the largest single memory consumer during training (materializing the full `[batch × seq_len, vocab_size]` logit tensor). Fused kernels address both.
+
+**Liger Kernel** (`liger-kernel`, Apache 2.0, from LinkedIn) provides drop-in fused Triton kernels for:
+
+- **Fused cross-entropy loss** — computes loss without materializing the full logit tensor, using online softmax in a single streaming pass. Reduces logit memory from multiple GB to ~100 MB. Applies to: Phase 1 decoder reconstruction loss, Phase 2 target LLM next-token prediction loss.
+- **Fused RMSNorm** — forward + backward in a single kernel, eliminating intermediate tensors. Applies to: BgKIT, decoder, target LLM.
+- **Fused SwiGLU** — gate + element-wise multiply + up projection combined. Applies to: BgKIT, decoder.
+- **Fused RoPE** — Q and K rotary embeddings in a single kernel. Applies to: BgKIT, decoder, target LLM (gated attention layers).
+
+These are **non-invasive** — they replace individual PyTorch modules without monkey-patching the full model or breaking autograd. This is critical because BgKIT's training requires gradient flow through the projection MLP and across compression levels, which is incompatible with more aggressive optimization frameworks (e.g., Unsloth) that use in-place backward operations that corrupt upstream gradient graphs.
+
+**CPU-offloaded gradient checkpointing** — during the forward pass, async-copy hidden states to CPU (`non_blocking=True`); during backward, async-copy back and recompute. Overlaps PCIe transfer with GPU compute (~1.9% overhead) for ~30% additional VRAM savings on top of standard gradient checkpointing. Implementation is ~20 lines of pure PyTorch (`torch.autograd.Function`). Particularly valuable for Phase 2 where the target LLM's activations dominate memory.
+
 ## Compute Estimates
 
-Estimates require validation via profiling.
+Estimates require validation via profiling on the DGX Spark (Blackwell GB10, 128 GB unified memory, 273 GB/s shared bandwidth).
 
 - **ICE:** Negligible one-time cost.
-- **Phase 1:** BgKIT + decoder co-training (~600M each). Dominant cost: compression-reconstruction examples + frozen target LLM forward passes for projection alignment.
-- **Phase 2:** Forward/backward through Qwen3-Coder-Next with LoRA at long context, plus full backpropagation through BgKIT. Gradient checkpointing across levels. This is the expensive phase.
+- **Phase 1:** BgKIT + decoder co-training (~600M each). Dominant cost: compression-reconstruction examples + frozen target LLM forward passes for projection alignment. Phase 1 Step 3 requires loading Qwen3-Coder-Next in 4-bit for frozen forward passes (~40 GB), but no backward pass through the target LLM, so memory pressure is moderate. Fused cross-entropy on the decoder reduces peak memory substantially.
+- **Phase 2:** The expensive phase. Approximate memory budget for BgKIT-unfrozen configuration: target LLM 4-bit weights (~40 GB) + BgKIT BF16 (~1.2 GB) + decoder BF16 (~1.2 GB) + LoRA adapters (~0.5 GB) + optimizer states (~7 GB worst case) ≈ 50 GB fixed, leaving ~78 GB for activations and gradients. With gradient checkpointing (including CPU-offloaded variant) across BgKIT levels and the target LLM, plus fused cross-entropy eliminating logit materialization, this should support sequence lengths of 8K–16K at microbatch 1 with gradient accumulation, but must be profiled. The DGX Spark's shared memory bandwidth (273 GB/s, ~12× lower than A100 HBM) will make Phase 2 bandwidth-bound; expect significantly longer step times than equivalent HBM hardware.

@@ -1,0 +1,21 @@
+services:
+  train:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - WANDB_API_KEY=${WANDB_API_KEY}
+    volumes:
+      - ${DATA_DIR:-./data}:/workspace/data
+      - ${CHECKPOINT_DIR:-./checkpoints}:/workspace/checkpoints
+    command: ["scripts/train.py"]
+
+  preprocess:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.data
+    volumes:
+      - ${DATA_DIR:-./data}:/workspace/data
+    command: ["scripts/process_repos.py"]

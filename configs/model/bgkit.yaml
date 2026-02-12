@@ -1,0 +1,21 @@
+# BgKIT compressor
+# Based on Qwen3-Embedding-0.6B (~600M params)
+bgkit:
+  backbone_name: Qwen/Qwen3-Embedding-0.6B
+  hidden_dim: 1024
+  # Total survivor budget across all files for a single repo
+  total_survivor_budget: 3500
+  # Level 0: within-file compression
+  level0:
+    # Survivor selection mix: fraction selected by ICE vs random
+    ice_fraction: 0.6
+    # Temperature for probabilistic ICE selection
+    ice_temperature: 1.0
+  # Level 1: cross-file compression
+  level1:
+    # Max positions for L1 input (Qwen3-0.6B context limit)
+    max_positions: 32768
+    # L1 selection is effectively uniform (ICE not calibrated for survivors)
+    ice_fraction: 0.0
+  # Auto-reproduction head
+  auto_reproduction: true

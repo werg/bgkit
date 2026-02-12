@@ -1,0 +1,13 @@
+# Reconstruction decoder
+# Based on Qwen3-0.6B (~600M params)
+decoder:
+  backbone_name: Qwen/Qwen3-0.6B
+  hidden_dim: 1024
+  vocab_size: 151936
+  # Adaptation strategy: "full" or "lora"
+  # Start with full fine-tuning, switch to LoRA if embedding drift observed
+  adaptation: full
+  lora:
+    rank: 256  # High-rank if switching to LoRA
+    alpha: 512
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
