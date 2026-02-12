@@ -1,0 +1,67 @@
+# BgKIT: Ambient Awareness for Agentic LLMs
+
+**Project Overview**
+
+---
+
+## Core Idea
+
+Agentic coding models rely on tokenized context — system prompts, AGENTS.md files, tool-retrieved snippets — to understand the context they operate in. We want to explore whether we can provide more holistic, subtle and compact forms of context injection inspired by the way image embeddings are injected. 
+
+## Approach
+
+A Background Knowledge Interaction Transformer (BgKIT) hierarchically compresses repository-wide context into a compact set of dense embeddings, injected into the target LLM's forward pass below the token level — analogous to how images are embedded in vision-language models. The target LLM receives a compressed, variable-sized embedded representation of the entire codebase or other background knowledge.
+
+## Architecture
+
+BgKIT is a single transformer network (~600M parameters) derived from a pre-trained embedding model (Qwen3-Embedding-0.6B), applied recursively at two compression levels:
+
+**Level 0 (within-file):** Each chunk is processed independently. BgKIT performs bidirectional self-attention over the full token sequence, then compresses via a drop-flag mechanism: positions are pre-labeled as "survive" or "doomed," and the network consolidates information from doomed positions into survivors during the forward pass. Survivors are retained; doomed positions are discarded. Parallelizable across files, analogous to how embeddings for an entire document are sometimes extracted just from the <eos> position, but applied to variable compression ratios.
+
+**Level 1 (cross-file):** All level 0 survivors across all files, prepended with file metadata (path, language), enter a single BgKIT pass with shared weights. Cross-file interaction occurs via self-attention — dependency structures, shared API contracts, module boundaries — and further compression produces the final output positions.
+
+**Reconstruction decoder:** A separate small causal LM (Qwen3-0.6B) is co-trained to reconstruct content from BgKIT's compressed representations, providing the primary training signal for compression quality.
+
+**Survivor budget allocation:** An Information Content Estimator (ICE), a lightweight convolutional network, estimates per-position information density. The total survivor budget is distributed across files proportionally to estimated information content. Very small files can be mainlined directly into Level 1.
+
+## Injection into the Target LLM
+
+Survivors are mapped via a learned projection MLP from BgKIT's hidden dimension into the target LLM's embedding space (the LLaVA paradigm). Dense vectors are framed as **tool-call responses** in the target LLM's input — each knowledge source is a named tool whose "response" contains the projected vectors:
+
+```
+<tool_call>bgkit_repo_contents</tool_call>
+<tool_response>[projected survivor vectors]</tool_response>
+```
+
+This reuses the model's existing tool-call understanding, makes knowledge sources individually addressable, and allows selective omission for graceful degradation.
+
+## Knowledge Sources
+
+We initially will focus on files, but there are a number of other potential sources that could be injected in this manner.
+These are just a few examples. Each knowledge domain is processed by the shared BgKIT network with appropriate compression prompts:
+
+- **Repository file contents** — the primary and initial target
+- **Git commit history** — change patterns and project evolution
+- **Library documentation** — API surfaces of declared dependencies
+- **Web search results** — query-guided compression of retrieved pages
+- **Past agent conversations** — interaction logs from prior sessions
+- **User memories** — accumulated facts about the user
+- **Structured and rote data** — HTML, JSON, logfiles to salient plaintext information
+
+Repository file contents are the focus of v1. Other sources are extensions using the same architecture.
+
+## Training
+
+**Phase 1 — BgKIT pre-training:** Train BgKIT's compression and the reconstruction decoder on code repositories. The decoder reconstructs original content from compressed survivors, providing gradient signal for consolidation quality. Multiple complementary objectives (data reconstruction, description generation, structural QA, commit reproduction) ensure survivors preserve diverse information types.
+
+**Phase 2 — End-to-end injection:** Train the full pipeline (BgKIT → projection MLP → target LLM with LoRA) on agentic coding tasks derived from commit history. The target LLM learns to attend to and use dense BgKIT vectors for file retrieval guidance, structural reasoning, and code generation.
+
+## Deployment
+
+BgKIT runs as a **preprocessing service**, decoupled from the serving stack. Projected vectors are injected via existing multimodal embedding infrastructure in vLLM and llama.cpp (the LLaVA image patch pathway). No patches to the inference runtime are required.
+
+Level 0 is re-run per changed file only. Level 1 requires full recomputation but can be cached and updated on request. KV cache entries for BgKIT positions persist across agent turns until refreshed.
+
+## Success Criteria
+
+BgKIT must outperform embedding-based retrieval with a reranker on end-to-end agentic coding benchmarks (SWE-bench or similar) to justify its complexity. Secondary metrics: retrieval guidance accuracy, structural QA from BgKIT context alone, tool-call efficiency, and graceful degradation under increasing compression.
