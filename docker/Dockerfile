@@ -1,6 +1,6 @@
 # BgKIT Training Dockerfile for DGX Spark
 # Based on NGC PyTorch container (ARM64 + CUDA 13.0 + sm_121 support)
-FROM nvcr.io/nvidia/pytorch:25.11-py3
+FROM nvcr.io/nvidia/pytorch:26.01-py3
 
 LABEL maintainer="bgkit"
 LABEL description="BgKIT training on DGX Spark (Blackwell GB10)"
