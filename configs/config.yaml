@@ -8,6 +8,8 @@ defaults:
   - data/repos
   - data/commits
   - data/tasks
+  - data/corpus
+  - data/ice_labels
   - compute/dgx_spark
   - _self_
 

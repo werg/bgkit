@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import structlog
 
 
@@ -23,9 +25,11 @@ def setup_logging(level: str = "INFO", json_output: bool = False) -> None:
     else:
         processors.append(structlog.dev.ConsoleRenderer())
 
+    # Also configure stdlib logging so standard loggers work
+    numeric_level = getattr(logging, level.upper(), logging.INFO)
+    logging.basicConfig(level=numeric_level, format="%(message)s", force=True)
+
     structlog.configure(
         processors=processors,
-        wrapper_class=structlog.make_filtering_bound_logger(
-            structlog.get_level_from_name(level)
-        ),
+        wrapper_class=structlog.make_filtering_bound_logger(numeric_level),
     )

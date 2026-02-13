@@ -1,0 +1,5 @@
+corpus:
+  tokenizer_name: Qwen/Qwen3-0.6B
+  max_file_size: 262144  # 256 KB, matches repo_processing.py
+  output_dir: ${oc.env:DATA_DIR,./data}/processed
+  max_repos: null

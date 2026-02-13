@@ -25,7 +25,9 @@ RUN python -c "import bgkit; print(f'bgkit {bgkit.__version__}')" && \
     python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')" && \
     python -c "import accelerate; print(f'accelerate {accelerate.__version__}')"
 
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    DATA_DIR=/workspace/data \
+    HF_HOME=/workspace/hf_cache
 
 ENTRYPOINT ["python"]
 CMD ["scripts/train.py"]

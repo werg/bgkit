@@ -1,4 +1,4 @@
-.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build docker-build-data
+.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build docker-build-data process-repos ice-labels
 
 install:
 	uv sync --extra dev --extra data
@@ -40,6 +40,12 @@ quality-gate:
 
 profile:
 	uv run python scripts/profile_compute.py
+
+process-repos:
+	.venv/bin/python scripts/process_repos.py $(ARGS)
+
+ice-labels:
+	docker compose -f docker/docker-compose.yaml run --rm ice-labels $(ARGS)
 
 docker-build:
 	docker build -f docker/Dockerfile -t bgkit:latest .

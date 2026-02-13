@@ -1,21 +1,34 @@
+x-gpu-common: &gpu-common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  volumes:
+    - ${DATA_DIR:-../data}:/workspace/data
+    - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
+    - ${CHECKPOINT_DIR:-../checkpoints}:/workspace/checkpoints
+
 services:
   train:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    runtime: nvidia
+    <<: *gpu-common
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
       - WANDB_API_KEY=${WANDB_API_KEY}
-    volumes:
-      - ${DATA_DIR:-./data}:/workspace/data
-      - ${CHECKPOINT_DIR:-./checkpoints}:/workspace/checkpoints
     command: ["scripts/train.py"]
+
+  ice-labels:
+    <<: *gpu-common
+    command: ["scripts/generate_ice_labels.py"]
 
   preprocess:
     build:
       context: ..
       dockerfile: docker/Dockerfile.data
     volumes:
-      - ${DATA_DIR:-./data}:/workspace/data
+      - ${DATA_DIR:-../data}:/workspace/data
     command: ["scripts/process_repos.py"]
