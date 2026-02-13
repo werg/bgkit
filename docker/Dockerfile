@@ -1,5 +1,5 @@
-# BgKIT Training Dockerfile for DGX Spark
-# Based on NGC PyTorch container (ARM64 + CUDA 13.0 + sm_121 support)
+# BgKIT Training Container for DGX Spark
+# NGC base provides ARM64 + CUDA 13.0 + sm_121 + torch pre-installed
 FROM nvcr.io/nvidia/pytorch:26.01-py3
 
 LABEL maintainer="bgkit"
@@ -7,27 +7,23 @@ LABEL description="BgKIT training on DGX Spark (Blackwell GB10)"
 
 WORKDIR /workspace/bgkit
 
-# Install uv for dependency management
-RUN pip install uv
-
-# Copy dependency specification first (Docker cache layer)
-COPY pyproject.toml uv.lock* ./
-
-# Install all deps EXCEPT torch (--group torch is excluded)
-# This preserves NGC container's pre-installed ARM64 + CUDA 13 torch build
-RUN uv sync --frozen --no-group torch || uv sync --no-group torch
-
-# Copy source code and configs
+# Copy project files needed for pip install
+COPY pyproject.toml ./
+COPY docs/01_overview.md docs/
 COPY src/ src/
+
+# Install bgkit + GPU deps into system Python.
+# pip finds NGC's pre-installed torch and does not reinstall it.
+RUN pip install --no-cache-dir ".[gpu]"
+
+# Copy configs and scripts (change more often than deps)
 COPY configs/ configs/
 COPY scripts/ scripts/
 
-# Install bgkit package (no-deps to avoid pulling torch from PyPI)
-RUN uv pip install --no-deps -e .
-
-# Verify installation
+# Verify
 RUN python -c "import bgkit; print(f'bgkit {bgkit.__version__}')" && \
-    python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')"
+    python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')" && \
+    python -c "import accelerate; print(f'accelerate {accelerate.__version__}')"
 
 ENV PYTHONUNBUFFERED=1
 

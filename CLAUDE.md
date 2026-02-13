@@ -33,12 +33,15 @@ The local `.venv/` (managed by `uv`) is used for:
 - Data crawler: `.venv/bin/bgkit-data stats|discover|download`
 - Any CPU-only data processing
 
-Install locally with: `uv sync --group torch --extra dev --extra eval`
+Install locally with: `make install` or `uv sync --extra dev --extra data`
+Full local dev (with torch + GPU packages): `make install-gpu` or `uv sync --group torch --extra gpu --extra dev --extra eval`
 
 ## Key Commands
 
 | Task | Command |
 |---|---|
+| Install (CPU dev) | `make install` |
+| Install (full + GPU) | `make install-gpu` |
 | Run unit tests | `make test` or `.venv/bin/pytest tests/unit -v` |
 | Lint | `make lint` |
 | Format | `make format` |
@@ -48,8 +51,10 @@ Install locally with: `uv sync --group torch --extra dev --extra eval`
 
 ## Dependency Management
 
-- **Package manager:** `uv`
-- **PyTorch in Docker:** The Dockerfile uses `uv sync --no-group torch` to preserve the NGC container's pre-installed PyTorch. Never override this.
+- **Package manager:** `uv` (host), `pip` (Docker)
+- **Core deps** (CPU-safe): transformers, safetensors, datasets, tokenizers, pygit2, hydra, etc.
+- **GPU extra** (`[gpu]`): accelerate, peft, bitsandbytes, einops — requires torch
+- **PyTorch in Docker:** NGC container provides torch. `pip install ".[gpu]"` sees it and skips reinstalling.
 - **PyTorch locally:** Installed via the `torch` dependency group (`uv sync --group torch`).
 
 ## Code Quality

@@ -1,4 +1,4 @@
-# BgKIT Data Preprocessing Dockerfile (CPU-only)
+# BgKIT Data Preprocessing Container (CPU-only)
 FROM python:3.12-slim
 
 WORKDIR /workspace/bgkit
@@ -9,19 +9,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgit2-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
-RUN pip install uv
-
-COPY pyproject.toml uv.lock* ./
-
-# Install without torch (CPU preprocessing doesn't need GPU)
-RUN uv sync --frozen --no-group torch || uv sync --no-group torch
-
+# Copy project files needed for pip install
+COPY pyproject.toml ./
+COPY docs/01_overview.md docs/
 COPY src/ src/
+
+# Install bgkit core + data extras (no GPU deps, no torch)
+RUN pip install --no-cache-dir ".[data]"
+
+# Copy configs and scripts
 COPY configs/ configs/
 COPY scripts/ scripts/
-
-RUN uv pip install --no-deps -e .
 
 ENV PYTHONUNBUFFERED=1
 

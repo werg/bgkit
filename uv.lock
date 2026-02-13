@@ -104,6 +104,15 @@ wheels = [
 ]
 
 [[package]]
+name = "aiosqlite"
+version = "0.22.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/4e/8a/64761f4005f17809769d23e518d915db74e6310474e733e3593cfc854ef1/aiosqlite-0.22.1.tar.gz", hash = "sha256:043e0bd78d32888c0a9ca90fc788b38796843360c855a7262a532813133a0650", size = 14821, upload-time = "2025-12-23T19:25:43.997Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/b7/e3bf5133d697a08128598c8d0abc5e16377b51465a33756de24fa7dee953/aiosqlite-0.22.1-py3-none-any.whl", hash = "sha256:21c002eb13823fad740196c5a2e9d8e62f6243bd9e7e4a1f87fb5e44ecb4fceb", size = 17405, upload-time = "2025-12-23T19:25:42.139Z" },
+]
+
+[[package]]
 name = "annotated-doc"
 version = "0.0.4"
 source = { registry = "https://pypi.org/simple" }
@@ -249,15 +258,11 @@ name = "bgkit"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "accelerate" },
-    { name = "bitsandbytes" },
     { name = "datasets" },
-    { name = "einops" },
     { name = "gitpython" },
     { name = "hydra-core" },
     { name = "numpy" },
     { name = "omegaconf" },
-    { name = "peft" },
     { name = "pygit2" },
     { name = "rich" },
     { name = "safetensors" },
@@ -269,6 +274,11 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+data = [
+    { name = "aiosqlite" },
+    { name = "httpx" },
+    { name = "python-dotenv" },
+]
 dev = [
     { name = "jupyterlab" },
     { name = "matplotlib" },
@@ -282,6 +292,12 @@ eval = [
     { name = "faiss-cpu" },
     { name = "sentence-transformers" },
 ]
+gpu = [
+    { name = "accelerate" },
+    { name = "bitsandbytes" },
+    { name = "einops" },
+    { name = "peft" },
+]
 
 [package.dev-dependencies]
 torch = [
@@ -290,23 +306,26 @@ torch = [
 
 [package.metadata]
 requires-dist = [
-    { name = "accelerate", specifier = ">=1.2" },
-    { name = "bitsandbytes" },
+    { name = "accelerate", marker = "extra == 'gpu'", specifier = ">=1.2" },
+    { name = "aiosqlite", marker = "extra == 'data'", specifier = ">=0.20" },
+    { name = "bitsandbytes", marker = "extra == 'gpu'" },
     { name = "datasets", specifier = ">=3.0" },
-    { name = "einops" },
+    { name = "einops", marker = "extra == 'gpu'" },
     { name = "faiss-cpu", marker = "extra == 'eval'" },
     { name = "gitpython" },
+    { name = "httpx", marker = "extra == 'data'", specifier = ">=0.27" },
     { name = "hydra-core", specifier = ">=1.3" },
     { name = "jupyterlab", marker = "extra == 'dev'" },
     { name = "matplotlib", marker = "extra == 'dev'" },
     { name = "mypy", marker = "extra == 'dev'" },
     { name = "numpy" },
     { name = "omegaconf" },
-    { name = "peft", specifier = ">=0.14" },
+    { name = "peft", marker = "extra == 'gpu'", specifier = ">=0.14" },
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pygit2" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
+    { name = "python-dotenv", marker = "extra == 'data'", specifier = ">=1.0" },
     { name = "rich" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "safetensors" },
@@ -317,7 +336,7 @@ requires-dist = [
     { name = "transformers", specifier = ">=4.51" },
     { name = "wandb" },
 ]
-provides-extras = ["dev", "eval"]
+provides-extras = ["gpu", "dev", "data", "eval"]
 
 [package.metadata.requires-dev]
 torch = [{ name = "torch", specifier = ">=2.5" }]
@@ -2323,6 +2342,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz", hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3", size = 342432, upload-time = "2024-03-01T18:36:20.211Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
+]
+
+[[package]]
+name = "python-dotenv"
+version = "1.2.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f0/26/19cadc79a718c5edbec86fd4919a6b6d3f681039a2f6d66d14be94e75fb9/python_dotenv-1.2.1.tar.gz", hash = "sha256:42667e897e16ab0d66954af0e60a9caa94f0fd4ecf3aaf6d2d260eec1aa36ad6", size = 44221, upload-time = "2025-10-26T15:12:10.434Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/14/1b/a298b06749107c305e1fe0f814c6c74aea7b2f1e10989cb30f544a1b3253/python_dotenv-1.2.1-py3-none-any.whl", hash = "sha256:b81ee9561e9ca4004139c6cbba3a238c32b03e4894671e181b671e8cb8425d61", size = 21230, upload-time = "2025-10-26T15:12:09.109Z" },
 ]
 
 [[package]]

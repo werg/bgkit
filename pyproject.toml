@@ -11,11 +11,7 @@ requires-python = ">=3.11,<3.13"
 license = "MIT"
 dependencies = [
     "transformers>=4.51",
-    "accelerate>=1.2",
-    "peft>=0.14",
-    "bitsandbytes",
     "safetensors",
-    "einops",
     "datasets>=3.0",
     "tokenizers",
     "gitpython",
@@ -30,6 +26,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gpu = [
+    "accelerate>=1.2",
+    "peft>=0.14",
+    "bitsandbytes",
+    "einops",
+]
 dev = [
     "pytest",
     "pytest-cov",

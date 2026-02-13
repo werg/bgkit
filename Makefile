@@ -1,7 +1,10 @@
-.PHONY: install test test-unit test-integration test-smoke lint format train eval ablation docker-build
+.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build docker-build-data
 
 install:
-	uv sync --group torch --extra dev --extra eval
+	uv sync --extra dev --extra data
+
+install-gpu:
+	uv sync --group torch --extra gpu --extra dev --extra eval
 
 test: test-unit
 

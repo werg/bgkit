@@ -3,25 +3,37 @@
 from __future__ import annotations
 
 import pytest
-import torch
 
-from bgkit.models.ice import ICE
-from bgkit.models.projection import ProjectionMLP
+try:
+    import torch
+
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+needs_torch = pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
 
 
 @pytest.fixture
 def tiny_ice():
     """Tiny ICE model for testing (2 layers, dim=64)."""
+    pytest.importorskip("torch")
+    from bgkit.models.ice import ICE
+
     return ICE(input_dim=64, hidden_dim=32, num_layers=2, kernel_size=3)
 
 
 @pytest.fixture
 def tiny_projection():
     """Tiny projection MLP for testing."""
+    pytest.importorskip("torch")
+    from bgkit.models.projection import ProjectionMLP
+
     return ProjectionMLP(input_dim=64, output_dim=128, hidden_dim=128)
 
 
 @pytest.fixture
 def device():
     """Test device."""
+    torch = pytest.importorskip("torch")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
