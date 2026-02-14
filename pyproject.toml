@@ -69,7 +69,7 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
 ignore = ["N812"]  # Allow `import torch.nn.functional as F` (PyTorch convention)
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["F401"]  # Allow unused imports in tests (used for side effects)
+"tests/**" = ["F401", "E402"]  # Allow unused imports and late imports after pytest.importorskip
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

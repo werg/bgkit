@@ -13,7 +13,7 @@ import pytest
 torch = pytest.importorskip("torch")
 import torch.nn as nn
 
-from bgkit.data.ice_label_generator import generate_ce_for_sequence
+from bgkit.data.ice_label_generator import _batched_ce_inference, generate_ce_for_sequence
 
 
 class TinyMockModel(nn.Module):
@@ -25,7 +25,7 @@ class TinyMockModel(nn.Module):
         # Need at least one parameter so next(model.parameters()) works
         self._dummy = nn.Parameter(torch.zeros(1))
 
-    def forward(self, input_ids: torch.Tensor):
+    def forward(self, input_ids: torch.Tensor, attention_mask=None):
         batch, seq_len = input_ids.shape
         logits = torch.randn(batch, seq_len, self.vocab_size, device=input_ids.device)
         result = MagicMock()
@@ -38,11 +38,12 @@ class TestGenerateCEForSequence:
         model = TinyMockModel(vocab_size=100)
         token_ids = list(range(50))
 
-        ce = generate_ce_for_sequence(token_ids, model, max_seq_len=128, device=torch.device("cpu"))
+        ce = generate_ce_for_sequence(
+            token_ids, model, max_seq_len=128, device=torch.device("cpu")
+        )
 
         assert isinstance(ce, np.ndarray)
         assert ce.dtype == np.float16
-        # CE has len(token_ids) - 1 values (shifted prediction)
         assert len(ce) == len(token_ids) - 1
 
     def test_empty_sequence(self):
@@ -64,9 +65,10 @@ class TestGenerateCEForSequence:
         model = TinyMockModel(vocab_size=100)
         token_ids = list(range(20))
 
-        ce = generate_ce_for_sequence(token_ids, model, max_seq_len=128, device=torch.device("cpu"))
+        ce = generate_ce_for_sequence(
+            token_ids, model, max_seq_len=128, device=torch.device("cpu")
+        )
 
-        # Cross-entropy should be non-negative
         assert np.all(ce >= 0)
 
     def test_chunking_long_sequence(self):
@@ -78,9 +80,91 @@ class TestGenerateCEForSequence:
         )
 
         assert isinstance(ce, np.ndarray)
-        # With chunking, total CE values should cover all chunks
-        # Each chunk produces chunk_len - 1 CE values
         assert len(ce) > 0
+
+
+class TestBatchedCEInference:
+    def test_basic_batch(self):
+        model = TinyMockModel(vocab_size=100)
+        sequences = [list(range(10)), list(range(20)), list(range(15))]
+
+        results = _batched_ce_inference(
+            sequences, model, torch.device("cpu"), max_batch_tokens=4096
+        )
+
+        assert len(results) == 3
+        assert len(results[0]) == 9   # 10 - 1
+        assert len(results[1]) == 19  # 20 - 1
+        assert len(results[2]) == 14  # 15 - 1
+
+    def test_preserves_order(self):
+        model = TinyMockModel(vocab_size=100)
+        # Varying lengths — batching sorts internally but must restore order
+        sequences = [list(range(30)), list(range(5)), list(range(50)), list(range(10))]
+
+        results = _batched_ce_inference(
+            sequences, model, torch.device("cpu"), max_batch_tokens=4096
+        )
+
+        assert len(results) == 4
+        assert len(results[0]) == 29
+        assert len(results[1]) == 4
+        assert len(results[2]) == 49
+        assert len(results[3]) == 9
+
+    def test_small_batch_budget_forces_splits(self):
+        model = TinyMockModel(vocab_size=100)
+        sequences = [list(range(20)), list(range(20)), list(range(20))]
+
+        # Budget of 30 means only 1 seq of len 20 per batch
+        results = _batched_ce_inference(
+            sequences, model, torch.device("cpu"), max_batch_tokens=30
+        )
+
+        assert len(results) == 3
+        for r in results:
+            assert len(r) == 19
+
+    def test_empty_input(self):
+        model = TinyMockModel()
+        results = _batched_ce_inference([], model, torch.device("cpu"))
+        assert results == []
+
+    def test_single_token_sequences_skipped(self):
+        model = TinyMockModel(vocab_size=100)
+        sequences = [[42], list(range(10)), [7]]
+
+        results = _batched_ce_inference(
+            sequences, model, torch.device("cpu"), max_batch_tokens=4096
+        )
+
+        assert len(results) == 3
+        assert len(results[0]) == 0   # single token -> empty
+        assert len(results[1]) == 9
+        assert len(results[2]) == 0
+
+    def test_ce_values_non_negative(self):
+        model = TinyMockModel(vocab_size=100)
+        sequences = [list(range(10)), list(range(20))]
+
+        results = _batched_ce_inference(
+            sequences, model, torch.device("cpu"), max_batch_tokens=4096
+        )
+
+        for r in results:
+            assert np.all(r >= 0)
+
+    def test_all_same_length(self):
+        model = TinyMockModel(vocab_size=100)
+        sequences = [list(range(15))] * 5
+
+        results = _batched_ce_inference(
+            sequences, model, torch.device("cpu"), max_batch_tokens=4096
+        )
+
+        assert len(results) == 5
+        for r in results:
+            assert len(r) == 14
 
 
 class TestOutputFormat:
