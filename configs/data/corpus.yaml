@@ -3,3 +3,43 @@ corpus:
   max_file_size: 262144  # 256 KB, matches repo_processing.py
   output_dir: ${oc.env:DATA_DIR,./data}/processed
   max_repos: null
+  max_tokens_per_repo: 2000000  # 2M tokens per repo
+  language_allowlist:
+    - Python
+    - JavaScript
+    - TypeScript
+    - Java
+    - Go
+    - Rust
+    - C
+    - C++
+    - C#
+    - PHP
+    - Ruby
+    - Swift
+    - Kotlin
+    - Scala
+    - Haskell
+    - OCaml
+    - Lua
+    - Perl
+    - Shell
+    - R
+    - Julia
+    - Elixir
+    - Erlang
+    - Zig
+    - Nim
+    - Dart
+    - V
+    - Crystal
+    - D
+    - F#
+    - Clojure
+    - SQL
+    - Makefile
+    - Dockerfile
+    - CMake
+    - Nix
+    - Terraform
+    - Protocol Buffers

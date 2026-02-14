@@ -143,6 +143,143 @@ class TestTokenizeRepo:
             assert fs.token_count == len(ft["token_ids"])
 
 
+class TestLanguageFiltering:
+    def test_allowlist_excludes_disallowed_languages(self):
+        """Files with languages not in the allowlist are excluded."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.encode.side_effect = lambda text, **kw: list(range(10))
+
+        # Create a mock snapshot with mixed languages
+        mock_snapshot = MagicMock()
+        mock_snapshot.commit_sha = "abc123"
+        mock_file_py = MagicMock(path="main.py", language="Python", content="x", size_bytes=100)
+        mock_file_json = MagicMock(path="data.json", language="JSON", content="y", size_bytes=200)
+        mock_file_none = MagicMock(path="README", language=None, content="z", size_bytes=50)
+        mock_snapshot.files = [mock_file_py, mock_file_json, mock_file_none]
+
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(
+                "bgkit.data.corpus_stats.extract_repo_snapshot",
+                lambda *a, **kw: mock_snapshot,
+            )
+            stats, file_tokens = tokenize_repo(
+                "/fake/repo", mock_tokenizer,
+                language_allowlist={"Python"},
+            )
+
+        assert len(stats.files) == 1
+        assert stats.files[0].path == "main.py"
+        assert len(file_tokens) == 1
+
+    def test_no_allowlist_includes_all(self):
+        """Without an allowlist, all files are included."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.encode.side_effect = lambda text, **kw: list(range(5))
+
+        mock_snapshot = MagicMock()
+        mock_snapshot.commit_sha = "abc123"
+        mock_snapshot.files = [
+            MagicMock(path="a.py", language="Python", content="x", size_bytes=10),
+            MagicMock(path="b.json", language="JSON", content="y", size_bytes=20),
+            MagicMock(path="c", language=None, content="z", size_bytes=30),
+        ]
+
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(
+                "bgkit.data.corpus_stats.extract_repo_snapshot",
+                lambda *a, **kw: mock_snapshot,
+            )
+            stats, file_tokens = tokenize_repo("/fake/repo", mock_tokenizer)
+
+        assert len(stats.files) == 3
+        assert len(file_tokens) == 3
+
+
+class TestPerRepoTokenCap:
+    def test_cap_truncates_large_repo(self):
+        """Repos exceeding max_tokens_per_repo are truncated to fit."""
+        mock_tokenizer = MagicMock()
+        # Each file produces 100 tokens
+        mock_tokenizer.encode.side_effect = lambda text, **kw: list(range(100))
+
+        mock_snapshot = MagicMock()
+        mock_snapshot.commit_sha = "abc123"
+        mock_snapshot.files = [
+            MagicMock(path=f"file{i}.py", language="Python", content="x" * 100, size_bytes=100)
+            for i in range(10)
+        ]
+
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(
+                "bgkit.data.corpus_stats.extract_repo_snapshot",
+                lambda *a, **kw: mock_snapshot,
+            )
+            stats, file_tokens = tokenize_repo(
+                "/fake/repo", mock_tokenizer,
+                language_allowlist={"Python"},
+            )
+        assert stats.total_tokens == 1000  # 10 files * 100 tokens
+
+        # Simulate cap at 350 tokens — should keep first 3 files (300 tokens)
+        max_tokens_per_repo = 350
+        if stats.total_tokens > max_tokens_per_repo:
+            capped_files = []
+            capped_file_tokens = []
+            running = 0
+            for fs, ft in zip(stats.files, file_tokens):
+                if running + fs.token_count > max_tokens_per_repo and capped_files:
+                    break
+                capped_files.append(fs)
+                capped_file_tokens.append(ft)
+                running += fs.token_count
+            stats.files = capped_files
+            stats.total_tokens = sum(f.token_count for f in capped_files)
+            file_tokens = capped_file_tokens
+
+        # With 100 tokens per file and cap at 350, we keep 3 files (300 tokens)
+        assert len(stats.files) == 3
+        assert stats.total_tokens == 300
+        assert len(file_tokens) == 3
+
+    def test_cap_keeps_first_file_even_if_over(self):
+        """If the first file alone exceeds the cap, it's still kept."""
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.encode.side_effect = lambda text, **kw: list(range(500))
+
+        mock_snapshot = MagicMock()
+        mock_snapshot.commit_sha = "abc123"
+        mock_snapshot.files = [
+            MagicMock(path="big.py", language="Python", content="x" * 500, size_bytes=500),
+            MagicMock(path="small.py", language="Python", content="y", size_bytes=10),
+        ]
+
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(
+                "bgkit.data.corpus_stats.extract_repo_snapshot",
+                lambda *a, **kw: mock_snapshot,
+            )
+            stats, file_tokens = tokenize_repo("/fake/repo", mock_tokenizer)
+
+        # Simulate cap at 100 — first file is 500, but we always keep at least one
+        max_tokens_per_repo = 100
+        if stats.total_tokens > max_tokens_per_repo:
+            capped_files = []
+            capped_file_tokens = []
+            running = 0
+            for fs, ft in zip(stats.files, file_tokens):
+                if running + fs.token_count > max_tokens_per_repo and capped_files:
+                    break
+                capped_files.append(fs)
+                capped_file_tokens.append(ft)
+                running += fs.token_count
+            stats.files = capped_files
+            stats.total_tokens = sum(f.token_count for f in capped_files)
+            file_tokens = capped_file_tokens
+
+        assert len(stats.files) == 1
+        assert stats.files[0].path == "big.py"
+
+
 class TestManifestFormat:
     def test_manifest_jsonl_roundtrip(self, tmp_path: Path):
         """Verify manifest JSONL can be written and read back."""

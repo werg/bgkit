@@ -56,6 +56,7 @@ def tokenize_repo(
     repo_path: str,
     tokenizer,
     max_file_size: int = 256 * 1024,
+    language_allowlist: set[str] | None = None,
 ) -> tuple[RepoTokenStats, list[dict]]:
     """Extract and tokenize all files from a repo.
 
@@ -63,6 +64,8 @@ def tokenize_repo(
         repo_path: Path to the git repo.
         tokenizer: HuggingFace tokenizer instance.
         max_file_size: Skip files larger than this (bytes).
+        language_allowlist: If set, only include files whose language is in this set.
+            Files with language=None are skipped when allowlist is set.
 
     Returns:
         Tuple of (RepoTokenStats, list of file token dicts).
@@ -74,6 +77,10 @@ def tokenize_repo(
     file_tokens: list[dict] = []
 
     for f in snapshot.files:
+        if language_allowlist is not None:
+            if f.language is None or f.language not in language_allowlist:
+                continue
+
         token_ids = tokenizer.encode(f.content, add_special_tokens=False)
         token_count = len(token_ids)
 
@@ -121,6 +128,8 @@ def process_corpus(
     output_dir: str,
     max_file_size: int = 256 * 1024,
     max_repos: int | None = None,
+    language_allowlist: set[str] | None = None,
+    max_tokens_per_repo: int | None = None,
 ) -> CorpusStats:
     """Tokenize all repos and write manifest + token shards.
 
@@ -130,6 +139,9 @@ def process_corpus(
         output_dir: Base output directory for manifest.jsonl and tokens/.
         max_file_size: Skip files larger than this (bytes).
         max_repos: Process at most this many repos (for dev runs).
+        language_allowlist: If set, only include files whose language is in this set.
+        max_tokens_per_repo: If set, cap each repo to at most this many tokens
+            by keeping only the first N files up to the cap.
 
     Returns:
         Aggregate CorpusStats for the entire corpus.
@@ -169,11 +181,28 @@ def process_corpus(
         for repo_dir in pbar:
             try:
                 repo_stats, file_tokens = tokenize_repo(
-                    str(repo_dir), tokenizer, max_file_size
+                    str(repo_dir), tokenizer, max_file_size,
+                    language_allowlist=language_allowlist,
                 )
             except Exception:
                 log.warning("Failed to process %s", repo_dir, exc_info=True)
                 continue
+
+            # Apply per-repo token cap
+            if max_tokens_per_repo is not None and repo_stats.total_tokens > max_tokens_per_repo:
+                capped_files = []
+                capped_file_tokens = []
+                running = 0
+                for fs, ft in zip(repo_stats.files, file_tokens):
+                    if running + fs.token_count > max_tokens_per_repo and capped_files:
+                        break
+                    capped_files.append(fs)
+                    capped_file_tokens.append(ft)
+                    running += fs.token_count
+                repo_stats.files = capped_files
+                repo_stats.total_tokens = sum(f.token_count for f in capped_files)
+                repo_stats.total_bytes = sum(f.byte_size for f in capped_files)
+                file_tokens = capped_file_tokens
 
             # Write manifest line (metadata only, no token_ids)
             manifest_line = {

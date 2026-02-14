@@ -72,12 +72,18 @@ def main(cfg: DictConfig) -> None:
         corpus_cfg.output_dir,
     )
 
+    language_allowlist = None
+    if corpus_cfg.get("language_allowlist"):
+        language_allowlist = set(corpus_cfg.language_allowlist)
+
     stats = process_corpus(
         repos_dir=repos_dir,
         tokenizer_name=corpus_cfg.tokenizer_name,
         output_dir=corpus_cfg.output_dir,
         max_file_size=corpus_cfg.max_file_size,
         max_repos=corpus_cfg.max_repos,
+        language_allowlist=language_allowlist,
+        max_tokens_per_repo=corpus_cfg.get("max_tokens_per_repo"),
     )
 
     _print_summary(stats)
