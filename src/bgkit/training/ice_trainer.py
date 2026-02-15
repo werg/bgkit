@@ -89,6 +89,11 @@ class ICETrainer(BaseTrainer):
         full_dataset = ICEDataset(data_dir)
         eval_size = max(1, int(len(full_dataset) * 0.1))
         train_size = len(full_dataset) - eval_size
+        if train_size < 1:
+            raise ValueError(
+                f"Dataset too small for train/eval split (got {len(full_dataset)} samples, "
+                "need at least 2)"
+            )
         self.train_dataset, self.eval_dataset = random_split(
             full_dataset, [train_size, eval_size]
         )

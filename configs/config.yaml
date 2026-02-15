@@ -9,6 +9,7 @@ defaults:
   - data/commits
   - data/tasks
   - data/corpus
+  - data/tokens
   - data/ice_labels
   - compute/dgx_spark
   - _self_

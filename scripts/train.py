@@ -26,6 +26,11 @@ def main(cfg: DictConfig) -> None:
 
         trainer = ICETrainer(cfg)
         trainer.train()
+    elif phase == "auto_repro":
+        from bgkit.training.auto_repro_trainer import AutoReproTrainer
+
+        trainer = AutoReproTrainer(cfg)
+        trainer.train()
     else:
         raise NotImplementedError(f"Training phase '{phase}' not yet implemented")
 

@@ -386,3 +386,57 @@ class TestResume:
         loaded_meta, _ = load_checkpoint(second_ckpt)
 
         assert loaded_meta.parent_checkpoint == str(first_ckpt)
+
+
+# ---------------------------------------------------------------------------
+# Tiny dataset split guard
+# ---------------------------------------------------------------------------
+
+
+class TestICETinyDataset:
+    def test_tiny_dataset_raises_value_error(self, tmp_path):
+        """ICETrainer.setup() should raise ValueError when dataset has only 1 sample."""
+        from unittest.mock import patch
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from omegaconf import OmegaConf
+
+        # Create a minimal shard with 1 sample
+        table = pa.table({
+            "token_ids": [[1, 2, 3]],
+            "ce_values": [[0.5, 0.3]],
+        })
+        pq.write_table(table, tmp_path / "shard_000.parquet")
+
+        cfg = OmegaConf.create({
+            "training": {
+                "phase": "ice",
+                "max_steps": 10,
+                "lr": 1e-3,
+                "warmup_steps": 0,
+                "eval_every": 0,
+                "save_every": 0,
+            },
+            "model": {
+                "ice": {
+                    "input_dim": 64,
+                    "hidden_dim": 32,
+                    "num_layers": 2,
+                    "kernel_size": 3,
+                },
+            },
+            "data": {
+                "ice_labels": {"output_dir": str(tmp_path)},
+            },
+            "wandb": {"enabled": False},
+        })
+
+        # Patch AutoModel.from_pretrained to return a mock
+        mock_emb = MockEmbeddingModel(hidden_dim=64)
+        with (
+            patch("bgkit.training.ice_trainer.AutoModel.from_pretrained", return_value=mock_emb),
+            pytest.raises(ValueError, match="too small"),
+        ):
+            trainer = ICETrainer(cfg)
+            trainer.setup()
