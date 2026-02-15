@@ -21,8 +21,13 @@ def main(cfg: DictConfig) -> None:
     if phase is None:
         raise ValueError("No training phase specified. Use a training config override.")
 
-    # TODO: Dispatch to appropriate trainer based on phase
-    raise NotImplementedError(f"Training phase '{phase}' not yet implemented")
+    if phase == "ice":
+        from bgkit.training.ice_trainer import ICETrainer
+
+        trainer = ICETrainer(cfg)
+        trainer.train()
+    else:
+        raise NotImplementedError(f"Training phase '{phase}' not yet implemented")
 
 
 if __name__ == "__main__":

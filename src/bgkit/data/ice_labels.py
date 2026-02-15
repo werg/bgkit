@@ -29,9 +29,9 @@ def compute_per_token_cross_entropy(
     # Flatten for cross_entropy, then reshape back
     batch_size, seq_len, vocab_size = logits.shape
     loss = F.cross_entropy(
-        logits.view(-1, vocab_size),
-        target_ids.view(-1),
+        logits.reshape(-1, vocab_size),
+        target_ids.reshape(-1),
         ignore_index=ignore_index,
         reduction="none",
     )
-    return loss.view(batch_size, seq_len)
+    return loss.reshape(batch_size, seq_len)

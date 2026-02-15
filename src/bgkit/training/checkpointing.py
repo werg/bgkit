@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
+import torch
 
 logger = structlog.get_logger()
 
@@ -36,8 +39,26 @@ def save_checkpoint(
     Returns:
         Path to the saved checkpoint directory.
     """
-    # TODO: Implement with torch.save / safetensors
-    raise NotImplementedError
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    ckpt_name = f"{metadata.phase}_step{metadata.step}_{timestamp}"
+    ckpt_path = checkpoint_dir / ckpt_name
+    ckpt_path.mkdir(parents=True, exist_ok=True)
+
+    # Save metadata
+    meta_path = ckpt_path / "metadata.json"
+    meta_path.write_text(json.dumps(asdict(metadata), indent=2))
+
+    # Save each state dict
+    for name, state_dict in state_dicts.items():
+        torch.save(state_dict, ckpt_path / f"{name}.pt")
+
+    logger.info(
+        "checkpoint_saved",
+        path=str(ckpt_path),
+        step=metadata.step,
+        keys=list(state_dicts.keys()),
+    )
+    return ckpt_path
 
 
 def load_checkpoint(checkpoint_path: Path) -> tuple[CheckpointMetadata, dict]:
@@ -47,7 +68,21 @@ def load_checkpoint(checkpoint_path: Path) -> tuple[CheckpointMetadata, dict]:
         checkpoint_path: Path to checkpoint directory.
 
     Returns:
-        (metadata, state_dicts) tuple.
+        (metadata, state_dicts) tuple where state_dicts maps name -> state_dict.
     """
-    # TODO: Implement
-    raise NotImplementedError
+    meta_path = checkpoint_path / "metadata.json"
+    meta_dict = json.loads(meta_path.read_text())
+    metadata = CheckpointMetadata(**meta_dict)
+
+    state_dicts = {}
+    for pt_file in sorted(checkpoint_path.glob("*.pt")):
+        name = pt_file.stem
+        state_dicts[name] = torch.load(pt_file, map_location="cpu", weights_only=True)
+
+    logger.info(
+        "checkpoint_loaded",
+        path=str(checkpoint_path),
+        step=metadata.step,
+        keys=list(state_dicts.keys()),
+    )
+    return metadata, state_dicts
