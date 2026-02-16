@@ -85,15 +85,27 @@ class AutoReproTrainer(BaseTrainer):
 
         # Load backbone
         backbone_name = self.cfg.model.bgkit.backbone_name
-        logger.info("loading_backbone", model=backbone_name)
-        backbone = AutoModel.from_pretrained(backbone_name, torch_dtype=torch.bfloat16)
+        backbone_revision = self.cfg.model.bgkit.get("backbone_revision", None)
+        logger.info("loading_backbone", model=backbone_name, revision=backbone_revision)
+        backbone = AutoModel.from_pretrained(
+            backbone_name,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            revision=backbone_revision,
+        )
 
         # Optional SLERP merge with decoder
         slerp_t = tcfg.get("slerp_t", None)
         if slerp_t is not None:
             decoder_name = self.cfg.model.decoder.backbone_name
+            decoder_revision = self.cfg.model.decoder.get("backbone_revision", None)
             logger.info("loading_decoder_for_slerp", model=decoder_name, t=slerp_t)
-            decoder = AutoModel.from_pretrained(decoder_name, torch_dtype=torch.bfloat16)
+            decoder = AutoModel.from_pretrained(
+                decoder_name,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                revision=decoder_revision,
+            )
 
             sd_a = backbone.state_dict()
             sd_b = decoder.state_dict()

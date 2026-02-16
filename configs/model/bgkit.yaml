@@ -2,6 +2,7 @@
 # Based on Qwen3-Embedding-0.6B (~600M params)
 bgkit:
   backbone_name: Qwen/Qwen3-Embedding-0.6B
+  backbone_revision: c54f2e6e80b2d7b7de06f51cec4959f6b3e03418
   hidden_dim: 1024
   # Total survivor budget across all files for a single repo
   total_survivor_budget: 3500

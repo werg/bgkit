@@ -127,6 +127,11 @@ class BaseTrainer(ABC):
             except ImportError:
                 logger.warning("wandb_not_installed")
 
+        # Sync sampler epoch before first iter (needed after resume)
+        batch_sampler = getattr(self.train_dataloader, "batch_sampler", None)
+        if hasattr(batch_sampler, "set_epoch"):
+            batch_sampler.set_epoch(self.epoch)
+
         dataloader_iter = iter(self.train_dataloader)
 
         logger.info("training_start", max_steps=max_steps, lr=base_lr, start_step=self.global_step)
@@ -144,6 +149,9 @@ class BaseTrainer(ABC):
                 batch = next(dataloader_iter)
             except StopIteration:
                 self.epoch += 1
+                batch_sampler = getattr(self.train_dataloader, "batch_sampler", None)
+                if hasattr(batch_sampler, "set_epoch"):
+                    batch_sampler.set_epoch(self.epoch)
                 dataloader_iter = iter(self.train_dataloader)
                 batch = next(dataloader_iter)
 

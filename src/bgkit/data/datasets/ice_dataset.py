@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
@@ -34,11 +35,19 @@ class ICEDataset(Dataset):
         data_dir = Path(data_path)
         self._shard_files = sorted(data_dir.glob("shard_*.parquet"))
 
+        self._lengths: list[int] = []
         for shard_idx, shard_file in enumerate(self._shard_files):
-            pf = pq.ParquetFile(shard_file)
-            num_rows = pf.metadata.num_rows
+            col = pq.read_table(shard_file, columns=["token_ids"]).column("token_ids")
+            shard_lengths = pc.list_value_length(col).to_pylist()
+            num_rows = len(shard_lengths)
             for row_idx in range(num_rows):
                 self._index.append((shard_idx, row_idx))
+            self._lengths.extend(shard_lengths)
+
+    @property
+    def lengths(self) -> list[int]:
+        """Per-sample token lengths for use with TokenBudgetBatchSampler."""
+        return self._lengths
 
     def _get_table(self, shard_idx: int) -> pa.Table:
         """Load and cache a shard table on first access."""

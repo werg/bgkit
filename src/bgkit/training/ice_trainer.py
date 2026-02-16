@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, random_split
 from transformers import AutoModel
 
 from bgkit.data.datasets.ice_dataset import ICEDataset
+from bgkit.data.samplers import TokenBudgetBatchSampler
 from bgkit.models.ice import ICE
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.gradient_utils import clip_grad_norm
@@ -64,9 +65,13 @@ class ICETrainer(BaseTrainer):
         emb_model_name = self.cfg.model.ice.get(
             "embedding_model", "Qwen/Qwen3-Embedding-0.6B"
         )
-        logger.info("loading_embedding_model", model=emb_model_name)
+        emb_revision = self.cfg.model.ice.get("embedding_model_revision", None)
+        logger.info("loading_embedding_model", model=emb_model_name, revision=emb_revision)
         self.embedding_model = AutoModel.from_pretrained(
-            emb_model_name, torch_dtype=torch.bfloat16
+            emb_model_name,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            revision=emb_revision,
         )
         self.embedding_model.to(device)
         self.embedding_model.eval()
@@ -98,22 +103,31 @@ class ICETrainer(BaseTrainer):
             full_dataset, [train_size, eval_size]
         )
 
-        batch_size = self.cfg.get("batch_size", 32)
+        max_batch_tokens = tcfg.get("max_batch_tokens", 65536)
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
 
+        # Token-budget batching: pack samples so batch_size * max_seq_len <= budget
+        train_lengths = [full_dataset.lengths[i] for i in self.train_dataset.indices]
+        eval_lengths = [full_dataset.lengths[i] for i in self.eval_dataset.indices]
+
+        self.train_sampler = TokenBudgetBatchSampler(
+            train_lengths, max_batch_tokens, shuffle=True, seed=self.cfg.get("seed", 42),
+        )
+        eval_sampler = TokenBudgetBatchSampler(
+            eval_lengths, max_batch_tokens, shuffle=False,
+        )
+
         self.train_dataloader = DataLoader(
             self.train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
+            batch_sampler=self.train_sampler,
             collate_fn=ice_collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
-            batch_size=batch_size,
-            shuffle=False,
+            batch_sampler=eval_sampler,
             collate_fn=ice_collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory,

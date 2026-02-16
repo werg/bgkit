@@ -417,6 +417,7 @@ class TestICETinyDataset:
                 "warmup_steps": 0,
                 "eval_every": 0,
                 "save_every": 0,
+                "max_batch_tokens": 65536,
             },
             "model": {
                 "ice": {
@@ -430,6 +431,7 @@ class TestICETinyDataset:
                 "ice_labels": {"output_dir": str(tmp_path)},
             },
             "compute": {"num_workers": 0, "pin_memory": False},
+            "seed": 42,
             "wandb": {"enabled": False},
         })
 

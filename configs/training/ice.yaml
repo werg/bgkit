@@ -1,9 +1,10 @@
 # ICE training configuration
 phase: ice
-max_steps: 50000
+max_steps: 30000
 lr: 3.0e-4
 warmup_steps: 1000
 # Uniformity regularizer weight
 uniformity_reg_weight: 0.1
-eval_every: 1000
+eval_every: 2000
 save_every: 5000
+max_batch_tokens: 65536
