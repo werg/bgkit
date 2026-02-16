@@ -13,6 +13,7 @@ x-gpu-common: &gpu-common
     - ${DATA_DIR:-../data}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
     - ${CHECKPOINT_DIR:-../checkpoints}:/workspace/checkpoints
+    - ~/.netrc:/root/.netrc:ro
 
 services:
   train:
