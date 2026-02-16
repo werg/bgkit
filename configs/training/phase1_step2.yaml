@@ -1,41 +1,40 @@
 # Phase 1 Step 2: Compression training (4 objectives, curriculum)
 # This is the core compression training config
-training:
-  phase: phase1_step2
-  max_steps: 200000
-  lr: 5.0e-5
-  warmup_steps: 5000
+phase: phase1_step2
+max_steps: 200000
+lr: 5.0e-5
+warmup_steps: 5000
 
-  # Objective weights (starting mix, shift over training)
-  objectives:
-    data_reconstruction: 0.40
-    description_generation: 0.20
-    structural_relational: 0.15
-    commit_reproduction: 0.25
+# Objective weights (starting mix, shift over training)
+objectives:
+  data_reconstruction: 0.40
+  description_generation: 0.20
+  structural_relational: 0.15
+  commit_reproduction: 0.25
 
-  # Curriculum
-  curriculum:
-    # Start with L0 objectives + commit reproduction at L1
-    l1_introduction_step: 20000  # Introduce full L1 after L0 stabilizes
-    # Survivor selection mix shifts from random toward ICE-biased
-    ice_fraction_start: 0.4
-    ice_fraction_end: 0.8
-    ice_fraction_ramp_steps: 100000
-    # Compression ratio varies across examples
-    min_compression_ratio: 0.05  # 5% survivors
-    max_compression_ratio: 0.30  # 30% survivors
+# Curriculum
+curriculum:
+  # Start with L0 objectives + commit reproduction at L1
+  l1_introduction_step: 20000  # Introduce full L1 after L0 stabilizes
+  # Survivor selection mix shifts from random toward ICE-biased
+  ice_fraction_start: 0.4
+  ice_fraction_end: 0.8
+  ice_fraction_ramp_steps: 100000
+  # Compression ratio varies across examples
+  min_compression_ratio: 0.05  # 5% survivors
+  max_compression_ratio: 0.30  # 30% survivors
 
-  # Decoder adaptation monitoring
-  decoder:
-    # Switch from full fine-tuning to LoRA if embedding drift detected
-    drift_threshold: 0.5  # Min mean cosine similarity to token embeddings
-    drift_check_every: 5000
+# Decoder adaptation monitoring
+decoder:
+  # Switch from full fine-tuning to LoRA if embedding drift detected
+  drift_threshold: 0.5  # Min mean cosine similarity to token embeddings
+  drift_check_every: 5000
 
-  # Freeze config
-  freeze:
-    ice: true  # ICE is always frozen after pre-training
-    bgkit: false
-    decoder: false
+# Freeze config
+freeze:
+  ice: true  # ICE is always frozen after pre-training
+  bgkit: false
+  decoder: false
 
-  eval_every: 2000
-  save_every: 10000
+eval_every: 2000
+save_every: 10000

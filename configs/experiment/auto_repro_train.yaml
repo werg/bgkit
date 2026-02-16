@@ -1,3 +1,4 @@
+# @package _global_
 # Full experiment preset: auto-reproduction training
 defaults:
   - /config

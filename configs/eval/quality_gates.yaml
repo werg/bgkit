@@ -1,13 +1,12 @@
 # Quality gate thresholds for phase transitions
-eval:
-  quality_gates:
-    phase1:
-      max_reconstruction_loss: 2.0
-      min_parse_success_rate: 0.80
-      max_text_repro_loss: 3.0
-      min_description_quality: 0.50
-    phase2:
-      # BgKIT must beat RAG baseline
-      min_retrieval_f1_improvement: 0.05
-      # Ablation gap must be significant
-      min_ablation_gap: 0.10  # present vs zeroed metric gap
+quality_gates:
+  phase1:
+    max_reconstruction_loss: 2.0
+    min_parse_success_rate: 0.80
+    max_text_repro_loss: 3.0
+    min_description_quality: 0.50
+  phase2:
+    # BgKIT must beat RAG baseline
+    min_retrieval_f1_improvement: 0.05
+    # Ablation gap must be significant
+    min_ablation_gap: 0.10  # present vs zeroed metric gap

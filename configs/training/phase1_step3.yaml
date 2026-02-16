@@ -1,27 +1,26 @@
 # Phase 1 Step 3: Frozen-target projection alignment
-training:
-  phase: phase1_step3
+phase: phase1_step3
 
-  # Step 3a: Text regurgitation (projection MLP only)
-  step3a:
-    max_steps: 50000
-    projection_lr: 3.0e-4
-    warmup_steps: 2000
-    freeze:
-      bgkit: true
-      projection: false
-      target_lm: true  # Frozen, 4-bit for forward passes only
+# Step 3a: Text regurgitation (projection MLP only)
+step3a:
+  max_steps: 50000
+  projection_lr: 3.0e-4
+  warmup_steps: 2000
+  freeze:
+    bgkit: true
+    projection: false
+    target_lm: true  # Frozen, 4-bit for forward passes only
 
-  # Step 3b: Content tasks (unfreeze BgKIT at low LR)
-  step3b:
-    max_steps: 50000
-    bgkit_lr: 1.0e-5  # Low LR for BgKIT
-    projection_lr: 1.0e-4
-    warmup_steps: 2000
-    freeze:
-      bgkit: false
-      projection: false
-      target_lm: true  # Still frozen
+# Step 3b: Content tasks (unfreeze BgKIT at low LR)
+step3b:
+  max_steps: 50000
+  bgkit_lr: 1.0e-5  # Low LR for BgKIT
+  projection_lr: 1.0e-4
+  warmup_steps: 2000
+  freeze:
+    bgkit: false
+    projection: false
+    target_lm: true  # Still frozen
 
-  eval_every: 2000
-  save_every: 10000
+eval_every: 2000
+save_every: 10000

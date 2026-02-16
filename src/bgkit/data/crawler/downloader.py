@@ -7,13 +7,15 @@ Downloads repositories using git clone with:
 - Resume capability via database state
 """
 
+from __future__ import annotations
+
 import asyncio
+import contextlib
 import os
 import shutil
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
 
 from bgkit.data.crawler.config import CrawlerConfig
 from bgkit.data.crawler.database import CrawlDatabase, RepoMetadata
@@ -34,9 +36,9 @@ class DownloadResult:
 
     full_name: str
     success: bool
-    path: Optional[Path] = None
+    path: Path | None = None
     size_bytes: int = 0
-    error: Optional[str] = None
+    error: str | None = None
 
 
 class RepoDownloader:
@@ -62,10 +64,8 @@ class RepoDownloader:
         for dirpath, _, filenames in os.walk(path):
             for filename in filenames:
                 filepath = Path(dirpath) / filename
-                try:
+                with contextlib.suppress(OSError, FileNotFoundError):
                     total += filepath.stat().st_size
-                except (OSError, FileNotFoundError):
-                    pass
         return total
 
     async def _clone_repo(
@@ -98,7 +98,7 @@ class RepoDownloader:
         )
 
         try:
-            stdout, stderr = await asyncio.wait_for(
+            _stdout, stderr = await asyncio.wait_for(
                 process.communicate(), timeout=timeout
             )
 
@@ -118,7 +118,7 @@ class RepoDownloader:
                     error=error,
                 )
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             process.kill()
             await process.wait()
             # Clean up partial clone
@@ -164,66 +164,82 @@ class RepoDownloader:
     async def download_repo(
         self, repo: RepoMetadata, attempt: int = 1
     ) -> DownloadResult:
-        """Download a single repository with retry logic."""
-        async with self._semaphore:
-            dest_path = self._get_repo_path(repo)
+        """Download a single repository with retry logic.
 
-            # Check repo size before cloning (if configured)
-            if self.config.max_repo_size_kb and repo.size_kb > self.config.max_repo_size_kb:
-                error_msg = f"skipped: repo size {repo.size_kb}KB exceeds limit {self.config.max_repo_size_kb}KB"
-                await self.db.mark_failed(repo.full_name, error_msg)
-                return DownloadResult(
-                    full_name=repo.full_name,
-                    success=False,
-                    error=error_msg,
-                )
+        Retries use a loop (not recursion) to avoid holding the semaphore
+        across retry attempts, which would cause deadlocks.
+        """
+        if self.config.retry_attempts < 1:
+            await self.db.mark_failed(repo.full_name, "retry_attempts < 1")
+            return DownloadResult(
+                full_name=repo.full_name, success=False, error="retry_attempts < 1"
+            )
 
-            # Mark as downloading in database
-            await self.db.mark_downloading(repo.full_name)
+        for current_attempt in range(attempt, self.config.retry_attempts + 1):
+            async with self._semaphore:
+                dest_path = self._get_repo_path(repo)
 
-            # Calculate timeout (increase on retries)
-            timeout = self.config.clone_timeout_seconds
-            if attempt > 1:
-                timeout = int(timeout * 1.5)
+                # Check repo size before cloning (if configured)
+                if self.config.max_repo_size_kb and repo.size_kb > self.config.max_repo_size_kb:
+                    error_msg = (
+                        f"skipped: repo size {repo.size_kb}KB "
+                        f"exceeds limit {self.config.max_repo_size_kb}KB"
+                    )
+                    await self.db.mark_failed(repo.full_name, error_msg)
+                    return DownloadResult(
+                        full_name=repo.full_name,
+                        success=False,
+                        error=error_msg,
+                    )
 
-            # Attempt clone
-            result = await self._clone_repo(repo, dest_path, timeout)
+                # Mark as downloading in database
+                await self.db.mark_downloading(repo.full_name)
 
-            if result.success:
-                # Record success
-                await self.db.mark_downloaded(
-                    repo.full_name,
-                    result.size_bytes,
-                    str(result.path),
-                )
-                return result
+                # Calculate timeout (increase on retries)
+                timeout = self.config.clone_timeout_seconds
+                if current_attempt > 1:
+                    timeout = int(timeout * 1.5)
 
-            # Handle failure
-            action = self._determine_failure_action(result.error or "")
+                # Attempt clone
+                result = await self._clone_repo(repo, dest_path, timeout)
 
-            if action == FailureAction.SKIP:
-                # Mark as failed with skip reason (simplified state machine)
-                await self.db.mark_failed(repo.full_name, f"skipped: {result.error or 'unknown'}")
-                return result
+                if result.success:
+                    # Record success
+                    await self.db.mark_downloaded(
+                        repo.full_name,
+                        result.size_bytes,
+                        str(result.path),
+                    )
+                    return result
 
-            if attempt < self.config.retry_attempts:
+                # Handle failure
+                action = self._determine_failure_action(result.error or "")
+
+                if action == FailureAction.SKIP:
+                    await self.db.mark_failed(
+                        repo.full_name, f"skipped: {result.error or 'unknown'}"
+                    )
+                    return result
+
+            # Semaphore released — sleep before retry (if eligible)
+            if current_attempt < self.config.retry_attempts:
                 if action == FailureAction.RETRY_WITH_EXTENDED_TIMEOUT:
-                    # Retry with extended timeout
                     await asyncio.sleep(self.config.retry_delay_seconds)
-                    return await self.download_repo(repo, attempt + 1)
+                    continue
                 elif action in (FailureAction.RETRY, FailureAction.RETRY_LATER):
-                    # Standard retry
-                    delay = self.config.retry_delay_seconds * attempt
+                    delay = self.config.retry_delay_seconds * current_attempt
                     await asyncio.sleep(delay)
-                    return await self.download_repo(repo, attempt + 1)
+                    continue
+            # Non-retryable action or max attempts — fall through
+            break
 
-            # Max retries exceeded
-            await self.db.mark_failed(repo.full_name, result.error or "unknown")
-            return result
+        # Max retries exceeded
+        await self.db.mark_failed(repo.full_name, result.error or "unknown")
+        return result
 
     async def download_batch(
-        self, repos: List[RepoMetadata], progress_callback: Optional[callable] = None
-    ) -> List[DownloadResult]:
+        self, repos: list[RepoMetadata], progress_callback: callable | None = None
+    ) -> list[DownloadResult]:
         """Download multiple repos in parallel.
 
         Args:
@@ -250,7 +266,7 @@ class RepoDownloader:
     async def download_all_queued(
         self,
         batch_size: int = 100,
-        progress_callback: Optional[callable] = None,
+        progress_callback: callable | None = None,
         randomize: bool = False,
     ) -> dict:
         """Download all queued repositories.

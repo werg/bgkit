@@ -18,6 +18,11 @@ def chunk_tokens(
     Returns:
         List of token id chunks.
     """
+    if overlap >= max_chunk_size:
+        raise ValueError(
+            f"overlap ({overlap}) must be less than max_chunk_size ({max_chunk_size})"
+        )
+
     if len(token_ids) <= max_chunk_size:
         return [token_ids]
 

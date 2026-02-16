@@ -35,8 +35,8 @@ class AutoReproDataset(Dataset):
         self._shard_files = sorted(data_dir.glob("shard_*.parquet"))
 
         for shard_idx, shard_file in enumerate(self._shard_files):
-            table = pq.read_table(shard_file)
-            self._table_cache[shard_idx] = table
+            # Read only metadata + token_ids column for indexing; full table loaded lazily
+            table = pq.read_table(shard_file, columns=["token_ids"])
 
             token_ids_col = table.column("token_ids")
             for row_idx in range(table.num_rows):

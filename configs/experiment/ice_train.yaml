@@ -1,3 +1,4 @@
+# @package _global_
 # Full experiment preset: ICE training
 defaults:
   - /config

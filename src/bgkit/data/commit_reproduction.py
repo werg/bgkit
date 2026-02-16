@@ -161,7 +161,6 @@ def process_commit_reproduction(
     if filter_config is None:
         filter_config = CommitFilterConfig()
 
-    rng = random.Random(seed)
     prefer_cross_file = filter_config.prefer_cross_file
 
     repo_paths = _collect_repo_paths(repos_path, max_repos)
@@ -238,6 +237,8 @@ def process_commit_reproduction(
 
         shard_rows: list[dict] = []
         failed_repos: list[str] = []
+        # Per-batch RNG so skipped batches don't affect determinism of later ones
+        batch_rng = random.Random(seed + batch_idx)
 
         for repo_dir in batch_repos:
             try:
@@ -251,7 +252,7 @@ def process_commit_reproduction(
                 continue
 
             # Cap commits per repo with cross-file preference
-            commits = _cap_commits(commits, max_commits_per_repo, prefer_cross_file, rng)
+            commits = _cap_commits(commits, max_commits_per_repo, prefer_cross_file, batch_rng)
 
             for commit in commits:
                 token_ids = serialize_and_tokenize_commit(

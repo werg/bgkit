@@ -75,10 +75,27 @@ class BaseTrainer(ABC):
         logger.info("restored_from_checkpoint", step=self.global_step)
 
     def train(self) -> None:
-        """Main training loop."""
+        """Main training loop.
+
+        Expects scalar ``training.max_steps``, ``training.lr``, and
+        ``training.warmup_steps``.  Phase configs with multi-step or
+        per-component LR schedules (phase1_step3, phase2) must override
+        this method with their own loop.
+        """
         self.setup()
 
         tcfg = self.cfg.training
+        if (
+            not hasattr(tcfg, "max_steps")
+            or not hasattr(tcfg, "lr")
+            or not isinstance(tcfg.lr, (int, float))
+        ):
+            phase = getattr(tcfg, "phase", "<unknown>")
+            raise TypeError(
+                f"BaseTrainer.train() requires scalar training.max_steps and "
+                f"training.lr, but phase '{phase}' uses a different schema. "
+                f"Override train() in the phase-specific trainer."
+            )
         max_steps = tcfg.max_steps
         eval_every = tcfg.eval_every
         save_every = tcfg.save_every
