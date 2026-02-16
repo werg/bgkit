@@ -17,6 +17,9 @@ defaults:
 seed: 42
 project_name: bgkit
 run_name: null  # auto-generated if null
+batch_size: 32
+checkpoint_dir: ${oc.env:CHECKPOINT_DIR,./checkpoints}
+resume_checkpoint: null  # path to checkpoint dir for resume
 
 wandb:
   enabled: true

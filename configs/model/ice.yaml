@@ -1,5 +1,6 @@
 # ICE: Information Content Estimator
 ice:
+  embedding_model: Qwen/Qwen3-Embedding-0.6B
   input_dim: 1024  # Qwen3-Embedding hidden dim
   hidden_dim: 256
   num_layers: 4

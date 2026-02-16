@@ -429,6 +429,7 @@ class TestICETinyDataset:
             "data": {
                 "ice_labels": {"output_dir": str(tmp_path)},
             },
+            "compute": {"num_workers": 0, "pin_memory": False},
             "wandb": {"enabled": False},
         })
 

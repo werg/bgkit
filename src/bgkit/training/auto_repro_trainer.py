@@ -151,7 +151,8 @@ class AutoReproTrainer(BaseTrainer):
         )
 
         batch_size = self.cfg.get("batch_size", 32)
-        num_workers = self.cfg.get("num_workers", 4)
+        num_workers = self.cfg.compute.get("num_workers", 4)
+        pin_memory = self.cfg.compute.get("pin_memory", False)
 
         self.train_dataloader = DataLoader(
             self.train_dataset,
@@ -159,7 +160,7 @@ class AutoReproTrainer(BaseTrainer):
             shuffle=True,
             collate_fn=auto_repro_collate_fn,
             num_workers=num_workers,
-            pin_memory=False,
+            pin_memory=pin_memory,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
@@ -167,7 +168,7 @@ class AutoReproTrainer(BaseTrainer):
             shuffle=False,
             collate_fn=auto_repro_collate_fn,
             num_workers=num_workers,
-            pin_memory=False,
+            pin_memory=pin_memory,
         )
 
         # Optimizer — trainable params only

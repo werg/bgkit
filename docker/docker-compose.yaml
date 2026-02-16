@@ -21,6 +21,18 @@ services:
       - WANDB_API_KEY=${WANDB_API_KEY}
     command: ["scripts/train.py"]
 
+  train-ice:
+    <<: *gpu-common
+    environment:
+      - WANDB_API_KEY=${WANDB_API_KEY}
+    command: ["scripts/train.py", "+experiment=ice_train"]
+
+  train-auto-repro:
+    <<: *gpu-common
+    environment:
+      - WANDB_API_KEY=${WANDB_API_KEY}
+    command: ["scripts/train.py", "+experiment=auto_repro_train"]
+
   ice-labels:
     <<: *gpu-common
     command: ["scripts/generate_ice_labels.py"]

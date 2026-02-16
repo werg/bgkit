@@ -1,0 +1,7 @@
+# Full experiment preset: auto-reproduction training
+defaults:
+  - /config
+  - /training/auto_repro
+  - _self_
+
+run_name: auto_repro_train
