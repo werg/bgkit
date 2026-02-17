@@ -1,0 +1,8 @@
+# @package _global_
+# Full experiment preset: Phase 1 Step 1 decoder initialization
+defaults:
+  - /config
+  - /training/phase1_step1
+  - _self_
+
+run_name: phase1_step1

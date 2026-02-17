@@ -5,5 +5,8 @@ lr: 1.0e-4
 warmup_steps: 1000
 # No compression -- full BgKIT output passed to decoder
 compression: false
+# Budget is based on input token counts; the decoder sees ~2x (survivors + targets).
+# Halve this if OOM, or if packing many short sequences into one batch.
+max_batch_tokens: 65536
 eval_every: 1000
 save_every: 5000

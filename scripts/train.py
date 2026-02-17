@@ -31,6 +31,11 @@ def main(cfg: DictConfig) -> None:
 
         trainer = AutoReproTrainer(cfg)
         trainer.train()
+    elif phase == "phase1_step1":
+        from bgkit.training.phase1.decoder_init import DecoderInitTrainer
+
+        trainer = DecoderInitTrainer(cfg)
+        trainer.train()
     else:
         raise NotImplementedError(f"Training phase '{phase}' not yet implemented")
 

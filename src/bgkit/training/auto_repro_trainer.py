@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from transformers import AutoModel
 
+from bgkit.data.collators import collate_token_ids
 from bgkit.data.datasets.auto_repro_dataset import AutoReproDataset
 from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.components.auto_reproduction import auto_reproduction_loss
@@ -27,23 +28,9 @@ logger = structlog.get_logger()
 def auto_repro_collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     """Pad variable-length token ID samples into a batch.
 
-    Args:
-        batch: List of dicts with "token_ids" (L,).
-
-    Returns:
-        Dict with padded "token_ids" (B, max_L) and "attention_mask" (B, max_L).
+    Thin wrapper around shared collate_token_ids for backwards compatibility.
     """
-    token_ids_list = [s["token_ids"] for s in batch]
-    max_len = max(t.size(0) for t in token_ids_list)
-
-    padded_token_ids = torch.zeros(len(batch), max_len, dtype=torch.long)
-    attention_mask = torch.zeros(len(batch), max_len, dtype=torch.long)
-
-    for i, tids in enumerate(token_ids_list):
-        padded_token_ids[i, : tids.size(0)] = tids
-        attention_mask[i, : tids.size(0)] = 1
-
-    return {"token_ids": padded_token_ids, "attention_mask": attention_mask}
+    return collate_token_ids(batch)
 
 
 def _resolve_last_block(backbone: nn.Module) -> nn.Module:

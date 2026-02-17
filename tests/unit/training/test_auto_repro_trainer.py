@@ -41,8 +41,8 @@ class TestAutoReproCollateFn:
         ]
         out = auto_repro_collate_fn(batch)
 
-        assert out["attention_mask"][0].tolist() == [1, 1, 0, 0]
-        assert out["attention_mask"][1].tolist() == [1, 1, 1, 1]
+        assert out["attention_mask"][0].tolist() == [True, True, False, False]
+        assert out["attention_mask"][1].tolist() == [True, True, True, True]
 
     def test_single_sample(self):
         """Collation should work with a single sample."""
@@ -56,7 +56,7 @@ class TestAutoReproCollateFn:
         batch = [{"token_ids": torch.tensor([1, 2, 3])}]
         out = auto_repro_collate_fn(batch)
         assert out["token_ids"].dtype == torch.long
-        assert out["attention_mask"].dtype == torch.long
+        assert out["attention_mask"].dtype == torch.bool
 
 
 # ---------------------------------------------------------------------------

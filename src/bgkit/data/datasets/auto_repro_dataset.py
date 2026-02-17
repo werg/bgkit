@@ -28,6 +28,7 @@ class AutoReproDataset(Dataset):
 
         # Flat index: (shard_idx, row_idx, chunk_start)
         self._index: list[tuple[int, int, int]] = []
+        self._chunk_lengths: list[int] = []
         self._shard_files: list[Path] = []
         self._table_cache: dict[int, pa.Table] = {}
 
@@ -46,6 +47,12 @@ class AutoReproDataset(Dataset):
                 # Split into non-overlapping chunks
                 for chunk_start in range(0, n_tokens, max_seq_len):
                     self._index.append((shard_idx, row_idx, chunk_start))
+                    self._chunk_lengths.append(min(max_seq_len, n_tokens - chunk_start))
+
+    @property
+    def lengths(self) -> list[int]:
+        """Return token count for each chunk (for TokenBudgetBatchSampler)."""
+        return self._chunk_lengths
 
     def _get_table(self, shard_idx: int) -> pa.Table:
         """Load and cache a shard table on first access."""

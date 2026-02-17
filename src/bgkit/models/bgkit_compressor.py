@@ -21,14 +21,18 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from bgkit.models.components.drop_flag import extract_survivors, pad_survivors
+
 
 @dataclass
 class CompressionOutput:
     """Output from a BgKIT compression pass."""
 
-    survivor_embeddings: torch.Tensor  # (batch, num_survivors, hidden_dim)
+    survivor_embeddings: torch.Tensor  # (batch, max_survivors, hidden_dim)
     survivor_mask: torch.Tensor  # (batch, seq_len) bool mask of surviving positions
     all_embeddings: torch.Tensor  # (batch, seq_len, hidden_dim) pre-drop embeddings
+    survivor_counts: torch.Tensor  # (batch,) int tensor of real survivor count per item
+    survivor_attention_mask: torch.Tensor  # (batch, max_survivors) bool mask for padded survivors
 
 
 class BgKITCompressor(nn.Module):
@@ -81,17 +85,28 @@ class BgKITCompressor(nn.Module):
         x = input_embeddings + flag_emb
 
         # Forward through backbone (bidirectional self-attention)
-        # TODO: Hook into actual Qwen3-Embedding forward pass
-        all_embeddings = x  # placeholder
+        all_embeddings = self.backbone(
+            inputs_embeds=x, attention_mask=attention_mask
+        ).last_hidden_state
 
-        # Extract survivors
-        survivor_embeddings = all_embeddings[survivor_mask]
-        # Reshape: we need to handle variable survivor counts per batch item
-        # For now, return padded tensor -- actual implementation needs gather logic
+        # Extract survivors per batch item (variable-length list)
+        survivor_list = extract_survivors(all_embeddings, survivor_mask)
+
+        # Pad into (batch, max_survivors, hidden_dim) + counts
+        padded_survivors, survivor_counts = pad_survivors(survivor_list)
+
+        # Build attention mask for padded survivors
+        max_survivors = padded_survivors.size(1)
+        survivor_attention_mask = torch.arange(
+            max_survivors, device=survivor_counts.device
+        ).unsqueeze(0) < survivor_counts.unsqueeze(1)
+
         return CompressionOutput(
-            survivor_embeddings=survivor_embeddings,
+            survivor_embeddings=padded_survivors,
             survivor_mask=survivor_mask,
             all_embeddings=all_embeddings,
+            survivor_counts=survivor_counts,
+            survivor_attention_mask=survivor_attention_mask,
         )
 
     def auto_reproduce(self, embeddings: torch.Tensor) -> torch.Tensor:

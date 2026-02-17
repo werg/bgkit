@@ -43,3 +43,17 @@ def pad_and_collate(
         mask[i, :length] = True
 
     return padded, mask
+
+
+def collate_token_ids(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    """Collate variable-length token ID samples into a padded batch.
+
+    Args:
+        batch: List of dicts with "token_ids" (L,).
+
+    Returns:
+        Dict with padded "token_ids" (B, max_L) and "attention_mask" (B, max_L) bool.
+    """
+    token_ids_list = [s["token_ids"] for s in batch]
+    padded, mask = pad_and_collate(token_ids_list, pad_value=0)
+    return {"token_ids": padded, "attention_mask": mask}
