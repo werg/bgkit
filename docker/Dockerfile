@@ -27,7 +27,8 @@ RUN python -c "import bgkit; print(f'bgkit {bgkit.__version__}')" && \
 
 ENV PYTHONUNBUFFERED=1 \
     DATA_DIR=/workspace/data \
-    HF_HOME=/workspace/hf_cache
+    HF_HOME=/workspace/hf_cache \
+    CHECKPOINT_DIR=/workspace/checkpoints
 
 ENTRYPOINT ["python"]
 CMD ["scripts/train.py"]
