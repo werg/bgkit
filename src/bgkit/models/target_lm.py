@@ -23,6 +23,20 @@ class TargetLMWithInjection(nn.Module):
 
     This reuses the model's existing tool-call understanding and makes
     knowledge sources individually addressable.
+
+    Implementation note — chat template integration:
+        The injection_positions must correspond to the exact token span of the
+        <tool_response> content within a tokenizer.apply_chat_template() output.
+        Use the same sentinel-based boundary detection pattern as ChatReproDataset
+        (see src/bgkit/data/datasets/chat_repro_dataset.py) to locate the tool
+        response region:
+        1. Build messages with a sentinel string as the tool response content
+        2. Call tokenizer.apply_chat_template(messages, tokenize=False)
+        3. Split on sentinel to find prefix/suffix boundaries
+        4. Tokenize piecewise to get exact token positions
+        The tool_response_start/end_token_id constructor args are insufficient
+        for this — they identify the *markers* but not the content span between
+        them. Consider replacing with a template-aware position finder.
     """
 
     def __init__(

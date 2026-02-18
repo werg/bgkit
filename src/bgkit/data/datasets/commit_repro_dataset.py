@@ -1,4 +1,11 @@
-"""Dataset for commit reproduction training: token IDs from serialized commits."""
+"""Dataset for commit reproduction training: token IDs from serialized commits.
+
+This is a raw-content dataset (analogous to AutoReproDataset for files). For
+Phase 1 Step 2, it will need a chat-template wrapper similar to ChatReproDataset
+that wraps the serialized commit in Qwen3's chat template with tool-call format,
+applies loss masking, and supports prompt variant selection. See the chat template
+integration note in commit_serialization.py.
+"""
 
 from __future__ import annotations
 

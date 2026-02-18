@@ -2,6 +2,17 @@
 
 Converts ExtractedCommit objects into plaintext documents with structured tags,
 suitable for training a model to reconstruct commits from compressed representations.
+
+Chat template integration (TODO for Phase 1 Step 2):
+    The serialized commit text produced here is raw content — it does not include
+    Qwen3's chat template wrapping. By Step 2, the decoder expects chat-formatted
+    input (trained on it in Step 1 via ChatReproDataset). The commit reproduction
+    objective needs a chat-wrapping dataset analogous to ChatReproDataset:
+    - New template YAML: configs/templates/commit_repro.yaml
+    - Different tool name / prompt fields, but same sentinel-based loss masking
+    - The _build_messages() pattern in chat_repro_dataset.py should be extracted
+      into a shared template assembler parameterized by task-specific fields
+    See also: scripts/generate_prompt_variants.py for variant generation.
 """
 
 from __future__ import annotations
