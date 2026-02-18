@@ -16,3 +16,6 @@ early_stopping:
   patience: 4         # stop after 4 evals (~2000 steps) without improvement
   min_delta: 0.001    # minimum loss improvement to reset patience
   metric: eval/loss   # which eval metric to track
+eval:
+  generation_samples: 50      # examples for generation metrics (expensive)
+  generation_eval_every: 4    # run generation metrics every Nth eval

@@ -106,6 +106,7 @@ def trainer():
     t.model = t.decoder
 
     t.optimizer = torch.optim.AdamW(t.decoder.parameters(), lr=1e-3)
+    t._eval_count = 0
 
     return t
 
@@ -128,6 +129,8 @@ def _make_batch(batch_size: int = 2, seq_len: int = 20, content_len: int = 10,
             "loss_mask": loss_mask,
             "content_token_ids": token_ids[content_start:content_end],
             "compression_prompt_ids": torch.randint(0, 1000, (prompt_len,)),
+            "prefix_ids": torch.randint(0, 1000, (content_start,)),
+            "language": "python",
         })
     return collate_chat_repro(samples)
 
@@ -207,6 +210,8 @@ class TestDecoderInitEvaluate:
                                         torch.zeros(5, dtype=torch.long)]),
                 "content_token_ids": torch.randint(0, 1000, (5,)),
                 "compression_prompt_ids": torch.randint(0, 1000, (3,)),
+                "prefix_ids": torch.randint(0, 1000, (5,)),
+                "language": "python",
             },
             {
                 "token_ids": torch.randint(0, 1000, (12,)),
@@ -215,6 +220,8 @@ class TestDecoderInitEvaluate:
                                         torch.zeros(4, dtype=torch.long)]),
                 "content_token_ids": torch.randint(0, 1000, (4,)),
                 "compression_prompt_ids": torch.randint(0, 1000, (3,)),
+                "prefix_ids": torch.randint(0, 1000, (4,)),
+                "language": "javascript",
             },
         ]
         trainer.eval_dataloader = DataLoader(

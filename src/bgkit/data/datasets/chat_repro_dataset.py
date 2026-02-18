@@ -152,6 +152,10 @@ class ChatReproDataset(Dataset):
         # to get the maximum number of non-content tokens.
         self._max_template_overhead = self._compute_max_template_overhead()
 
+        # Precompute suffix_ids — structurally constant across all variants.
+        # The suffix is always `\n``` ` + `<|im_end|>` (closing fence + end-of-turn).
+        self._suffix_ids = self._compute_suffix_ids()
+
     def _compute_max_template_overhead(self) -> int:
         """Compute the maximum template token overhead across all variants.
 
@@ -177,6 +181,39 @@ class ChatReproDataset(Dataset):
                 max_overhead = max(max_overhead, overhead_tokens)
 
         return max_overhead
+
+    def _compute_suffix_ids(self) -> torch.Tensor:
+        """Compute the constant suffix token IDs (closing fence + end-of-turn).
+
+        The suffix is structurally identical across all variants — only the
+        text *before* the sentinel differs per variant. Verify across a few
+        variants as a sanity check.
+        """
+        suffix_ids = None
+        for variant in self._variants:
+            messages = _build_messages(variant, "test.py", "python", CONTENT_SENTINEL)
+            template_str = self._tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False,
+            )
+            _, suffix_str = template_str.split(CONTENT_SENTINEL)
+            ids = self._tokenizer.encode(suffix_str, add_special_tokens=False)
+            ids_tensor = torch.tensor(ids, dtype=torch.long)
+            if suffix_ids is None:
+                suffix_ids = ids_tensor
+            elif not suffix_ids.equal(ids_tensor):
+                raise ValueError(
+                    "Suffix token IDs differ across variants — expected constant suffix. "
+                    f"Got {suffix_ids.tolist()} vs {ids_tensor.tolist()}"
+                )
+        return suffix_ids
+
+    @property
+    def suffix_ids(self) -> torch.Tensor:
+        """Constant 1D suffix token IDs (closing fence + end-of-turn).
+
+        Not batched — accessed directly by the trainer for generation.
+        """
+        return self._suffix_ids
 
     @property
     def lengths(self) -> list[int]:
@@ -265,4 +302,6 @@ class ChatReproDataset(Dataset):
             "loss_mask": loss_mask,
             "content_token_ids": content_token_ids,
             "compression_prompt_ids": compression_prompt_ids,
+            "prefix_ids": torch.tensor(prefix_ids, dtype=torch.long),
+            "language": language,
         }

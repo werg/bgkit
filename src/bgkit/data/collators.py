@@ -59,7 +59,7 @@ def collate_token_ids(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.T
     return {"token_ids": padded, "attention_mask": mask}
 
 
-def collate_chat_repro(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+def collate_chat_repro(batch: list[dict]) -> dict:
     """Collate chat-formatted reproduction samples into a padded batch.
 
     Args:
@@ -68,9 +68,11 @@ def collate_chat_repro(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.
             - "loss_mask" (L,) — 1 for content tokens, 0 elsewhere
             - "content_token_ids" (C,) — raw file tokens for BgKIT input
             - "compression_prompt_ids" (P,) — tokenized compression prompt
+            - "prefix_ids" (X,) — chat template prefix tokens (for generation)
+            - "language" (str) — source language label
 
     Returns:
-        Dict with padded tensors and attention masks for each field.
+        Dict with padded tensors, attention masks, and language list.
     """
     token_ids, attention_mask = pad_and_collate(
         [s["token_ids"] for s in batch], pad_value=0,
@@ -84,6 +86,9 @@ def collate_chat_repro(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.
     compression_prompt_ids, compression_prompt_mask = pad_and_collate(
         [s["compression_prompt_ids"] for s in batch], pad_value=0,
     )
+    prefix_ids, prefix_attention_mask = pad_and_collate(
+        [s["prefix_ids"] for s in batch], pad_value=0,
+    )
     return {
         "token_ids": token_ids,
         "attention_mask": attention_mask,
@@ -92,4 +97,7 @@ def collate_chat_repro(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.
         "content_attention_mask": content_attention_mask,
         "compression_prompt_ids": compression_prompt_ids,
         "compression_prompt_mask": compression_prompt_mask,
+        "prefix_ids": prefix_ids,
+        "prefix_attention_mask": prefix_attention_mask,
+        "languages": [s["language"] for s in batch],
     }

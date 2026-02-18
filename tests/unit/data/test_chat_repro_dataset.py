@@ -201,7 +201,10 @@ class TestChatReproDataset:
 
     def test_getitem_returns_expected_keys(self, dataset):
         sample = dataset[0]
-        expected_keys = {"token_ids", "loss_mask", "content_token_ids", "compression_prompt_ids"}
+        expected_keys = {
+            "token_ids", "loss_mask", "content_token_ids",
+            "compression_prompt_ids", "prefix_ids", "language",
+        }
         assert set(sample.keys()) == expected_keys
 
     def test_token_ids_is_long_tensor(self, dataset):
@@ -242,6 +245,25 @@ class TestChatReproDataset:
     def test_compression_prompt_ids_nonempty(self, dataset):
         sample = dataset[0]
         assert len(sample["compression_prompt_ids"]) > 0
+
+    def test_prefix_ids_nonempty(self, dataset):
+        sample = dataset[0]
+        assert len(sample["prefix_ids"]) > 0
+
+    def test_prefix_ids_shorter_than_token_ids(self, dataset):
+        """Prefix should be shorter than full sequence (content + suffix omitted)."""
+        sample = dataset[0]
+        assert len(sample["prefix_ids"]) < len(sample["token_ids"])
+
+    def test_suffix_ids_constant_1d_tensor(self, dataset):
+        """suffix_ids should be a constant 1D tensor."""
+        suffix = dataset.suffix_ids
+        assert suffix.dim() == 1
+        assert len(suffix) > 0
+
+    def test_suffix_ids_same_across_access(self, dataset):
+        """suffix_ids should return the same tensor each time."""
+        assert torch.equal(dataset.suffix_ids, dataset.suffix_ids)
 
     def test_token_ids_longer_than_content(self, dataset, inner_dataset):
         """Chat-formatted tokens should be longer than raw content (template overhead)."""
@@ -373,6 +395,8 @@ class TestCollateChatRepro:
             "token_ids", "attention_mask", "loss_mask",
             "content_token_ids", "content_attention_mask",
             "compression_prompt_ids", "compression_prompt_mask",
+            "prefix_ids", "prefix_attention_mask",
+            "languages",
         }
         assert set(batch.keys()) == expected
 
@@ -384,6 +408,26 @@ class TestCollateChatRepro:
         max_content_len = max(len(s["content_token_ids"]) for s in samples)
         assert batch["content_token_ids"].shape == (2, max_content_len)
         assert batch["content_attention_mask"].shape == (2, max_content_len)
+
+    def test_prefix_ids_padded(self, dataset):
+        """Prefix IDs should be padded to max prefix length."""
+        samples = [dataset[0], dataset[1]]
+        batch = collate_chat_repro(samples)
+
+        max_prefix_len = max(len(s["prefix_ids"]) for s in samples)
+        assert batch["prefix_ids"].shape == (2, max_prefix_len)
+        assert batch["prefix_attention_mask"].shape == (2, max_prefix_len)
+
+    def test_prefix_attention_mask_correct(self, dataset):
+        """Prefix attention mask should be True for real tokens, False for padding."""
+        samples = [dataset[0], dataset[1]]
+        batch = collate_chat_repro(samples)
+
+        for i, s in enumerate(samples):
+            real_len = len(s["prefix_ids"])
+            assert batch["prefix_attention_mask"][i, :real_len].all()
+            if real_len < batch["prefix_attention_mask"].shape[1]:
+                assert not batch["prefix_attention_mask"][i, real_len:].any()
 
 
 # ---------------------------------------------------------------------------
