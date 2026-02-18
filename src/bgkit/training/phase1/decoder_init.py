@@ -124,7 +124,8 @@ class DecoderInitTrainer(BaseTrainer):
             seed=self.cfg.get("seed", 42),
         )
 
-        eval_size = max(1, int(len(full_dataset) * 0.1))
+        max_eval_samples = tcfg.get("max_eval_samples", 10000)
+        eval_size = min(max(1, int(len(full_dataset) * 0.1)), max_eval_samples)
         train_size = len(full_dataset) - eval_size
         if train_size < 1:
             raise ValueError(
@@ -255,7 +256,10 @@ class DecoderInitTrainer(BaseTrainer):
         total_loss = 0.0
         total_content_tokens = 0.0
 
-        for batch in self.eval_dataloader:
+        num_batches = len(self.eval_dataloader)
+        for batch_idx, batch in enumerate(self.eval_dataloader):
+            if batch_idx % 100 == 0:
+                logger.info("eval_progress", batch=batch_idx, total=num_batches)
             token_ids = batch["token_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             loss_mask = batch["loss_mask"].to(self.device)

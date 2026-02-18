@@ -16,6 +16,7 @@ from transformers import AutoModel
 
 from bgkit.data.collators import collate_token_ids
 from bgkit.data.datasets.auto_repro_dataset import AutoReproDataset
+from bgkit.data.samplers import TokenBudgetBatchSampler
 from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.components.auto_reproduction import auto_reproduction_loss
 from bgkit.training.base_trainer import BaseTrainer
@@ -138,7 +139,8 @@ class AutoReproTrainer(BaseTrainer):
         data_dir = self.cfg.data.tokens.input_dir
         max_seq_len = self.cfg.data.tokens.get("max_seq_len", 8192)
         full_dataset = AutoReproDataset(data_dir, max_seq_len=max_seq_len)
-        eval_size = max(1, int(len(full_dataset) * 0.1))
+        max_eval_samples = tcfg.get("max_eval_samples", 10000)
+        eval_size = min(max(1, int(len(full_dataset) * 0.1)), max_eval_samples)
         train_size = len(full_dataset) - eval_size
         if train_size < 1:
             raise ValueError(
@@ -149,22 +151,31 @@ class AutoReproTrainer(BaseTrainer):
             full_dataset, [train_size, eval_size]
         )
 
-        batch_size = self.cfg.get("batch_size", 32)
+        max_batch_tokens = tcfg.get("max_batch_tokens", 65536)
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
 
+        # Token-budget batching: pack samples so batch_size * max_seq_len <= budget
+        train_lengths = [full_dataset.lengths[i] for i in self.train_dataset.indices]
+        eval_lengths = [full_dataset.lengths[i] for i in self.eval_dataset.indices]
+
+        self.train_sampler = TokenBudgetBatchSampler(
+            train_lengths, max_batch_tokens, shuffle=True, seed=self.cfg.get("seed", 42),
+        )
+        eval_sampler = TokenBudgetBatchSampler(
+            eval_lengths, max_batch_tokens, shuffle=False,
+        )
+
         self.train_dataloader = DataLoader(
             self.train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
+            batch_sampler=self.train_sampler,
             collate_fn=auto_repro_collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
-            batch_size=batch_size,
-            shuffle=False,
+            batch_sampler=eval_sampler,
             collate_fn=auto_repro_collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory,
@@ -246,7 +257,10 @@ class AutoReproTrainer(BaseTrainer):
         total_cosine = 0.0
         n = 0.0
 
-        for batch in self.eval_dataloader:
+        num_batches = len(self.eval_dataloader)
+        for batch_idx, batch in enumerate(self.eval_dataloader):
+            if batch_idx % 100 == 0:
+                logger.info("eval_progress", batch=batch_idx, total=num_batches)
             token_ids = batch["token_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
 
