@@ -22,6 +22,10 @@ class CheckpointMetadata:
     epoch: int
     parent_checkpoint: str | None  # Lineage: which checkpoint this was initialized from
     metrics: dict[str, float] | None = None
+    # LR schedule params at save time — restored on resume for schedule continuity
+    schedule_params: dict[str, float] | None = None
+    # Training loop state for seamless resume (early stopping, wandb run ID, etc.)
+    training_state: dict | None = None
 
 
 def save_checkpoint(

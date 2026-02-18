@@ -1,8 +1,8 @@
 # Auto-reproduction training configuration
 phase: auto_repro
-max_steps: 500
+max_steps: 5000
 lr: 3.0e-6
-warmup_steps: 50
+warmup_steps: 500
 # Only last transformer block trainable
 freeze_except: ["last_block"]
 eval_every: 100

@@ -33,6 +33,8 @@ class BaseTrainer(ABC):
         self.global_step = 0
         self.epoch = 0
         self._last_checkpoint_path: str | None = None
+        self._schedule_params: dict[str, float] | None = None
+        self._training_state: dict | None = None
 
     @abstractmethod
     def setup(self) -> None:
@@ -53,6 +55,8 @@ class BaseTrainer(ABC):
             step=self.global_step,
             epoch=self.epoch,
             parent_checkpoint=self._last_checkpoint_path,
+            schedule_params=self._schedule_params,
+            training_state=self._training_state,
         )
         ckpt_path = save_checkpoint(
             checkpoint_dir,
@@ -72,6 +76,10 @@ class BaseTrainer(ABC):
         self.global_step = metadata.step
         self.epoch = metadata.epoch
         self._last_checkpoint_path = str(checkpoint_path)
+        if metadata.schedule_params is not None:
+            self._schedule_params = metadata.schedule_params
+        if metadata.training_state is not None:
+            self._training_state = metadata.training_state
         logger.info("restored_from_checkpoint", step=self.global_step)
 
     def _sync_epoch(self, epoch: int) -> None:
@@ -114,11 +122,8 @@ class BaseTrainer(ABC):
                 f"training.lr, but phase '{phase}' uses a different schema. "
                 f"Override train() in the phase-specific trainer."
             )
-        max_steps = tcfg.max_steps
         eval_every = tcfg.eval_every
         save_every = tcfg.save_every
-        base_lr = tcfg.lr
-        warmup_steps = tcfg.warmup_steps
         checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
 
         # Early stopping config (disabled by default; enable per-phase in YAML)
@@ -136,25 +141,75 @@ class BaseTrainer(ABC):
 
         # Resume from checkpoint if specified
         resume_path = self.cfg.get("resume_checkpoint", None)
+        is_resuming = False
         if resume_path is not None:
             self.load_checkpoint(Path(resume_path))
             # Checkpoint was saved after step completed, so resume from next step
             self.global_step += 1
-            logger.info("resuming_training", from_step=self.global_step)
+            is_resuming = True
+            # Restore early stopping state
+            if self._training_state is not None:
+                es_best = self._training_state.get("es_best")
+                es_evals_without_improvement = self._training_state.get(
+                    "es_evals_without_improvement", 0
+                )
+            logger.info(
+                "resuming_training",
+                from_step=self.global_step,
+                es_best=es_best,
+                es_evals_without_improvement=es_evals_without_improvement,
+            )
 
-        # Optional wandb init
+        # LR schedule params: use restored values from checkpoint if available,
+        # otherwise use current config. This ensures schedule continuity on resume
+        # even if the config file changed between runs.
+        if self._schedule_params is not None:
+            max_steps = int(self._schedule_params["max_steps"])
+            base_lr = self._schedule_params["base_lr"]
+            warmup_steps = int(self._schedule_params["warmup_steps"])
+            logger.info(
+                "schedule_restored_from_checkpoint",
+                max_steps=max_steps,
+                base_lr=base_lr,
+                warmup_steps=warmup_steps,
+            )
+            # Allow config to extend max_steps beyond the original schedule
+            if tcfg.max_steps > max_steps:
+                max_steps = tcfg.max_steps
+                logger.info("max_steps_extended", max_steps=max_steps)
+        else:
+            max_steps = tcfg.max_steps
+            base_lr = tcfg.lr
+            warmup_steps = tcfg.warmup_steps
+
+        # Store schedule params for checkpointing
+        self._schedule_params = {
+            "max_steps": max_steps,
+            "base_lr": base_lr,
+            "warmup_steps": warmup_steps,
+        }
+
+        # Optional wandb init (resume previous run if checkpoint had a wandb run ID)
         wandb_run = None
+        wandb_run_id = (
+            self._training_state.get("wandb_run_id") if self._training_state else None
+        )
         if self.cfg.get("wandb", {}).get("enabled", False):
             try:
                 import wandb
 
-                wandb_run = wandb.init(
+                wandb_kwargs = dict(
                     project=self.cfg.wandb.get("project", "bgkit"),
                     entity=self.cfg.wandb.get("entity", None),
                     name=self.cfg.get("run_name", None),
                     tags=list(self.cfg.wandb.get("tags", [])),
                     config=OmegaConf.to_container(self.cfg, resolve=True),
                 )
+                if is_resuming and wandb_run_id is not None:
+                    wandb_kwargs["id"] = wandb_run_id
+                    wandb_kwargs["resume"] = "must"
+                    logger.info("wandb_resuming_run", run_id=wandb_run_id)
+                wandb_run = wandb.init(**wandb_kwargs)
             except ImportError:
                 logger.warning("wandb_not_installed")
 
@@ -234,11 +289,21 @@ class BaseTrainer(ABC):
 
             # Checkpoint
             if save_every > 0 and step > 0 and step % save_every == 0:
+                self._training_state = {
+                    "es_best": es_best,
+                    "es_evals_without_improvement": es_evals_without_improvement,
+                    "wandb_run_id": wandb_run.id if wandb_run is not None else None,
+                }
                 self.save_checkpoint(checkpoint_dir)
 
         # Final eval + checkpoint
         eval_metrics = self.evaluate()
         logger.info("final_eval", **eval_metrics)
+        self._training_state = {
+            "es_best": es_best,
+            "es_evals_without_improvement": es_evals_without_improvement,
+            "wandb_run_id": wandb_run.id if wandb_run is not None else None,
+        }
         self.save_checkpoint(checkpoint_dir)
 
         if wandb_run is not None:
