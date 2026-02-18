@@ -14,6 +14,7 @@ from bgkit.data.repo_processing import (
     load_repo_files,
     _should_skip_path,
 )
+from bgkit.utils.git_utils import is_git_repo
 
 
 # Use a real repo from the data collection for integration-style unit tests.
@@ -29,7 +30,7 @@ def _find_test_repo() -> str | None:
             continue
         for repo_name in os.listdir(owner_path):
             repo_path = os.path.join(owner_path, repo_name)
-            if os.path.isdir(os.path.join(repo_path, ".git")):
+            if is_git_repo(repo_path):
                 return repo_path
     return None
 

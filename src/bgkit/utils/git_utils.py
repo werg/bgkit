@@ -2,9 +2,24 @@
 
 from __future__ import annotations
 
+import os
 import re
 
 import pygit2
+
+
+def is_git_repo(path: str | os.PathLike) -> bool:
+    """Check whether *path* is a git repository (bare or with a working tree).
+
+    Works for:
+    - Standard repos with a ``.git/`` subdirectory
+    - Bare repos (the directory itself contains git objects)
+    """
+    try:
+        pygit2.Repository(str(path))
+        return True
+    except pygit2.GitError:
+        return False
 
 
 def get_file_at_commit(repo_path: str, commit_sha: str, file_path: str) -> str | None:

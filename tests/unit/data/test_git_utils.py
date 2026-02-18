@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from bgkit.utils.git_utils import get_file_at_commit, parse_diff_hunks
+from bgkit.utils.git_utils import get_file_at_commit, is_git_repo, parse_diff_hunks
 
 
 # Reuse the repo discovery logic
@@ -21,7 +21,7 @@ def _find_test_repo() -> str | None:
             continue
         for repo_name in os.listdir(owner_path):
             repo_path = os.path.join(owner_path, repo_name)
-            if os.path.isdir(os.path.join(repo_path, ".git")):
+            if is_git_repo(repo_path):
                 return repo_path
     return None
 

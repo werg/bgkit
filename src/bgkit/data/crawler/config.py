@@ -36,6 +36,7 @@ class CrawlerConfig:
     exclude_forks: bool = True
     exclude_archived: bool = False
     max_repo_size_kb: Optional[int] = None
+    bare_clone: bool = True
 
     def __post_init__(self):
         """Ensure paths are Path objects and create directories."""

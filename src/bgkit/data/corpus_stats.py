@@ -18,6 +18,7 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from bgkit.data.repo_processing import extract_repo_snapshot
+from bgkit.utils.git_utils import is_git_repo
 
 log = logging.getLogger(__name__)
 
@@ -168,7 +169,7 @@ def process_corpus(
         if not owner_dir.is_dir():
             continue
         for repo_dir in sorted(owner_dir.iterdir()):
-            if (repo_dir / ".git").is_dir():
+            if is_git_repo(repo_dir):
                 repo_paths.append(repo_dir)
 
     if max_repos is not None:

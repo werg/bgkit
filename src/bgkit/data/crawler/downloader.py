@@ -81,15 +81,18 @@ class RepoDownloader:
         if dest_path.exists():
             shutil.rmtree(dest_path)
 
-        cmd = [
-            "git",
-            "clone",
-            "--single-branch",
-            "--branch",
-            repo.default_branch,
-            url,
-            str(dest_path),
-        ]
+        if self.config.bare_clone:
+            cmd = ["git", "clone", "--bare", url, str(dest_path)]
+        else:
+            cmd = [
+                "git",
+                "clone",
+                "--single-branch",
+                "--branch",
+                repo.default_branch,
+                url,
+                str(dest_path),
+            ]
 
         process = await asyncio.create_subprocess_exec(
             *cmd,

@@ -22,6 +22,7 @@ from tqdm import tqdm
 from bgkit.data.commit_extraction import ExtractedCommit, extract_commits
 from bgkit.data.commit_filters import CommitFilterConfig
 from bgkit.data.commit_serialization import serialize_and_tokenize_commit
+from bgkit.utils.git_utils import is_git_repo
 
 log = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ def _collect_repo_paths(repos_dir: Path, max_repos: int | None = None) -> list[P
         if not owner_dir.is_dir():
             continue
         for repo_dir in sorted(owner_dir.iterdir()):
-            if (repo_dir / ".git").is_dir():
+            if is_git_repo(repo_dir):
                 repo_paths.append(repo_dir)
 
     if max_repos is not None:
