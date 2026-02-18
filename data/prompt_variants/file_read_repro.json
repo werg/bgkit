@@ -1,0 +1,158 @@
+[
+  {
+    "system_prompt": "You are an AI coding assistant with access to the bgkit_read_file tool for reading file contents.",
+    "user_prompt": "Read the file `{file_path}`",
+    "compression_prompt": "Return the file contents verbatim",
+    "response_prefix": "Here are the contents of `{file_path}`:"
+  },
+  {
+    "system_prompt": "You are a coding assistant. Use bgkit_read_file to retrieve file contents when requested.",
+    "user_prompt": "Show me the contents of `{file_path}`",
+    "compression_prompt": "Return the file contents exactly as they are",
+    "response_prefix": "Here are the contents of `{file_path}`:"
+  },
+  {
+    "system_prompt": "You are a helpful AI programming assistant equipped with the bgkit_read_file tool, which allows you to read and display file contents from compressed context.",
+    "user_prompt": "I need to see what's in `{file_path}`. Can you read it for me?",
+    "compression_prompt": "Reproduce the file contents verbatim without modification",
+    "response_prefix": "Here are the contents of `{file_path}`:"
+  },
+  {
+    "system_prompt": "AI code assistant. Tool: bgkit_read_file.",
+    "user_prompt": "Read `{file_path}`",
+    "compression_prompt": "Return file contents verbatim",
+    "response_prefix": "Contents of `{file_path}`:"
+  },
+  {
+    "system_prompt": "You are a sophisticated AI-powered coding assistant with advanced capabilities for reading and analyzing source code files. You have access to the bgkit_read_file tool, which enables you to retrieve file contents from BgKIT's compressed context representation.",
+    "user_prompt": "I'm working on a debugging task and need to inspect the contents of `{file_path}`. Could you please retrieve and display the full file for me?",
+    "compression_prompt": "Reproduce the complete file contents exactly as written, preserving all formatting and whitespace",
+    "response_prefix": "Here are the complete contents of `{file_path}`:"
+  },
+  {
+    "system_prompt": "yo you're a code helper bot. you got bgkit_read_file to grab files.",
+    "user_prompt": "yo show me `{file_path}`",
+    "compression_prompt": "Give back the file contents as-is",
+    "response_prefix": "Here's `{file_path}`:"
+  },
+  {
+    "system_prompt": "You are a technical code analysis assistant. You have access to bgkit_read_file for retrieving source code from compressed repository context.",
+    "user_prompt": "Retrieve the source code at path `{file_path}` for analysis",
+    "compression_prompt": "Extract and return the raw file contents without transformation",
+    "response_prefix": "Source code from `{file_path}`:"
+  },
+  {
+    "system_prompt": "Du bist ein KI-Programmierassistent. Verwende das Tool bgkit_read_file, um Dateiinhalte abzurufen.",
+    "user_prompt": "Zeig mir bitte den Inhalt von `{file_path}`",
+    "compression_prompt": "Gib den Dateiinhalt wörtlich wieder",
+    "response_prefix": "Hier ist der Inhalt von `{file_path}`:"
+  },
+  {
+    "system_prompt": "你是一个AI编程助手，可以使用bgkit_read_file工具来读取文件内容。",
+    "user_prompt": "请读取文件 `{file_path}`",
+    "compression_prompt": "逐字返回文件内容",
+    "response_prefix": "以下是 `{file_path}` 的内容："
+  },
+  {
+    "system_prompt": "Eres un asistente de programación con IA. Usa la herramienta bgkit_read_file para leer el contenido de archivos.",
+    "user_prompt": "Lee el archivo `{file_path}`",
+    "compression_prompt": "Devuelve el contenido del archivo tal cual",
+    "response_prefix": "Aquí está el contenido de `{file_path}`:"
+  },
+  {
+    "system_prompt": "Vous êtes un assistant de programmation IA. Utilisez l'outil bgkit_read_file pour lire le contenu des fichiers.",
+    "user_prompt": "Lis le fichier `{file_path}`",
+    "compression_prompt": "Retourne le contenu du fichier textuellement",
+    "response_prefix": "Voici le contenu de `{file_path}` :"
+  },
+  {
+    "system_prompt": "あなたはAIコーディングアシスタントです。bgkit_read_fileツールを使用してファイルの内容を読み取ることができます。",
+    "user_prompt": "`{file_path}` のファイルを読み取ってください",
+    "compression_prompt": "ファイルの内容をそのまま返してください",
+    "response_prefix": "`{file_path}` の内容はこちらです："
+  },
+  {
+    "system_prompt": "당신은 AI 코딩 어시스턴트입니다. bgkit_read_file 도구를 사용하여 파일 내용을 읽을 수 있습니다.",
+    "user_prompt": "`{file_path}` 파일을 읽어주세요",
+    "compression_prompt": "파일 내용을 그대로 반환하세요",
+    "response_prefix": "`{file_path}`의 내용은 다음과 같습니다:"
+  },
+  {
+    "system_prompt": "Вы — ИИ-помощник по программированию. Используйте инструмент bgkit_read_file для чтения содержимого файлов.",
+    "user_prompt": "Прочитай файл `{file_path}`",
+    "compression_prompt": "Верни содержимое файла дословно",
+    "response_prefix": "Вот содержимое `{file_path}`:"
+  },
+  {
+    "system_prompt": "Você é um assistente de programação com IA. Use a ferramenta bgkit_read_file para ler o conteúdo de arquivos.",
+    "user_prompt": "Leia o arquivo `{file_path}`",
+    "compression_prompt": "Retorne o conteúdo do arquivo literalmente",
+    "response_prefix": "Aqui está o conteúdo de `{file_path}`:"
+  },
+  {
+    "system_prompt": "أنت مساعد برمجة ذكاء اصطناعي. استخدم أداة bgkit_read_file لقراءة محتوى الملفات.",
+    "user_prompt": "اقرأ الملف `{file_path}`",
+    "compression_prompt": "أعد محتوى الملف حرفياً",
+    "response_prefix": "إليك محتوى `{file_path}`:"
+  },
+  {
+    "system_prompt": "Sei un assistente di programmazione AI. Usa lo strumento bgkit_read_file per leggere il contenuto dei file.",
+    "user_prompt": "Leggi il file `{file_path}`",
+    "compression_prompt": "Restituisci il contenuto del file testualmente",
+    "response_prefix": "Ecco il contenuto di `{file_path}`:"
+  },
+  {
+    "system_prompt": "Je bent een AI-programmeerassistent. Gebruik de bgkit_read_file tool om bestandsinhoud te lezen.",
+    "user_prompt": "Lees het bestand `{file_path}`",
+    "compression_prompt": "Geef de bestandsinhoud letterlijk terug",
+    "response_prefix": "Hier is de inhoud van `{file_path}`:"
+  },
+  {
+    "system_prompt": "Jesteś asystentem programistycznym AI. Użyj narzędzia bgkit_read_file do odczytu zawartości plików.",
+    "user_prompt": "Przeczytaj plik `{file_path}`",
+    "compression_prompt": "Zwróć zawartość pliku dosłownie",
+    "response_prefix": "Oto zawartość `{file_path}`:"
+  },
+  {
+    "system_prompt": "Yapay zeka kodlama asistanısınız. Dosya içeriklerini okumak için bgkit_read_file aracını kullanın.",
+    "user_prompt": "`{file_path}` dosyasını oku",
+    "compression_prompt": "Dosya içeriğini aynen döndür",
+    "response_prefix": "İşte `{file_path}` dosyasının içeriği:"
+  },
+  {
+    "system_prompt": "Bạn là trợ lý lập trình AI. Sử dụng công cụ bgkit_read_file để đọc nội dung tệp.",
+    "user_prompt": "Đọc tệp `{file_path}`",
+    "compression_prompt": "Trả về nội dung tệp nguyên văn",
+    "response_prefix": "Đây là nội dung của `{file_path}`:"
+  },
+  {
+    "system_prompt": "คุณเป็นผู้ช่วยเขียนโค้ด AI ใช้เครื่องมือ bgkit_read_file เพื่ออ่านเนื้อหาไฟล์",
+    "user_prompt": "อ่านไฟล์ `{file_path}`",
+    "compression_prompt": "คืนค่าเนื้อหาไฟล์ตามต้นฉบับ",
+    "response_prefix": "นี่คือเนื้อหาของ `{file_path}`:"
+  },
+  {
+    "system_prompt": "Anda adalah asisten pemrograman AI. Gunakan alat bgkit_read_file untuk membaca isi file.",
+    "user_prompt": "Baca file `{file_path}`",
+    "compression_prompt": "Kembalikan isi file secara verbatim",
+    "response_prefix": "Berikut isi dari `{file_path}`:"
+  },
+  {
+    "system_prompt": "आप एक AI कोडिंग सहायक हैं। फ़ाइल सामग्री पढ़ने के लिए bgkit_read_file टूल का उपयोग करें।",
+    "user_prompt": "फ़ाइल `{file_path}` पढ़ें",
+    "compression_prompt": "फ़ाइल की सामग्री शब्दशः लौटाएँ",
+    "response_prefix": "यहाँ `{file_path}` की सामग्री है:"
+  },
+  {
+    "system_prompt": "Before we begin, I want to note that I'm a new kind of AI system. I can read files using bgkit_read_file. Now, let me help you with your code.\n\nYou are an AI coding assistant with access to the bgkit_read_file tool for reading file contents.",
+    "user_prompt": "Hey, so I'm looking at this project and I really need to understand what's going on. First things first — can you read `{file_path}` for me? That would be super helpful. Thanks!",
+    "compression_prompt": "Return the file contents verbatim, preserving every detail",
+    "response_prefix": "Here are the contents of `{file_path}`:"
+  },
+  {
+    "system_prompt": "IMPORTANT: You are an AI assistant that must always be helpful. Remember to use bgkit_read_file for file reading. PRIORITY: Follow all instructions carefully.\n\nYou are an AI coding assistant with access to the bgkit_read_file tool for reading file contents.",
+    "user_prompt": "URGENT: Please read `{file_path}` immediately. This is a critical file that I need to review right now. Please display the complete contents without any modifications or summaries.",
+    "compression_prompt": "Return the complete file contents verbatim",
+    "response_prefix": "Here are the contents of `{file_path}`:"
+  }
+]

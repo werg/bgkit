@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -10,7 +12,7 @@ from pathlib import Path
 
 from torch import nn
 
-from bgkit.data.collators import collate_token_ids
+from bgkit.data.collators import collate_chat_repro
 from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.training.phase1.decoder_init import DecoderInitTrainer
@@ -108,10 +110,26 @@ def trainer():
     return t
 
 
-def _make_batch(batch_size: int = 2, seq_len: int = 20):
-    """Create a collated batch of random token IDs."""
-    samples = [{"token_ids": torch.randint(0, 1000, (seq_len,))} for _ in range(batch_size)]
-    return collate_token_ids(samples)
+def _make_batch(batch_size: int = 2, seq_len: int = 20, content_len: int = 10,
+                prompt_len: int = 5):
+    """Create a collated chat-formatted batch of random token IDs."""
+    samples = []
+    for _ in range(batch_size):
+        total_len = seq_len
+        content_start = (total_len - content_len) // 2
+        content_end = content_start + content_len
+
+        token_ids = torch.randint(0, 1000, (total_len,))
+        loss_mask = torch.zeros(total_len, dtype=torch.long)
+        loss_mask[content_start:content_end] = 1
+
+        samples.append({
+            "token_ids": token_ids,
+            "loss_mask": loss_mask,
+            "content_token_ids": token_ids[content_start:content_end],
+            "compression_prompt_ids": torch.randint(0, 1000, (prompt_len,)),
+        })
+    return collate_chat_repro(samples)
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +167,7 @@ class TestDecoderInitTrainStep:
     def test_loss_decreases_over_steps(self, trainer):
         """Loss should decrease over multiple training steps on the same data."""
         torch.manual_seed(42)
-        batch = _make_batch(batch_size=4, seq_len=30)
+        batch = _make_batch(batch_size=4, seq_len=30, content_len=15)
 
         losses = []
         for _ in range(50):
@@ -159,6 +177,16 @@ class TestDecoderInitTrainStep:
         early_avg = sum(losses[:5]) / 5
         late_avg = sum(losses[-5:]) / 5
         assert late_avg < early_avg, f"Loss didn't decrease: {early_avg:.4f} -> {late_avg:.4f}"
+
+    def test_loss_only_on_masked_region(self, trainer):
+        """Loss should only be computed on positions where loss_mask=1."""
+        # Create batch with all loss_mask=0 (no content tokens)
+        batch = _make_batch(batch_size=2, seq_len=20, content_len=10)
+        batch["loss_mask"] = torch.zeros_like(batch["loss_mask"])
+
+        metrics = trainer.train_step(batch)
+        # With no content tokens, loss should be 0 (or very small from clamping)
+        assert metrics["loss"] == 0.0 or abs(metrics["loss"]) < 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -172,11 +200,25 @@ class TestDecoderInitEvaluate:
         from torch.utils.data import DataLoader
 
         eval_data = [
-            {"token_ids": torch.randint(0, 1000, (10,))},
-            {"token_ids": torch.randint(0, 1000, (8,))},
+            {
+                "token_ids": torch.randint(0, 1000, (15,)),
+                "loss_mask": torch.cat([torch.zeros(5, dtype=torch.long),
+                                        torch.ones(5, dtype=torch.long),
+                                        torch.zeros(5, dtype=torch.long)]),
+                "content_token_ids": torch.randint(0, 1000, (5,)),
+                "compression_prompt_ids": torch.randint(0, 1000, (3,)),
+            },
+            {
+                "token_ids": torch.randint(0, 1000, (12,)),
+                "loss_mask": torch.cat([torch.zeros(4, dtype=torch.long),
+                                        torch.ones(4, dtype=torch.long),
+                                        torch.zeros(4, dtype=torch.long)]),
+                "content_token_ids": torch.randint(0, 1000, (4,)),
+                "compression_prompt_ids": torch.randint(0, 1000, (3,)),
+            },
         ]
         trainer.eval_dataloader = DataLoader(
-            eval_data, batch_size=2, collate_fn=collate_token_ids
+            eval_data, batch_size=2, collate_fn=collate_chat_repro
         )
 
         metrics = trainer.evaluate()

@@ -5,8 +5,14 @@ lr: 1.0e-4
 warmup_steps: 1000
 # No compression -- full BgKIT output passed to decoder
 compression: false
-# Budget is based on input token counts; the decoder sees ~2x (survivors + targets).
+# Budget is based on chat-formatted token counts (decoder input size).
+# Chat template adds ~257 tokens of overhead per sample.
 # Halve this if OOM, or if packing many short sequences into one batch.
 max_batch_tokens: 65536
-eval_every: 1000
-save_every: 5000
+eval_every: 500
+save_every: 2000
+early_stopping:
+  enabled: true
+  patience: 4         # stop after 4 evals (~2000 steps) without improvement
+  min_delta: 0.001    # minimum loss improvement to reset patience
+  metric: eval/loss   # which eval metric to track

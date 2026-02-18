@@ -1,12 +1,16 @@
 """Phase 1, Step 1: Decoder initialization on uncompressed output.
 
 Train the reconstruction decoder to generate text from BgKIT's full
-(uncompressed) output representations. Near-trivial but initializes the
-decoder's ability to read BgKIT's output space before compression.
+(uncompressed) output representations, using Qwen3's native chat template
+with tool-call format for in-distribution agentic conversation.
 
 The BgKIT backbone is called directly (bypassing flag embeddings) since
 there's no compression in Step 1 — flag embeddings are untrained at this
-point and would corrupt the input.
+point and would corrupt the input. The prompt separator embedding is
+zero-initialized and frozen alongside the rest of BgKIT.
+
+Loss is computed only on the file content tokens inside the chat template's
+code fence (via loss_mask), so the decoder learns pure reconstruction.
 """
 
 from __future__ import annotations
@@ -16,10 +20,11 @@ from pathlib import Path
 import structlog
 import torch
 from torch.utils.data import DataLoader, random_split
-from transformers import AutoModel, AutoModelForCausalLM
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
-from bgkit.data.collators import collate_token_ids
+from bgkit.data.collators import collate_chat_repro
 from bgkit.data.datasets.auto_repro_dataset import AutoReproDataset
+from bgkit.data.datasets.chat_repro_dataset import ChatReproDataset
 from bgkit.data.samplers import TokenBudgetBatchSampler
 from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
@@ -95,10 +100,30 @@ class DecoderInitTrainer(BaseTrainer):
         # BaseTrainer logging/device logic uses self.model
         self.model = self.decoder
 
+        # --- Tokenizer (for chat template) ---
+        tokenizer_name = decoder_cfg.backbone_name
+        tokenizer_revision = decoder_cfg.get("backbone_revision", None)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            trust_remote_code=True,
+            revision=tokenizer_revision,
+        )
+
         # --- Dataset ---
         data_dir = self.cfg.data.tokens.input_dir
         max_seq_len = self.cfg.data.tokens.get("max_seq_len", 8192)
-        full_dataset = AutoReproDataset(data_dir, max_seq_len=max_seq_len)
+        variant_bank_path = self.cfg.data.get(
+            "variant_bank_path", "data/prompt_variants/file_read_repro.json",
+        )
+
+        inner_dataset = AutoReproDataset(data_dir, max_seq_len=max_seq_len)
+        full_dataset = ChatReproDataset(
+            inner_dataset,
+            tokenizer=self.tokenizer,
+            variant_bank_path=variant_bank_path,
+            seed=self.cfg.get("seed", 42),
+        )
+
         eval_size = max(1, int(len(full_dataset) * 0.1))
         train_size = len(full_dataset) - eval_size
         if train_size < 1:
@@ -110,7 +135,7 @@ class DecoderInitTrainer(BaseTrainer):
             full_dataset, [train_size, eval_size]
         )
 
-        # Token-budget batching
+        # Token-budget batching (based on chat-formatted lengths)
         max_batch_tokens = tcfg.get("max_batch_tokens", 65536)
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
@@ -128,14 +153,14 @@ class DecoderInitTrainer(BaseTrainer):
         self.train_dataloader = DataLoader(
             self.train_dataset,
             batch_sampler=self.train_sampler,
-            collate_fn=collate_token_ids,
+            collate_fn=collate_chat_repro,
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
             batch_sampler=eval_sampler,
-            collate_fn=collate_token_ids,
+            collate_fn=collate_chat_repro,
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
@@ -163,16 +188,40 @@ class DecoderInitTrainer(BaseTrainer):
 
         token_ids = batch["token_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
+        loss_mask = batch["loss_mask"].to(self.device)
+        content_token_ids = batch["content_token_ids"].to(self.device)
+        content_attention_mask = batch["content_attention_mask"].to(self.device)
+        compression_prompt_ids = batch["compression_prompt_ids"].to(self.device)
+        compression_prompt_mask = batch["compression_prompt_mask"].to(self.device)
 
-        # Get input embeddings
-        input_emb = self.bgkit_model.backbone.get_input_embeddings()(token_ids)
+        # Embed content and prompt tokens using BgKIT's input embeddings
+        bgkit_embed = self.bgkit_model.backbone.get_input_embeddings()
+        content_emb = bgkit_embed(content_token_ids)
+        prompt_emb = bgkit_embed(compression_prompt_ids)
 
-        # Forward through frozen BgKIT backbone directly (no flag embeddings)
+        # Forward through frozen BgKIT backbone directly (no flag embeddings).
+        # Prompt tokens condition content via attention; separator is zero-init no-op.
         with torch.no_grad():
             bgkit_out = self.bgkit_model.backbone(
-                inputs_embeds=input_emb, attention_mask=attention_mask
+                inputs_embeds=torch.cat([
+                    prompt_emb,
+                    self.bgkit_model.prompt_separator_embedding.unsqueeze(0).unsqueeze(0).expand(
+                        content_emb.size(0), 1, -1,
+                    ),
+                    content_emb,
+                ], dim=1),
+                attention_mask=torch.cat([
+                    compression_prompt_mask,
+                    torch.ones(
+                        content_emb.size(0), 1,
+                        dtype=torch.bool, device=self.device,
+                    ),
+                    content_attention_mask,
+                ], dim=1),
             )
-            survivors = bgkit_out.last_hidden_state  # all positions survive
+            # Slice out content portion only (skip prompt + separator)
+            prompt_len = compression_prompt_ids.size(1) + 1  # prompt + separator
+            survivors = bgkit_out.last_hidden_state[:, prompt_len:, :]
 
         # BF16 autocast for decoder forward + backward
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
@@ -180,9 +229,11 @@ class DecoderInitTrainer(BaseTrainer):
                 survivor_embeddings=survivors,
                 target_ids=token_ids,
                 target_attention_mask=attention_mask,
-                survivor_attention_mask=attention_mask,  # same — all positions real
+                survivor_attention_mask=content_attention_mask,
             )
-            loss = data_reconstruction_loss(logits, token_ids, attention_mask)
+            loss = data_reconstruction_loss(
+                logits, token_ids, attention_mask, loss_mask=loss_mask,
+            )
 
         # Backward
         self.optimizer.zero_grad()
@@ -202,18 +253,40 @@ class DecoderInitTrainer(BaseTrainer):
         self.decoder.eval()
 
         total_loss = 0.0
-        total_tokens = 0.0
+        total_content_tokens = 0.0
 
         for batch in self.eval_dataloader:
             token_ids = batch["token_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
+            loss_mask = batch["loss_mask"].to(self.device)
+            content_token_ids = batch["content_token_ids"].to(self.device)
+            content_attention_mask = batch["content_attention_mask"].to(self.device)
+            compression_prompt_ids = batch["compression_prompt_ids"].to(self.device)
+            compression_prompt_mask = batch["compression_prompt_mask"].to(self.device)
 
-            input_emb = self.bgkit_model.backbone.get_input_embeddings()(token_ids)
+            bgkit_embed = self.bgkit_model.backbone.get_input_embeddings()
+            content_emb = bgkit_embed(content_token_ids)
+            prompt_emb = bgkit_embed(compression_prompt_ids)
 
             bgkit_out = self.bgkit_model.backbone(
-                inputs_embeds=input_emb, attention_mask=attention_mask
+                inputs_embeds=torch.cat([
+                    prompt_emb,
+                    self.bgkit_model.prompt_separator_embedding.unsqueeze(0).unsqueeze(0).expand(
+                        content_emb.size(0), 1, -1,
+                    ),
+                    content_emb,
+                ], dim=1),
+                attention_mask=torch.cat([
+                    compression_prompt_mask,
+                    torch.ones(
+                        content_emb.size(0), 1,
+                        dtype=torch.bool, device=self.device,
+                    ),
+                    content_attention_mask,
+                ], dim=1),
             )
-            survivors = bgkit_out.last_hidden_state
+            prompt_len = compression_prompt_ids.size(1) + 1
+            survivors = bgkit_out.last_hidden_state[:, prompt_len:, :]
 
             with torch.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"
@@ -222,15 +295,18 @@ class DecoderInitTrainer(BaseTrainer):
                     survivor_embeddings=survivors,
                     target_ids=token_ids,
                     target_attention_mask=attention_mask,
-                    survivor_attention_mask=attention_mask,
+                    survivor_attention_mask=content_attention_mask,
                 )
-                loss = data_reconstruction_loss(logits, token_ids, attention_mask)
+                loss = data_reconstruction_loss(
+                    logits, token_ids, attention_mask, loss_mask=loss_mask,
+                )
 
-            batch_tokens = attention_mask.sum().item()
-            total_loss += loss.item() * batch_tokens
-            total_tokens += batch_tokens
+            # Weight by content tokens only (loss_mask[:, 1:] for shift alignment)
+            batch_content_tokens = loss_mask[:, 1:].sum().item()
+            total_loss += loss.item() * batch_content_tokens
+            total_content_tokens += batch_content_tokens
 
-        avg_loss = total_loss / max(total_tokens, 1)
+        avg_loss = total_loss / max(total_content_tokens, 1)
         perplexity = torch.exp(torch.tensor(avg_loss)).item()
 
         return {

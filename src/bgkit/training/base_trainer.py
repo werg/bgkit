@@ -74,6 +74,17 @@ class BaseTrainer(ABC):
         self._last_checkpoint_path = str(checkpoint_path)
         logger.info("restored_from_checkpoint", step=self.global_step)
 
+    def _sync_epoch(self, epoch: int) -> None:
+        """Propagate epoch to batch sampler and dataset for shuffling/variant diversity."""
+        batch_sampler = getattr(self.train_dataloader, "batch_sampler", None)
+        if hasattr(batch_sampler, "set_epoch"):
+            batch_sampler.set_epoch(epoch)
+        dataset = getattr(self.train_dataloader, "dataset", None)
+        # Unwrap Subset → underlying dataset
+        inner = getattr(dataset, "dataset", dataset)
+        if hasattr(inner, "set_epoch"):
+            inner.set_epoch(epoch)
+
     def train(self) -> None:
         """Main training loop.
 
@@ -81,6 +92,13 @@ class BaseTrainer(ABC):
         ``training.warmup_steps``.  Phase configs with multi-step or
         per-component LR schedules (phase1_step3, phase2) must override
         this method with their own loop.
+
+        Supports early stopping via ``training.early_stopping`` config:
+        - ``enabled`` (bool, default False): set True to enable
+        - ``patience`` (int, default 5): evals without improvement before stopping
+        - ``min_delta`` (float, default 0.001): minimum improvement to reset patience
+        - ``metric`` (str, default "eval/loss"): eval metric to track (must be present
+          in evaluate() results; lower is better)
         """
         self.setup()
 
@@ -102,6 +120,19 @@ class BaseTrainer(ABC):
         base_lr = tcfg.lr
         warmup_steps = tcfg.warmup_steps
         checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
+
+        # Early stopping config (disabled by default; enable per-phase in YAML)
+        es_cfg = tcfg.get("early_stopping", {})
+        if isinstance(es_cfg, bool):
+            es_enabled = es_cfg
+            es_cfg = {}
+        else:
+            es_enabled = es_cfg.get("enabled", False) if es_cfg else False
+        es_patience = es_cfg.get("patience", 5) if es_cfg else 5
+        es_min_delta = es_cfg.get("min_delta", 0.001) if es_cfg else 0.001
+        es_metric = es_cfg.get("metric", "eval/loss") if es_cfg else "eval/loss"
+        es_best: float | None = None
+        es_evals_without_improvement = 0
 
         # Resume from checkpoint if specified
         resume_path = self.cfg.get("resume_checkpoint", None)
@@ -127,15 +158,20 @@ class BaseTrainer(ABC):
             except ImportError:
                 logger.warning("wandb_not_installed")
 
-        # Sync sampler epoch before first iter (needed after resume)
-        batch_sampler = getattr(self.train_dataloader, "batch_sampler", None)
-        if hasattr(batch_sampler, "set_epoch"):
-            batch_sampler.set_epoch(self.epoch)
+        # Sync sampler + dataset epoch before first iter (needed after resume)
+        self._sync_epoch(self.epoch)
 
         dataloader_iter = iter(self.train_dataloader)
 
-        logger.info("training_start", max_steps=max_steps, lr=base_lr, start_step=self.global_step)
+        logger.info(
+            "training_start",
+            max_steps=max_steps,
+            lr=base_lr,
+            start_step=self.global_step,
+            early_stopping=es_enabled,
+        )
 
+        stopped_early = False
         for step in range(self.global_step, max_steps):
             self.global_step = step
 
@@ -149,9 +185,7 @@ class BaseTrainer(ABC):
                 batch = next(dataloader_iter)
             except StopIteration:
                 self.epoch += 1
-                batch_sampler = getattr(self.train_dataloader, "batch_sampler", None)
-                if hasattr(batch_sampler, "set_epoch"):
-                    batch_sampler.set_epoch(self.epoch)
+                self._sync_epoch(self.epoch)
                 dataloader_iter = iter(self.train_dataloader)
                 batch = next(dataloader_iter)
 
@@ -173,6 +207,31 @@ class BaseTrainer(ABC):
                 if wandb_run is not None:
                     wandb_run.log(eval_metrics, step=step)
 
+                # Early stopping check
+                if es_enabled:
+                    if es_metric not in eval_metrics:
+                        raise KeyError(
+                            f"Early stopping metric '{es_metric}' not found in eval "
+                            f"results. Available: {sorted(eval_metrics.keys())}. "
+                            f"Check training.early_stopping.metric config."
+                        )
+                    current_val = eval_metrics[es_metric]
+                    if es_best is None or current_val < es_best - es_min_delta:
+                        es_best = current_val
+                        es_evals_without_improvement = 0
+                    else:
+                        es_evals_without_improvement += 1
+                        if es_evals_without_improvement >= es_patience:
+                            logger.info(
+                                "early_stopping",
+                                step=step,
+                                metric=es_metric,
+                                best=es_best,
+                                patience=es_patience,
+                            )
+                            stopped_early = True
+                            break
+
             # Checkpoint
             if save_every > 0 and step > 0 and step % save_every == 0:
                 self.save_checkpoint(checkpoint_dir)
@@ -185,4 +244,7 @@ class BaseTrainer(ABC):
         if wandb_run is not None:
             wandb_run.finish()
 
-        logger.info("training_complete", total_steps=max_steps)
+        if stopped_early:
+            logger.info("training_complete_early_stop", total_steps=self.global_step)
+        else:
+            logger.info("training_complete", total_steps=max_steps)

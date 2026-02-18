@@ -63,11 +63,15 @@ class AutoReproDataset(Dataset):
     def __len__(self) -> int:
         return len(self._index)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> dict:
         shard_idx, row_idx, chunk_start = self._index[idx]
         table = self._get_table(shard_idx)
 
         token_ids = np.array(table.column("token_ids")[row_idx].as_py(), dtype=np.int64)
         chunk = token_ids[chunk_start : chunk_start + self.max_seq_len]
 
-        return {"token_ids": torch.from_numpy(chunk)}
+        return {
+            "token_ids": torch.from_numpy(chunk),
+            "file_path": str(table.column("file_path")[row_idx].as_py()),
+            "language": str(table.column("language")[row_idx].as_py()),
+        }
