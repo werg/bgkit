@@ -15,31 +15,25 @@ x-gpu-common: &gpu-common
     - ${CHECKPOINT_DIR:-../checkpoints}:/workspace/checkpoints
     - ../configs:/workspace/bgkit/configs:ro
     - ../scripts:/workspace/bgkit/scripts:ro
+    # Wandb authenticates via netrc (machine api.wandb.ai).
+    # To override, pass -e WANDB_API_KEY=... to docker compose run.
     - ~/.netrc:/root/.netrc:ro
 
 services:
   train:
     <<: *gpu-common
-    environment:
-      - WANDB_API_KEY=${WANDB_API_KEY}
     command: ["scripts/train.py"]
 
   train-ice:
     <<: *gpu-common
-    environment:
-      - WANDB_API_KEY=${WANDB_API_KEY}
     command: ["scripts/train.py", "+experiment=ice_train"]
 
   train-joint-block:
     <<: *gpu-common
-    environment:
-      - WANDB_API_KEY=${WANDB_API_KEY}
     command: ["scripts/train.py", "+experiment=joint_block_pretrain"]
 
   train-phase1-step1:
     <<: *gpu-common
-    environment:
-      - WANDB_API_KEY=${WANDB_API_KEY}
     command: ["scripts/train.py", "+experiment=phase1_step1"]
 
   ice-labels:
