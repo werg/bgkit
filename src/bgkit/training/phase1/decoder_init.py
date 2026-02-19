@@ -91,6 +91,9 @@ class DecoderInitTrainer(BaseTrainer):
 
         enable_gradient_checkpointing(self.decoder.backbone)
 
+        # --- Conditional freeze of top layer ---
+        self._apply_freeze()
+
         # torch.compile: ~15-30% speedup on Blackwell. If compile fails on sm_121,
         # remove this line — training is correct without it.
         try:
@@ -171,15 +174,7 @@ class DecoderInitTrainer(BaseTrainer):
         )
 
         # --- Optimizer ---
-        # 8-bit AdamW: reduces optimizer memory. If bnb causes issues,
-        # fall back to torch.optim.AdamW — correctness is unaffected.
-        try:
-            import bitsandbytes as bnb
-            self.optimizer = bnb.optim.AdamW8bit(self.decoder.parameters(), lr=tcfg.lr)
-            logger.info("using_adamw8bit")
-        except ImportError:
-            self.optimizer = torch.optim.AdamW(self.decoder.parameters(), lr=tcfg.lr)
-            logger.info("using_adamw_fp32", reason="bitsandbytes not available")
+        self._setup_optimizer()
 
         logger.info(
             "decoder_init_trainer_setup",
@@ -187,6 +182,78 @@ class DecoderInitTrainer(BaseTrainer):
             eval_samples=eval_size,
             device=str(device),
         )
+
+    def _apply_freeze(self) -> None:
+        """Freeze top transformer layer, lm_head, and embed_tokens if configured."""
+        tcfg = self.cfg.training
+        if not tcfg.get("freeze_top_layer", False):
+            return
+
+        self.decoder.backbone.model.layers[-1].requires_grad_(False)
+        self.decoder.backbone.lm_head.requires_grad_(False)
+        self.decoder.backbone.model.embed_tokens.requires_grad_(False)
+
+        num_layers = len(self.decoder.backbone.model.layers)
+        logger.info(
+            "decoder_layer_freeze",
+            total_layers=num_layers,
+            trainable_layers=num_layers - 1,
+            lr_scale_bottom=tcfg.get("lr_scale_bottom", 0.1),
+        )
+
+    def _setup_optimizer(self) -> None:
+        """Create optimizer, using differential LR param groups when freezing."""
+        tcfg = self.cfg.training
+
+        if tcfg.get("freeze_top_layer", False):
+            lr_scale_bottom = tcfg.get("lr_scale_bottom", 0.1)
+            param_groups = self._build_param_groups(tcfg.lr, lr_scale_bottom)
+        else:
+            param_groups = [{"params": list(self.decoder.parameters()), "lr": tcfg.lr}]
+
+        # 8-bit AdamW: reduces optimizer memory. If bnb causes issues,
+        # fall back to torch.optim.AdamW — correctness is unaffected.
+        try:
+            import bitsandbytes as bnb
+            self.optimizer = bnb.optim.AdamW8bit(param_groups, lr=tcfg.lr)
+            logger.info("using_adamw8bit")
+        except ImportError:
+            self.optimizer = torch.optim.AdamW(param_groups, lr=tcfg.lr)
+            logger.info("using_adamw_fp32", reason="bitsandbytes not available")
+
+    def _build_param_groups(self, base_lr: float, lr_scale_bottom: float) -> list[dict]:
+        """Build optimizer param groups with rising LR from bottom to top.
+
+        Called only when freeze_top_layer is enabled. Assumes the top layer
+        and lm_head are already frozen via requires_grad_(False).
+        """
+        layers = self.decoder.backbone.model.layers
+        num_trainable = len(layers) - 1  # last layer is frozen
+
+        param_groups = []
+        for i in range(num_trainable):
+            t = i / max(num_trainable - 1, 1)
+            scale = lr_scale_bottom + t * (1.0 - lr_scale_bottom)
+            group_lr = base_lr * scale
+            params = [p for p in layers[i].parameters() if p.requires_grad]
+            if params:
+                param_groups.append({
+                    "params": params,
+                    "lr": group_lr,
+                    "base_lr": group_lr,
+                })
+
+        # Final norm
+        norm_params = [p for p in self.decoder.backbone.model.norm.parameters()
+                       if p.requires_grad]
+        if norm_params:
+            param_groups.append({
+                "params": norm_params,
+                "lr": base_lr,
+                "base_lr": base_lr,
+            })
+
+        return param_groups
 
     def train_step(self, batch) -> dict[str, float]:
         self.decoder.train()
@@ -378,6 +445,8 @@ class DecoderInitTrainer(BaseTrainer):
             step=self.global_step,
             epoch=self.epoch,
             parent_checkpoint=self._last_checkpoint_path,
+            schedule_params=self._schedule_params,
+            training_state=self._training_state,
         )
         ckpt_path = save_checkpoint(
             checkpoint_dir,
@@ -400,4 +469,8 @@ class DecoderInitTrainer(BaseTrainer):
         self.global_step = metadata.step
         self.epoch = metadata.epoch
         self._last_checkpoint_path = str(checkpoint_path)
+        if metadata.schedule_params is not None:
+            self._schedule_params = metadata.schedule_params
+        if metadata.training_state is not None:
+            self._training_state = metadata.training_state
         logger.info("restored_from_checkpoint", step=self.global_step)

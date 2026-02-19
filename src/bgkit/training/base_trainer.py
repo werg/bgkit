@@ -233,7 +233,8 @@ class BaseTrainer(ABC):
             # LR schedule
             lr = cosine_with_warmup(step, max_steps, warmup_steps, base_lr)
             for pg in self.optimizer.param_groups:
-                pg["lr"] = lr
+                group_base = pg.get("base_lr", base_lr)
+                pg["lr"] = cosine_with_warmup(step, max_steps, warmup_steps, group_base)
 
             # Get batch, cycling dataloader
             try:
@@ -247,6 +248,8 @@ class BaseTrainer(ABC):
             # Train step
             metrics = self.train_step(batch)
             metrics["lr"] = lr
+            if len(self.optimizer.param_groups) > 1:
+                metrics["lr_min"] = min(pg["lr"] for pg in self.optimizer.param_groups)
 
             # Log
             if step % 100 == 0:

@@ -5,6 +5,9 @@ lr: 1.0e-4
 warmup_steps: 1000
 # No compression -- full BgKIT output passed to decoder
 compression: false
+# Freeze topmost transformer layer + lm_head; differential LR rising toward top
+freeze_top_layer: true
+lr_scale_bottom: 0.1
 # Budget is based on chat-formatted token counts (decoder input size).
 # Chat template adds ~257 tokens of overhead per sample.
 # Halve this if OOM, or if packing many short sequences into one batch.
