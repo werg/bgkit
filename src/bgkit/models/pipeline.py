@@ -11,9 +11,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from bgkit.models.bgkit_compressor import BgKITCompressor
+from bgkit.models.encoder import BgKITEncoder
 from bgkit.models.ice import ICE
-from bgkit.models.projection import ProjectionMLP
 
 
 @dataclass
@@ -32,14 +31,12 @@ class BgKITPipeline(nn.Module):
     def __init__(
         self,
         ice: ICE,
-        compressor: BgKITCompressor,
-        projection: ProjectionMLP,
+        encoder: BgKITEncoder,
         total_survivor_budget: int = 3500,
     ):
         super().__init__()
         self.ice = ice
-        self.compressor = compressor
-        self.projection = projection
+        self.encoder = encoder
         self.total_survivor_budget = total_survivor_budget
 
     def forward(

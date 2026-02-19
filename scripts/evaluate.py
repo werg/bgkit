@@ -20,16 +20,16 @@ import structlog
 import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from bgkit.data.collators import collate_chat_repro
-from bgkit.data.datasets.auto_repro_dataset import AutoReproDataset
 from bgkit.data.datasets.chat_repro_dataset import ChatReproDataset
+from bgkit.data.datasets.token_chunk_dataset import TokenChunkDataset
 from bgkit.data.samplers import TokenBudgetBatchSampler
 from bgkit.eval.metrics.embedding_health import embedding_drift_metrics
 from bgkit.eval.metrics.reconstruction import parse_success_rate
-from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
+from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.checkpointing import load_checkpoint
 from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
 from bgkit.utils.logging import setup_logging
@@ -53,17 +53,17 @@ def main(cfg: DictConfig) -> None:
     # Load models
     bgkit_cfg = cfg.model.bgkit
     hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
-    bgkit_backbone = AutoModel.from_pretrained(
+    encoder = BgKITEncoder.from_pretrained(
         bgkit_cfg.backbone_name,
+        hidden_dim=hidden_dim,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         revision=bgkit_cfg.get("backbone_revision"),
         attn_implementation="sdpa",
     )
-    bgkit_model = BgKITCompressor(bgkit_backbone, hidden_dim=hidden_dim)
-    bgkit_model.to(device)
-    bgkit_model.requires_grad_(False)
-    bgkit_model.eval()
+    encoder.to(device)
+    encoder.requires_grad_(False)
+    encoder.eval()
 
     decoder_cfg = cfg.model.decoder
     decoder_backbone = AutoModelForCausalLM.from_pretrained(
@@ -79,8 +79,10 @@ def main(cfg: DictConfig) -> None:
 
     # Load checkpoint weights
     _, state_dicts = load_checkpoint(Path(checkpoint_path))
-    if "bgkit_model" in state_dicts:
-        bgkit_model.load_state_dict(state_dicts["bgkit_model"])
+    if "encoder" in state_dicts:
+        encoder.load_state_dict(state_dicts["encoder"])
+    elif "bgkit_model" in state_dicts:
+        encoder.compressor.load_state_dict(state_dicts["bgkit_model"], strict=False)
     decoder.load_state_dict(state_dicts["decoder"])
 
     # Tokenizer
@@ -96,7 +98,7 @@ def main(cfg: DictConfig) -> None:
     variant_bank_path = cfg.data.get(
         "variant_bank_path", "data/prompt_variants/file_read_repro.json",
     )
-    inner_dataset = AutoReproDataset(data_dir, max_seq_len=max_seq_len)
+    inner_dataset = TokenChunkDataset(data_dir, max_seq_len=max_seq_len)
     chat_dataset = ChatReproDataset(
         inner_dataset, tokenizer=tokenizer, variant_bank_path=variant_bank_path,
     )
@@ -130,26 +132,18 @@ def main(cfg: DictConfig) -> None:
             compression_prompt_ids = batch["compression_prompt_ids"].to(device)
             compression_prompt_mask = batch["compression_prompt_mask"].to(device)
 
-            bgkit_embed = bgkit_model.backbone.get_input_embeddings()
+            bgkit_embed = encoder.compressor.backbone.get_input_embeddings()
             content_emb = bgkit_embed(content_token_ids)
             prompt_emb = bgkit_embed(compression_prompt_ids)
 
-            bgkit_out = bgkit_model.backbone(
-                inputs_embeds=torch.cat([
-                    prompt_emb,
-                    bgkit_model.prompt_separator_embedding.unsqueeze(0).unsqueeze(0).expand(
-                        content_emb.size(0), 1, -1,
-                    ),
-                    content_emb,
-                ], dim=1),
-                attention_mask=torch.cat([
-                    compression_prompt_mask,
-                    torch.ones(content_emb.size(0), 1, dtype=torch.bool, device=device),
-                    content_attention_mask,
-                ], dim=1),
+            enc_out = encoder(
+                input_embeddings=content_emb,
+                survivor_mask=None,
+                attention_mask=content_attention_mask,
+                prompt_embeddings=prompt_emb,
+                prompt_attention_mask=compression_prompt_mask,
             )
-            prompt_len = compression_prompt_ids.size(1) + 1
-            survivors = bgkit_out.last_hidden_state[:, prompt_len:, :]
+            survivors = enc_out.survivor_embeddings
 
             # Teacher-forced loss (all batches)
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
@@ -213,7 +207,7 @@ def main(cfg: DictConfig) -> None:
 
     if all_survivors:
         combined = torch.cat(all_survivors, dim=0)
-        token_emb = bgkit_model.backbone.get_input_embeddings().weight.detach()
+        token_emb = encoder.compressor.backbone.get_input_embeddings().weight.detach()
         health = embedding_drift_metrics(combined, token_emb)
         results.update(health)
 

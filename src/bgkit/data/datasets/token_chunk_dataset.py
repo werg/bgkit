@@ -1,4 +1,4 @@
-"""Dataset for auto-reproduction training: token ID chunks from corpus shards."""
+"""Dataset yielding token ID chunks from tokenized corpus shards."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ import torch
 from torch.utils.data import Dataset
 
 
-class AutoReproDataset(Dataset):
-    """Dataset yielding token ID chunks for auto-reproduction training.
+class TokenChunkDataset(Dataset):
+    """Dataset yielding token ID chunks from tokenized corpus shards.
 
     Loads tokenized corpus shards (Parquet) and builds a flat index for
     random access. Files longer than ``max_seq_len`` are split into

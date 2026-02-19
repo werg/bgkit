@@ -13,6 +13,8 @@ from torch import nn
 from bgkit.data.collators import collate_chat_repro
 from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
+from bgkit.models.encoder import BgKITEncoder
+from bgkit.models.projection_block import ProjectionBlock
 from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
 # ---------------------------------------------------------------------------
@@ -32,7 +34,7 @@ class MockEncoderBackbone(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size, hidden_dim)
         self.layers = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim)])
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.norm = nn.Identity()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -41,6 +43,27 @@ class MockEncoderBackbone(nn.Module):
         x = self.layers[0](inputs_embeds)
         x = self.norm(x)
         return _Output(last_hidden_state=x)
+
+
+class MockTransformerLayer(nn.Module):
+    def __init__(self, hidden_dim: int = 64):
+        super().__init__()
+        self.linear = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
+        return self.linear(hidden_states)
+
+
+class MockRotaryEmb(nn.Module):
+    def __init__(self, hidden_dim: int = 64):
+        super().__init__()
+        self.dim = hidden_dim
+
+    def forward(self, x, position_ids):
+        seq_len = x.size(1)
+        cos = torch.ones(1, seq_len, self.dim, device=x.device, dtype=x.dtype)
+        sin = torch.zeros(1, seq_len, self.dim, device=x.device, dtype=x.dtype)
+        return cos, sin
 
 
 class _CausalLMOutput:
@@ -81,6 +104,20 @@ class MockCausalLMBackbone(nn.Module):
         return _CausalLMOutput(logits=logits)
 
 
+def _make_mock_encoder(hidden_dim: int = 64) -> BgKITEncoder:
+    """Create a mock BgKITEncoder for testing."""
+    backbone = MockEncoderBackbone(hidden_dim=hidden_dim)
+    compressor_norm = nn.LayerNorm(hidden_dim)
+    compressor = BgKITCompressor(backbone, compressor_norm, hidden_dim=hidden_dim)
+
+    proj_layer = MockTransformerLayer(hidden_dim)
+    proj_norm = nn.LayerNorm(hidden_dim)
+    rotary = MockRotaryEmb(hidden_dim)
+    projection_block = ProjectionBlock(proj_layer, proj_norm, rotary, hidden_dim=hidden_dim)
+
+    return BgKITEncoder(compressor, projection_block)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -107,11 +144,10 @@ def trainer():
     t = DecoderInitTrainer(cfg)
     t.device = torch.device("cpu")
 
-    # BgKIT (frozen)
-    bgkit_backbone = MockEncoderBackbone(hidden_dim=hidden_dim)
-    t.bgkit_model = BgKITCompressor(bgkit_backbone, hidden_dim=hidden_dim)
-    t.bgkit_model.requires_grad_(False)
-    t.bgkit_model.eval()
+    # BgKIT encoder (frozen)
+    t.encoder = _make_mock_encoder(hidden_dim=hidden_dim)
+    t.encoder.requires_grad_(False)
+    t.encoder.eval()
 
     # Decoder (trainable)
     decoder_backbone = MockCausalLMBackbone(hidden_dim=hidden_dim)
@@ -166,12 +202,12 @@ class TestDecoderInitTrainStep:
         assert torch.isfinite(torch.tensor(metrics["loss"]))
 
     def test_only_decoder_has_gradients(self, trainer):
-        """BgKIT should remain frozen, only decoder params should have grads."""
+        """BgKIT encoder should remain frozen, only decoder params should have grads."""
         trainer.train_step(_make_batch())
 
-        # BgKIT params should have no grad
-        for p in trainer.bgkit_model.parameters():
-            assert p.grad is None or (p.grad == 0).all(), "BgKIT should be frozen"
+        # BgKIT encoder params should have no grad
+        for p in trainer.encoder.parameters():
+            assert p.grad is None or (p.grad == 0).all(), "Encoder should be frozen"
 
         # Decoder should have non-zero grads
         has_grad = any(
@@ -267,7 +303,7 @@ class TestDecoderInitCheckpoint:
 
         # Verify expected files
         assert (Path(ckpt_path) / "metadata.json").exists()
-        assert (Path(ckpt_path) / "bgkit_model.pt").exists()
+        assert (Path(ckpt_path) / "encoder.pt").exists()
         assert (Path(ckpt_path) / "decoder.pt").exists()
         assert (Path(ckpt_path) / "optimizer.pt").exists()
 
@@ -346,11 +382,10 @@ def _make_frozen_trainer(num_layers: int = 4, lr: float = 1e-3,
     t = DecoderInitTrainer(cfg)
     t.device = torch.device("cpu")
 
-    # BgKIT (frozen)
-    bgkit_backbone = MockEncoderBackbone(hidden_dim=hidden_dim)
-    t.bgkit_model = BgKITCompressor(bgkit_backbone, hidden_dim=hidden_dim)
-    t.bgkit_model.requires_grad_(False)
-    t.bgkit_model.eval()
+    # BgKIT encoder (frozen)
+    t.encoder = _make_mock_encoder(hidden_dim=hidden_dim)
+    t.encoder.requires_grad_(False)
+    t.encoder.eval()
 
     # Decoder (trainable) with Qwen3-style nesting
     decoder_backbone = MockCausalLMBackbone(
@@ -471,7 +506,7 @@ class TestDifferentialLR:
             assert "base_lr" in g, "Param group should have base_lr"
 
     def test_single_layer_model(self):
-        """With 1 layer (frozen), no trainable layers — only norm group."""
+        """With 1 layer (frozen), no trainable layers -- only norm group."""
         t = _make_frozen_trainer(num_layers=1, lr=1e-3, lr_scale_bottom=0.1)
         # Only norm group (the single layer is frozen)
         assert len(t.optimizer.param_groups) == 1

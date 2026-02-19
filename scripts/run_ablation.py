@@ -19,19 +19,19 @@ import structlog
 import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from bgkit.data.collators import collate_chat_repro
-from bgkit.data.datasets.auto_repro_dataset import AutoReproDataset
 from bgkit.data.datasets.chat_repro_dataset import ChatReproDataset
+from bgkit.data.datasets.token_chunk_dataset import TokenChunkDataset
 from bgkit.data.samplers import TokenBudgetBatchSampler
 from bgkit.eval.ablations import (
     AblationCondition,
     compute_ablation_gap,
     run_ablation_suite,
 )
-from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
+from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.checkpointing import load_checkpoint
 from bgkit.utils.logging import setup_logging
 
@@ -76,17 +76,17 @@ def main(cfg: DictConfig) -> None:
     # Load models
     bgkit_cfg = cfg.model.bgkit
     hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
-    bgkit_backbone = AutoModel.from_pretrained(
+    encoder = BgKITEncoder.from_pretrained(
         bgkit_cfg.backbone_name,
+        hidden_dim=hidden_dim,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         revision=bgkit_cfg.get("backbone_revision"),
         attn_implementation="sdpa",
     )
-    bgkit_model = BgKITCompressor(bgkit_backbone, hidden_dim=hidden_dim)
-    bgkit_model.to(device)
-    bgkit_model.requires_grad_(False)
-    bgkit_model.eval()
+    encoder.to(device)
+    encoder.requires_grad_(False)
+    encoder.eval()
 
     decoder_cfg = cfg.model.decoder
     decoder_backbone = AutoModelForCausalLM.from_pretrained(
@@ -102,8 +102,10 @@ def main(cfg: DictConfig) -> None:
 
     # Load checkpoint weights
     _, state_dicts = load_checkpoint(Path(checkpoint_path))
-    if "bgkit_model" in state_dicts:
-        bgkit_model.load_state_dict(state_dicts["bgkit_model"])
+    if "encoder" in state_dicts:
+        encoder.load_state_dict(state_dicts["encoder"])
+    elif "bgkit_model" in state_dicts:
+        encoder.compressor.load_state_dict(state_dicts["bgkit_model"], strict=False)
     decoder.load_state_dict(state_dicts["decoder"])
 
     # Tokenizer
@@ -119,7 +121,7 @@ def main(cfg: DictConfig) -> None:
     variant_bank_path = cfg.data.get(
         "variant_bank_path", "data/prompt_variants/file_read_repro.json",
     )
-    inner_dataset = AutoReproDataset(data_dir, max_seq_len=max_seq_len)
+    inner_dataset = TokenChunkDataset(data_dir, max_seq_len=max_seq_len)
     chat_dataset = ChatReproDataset(
         inner_dataset, tokenizer=tokenizer, variant_bank_path=variant_bank_path,
     )
@@ -138,7 +140,7 @@ def main(cfg: DictConfig) -> None:
     # Run ablation suite
     results = run_ablation_suite(
         decoder=decoder,
-        bgkit_model=bgkit_model,
+        encoder=encoder,
         eval_dataloader=eval_dataloader,
         tokenizer=tokenizer,
         device=device,

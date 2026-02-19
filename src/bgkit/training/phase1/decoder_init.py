@@ -4,10 +4,10 @@ Train the reconstruction decoder to generate text from BgKIT's full
 (uncompressed) output representations, using Qwen3's native chat template
 with tool-call format for in-distribution agentic conversation.
 
-The BgKIT backbone is called directly (bypassing flag embeddings) since
-there's no compression in Step 1 — flag embeddings are untrained at this
-point and would corrupt the input. The prompt separator embedding is
-zero-initialized and frozen alongside the rest of BgKIT.
+The BgKIT encoder runs the full compressor + projection block pipeline
+without compression (survivor_mask=None). Prompt conditioning uses the
+encoder's forward method which handles prompt prepending and content
+slicing internally.
 
 Loss is computed only on the file content tokens inside the chat template's
 code fence (via loss_mask), so the decoder learns pure reconstruction.
@@ -20,16 +20,16 @@ from pathlib import Path
 import structlog
 import torch
 from torch.utils.data import DataLoader, random_split
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from bgkit.data.collators import collate_chat_repro
-from bgkit.data.datasets.auto_repro_dataset import AutoReproDataset
 from bgkit.data.datasets.chat_repro_dataset import ChatReproDataset
+from bgkit.data.datasets.token_chunk_dataset import TokenChunkDataset
 from bgkit.data.samplers import TokenBudgetBatchSampler
 from bgkit.eval.metrics.embedding_health import embedding_drift_metrics
 from bgkit.eval.metrics.reconstruction import parse_success_rate
-from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
+from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import clip_grad_norm, enable_gradient_checkpointing
@@ -42,37 +42,42 @@ class DecoderInitTrainer(BaseTrainer):
     """Step 1: Initialize decoder on uncompressed BgKIT output."""
 
     def setup(self) -> None:
-        """Load frozen BgKIT backbone and trainable decoder."""
+        """Load frozen BgKIT encoder and trainable decoder."""
         tcfg = self.cfg.training
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
 
-        # --- BgKIT backbone (frozen) ---
+        # --- BgKIT encoder (frozen) ---
         bgkit_cfg = self.cfg.model.bgkit
         backbone_name = bgkit_cfg.backbone_name
         backbone_revision = bgkit_cfg.get("backbone_revision", None)
         hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
-        logger.info("loading_bgkit_backbone", model=backbone_name, revision=backbone_revision)
-        bgkit_backbone = AutoModel.from_pretrained(
+        logger.info("loading_bgkit_encoder", model=backbone_name, revision=backbone_revision)
+        self.encoder = BgKITEncoder.from_pretrained(
             backbone_name,
+            hidden_dim=hidden_dim,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=backbone_revision,
             attn_implementation="sdpa",
         )
-        self.bgkit_model = BgKITCompressor(bgkit_backbone, hidden_dim=hidden_dim)
-        self.bgkit_model.to(device)
-        self.bgkit_model.requires_grad_(False)
-        self.bgkit_model.eval()
+        self.encoder.to(device)
+        self.encoder.requires_grad_(False)
+        self.encoder.eval()
 
-        # Load BgKIT from auto-repro checkpoint if available.
-        # Auto-repro checkpoints save under key "model"; step 1 checkpoints
-        # save under "bgkit_model". This path handles the auto-repro format.
+        # Load BgKIT from checkpoint if available.
+        # Joint block pretrain checkpoints save under key "encoder";
+        # legacy auto-repro checkpoints save under "model".
         bgkit_checkpoint = self.cfg.get("bgkit_checkpoint", None)
         if bgkit_checkpoint is not None:
             logger.info("loading_bgkit_checkpoint", path=bgkit_checkpoint)
             _, state_dicts = load_checkpoint(Path(bgkit_checkpoint))
-            self.bgkit_model.load_state_dict(state_dicts["model"])
+            if "encoder" in state_dicts:
+                self.encoder.load_state_dict(state_dicts["encoder"])
+            elif "model" in state_dicts:
+                # Legacy auto-repro checkpoint -- load into compressor only
+                logger.info("loading_legacy_auto_repro_checkpoint")
+                self.encoder.compressor.load_state_dict(state_dicts["model"], strict=False)
 
         # --- Decoder (trainable) ---
         decoder_cfg = self.cfg.model.decoder
@@ -95,7 +100,7 @@ class DecoderInitTrainer(BaseTrainer):
         self._apply_freeze()
 
         # torch.compile: ~15-30% speedup on Blackwell. If compile fails on sm_121,
-        # remove this line — training is correct without it.
+        # remove this line -- training is correct without it.
         try:
             self.decoder.backbone = torch.compile(self.decoder.backbone)
             logger.info("torch_compile_enabled")
@@ -121,7 +126,7 @@ class DecoderInitTrainer(BaseTrainer):
             "variant_bank_path", "data/prompt_variants/file_read_repro.json",
         )
 
-        inner_dataset = AutoReproDataset(data_dir, max_seq_len=max_seq_len)
+        inner_dataset = TokenChunkDataset(data_dir, max_seq_len=max_seq_len)
         full_dataset = ChatReproDataset(
             inner_dataset,
             tokenizer=self.tokenizer,
@@ -212,7 +217,7 @@ class DecoderInitTrainer(BaseTrainer):
             param_groups = [{"params": list(self.decoder.parameters()), "lr": tcfg.lr}]
 
         # 8-bit AdamW: reduces optimizer memory. If bnb causes issues,
-        # fall back to torch.optim.AdamW — correctness is unaffected.
+        # fall back to torch.optim.AdamW -- correctness is unaffected.
         try:
             import bitsandbytes as bnb
             self.optimizer = bnb.optim.AdamW8bit(param_groups, lr=tcfg.lr)
@@ -292,35 +297,25 @@ class DecoderInitTrainer(BaseTrainer):
         }
 
     def _compute_survivors(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Run content through frozen BgKIT and return survivor embeddings."""
+        """Run content through frozen BgKIT encoder and return output embeddings."""
         content_token_ids = batch["content_token_ids"].to(self.device)
         content_attention_mask = batch["content_attention_mask"].to(self.device)
         compression_prompt_ids = batch["compression_prompt_ids"].to(self.device)
         compression_prompt_mask = batch["compression_prompt_mask"].to(self.device)
 
-        bgkit_embed = self.bgkit_model.backbone.get_input_embeddings()
+        bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
         content_emb = bgkit_embed(content_token_ids)
         prompt_emb = bgkit_embed(compression_prompt_ids)
 
-        bgkit_out = self.bgkit_model.backbone(
-            inputs_embeds=torch.cat([
-                prompt_emb,
-                self.bgkit_model.prompt_separator_embedding.unsqueeze(0).unsqueeze(0).expand(
-                    content_emb.size(0), 1, -1,
-                ),
-                content_emb,
-            ], dim=1),
-            attention_mask=torch.cat([
-                compression_prompt_mask,
-                torch.ones(
-                    content_emb.size(0), 1,
-                    dtype=torch.bool, device=self.device,
-                ),
-                content_attention_mask,
-            ], dim=1),
+        # Run through encoder (compressor + projection block, no compression)
+        enc_out = self.encoder(
+            input_embeddings=content_emb,
+            survivor_mask=None,
+            attention_mask=content_attention_mask,
+            prompt_embeddings=prompt_emb,
+            prompt_attention_mask=compression_prompt_mask,
         )
-        prompt_len = compression_prompt_ids.size(1) + 1
-        return bgkit_out.last_hidden_state[:, prompt_len:, :]
+        return enc_out.survivor_embeddings
 
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
@@ -367,7 +362,7 @@ class DecoderInitTrainer(BaseTrainer):
             "perplexity": perplexity,
         }
 
-        # Generation metrics (expensive — only every Nth eval)
+        # Generation metrics (expensive -- only every Nth eval)
         tcfg = self.cfg.training
         gen_every = tcfg.get("eval", {}).get("generation_eval_every", 4)
         if self._eval_count % gen_every == 0:
@@ -431,7 +426,9 @@ class DecoderInitTrainer(BaseTrainer):
         # Embedding health
         if all_survivors:
             combined_survivors = torch.cat(all_survivors, dim=0)
-            token_emb = self.bgkit_model.backbone.get_input_embeddings().weight.detach()
+            token_emb = (
+                self.encoder.compressor.backbone.get_input_embeddings().weight.detach()
+            )
             health = embedding_drift_metrics(combined_survivors, token_emb)
             gen_metrics["mean_max_cosine_sim"] = health["mean_max_cosine_sim"]
             gen_metrics["std_max_cosine_sim"] = health["std_max_cosine_sim"]
@@ -439,7 +436,7 @@ class DecoderInitTrainer(BaseTrainer):
         return gen_metrics
 
     def save_checkpoint(self, checkpoint_dir: Path) -> Path:
-        """Save both BgKIT and decoder models."""
+        """Save both BgKIT encoder and decoder models."""
         metadata = CheckpointMetadata(
             phase=self.cfg.training.phase,
             step=self.global_step,
@@ -451,7 +448,7 @@ class DecoderInitTrainer(BaseTrainer):
         ckpt_path = save_checkpoint(
             checkpoint_dir,
             metadata,
-            bgkit_model=self.bgkit_model.state_dict(),
+            encoder=self.encoder.state_dict(),
             decoder=self.decoder.state_dict(),
             optimizer=self.optimizer.state_dict(),
         )
@@ -459,10 +456,13 @@ class DecoderInitTrainer(BaseTrainer):
         return ckpt_path
 
     def load_checkpoint(self, checkpoint_path: Path) -> None:
-        """Load both BgKIT and decoder models."""
+        """Load both BgKIT encoder and decoder models."""
         metadata, state_dicts = load_checkpoint(checkpoint_path)
-        if "bgkit_model" in state_dicts:
-            self.bgkit_model.load_state_dict(state_dicts["bgkit_model"])
+        if "encoder" in state_dicts:
+            self.encoder.load_state_dict(state_dicts["encoder"])
+        elif "bgkit_model" in state_dicts:
+            # Legacy checkpoint -- load into compressor only
+            self.encoder.compressor.load_state_dict(state_dicts["bgkit_model"], strict=False)
         self.decoder.load_state_dict(state_dicts["decoder"])
         if "optimizer" in state_dicts:
             self.optimizer.load_state_dict(state_dicts["optimizer"])

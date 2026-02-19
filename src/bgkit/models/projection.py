@@ -1,5 +1,10 @@
 """Projection MLP: BgKIT hidden dim (1024) -> target LLM hidden dim (2048).
 
+.. deprecated::
+    Replaced by :class:`bgkit.models.projection_block.ProjectionBlock` which
+    uses a full transformer layer for context-aware projection instead of a
+    simple MLP. Kept for potential ablation use.
+
 Maps BgKIT survivor embeddings into the target LLM's embedding space
 using the LLaVA paradigm. ~10M parameters.
 """

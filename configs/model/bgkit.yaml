@@ -18,5 +18,3 @@ bgkit:
     max_positions: 32768
     # L1 selection is effectively uniform (ICE not calibrated for survivors)
     ice_fraction: 0.0
-  # Auto-reproduction head
-  auto_reproduction: true

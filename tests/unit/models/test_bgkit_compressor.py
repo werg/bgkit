@@ -8,7 +8,7 @@ torch = pytest.importorskip("torch")
 
 from torch import nn
 
-from bgkit.models.bgkit_compressor import BgKITCompressor, CompressionOutput
+from bgkit.models.bgkit_compressor import BgKITCompressor, CompressorOutput
 from bgkit.models.components.drop_flag import pad_survivors
 
 # ---------------------------------------------------------------------------
@@ -26,7 +26,9 @@ class MockBackbone(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(1000, hidden_dim)
         self.layers = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim)])
-        self.norm = nn.LayerNorm(hidden_dim)
+        # norm is replaced with Identity by the encoder factory;
+        # here we just keep it as Identity since the compressor owns its own norm.
+        self.norm = nn.Identity()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -92,69 +94,75 @@ class TestBgKITCompressorForward:
     def compressor(self):
         hidden_dim = 64
         backbone = MockBackbone(hidden_dim=hidden_dim)
-        return BgKITCompressor(backbone, hidden_dim=hidden_dim)
+        norm = nn.LayerNorm(hidden_dim)
+        return BgKITCompressor(backbone, norm, hidden_dim=hidden_dim)
 
     def test_output_type(self, compressor):
-        """forward() should return a CompressionOutput."""
+        """forward() should return a CompressorOutput."""
+        batch_size, seq_len = 2, 10
+        x = torch.randn(batch_size, seq_len, 64)
+        out = compressor(x, survivor_mask=None)
+        assert isinstance(out, CompressorOutput)
+
+    def test_no_survivor_mask_shape(self, compressor):
+        """With no survivor_mask, output should have full sequence."""
+        batch_size, seq_len = 2, 10
+        x = torch.randn(batch_size, seq_len, 64)
+        out = compressor(x, survivor_mask=None)
+
+        assert out.raw_embeddings.shape == (batch_size, seq_len, 64)
+        assert out.normed_embeddings.shape == (batch_size, seq_len, 64)
+        assert out.content_slice == slice(0, None)
+
+    def test_with_survivor_mask_adds_flags(self, compressor):
+        """With survivor_mask, flag embeddings should be added."""
         batch_size, seq_len = 2, 10
         x = torch.randn(batch_size, seq_len, 64)
         mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
-        out = compressor(x, survivor_mask=mask)
-        assert isinstance(out, CompressionOutput)
 
-    def test_all_survivors_shape(self, compressor):
-        """With all-True mask, survivors should equal full sequence."""
-        batch_size, seq_len = 2, 10
-        x = torch.randn(batch_size, seq_len, 64)
-        mask = torch.ones(batch_size, seq_len, dtype=torch.bool)
-        out = compressor(x, survivor_mask=mask)
+        # Run with and without mask, outputs should differ (flag embeddings added)
+        out_no_mask = compressor(x, survivor_mask=None)
+        out_with_mask = compressor(x, survivor_mask=mask)
 
-        assert out.survivor_embeddings.shape == (batch_size, seq_len, 64)
-        assert out.all_embeddings.shape == (batch_size, seq_len, 64)
-        assert out.survivor_counts.tolist() == [seq_len, seq_len]
-        assert out.survivor_attention_mask.shape == (batch_size, seq_len)
-        assert out.survivor_attention_mask.all()
-
-    def test_partial_survivors(self, compressor):
-        """With partial mask, survivor shapes should match counts."""
-        x = torch.randn(2, 8, 64)
-        mask = torch.tensor([
-            [True, True, False, True, False, False, True, True],
-            [True, False, True, False, True, False, False, False],
-        ])
-        out = compressor(x, survivor_mask=mask)
-
-        assert out.survivor_counts.tolist() == [5, 3]
-        assert out.survivor_embeddings.shape == (2, 5, 64)  # max survivors = 5
-        assert out.survivor_attention_mask.shape == (2, 5)
-        assert out.survivor_attention_mask[0].tolist() == [True, True, True, True, True]
-        assert out.survivor_attention_mask[1].tolist() == [True, True, True, False, False]
-
-    def test_counts_match_mask(self, compressor):
-        """survivor_counts should equal number of True positions in survivor_mask."""
-        x = torch.randn(3, 6, 64)
-        mask = torch.randint(0, 2, (3, 6), dtype=torch.bool)
-        # Ensure at least one survivor per item
-        mask[:, 0] = True
-        out = compressor(x, survivor_mask=mask)
-
-        expected_counts = mask.sum(dim=1)
-        assert torch.equal(out.survivor_counts, expected_counts)
+        # They should differ because flag embeddings are added
+        assert not torch.allclose(out_no_mask.raw_embeddings, out_with_mask.raw_embeddings)
 
     def test_with_attention_mask(self, compressor):
         """Should work with an attention mask passed through."""
         x = torch.randn(2, 8, 64)
-        survivor_mask = torch.ones(2, 8, dtype=torch.bool)
         attention_mask = torch.ones(2, 8, dtype=torch.bool)
         attention_mask[0, 5:] = False  # padding
 
-        out = compressor(x, survivor_mask=survivor_mask, attention_mask=attention_mask)
-        assert out.survivor_embeddings.shape == (2, 8, 64)
+        out = compressor(x, survivor_mask=None, attention_mask=attention_mask)
+        assert out.raw_embeddings.shape == (2, 8, 64)
+        assert out.attention_mask is not None
 
     def test_gradient_flows(self, compressor):
         """Gradients should flow through the compressor."""
         x = torch.randn(1, 5, 64, requires_grad=True)
-        mask = torch.ones(1, 5, dtype=torch.bool)
-        out = compressor(x, survivor_mask=mask)
-        out.survivor_embeddings.sum().backward()
+        out = compressor(x, survivor_mask=None)
+        out.raw_embeddings.sum().backward()
         assert x.grad is not None
+
+    def test_normed_differs_from_raw(self, compressor):
+        """Normed embeddings should differ from raw embeddings."""
+        x = torch.randn(1, 5, 64)
+        out = compressor(x, survivor_mask=None)
+        # With LayerNorm, they should differ
+        assert not torch.allclose(out.raw_embeddings, out.normed_embeddings)
+
+    def test_content_slice_no_prompt(self, compressor):
+        """Without prompt, content_slice should be slice(0, None)."""
+        x = torch.randn(1, 5, 64)
+        out = compressor(x, survivor_mask=None)
+        assert out.content_slice == slice(0, None)
+
+    def test_content_slice_with_prompt(self, compressor):
+        """With prompt, content_slice should start after prompt+separator."""
+        x = torch.randn(1, 5, 64)
+        prompt = torch.randn(1, 3, 64)
+        out = compressor(x, survivor_mask=None, prompt_embeddings=prompt)
+        # prompt_len=3, separator=1, so prefix_len=4
+        assert out.content_slice == slice(4, None)
+        # Full sequence should be prompt+sep+content = 3+1+5=9
+        assert out.raw_embeddings.shape == (1, 9, 64)

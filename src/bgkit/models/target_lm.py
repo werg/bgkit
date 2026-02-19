@@ -62,7 +62,7 @@ class TargetLMWithInjection(nn.Module):
         Args:
             input_ids: (batch, seq_len) token ids with placeholder tokens at injection sites.
             input_embeds: (batch, seq_len, hidden_dim) token embeddings from the LLM.
-            projected_survivors: (batch, num_survivors, hidden_dim) from ProjectionMLP.
+            projected_survivors: (batch, num_survivors, hidden_dim) from ProjectionBlock.
             injection_positions: (batch, num_survivors) indices into seq_len.
 
         Returns:

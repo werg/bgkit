@@ -77,7 +77,7 @@ class MockTokenizer:
 
 
 class MockInnerDataset:
-    """Mock AutoReproDataset returning fixed samples."""
+    """Mock TokenChunkDataset returning fixed samples."""
 
     def __init__(self, samples: list[dict]):
         self._samples = samples

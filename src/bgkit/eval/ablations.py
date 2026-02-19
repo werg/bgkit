@@ -15,8 +15,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from bgkit.eval.metrics.reconstruction import parse_success_rate
-from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
+from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
 
 logger = structlog.get_logger()
@@ -53,7 +53,7 @@ def _modify_survivors(
 
 def run_ablation_suite(
     decoder: ReconstructionDecoder,
-    bgkit_model: BgKITCompressor,
+    encoder: BgKITEncoder,
     eval_dataloader: DataLoader,
     tokenizer,
     device: torch.device,
@@ -73,14 +73,14 @@ def run_ablation_suite(
 
     Args:
         decoder: Trained reconstruction decoder.
-        bgkit_model: Frozen BgKIT compressor.
+        encoder: Frozen BgKIT encoder.
         eval_dataloader: Evaluation dataloader yielding collated batches.
         tokenizer: Tokenizer for decoding (needed for generation metrics).
         device: Torch device.
         conditions: Which conditions to test (default: all three).
         max_examples: Maximum evaluation examples per condition.
         include_generation_metrics: Whether to run generation + parse_success_rate
-            (expensive). Default False — primary signal is loss gap.
+            (expensive). Default False -- primary signal is loss gap.
         suffix_ids: Constant 1D suffix token IDs for generation. Required when
             include_generation_metrics is True.
 
@@ -91,7 +91,7 @@ def run_ablation_suite(
         conditions = list(AblationCondition)
 
     decoder.eval()
-    bgkit_model.eval()
+    encoder.eval()
     results = []
 
     for condition in conditions:
@@ -114,30 +114,20 @@ def run_ablation_suite(
             compression_prompt_ids = batch["compression_prompt_ids"].to(device)
             compression_prompt_mask = batch["compression_prompt_mask"].to(device)
 
-            # Compute survivors via BgKIT
-            bgkit_embed = bgkit_model.backbone.get_input_embeddings()
+            # Compute survivors via BgKIT encoder
+            bgkit_embed = encoder.compressor.backbone.get_input_embeddings()
             content_emb = bgkit_embed(content_token_ids)
             prompt_emb = bgkit_embed(compression_prompt_ids)
 
             with torch.no_grad():
-                bgkit_out = bgkit_model.backbone(
-                    inputs_embeds=torch.cat([
-                        prompt_emb,
-                        bgkit_model.prompt_separator_embedding.unsqueeze(0).unsqueeze(0).expand(
-                            content_emb.size(0), 1, -1,
-                        ),
-                        content_emb,
-                    ], dim=1),
-                    attention_mask=torch.cat([
-                        compression_prompt_mask,
-                        torch.ones(
-                            content_emb.size(0), 1, dtype=torch.bool, device=device,
-                        ),
-                        content_attention_mask,
-                    ], dim=1),
+                enc_out = encoder(
+                    input_embeddings=content_emb,
+                    survivor_mask=None,
+                    attention_mask=content_attention_mask,
+                    prompt_embeddings=prompt_emb,
+                    prompt_attention_mask=compression_prompt_mask,
                 )
-                prompt_len = compression_prompt_ids.size(1) + 1
-                survivors = bgkit_out.last_hidden_state[:, prompt_len:, :]
+                survivors = enc_out.survivor_embeddings
 
                 # Apply ablation modification
                 survivors = _modify_survivors(survivors, condition)
@@ -204,7 +194,7 @@ def compute_ablation_gap(results: list[AblationResult]) -> dict[str, float]:
     """Compute present-vs-zeroed and present-vs-noise gaps.
 
     A positive gap means the 'present' condition is better (lower loss),
-    i.e., zeroed/noise hurt performance — the expected outcome if BgKIT
+    i.e., zeroed/noise hurt performance -- the expected outcome if BgKIT
     survivors carry signal.
 
     Returns:

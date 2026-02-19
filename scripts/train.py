@@ -26,10 +26,10 @@ def main(cfg: DictConfig) -> None:
 
         trainer = ICETrainer(cfg)
         trainer.train()
-    elif phase == "auto_repro":
-        from bgkit.training.auto_repro_trainer import AutoReproTrainer
+    elif phase == "joint_block_pretrain":
+        from bgkit.training.joint_block_trainer import JointBlockTrainer
 
-        trainer = AutoReproTrainer(cfg)
+        trainer = JointBlockTrainer(cfg)
         trainer.train()
     elif phase == "phase1_step1":
         from bgkit.training.phase1.decoder_init import DecoderInitTrainer

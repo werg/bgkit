@@ -21,18 +21,26 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from bgkit.models.components.drop_flag import extract_survivors, pad_survivors
+
+@dataclass
+class CompressorOutput:
+    """Dense output from the compressor (layers 0..N-2), before projection."""
+
+    raw_embeddings: torch.Tensor  # (B, L_full, D) un-normed, FULL sequence incl. prompt+sep
+    normed_embeddings: torch.Tensor  # (B, L_full, D) after compressor norm (for auto-repro)
+    attention_mask: torch.Tensor | None  # (B, L_full) mask for full sequence
+    content_slice: slice  # slice(prefix_len, None) -- where content starts in L_full
 
 
 @dataclass
 class CompressionOutput:
-    """Output from a BgKIT compression pass."""
+    """Output from a BgKIT compression pass (or uncompressed pass)."""
 
-    survivor_embeddings: torch.Tensor  # (batch, max_survivors, hidden_dim)
-    survivor_mask: torch.Tensor  # (batch, seq_len) bool mask of surviving positions
-    all_embeddings: torch.Tensor  # (batch, seq_len, hidden_dim) pre-drop embeddings
-    survivor_counts: torch.Tensor  # (batch,) int tensor of real survivor count per item
-    survivor_attention_mask: torch.Tensor  # (batch, max_survivors) bool mask for padded survivors
+    survivor_embeddings: torch.Tensor  # (B, max_survivors, D) or (B, L_content, D)
+    all_embeddings: torch.Tensor  # (B, L_content, D) pre-drop content embeddings
+    survivor_attention_mask: torch.Tensor  # (B, max_survivors) or (B, L_content) bool
+    survivor_mask: torch.Tensor | None = None  # (B, L_content) bool, None if no compression
+    survivor_counts: torch.Tensor | None = None  # (B,) int, None if no compression
 
 
 class BgKITCompressor(nn.Module):
@@ -42,15 +50,21 @@ class BgKITCompressor(nn.Module):
     - Learned binary embeddings for survive/doomed flags
     - Drop-flag mechanism for compression
     - Auto-reproduction output head
+
+    The compressor runs layers 0..N-2 of the backbone (the final layer is
+    extracted as the projection block). It owns a separate norm layer for
+    normalizing the output before auto-reproduction.
     """
 
     def __init__(
         self,
         backbone: nn.Module,
+        norm: nn.Module,
         hidden_dim: int = 1024,
     ):
         super().__init__()
         self.backbone = backbone
+        self.norm = norm
         self.hidden_dim = hidden_dim
 
         # Learned flag embeddings added to input representations
@@ -68,36 +82,42 @@ class BgKITCompressor(nn.Module):
     def forward(
         self,
         input_embeddings: torch.Tensor,
-        survivor_mask: torch.Tensor,
+        survivor_mask: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         prompt_embeddings: torch.Tensor | None = None,
         prompt_attention_mask: torch.Tensor | None = None,
-    ) -> CompressionOutput:
-        """Run a single compression level.
+    ) -> CompressorOutput:
+        """Run the compressor (layers 0..N-2) and return dense output.
 
         Args:
             input_embeddings: (batch, seq_len, hidden_dim) input token or survivor embeddings.
             survivor_mask: (batch, seq_len) bool mask -- True for survivors, False for doomed.
+                When None, flag embeddings are skipped entirely (used during pretraining
+                and decoder init when there's no compression).
             attention_mask: (batch, seq_len) optional padding mask for content.
             prompt_embeddings: (batch, prompt_len, hidden_dim) optional prompt embeddings
                 that condition compression. When provided, prepended with a learned separator
                 before the content. Prompt tokens attend and are attended to but are never
-                candidates for survival — only content positions get flag embeddings.
+                candidates for survival -- only content positions get flag embeddings.
             prompt_attention_mask: (batch, prompt_len) optional mask for prompt positions.
                 Required when prompt_embeddings is provided and prompts have variable length.
 
         Returns:
-            CompressionOutput with survivor embeddings extracted (content portion only).
+            CompressorOutput with dense embeddings for the full sequence (including prompt
+            if present). Survivor extraction is handled downstream by the projection block.
         """
-        batch_size, _seq_len, _ = input_embeddings.shape
+        batch_size = input_embeddings.size(0)
 
-        # Add flag embeddings to content positions only
-        flag_emb = torch.where(
-            survivor_mask.unsqueeze(-1),
-            self.survive_embedding,
-            self.doomed_embedding,
-        )
-        content_x = input_embeddings + flag_emb
+        # Add flag embeddings to content positions only (when compression is active)
+        if survivor_mask is not None:
+            flag_emb = torch.where(
+                survivor_mask.unsqueeze(-1),
+                self.survive_embedding,
+                self.doomed_embedding,
+            )
+            content_x = input_embeddings + flag_emb
+        else:
+            content_x = input_embeddings
 
         if prompt_embeddings is not None:
             prompt_len = prompt_embeddings.size(1)
@@ -128,38 +148,26 @@ class BgKITCompressor(nn.Module):
             else:
                 combined_mask = None
 
-            # Forward through backbone on full sequence
-            all_out = self.backbone(
-                inputs_embeds=x, attention_mask=combined_mask,
-            ).last_hidden_state
-
-            # Slice out only the content portion
-            all_embeddings = all_out[:, prefix_len:, :]
+            content_slice = slice(prefix_len, None)
         else:
-            # No prompt — original behavior
             x = content_x
-            all_embeddings = self.backbone(
-                inputs_embeds=x, attention_mask=attention_mask,
-            ).last_hidden_state
+            combined_mask = attention_mask
+            prefix_len = 0
+            content_slice = slice(0, None)
 
-        # Extract survivors per batch item (variable-length list)
-        survivor_list = extract_survivors(all_embeddings, survivor_mask)
+        # Forward through backbone (returns un-normed states since backbone.norm = Identity)
+        raw_out = self.backbone(
+            inputs_embeds=x, attention_mask=combined_mask,
+        ).last_hidden_state
 
-        # Pad into (batch, max_survivors, hidden_dim) + counts
-        padded_survivors, survivor_counts = pad_survivors(survivor_list)
+        # Apply compressor norm for auto-reproduction
+        normed_out = self.norm(raw_out)
 
-        # Build attention mask for padded survivors
-        max_survivors = padded_survivors.size(1)
-        survivor_attention_mask = torch.arange(
-            max_survivors, device=survivor_counts.device
-        ).unsqueeze(0) < survivor_counts.unsqueeze(1)
-
-        return CompressionOutput(
-            survivor_embeddings=padded_survivors,
-            survivor_mask=survivor_mask,
-            all_embeddings=all_embeddings,
-            survivor_counts=survivor_counts,
-            survivor_attention_mask=survivor_attention_mask,
+        return CompressorOutput(
+            raw_embeddings=raw_out,
+            normed_embeddings=normed_out,
+            attention_mask=combined_mask,
+            content_slice=content_slice,
         )
 
     def auto_reproduce(self, embeddings: torch.Tensor) -> torch.Tensor:

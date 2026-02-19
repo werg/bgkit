@@ -30,11 +30,11 @@ services:
       - WANDB_API_KEY=${WANDB_API_KEY}
     command: ["scripts/train.py", "+experiment=ice_train"]
 
-  train-auto-repro:
+  train-joint-block:
     <<: *gpu-common
     environment:
       - WANDB_API_KEY=${WANDB_API_KEY}
-    command: ["scripts/train.py", "+experiment=auto_repro_train"]
+    command: ["scripts/train.py", "+experiment=joint_block_pretrain"]
 
   train-phase1-step1:
     <<: *gpu-common
