@@ -321,7 +321,9 @@ class TestResume:
         assert trained_steps == [0, 1, 2, 3, 4]
 
         # Find the checkpoint that was saved (final checkpoint at step 4)
-        ckpt_dirs = sorted(ckpt_dir.iterdir())
+        ckpt_dirs = sorted(
+            p for p in ckpt_dir.iterdir() if p.is_dir()
+        )
         assert len(ckpt_dirs) == 1
         saved_ckpt = ckpt_dirs[0]
 

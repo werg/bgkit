@@ -84,11 +84,13 @@ class TestEarlyStopping:
         return OmegaConf.create(base)
 
     @patch.object(BaseTrainer, "save_checkpoint")
-    def test_stops_when_no_improvement(self, mock_save):
+    def test_stops_when_no_improvement(self, mock_save, tmp_path):
         """Should stop after patience evals without improvement."""
+        mock_save.return_value = tmp_path / "fake_ckpt"
         # Losses: first improves, then plateau
         losses = [1.0, 0.9, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85]
         cfg = self._make_cfg()
+        cfg.checkpoint_dir = str(tmp_path)
         trainer = _FakeTrainer(cfg, eval_losses=losses)
         trainer.train()
 
@@ -96,11 +98,13 @@ class TestEarlyStopping:
         assert trainer.global_step < 1000
 
     @patch.object(BaseTrainer, "save_checkpoint")
-    def test_continues_with_improvement(self, mock_save):
+    def test_continues_with_improvement(self, mock_save, tmp_path):
         """Should continue if loss keeps improving."""
+        mock_save.return_value = tmp_path / "fake_ckpt"
         # Steady improvement
         losses = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
         cfg = self._make_cfg(max_steps=100)
+        cfg.checkpoint_dir = str(tmp_path)
         trainer = _FakeTrainer(cfg, eval_losses=losses)
         trainer.train()
 
@@ -108,19 +112,23 @@ class TestEarlyStopping:
         assert trainer.global_step == 99  # last step
 
     @patch.object(BaseTrainer, "save_checkpoint")
-    def test_disabled_early_stopping(self, mock_save):
+    def test_disabled_early_stopping(self, mock_save, tmp_path):
         """With early_stopping disabled, should run to max_steps."""
+        mock_save.return_value = tmp_path / "fake_ckpt"
         losses = [1.0, 1.0, 1.0, 1.0, 1.0]
         cfg = self._make_cfg(max_steps=50, early_stopping=False)
+        cfg.checkpoint_dir = str(tmp_path)
         trainer = _FakeTrainer(cfg, eval_losses=losses)
         trainer.train()
 
         assert trainer.global_step == 49
 
     @patch.object(BaseTrainer, "save_checkpoint")
-    def test_missing_metric_raises(self, mock_save):
+    def test_missing_metric_raises(self, mock_save, tmp_path):
         """Should raise KeyError if metric not in eval results."""
+        mock_save.return_value = tmp_path / "fake_ckpt"
         cfg = self._make_cfg()
+        cfg.checkpoint_dir = str(tmp_path)
         # Override metric to something that doesn't exist
         cfg.training.early_stopping.metric = "eval/nonexistent"
         trainer = _FakeTrainer(cfg, eval_losses=[1.0])
@@ -128,11 +136,13 @@ class TestEarlyStopping:
             trainer.train()
 
     @patch.object(BaseTrainer, "save_checkpoint")
-    def test_min_delta_respected(self, mock_save):
+    def test_min_delta_respected(self, mock_save, tmp_path):
         """Small improvements below min_delta should not reset patience."""
+        mock_save.return_value = tmp_path / "fake_ckpt"
         # Tiny improvements (< min_delta=0.01)
         losses = [1.0, 0.998, 0.996, 0.994, 0.992, 0.990]
         cfg = self._make_cfg()
+        cfg.checkpoint_dir = str(tmp_path)
         trainer = _FakeTrainer(cfg, eval_losses=losses)
         trainer.train()
 

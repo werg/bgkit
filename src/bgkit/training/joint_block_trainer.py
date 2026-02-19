@@ -202,6 +202,12 @@ class JointBlockTrainer(BaseTrainer):
             w_proj=self.w_proj,
         )
 
+    def apply_live_config(self, changes: dict) -> None:
+        if "w_repro" in changes:
+            self.w_repro = changes["w_repro"]
+        if "w_proj" in changes:
+            self.w_proj = changes["w_proj"]
+
     def _get_input_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Get input embeddings from the compressor's backbone embedding layer."""
         return self.encoder.compressor.backbone.get_input_embeddings()(token_ids)
@@ -348,13 +354,16 @@ class JointBlockTrainer(BaseTrainer):
             "cosine_sim_proj": total_cosine_proj / max(n, 1),
         }
 
-    def save_checkpoint(self, checkpoint_dir: Path) -> Path:
+    def save_checkpoint(
+        self, checkpoint_dir: Path, metrics: dict[str, float] | None = None
+    ) -> Path:
         """Save encoder state dict with phase metadata."""
         metadata = CheckpointMetadata(
             phase=self.cfg.training.phase,
             step=self.global_step,
             epoch=self.epoch,
             parent_checkpoint=self._last_checkpoint_path,
+            metrics=metrics,
             schedule_params=self._schedule_params,
             training_state=self._training_state,
         )

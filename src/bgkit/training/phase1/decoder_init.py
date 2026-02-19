@@ -435,13 +435,16 @@ class DecoderInitTrainer(BaseTrainer):
 
         return gen_metrics
 
-    def save_checkpoint(self, checkpoint_dir: Path) -> Path:
+    def save_checkpoint(
+        self, checkpoint_dir: Path, metrics: dict[str, float] | None = None
+    ) -> Path:
         """Save both BgKIT encoder and decoder models."""
         metadata = CheckpointMetadata(
             phase=self.cfg.training.phase,
             step=self.global_step,
             epoch=self.epoch,
             parent_checkpoint=self._last_checkpoint_path,
+            metrics=metrics,
             schedule_params=self._schedule_params,
             training_state=self._training_state,
         )

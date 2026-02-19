@@ -21,6 +21,14 @@ batch_size: 32
 checkpoint_dir: ${oc.env:CHECKPOINT_DIR,./checkpoints}
 resume_checkpoint: null  # path to checkpoint dir for resume
 
+control_file: null  # optional path to live HP control JSON
+
+retry:
+  enabled: false
+  max_retries: 3
+  base_delay: 30.0
+  max_delay: 300.0
+
 wandb:
   enabled: true
   project: bgkit

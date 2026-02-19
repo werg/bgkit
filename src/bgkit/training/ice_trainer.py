@@ -146,6 +146,10 @@ class ICETrainer(BaseTrainer):
             device=str(device),
         )
 
+    def apply_live_config(self, changes: dict) -> None:
+        if "uniformity_reg_weight" in changes:
+            self.uniformity_weight = changes["uniformity_reg_weight"]
+
     def _embed_tokens(self, token_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Run frozen embedding model to get token embeddings.
 

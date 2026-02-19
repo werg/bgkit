@@ -13,7 +13,10 @@ from pathlib import Path
 import structlog
 from omegaconf import OmegaConf
 
+from bgkit.training.checkpoint_manager import CheckpointManager
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
+from bgkit.training.interruption import GracefulInterruptor
+from bgkit.training.live_config import LiveConfig
 from bgkit.training.scheduling import cosine_with_warmup
 
 logger = structlog.get_logger()
@@ -48,13 +51,16 @@ class BaseTrainer(ABC):
     def evaluate(self) -> dict[str, float]:
         """Run evaluation. Returns dict of metrics."""
 
-    def save_checkpoint(self, checkpoint_dir: Path) -> Path:
+    def save_checkpoint(
+        self, checkpoint_dir: Path, metrics: dict[str, float] | None = None
+    ) -> Path:
         """Save checkpoint with phase metadata and lineage."""
         metadata = CheckpointMetadata(
             phase=self.cfg.training.phase,
             step=self.global_step,
             epoch=self.epoch,
             parent_checkpoint=self._last_checkpoint_path,
+            metrics=metrics,
             schedule_params=self._schedule_params,
             training_state=self._training_state,
         )
@@ -92,6 +98,9 @@ class BaseTrainer(ABC):
         inner = getattr(dataset, "dataset", dataset)
         if hasattr(inner, "set_epoch"):
             inner.set_epoch(epoch)
+
+    def apply_live_config(self, changes: dict) -> None:  # noqa: B027
+        """Apply trainer-specific live config changes. Override in subclasses."""
 
     def train(self) -> None:
         """Main training loop.
@@ -226,91 +235,230 @@ class BaseTrainer(ABC):
             early_stopping=es_enabled,
         )
 
+        # Live config (file-based HP control)
+        control_file = self.cfg.get("control_file", None)
+        if control_file is None:
+            control_file = checkpoint_dir / "control.json"
+        live_config = LiveConfig(Path(control_file))
+
+        # Checkpoint pruning
+        prune_cfg = tcfg.get("checkpoint_pruning", {})
+        prune_enabled = prune_cfg.get("enabled", False) if prune_cfg else False
+        if prune_enabled:
+            ckpt_manager = CheckpointManager(
+                keep_best=prune_cfg.get("keep_best", 3),
+                keep_latest=prune_cfg.get("keep_latest", 2),
+                metric=prune_cfg.get("metric", es_metric),
+                lower_is_better=prune_cfg.get("lower_is_better", True),
+                phase=tcfg.phase,
+            )
+            ckpt_manager.load_existing(checkpoint_dir)
+        else:
+            ckpt_manager = None
+
+        last_eval_metrics: dict[str, float] | None = None
+        last_eval_step = -1
+
         stopped_early = False
-        for step in range(self.global_step, max_steps):
-            self.global_step = step
+        try:
+            with GracefulInterruptor() as interruptor:
+                for step in range(self.global_step, max_steps):
+                    self.global_step = step
 
-            # LR schedule
-            lr = cosine_with_warmup(step, max_steps, warmup_steps, base_lr)
-            for pg in self.optimizer.param_groups:
-                group_base = pg.get("base_lr", base_lr)
-                pg["lr"] = cosine_with_warmup(step, max_steps, warmup_steps, group_base)
-
-            # Get batch, cycling dataloader
-            try:
-                batch = next(dataloader_iter)
-            except StopIteration:
-                self.epoch += 1
-                self._sync_epoch(self.epoch)
-                dataloader_iter = iter(self.train_dataloader)
-                batch = next(dataloader_iter)
-
-            # Train step
-            metrics = self.train_step(batch)
-            metrics["lr"] = lr
-            if len(self.optimizer.param_groups) > 1:
-                metrics["lr_min"] = min(pg["lr"] for pg in self.optimizer.param_groups)
-
-            # Log
-            if step % 100 == 0:
-                logger.info("train_step", step=step, **metrics)
-            if wandb_run is not None:
-                wandb_run.log(metrics, step=step)
-
-            # Eval
-            if eval_every > 0 and step > 0 and step % eval_every == 0:
-                eval_metrics = self.evaluate()
-                eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
-                logger.info("eval", step=step, **eval_metrics)
-                if wandb_run is not None:
-                    wandb_run.log(eval_metrics, step=step)
-
-                # Early stopping check
-                if es_enabled:
-                    if es_metric not in eval_metrics:
-                        raise KeyError(
-                            f"Early stopping metric '{es_metric}' not found in eval "
-                            f"results. Available: {sorted(eval_metrics.keys())}. "
-                            f"Check training.early_stopping.metric config."
+                    # LR schedule
+                    lr = cosine_with_warmup(step, max_steps, warmup_steps, base_lr)
+                    for pg in self.optimizer.param_groups:
+                        group_base = pg.get("base_lr", base_lr)
+                        pg["lr"] = cosine_with_warmup(
+                            step, max_steps, warmup_steps, group_base
                         )
-                    current_val = eval_metrics[es_metric]
-                    if es_best is None or current_val < es_best - es_min_delta:
-                        es_best = current_val
-                        es_evals_without_improvement = 0
-                    else:
-                        es_evals_without_improvement += 1
-                        if es_evals_without_improvement >= es_patience:
-                            logger.info(
-                                "early_stopping",
-                                step=step,
-                                metric=es_metric,
-                                best=es_best,
-                                patience=es_patience,
-                            )
-                            stopped_early = True
-                            break
 
-            # Checkpoint
-            if save_every > 0 and step > 0 and step % save_every == 0:
+                    # Get batch, cycling dataloader
+                    try:
+                        batch = next(dataloader_iter)
+                    except StopIteration:
+                        self.epoch += 1
+                        self._sync_epoch(self.epoch)
+                        dataloader_iter = iter(self.train_dataloader)
+                        batch = next(dataloader_iter)
+
+                    # Train step
+                    metrics = self.train_step(batch)
+                    metrics["lr"] = lr
+                    if len(self.optimizer.param_groups) > 1:
+                        metrics["lr_min"] = min(
+                            pg["lr"] for pg in self.optimizer.param_groups
+                        )
+
+                    # Log
+                    if step % 100 == 0:
+                        logger.info("train_step", step=step, **metrics)
+                    if wandb_run is not None:
+                        wandb_run.log(metrics, step=step)
+
+                    # Eval
+                    if eval_every > 0 and step > 0 and step % eval_every == 0:
+                        eval_metrics = self.evaluate()
+                        eval_metrics = {
+                            f"eval/{k}": v for k, v in eval_metrics.items()
+                        }
+                        logger.info("eval", step=step, **eval_metrics)
+                        if wandb_run is not None:
+                            wandb_run.log(eval_metrics, step=step)
+
+                        last_eval_metrics = eval_metrics
+                        last_eval_step = step
+
+                        # Early stopping check
+                        if es_enabled:
+                            if es_metric not in eval_metrics:
+                                raise KeyError(
+                                    f"Early stopping metric '{es_metric}' not "
+                                    f"found in eval results. Available: "
+                                    f"{sorted(eval_metrics.keys())}. "
+                                    f"Check training.early_stopping.metric "
+                                    f"config."
+                                )
+                            current_val = eval_metrics[es_metric]
+                            if (
+                                es_best is None
+                                or current_val < es_best - es_min_delta
+                            ):
+                                es_best = current_val
+                                es_evals_without_improvement = 0
+                            else:
+                                es_evals_without_improvement += 1
+                                if es_evals_without_improvement >= es_patience:
+                                    logger.info(
+                                        "early_stopping",
+                                        step=step,
+                                        metric=es_metric,
+                                        best=es_best,
+                                        patience=es_patience,
+                                    )
+                                    stopped_early = True
+                                    break
+
+                    # Live config polling
+                    changes = live_config.poll()
+                    if changes:
+                        # Apply LR changes
+                        if "lr" in changes:
+                            new_lr = changes["lr"]
+                            old_base_lr = base_lr
+                            if (
+                                isinstance(new_lr, (int, float))
+                                and new_lr > 0
+                                and old_base_lr > 0
+                            ):
+                                ratio = new_lr / old_base_lr
+                                base_lr = new_lr
+                                self._schedule_params["base_lr"] = base_lr
+                                for pg in self.optimizer.param_groups:
+                                    pg["base_lr"] = (
+                                        pg.get("base_lr", old_base_lr) * ratio
+                                    )
+                                logger.info(
+                                    "live_lr_update",
+                                    old_lr=old_base_lr,
+                                    new_lr=base_lr,
+                                    ratio=ratio,
+                                )
+
+                        # Apply early stopping patience
+                        if "early_stopping_patience" in changes:
+                            new_patience = changes["early_stopping_patience"]
+                            if isinstance(new_patience, int) and new_patience > 0:
+                                es_patience = new_patience
+                                logger.info(
+                                    "live_es_patience_update",
+                                    patience=es_patience,
+                                )
+
+                        # Apply trainer-specific changes (loss weights, etc.)
+                        self.apply_live_config(changes)
+
+                    # Checkpoint
+                    saved_this_step = False
+                    if save_every > 0 and step > 0 and step % save_every == 0:
+                        self._training_state = {
+                            "es_best": es_best,
+                            "es_evals_without_improvement": (
+                                es_evals_without_improvement
+                            ),
+                            "wandb_run_id": (
+                                wandb_run.id if wandb_run is not None else None
+                            ),
+                        }
+                        step_metrics = (
+                            last_eval_metrics if last_eval_step == step else None
+                        )
+                        ckpt_path = self.save_checkpoint(
+                            checkpoint_dir, metrics=step_metrics
+                        )
+                        if ckpt_manager is not None:
+                            ckpt_manager.record(ckpt_path, step, step_metrics)
+                            ckpt_manager.prune()
+                        (checkpoint_dir / ".last_checkpoint").write_text(
+                            str(ckpt_path)
+                        )
+                        saved_this_step = True
+
+                    # Graceful shutdown check
+                    if interruptor.should_stop:
+                        if not saved_this_step:
+                            self._training_state = {
+                                "es_best": es_best,
+                                "es_evals_without_improvement": (
+                                    es_evals_without_improvement
+                                ),
+                                "wandb_run_id": (
+                                    wandb_run.id
+                                    if wandb_run is not None
+                                    else None
+                                ),
+                            }
+                            ckpt_path = self.save_checkpoint(checkpoint_dir)
+                            if ckpt_manager is not None:
+                                ckpt_manager.record(ckpt_path, step, None)
+                                ckpt_manager.prune()
+                            (checkpoint_dir / ".last_checkpoint").write_text(
+                                str(ckpt_path)
+                            )
+                        logger.info(
+                            "graceful_shutdown_complete",
+                            step=step,
+                            signal=interruptor.received_signal.name
+                            if interruptor.received_signal
+                            else None,
+                        )
+                        return
+
+                # Final eval + checkpoint
+                eval_metrics = self.evaluate()
+                eval_metrics = {
+                    f"eval/{k}": v for k, v in eval_metrics.items()
+                }
+                logger.info("final_eval", **eval_metrics)
                 self._training_state = {
                     "es_best": es_best,
                     "es_evals_without_improvement": es_evals_without_improvement,
-                    "wandb_run_id": wandb_run.id if wandb_run is not None else None,
+                    "wandb_run_id": (
+                        wandb_run.id if wandb_run is not None else None
+                    ),
                 }
-                self.save_checkpoint(checkpoint_dir)
-
-        # Final eval + checkpoint
-        eval_metrics = self.evaluate()
-        logger.info("final_eval", **eval_metrics)
-        self._training_state = {
-            "es_best": es_best,
-            "es_evals_without_improvement": es_evals_without_improvement,
-            "wandb_run_id": wandb_run.id if wandb_run is not None else None,
-        }
-        self.save_checkpoint(checkpoint_dir)
-
-        if wandb_run is not None:
-            wandb_run.finish()
+                ckpt_path = self.save_checkpoint(
+                    checkpoint_dir, metrics=eval_metrics
+                )
+                if ckpt_manager is not None:
+                    ckpt_manager.record(
+                        ckpt_path, self.global_step, eval_metrics
+                    )
+                    ckpt_manager.prune()
+                (checkpoint_dir / ".last_checkpoint").write_text(str(ckpt_path))
+        finally:
+            if wandb_run is not None:
+                wandb_run.finish()
 
         if stopped_early:
             logger.info("training_complete_early_stop", total_steps=self.global_step)

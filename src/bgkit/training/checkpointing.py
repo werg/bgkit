@@ -76,7 +76,10 @@ def load_checkpoint(checkpoint_path: Path) -> tuple[CheckpointMetadata, dict]:
     """
     meta_path = checkpoint_path / "metadata.json"
     meta_dict = json.loads(meta_path.read_text())
-    metadata = CheckpointMetadata(**meta_dict)
+    # Filter to known fields for forward-compatibility: a checkpoint saved by
+    # newer code may contain extra metadata keys unknown to this version.
+    known_fields = {f.name for f in CheckpointMetadata.__dataclass_fields__.values()}
+    metadata = CheckpointMetadata(**{k: v for k, v in meta_dict.items() if k in known_fields})
 
     state_dicts = {}
     for pt_file in sorted(checkpoint_path.glob("*.pt")):
