@@ -21,17 +21,21 @@
 
 ### 1.1 Multi-Target Projection
 
-BgKIT can serve multiple target LLMs via separate projection heads sharing the same backbone:
+BgKIT can serve multiple target LLMs via separate projection blocks sharing the same compressor backbone:
 
 ```
-                    ┌─ Projection MLP (Qwen-Coder)  → Qwen3-Coder-Next
-BgKIT survivors ────┤─ Projection MLP (GLM)         → GLM-4.7-Flash
-                    └─ Projection MLP (Qwen-4B)     → Qwen3 4B 2507
+                       ┌─ Projection block (Qwen-Coder, 2048-dim)  → Qwen3-Coder-Next
+BgKIT compressor ──────┤─ Projection block (GLM, 4096-dim)         → GLM-4.7-Flash
+                       └─ Projection block (Qwen-4B, 2560-dim)     → Qwen3 4B 2507
 ```
 
-Each projection MLP is ~10M parameters. During Phase 1, auxiliary multi-target losses can be trained simultaneously: each frozen target LLM receives projected survivors and computes next-token prediction loss, with gradients flowing back through the projection heads into BgKIT. Auxiliary losses weighted 0.1–0.3× relative to the decoder's reconstruction loss. This would help BgKIT develop target-agnostic representations.
+The v1 projection block (~25M parameters at native 1024-dim) is extended for higher-dimensional targets via **block-diagonal parameter initialization**: existing pretrained weights occupy the original-dimension subspace, and new parameters are added for the extra dimensions, initialized near-zero. At initialization the block behaves like the pretrained version on the original dimensions with zero cross-interaction; fine-tuning then learns the cross-terms. This is strictly better than random initialization of a full target-dim block — the learned attention patterns and MLP transformations in the original subspace transfer directly.
 
-**Cross-platform transfer test:** After v1, evaluate adaptation to a new LLM by training only a fresh projection MLP with BgKIT frozen. If this works well, it validates the architecture's reusability.
+For each new target, the projection block can be distillation-pretrained on token embedding alignment (compressor output → target model's token embeddings via MSE/cosine loss) before connecting to the real end-to-end task. This provides a warm start regardless of how different the target's embedding space is.
+
+During Phase 1, auxiliary multi-target losses can be trained simultaneously: each frozen target LLM receives projected survivors and computes next-token prediction loss, with gradients flowing back through the projection blocks into the compressor. Auxiliary losses weighted 0.1–0.3× relative to the decoder's reconstruction loss. This would help the compressor develop target-agnostic representations.
+
+**Cross-platform transfer test:** After v1, evaluate adaptation to a new LLM by training only a fresh (block-diagonally extended) projection block with the compressor frozen. If this works well, it validates the architecture's reusability.
 
 ### 1.2 Phase 2a: Attention Priming
 
@@ -41,7 +45,7 @@ Two mechanisms to strengthen attention pathways to BgKIT positions early in Phas
 
 **Mechanism 2 — Description generation bridge task.** The LLM generates natural-language repository descriptions conditioned on BgKIT survivors. Validates end-to-end information survival with gentler signal than coding tasks.
 
-**Proposed data mix if used:** ~20% privileged-encoding tasks, ~40% standard tasks with real encodings, ~25% description generation bridge, ~15% without injection. Higher learning rate for projection MLP (2–3× the Phase 2 base rate).
+**Proposed data mix if used:** ~20% privileged-encoding tasks, ~40% standard tasks with real encodings, ~25% description generation bridge, ~15% without injection. Higher learning rate for projection block (2–3× the Phase 2 base rate).
 
 **Risk:** Privileged encodings could teach the model a dependency on information that won't be present at inference. Should be short and carefully annealed.
 
@@ -136,9 +140,9 @@ Two options, both with justifications:
 
 ### 4.2 Weight Sharing Across Levels
 
-The plan uses shared weights for level 0 and level 1. The auto-reproduction trick (mapping outputs back to input space) is intended to keep the input distributions compatible, but level 0 processes natural token distributions while level 1 processes curated, compressed survivors. These may require different attention patterns.
+The plan uses shared compressor weights for level 0 and level 1. The auto-reproduction objective in joint block pretraining (which regularizes the compressor's output toward its own input embedding space) is intended to keep the input distributions compatible. However, level 0 processes natural token distributions while level 1 processes curated, compressed survivors. These may require different attention patterns.
 
-**Fallback:** Separate LoRA adapters per level on top of shared base weights. This should be an explicit ablation (shared vs. per-level adapters) and a hard go/no-go gate, not an afterthought.
+**Fallback:** Separate LoRA adapters per level on top of shared compressor base weights. This should be an explicit ablation (shared vs. per-level adapters) and a hard go/no-go gate, not an afterthought.
 
 ### 4.3 Promptable Compression at Inference
 
@@ -151,12 +155,13 @@ This tension needs resolution. Most likely the right answer is generic prompts f
 
 ### 4.4 BgKIT Freezing in Phase 2
 
-The core training plan lists this as an early experiment. Two options:
+The core training plan lists this as an early experiment. Multiple configurations:
 
-- **Frozen BgKIT:** Train only projection MLP + target LLM LoRA. Simpler training graph, no risk of representational degradation. Analogous to frozen vision encoders in VLM training.
-- **Unfrozen BgKIT:** End-to-end gradients through the full pipeline. BgKIT's compression may improve, but Phase 1's representations might degrade under target-LLM-driven gradients.
+- **Frozen compressor + frozen projection block:** Train only target LLM LoRA. Simplest, no risk of representational degradation. Analogous to frozen vision encoders in VLM training.
+- **Frozen compressor + unfrozen projection block:** Train projection block + target LLM LoRA. The projection block adapts to the target LLM while the compressor's representations stay stable.
+- **Unfrozen compressor + unfrozen projection block:** End-to-end gradients through the full pipeline. Compression may improve, but Phase 1's representations might degrade under target-LLM-driven gradients.
 
-BgKIT's encoder may not be "good enough" after Phase 1 the way a pretrained CLIP is — Phase 1 trains new capabilities (compression, consolidation) that may benefit from further refinement. But frozen is safer and strongly preferred if performance is comparable.
+The compressor may not be "good enough" after Phase 1 the way a pretrained CLIP is — Phase 1 trains new capabilities (compression, consolidation) that may benefit from further refinement. But frozen compressor is safer and strongly preferred if performance is comparable. The projection block is more likely to benefit from continued training since it directly interfaces with the target LLM.
 
 ### 4.5 Knowledge Source Ablation During Training
 
@@ -164,7 +169,7 @@ Randomly omit individual tool-call knowledge frames (independently, ~20% drop pr
 
 ### 4.6 Alternative BgKIT Source: Weight Merge
 
-SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), combining embedding quality with predictive modeling. Evaluated via auto-reproduction quality (the prerequisite step). Use the embedding model alone if no merge improves over it.
+SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), combining embedding quality with predictive modeling. Evaluated via joint block pretraining quality — both auto-reproduction (layer 26) and decoder projection (layer 27) metrics (the prerequisite step). Use the embedding model alone if no merge improves over it.
 
 ---
 
@@ -180,9 +185,9 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 ### 5.2 Gradient Flow Through Recursive Application
 
-**Risk:** End-to-end backpropagation from target LLM loss through projection MLP, through level 1, through level 0 is a deep computation graph with shared weights. Vanishing or exploding gradients.
+**Risk:** End-to-end backpropagation from target LLM loss through the projection block, through level 1, through level 0 is a deep computation graph with shared weights. Vanishing or exploding gradients.
 
-**Mitigation:** Gradient checkpointing, separate learning rates for projection vs. BgKIT layers, and a curriculum of verifiable knowledge extraction at every level. Freezing BgKIT during Phase 2 (Section 4.4) eliminates this risk entirely if viable.
+**Mitigation:** The compressor is one layer shorter (27 vs 28 layers) than the full base model, marginally helping gradient flow. More importantly: gradient checkpointing, separate learning rates for the projection block vs. compressor layers, and a curriculum of verifiable knowledge extraction at every level. Freezing the compressor during Phase 2 (Section 4.4) eliminates the deepest gradient path if viable.
 
 ### 5.3 ICE Calibration at Level 1+
 
@@ -232,7 +237,7 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 **Risk:** The entire projection pipeline is trained against a specific target LLM's embedding space. If that model's architecture or embedding space changes in the next release, everything from Phase 1 Step 3 onward needs retraining.
 
-**Mitigation:** Multi-target projection (Section 1.1) helps BgKIT's internal representations stay target-agnostic. But in v1, this risk is accepted. The key question is whether BgKIT's output space is stable enough that adapting to a new target requires only a fresh projection MLP (cheap) rather than full Phase 2 retraining (expensive).
+**Mitigation:** Multi-target projection (Section 1.1) helps the compressor's internal representations stay target-agnostic. But in v1, this risk is accepted. The key question is whether the compressor's output space is stable enough that adapting to a new target requires only a fresh projection block (cheap, with block-diagonal warm-start from the v1 block) rather than full Phase 2 retraining (expensive).
 
 ### 5.9 Decoder Co-Adaptation
 
@@ -295,7 +300,7 @@ Beyond the mandatory survivors-present vs. zeroed ablation:
 
 ## 8. Deferred Evaluation Dimensions
 
-- **Cross-platform transfer:** Adaptation to a new target LLM by training only a fresh projection MLP (frozen BgKIT). How much performance is retained?
+- **Cross-platform transfer:** Adaptation to a new target LLM by training only a fresh projection block (block-diagonally extended from v1, frozen compressor). How much performance is retained?
 - **Coding style preservation:** Does BgKIT context help the model match repository-specific conventions?
 - **Temporal reasoning:** With commit history as a knowledge source, can the model reason about what changed recently and why?
 - **User personalization:** With user memories as a knowledge source, does the model adapt behavior to user preferences?

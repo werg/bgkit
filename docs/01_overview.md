@@ -14,11 +14,15 @@ A Background Knowledge Interaction Transformer (BgKIT) hierarchically compresses
 
 ## Architecture
 
-BgKIT is a single transformer network (~600M parameters) derived from a pre-trained embedding model (Qwen3-Embedding-0.6B), applied recursively at two compression levels:
+BgKIT is a single transformer network (~600M parameters) derived from a pre-trained embedding model (Qwen3-Embedding-0.6B). The architecture separates the base model's layers into two functional components:
 
-**Level 0 (within-file):** Each chunk is processed independently. BgKIT performs bidirectional self-attention over the full token sequence, then compresses via a drop-flag mechanism: positions are pre-labeled as "survive" or "doomed," and the network consolidates information from doomed positions into survivors during the forward pass. Survivors are retained; doomed positions are discarded. Parallelizable across files, analogous to how embeddings for an entire document are sometimes extracted just from the <eos> position, but applied to variable compression ratios.
+**BgKIT compressor (layers 0 through N-2):** The bulk of the encoder, responsible for compression and recursive re-representation. Applied at two compression levels with shared weights:
 
-**Level 1 (cross-file):** All level 0 survivors across all files, prepended with file metadata (path, language), enter a single BgKIT pass with shared weights. Cross-file interaction occurs via self-attention — dependency structures, shared API contracts, module boundaries — and further compression produces the final output positions.
+**Level 0 (within-file):** Each chunk is processed independently. The compressor performs bidirectional self-attention over the full token sequence, then compresses via a drop-flag mechanism: positions are pre-labeled as "survive" or "doomed," and the network consolidates information from doomed positions into survivors during the forward pass. Survivors are retained; doomed positions are discarded. Parallelizable across files, analogous to how embeddings for an entire document are sometimes extracted just from the <eos> position, but applied to variable compression ratios.
+
+**Level 1 (cross-file):** All level 0 survivors across all files, prepended with file metadata (path, language), enter a single compressor pass with shared weights. Cross-file interaction occurs via self-attention — dependency structures, shared API contracts, module boundaries — and further compression produces the final output positions.
+
+**Projection block (layer N-1):** The final transformer block of the base model, separated from the compressor and repurposed as a context-aware projection module. It receives the compressor's output for all positions (not just survivors), performs self-attention over the full sequence, and produces projected embeddings only for survivor positions. This is more expressive than a pointwise MLP — each survivor's projection can attend to the full context including doomed positions, enabling holistic, position-aware mapping into the target decoder's embedding space. For target models with different hidden dimensions, the block is extended via block-diagonal parameter initialization (preserving pretrained weights in the original-dimension subspace while adding new capacity for the extra dimensions).
 
 **Reconstruction decoder:** A separate small causal LM (Qwen3-0.6B) is co-trained to reconstruct content from BgKIT's compressed representations, providing the primary training signal for compression quality.
 
@@ -26,7 +30,7 @@ BgKIT is a single transformer network (~600M parameters) derived from a pre-trai
 
 ## Injection into the Target LLM
 
-Survivors are mapped via a learned projection MLP from BgKIT's hidden dimension into the target LLM's embedding space (the LLaVA paradigm). Dense vectors are framed as **tool-call responses** in the target LLM's input — each knowledge source is a named tool whose "response" contains the projected vectors:
+Survivors are mapped via the learned projection block from BgKIT's hidden dimension into the target LLM's embedding space (the LLaVA paradigm). Dense vectors are framed as **tool-call responses** in the target LLM's input — each knowledge source is a named tool whose "response" contains the projected vectors:
 
 ```
 <tool_call>bgkit_repo_contents</tool_call>
@@ -52,9 +56,11 @@ Repository file contents are the focus of v1. Other sources are extensions using
 
 ## Training
 
+**Prerequisites — Joint block pretraining:** The compressor's penultimate block is trained to reproduce input embeddings (auto-reproduction) while the projection block is trained to produce decoder-compatible embeddings, jointly in a single forward pass. This simultaneously establishes the compressor's output space for recursive compression and warm-starts the projection block for decoder readability.
+
 **Phase 1 — BgKIT pre-training:** Train BgKIT's compression and the reconstruction decoder on code repositories. The decoder reconstructs original content from compressed survivors, providing gradient signal for consolidation quality. Multiple complementary objectives (data reconstruction, description generation, structural QA, commit reproduction) ensure survivors preserve diverse information types.
 
-**Phase 2 — End-to-end injection:** Train the full pipeline (BgKIT → projection MLP → target LLM with LoRA) on agentic coding tasks derived from commit history. The target LLM learns to attend to and use dense BgKIT vectors for file retrieval guidance, structural reasoning, and code generation.
+**Phase 2 — End-to-end injection:** Train the full pipeline (BgKIT compressor → projection block → target LLM with LoRA) on agentic coding tasks derived from commit history. The target LLM learns to attend to and use dense BgKIT vectors for file retrieval guidance, structural reasoning, and code generation.
 
 ## Deployment
 

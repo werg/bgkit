@@ -4,17 +4,17 @@
 
 ## What
 
-BgKIT is a ~600M transformer (Qwen3-Embedding-0.6B) that recursively compresses a codebase into a compact set of survivor embeddings via a drop-flag mechanism. A projection MLP maps these into the target LLM's embedding space (LLaVA-style), where they're framed as tool-call responses. The target LLM receives a compressed, variable-sized representation of the entire repo without consuming text context.
+BgKIT is a ~600M transformer (Qwen3-Embedding-0.6B) that recursively compresses a codebase into a compact set of survivor embeddings via a drop-flag mechanism. A projection block (the encoder's last transformer layer, repurposed) maps these into the target LLM's embedding space (LLaVA-style), where they're framed as tool-call responses. The target LLM receives a compressed, variable-sized representation of the entire repo without consuming text context.
 
 ## Architecture
 
 ```
 Files → [ICE budget allocation] → [Level 0: within-file compression]
-     → [Level 1: cross-file compression] → [Projection MLP]
+     → [Level 1: cross-file compression] → [Projection block]
      → Target LLM (as tool-call response embeddings)
 ```
 
-**Components**: ICE (2-5M, budget allocator), BgKIT compressor (600M, shared weights L0/L1), reconstruction decoder (600M, training signal), projection MLP (10M), target LLM LoRA adapters.
+**Components**: ICE (2-5M, budget allocator), BgKIT compressor (layers 0-26, ~580M, shared weights L0/L1), projection block (layer 27, ~25M, context-aware projection), reconstruction decoder (600M, training signal), target LLM LoRA adapters.
 
 ## Training
 
