@@ -34,6 +34,7 @@ from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import clip_grad_norm, enable_gradient_checkpointing
 from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
+from bgkit.training.scheduling import cosine_with_warmup
 
 logger = structlog.get_logger()
 
@@ -44,6 +45,13 @@ class DecoderInitTrainer(BaseTrainer):
     def setup(self) -> None:
         """Load frozen BgKIT encoder and trainable decoder."""
         tcfg = self.cfg.training
+
+        # Config validation
+        if tcfg.get("projection_only_steps", 0) > 0 and not tcfg.get(
+            "train_projection_block", True
+        ):
+            raise ValueError("projection_only_steps > 0 requires train_projection_block: true")
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
 
@@ -64,6 +72,10 @@ class DecoderInitTrainer(BaseTrainer):
         self.encoder.to(device)
         self.encoder.requires_grad_(False)
         self.encoder.eval()
+
+        # Projection block training flags
+        self._train_projection = tcfg.get("train_projection_block", True)
+        self._projection_only_steps = tcfg.get("projection_only_steps", 0)
 
         # Load BgKIT from checkpoint if available.
         # Joint block pretrain checkpoints save under key "encoder";
@@ -95,9 +107,6 @@ class DecoderInitTrainer(BaseTrainer):
         self.decoder.to(device)
 
         enable_gradient_checkpointing(self.decoder.backbone)
-
-        # --- Conditional freeze of top layer ---
-        self._apply_freeze()
 
         # torch.compile: ~15-30% speedup on Blackwell. If compile fails on sm_121,
         # remove this line -- training is correct without it.
@@ -178,8 +187,8 @@ class DecoderInitTrainer(BaseTrainer):
             pin_memory=pin_memory,
         )
 
-        # --- Optimizer ---
-        self._setup_optimizer()
+        # --- Optimizer (with projection-aware freeze/unfreeze) ---
+        self._configure_trainable_state()
 
         logger.info(
             "decoder_init_trainer_setup",
@@ -206,20 +215,82 @@ class DecoderInitTrainer(BaseTrainer):
             lr_scale_bottom=tcfg.get("lr_scale_bottom", 0.1),
         )
 
+    def _configure_trainable_state(self) -> None:
+        """Set requires_grad flags and build optimizer based on current global_step.
+
+        Called by setup() (global_step=0) and load_checkpoint() (after restoring
+        global_step). Makes freeze/optimizer state a pure function of step position.
+        """
+        # Projection block: unfreeze and set to train mode (dropout etc.)
+        if self._train_projection:
+            self.encoder.projection_block.requires_grad_(True)
+            self.encoder.projection_block.train()
+
+        # Decoder: frozen during projection-only warmup, unfrozen after
+        self._decoder_frozen = (
+            self._projection_only_steps > 0
+            and self.global_step < self._projection_only_steps
+        )
+        if self._decoder_frozen:
+            self.decoder.requires_grad_(False)
+        else:
+            self.decoder.requires_grad_(True)
+            self._apply_freeze()  # re-freeze top layer, lm_head, embed_tokens
+
+        # Build optimizer matching current trainable params
+        self._setup_optimizer()
+
+        # Log for verification
+        proj_params = sum(
+            p.numel() for p in self.encoder.projection_block.parameters() if p.requires_grad
+        )
+        dec_params = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
+        logger.info(
+            "trainable_state_configured",
+            step=self.global_step,
+            decoder_frozen=self._decoder_frozen,
+            projection_params=proj_params,
+            decoder_params=dec_params,
+        )
+
+    def _build_decoder_param_groups(self) -> list[dict]:
+        """Build decoder param groups (with differential LR if freeze_top_layer)."""
+        tcfg = self.cfg.training
+        if tcfg.get("freeze_top_layer", False):
+            return self._build_param_groups(tcfg.lr, tcfg.get("lr_scale_bottom", 0.1))
+        else:
+            return [
+                {"params": list(self.decoder.parameters()), "lr": tcfg.lr, "base_lr": tcfg.lr}
+            ]
+
+    def _build_projection_param_groups(self) -> list[dict]:
+        """Build projection block param group."""
+        tcfg = self.cfg.training
+        proj_lr = tcfg.get("projection_lr")
+        if proj_lr is None:
+            proj_lr = tcfg.lr
+        proj_params = [
+            p for p in self.encoder.projection_block.parameters() if p.requires_grad
+        ]
+        if proj_params:
+            return [{"params": proj_params, "lr": proj_lr, "base_lr": proj_lr}]
+        return []
+
     def _setup_optimizer(self) -> None:
-        """Create optimizer, using differential LR param groups when freezing."""
+        """Create optimizer from current trainable param groups."""
         tcfg = self.cfg.training
 
-        if tcfg.get("freeze_top_layer", False):
-            lr_scale_bottom = tcfg.get("lr_scale_bottom", 0.1)
-            param_groups = self._build_param_groups(tcfg.lr, lr_scale_bottom)
-        else:
-            param_groups = [{"params": list(self.decoder.parameters()), "lr": tcfg.lr}]
+        param_groups = []
+        if self._train_projection:
+            param_groups.extend(self._build_projection_param_groups())
+        if not self._decoder_frozen:
+            param_groups.extend(self._build_decoder_param_groups())
 
         # 8-bit AdamW: reduces optimizer memory. If bnb causes issues,
         # fall back to torch.optim.AdamW -- correctness is unaffected.
         try:
             import bitsandbytes as bnb
+
             self.optimizer = bnb.optim.AdamW8bit(param_groups, lr=tcfg.lr)
             logger.info("using_adamw8bit")
         except ImportError:
@@ -249,8 +320,9 @@ class DecoderInitTrainer(BaseTrainer):
                 })
 
         # Final norm
-        norm_params = [p for p in self.decoder.backbone.model.norm.parameters()
-                       if p.requires_grad]
+        norm_params = [
+            p for p in self.decoder.backbone.model.norm.parameters() if p.requires_grad
+        ]
         if norm_params:
             param_groups.append({
                 "params": norm_params,
@@ -260,16 +332,59 @@ class DecoderInitTrainer(BaseTrainer):
 
         return param_groups
 
+    def _maybe_end_projection_only(self) -> None:
+        """Transition from projection-only warmup to full training."""
+        if not self._decoder_frozen:
+            return
+        if self.global_step < self._projection_only_steps:
+            return
+
+        # Unfreeze decoder, re-apply intentional freezes
+        self.decoder.requires_grad_(True)
+        self._apply_freeze()  # re-freeze top layer, lm_head, embed_tokens
+        self._decoder_frozen = False
+
+        # Add decoder param groups to existing optimizer (preserves projection momentum)
+        decoder_groups = self._build_decoder_param_groups()
+        for group in decoder_groups:
+            self.optimizer.add_param_group(group)
+
+        # Sync LR schedule for new groups
+        sp = self._schedule_params or {
+            "max_steps": self.cfg.training.max_steps,
+            "base_lr": self.cfg.training.lr,
+            "warmup_steps": self.cfg.training.warmup_steps,
+        }
+        for pg in self.optimizer.param_groups:
+            group_base = pg.get("base_lr", sp["base_lr"])
+            pg["lr"] = cosine_with_warmup(
+                self.global_step, int(sp["max_steps"]), int(sp["warmup_steps"]), group_base
+            )
+
+        logger.info(
+            "projection_only_phase_ended",
+            step=self.global_step,
+            decoder_param_groups=len(decoder_groups),
+        )
+
     def train_step(self, batch) -> dict[str, float]:
         self.decoder.train()
+        if self._train_projection:
+            self.encoder.projection_block.train()
+
+        # Phase transition check (before anything else)
+        self._maybe_end_projection_only()
 
         token_ids = batch["token_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
         loss_mask = batch["loss_mask"].to(self.device)
         content_attention_mask = batch["content_attention_mask"].to(self.device)
 
-        with torch.no_grad():
-            survivors = self._compute_survivors(batch)
+        if self._train_projection:
+            survivors = self._compute_survivors(batch)  # no outer no_grad
+        else:
+            with torch.no_grad():
+                survivors = self._compute_survivors(batch)
 
         # BF16 autocast for decoder forward + backward
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
@@ -286,9 +401,13 @@ class DecoderInitTrainer(BaseTrainer):
         # Backward
         self.optimizer.zero_grad()
         loss.backward()
-        grad_norm = clip_grad_norm(
-            [p for p in self.decoder.parameters() if p.requires_grad]
-        )
+
+        trainable_params = [p for p in self.decoder.parameters() if p.requires_grad]
+        if self._train_projection:
+            trainable_params += [
+                p for p in self.encoder.projection_block.parameters() if p.requires_grad
+            ]
+        grad_norm = clip_grad_norm(trainable_params)
         self.optimizer.step()
 
         return {
@@ -297,29 +416,62 @@ class DecoderInitTrainer(BaseTrainer):
         }
 
     def _compute_survivors(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Run content through frozen BgKIT encoder and return output embeddings."""
+        """Run content through BgKIT encoder and return output embeddings.
+
+        When projection block is trainable, only the compressor runs under
+        no_grad; the projection block gets gradients. When projection is
+        frozen, the entire encoder runs under no_grad (caller wraps).
+        """
         content_token_ids = batch["content_token_ids"].to(self.device)
         content_attention_mask = batch["content_attention_mask"].to(self.device)
         compression_prompt_ids = batch["compression_prompt_ids"].to(self.device)
         compression_prompt_mask = batch["compression_prompt_mask"].to(self.device)
 
-        bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
-        content_emb = bgkit_embed(content_token_ids)
-        prompt_emb = bgkit_embed(compression_prompt_ids)
+        if self._train_projection:
+            # Split: compressor under no_grad, projection block gets gradients
+            with torch.no_grad():
+                bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+                content_emb = bgkit_embed(content_token_ids)
+                prompt_emb = bgkit_embed(compression_prompt_ids)
 
-        # Run through encoder (compressor + projection block, no compression)
-        enc_out = self.encoder(
-            input_embeddings=content_emb,
-            survivor_mask=None,
-            attention_mask=content_attention_mask,
-            prompt_embeddings=prompt_emb,
-            prompt_attention_mask=compression_prompt_mask,
-        )
-        return enc_out.survivor_embeddings
+                comp_out = self.encoder.compressor(
+                    content_emb,
+                    survivor_mask=None,
+                    attention_mask=content_attention_mask,
+                    prompt_embeddings=prompt_emb,
+                    prompt_attention_mask=compression_prompt_mask,
+                )
+
+            # Detach compressor output so gradients don't flow back
+            full_raw = comp_out.raw_embeddings.detach()
+            full_mask = comp_out.attention_mask
+
+            # Projection block outside no_grad (gets gradients)
+            proj_out = self.encoder.projection_block(full_raw, full_mask, survivor_mask=None)
+
+            # Slice to content-only (replicate BgKITEncoder.forward no-compression path)
+            content_proj = proj_out.projected_embeddings[:, comp_out.content_slice, :]
+            return content_proj
+        else:
+            # Original path: entire encoder under no_grad (caller wraps)
+            bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+            content_emb = bgkit_embed(content_token_ids)
+            prompt_emb = bgkit_embed(compression_prompt_ids)
+
+            enc_out = self.encoder(
+                input_embeddings=content_emb,
+                survivor_mask=None,
+                attention_mask=content_attention_mask,
+                prompt_embeddings=prompt_emb,
+                prompt_attention_mask=compression_prompt_mask,
+            )
+            return enc_out.survivor_embeddings
 
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
         self.decoder.eval()
+        if self._train_projection:
+            self.encoder.projection_block.eval()
         self._eval_count += 1
 
         total_loss = 0.0
@@ -439,6 +591,11 @@ class DecoderInitTrainer(BaseTrainer):
         self, checkpoint_dir: Path, metrics: dict[str, float] | None = None
     ) -> Path:
         """Save both BgKIT encoder and decoder models."""
+        # Inject phase state into training_state
+        if self._training_state is None:
+            self._training_state = {}
+        self._training_state["decoder_frozen"] = getattr(self, "_decoder_frozen", False)
+
         metadata = CheckpointMetadata(
             phase=self.cfg.training.phase,
             step=self.global_step,
@@ -461,14 +618,16 @@ class DecoderInitTrainer(BaseTrainer):
     def load_checkpoint(self, checkpoint_path: Path) -> None:
         """Load both BgKIT encoder and decoder models."""
         metadata, state_dicts = load_checkpoint(checkpoint_path)
+
+        # Restore model weights
         if "encoder" in state_dicts:
             self.encoder.load_state_dict(state_dicts["encoder"])
         elif "bgkit_model" in state_dicts:
             # Legacy checkpoint -- load into compressor only
             self.encoder.compressor.load_state_dict(state_dicts["bgkit_model"], strict=False)
         self.decoder.load_state_dict(state_dicts["decoder"])
-        if "optimizer" in state_dicts:
-            self.optimizer.load_state_dict(state_dicts["optimizer"])
+
+        # Restore step position
         self.global_step = metadata.step
         self.epoch = metadata.epoch
         self._last_checkpoint_path = str(checkpoint_path)
@@ -476,4 +635,36 @@ class DecoderInitTrainer(BaseTrainer):
             self._schedule_params = metadata.schedule_params
         if metadata.training_state is not None:
             self._training_state = metadata.training_state
+
+        # Sanity-check: log if saved phase state doesn't match derived state
+        if metadata.training_state:
+            saved_frozen = metadata.training_state.get("decoder_frozen")
+            expected_frozen = (
+                self._projection_only_steps > 0
+                and self.global_step < self._projection_only_steps
+            )
+            if saved_frozen is not None and saved_frozen != expected_frozen:
+                logger.warning(
+                    "phase_state_mismatch",
+                    saved=saved_frozen,
+                    derived=expected_frozen,
+                    step=self.global_step,
+                )
+
+        # Recompute freeze state + rebuild optimizer from restored global_step
+        self._configure_trainable_state()
+
+        # Load optimizer state. If config topology changed between runs,
+        # param-group count won't match — warn and skip optimizer restore.
+        if "optimizer" in state_dicts:
+            try:
+                self.optimizer.load_state_dict(state_dicts["optimizer"])
+            except (ValueError, KeyError, RuntimeError) as e:
+                logger.warning(
+                    "optimizer_state_load_failed",
+                    error=str(e),
+                    hint="config topology may have changed between runs; "
+                    "optimizer state reset, training continues with fresh moments",
+                )
+
         logger.info("restored_from_checkpoint", step=self.global_step)

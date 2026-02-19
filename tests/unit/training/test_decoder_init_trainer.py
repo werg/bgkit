@@ -154,6 +154,9 @@ def trainer():
     t.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
     t.model = t.decoder
 
+    t._train_projection = False
+    t._decoder_frozen = False
+    t._projection_only_steps = 0
     t.optimizer = torch.optim.AdamW(t.decoder.parameters(), lr=1e-3)
     t._eval_count = 0
 
@@ -395,6 +398,9 @@ def _make_frozen_trainer(num_layers: int = 4, lr: float = 1e-3,
     t.model = t.decoder
 
     # Use the real freeze + optimizer wiring from setup()
+    t._train_projection = False
+    t._decoder_frozen = False
+    t._projection_only_steps = 0
     t._apply_freeze()
     t._setup_optimizer()
     t._eval_count = 0
