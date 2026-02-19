@@ -120,18 +120,18 @@ class JointBlockTrainer(BaseTrainer):
         # Freeze everything, then unfreeze target components
         self.encoder.requires_grad_(False)
 
-        # Unfreeze penultimate layer (now the last in the compressor's backbone)
-        compressor_layers = _resolve_layers(self.encoder.compressor.backbone)
-        compressor_layers[-1].requires_grad_(True)
-
-        # Unfreeze compressor norm
-        self.encoder.compressor.norm.requires_grad_(True)
-
-        # Unfreeze auto-repro head
-        self.encoder.compressor.auto_repro_head.requires_grad_(True)
-
-        # Unfreeze entire projection block
-        self.encoder.projection_block.requires_grad_(True)
+        heads_only = tcfg.get("heads_only", False)
+        if heads_only:
+            # Only train the linear projection heads
+            self.encoder.compressor.auto_repro_head.requires_grad_(True)
+            self.encoder.projection_block.projection_head.requires_grad_(True)
+        else:
+            # Train heads + transformer blocks + norms
+            compressor_layers = _resolve_layers(self.encoder.compressor.backbone)
+            compressor_layers[-1].requires_grad_(True)
+            self.encoder.compressor.norm.requires_grad_(True)
+            self.encoder.compressor.auto_repro_head.requires_grad_(True)
+            self.encoder.projection_block.requires_grad_(True)
 
         trainable = count_parameters(self.encoder, trainable_only=True)
         total = count_parameters(self.encoder, trainable_only=False)
