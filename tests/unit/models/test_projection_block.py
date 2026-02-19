@@ -116,18 +116,19 @@ class TestProjectionBlockForward:
         out.projected_embeddings.sum().backward()
         assert x.grad is not None
 
-    def test_output_norm_applied(self, block):
-        """Output should be normalized (different from pre-norm)."""
+    def test_output_head_applied(self, block):
+        """Output should pass through projection_head after norm."""
         x = torch.randn(1, 5, 64)
         out = block(x, survivor_mask=None)
 
-        # Get pre-norm output for comparison
+        # Get pre-head output for comparison
         position_ids = torch.arange(5).unsqueeze(0)
         position_embeddings = block._rotary_emb(x, position_ids)
         pre_norm = block.transformer_layer(x, position_embeddings=position_embeddings)
         normed = block.output_norm(pre_norm)
+        expected = block.projection_head(normed)
 
-        assert torch.allclose(out.projected_embeddings, normed)
+        assert torch.allclose(out.projected_embeddings, expected)
 
     def test_with_attention_mask(self, block):
         """Should work with a padding attention mask."""

@@ -54,6 +54,7 @@ class ProjectionBlock(nn.Module):
         self.transformer_layer = transformer_layer
         self.output_norm = output_norm
         self.hidden_dim = hidden_dim
+        self.projection_head = nn.Linear(hidden_dim, hidden_dim)
 
         # Bypass nn.Module.__setattr__ to avoid registering as submodule
         # (prevents duplicate state_dict entries -- backbone already owns this).
@@ -105,9 +106,11 @@ class ProjectionBlock(nn.Module):
             padded, counts = pad_survivors(survivor_list)
             max_s = padded.size(1)
             s_mask = torch.arange(max_s, device=counts.device).unsqueeze(0) < counts.unsqueeze(1)
-            return ProjectionOutput(self.output_norm(padded), counts, s_mask)
+            projected = self.projection_head(self.output_norm(padded))
+            return ProjectionOutput(projected, counts, s_mask)
         else:
-            return ProjectionOutput(self.output_norm(all_out), None, None)
+            projected = self.projection_head(self.output_norm(all_out))
+            return ProjectionOutput(projected, None, None)
 
     def extend_to_dim(self, target_dim: int, init_scale: float = 0.01) -> None:
         """Extend output dimensionality for target LLM alignment.
