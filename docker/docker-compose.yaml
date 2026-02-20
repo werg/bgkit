@@ -13,14 +13,12 @@ x-gpu-common: &gpu-common
     - ${DATA_DIR:-../data}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
     - ${CHECKPOINT_DIR:-../checkpoints}:/workspace/checkpoints
-    # Mount source, configs and scripts from host so changes take effect
-    # without rebuilding. The editable install (-e) in the Dockerfile
-    # ensures Python imports from src/ directly.
+    # Source code — the ONLY way bgkit code enters the container.
+    # Image has deps only; no bgkit in dist-packages.
     - ../src:/workspace/bgkit/src:ro
     - ../configs:/workspace/bgkit/configs:ro
     - ../scripts:/workspace/bgkit/scripts:ro
     # Wandb authenticates via netrc (machine api.wandb.ai).
-    # To override, pass -e WANDB_API_KEY=... to docker compose run.
     - ~/.netrc:/root/.netrc:ro
 
 services:
@@ -39,6 +37,10 @@ services:
   train-phase1-step1:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_step1"]
+
+  train-phase1-step2:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step2"]
 
   ice-labels:
     <<: *gpu-common

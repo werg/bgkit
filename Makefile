@@ -1,4 +1,4 @@
-.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build docker-build-data process-repos ice-labels
+.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2
 
 install:
 	uv sync --extra dev --extra data
@@ -47,7 +47,16 @@ process-repos:
 ice-labels:
 	docker compose -f docker/docker-compose.yaml run --rm ice-labels $(ARGS)
 
-docker-build:
+train-ice:
+	scripts/run-train.sh train-ice
+
+train-phase1-step1:
+	scripts/run-train.sh train-phase1-step1
+
+train-phase1-step2:
+	scripts/run-train.sh train-phase1-step2
+
+docker-build-deps:
 	docker compose -f docker/docker-compose.yaml build train
 
 docker-build-data:
