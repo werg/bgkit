@@ -109,7 +109,6 @@ class TestICETrainStep:
                 "max_steps": 100,
                 "lr": 1e-3,
                 "warmup_steps": 10,
-                "uniformity_reg_weight": 0.1,
                 "uniform_output_reg_weight": 0.05,
                 "eval_every": 50,
                 "save_every": 0,
@@ -132,7 +131,6 @@ class TestICETrainStep:
 
         # Optimizer
         trainer.optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=1e-3)
-        trainer.uniformity_weight = 0.1
         trainer.uniform_reg_weight = 0.05
 
         return trainer
@@ -147,7 +145,6 @@ class TestICETrainStep:
 
         assert "loss" in metrics
         assert "mse_loss" in metrics
-        assert "uniformity_loss" in metrics
         assert "pred_variance" in metrics
         assert "grad_norm" in metrics
         assert "uniform_output_loss" in metrics

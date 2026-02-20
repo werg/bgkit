@@ -138,7 +138,6 @@ class ICETrainer(BaseTrainer):
         # Optimizer — ICE params only
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tcfg.lr)
 
-        self.uniformity_weight = tcfg.get("uniformity_reg_weight", 0.1)
         self.uniform_reg_weight = tcfg.get("uniform_output_reg_weight", 0.0)
 
         logger.info(
@@ -149,8 +148,6 @@ class ICETrainer(BaseTrainer):
         )
 
     def apply_live_config(self, changes: dict) -> None:
-        if "uniformity_reg_weight" in changes:
-            self.uniformity_weight = changes["uniformity_reg_weight"]
         if "uniform_output_reg_weight" in changes:
             self.uniform_reg_weight = changes["uniform_output_reg_weight"]
 
@@ -218,17 +215,11 @@ class ICETrainer(BaseTrainer):
         sq_err = (ce_pred_aligned - ce_target) ** 2
         mse_loss = (sq_err * ce_mask).sum() / ce_mask.sum().clamp(min=1)
 
-        # Uniformity regularizer: penalize low variance in predictions
-        # Only compute over valid positions
-        masked_pred = ce_pred_aligned * ce_mask
-        pred_mean = masked_pred.sum() / ce_mask.sum().clamp(min=1)
-        pred_var = (
-            ((masked_pred - pred_mean * ce_mask) ** 2 * ce_mask).sum()
-            / ce_mask.sum().clamp(min=1)
-        )
-        uniformity_loss = -pred_var
+        # Track prediction variance as a diagnostic (not used in loss)
+        valid_pred = ce_pred_aligned[ce_mask.bool()]
+        pred_var = valid_pred.var(correction=0).item() if valid_pred.numel() > 1 else 0.0
 
-        loss = mse_loss + self.uniformity_weight * uniformity_loss
+        loss = mse_loss
 
         # Uniform-output regularization on random embeddings
         uniform_output_loss_val = 0.0
@@ -247,14 +238,15 @@ class ICETrainer(BaseTrainer):
                 )
             rand_pred = self.model(rand_embeddings)
             rand_valid = rand_pred[attention_mask.bool()]
-            uniform_output_loss = (
-                rand_valid.var(correction=0)
-                if rand_valid.numel() > 0
-                else rand_pred.new_tensor(0.0)
-            )
+            if rand_valid.numel() > 1:
+                sorted_rand, _ = torch.sort(rand_valid)
+                gaps = sorted_rand[1:] - sorted_rand[:-1]
+                uniform_output_loss = -torch.log(gaps + 1e-6).mean()
+            else:
+                uniform_output_loss = rand_pred.new_tensor(0.0)
             loss = loss + self.uniform_reg_weight * uniform_output_loss
             uniform_output_loss_val = uniform_output_loss.item()
-            rand_pred_var_val = uniform_output_loss_val
+            rand_pred_var_val = rand_valid.var(correction=0).item() if rand_valid.numel() > 1 else 0.0
 
         # Backward
         self.optimizer.zero_grad()
@@ -265,8 +257,7 @@ class ICETrainer(BaseTrainer):
         return {
             "loss": loss.item(),
             "mse_loss": mse_loss.item(),
-            "uniformity_loss": uniformity_loss.item(),
-            "pred_variance": pred_var.item(),
+            "pred_variance": pred_var,
             "grad_norm": grad_norm,
             "uniform_output_loss": uniform_output_loss_val,
             "rand_pred_variance": rand_pred_var_val,
