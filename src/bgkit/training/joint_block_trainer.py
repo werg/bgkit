@@ -144,7 +144,9 @@ class JointBlockTrainer(BaseTrainer):
         # Dataset + split
         data_dir = self.cfg.data.tokens.input_dir
         max_seq_len = self.cfg.data.tokens.get("max_seq_len", 8192)
-        full_dataset = MmapTokenDataset(data_dir, max_seq_len=max_seq_len)
+        full_dataset = MmapTokenDataset(
+            data_dir, max_seq_len=max_seq_len, include_metadata=False
+        )
         max_eval_samples = tcfg.get("max_eval_samples", 10000)
         eval_size = min(max(1, int(len(full_dataset) * 0.1)), max_eval_samples)
         train_size = len(full_dataset) - eval_size

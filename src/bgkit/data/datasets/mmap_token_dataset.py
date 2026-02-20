@@ -29,15 +29,20 @@ class MmapTokenDataset(Dataset):
     re-open from the same path.
     """
 
-    REQUIRED_FILES: ClassVar[list[str]] = [
-        "tokens.npy", "offsets.npy", "metadata.parquet", "manifest.json",
-    ]
+    REQUIRED_FILES: ClassVar[list[str]] = ["tokens.npy", "offsets.npy", "manifest.json"]
+    METADATA_FILE: ClassVar[str] = "metadata.parquet"
 
-    def __init__(self, data_dir: str, max_seq_len: int = 8192):
+    def __init__(
+        self, data_dir: str, max_seq_len: int = 8192, include_metadata: bool = True
+    ):
         data_path = Path(data_dir)
+        self._include_metadata = include_metadata
 
         # Preflight: fail fast with actionable error
-        missing = [f for f in self.REQUIRED_FILES if not (data_path / f).exists()]
+        required_files = list(self.REQUIRED_FILES)
+        if self._include_metadata:
+            required_files.append(self.METADATA_FILE)
+        missing = [f for f in required_files if not (data_path / f).exists()]
         if missing:
             raise FileNotFoundError(
                 f"Missing mmap artifacts in {data_path.resolve()}: {missing}. "
@@ -88,7 +93,10 @@ class MmapTokenDataset(Dataset):
         total_chunks = int(n_chunks_per_file.sum())
 
         # Build flat chunk index arrays — fully vectorized (no Python loops)
-        self._chunk_file_idx = np.repeat(valid_indices, n_chunks_per_file).astype(np.int32)
+        if self._include_metadata:
+            self._chunk_file_idx = np.repeat(valid_indices, n_chunks_per_file).astype(np.int32)
+        else:
+            self._chunk_file_idx = None
 
         # Compute within-file chunk index via cumsum group trick:
         # offsets_within[i] = position of chunk i within its file
@@ -123,7 +131,7 @@ class MmapTokenDataset(Dataset):
         return self._metadata
 
     def __len__(self) -> int:
-        return len(self._chunk_file_idx)
+        return len(self._chunk_lengths)
 
     def __getstate__(self):
         """Exclude mmap and metadata from pickle -- workers re-open from path."""
@@ -137,11 +145,15 @@ class MmapTokenDataset(Dataset):
         self._tokens = np.load(self._data_path / "tokens.npy", mmap_mode="r")
 
     def __getitem__(self, idx: int) -> dict:
-        file_idx = int(self._chunk_file_idx[idx])
         start = int(self._chunk_offset[idx])
         length = int(self._chunk_lengths[idx])
         # Copy from mmap into owned array, cast to int64 for torch
         tokens = self._tokens[start : start + length].astype(np.int64)
+        if not self._include_metadata:
+            return {"token_ids": torch.from_numpy(tokens)}
+
+        assert self._chunk_file_idx is not None
+        file_idx = int(self._chunk_file_idx[idx])
         meta = self._get_metadata()
         return {
             "token_ids": torch.from_numpy(tokens),

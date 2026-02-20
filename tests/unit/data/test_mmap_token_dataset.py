@@ -88,6 +88,12 @@ class TestMmapTokenDataset:
         assert ds[1]["file_path"] == "b.js"
         assert ds[2]["language"] == "rust"
 
+    def test_getitem_without_metadata(self, token_data_dir: Path):
+        ds = MmapTokenDataset(str(token_data_dir), max_seq_len=8192, include_metadata=False)
+        sample = ds[0]
+        assert set(sample.keys()) == {"token_ids"}
+        assert sample["token_ids"].dtype == torch.int64
+
     def test_lengths(self, token_data_dir: Path):
         ds = MmapTokenDataset(str(token_data_dir), max_seq_len=8192)
         np.testing.assert_array_equal(ds.lengths, [10, 5, 3])
@@ -136,6 +142,18 @@ class TestMmapTokenDataset:
         d.mkdir()
         with pytest.raises(FileNotFoundError, match="Missing mmap artifacts"):
             MmapTokenDataset(str(d))
+
+    def test_missing_metadata_allowed_when_disabled(self, tmp_path: Path):
+        d = tmp_path / "no_meta"
+        d.mkdir()
+        np.save(d / "tokens.npy", np.array([1, 2, 3], dtype=np.int32))
+        np.save(d / "offsets.npy", np.array([0, 3], dtype=np.int64))
+        (d / "manifest.json").write_text(
+            json.dumps({"schema_version": 1, "row_count": 1, "total_tokens": 3})
+        )
+        ds = MmapTokenDataset(str(d), include_metadata=False)
+        assert len(ds) == 1
+        assert set(ds[0].keys()) == {"token_ids"}
 
     def test_invalid_manifest(self, tmp_path: Path):
         d = tmp_path / "bad_manifest"
