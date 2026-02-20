@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -77,14 +78,14 @@ class MockTokenizer:
 
 
 class MockInnerDataset:
-    """Mock TokenChunkDataset returning fixed samples."""
+    """Mock MmapTokenDataset returning fixed samples."""
 
     def __init__(self, samples: list[dict]):
         self._samples = samples
-        self._chunk_lengths = [len(s["token_ids"]) for s in samples]
+        self._chunk_lengths = np.array([len(s["token_ids"]) for s in samples], dtype=np.int32)
 
     @property
-    def lengths(self) -> list[int]:
+    def lengths(self) -> np.ndarray:
         return self._chunk_lengths
 
     def __len__(self) -> int:
@@ -347,7 +348,7 @@ class TestLengthProperties:
 
     def test_content_lengths_match_inner(self, dataset, inner_dataset):
         """content_lengths should exactly match inner dataset lengths."""
-        assert dataset.content_lengths == inner_dataset.lengths
+        np.testing.assert_array_equal(dataset.content_lengths, inner_dataset.lengths)
 
 
 # ---------------------------------------------------------------------------

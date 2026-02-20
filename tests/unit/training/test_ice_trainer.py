@@ -400,16 +400,18 @@ class TestICETinyDataset:
         """ICETrainer.setup() should raise ValueError when dataset has only 1 sample."""
         from unittest.mock import patch
 
-        import pyarrow as pa
-        import pyarrow.parquet as pq
         from omegaconf import OmegaConf
 
-        # Create a minimal shard with 1 sample
-        table = pa.table({
-            "token_ids": [[1, 2, 3]],
-            "ce_values": [[0.5, 0.3]],
-        })
-        pq.write_table(table, tmp_path / "shard_000.parquet")
+        # Create minimal mmap artifacts with 1 sample
+        import json
+
+        import numpy as np
+
+        np.save(tmp_path / "tokens.npy", np.array([1, 2, 3], dtype=np.int32))
+        np.save(tmp_path / "offsets.npy", np.array([0, 3], dtype=np.int64))
+        np.save(tmp_path / "ce_values.npy", np.array([0.5, 0.3], dtype=np.float32))
+        np.save(tmp_path / "ce_offsets.npy", np.array([0, 2], dtype=np.int64))
+        (tmp_path / "manifest.json").write_text(json.dumps({"schema_version": 1}))
 
         cfg = OmegaConf.create({
             "training": {

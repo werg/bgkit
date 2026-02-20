@@ -1,4 +1,4 @@
-"""Chat-formatted reproduction dataset wrapping TokenChunkDataset.
+"""Chat-formatted reproduction dataset wrapping MmapTokenDataset.
 
 Wraps raw file token chunks in Qwen3's native chat template with tool-call
 format, producing in-distribution agentic conversation for decoder training.
@@ -11,10 +11,11 @@ import hashlib
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from bgkit.data.datasets.token_chunk_dataset import TokenChunkDataset
+from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
 
 # Sentinel used to locate exact content boundaries within the template.
 # Long random suffix makes accidental collision near-impossible.
@@ -116,14 +117,14 @@ def _build_messages(
 
 
 class ChatReproDataset(Dataset):
-    """Chat-formatted wrapper around TokenChunkDataset.
+    """Chat-formatted wrapper around MmapTokenDataset.
 
     For each sample, selects a prompt variant (deterministic per sample+epoch),
     wraps the file content in Qwen3's chat template with tool-call format, and
     returns tokenized IDs with a loss mask covering only the file content.
 
     Args:
-        inner_dataset: TokenChunkDataset providing raw file token chunks.
+        inner_dataset: MmapTokenDataset providing raw file token chunks.
         tokenizer: Qwen3 tokenizer (must support apply_chat_template).
         variant_bank_path: Path to JSON file with prompt variants.
         seed: Base seed for variant selection.
@@ -131,7 +132,7 @@ class ChatReproDataset(Dataset):
 
     def __init__(
         self,
-        inner_dataset: TokenChunkDataset,
+        inner_dataset: MmapTokenDataset,
         tokenizer,
         variant_bank_path: str | Path,
         seed: int = 42,
@@ -151,6 +152,9 @@ class ChatReproDataset(Dataset):
         # Tokenize the longest variant's scaffolding (with sentinel as content)
         # to get the maximum number of non-content tokens.
         self._max_template_overhead = self._compute_max_template_overhead()
+
+        # Cache lengths array (content + overhead) — avoids allocation per access
+        self._lengths = self._inner.lengths + self._max_template_overhead
 
         # Precompute suffix_ids — structurally constant across all variants.
         # The suffix is always `\n``` ` + `<|im_end|>` (closing fence + end-of-turn).
@@ -216,16 +220,15 @@ class ChatReproDataset(Dataset):
         return self._suffix_ids
 
     @property
-    def lengths(self) -> list[int]:
+    def lengths(self) -> np.ndarray:
         """Conservative upper-bound lengths for token budget batching.
 
         Returns content_length + max_template_overhead for each sample.
         """
-        inner_lengths = self._inner.lengths
-        return [n + self._max_template_overhead for n in inner_lengths]
+        return self._lengths
 
     @property
-    def content_lengths(self) -> list[int]:
+    def content_lengths(self) -> np.ndarray:
         """Raw content token lengths (for understanding BgKIT input sizes)."""
         return self._inner.lengths
 

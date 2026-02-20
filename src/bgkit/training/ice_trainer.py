@@ -6,12 +6,13 @@ values from token embedding sequences with a uniformity regularizer.
 
 from __future__ import annotations
 
+import numpy as np
 import structlog
 import torch
 from torch.utils.data import DataLoader, random_split
 from transformers import AutoModel
 
-from bgkit.data.datasets.ice_dataset import ICEDataset
+from bgkit.data.datasets.mmap_ice_dataset import MmapICEDataset
 from bgkit.data.samplers import TokenBudgetBatchSampler
 from bgkit.models.ice import ICE
 from bgkit.training.base_trainer import BaseTrainer
@@ -91,7 +92,7 @@ class ICETrainer(BaseTrainer):
 
         # Dataset + split
         data_dir = self.cfg.data.ice_labels.output_dir
-        full_dataset = ICEDataset(data_dir)
+        full_dataset = MmapICEDataset(data_dir)
         max_eval_samples = tcfg.get("max_eval_samples", 10000)
         eval_size = min(max(1, int(len(full_dataset) * 0.1)), max_eval_samples)
         train_size = len(full_dataset) - eval_size
@@ -109,8 +110,8 @@ class ICETrainer(BaseTrainer):
         pin_memory = self.cfg.compute.get("pin_memory", False)
 
         # Token-budget batching: pack samples so batch_size * max_seq_len <= budget
-        train_lengths = [full_dataset.lengths[i] for i in self.train_dataset.indices]
-        eval_lengths = [full_dataset.lengths[i] for i in self.eval_dataset.indices]
+        train_lengths = full_dataset.lengths[np.array(self.train_dataset.indices)]
+        eval_lengths = full_dataset.lengths[np.array(self.eval_dataset.indices)]
 
         self.train_sampler = TokenBudgetBatchSampler(
             train_lengths, max_batch_tokens, shuffle=True, seed=self.cfg.get("seed", 42),

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import structlog
 import torch
 from torch.utils.data import DataLoader, random_split
@@ -24,7 +25,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from bgkit.data.collators import collate_chat_repro
 from bgkit.data.datasets.chat_repro_dataset import ChatReproDataset
-from bgkit.data.datasets.token_chunk_dataset import TokenChunkDataset
+from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
 from bgkit.data.samplers import TokenBudgetBatchSampler
 from bgkit.eval.metrics.embedding_health import embedding_drift_metrics
 from bgkit.eval.metrics.reconstruction import parse_success_rate
@@ -135,7 +136,7 @@ class DecoderInitTrainer(BaseTrainer):
             "variant_bank_path", "data/prompt_variants/file_read_repro.json",
         )
 
-        inner_dataset = TokenChunkDataset(data_dir, max_seq_len=max_seq_len)
+        inner_dataset = MmapTokenDataset(data_dir, max_seq_len=max_seq_len)
         full_dataset = ChatReproDataset(
             inner_dataset,
             tokenizer=self.tokenizer,
@@ -162,8 +163,8 @@ class DecoderInitTrainer(BaseTrainer):
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
 
-        train_lengths = [full_dataset.lengths[i] for i in self.train_dataset.indices]
-        eval_lengths = [full_dataset.lengths[i] for i in self.eval_dataset.indices]
+        train_lengths = full_dataset.lengths[np.array(self.train_dataset.indices)]
+        eval_lengths = full_dataset.lengths[np.array(self.eval_dataset.indices)]
 
         self.train_sampler = TokenBudgetBatchSampler(
             train_lengths, max_batch_tokens, shuffle=True, seed=self.cfg.get("seed", 42),

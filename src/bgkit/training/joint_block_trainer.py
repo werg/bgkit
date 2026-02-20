@@ -11,6 +11,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import structlog
 import torch
 import torch.nn.functional as F
@@ -18,7 +19,7 @@ from torch.utils.data import DataLoader, random_split
 from transformers import AutoModel
 
 from bgkit.data.collators import collate_token_ids
-from bgkit.data.datasets.token_chunk_dataset import TokenChunkDataset
+from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
 from bgkit.data.samplers import TokenBudgetBatchSampler
 from bgkit.models.components.auto_reproduction import auto_reproduction_loss
 from bgkit.models.encoder import BgKITEncoder, _resolve_layers
@@ -143,7 +144,7 @@ class JointBlockTrainer(BaseTrainer):
         # Dataset + split
         data_dir = self.cfg.data.tokens.input_dir
         max_seq_len = self.cfg.data.tokens.get("max_seq_len", 8192)
-        full_dataset = TokenChunkDataset(data_dir, max_seq_len=max_seq_len)
+        full_dataset = MmapTokenDataset(data_dir, max_seq_len=max_seq_len)
         max_eval_samples = tcfg.get("max_eval_samples", 10000)
         eval_size = min(max(1, int(len(full_dataset) * 0.1)), max_eval_samples)
         train_size = len(full_dataset) - eval_size
@@ -160,8 +161,8 @@ class JointBlockTrainer(BaseTrainer):
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
 
-        train_lengths = [full_dataset.lengths[i] for i in self.train_dataset.indices]
-        eval_lengths = [full_dataset.lengths[i] for i in self.eval_dataset.indices]
+        train_lengths = full_dataset.lengths[np.array(self.train_dataset.indices)]
+        eval_lengths = full_dataset.lengths[np.array(self.eval_dataset.indices)]
 
         self.train_sampler = TokenBudgetBatchSampler(
             train_lengths, max_batch_tokens, shuffle=True, seed=self.cfg.get("seed", 42),
@@ -377,11 +378,26 @@ class JointBlockTrainer(BaseTrainer):
         return ckpt_path
 
     def load_checkpoint(self, checkpoint_path: Path) -> None:
-        """Load encoder state dict and restore training state."""
+        """Load encoder state dict and restore training state.
+
+        Optimizer state is loaded if the parameter count matches; otherwise
+        (e.g. switching heads_only mode) it is skipped with a warning so the
+        optimizer starts fresh for the new trainable set.
+        """
         metadata, state_dicts = load_checkpoint(checkpoint_path)
         self.encoder.load_state_dict(state_dicts["encoder"])
         if "optimizer" in state_dicts:
-            self.optimizer.load_state_dict(state_dicts["optimizer"])
+            saved_n = len(state_dicts["optimizer"]["state"])
+            current_n = len(self.optimizer.param_groups[0]["params"])
+            if saved_n == current_n:
+                self.optimizer.load_state_dict(state_dicts["optimizer"])
+            else:
+                logger.warning(
+                    "optimizer_state_skipped",
+                    reason="trainable param count changed",
+                    saved=saved_n,
+                    current=current_n,
+                )
         self.global_step = metadata.step
         self.epoch = metadata.epoch
         self._last_checkpoint_path = str(checkpoint_path)

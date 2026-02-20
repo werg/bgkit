@@ -172,7 +172,10 @@ class BaseTrainer(ABC):
         # LR schedule params: use restored values from checkpoint if available,
         # otherwise use current config. This ensures schedule continuity on resume
         # even if the config file changed between runs.
-        if self._schedule_params is not None:
+        # Set reset_schedule: true to force using config values (e.g. when
+        # switching training modes and wanting a fresh schedule).
+        reset_schedule = tcfg.get("reset_schedule", False)
+        if self._schedule_params is not None and not reset_schedule:
             max_steps = int(self._schedule_params["max_steps"])
             base_lr = self._schedule_params["base_lr"]
             warmup_steps = int(self._schedule_params["warmup_steps"])
@@ -190,6 +193,13 @@ class BaseTrainer(ABC):
             max_steps = tcfg.max_steps
             base_lr = tcfg.lr
             warmup_steps = tcfg.warmup_steps
+            if reset_schedule and self._schedule_params is not None:
+                logger.info(
+                    "schedule_reset_from_config",
+                    max_steps=max_steps,
+                    base_lr=base_lr,
+                    warmup_steps=warmup_steps,
+                )
 
         # Store schedule params for checkpointing
         self._schedule_params = {

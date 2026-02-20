@@ -24,7 +24,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from bgkit.data.collators import collate_chat_repro
 from bgkit.data.datasets.chat_repro_dataset import ChatReproDataset
-from bgkit.data.datasets.token_chunk_dataset import TokenChunkDataset
+from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
 from bgkit.data.samplers import TokenBudgetBatchSampler
 from bgkit.eval.metrics.embedding_health import embedding_drift_metrics
 from bgkit.eval.metrics.reconstruction import parse_success_rate
@@ -98,7 +98,7 @@ def main(cfg: DictConfig) -> None:
     variant_bank_path = cfg.data.get(
         "variant_bank_path", "data/prompt_variants/file_read_repro.json",
     )
-    inner_dataset = TokenChunkDataset(data_dir, max_seq_len=max_seq_len)
+    inner_dataset = MmapTokenDataset(data_dir, max_seq_len=max_seq_len)
     chat_dataset = ChatReproDataset(
         inner_dataset, tokenizer=tokenizer, variant_bank_path=variant_bank_path,
     )

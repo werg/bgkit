@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 from collections.abc import Iterator, Sequence
 
+import numpy as np
 from torch.utils.data import Sampler
 
 
@@ -17,12 +18,12 @@ class TokenBudgetBatchSampler(Sampler[list[int]]):
 
     def __init__(
         self,
-        lengths: Sequence[int],
+        lengths: Sequence[int] | np.ndarray,
         max_batch_tokens: int,
         shuffle: bool = True,
         seed: int = 42,
     ):
-        self.lengths = list(lengths)
+        self.lengths = np.asarray(lengths, dtype=np.int32)
         self.max_batch_tokens = max_batch_tokens
         self.shuffle = shuffle
         self.seed = seed
@@ -33,7 +34,7 @@ class TokenBudgetBatchSampler(Sampler[list[int]]):
         self.epoch = epoch
 
     def __iter__(self) -> Iterator[list[int]]:
-        indices = sorted(range(len(self.lengths)), key=lambda i: self.lengths[i])
+        indices = np.argsort(self.lengths).tolist()
         if self.shuffle:
             rng = random.Random(self.seed + self.epoch)
             bucket_size = 512
@@ -46,7 +47,7 @@ class TokenBudgetBatchSampler(Sampler[list[int]]):
         batch: list[int] = []
         current_max_len = 0
         for idx in indices:
-            seq_len = self.lengths[idx]
+            seq_len = int(self.lengths[idx])
             new_max = max(current_max_len, seq_len)
             if batch and (len(batch) + 1) * new_max > self.max_batch_tokens:
                 yield batch
@@ -63,7 +64,8 @@ class TokenBudgetBatchSampler(Sampler[list[int]]):
         count = 0
         current_max_len = 0
         batch_size = 0
-        for length in sorted(self.lengths):
+        for length in np.sort(self.lengths):
+            length = int(length)
             new_max = max(current_max_len, length)
             if batch_size > 0 and (batch_size + 1) * new_max > self.max_batch_tokens:
                 count += 1

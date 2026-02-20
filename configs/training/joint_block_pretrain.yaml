@@ -3,11 +3,13 @@
 # Ultimate block (layer 27): decoder projection (output ≈ decoder token embeddings)
 # Both trained jointly; projection loss gradients flow freely through layer 26.
 phase: joint_block_pretrain
-max_steps: 2000
-lr: 1.0e-5
-warmup_steps: 50
-# Only train the linear heads, freeze transformer blocks
-heads_only: true
+max_steps: 4000
+lr: 5.0e-6
+warmup_steps: 2100
+reset_schedule: true
+# heads_only: true — only trains linear heads, freeze transformer blocks
+# false — also unfreezes the connected transformer blocks + norms
+heads_only: false
 w_repro: 1.0
 w_proj: 1.0
 eval_every: 100
