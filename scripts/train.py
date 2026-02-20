@@ -30,6 +30,10 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
         return DecoderInitTrainer(cfg)
+    elif phase == "phase1_step2":
+        from bgkit.training.phase1.compression import CompressionTrainer
+
+        return CompressionTrainer(cfg)
     else:
         raise NotImplementedError(f"Training phase '{phase}' not yet implemented")
 

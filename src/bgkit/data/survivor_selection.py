@@ -1,7 +1,7 @@
-"""ICE-biased and random survivor selection logic.
+"""Threshold-based survivor selection using ICE scores.
 
-Combines ICE-based selection with random selection. Training mix:
-~60% ICE-biased, ~40% random, shifting toward ICE-biased over training.
+Selects positions with ICE score >= threshold, clamped to [min, max] bounds.
+Replaces the old mixed ICE+random selection strategy.
 """
 
 from __future__ import annotations
@@ -9,43 +9,46 @@ from __future__ import annotations
 import torch
 
 
-def select_survivors(
+def select_survivors_by_threshold(
     ice_scores: torch.Tensor,
-    budget: int,
-    ice_fraction: float = 0.6,
-    temperature: float = 1.0,
+    threshold: float,
+    min_survivors: int = 1,
+    max_survivors: int | None = None,
 ) -> torch.Tensor:
-    """Select survivor positions using mixed ICE-biased and random strategy.
+    """Select survivors by ICE score threshold, clamped to [min, max].
+
+    Positions with ICE score >= threshold survive. If the count falls
+    outside [min_survivors, max_survivors], clamp by taking top-k or
+    bottom-k by score to meet the bound.
 
     Args:
-        ice_scores: (seq_len,) per-token information content estimates.
-        budget: Number of survivors to select.
-        ice_fraction: Fraction selected by ICE score (rest random).
-        temperature: Softmax temperature for probabilistic ICE selection.
+        ice_scores: (seq_len,) per-position information content estimates.
+        threshold: Minimum ICE score to survive.
+        min_survivors: Floor on survivor count (default 1).
+        max_survivors: Ceiling on survivor count (default None = seq_len).
 
     Returns:
-        (budget,) indices of selected survivor positions, sorted.
+        Sorted indices of selected survivor positions.
     """
     seq_len = ice_scores.size(0)
-    budget = min(budget, seq_len)
+    if max_survivors is None:
+        max_survivors = seq_len
+    max_survivors = min(max_survivors, seq_len)
+    min_survivors = min(min_survivors, seq_len)
 
-    num_ice = int(budget * ice_fraction)
-    num_random = budget - num_ice
+    # Threshold selection
+    above = (ice_scores >= threshold).nonzero(as_tuple=True)[0]
+    n_above = above.size(0)
 
-    selected = set()
+    if n_above < min_survivors:
+        # Not enough above threshold — take top min_survivors by score
+        _, indices = torch.topk(ice_scores, min_survivors, sorted=False)
+    elif n_above > max_survivors:
+        # Too many above threshold — take top max_survivors by score
+        above_scores = ice_scores[above]
+        _, top_k = torch.topk(above_scores, max_survivors, sorted=False)
+        indices = above[top_k]
+    else:
+        indices = above
 
-    # ICE-biased: sample proportional to softmax(scores/temp)
-    if num_ice > 0:
-        probs = torch.softmax(ice_scores / temperature, dim=0)
-        ice_indices = torch.multinomial(probs, min(num_ice, seq_len), replacement=False)
-        selected.update(ice_indices.tolist())
-
-    # Random: uniform from remaining
-    if num_random > 0:
-        remaining = [i for i in range(seq_len) if i not in selected]
-        if remaining:
-            perm = torch.randperm(len(remaining))[:num_random]
-            selected.update(remaining[p] for p in perm.tolist())
-
-    indices = sorted(selected)
-    return torch.tensor(indices, device=ice_scores.device)
+    return indices.sort().values

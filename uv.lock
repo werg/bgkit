@@ -287,6 +287,7 @@ data = [
     { name = "aiosqlite" },
     { name = "httpx" },
     { name = "python-dotenv" },
+    { name = "tree-sitter-language-pack" },
 ]
 dev = [
     { name = "jupyterlab" },
@@ -346,6 +347,7 @@ requires-dist = [
     { name = "tokenizers" },
     { name = "tqdm" },
     { name = "transformers", specifier = ">=4.51" },
+    { name = "tree-sitter-language-pack", marker = "extra == 'data'", specifier = ">=0.6" },
     { name = "tree-sitter-language-pack", marker = "extra == 'eval'", specifier = ">=0.6" },
     { name = "wandb" },
 ]

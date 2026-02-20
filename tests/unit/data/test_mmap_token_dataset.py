@@ -21,6 +21,8 @@ def _create_mmap_data(
     file_token_ids: list[list[int]],
     file_paths: list[str],
     languages: list[str],
+    repo_paths: list[str] | None = None,
+    commit_shas: list[str] | None = None,
 ) -> None:
     """Helper to write mmap artifacts from known data."""
     all_tokens = []
@@ -32,11 +34,15 @@ def _create_mmap_data(
     np.save(data_dir / "tokens.npy", np.array(all_tokens, dtype=np.int32))
     np.save(data_dir / "offsets.npy", np.array(offsets, dtype=np.int64))
 
-    meta = pa.table({
+    meta_dict: dict[str, pa.Array] = {
         "file_path": pa.array(file_paths, type=pa.string()),
         "language": pa.array(languages, type=pa.string()),
-    })
-    pq.write_table(meta, data_dir / "metadata.parquet")
+    }
+    if repo_paths is not None:
+        meta_dict["repo_path"] = pa.array(repo_paths, type=pa.string())
+    if commit_shas is not None:
+        meta_dict["commit_sha"] = pa.array(commit_shas, type=pa.string())
+    pq.write_table(pa.table(meta_dict), data_dir / "metadata.parquet")
 
     manifest = {
         "schema_version": 1,
@@ -223,6 +229,90 @@ class TestMmapTokenDataset:
         for i in range(len(ds)):
             sample = ds[i]
             assert sample["token_ids"].ndim == 1
+
+    def test_getitem_with_commit_sha(self, tmp_path: Path):
+        """commit_sha is returned when present in metadata."""
+        d = tmp_path / "with_sha"
+        d.mkdir()
+        _create_mmap_data(
+            d,
+            file_token_ids=[[1, 2, 3], [4, 5]],
+            file_paths=["a.py", "b.py"],
+            languages=["python", "python"],
+            repo_paths=["owner/repo", "owner/repo"],
+            commit_shas=["abc123", "def456"],
+        )
+        ds = MmapTokenDataset(str(d), max_seq_len=8192)
+        assert ds[0]["commit_sha"] == "abc123"
+        assert ds[1]["commit_sha"] == "def456"
+
+    def test_getitem_with_repo_path(self, tmp_path: Path):
+        """repo_path is returned when present in metadata."""
+        d = tmp_path / "with_repo"
+        d.mkdir()
+        _create_mmap_data(
+            d,
+            file_token_ids=[[1, 2, 3]],
+            file_paths=["a.py"],
+            languages=["python"],
+            repo_paths=["owner/myrepo"],
+        )
+        ds = MmapTokenDataset(str(d), max_seq_len=8192)
+        assert ds[0]["repo_path"] == "owner/myrepo"
+
+    def test_require_commit_sha_raises(self, token_data_dir: Path):
+        """ValueError when require_commit_sha=True but column missing."""
+        with pytest.raises(ValueError, match="commit_sha column required"):
+            MmapTokenDataset(
+                str(token_data_dir), max_seq_len=8192, require_commit_sha=True
+            )
+
+    def test_require_commit_sha_passes(self, tmp_path: Path):
+        """No error when commit_sha present and required."""
+        d = tmp_path / "sha_ok"
+        d.mkdir()
+        _create_mmap_data(
+            d,
+            file_token_ids=[[1, 2]],
+            file_paths=["a.py"],
+            languages=["python"],
+            commit_shas=["abc123"],
+        )
+        ds = MmapTokenDataset(str(d), max_seq_len=8192, require_commit_sha=True)
+        assert ds[0]["commit_sha"] == "abc123"
+
+    def test_backward_compat_no_commit_sha(self, token_data_dir: Path):
+        """Old metadata without commit_sha still works fine."""
+        ds = MmapTokenDataset(str(token_data_dir), max_seq_len=8192)
+        sample = ds[0]
+        assert "commit_sha" not in sample
+        assert "file_path" in sample
+        assert "language" in sample
+
+    def test_has_commit_sha_property(self, tmp_path: Path):
+        """has_commit_sha property reflects metadata contents."""
+        d1 = tmp_path / "no_sha"
+        d1.mkdir()
+        _create_mmap_data(
+            d1,
+            file_token_ids=[[1]],
+            file_paths=["a.py"],
+            languages=["python"],
+        )
+        ds1 = MmapTokenDataset(str(d1), max_seq_len=8192)
+        assert ds1.has_commit_sha is False
+
+        d2 = tmp_path / "has_sha"
+        d2.mkdir()
+        _create_mmap_data(
+            d2,
+            file_token_ids=[[1]],
+            file_paths=["a.py"],
+            languages=["python"],
+            commit_shas=["abc"],
+        )
+        ds2 = MmapTokenDataset(str(d2), max_seq_len=8192)
+        assert ds2.has_commit_sha is True
 
 
 class TestGoldenOutput:

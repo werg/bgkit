@@ -8,13 +8,11 @@ bgkit:
   total_survivor_budget: 3500
   # Level 0: within-file compression
   level0:
-    # Survivor selection mix: fraction selected by ICE vs random
-    ice_fraction: 0.6
-    # Temperature for probabilistic ICE selection
-    ice_temperature: 1.0
+    # ICE threshold for survivor selection (nats/token)
+    ice_threshold: 3.0
   # Level 1: cross-file compression
   level1:
     # Max positions for L1 input (Qwen3-0.6B context limit)
     max_positions: 32768
-    # L1 selection is effectively uniform (ICE not calibrated for survivors)
-    ice_fraction: 0.0
+    # ICE threshold for L1 survivor selection
+    ice_threshold: 3.0

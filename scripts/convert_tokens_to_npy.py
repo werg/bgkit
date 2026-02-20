@@ -4,7 +4,7 @@
 Reads shard_*.parquet from a tokens directory and writes:
   - tokens.npy    -- flat int32, all files' token IDs concatenated
   - offsets.npy   -- int64 CSR-style file boundaries (N+1 entries)
-  - metadata.parquet -- one row per file: file_path, language, repo_path
+  - metadata.parquet -- one row per file: file_path, language, repo_path, commit_sha
   - manifest.json -- schema version, row count, totals, sha256
 
 Includes a full verification pass by default (--skip-verify to disable).
@@ -59,7 +59,10 @@ def convert(input_dir: Path) -> dict:
         length_chunks.append(lengths)
 
         # Metadata columns (keep as Arrow for efficient concat)
-        meta_tables.append(table.select(["file_path", "language", "repo_path"]))
+        meta_cols = ["file_path", "language", "repo_path"]
+        if "commit_sha" in table.column_names:
+            meta_cols.append("commit_sha")
+        meta_tables.append(table.select(meta_cols))
 
         if (shard_idx + 1) % 10 == 0 or shard_idx == len(shard_files) - 1:
             print(f"  Processed shard {shard_idx + 1}/{len(shard_files)}")
@@ -73,8 +76,14 @@ def convert(input_dir: Path) -> dict:
     offsets[0] = 0
     np.cumsum(all_lengths, out=offsets[1:])
 
-    # Concatenate metadata
-    meta_table = pa.concat_tables(meta_tables)
+    # Concatenate metadata (promote schemas so shards with/without commit_sha merge)
+    meta_table = pa.concat_tables(meta_tables, promote_options="default")
+
+    # Backfill commit_sha if no shard had it
+    if "commit_sha" not in meta_table.column_names:
+        meta_table = meta_table.append_column(
+            "commit_sha", pa.array([""] * meta_table.num_rows, type=pa.string())
+        )
 
     total_rows = len(all_lengths)
     total_tokens = int(offsets[-1])
@@ -132,6 +141,8 @@ def verify(input_dir: Path) -> None:
         )
 
         # Verify metadata row-by-row (strings can't be bulk-compared as easily)
+        shard_has_sha = "commit_sha" in table.column_names
+        sha_col = table.column("commit_sha") if shard_has_sha else None
         for ri in range(table.num_rows):
             assert str(fp_col[ri].as_py()) == str(meta.column("file_path")[row_idx].as_py()), (
                 f"file_path mismatch at row {row_idx}"
@@ -139,6 +150,13 @@ def verify(input_dir: Path) -> None:
             assert str(lang_col[ri].as_py()) == str(meta.column("language")[row_idx].as_py()), (
                 f"language mismatch at row {row_idx}"
             )
+            if shard_has_sha:
+                expected_sha = str(sha_col[ri].as_py()) if sha_col[ri].as_py() is not None else ""
+                actual_sha = meta.column("commit_sha")[row_idx].as_py()
+                actual_sha = str(actual_sha) if actual_sha is not None else ""
+                assert expected_sha == actual_sha, (
+                    f"commit_sha mismatch at row {row_idx}"
+                )
             row_idx += 1
 
         if (shard_idx + 1) % 10 == 0 or shard_idx == len(shard_files) - 1:

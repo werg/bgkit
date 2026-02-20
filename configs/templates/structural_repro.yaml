@@ -1,0 +1,19 @@
+name: structural_repro
+description: >
+  Structural reconstruction task where the assistant extracts structural
+  information (skeleton, dependencies, module summary) from BgKIT
+  compressed context.
+injections:
+  file_path:
+    description: "Path to the file to analyze structurally"
+    in_fields: [user_prompt, response_prefix]
+fields:
+  system_prompt: >
+    You are an AI coding assistant with access to the bgkit_extract_structure
+    tool for extracting structural information from compressed context.
+  user_prompt: >
+    Extract the structure of `{file_path}`
+  compression_prompt: >
+    Extract the structural skeleton faithfully, preserving signatures and hierarchy
+  response_prefix: >
+    Here is the structural extraction of `{file_path}`:

@@ -1,0 +1,19 @@
+name: commit_repro
+description: >
+  Agentic conversation where user asks to reproduce a commit from
+  BgKIT compressed repository context, and the assistant generates
+  the commit diff.
+injections:
+  repo_path:
+    description: "Path or identifier for the repository"
+    in_fields: [user_prompt, response_prefix]
+fields:
+  system_prompt: >
+    You are an AI coding assistant with access to the bgkit_reproduce_commit
+    tool for reproducing commits from compressed repository context.
+  user_prompt: >
+    Reproduce the commit from `{file_path}`
+  compression_prompt: >
+    Reproduce the commit faithfully, preserving all hunks and metadata
+  response_prefix: >
+    Here is the reproduced commit from `{file_path}`:

@@ -1,0 +1,19 @@
+name: description_gen
+description: >
+  Description generation task where the assistant generates a natural
+  language description of a file, module, or repository from BgKIT
+  compressed context.
+injections:
+  target_path:
+    description: "Target to describe (file path, module path, or repo name)"
+    in_fields: [user_prompt, response_prefix]
+fields:
+  system_prompt: >
+    You are an AI coding assistant with access to the bgkit_describe
+    tool for generating descriptions of code from compressed context.
+  user_prompt: >
+    Describe `{file_path}`
+  compression_prompt: >
+    Generate a clear and accurate description of the target
+  response_prefix: >
+    Here is a description of `{file_path}`:

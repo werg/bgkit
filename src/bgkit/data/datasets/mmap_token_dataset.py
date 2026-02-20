@@ -33,7 +33,11 @@ class MmapTokenDataset(Dataset):
     METADATA_FILE: ClassVar[str] = "metadata.parquet"
 
     def __init__(
-        self, data_dir: str, max_seq_len: int = 8192, include_metadata: bool = True
+        self,
+        data_dir: str,
+        max_seq_len: int = 8192,
+        include_metadata: bool = True,
+        require_commit_sha: bool = False,
     ):
         data_path = Path(data_dir)
         self._include_metadata = include_metadata
@@ -56,6 +60,15 @@ class MmapTokenDataset(Dataset):
             raise ValueError(
                 f"Unsupported manifest schema version: {manifest.get('schema_version')}"
             )
+
+        if require_commit_sha and self._include_metadata:
+            schema = pq.read_schema(data_path / "metadata.parquet")
+            if "commit_sha" not in schema.names:
+                raise ValueError(
+                    f"commit_sha column required but not found in "
+                    f"{data_path / 'metadata.parquet'}. "
+                    f"Re-run conversion with commit_sha-aware parquet shards."
+                )
 
         self._tokens = np.load(data_path / "tokens.npy", mmap_mode="r")
         offsets = np.load(data_path / "offsets.npy")
@@ -121,12 +134,56 @@ class MmapTokenDataset(Dataset):
         """Return token count for each chunk (for TokenBudgetBatchSampler)."""
         return self._chunk_lengths
 
+    @property
+    def has_commit_sha(self) -> bool:
+        """Check if commit_sha column is available in metadata."""
+        schema = pq.read_schema(self._data_path / "metadata.parquet")
+        return "commit_sha" in schema.names
+
+    @property
+    def chunk_file_indices(self) -> np.ndarray | None:
+        """Per-chunk file index array (int32). None when metadata disabled."""
+        return self._chunk_file_idx
+
+    def get_metadata_table(self) -> pa.Table:
+        """Return the metadata Arrow table (lazy-loaded).
+
+        Public accessor for metadata needed by key-based joins (e.g.,
+        CompressionDataset sub-datasets).
+        """
+        return self._get_metadata()
+
+    def file_key(self, chunk_idx: int) -> tuple[str, str, str] | None:
+        """Return (repo_path, file_path, commit_sha) for a chunk, or None.
+
+        Returns None when metadata is disabled or the required columns
+        are missing.
+        """
+        if self._chunk_file_idx is None:
+            return None
+        file_idx = int(self._chunk_file_idx[chunk_idx])
+        meta = self._get_metadata()
+        if "repo_path" not in meta.column_names or "commit_sha" not in meta.column_names:
+            return None
+        return (
+            str(meta.column("repo_path")[file_idx].as_py()),
+            str(meta.column("file_path")[file_idx].as_py()),
+            str(meta.column("commit_sha")[file_idx].as_py()),
+        )
+
     def _get_metadata(self) -> pa.Table:
         """Lazy-load metadata (only needed columns)."""
         if self._metadata is None:
+            columns = ["file_path", "language"]
+            schema = pq.read_schema(self._data_path / "metadata.parquet")
+            available = set(schema.names)
+            if "repo_path" in available:
+                columns.append("repo_path")
+            if "commit_sha" in available:
+                columns.append("commit_sha")
             self._metadata = pq.read_table(
                 self._data_path / "metadata.parquet",
-                columns=["file_path", "language"],
+                columns=columns,
             )
         return self._metadata
 
@@ -155,8 +212,13 @@ class MmapTokenDataset(Dataset):
         assert self._chunk_file_idx is not None
         file_idx = int(self._chunk_file_idx[idx])
         meta = self._get_metadata()
-        return {
+        result = {
             "token_ids": torch.from_numpy(tokens),
             "file_path": str(meta.column("file_path")[file_idx].as_py()),
             "language": str(meta.column("language")[file_idx].as_py()),
         }
+        if "repo_path" in meta.column_names:
+            result["repo_path"] = str(meta.column("repo_path")[file_idx].as_py())
+        if "commit_sha" in meta.column_names:
+            result["commit_sha"] = str(meta.column("commit_sha")[file_idx].as_py())
+        return result
