@@ -11,11 +11,11 @@ objectives:
   commit_reproduction: 0.25
 
 ice:
-  checkpoint_path: checkpoints/ice/ice_step5000_20250101_120000
+  checkpoint_path: null  # must be set to a retrained ICE checkpoint
   input_dim: 1024
-  hidden_dim: 256
-  num_layers: 4
-  kernel_size: 7
+  hidden_dim: 128
+  num_layers: 2
+  kernel_size: 5
 
 curriculum:
   l1_introduction_step: 20000

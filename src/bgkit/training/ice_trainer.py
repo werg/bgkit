@@ -62,30 +62,30 @@ class ICETrainer(BaseTrainer):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
 
-        # Frozen embedding model
+        # Frozen embedding layer (table lookup only — matches inference in CompressionTrainer)
         emb_model_name = self.cfg.model.ice.get(
             "embedding_model", "Qwen/Qwen3-Embedding-0.6B"
         )
         emb_revision = self.cfg.model.ice.get("embedding_model_revision", None)
-        logger.info("loading_embedding_model", model=emb_model_name, revision=emb_revision)
-        self.embedding_model = AutoModel.from_pretrained(
+        logger.info("loading_embedding_layer", model=emb_model_name, revision=emb_revision)
+        emb_model = AutoModel.from_pretrained(
             emb_model_name,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=emb_revision,
         )
-        self.embedding_model.to(device)
-        self.embedding_model.eval()
-        for p in self.embedding_model.parameters():
-            p.requires_grad = False
+        self.embedding_layer = emb_model.get_input_embeddings()
+        self.embedding_layer.to(device)
+        self.embedding_layer.requires_grad_(False)
+        del emb_model  # free the transformer layers
 
         # ICE model
         ice_cfg = self.cfg.model.ice
         self.model = ICE(
             input_dim=ice_cfg.get("input_dim", 1024),
-            hidden_dim=ice_cfg.get("hidden_dim", 256),
-            num_layers=ice_cfg.get("num_layers", 4),
-            kernel_size=ice_cfg.get("kernel_size", 7),
+            hidden_dim=ice_cfg.get("hidden_dim", 128),
+            num_layers=ice_cfg.get("num_layers", 2),
+            kernel_size=ice_cfg.get("kernel_size", 5),
             dropout=ice_cfg.get("dropout", 0.1),
         )
         self.model.to(device)
@@ -139,6 +139,7 @@ class ICETrainer(BaseTrainer):
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tcfg.lr)
 
         self.uniformity_weight = tcfg.get("uniformity_reg_weight", 0.1)
+        self.uniform_reg_weight = tcfg.get("uniform_output_reg_weight", 0.0)
 
         logger.info(
             "ice_trainer_setup",
@@ -150,43 +151,39 @@ class ICETrainer(BaseTrainer):
     def apply_live_config(self, changes: dict) -> None:
         if "uniformity_reg_weight" in changes:
             self.uniformity_weight = changes["uniformity_reg_weight"]
+        if "uniform_output_reg_weight" in changes:
+            self.uniform_reg_weight = changes["uniform_output_reg_weight"]
 
     def _embed_tokens(self, token_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Run frozen embedding model to get token embeddings.
+        """Look up token embeddings from frozen embedding table.
 
         Args:
             token_ids: (B, L) token IDs.
-            attention_mask: (B, L) attention mask.
+            attention_mask: (B, L) attention mask (unused, kept for API compat).
 
         Returns:
-            (B, L, hidden_dim) token embeddings.
+            (B, L, embedding_dim) token embeddings.
         """
         with torch.no_grad():
-            if self.device.type == "cuda":
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    outputs = self.embedding_model(
-                        input_ids=token_ids, attention_mask=attention_mask
-                    )
-            else:
-                outputs = self.embedding_model(
-                    input_ids=token_ids, attention_mask=attention_mask
-                )
-            return outputs.last_hidden_state.float()
+            return self.embedding_layer(token_ids).float()
 
     def _align_and_mask(
         self, ce_pred: torch.Tensor, ce_values: torch.Tensor, attention_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Align ICE predictions with CE targets and build validity mask.
 
+        ICE(pos_i) predicts CE(token_i). Position 0 has no CE target (no prior
+        context), so we drop it: ce_pred[:, 1:] is paired with ce_values[:, :].
+
         Args:
             ce_pred: (B, L) raw ICE predictions.
-            ce_values: (B, max_ce_len) padded CE targets.
+            ce_values: (B, max_ce_len) padded CE targets (ce_values[k] = CE of token k+1).
             attention_mask: (B, L) token-level attention mask.
 
         Returns:
             (ce_pred_aligned, ce_target, ce_mask) all (B, min_len).
         """
-        ce_pred_aligned = ce_pred[:, :-1].float()
+        ce_pred_aligned = ce_pred[:, 1:].float()
         ce_mask = attention_mask[:, 1:].float()
         min_len = min(ce_pred_aligned.size(1), ce_values.size(1))
         return (
@@ -233,6 +230,32 @@ class ICETrainer(BaseTrainer):
 
         loss = mse_loss + self.uniformity_weight * uniformity_loss
 
+        # Uniform-output regularization on random embeddings
+        uniform_output_loss_val = 0.0
+        rand_pred_var_val = 0.0
+        if self.uniform_reg_weight > 0:
+            rand_embeddings = torch.randn_like(embeddings)
+            with torch.no_grad():
+                valid_emb = embeddings[attention_mask.bool()]
+                emb_norm = (
+                    valid_emb.norm(dim=-1).mean()
+                    if valid_emb.numel() > 0
+                    else embeddings.new_tensor(1.0)
+                )
+                rand_embeddings = rand_embeddings * emb_norm / (
+                    rand_embeddings.norm(dim=-1, keepdim=True) + 1e-8
+                )
+            rand_pred = self.model(rand_embeddings)
+            rand_valid = rand_pred[attention_mask.bool()]
+            uniform_output_loss = (
+                rand_valid.var(correction=0)
+                if rand_valid.numel() > 0
+                else rand_pred.new_tensor(0.0)
+            )
+            loss = loss + self.uniform_reg_weight * uniform_output_loss
+            uniform_output_loss_val = uniform_output_loss.item()
+            rand_pred_var_val = uniform_output_loss_val
+
         # Backward
         self.optimizer.zero_grad()
         loss.backward()
@@ -245,6 +268,8 @@ class ICETrainer(BaseTrainer):
             "uniformity_loss": uniformity_loss.item(),
             "pred_variance": pred_var.item(),
             "grad_norm": grad_norm,
+            "uniform_output_loss": uniform_output_loss_val,
+            "rand_pred_variance": rand_pred_var_val,
         }
 
     @torch.no_grad()

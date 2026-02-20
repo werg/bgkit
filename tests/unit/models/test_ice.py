@@ -17,6 +17,14 @@ def test_ice_output_shape():
     assert out.shape == (2, 100)
 
 
+def test_ice_default_params():
+    """ICE with default params should produce ~0.7M parameters."""
+    model = ICE()
+    total = sum(p.numel() for p in model.parameters())
+    # Expected ~738K with hidden_dim=128, num_layers=2, kernel_size=5
+    assert 600_000 < total < 900_000, f"Expected ~738K params, got {total}"
+
+
 def test_ice_positive_output():
     """ICE predicts cross-entropy values, which should be non-negative after training.
     Before training, outputs can be anything -- just check the shape is right."""

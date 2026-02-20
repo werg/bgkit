@@ -80,31 +80,15 @@ class TestIceCollateFn:
 
 
 # ---------------------------------------------------------------------------
-# Mock embedding model for train_step tests (avoids loading real Qwen)
+# Mock embedding layer for train_step tests (avoids loading real Qwen)
 # ---------------------------------------------------------------------------
 
 
-class MockEmbeddingModel(nn.Module):
-    """Tiny mock that returns random embeddings of the right shape."""
+class MockEmbeddingLayer(nn.Embedding):
+    """Tiny mock embedding layer that returns embeddings of the right shape."""
 
-    def __init__(self, hidden_dim: int = 64):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        # Need a parameter so .to(device) works
-        self._dummy = nn.Parameter(torch.zeros(1), requires_grad=False)
-
-    def forward(self, input_ids, attention_mask=None):
-        batch_size, seq_len = input_ids.shape
-        embeddings = torch.randn(
-            batch_size, seq_len, self.hidden_dim, device=input_ids.device
-        )
-
-        class _Output:
-            pass
-
-        out = _Output()
-        out.last_hidden_state = embeddings
-        return out
+    def __init__(self, hidden_dim: int = 64, vocab_size: int = 2000):
+        super().__init__(vocab_size, hidden_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +110,7 @@ class TestICETrainStep:
                 "lr": 1e-3,
                 "warmup_steps": 10,
                 "uniformity_reg_weight": 0.1,
+                "uniform_output_reg_weight": 0.05,
                 "eval_every": 50,
                 "save_every": 0,
             },
@@ -135,10 +120,10 @@ class TestICETrainStep:
         trainer = ICETrainer(cfg)
         trainer.device = torch.device("cpu")
 
-        # Mock embedding model
+        # Mock embedding layer
         hidden_dim = 64
-        trainer.embedding_model = MockEmbeddingModel(hidden_dim)
-        trainer.embedding_model.eval()
+        trainer.embedding_layer = MockEmbeddingLayer(hidden_dim)
+        trainer.embedding_layer.requires_grad_(False)
 
         # Small ICE model
         trainer.model = ICE(
@@ -148,6 +133,7 @@ class TestICETrainStep:
         # Optimizer
         trainer.optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=1e-3)
         trainer.uniformity_weight = 0.1
+        trainer.uniform_reg_weight = 0.05
 
         return trainer
 
@@ -164,6 +150,8 @@ class TestICETrainStep:
         assert "uniformity_loss" in metrics
         assert "pred_variance" in metrics
         assert "grad_norm" in metrics
+        assert "uniform_output_loss" in metrics
+        assert "rand_pred_variance" in metrics
 
     def test_train_step_loss_is_finite(self, trainer):
         """Loss should be a finite number."""
@@ -195,6 +183,34 @@ class TestICETrainStep:
         early_avg = sum(losses[:5]) / 5
         late_avg = sum(losses[-5:]) / 5
         assert late_avg < early_avg, f"Loss didn't decrease: {early_avg:.4f} -> {late_avg:.4f}"
+
+    def test_alignment_direction(self, trainer):
+        """Verify _align_and_mask pairs ce_pred[:, 1:] with ce_values[:, :]."""
+        # Create a simple prediction and target
+        ce_pred = torch.arange(10).unsqueeze(0).float()  # (1, 10): [0,1,2,...,9]
+        ce_values = torch.arange(9).unsqueeze(0).float()  # (1, 9): [0,1,2,...,8]
+        attention_mask = torch.ones(1, 10, dtype=torch.long)
+
+        pred_aligned, target, _mask = trainer._align_and_mask(ce_pred, ce_values, attention_mask)
+
+        # ce_pred[:, 1:] = [1,2,...,9], ce_values[:, :] = [0,1,...,8]
+        assert pred_aligned.shape == (1, 9)
+        assert target.shape == (1, 9)
+        assert pred_aligned[0, 0].item() == 1.0  # position 1 from ce_pred
+        assert target[0, 0].item() == 0.0  # first CE target
+
+    def test_uniform_reg_metric_keys(self, trainer):
+        """train_step with uniform_reg_weight > 0 should return uniform reg metrics."""
+        batch = ice_collate_fn([
+            {"token_ids": torch.randint(0, 1000, (20,)), "ce_values": torch.rand(19)},
+        ])
+        metrics = trainer.train_step(batch)
+
+        assert "uniform_output_loss" in metrics
+        assert "rand_pred_variance" in metrics
+        # With uniform_reg_weight > 0, these should be non-zero (almost certainly)
+        assert isinstance(metrics["uniform_output_loss"], float)
+        assert isinstance(metrics["rand_pred_variance"], float)
 
 
 # ---------------------------------------------------------------------------
@@ -398,14 +414,11 @@ class TestResume:
 class TestICETinyDataset:
     def test_tiny_dataset_raises_value_error(self, tmp_path):
         """ICETrainer.setup() should raise ValueError when dataset has only 1 sample."""
-        from unittest.mock import patch
-
-        from omegaconf import OmegaConf
-
-        # Create minimal mmap artifacts with 1 sample
         import json
+        from unittest.mock import MagicMock, patch
 
         import numpy as np
+        from omegaconf import OmegaConf
 
         np.save(tmp_path / "tokens.npy", np.array([1, 2, 3], dtype=np.int32))
         np.save(tmp_path / "offsets.npy", np.array([0, 3], dtype=np.int64))
@@ -439,10 +452,12 @@ class TestICETinyDataset:
             "wandb": {"enabled": False},
         })
 
-        # Patch AutoModel.from_pretrained to return a mock
-        mock_emb = MockEmbeddingModel(hidden_dim=64)
+        # Patch AutoModel.from_pretrained to return a mock with get_input_embeddings
+        mock_embedding = MockEmbeddingLayer(hidden_dim=64)
+        mock_model = MagicMock()
+        mock_model.get_input_embeddings.return_value = mock_embedding
         with (
-            patch("bgkit.training.ice_trainer.AutoModel.from_pretrained", return_value=mock_emb),
+            patch("bgkit.training.ice_trainer.AutoModel.from_pretrained", return_value=mock_model),
             pytest.raises(ValueError, match="too small"),
         ):
             trainer = ICETrainer(cfg)

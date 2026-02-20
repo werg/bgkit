@@ -45,12 +45,20 @@ def test_threshold_returns_sorted():
         assert torch.all(indices[1:] > indices[:-1])
 
 
-def test_threshold_zero_min_survivors():
-    """min_survivors=0 with nothing above threshold returns empty."""
+def test_threshold_min_survivors_fallback():
+    """When nothing above threshold, takes top min_survivors by score."""
     scores = torch.tensor([1.0, 2.0, 3.0])
-    # Nothing above 10.0, min_survivors defaults to 1
     indices = select_survivors_by_threshold(scores, threshold=10.0, min_survivors=1)
     assert indices.size(0) == 1
+    # Highest score is at position 2
+    assert indices[0].item() == 2
+
+
+def test_threshold_empty_input():
+    """Empty input tensor returns empty indices without crashing."""
+    scores = torch.tensor([])
+    indices = select_survivors_by_threshold(scores, threshold=1.0, min_survivors=1)
+    assert indices.size(0) == 0
 
 
 def test_threshold_all_above():

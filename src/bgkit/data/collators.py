@@ -221,5 +221,5 @@ def _collate_repo_samples(samples: list) -> dict:
         "prefix_attention_mask": prefix_mask,
         "compression_prompt_ids": prompt_ids,
         "compression_prompt_mask": prompt_mask,
-        "direct_l1": all(s.direct_l1 for s in samples),
+        "direct_l1": torch.tensor([s.direct_l1 for s in samples], dtype=torch.bool),
     }

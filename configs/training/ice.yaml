@@ -5,6 +5,8 @@ lr: 3.0e-4
 warmup_steps: 1000
 # Uniformity regularizer weight
 uniformity_reg_weight: 0.1
+# Uniform-output regularizer on random embeddings (graceful L1 fallback)
+uniform_output_reg_weight: 0.05
 eval_every: 2000
 save_every: 2000
 max_batch_tokens: 65536

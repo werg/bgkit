@@ -5,7 +5,7 @@ Lightweight 1D CNN that predicts per-token information density
 Used to allocate survivor budgets across files proportionally
 to estimated information content.
 
-~2-5M parameters. Trained offline before all other components.
+~0.7M parameters. Trained offline before all other components.
 """
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ class ICE(nn.Module):
     def __init__(
         self,
         input_dim: int = 1024,
-        hidden_dim: int = 256,
-        num_layers: int = 4,
-        kernel_size: int = 7,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+        kernel_size: int = 5,
         dropout: float = 0.1,
     ):
         super().__init__()

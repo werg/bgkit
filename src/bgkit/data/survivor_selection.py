@@ -31,6 +31,8 @@ def select_survivors_by_threshold(
         Sorted indices of selected survivor positions.
     """
     seq_len = ice_scores.size(0)
+    if seq_len == 0:
+        return torch.empty(0, dtype=torch.long, device=ice_scores.device)
     if max_survivors is None:
         max_survivors = seq_len
     max_survivors = min(max_survivors, seq_len)

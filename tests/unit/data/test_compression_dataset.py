@@ -559,7 +559,7 @@ class TestDirectL1Flag:
         assert sample.direct_l1 is False
 
     def test_collate_repo_direct_l1_flag(self):
-        """direct_l1=True should propagate through collator."""
+        """direct_l1=True should propagate as per-sample bool tensor."""
         samples = [
             RepoCompressionSample(
                 objective="commit_reproduction",
@@ -577,10 +577,11 @@ class TestDirectL1Flag:
             for _ in range(3)
         ]
         batch = collate_compression(samples)
-        assert batch["direct_l1"] is True
+        assert batch["direct_l1"].dtype == torch.bool
+        assert batch["direct_l1"].all()
 
-    def test_collate_repo_direct_l1_mixed_is_false(self):
-        """Mixed direct_l1 batch should fall back to False."""
+    def test_collate_repo_direct_l1_mixed(self):
+        """Mixed direct_l1 batch preserves per-sample flags."""
         s1 = RepoCompressionSample(
             objective="commit_reproduction",
             file_token_ids=[torch.ones(50, dtype=torch.long)],
@@ -608,7 +609,8 @@ class TestDirectL1Flag:
             direct_l1=False,
         )
         batch = collate_compression([s1, s2])
-        assert batch["direct_l1"] is False
+        assert batch["direct_l1"][0] is True or batch["direct_l1"][0].item() is True
+        assert batch["direct_l1"][1] is False or batch["direct_l1"][1].item() is False
 
 
 # ---------------------------------------------------------------------------

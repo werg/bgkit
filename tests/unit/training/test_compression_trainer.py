@@ -523,66 +523,105 @@ class TestCheckpointRoundtrip:
 
 class TestDirectL1:
     def test_direct_l1_dispatches(self, trainer):
-        """Batch with direct_l1=True should go through _compress_direct_l1."""
+        """Batch with all direct_l1=True should produce valid metrics."""
         batch = _make_direct_l1_batch()
-        assert batch["direct_l1"] is True
+        assert batch["direct_l1"].all()
 
-        # Should run without error and produce valid metrics
         metrics = trainer.train_step(batch)
         assert "loss" in metrics
         assert torch.isfinite(torch.tensor(metrics["loss"]))
         assert metrics["sample_type"] == "repo"
 
     def test_direct_l1_returns_valid_embeddings(self, trainer):
-        """_compress_direct_l1 should return embeddings with correct shapes."""
+        """direct_l1 batch should return embeddings with correct shapes."""
         batch = _make_direct_l1_batch(batch_size=2, file_len=12)
-        survivors, survivor_mask = trainer._compress_direct_l1(batch)
+        survivors, survivor_mask = trainer._compress_repo_batch(batch)
 
         assert survivors.dim() == 3  # (B, num_survivors, D)
-        assert survivors.size(0) == 2  # batch_size
+        assert survivors.size(0) == 2
         assert survivors.size(-1) == HIDDEN_DIM
-        assert survivor_mask.dim() == 2  # (B, num_survivors)
+        assert survivor_mask.dim() == 2
         assert survivor_mask.size(0) == 2
 
-    def test_direct_l1_skips_l0(self, trainer):
-        """direct_l1 batch should call _compress_direct_l1, not per-file L0 loop."""
+    def test_direct_l1_uses_single_direct_l1(self, trainer):
+        """direct_l1 samples should call _compress_single_direct_l1."""
         batch = _make_direct_l1_batch()
 
-        # Patch _compress_direct_l1 to track calls
-        original = trainer._compress_direct_l1
+        original = trainer._compress_single_direct_l1
         call_count = [0]
 
-        def tracking_compress(b):
+        def tracking(*args, **kwargs):
             call_count[0] += 1
-            return original(b)
+            return original(*args, **kwargs)
 
-        trainer._compress_direct_l1 = tracking_compress
+        trainer._compress_single_direct_l1 = tracking
         trainer._compress_repo_batch(batch)
-        assert call_count[0] == 1
+        assert call_count[0] == batch["file_token_ids"].size(0)
 
     def test_non_direct_l1_does_not_dispatch(self, trainer):
-        """Regular repo batch should NOT call _compress_direct_l1."""
+        """Regular repo batch should NOT call _compress_single_direct_l1."""
         batch = _make_repo_batch(n_files=2)
-        assert batch.get("direct_l1", False) is False
+        assert not batch["direct_l1"].any()
 
-        # Track _compress_direct_l1 calls
         call_count = [0]
-        original = trainer._compress_direct_l1
+        original = trainer._compress_single_direct_l1
 
-        def tracking_compress(b):
+        def tracking(*args, **kwargs):
             call_count[0] += 1
-            return original(b)
+            return original(*args, **kwargs)
 
-        trainer._compress_direct_l1 = tracking_compress
+        trainer._compress_single_direct_l1 = tracking
         trainer._compress_repo_batch(batch)
         assert call_count[0] == 0
 
     def test_compress_repo_batch_dispatches_direct_l1(self, trainer):
-        """_compress_repo_batch dispatches to _compress_direct_l1 for direct_l1 batches."""
+        """_compress_repo_batch handles direct_l1 batches end-to-end."""
         batch = _make_direct_l1_batch()
         survivors, survivor_mask = trainer._compress_repo_batch(batch)
         assert survivors.dim() == 3
         assert survivor_mask.dim() == 2
+
+    def test_direct_l1_single_encoder_pass(self, trainer):
+        """direct_l1 samples should get exactly one encoder call, not two."""
+        batch = _make_direct_l1_batch(batch_size=2)
+
+        encoder_call_count = [0]
+        original_encoder = trainer.encoder.forward
+
+        def counting_encoder(*args, **kwargs):
+            encoder_call_count[0] += 1
+            return original_encoder(*args, **kwargs)
+
+        trainer.encoder.forward = counting_encoder
+        trainer._compress_repo_batch(batch)
+        # One encoder call per direct_l1 sample, no extra L1 pass
+        assert encoder_call_count[0] == 2
+
+    def test_direct_l1_rejects_multi_file(self, trainer):
+        """direct_l1=True with file_count > 1 should raise ValueError."""
+        # Create a sample with direct_l1=True but 2 files
+        sample = RepoCompressionSample(
+            objective="commit_reproduction",
+            file_token_ids=[
+                torch.randint(0, VOCAB_SIZE, (12,)),
+                torch.randint(0, VOCAB_SIZE, (12,)),
+            ],
+            file_attention_masks=[
+                torch.ones(12, dtype=torch.bool),
+                torch.ones(12, dtype=torch.bool),
+            ],
+            compression_ratio=0.2,
+            compression_level=1,
+            target_token_ids=torch.randint(0, VOCAB_SIZE, (SEQ_LEN,)),
+            target_attention_mask=torch.ones(SEQ_LEN, dtype=torch.bool),
+            target_loss_mask=torch.ones(SEQ_LEN, dtype=torch.long),
+            prefix_ids=torch.randint(0, VOCAB_SIZE, (3,)),
+            compression_prompt_ids=torch.randint(0, VOCAB_SIZE, (4,)),
+            direct_l1=True,
+        )
+        batch = collate_compression([sample])
+        with pytest.raises(ValueError, match=r"direct_l1 sample.*file_count=2"):
+            trainer._compress_repo_batch(batch)
 
 
 # ---------------------------------------------------------------------------

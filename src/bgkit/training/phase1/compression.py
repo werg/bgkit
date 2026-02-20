@@ -143,12 +143,21 @@ class CompressionTrainer(BaseTrainer):
         from bgkit.models.ice import ICE
 
         ice_cfg = tcfg.ice
+        if not ice_cfg.get("checkpoint_path"):
+            raise ValueError(
+                "training.ice.checkpoint_path must be set to a trained ICE checkpoint"
+            )
         ice_ckpt_path = Path(ice_cfg.checkpoint_path)
+        if not ice_ckpt_path.exists():
+            raise FileNotFoundError(
+                f"ICE checkpoint not found: {ice_ckpt_path}\n"
+                "Set training.ice.checkpoint_path to a valid ICE checkpoint."
+            )
         self.ice_model = ICE(
             input_dim=ice_cfg.get("input_dim", 1024),
-            hidden_dim=ice_cfg.get("hidden_dim", 256),
-            num_layers=ice_cfg.get("num_layers", 4),
-            kernel_size=ice_cfg.get("kernel_size", 7),
+            hidden_dim=ice_cfg.get("hidden_dim", 128),
+            num_layers=ice_cfg.get("num_layers", 2),
+            kernel_size=ice_cfg.get("kernel_size", 5),
         )
         _, ice_state_dicts = load_checkpoint(ice_ckpt_path)
         self.ice_model.load_state_dict(ice_state_dicts["model"])
@@ -406,10 +415,14 @@ class CompressionTrainer(BaseTrainer):
         with torch.no_grad():
             ice_scores = self.ice_model(embeddings.float())  # (B, L)
         ice_scores = ice_scores.masked_fill(~attention_mask, float("-inf"))
+        if seq_len > 0:
+            ice_scores[:, 0] = float("-inf")  # position 0 unsupervised during ICE training
 
         survivor_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=embeddings.device)
         for b in range(batch_size):
             valid_len = int(attention_mask[b].sum().item())
+            if valid_len == 0:
+                continue
             min_surv = max(1, int(valid_len * self._min_compression_ratio))
             max_surv = max(1, int(valid_len * self._max_compression_ratio))
             valid_scores = ice_scores[b, :valid_len]
@@ -419,12 +432,15 @@ class CompressionTrainer(BaseTrainer):
             )
             survivor_mask[b, indices] = True
 
-        # ICE distribution monitoring
+        # ICE distribution monitoring (exclude position 0 which is forced to -inf)
         eval_every = self.cfg.training.get("eval_every", 0)
         if eval_every > 0 and self.global_step % eval_every == 0:
-            valid_scores = ice_scores[attention_mask]
+            stats_mask = attention_mask.clone()
+            if seq_len > 0:
+                stats_mask[:, 0] = False
+            valid_scores = ice_scores[stats_mask]
             selected_scores = ice_scores[survivor_mask]
-            if selected_scores.numel() > 1:
+            if valid_scores.numel() > 1 and selected_scores.numel() > 1:
                 logger.info(
                     "ice_survivor_stats",
                     step=self.global_step,
@@ -474,154 +490,183 @@ class CompressionTrainer(BaseTrainer):
 
         return enc_out.survivor_embeddings, enc_out.survivor_attention_mask
 
-    def _compress_direct_l1(
-        self, batch: dict,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run direct L1 compression (skip L0) for single-file repo samples.
+    def _compress_single_direct_l1(
+        self,
+        f_ids: torch.Tensor,
+        f_mask: torch.Tensor,
+        prompt_emb: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        bgkit_embed: torch.nn.Module,
+    ) -> torch.Tensor:
+        """Run direct L1 on a single sample (1, L) -> (n_surv, D).
 
-        Used for commit reproduction where tokens are already cross-file
-        representations and don't need L0 per-file compression.
-
-        Returns:
-            (survivor_embeddings, survivor_attention_mask)
+        Skips L0; embeds file tokens, scores with ICE, runs one encoder pass.
         """
-        file_ids = batch["file_token_ids"].to(self.device)  # (B, 1, L)
-        file_masks = batch["file_attention_masks"].to(self.device)
-        file_count = batch["file_count"]
-        prompt_ids = batch["compression_prompt_ids"].to(self.device)
-        prompt_mask = batch["compression_prompt_mask"].to(self.device)
-
-        # Validate: direct_l1 requires exactly one file per sample
-        if file_ids.size(1) != 1:
-            raise ValueError(
-                f"direct_l1 batch has {file_ids.size(1)} file slots, expected 1"
-            )
-        if not (file_count == 1).all():
-            raise ValueError(
-                f"direct_l1 batch has file_count {file_count.tolist()}, expected all 1"
-            )
-
-        # Squeeze out the single-file dimension: (B, 1, L) -> (B, L)
-        token_ids = file_ids[:, 0]
-        attention_mask = file_masks[:, 0]
-
-        bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
-        embeddings = bgkit_embed(token_ids)
-        prompt_emb = bgkit_embed(prompt_ids)
-
-        # Live ICE scoring for survivor selection
-        survivor_mask = self._score_and_select(embeddings, attention_mask)
-
-        # Single encoder call at L1 level
+        f_emb = bgkit_embed(f_ids)
+        survivor_mask = self._score_and_select(f_emb, f_mask)
         enc_out = self.encoder(
-            input_embeddings=embeddings,
+            input_embeddings=f_emb,
             survivor_mask=survivor_mask,
-            attention_mask=attention_mask,
+            attention_mask=f_mask,
             prompt_embeddings=prompt_emb,
             prompt_attention_mask=prompt_mask,
         )
+        return enc_out.survivor_embeddings[0]  # (n_surv, D)
 
-        return enc_out.survivor_embeddings, enc_out.survivor_attention_mask
+    def _compress_single_l0_l1(
+        self,
+        file_ids: torch.Tensor,
+        file_masks: torch.Tensor,
+        n_files: int,
+        prompt_emb: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        bgkit_embed: torch.nn.Module,
+    ) -> torch.Tensor:
+        """Run L0 per-file + collect survivors for one sample -> (total_surv, D).
+
+        Returns L0 survivors mapped back to input embedding space via auto_repro.
+        """
+        sample_survivors = []
+        for f in range(n_files):
+            f_ids = file_ids[f].unsqueeze(0)
+            f_mask = file_masks[f].unsqueeze(0)
+            f_emb = bgkit_embed(f_ids)
+
+            s_mask = self._score_and_select(f_emb, f_mask)
+
+            enc_out = self.encoder(
+                input_embeddings=f_emb,
+                survivor_mask=s_mask,
+                attention_mask=f_mask,
+                prompt_embeddings=prompt_emb,
+                prompt_attention_mask=prompt_mask,
+            )
+
+            # Map L0 output back to input embedding space for L1
+            all_normed = enc_out.all_embeddings[0]
+            surv_mask_out = enc_out.survivor_mask[0]
+            survivor_normed = all_normed[surv_mask_out]
+            survivor_input_space = self.encoder.auto_reproduce(
+                survivor_normed.unsqueeze(0),
+            )[0]
+            sample_survivors.append(survivor_input_space)
+
+        if sample_survivors:
+            return torch.cat(sample_survivors, dim=0)
+        return torch.zeros(
+            1, self.encoder.compressor.hidden_dim,
+            device=self.device, dtype=torch.bfloat16,
+        )
 
     def _compress_repo_batch(
         self, batch: dict,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run L0+L1 compression on a batch of RepoCompressionSamples.
+        """Run compression on a batch of RepoCompressionSamples.
 
-        For each sample, runs L0 compression on each file independently,
-        concatenates L0 survivors, then runs L1 compression on the
-        concatenated result.
+        Handles mixed batches with two distinct paths:
+        - direct_l1 samples: single encoder pass (skip L0), producing final
+          decoder-space survivors directly.
+        - Regular samples: L0 per-file → auto_repro to input space → L1
+          (ICE + encoder), producing decoder-space survivors.
+
+        Final outputs from both paths are padded and combined.
 
         Returns:
-            (l1_survivor_embeddings, l1_survivor_attention_mask)
+            (survivor_embeddings, survivor_attention_mask)
         """
-        # Direct L1 dispatch: skip L0 for commit reproduction and similar
-        if batch.get("direct_l1", False):
-            return self._compress_direct_l1(batch)
-
-        file_ids = batch["file_token_ids"].to(self.device)  # (B, max_files, max_file_len)
+        file_ids = batch["file_token_ids"].to(self.device)
         file_masks = batch["file_attention_masks"].to(self.device)
-        file_count = batch["file_count"]  # (B,)
+        file_count = batch["file_count"]
         prompt_ids = batch["compression_prompt_ids"].to(self.device)
         prompt_mask = batch["compression_prompt_mask"].to(self.device)
+        direct_l1_flags = batch["direct_l1"]  # (B,) bool tensor
 
         batch_size = file_ids.size(0)
         bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
         prompt_emb = bgkit_embed(prompt_ids)
 
-        # Process each sample: L0 per-file, then concat
-        all_l0_survivors = []
+        # Collect final decoder-space survivors per sample.
+        # direct_l1: one encoder pass → done.
+        # regular: L0 per-file → auto_repro intermediates → batched L1.
+        final_survivors: list[torch.Tensor | None] = [None] * batch_size
+        l0_intermediates: dict[int, torch.Tensor] = {}  # b -> input-space surv
 
         for b in range(batch_size):
             n_files = int(file_count[b].item())
-            sample_survivors = []
 
-            for f in range(n_files):
-                f_ids = file_ids[b, f].unsqueeze(0)  # (1, file_len)
-                f_mask = file_masks[b, f].unsqueeze(0)  # (1, file_len)
-                f_emb = bgkit_embed(f_ids)
-
-                # Live ICE scoring for survivor selection
-                s_mask = self._score_and_select(f_emb, f_mask)
-
-                # L0 compression for this file
-                enc_out = self.encoder(
-                    input_embeddings=f_emb,
-                    survivor_mask=s_mask,
-                    attention_mask=f_mask,
-                    prompt_embeddings=prompt_emb[b:b + 1],
-                    prompt_attention_mask=prompt_mask[b:b + 1],
+            if direct_l1_flags[b]:
+                if n_files != 1:
+                    raise ValueError(
+                        f"direct_l1 sample {b} has file_count={n_files}, expected 1"
+                    )
+                final_survivors[b] = self._compress_single_direct_l1(
+                    file_ids[b, 0].unsqueeze(0),
+                    file_masks[b, 0].unsqueeze(0),
+                    prompt_emb[b:b + 1],
+                    prompt_mask[b:b + 1],
+                    bgkit_embed,
                 )
-
-                # Map L0 output back to input embedding space for L1
-                # all_embeddings = (1, L_content, D), normed pre-drop embeddings
-                # survivor_mask = (1, L_content) bool from encoder output
-                all_normed = enc_out.all_embeddings[0]  # (L_content, D)
-                surv_mask_out = enc_out.survivor_mask[0]  # (L_content,) bool
-                survivor_normed = all_normed[surv_mask_out]  # (n_surv, D)
-                survivor_input_space = self.encoder.auto_reproduce(
-                    survivor_normed.unsqueeze(0),
-                )[0]  # (n_surv, D)
-                sample_survivors.append(survivor_input_space)
-
-            # Concatenate all L0 survivors for this sample
-            if sample_survivors:
-                concat_survivors = torch.cat(sample_survivors, dim=0)  # (total_surv, D)
             else:
-                concat_survivors = torch.zeros(
-                    1, self.encoder.compressor.hidden_dim,
-                    device=self.device, dtype=torch.bfloat16,
+                l0_intermediates[b] = self._compress_single_l0_l1(
+                    file_ids[b], file_masks[b], n_files,
+                    prompt_emb[b:b + 1], prompt_mask[b:b + 1],
+                    bgkit_embed,
                 )
 
-            all_l0_survivors.append(concat_survivors)
+        # Run batched L1 on non-direct_l1 samples only
+        if l0_intermediates:
+            l1_indices = sorted(l0_intermediates.keys())
+            l1_survs = [l0_intermediates[b] for b in l1_indices]
+            l1_prompts = torch.stack([prompt_emb[b] for b in l1_indices])
+            l1_pmasks = torch.stack([prompt_mask[b] for b in l1_indices])
 
-        # Pad L0 survivors across batch
-        max_surv = max(s.size(0) for s in all_l0_survivors)
-        hidden_dim = all_l0_survivors[0].size(-1)
-        padded_l0 = torch.zeros(
-            batch_size, max_surv, hidden_dim,
-            device=self.device, dtype=all_l0_survivors[0].dtype,
+            max_surv = max(s.size(0) for s in l1_survs)
+            hidden_dim = l1_survs[0].size(-1)
+            n_l1 = len(l1_indices)
+            padded = torch.zeros(
+                n_l1, max_surv, hidden_dim,
+                device=self.device, dtype=l1_survs[0].dtype,
+            )
+            pad_mask = torch.zeros(
+                n_l1, max_surv, dtype=torch.bool, device=self.device,
+            )
+            for i, surv in enumerate(l1_survs):
+                padded[i, :surv.size(0)] = surv
+                pad_mask[i, :surv.size(0)] = True
+
+            l1_survivor_mask = self._score_and_select(padded, pad_mask)
+
+            l1_out = self.encoder(
+                input_embeddings=padded,
+                survivor_mask=l1_survivor_mask,
+                attention_mask=pad_mask,
+                prompt_embeddings=l1_prompts,
+                prompt_attention_mask=l1_pmasks,
+            )
+
+            for i, b in enumerate(l1_indices):
+                # Extract per-sample survivors (remove batch padding)
+                smask = l1_out.survivor_attention_mask[i]
+                n_valid = int(smask.sum().item())
+                final_survivors[b] = l1_out.survivor_embeddings[i, :n_valid]
+
+        # Pad all final survivors across the full batch
+        all_final = [s for s in final_survivors if s is not None]
+        assert len(all_final) == batch_size
+        max_final = max(s.size(0) for s in all_final)
+        hidden_dim = all_final[0].size(-1)
+        out_emb = torch.zeros(
+            batch_size, max_final, hidden_dim,
+            device=self.device, dtype=all_final[0].dtype,
         )
-        l0_mask = torch.zeros(
-            batch_size, max_surv, dtype=torch.bool, device=self.device,
+        out_mask = torch.zeros(
+            batch_size, max_final, dtype=torch.bool, device=self.device,
         )
-        for b, surv in enumerate(all_l0_survivors):
-            padded_l0[b, :surv.size(0)] = surv
-            l0_mask[b, :surv.size(0)] = True
+        for b, surv in enumerate(all_final):
+            out_emb[b, :surv.size(0)] = surv
+            out_mask[b, :surv.size(0)] = True
 
-        # L1 compression: score input-space L0 survivors with ICE
-        l1_survivor_mask = self._score_and_select(padded_l0, l0_mask)
-
-        # Run encoder for L1 (shared weights)
-        l1_out = self.encoder(
-            input_embeddings=padded_l0,
-            survivor_mask=l1_survivor_mask,
-            attention_mask=l0_mask,
-            prompt_embeddings=prompt_emb,
-            prompt_attention_mask=prompt_mask,
-        )
-
-        return l1_out.survivor_embeddings, l1_out.survivor_attention_mask
+        return out_emb, out_mask
 
     # ------------------------------------------------------------------
     # Loss computation
