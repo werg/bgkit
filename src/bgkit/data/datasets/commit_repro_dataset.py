@@ -1,19 +1,20 @@
-"""Dataset for commit reproduction training: token IDs from serialized commits.
+"""Dataset for commit reproduction training: token IDs from memory-mapped numpy arrays.
 
-This is a raw-content dataset (analogous to TokenChunkDataset for files). For
-Phase 1 Step 2, it will need a chat-template wrapper similar to ChatReproDataset
-that wraps the serialized commit in Qwen3's chat template with tool-call format,
-applies loss masking, and supports prompt variant selection. See the chat template
-integration note in commit_serialization.py.
+Replaces the parquet-based CommitReproDataset. Workers share token data via OS
+page cache instead of each building independent Arrow table caches.
+
+Important: Commits are NOT chunked. One sample = one commit, truncated to
+max_seq_len. This is a raw-content dataset — for Phase 1 Step 2, it will need
+a chat-template wrapper similar to ChatReproDataset.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
@@ -21,45 +22,83 @@ from torch.utils.data import Dataset
 class CommitReproDataset(Dataset):
     """Dataset yielding token ID sequences for commit reproduction training.
 
-    Loads pre-processed commit reproduction shards (Parquet) and builds a flat
-    index for random access. Each sample is one serialized commit.
+    Loads pre-converted commit data (tokens.npy, offsets.npy, manifest.json)
+    for memory-efficient random access. Each sample is one serialized commit,
+    truncated to ``max_seq_len``.
 
-    Schema expected: ``repo_path``, ``sha``, ``message``, ``num_files``,
-    ``is_cross_file``, ``token_ids`` (``list<int32>``).
+    Workers share the mmap'd token array via OS page cache. Pickle excludes
+    the mmap; workers re-open from the same path.
     """
 
-    def __init__(self, data_path: str, max_seq_len: int = 4096):
-        self.data_path = data_path
-        self.max_seq_len = max_seq_len
+    REQUIRED_FILES: ClassVar[list[str]] = ["tokens.npy", "offsets.npy", "manifest.json"]
 
-        # Flat index: (shard_idx, row_idx)
-        self._index: list[tuple[int, int]] = []
-        self._shard_files: list[Path] = []
-        self._table_cache: dict[int, pa.Table] = {}
+    def __init__(self, data_dir: str, max_seq_len: int = 4096):
+        data_path = Path(data_dir)
 
-        data_dir = Path(data_path)
-        self._shard_files = sorted(data_dir.glob("shard_*.parquet"))
+        # Preflight: fail fast with actionable error
+        missing = [f for f in self.REQUIRED_FILES if not (data_path / f).exists()]
+        if missing:
+            raise FileNotFoundError(
+                f"Missing mmap artifacts in {data_path.resolve()}: {missing}. "
+                f"Convert with: python scripts/convert_commits_to_npy.py "
+                f"--input-dir {data_path.resolve()}"
+            )
 
-        for shard_idx, shard_file in enumerate(self._shard_files):
-            pf = pq.ParquetFile(shard_file)
-            num_rows = pf.metadata.num_rows
-            for row_idx in range(num_rows):
-                self._index.append((shard_idx, row_idx))
+        # Validate manifest
+        manifest = json.loads((data_path / "manifest.json").read_text())
+        if manifest.get("schema_version") != 1:
+            raise ValueError(
+                f"Unsupported manifest schema version: {manifest.get('schema_version')}"
+            )
 
-    def _get_table(self, shard_idx: int) -> pa.Table:
-        """Load and cache a shard table on first access."""
-        if shard_idx not in self._table_cache:
-            self._table_cache[shard_idx] = pq.read_table(self._shard_files[shard_idx])
-        return self._table_cache[shard_idx]
+        self._data_path = data_path
+        self._tokens = np.load(data_path / "tokens.npy", mmap_mode="r")
+        self._offsets = np.load(data_path / "offsets.npy")
+        self._max_seq_len = max_seq_len
+
+        # Validate manifest counts against actual array sizes
+        n_rows = len(self._offsets) - 1
+        expected_rows = manifest.get("row_count")
+        if expected_rows is not None and expected_rows != n_rows:
+            raise ValueError(
+                f"Manifest row_count ({expected_rows}) != offsets length ({n_rows}). "
+                "Artifacts may be stale — re-run conversion."
+            )
+        expected_tokens = manifest.get("total_tokens")
+        if expected_tokens is not None and expected_tokens != len(self._tokens):
+            raise ValueError(
+                f"Manifest total_tokens ({expected_tokens}) != tokens.npy length "
+                f"({len(self._tokens)}). Artifacts may be stale — re-run conversion."
+            )
+
+        # Filter out zero-length commits
+        raw_lengths = (self._offsets[1:] - self._offsets[:-1]).astype(np.int32)
+        valid = raw_lengths > 0
+        self._valid_indices = np.where(valid)[0]
+        self._lengths = np.minimum(raw_lengths[valid], max_seq_len).astype(np.int32)
+
+    @property
+    def lengths(self) -> np.ndarray:
+        """Per-sample token lengths (truncated) for TokenBudgetBatchSampler."""
+        return self._lengths
 
     def __len__(self) -> int:
-        return len(self._index)
+        return len(self._valid_indices)
+
+    def __getstate__(self):
+        """Exclude mmap from pickle -- workers re-open from path."""
+        state = self.__dict__.copy()
+        state["_tokens"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._tokens = np.load(self._data_path / "tokens.npy", mmap_mode="r")
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        shard_idx, row_idx = self._index[idx]
-        table = self._get_table(shard_idx)
-
-        token_ids = np.array(table.column("token_ids")[row_idx].as_py(), dtype=np.int64)
-        token_ids = token_ids[: self.max_seq_len]
-
-        return {"token_ids": torch.from_numpy(token_ids)}
+        orig_idx = int(self._valid_indices[idx])
+        start = int(self._offsets[orig_idx])
+        length = int(self._lengths[idx])
+        # Copy from mmap into owned array, cast to int64 for torch
+        tokens = self._tokens[start : start + length].astype(np.int64)
+        return {"token_ids": torch.from_numpy(tokens)}

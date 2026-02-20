@@ -1,0 +1,150 @@
+"""Dataset yielding token ID chunks from memory-mapped numpy arrays.
+
+Replaces TokenChunkDataset (parquet-based). Workers share token data via OS
+page cache instead of each building independent Arrow table caches.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import ClassVar
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+import torch
+from torch.utils.data import Dataset
+
+
+class MmapTokenDataset(Dataset):
+    """Dataset yielding token ID chunks from mmap'd numpy arrays.
+
+    Loads pre-converted token data (tokens.npy, offsets.npy, metadata.parquet)
+    and builds a flat chunk index for random access. Files longer than
+    ``max_seq_len`` are split into non-overlapping chunks.
+
+    Workers share the mmap'd token array via OS page cache. Pickle
+    (for DataLoader workers) excludes the mmap and metadata; workers
+    re-open from the same path.
+    """
+
+    REQUIRED_FILES: ClassVar[list[str]] = [
+        "tokens.npy", "offsets.npy", "metadata.parquet", "manifest.json",
+    ]
+
+    def __init__(self, data_dir: str, max_seq_len: int = 8192):
+        data_path = Path(data_dir)
+
+        # Preflight: fail fast with actionable error
+        missing = [f for f in self.REQUIRED_FILES if not (data_path / f).exists()]
+        if missing:
+            raise FileNotFoundError(
+                f"Missing mmap artifacts in {data_path.resolve()}: {missing}. "
+                f"Convert with: python scripts/convert_tokens_to_npy.py "
+                f"--input-dir {data_path.resolve()}"
+            )
+
+        # Validate manifest
+        manifest = json.loads((data_path / "manifest.json").read_text())
+        if manifest.get("schema_version") != 1:
+            raise ValueError(
+                f"Unsupported manifest schema version: {manifest.get('schema_version')}"
+            )
+
+        self._tokens = np.load(data_path / "tokens.npy", mmap_mode="r")
+        offsets = np.load(data_path / "offsets.npy")
+        self._data_path = data_path
+        self._metadata: pa.Table | None = None  # lazy-loaded, NOT pickled
+        self._max_seq_len = max_seq_len
+
+        # Validate manifest counts against actual array sizes
+        expected_rows = manifest.get("row_count")
+        n_rows = len(offsets) - 1
+        if expected_rows is not None and expected_rows != n_rows:
+            raise ValueError(
+                f"Manifest row_count ({expected_rows}) != offsets length ({n_rows}). "
+                "Artifacts may be stale — re-run conversion."
+            )
+        expected_tokens = manifest.get("total_tokens")
+        if expected_tokens is not None and expected_tokens != len(self._tokens):
+            raise ValueError(
+                f"Manifest total_tokens ({expected_tokens}) != tokens.npy length "
+                f"({len(self._tokens)}). Artifacts may be stale — re-run conversion."
+            )
+
+        # Vectorized chunk index from offsets (no Python loops)
+        file_lengths = (offsets[1:] - offsets[:-1]).astype(np.int64)
+        file_starts = offsets[:-1]
+
+        # Skip zero-length files
+        valid = file_lengths > 0
+        file_lengths = file_lengths[valid]
+        file_starts = file_starts[valid]
+        valid_indices = np.where(valid)[0].astype(np.int32)
+
+        # For each file, compute number of chunks
+        n_chunks_per_file = ((file_lengths - 1) // max_seq_len + 1).astype(np.int64)
+        total_chunks = int(n_chunks_per_file.sum())
+
+        # Build flat chunk index arrays — fully vectorized (no Python loops)
+        self._chunk_file_idx = np.repeat(valid_indices, n_chunks_per_file).astype(np.int32)
+
+        # Compute within-file chunk index via cumsum group trick:
+        # offsets_within[i] = position of chunk i within its file
+        cumsum_chunks = np.cumsum(n_chunks_per_file)
+        group_starts = np.empty(len(cumsum_chunks), dtype=np.int64)
+        group_starts[0] = 0
+        group_starts[1:] = cumsum_chunks[:-1]
+        offsets_within = np.arange(total_chunks, dtype=np.int64) - np.repeat(
+            group_starts, n_chunks_per_file,
+        )
+
+        # Absolute token offset and chunk length
+        chunk_file_starts = np.repeat(file_starts, n_chunks_per_file)
+        chunk_file_lengths = np.repeat(file_lengths, n_chunks_per_file)
+        self._chunk_offset = chunk_file_starts + offsets_within * max_seq_len
+        self._chunk_lengths = np.minimum(
+            chunk_file_lengths - offsets_within * max_seq_len, max_seq_len,
+        ).astype(np.int32)
+
+    @property
+    def lengths(self) -> np.ndarray:
+        """Return token count for each chunk (for TokenBudgetBatchSampler)."""
+        return self._chunk_lengths
+
+    def _get_metadata(self) -> pa.Table:
+        """Lazy-load metadata (only needed columns)."""
+        if self._metadata is None:
+            self._metadata = pq.read_table(
+                self._data_path / "metadata.parquet",
+                columns=["file_path", "language"],
+            )
+        return self._metadata
+
+    def __len__(self) -> int:
+        return len(self._chunk_file_idx)
+
+    def __getstate__(self):
+        """Exclude mmap and metadata from pickle -- workers re-open from path."""
+        state = self.__dict__.copy()
+        state["_tokens"] = None
+        state["_metadata"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._tokens = np.load(self._data_path / "tokens.npy", mmap_mode="r")
+
+    def __getitem__(self, idx: int) -> dict:
+        file_idx = int(self._chunk_file_idx[idx])
+        start = int(self._chunk_offset[idx])
+        length = int(self._chunk_lengths[idx])
+        # Copy from mmap into owned array, cast to int64 for torch
+        tokens = self._tokens[start : start + length].astype(np.int64)
+        meta = self._get_metadata()
+        return {
+            "token_ids": torch.from_numpy(tokens),
+            "file_path": str(meta.column("file_path")[file_idx].as_py()),
+            "language": str(meta.column("language")[file_idx].as_py()),
+        }
