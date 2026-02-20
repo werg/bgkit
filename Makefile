@@ -48,7 +48,7 @@ ice-labels:
 	docker compose -f docker/docker-compose.yaml run --rm ice-labels $(ARGS)
 
 docker-build:
-	docker build -f docker/Dockerfile -t bgkit:latest .
+	docker compose -f docker/docker-compose.yaml build train
 
 docker-build-data:
 	docker build -f docker/Dockerfile.data -t bgkit-data:latest .

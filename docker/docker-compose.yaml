@@ -13,6 +13,10 @@ x-gpu-common: &gpu-common
     - ${DATA_DIR:-../data}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
     - ${CHECKPOINT_DIR:-../checkpoints}:/workspace/checkpoints
+    # Mount source, configs and scripts from host so changes take effect
+    # without rebuilding. The editable install (-e) in the Dockerfile
+    # ensures Python imports from src/ directly.
+    - ../src:/workspace/bgkit/src:ro
     - ../configs:/workspace/bgkit/configs:ro
     - ../scripts:/workspace/bgkit/scripts:ro
     # Wandb authenticates via netrc (machine api.wandb.ai).
