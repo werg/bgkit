@@ -4,7 +4,7 @@ description: >
   language description of a file, module, or repository from BgKIT
   compressed context.
 injections:
-  target_path:
+  file_path:
     description: "Target to describe (file path, module path, or repo name)"
     in_fields: [user_prompt, response_prefix]
 fields:

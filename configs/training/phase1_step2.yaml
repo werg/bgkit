@@ -11,7 +11,7 @@ objectives:
   commit_reproduction: 0.25
 
 ice:
-  checkpoint_path: null  # must be set to a retrained ICE checkpoint
+  checkpoint_path: ${checkpoint_dir}/ice_step29999_20260220_220522
   input_dim: 1024
   hidden_dim: 128
   num_layers: 2
@@ -38,11 +38,11 @@ freeze:
   decoder: false
 
 data:
-  file_tokens_path: data/mmap/tokens/
-  commit_tokens_path: data/mmap/commits/
-  description_tokens_path: data/mmap/descriptions/
-  structural_tokens_path: data/mmap/structural/
-  prompt_variants_dir: data/prompt_variants/
+  file_tokens_path: ${oc.env:DATA_DIR,./data}/processed/tokens
+  commit_tokens_path: ${oc.env:DATA_DIR,./data}/processed/commit_reproduction
+  description_tokens_path: ${oc.env:DATA_DIR,./data}/mmap/descriptions
+  structural_tokens_path: ${oc.env:DATA_DIR,./data}/mmap/structural
+  prompt_variants_dir: ${oc.env:DATA_DIR,./data}/prompt_variants
 
 eval:
   generation_samples: 8

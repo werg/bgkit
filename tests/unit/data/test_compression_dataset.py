@@ -974,3 +974,210 @@ class TestFromConfigRepoDiscovery:
         # Verify repo_desc_ds was loaded
         assert desc_subset._repo_desc_ds is not None
         assert desc_subset._repo_desc_ds.has_key("owner/repo", "abc")
+
+
+# ---------------------------------------------------------------------------
+# Variant bank loading tests
+# ---------------------------------------------------------------------------
+
+
+def _create_mmap_dir(path, tokens, offsets, metadata_columns=None):
+    """Create a minimal mmap dataset directory (tokens, offsets, manifest, metadata)."""
+    path.mkdir(parents=True, exist_ok=True)
+    np.save(path / "tokens.npy", np.array(tokens, dtype=np.int32))
+    np.save(path / "offsets.npy", np.array(offsets, dtype=np.int64))
+    (path / "manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "row_count": len(offsets) - 1,
+        "total_tokens": len(tokens),
+    }))
+    if metadata_columns is not None:
+        pq.write_table(pa.table(metadata_columns), path / "metadata.parquet")
+
+
+class TestVariantBankLoading:
+    """Tests for per-objective variant bank loading in from_config."""
+
+    def _make_full_config(self, tmp_path, variants_dir=None):
+        """Create config with all four objective datasets populated."""
+        # Token dataset (shared by data_reconstruction, description, structural)
+        token_dir = tmp_path / "tokens"
+        _create_mmap_dir(
+            token_dir,
+            tokens=[1, 2, 3, 4, 5],
+            offsets=[0, 5],
+            metadata_columns={
+                "repo_path": ["owner/repo"],
+                "file_path": ["a.py"],
+                "commit_sha": ["abc"],
+                "language": ["python"],
+            },
+        )
+        np.save(token_dir / "chunk_map.npy", np.array([0], dtype=np.int32))
+
+        # Description dataset (file scope)
+        desc_dir = tmp_path / "descriptions" / "file"
+        _create_mmap_dir(
+            desc_dir,
+            tokens=[10, 11, 12],
+            offsets=[0, 3],
+            metadata_columns={
+                "repo_path": ["owner/repo"],
+                "file_path": ["a.py"],
+                "commit_sha": ["abc"],
+            },
+        )
+
+        # Structural dataset
+        struct_dir = tmp_path / "structural"
+        _create_mmap_dir(
+            struct_dir,
+            tokens=[20, 21, 22],
+            offsets=[0, 3],
+            metadata_columns={
+                "repo_path": ["owner/repo"],
+                "file_path": ["a.py"],
+                "commit_sha": ["abc"],
+                "structural_type": ["skeleton"],
+            },
+        )
+
+        # Commit dataset (no metadata.parquet needed)
+        commit_dir = tmp_path / "commits"
+        _create_mmap_dir(
+            commit_dir,
+            tokens=[30, 31, 32, 33],
+            offsets=[0, 4],
+        )
+
+        class _Cfg:
+            file_tokens_path = str(token_dir)
+            description_tokens_path = str(tmp_path / "descriptions")
+            structural_tokens_path = str(struct_dir)
+            commit_tokens_path = str(commit_dir)
+            prompt_variants_dir = str(variants_dir) if variants_dir else None
+            max_seq_len = 512
+
+        return _Cfg()
+
+    def _make_minimal_config(self, tmp_path, variants_dir=None):
+        """Create config with only data_reconstruction (token dataset)."""
+        token_dir = tmp_path / "tokens"
+        _create_mmap_dir(
+            token_dir,
+            tokens=[1, 2, 3, 4, 5],
+            offsets=[0, 5],
+            metadata_columns={
+                "repo_path": ["owner/repo"],
+                "file_path": ["a.py"],
+                "commit_sha": ["abc"],
+                "language": ["python"],
+            },
+        )
+        np.save(token_dir / "chunk_map.npy", np.array([0], dtype=np.int32))
+
+        class _Cfg:
+            file_tokens_path = str(token_dir)
+            description_tokens_path = None
+            structural_tokens_path = None
+            commit_tokens_path = None
+            prompt_variants_dir = str(variants_dir) if variants_dir else None
+            max_seq_len = 512
+
+        return _Cfg()
+
+    def test_per_objective_banks_routed_to_all_subsets(self, tmp_path):
+        """Each objective gets its own variant bank when per-objective files exist."""
+        variants_dir = tmp_path / "variants"
+        variants_dir.mkdir()
+
+        def _make_variant(name):
+            return [{"system_prompt": name, "user_prompt": f"{name} {{file_path}}",
+                     "compression_prompt": f"{name}.", "response_prefix": "{file_path}:"}]
+
+        (variants_dir / "file_read_repro.json").write_text(json.dumps(_make_variant("fr")))
+        (variants_dir / "description_gen.json").write_text(json.dumps(_make_variant("dg")))
+        (variants_dir / "structural_repro.json").write_text(json.dumps(_make_variant("sr")))
+        (variants_dir / "commit_repro.json").write_text(json.dumps(_make_variant("cr")))
+
+        cfg = self._make_full_config(tmp_path, variants_dir)
+        tokenizer = _MockTokenizer()
+        ds = CompressionDataset.from_config(cfg, tokenizer, seed=42)
+
+        # All four objectives should be present
+        assert set(ds._subsets.keys()) == {
+            "data_reconstruction", "description_generation",
+            "structural_relational", "commit_reproduction",
+        }
+
+        # Each subset should have its own distinct variant bank
+        assert ds._subsets["data_reconstruction"]._variants[0]["system_prompt"] == "fr"
+        assert ds._subsets["description_generation"]._variants[0]["system_prompt"] == "dg"
+        assert ds._subsets["structural_relational"]._variants[0]["system_prompt"] == "sr"
+        assert ds._subsets["commit_reproduction"]._variants[0]["system_prompt"] == "cr"
+
+    def test_missing_bank_falls_back_to_shared(self, tmp_path):
+        """Objectives without their own bank file fall back to file_read_repro."""
+        variants_dir = tmp_path / "variants"
+        variants_dir.mkdir()
+
+        shared_variant = [{"system_prompt": "shared", "user_prompt": "Read {file_path}",
+                           "compression_prompt": "Reproduce.", "response_prefix": "{file_path}:"}]
+        (variants_dir / "file_read_repro.json").write_text(json.dumps(shared_variant))
+        # No per-objective files — all should fall back to shared
+
+        cfg = self._make_full_config(tmp_path, variants_dir)
+        tokenizer = _MockTokenizer()
+        ds = CompressionDataset.from_config(cfg, tokenizer, seed=42)
+
+        for key in ["data_reconstruction", "description_generation",
+                     "structural_relational", "commit_reproduction"]:
+            assert ds._subsets[key]._variants[0]["system_prompt"] == "shared", (
+                f"{key} should fall back to shared bank"
+            )
+
+    def test_empty_bank_falls_back_to_shared(self, tmp_path):
+        """Empty JSON array bank file should fall back to shared."""
+        variants_dir = tmp_path / "variants"
+        variants_dir.mkdir()
+
+        shared_variant = [{"system_prompt": "shared", "user_prompt": "Read {file_path}",
+                           "compression_prompt": "Reproduce.", "response_prefix": "{file_path}:"}]
+        (variants_dir / "file_read_repro.json").write_text(json.dumps(shared_variant))
+        (variants_dir / "description_gen.json").write_text("[]")  # empty
+
+        cfg = self._make_full_config(tmp_path, variants_dir)
+        tokenizer = _MockTokenizer()
+        ds = CompressionDataset.from_config(cfg, tokenizer, seed=42)
+
+        # description_generation had empty bank → should fall back to shared
+        assert ds._subsets["description_generation"]._variants[0]["system_prompt"] == "shared"
+        # data_reconstruction uses file_read_repro directly
+        assert ds._subsets["data_reconstruction"]._variants[0]["system_prompt"] == "shared"
+
+    def test_no_variants_dir_uses_fallback(self, tmp_path):
+        """Without variants dir, all objectives get the hardcoded fallback."""
+        cfg = self._make_full_config(tmp_path, variants_dir=None)
+        tokenizer = _MockTokenizer()
+        ds = CompressionDataset.from_config(cfg, tokenizer, seed=42)
+
+        for key in ds._subsets:
+            assert ds._subsets[key]._variants[0]["user_prompt"] == "Read {file_path}", (
+                f"{key} should use hardcoded fallback"
+            )
+
+    def test_single_file_variant_path(self, tmp_path):
+        """A single JSON file as prompt_variants_dir loads for all objectives."""
+        variant_file = tmp_path / "variants.json"
+        variant = [{"system_prompt": "single", "user_prompt": "Read {file_path}",
+                     "compression_prompt": "Reproduce.", "response_prefix": "{file_path}:"}]
+        variant_file.write_text(json.dumps(variant))
+
+        cfg = self._make_full_config(tmp_path, variants_dir=variant_file)
+        tokenizer = _MockTokenizer()
+        ds = CompressionDataset.from_config(cfg, tokenizer, seed=42)
+
+        for key in ds._subsets:
+            assert ds._subsets[key]._variants[0]["system_prompt"] == "single", (
+                f"{key} should use single-file bank"
+            )

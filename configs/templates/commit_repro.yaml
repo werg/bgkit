@@ -4,7 +4,7 @@ description: >
   BgKIT compressed repository context, and the assistant generates
   the commit diff.
 injections:
-  repo_path:
+  file_path:
     description: "Path or identifier for the repository"
     in_fields: [user_prompt, response_prefix]
 fields:

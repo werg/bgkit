@@ -760,30 +760,44 @@ class CompressionDataset(Dataset):
         subsets: dict[str, Dataset] = {}
         weights = objective_weights or cls.DEFAULT_WEIGHTS
 
-        # Load variant bank
-        variant_bank_path = getattr(cfg, "prompt_variants_dir", None)
-        if variant_bank_path and Path(variant_bank_path).exists():
-            # Try loading as JSON file directly, or as directory with per-template files
-            p = Path(variant_bank_path)
-            if p.is_file():
-                with open(p) as f:
-                    variant_bank = json.load(f)
-            elif (p / "file_read_repro.json").exists():
-                with open(p / "file_read_repro.json") as f:
-                    variant_bank = json.load(f)
-            else:
-                variant_bank = None
-        else:
-            variant_bank = None
+        # Load variant banks (per-objective when available, shared fallback)
+        fallback_bank = [{
+            "system_prompt": "You are a helpful assistant.",
+            "user_prompt": "Read {file_path}",
+            "compression_prompt": "Reproduce the file contents exactly.",
+            "response_prefix": "Here is {file_path}:",
+        }]
 
-        if not variant_bank:
-            # Minimal fallback variant for testing
-            variant_bank = [{
-                "system_prompt": "You are a helpful assistant.",
-                "user_prompt": "Read {file_path}",
-                "compression_prompt": "Reproduce the file contents exactly.",
-                "response_prefix": "Here is {file_path}:",
-            }]
+        variant_banks: dict[str, list] = {}
+        variant_dir = getattr(cfg, "prompt_variants_dir", None)
+        if variant_dir and Path(variant_dir).is_dir():
+            p = Path(variant_dir)
+            # Load shared fallback
+            shared_bank = None
+            if (p / "file_read_repro.json").exists():
+                with open(p / "file_read_repro.json") as f:
+                    shared_bank = json.load(f)
+            # Load per-objective banks, falling back to shared
+            for obj_key in [
+                "file_read_repro", "description_gen", "structural_repro", "commit_repro",
+            ]:
+                bank_path = p / f"{obj_key}.json"
+                if bank_path.exists():
+                    with open(bank_path) as f:
+                        bank = json.load(f)
+                    if bank:  # guard against empty JSON arrays
+                        variant_banks[obj_key] = bank
+                        continue
+                if shared_bank:
+                    variant_banks[obj_key] = shared_bank
+        elif variant_dir and Path(variant_dir).is_file():
+            with open(variant_dir) as f:
+                shared = json.load(f)
+            if shared:
+                for obj_key in [
+                    "file_read_repro", "description_gen", "structural_repro", "commit_repro",
+                ]:
+                    variant_banks[obj_key] = shared
 
         max_seq_len = getattr(cfg, "max_seq_len", 8192)
 
@@ -829,7 +843,9 @@ class CompressionDataset(Dataset):
         if token_ds is not None:
             config = TOOL_CONFIGS["file_read_repro"]
             subsets["data_reconstruction"] = DataReconstructionSubset(
-                token_ds, tokenizer, variant_bank, config, seed=seed,
+                token_ds, tokenizer,
+                variant_banks.get("file_read_repro", fallback_bank),
+                config, seed=seed,
             )
 
         # Objective 2: Description generation
@@ -858,8 +874,9 @@ class CompressionDataset(Dataset):
 
                 config = TOOL_CONFIGS["description_gen"]
                 subsets["description_generation"] = DescriptionSubset(
-                    token_ds, desc_ds, tokenizer, variant_bank, config,
-                    seed=seed,
+                    token_ds, desc_ds, tokenizer,
+                    variant_banks.get("description_gen", fallback_bank),
+                    config, seed=seed,
                     repo_description_dataset=repo_desc_ds,
                 )
             except (FileNotFoundError, ValueError) as e:
@@ -872,8 +889,9 @@ class CompressionDataset(Dataset):
                 struct_ds = MmapStructuralDataset(struct_path, max_seq_len=2048)
                 config = TOOL_CONFIGS["structural_repro"]
                 subsets["structural_relational"] = StructuralSubset(
-                    token_ds, struct_ds, tokenizer, variant_bank, config,
-                    seed=seed,
+                    token_ds, struct_ds, tokenizer,
+                    variant_banks.get("structural_repro", fallback_bank),
+                    config, seed=seed,
                 )
             except (FileNotFoundError, ValueError) as e:
                 logger.warning("Could not load structural dataset: %s", e)
@@ -885,7 +903,9 @@ class CompressionDataset(Dataset):
                 commit_ds = CommitReproDataset(commit_path, max_seq_len=4096)
                 config = TOOL_CONFIGS["commit_repro"]
                 subsets["commit_reproduction"] = CommitReproSubset(
-                    commit_ds, tokenizer, variant_bank, config, seed=seed,
+                    commit_ds, tokenizer,
+                    variant_banks.get("commit_repro", fallback_bank),
+                    config, seed=seed,
                 )
             except (FileNotFoundError, ValueError) as e:
                 logger.warning("Could not load commit dataset: %s", e)
