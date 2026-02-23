@@ -8,11 +8,17 @@ bgkit:
   total_survivor_budget: 3500
   # Level 0: within-file compression
   level0:
-    # ICE threshold for survivor selection (nats/token)
+    # Static fallback ICE threshold (used before calibration)
     ice_threshold: 3.0
+    # After calibration export, add:
+    # target_ratio: 0.15
+    # calibration_snapshot: { ... }
   # Level 1: cross-file compression
   level1:
     # Max positions for L1 input (Qwen3-0.6B context limit)
     max_positions: 32768
-    # ICE threshold for L1 survivor selection
+    # Static fallback ICE threshold (used before calibration)
     ice_threshold: 3.0
+    # After calibration export, add:
+    # target_ratio: 0.15
+    # calibration_snapshot: { ... }

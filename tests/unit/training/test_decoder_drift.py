@@ -8,6 +8,7 @@ torch = pytest.importorskip("torch")
 
 from torch import nn
 
+from bgkit.data.threshold_calibrator import ThresholdCalibrator
 from bgkit.eval.metrics.embedding_health import embedding_drift_metrics
 from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
@@ -109,11 +110,14 @@ def _make_trainer(drift_threshold: float = 0.5, drift_check_every: int = 100):
             "save_every": 0,
             "curriculum": {
                 "l1_introduction_step": 20000,
-                "ice_threshold_start": 2.0,
-                "ice_threshold_end": 4.0,
-                "ice_threshold_ramp_steps": 100000,
-                "min_compression_ratio": 0.05,
-                "max_compression_ratio": 0.30,
+                "target_ratio_start": 0.30,
+                "target_ratio_end": 0.15,
+                "target_ratio_ramp_steps": 100000,
+                "max_survivor_gap": 64,
+                "fallback_threshold": 3.0,
+                "calibrator_ema_decay": 0.99,
+                "calibrator_warmup_batches": 50,
+                "l1_calibrator_fast_batches": 200,
             },
             "decoder": {
                 "drift_threshold": drift_threshold,
@@ -148,12 +152,23 @@ def _make_trainer(drift_threshold: float = 0.5, drift_check_every: int = 100):
 
     # Curriculum defaults
     t._l1_introduction_step = 20000
-    t._ice_threshold_start = 2.0
-    t._ice_threshold_end = 4.0
-    t._ice_threshold_ramp_steps = 100000
-    t._min_compression_ratio = 0.05
-    t._max_compression_ratio = 0.30
-    t._ice_threshold = 2.0
+    t._target_ratio_start = 0.30
+    t._target_ratio_end = 0.15
+    t._target_ratio_ramp_steps = 100000
+    t._target_ratio_override = None
+    t._max_gap = 64
+    t._l0_calibrator = ThresholdCalibrator(
+        ema_decay=0.99, warmup_batches=50, fallback_threshold=3.0,
+    )
+    t._l1_calibrator = ThresholdCalibrator(
+        ema_decay=0.95, warmup_batches=50, fallback_threshold=3.0,
+    )
+    t._l1_calibrator_fast_batches = 200
+    t._l1_calibrator_slow_decay = 0.99
+    t._l1_batches_seen = 0
+    t._pending_l0_scores = []
+    t._pending_l1_scores = []
+    t._is_evaluating = False
     t._l1_enabled = False
     t._l1_transitioned = False
     t._l1_rebuild_pending = False

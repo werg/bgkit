@@ -19,11 +19,15 @@ ice:
 
 curriculum:
   l1_introduction_step: 20000
-  ice_threshold_start: 2.0
-  ice_threshold_end: 4.0
-  ice_threshold_ramp_steps: 100000
-  min_compression_ratio: 0.05
-  max_compression_ratio: 0.30
+  # Ratio targeting (replaces ice_threshold_start/end/ramp_steps)
+  target_ratio_start: 0.30
+  target_ratio_end: 0.15
+  target_ratio_ramp_steps: 100000
+  max_survivor_gap: 64
+  fallback_threshold: 3.0       # used before calibrator warms up
+  calibrator_ema_decay: 0.99
+  calibrator_warmup_batches: 50
+  l1_calibrator_fast_batches: 200
 
 decoder:
   drift_threshold: 0.5

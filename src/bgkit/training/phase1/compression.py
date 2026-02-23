@@ -25,7 +25,8 @@ from torch.utils.data import DataLoader, random_split
 from bgkit.data.collators import collate_compression
 from bgkit.data.datasets.compression_dataset import CompressionDataset
 from bgkit.data.samplers import LengthSortedBatchSampler
-from bgkit.data.survivor_selection import select_survivors_by_threshold
+from bgkit.data.survivor_selection import fill_survivor_gaps, select_survivors_by_threshold
+from bgkit.data.threshold_calibrator import ThresholdCalibrator
 from bgkit.eval.metrics.embedding_health import embedding_drift_metrics
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
@@ -245,17 +246,41 @@ class CompressionTrainer(BaseTrainer):
         # --- Curriculum state ---
         curriculum = tcfg.get("curriculum", {})
         self._l1_introduction_step = curriculum.get("l1_introduction_step", 20000)
-        self._ice_threshold_start = curriculum.get("ice_threshold_start", 2.0)
-        self._ice_threshold_end = curriculum.get("ice_threshold_end", 4.0)
-        self._ice_threshold_ramp_steps = curriculum.get("ice_threshold_ramp_steps", 100000)
-        self._min_compression_ratio = curriculum.get("min_compression_ratio", 0.05)
-        self._max_compression_ratio = curriculum.get("max_compression_ratio", 0.30)
+
+        # Ratio targeting curriculum (replaces threshold ramp + min/max clamps)
+        self._target_ratio_start = curriculum.get("target_ratio_start", 0.30)
+        self._target_ratio_end = curriculum.get("target_ratio_end", 0.15)
+        self._target_ratio_ramp_steps = curriculum.get("target_ratio_ramp_steps", 100000)
+        self._target_ratio_override: float | None = None
+        self._max_gap = curriculum.get("max_survivor_gap", 64)
+
+        # Calibrators
+        fallback = curriculum.get("fallback_threshold", 3.0)
+        self._l0_calibrator = ThresholdCalibrator(
+            ema_decay=curriculum.get("calibrator_ema_decay", 0.99),
+            warmup_batches=curriculum.get("calibrator_warmup_batches", 50),
+            fallback_threshold=fallback,
+        )
+        self._l1_calibrator = ThresholdCalibrator(
+            ema_decay=0.95,  # starts fast
+            warmup_batches=curriculum.get("calibrator_warmup_batches", 50),
+            fallback_threshold=fallback,
+        )
+        self._l1_calibrator_fast_batches = curriculum.get("l1_calibrator_fast_batches", 200)
+        self._l1_calibrator_slow_decay = curriculum.get("calibrator_ema_decay", 0.99)
+        self._l1_batches_seen = 0
+
+        # Score buffers for deferred calibrator update (once per train_step)
+        self._pending_l0_scores: list[torch.Tensor] = []
+        self._pending_l1_scores: list[torch.Tensor] = []
 
         # Live curriculum values
-        self._ice_threshold = self._ice_threshold_start
         self._l1_enabled = False
         self._l1_transitioned = False
         self._l1_rebuild_pending = False
+
+        # Eval isolation flag
+        self._is_evaluating = False
 
         # --- Decoder drift monitoring ---
         decoder_cfg_section = tcfg.get("decoder", {})
@@ -316,25 +341,41 @@ class CompressionTrainer(BaseTrainer):
     # Curriculum
     # ------------------------------------------------------------------
 
-    def _update_curriculum(self) -> None:
-        """Update curriculum state based on current global_step."""
-        step = self.global_step
-
-        # ICE threshold ramp: linear from start to end over ramp_steps
-        if step >= self._ice_threshold_ramp_steps:
-            self._ice_threshold = self._ice_threshold_end
-        else:
-            t = step / max(self._ice_threshold_ramp_steps, 1)
-            self._ice_threshold = (
-                self._ice_threshold_start
-                + t * (self._ice_threshold_end - self._ice_threshold_start)
-            )
-
-        # L1 introduction
-        if step >= self._l1_introduction_step and not self._l1_enabled:
+    def _check_l1_introduction(self) -> None:
+        """Check if L1 should be introduced based on curriculum step."""
+        if self.global_step >= self._l1_introduction_step and not self._l1_enabled:
             self._l1_enabled = True
             self._l1_rebuild_pending = True
-            logger.info("l1_curriculum_triggered", step=step)
+            logger.info("l1_curriculum_triggered", step=self.global_step)
+
+    def _current_target_ratio(self) -> float:
+        """Compute the current target compression ratio from the ramp or override."""
+        if self._target_ratio_override is not None:
+            return self._target_ratio_override
+        step = self.global_step
+        if step >= self._target_ratio_ramp_steps:
+            return self._target_ratio_end
+        t = step / max(self._target_ratio_ramp_steps, 1)
+        return self._target_ratio_start + t * (self._target_ratio_end - self._target_ratio_start)
+
+    def _flush_calibrator_scores(self) -> None:
+        """Flush buffered ICE scores into calibrators. Called once per train_step."""
+        if self._pending_l0_scores:
+            non_empty = [s for s in self._pending_l0_scores if s.numel() > 0]
+            if non_empty:
+                combined = torch.cat(non_empty)
+                self._l0_calibrator.update_from_flat(combined)
+            self._pending_l0_scores.clear()
+        if self._pending_l1_scores:
+            non_empty = [s for s in self._pending_l1_scores if s.numel() > 0]
+            if non_empty:
+                combined = torch.cat(non_empty)
+                self._l1_calibrator.update_from_flat(combined)
+                # Adaptive L1 decay — only count steps with actual score data
+                self._l1_batches_seen += 1
+                if self._l1_batches_seen >= self._l1_calibrator_fast_batches:
+                    self._l1_calibrator.set_decay(self._l1_calibrator_slow_decay)
+            self._pending_l1_scores.clear()
 
     def _perform_l1_rebuild(self) -> None:
         """Rebuild dataset and dataloader for L1 phase."""
@@ -396,16 +437,18 @@ class CompressionTrainer(BaseTrainer):
         self,
         embeddings: torch.Tensor,
         attention_mask: torch.Tensor,
+        level: str = "l0",
     ) -> torch.Tensor:
-        """Score embeddings with ICE and select survivors by threshold.
+        """Score embeddings with ICE and select survivors via calibrated threshold.
 
-        Uses self._ice_threshold (from curriculum) and clamps survivor
-        count per sample to [min_survivors, max_survivors] derived from
-        the static compression ratio bounds.
+        Uses the appropriate calibrator (L0 or L1) to convert the current
+        target compression ratio into a threshold. Applies gap-filling to
+        prevent long stretches without survivors.
 
         Args:
             embeddings: (B, L, D) embeddings to score.
             attention_mask: (B, L) bool mask for valid positions.
+            level: ``"l0"`` or ``"l1"`` — selects which calibrator to use.
 
         Returns:
             (B, L) bool survivor mask.
@@ -418,18 +461,30 @@ class CompressionTrainer(BaseTrainer):
         if seq_len > 0:
             ice_scores[:, 0] = float("-inf")  # position 0 unsupervised during ICE training
 
+        calibrator = self._l0_calibrator if level == "l0" else self._l1_calibrator
+
+        # Buffer scores for deferred calibrator update (training only)
+        if not self._is_evaluating:
+            stats_mask = attention_mask.clone()
+            if seq_len > 0:
+                stats_mask[:, 0] = False
+            valid_scores_flat = ice_scores[stats_mask].detach()
+            if level == "l0":
+                self._pending_l0_scores.append(valid_scores_flat)
+            else:
+                self._pending_l1_scores.append(valid_scores_flat)
+
+        target_ratio = self._current_target_ratio()
+        threshold = calibrator.get_threshold(target_ratio)
+
         survivor_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=embeddings.device)
         for b in range(batch_size):
             valid_len = int(attention_mask[b].sum().item())
             if valid_len == 0:
                 continue
-            min_surv = max(1, int(valid_len * self._min_compression_ratio))
-            max_surv = max(1, int(valid_len * self._max_compression_ratio))
             valid_scores = ice_scores[b, :valid_len]
-            indices = select_survivors_by_threshold(
-                valid_scores, self._ice_threshold,
-                min_survivors=min_surv, max_survivors=max_surv,
-            )
+            indices = select_survivors_by_threshold(valid_scores, threshold)
+            indices = fill_survivor_gaps(indices, valid_scores, self._max_gap, valid_len)
             survivor_mask[b, indices] = True
 
         # ICE distribution monitoring (exclude position 0 which is forced to -inf)
@@ -444,6 +499,7 @@ class CompressionTrainer(BaseTrainer):
                 logger.info(
                     "ice_survivor_stats",
                     step=self.global_step,
+                    level=level,
                     pre_mean=valid_scores.mean().item(),
                     pre_std=valid_scores.std().item(),
                     post_mean=selected_scores.mean().item(),
@@ -634,7 +690,7 @@ class CompressionTrainer(BaseTrainer):
                 padded[i, :surv.size(0)] = surv
                 pad_mask[i, :surv.size(0)] = True
 
-            l1_survivor_mask = self._score_and_select(padded, pad_mask)
+            l1_survivor_mask = self._score_and_select(padded, pad_mask, level="l1")
 
             l1_out = self.encoder(
                 input_embeddings=padded,
@@ -789,8 +845,8 @@ class CompressionTrainer(BaseTrainer):
         self.encoder.train()
         self.decoder.train()
 
-        # Update curriculum
-        self._update_curriculum()
+        # Check L1 introduction + flush calibrator scores
+        self._check_l1_introduction()
 
         # Handle mixed batches
         if batch.get("mixed", False):
@@ -816,6 +872,9 @@ class CompressionTrainer(BaseTrainer):
         # Compute loss
         loss = self._compute_loss(logits, batch)
 
+        # Flush calibrator scores (once per train_step)
+        self._flush_calibrator_scores()
+
         # Backward
         self.optimizer.zero_grad()
         loss.backward()
@@ -825,13 +884,25 @@ class CompressionTrainer(BaseTrainer):
         # Drift check
         self._check_decoder_drift(survivors)
 
-        return {
+        target_ratio = self._current_target_ratio()
+        n_survivors = int(survivor_mask.sum().item())
+        if sample_type == "file":
+            n_valid = int(batch["content_attention_mask"].sum().item())
+        else:
+            n_valid = int(batch["file_attention_masks"].sum().item())
+        actual_ratio = n_survivors / max(n_valid, 1)
+        metrics = {
             "loss": loss.item(),
             "grad_norm": grad_norm,
             "sample_type": sample_type,
-            "ice_threshold": self._ice_threshold,
+            "target_ratio": target_ratio,
+            "actual_ratio": actual_ratio,
+            "calibrated_threshold_l0": self._l0_calibrator.get_threshold(target_ratio),
             "l1_enabled": float(self._l1_enabled),
         }
+        if self._l1_enabled:
+            metrics["calibrated_threshold_l1"] = self._l1_calibrator.get_threshold(target_ratio)
+        return metrics
 
     def _train_step_mixed(self, batch: dict) -> dict[str, float]:
         """Handle mixed batch containing both file and repo samples."""
@@ -863,18 +934,31 @@ class CompressionTrainer(BaseTrainer):
         # Average losses
         loss = (file_loss + repo_loss) / 2.0
 
+        # Flush calibrator scores (once per train_step)
+        self._flush_calibrator_scores()
+
         self.optimizer.zero_grad()
         loss.backward()
         grad_norm = clip_grad_norm(self._trainable_params())
         self.optimizer.step()
 
-        return {
+        target_ratio = self._current_target_ratio()
+        total_survivors = int(file_mask.sum().item()) + int(repo_mask.sum().item())
+        n_valid_file = int(file_batch["content_attention_mask"].sum().item())
+        n_valid_repo = int(repo_batch["file_attention_masks"].sum().item())
+        actual_ratio = total_survivors / max(n_valid_file + n_valid_repo, 1)
+        metrics = {
             "loss": loss.item(),
             "grad_norm": grad_norm,
             "sample_type": "mixed",
-            "ice_threshold": self._ice_threshold,
+            "target_ratio": target_ratio,
+            "actual_ratio": actual_ratio,
+            "calibrated_threshold_l0": self._l0_calibrator.get_threshold(target_ratio),
             "l1_enabled": float(self._l1_enabled),
         }
+        if self._l1_enabled:
+            metrics["calibrated_threshold_l1"] = self._l1_calibrator.get_threshold(target_ratio)
+        return metrics
 
     # ------------------------------------------------------------------
     # Custom train() with pre-fetch L1 rebuild hook
@@ -1185,8 +1269,9 @@ class CompressionTrainer(BaseTrainer):
             "l1_enabled": self._l1_enabled,
             "l1_transitioned": self._l1_transitioned,
             "l1_rebuild_pending": self._l1_rebuild_pending,
-            "ice_threshold": self._ice_threshold,
             "lora_active": self._lora_active,
+            "l1_batches_seen": self._l1_batches_seen,
+            "target_ratio_override": self._target_ratio_override,
         }
 
     # ------------------------------------------------------------------
@@ -1198,87 +1283,92 @@ class CompressionTrainer(BaseTrainer):
         """Run evaluation on the eval split."""
         self.encoder.eval()
         self.decoder.eval()
+        self._is_evaluating = True
         self._eval_count += 1
 
-        total_loss = 0.0
-        total_tokens = 0.0
-        per_objective_loss: dict[str, float] = {}
-        per_objective_count: dict[str, int] = {}
+        try:
+            total_loss = 0.0
+            total_tokens = 0.0
+            per_objective_loss: dict[str, float] = {}
+            per_objective_count: dict[str, int] = {}
 
-        all_survivors: list[torch.Tensor] = []
+            all_survivors: list[torch.Tensor] = []
 
-        num_batches = len(self.eval_dataloader)
-        for batch_idx, batch in enumerate(self.eval_dataloader):
-            if batch_idx % 100 == 0:
-                logger.info("eval_progress", batch=batch_idx, total=num_batches)
+            num_batches = len(self.eval_dataloader)
+            for batch_idx, batch in enumerate(self.eval_dataloader):
+                if batch_idx % 100 == 0:
+                    logger.info("eval_progress", batch=batch_idx, total=num_batches)
 
-            if batch.get("mixed", False):
-                # Skip mixed batches in eval for simplicity
-                continue
+                if batch.get("mixed", False):
+                    # Skip mixed batches in eval for simplicity
+                    continue
 
-            sample_type = batch["sample_type"]
-            if sample_type == "file":
-                survivors, survivor_mask = self._compress_file_batch(batch)
-            else:
-                survivors, survivor_mask = self._compress_repo_batch(batch)
+                sample_type = batch["sample_type"]
+                if sample_type == "file":
+                    survivors, survivor_mask = self._compress_file_batch(batch)
+                else:
+                    survivors, survivor_mask = self._compress_repo_batch(batch)
 
-            with torch.autocast(
-                "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
-            ):
-                logits = self.decoder(
-                    survivor_embeddings=survivors,
-                    target_ids=batch["target_token_ids"].to(self.device),
-                    target_attention_mask=batch["target_attention_mask"].to(self.device),
-                    survivor_attention_mask=survivor_mask,
+                with torch.autocast(
+                    "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
+                ):
+                    logits = self.decoder(
+                        survivor_embeddings=survivors,
+                        target_ids=batch["target_token_ids"].to(self.device),
+                        target_attention_mask=batch["target_attention_mask"].to(
+                            self.device,
+                        ),
+                        survivor_attention_mask=survivor_mask,
+                    )
+                    loss = self._compute_loss(logits, batch)
+
+                target_mask = batch["target_attention_mask"]
+                batch_tokens = target_mask[:, 1:].sum().item()
+                total_loss += loss.item() * batch_tokens
+                total_tokens += batch_tokens
+
+                # Per-objective tracking
+                objectives = batch.get("objectives", [])
+                if objectives:
+                    obj = objectives[0]
+                    per_objective_loss[obj] = per_objective_loss.get(obj, 0.0) + loss.item()
+                    per_objective_count[obj] = per_objective_count.get(obj, 0) + 1
+
+                # Collect survivors for drift metrics
+                total_vecs = sum(s.size(0) for s in all_survivors)
+                if total_vecs < 512:
+                    flat = survivors[survivor_mask].detach() if survivor_mask is not None else (
+                        survivors.reshape(-1, survivors.size(-1)).detach()
+                    )
+                    remaining = 512 - total_vecs
+                    all_survivors.append(flat[:remaining])
+
+            avg_loss = total_loss / max(total_tokens, 1)
+            perplexity = torch.exp(torch.tensor(avg_loss)).item()
+
+            metrics: dict[str, float] = {
+                "loss": avg_loss,
+                "perplexity": perplexity,
+            }
+
+            # Per-objective losses
+            for obj, total in per_objective_loss.items():
+                count = per_objective_count.get(obj, 1)
+                metrics[f"{obj}_loss"] = total / count
+
+            # Embedding drift metrics
+            if all_survivors:
+                combined = torch.cat(all_survivors, dim=0)
+                token_emb = (
+                    self.encoder.compressor.backbone.get_input_embeddings().weight.detach()
                 )
-                loss = self._compute_loss(logits, batch)
-
-            target_mask = batch["target_attention_mask"]
-            batch_tokens = target_mask[:, 1:].sum().item()
-            total_loss += loss.item() * batch_tokens
-            total_tokens += batch_tokens
-
-            # Per-objective tracking
-            objectives = batch.get("objectives", [])
-            if objectives:
-                obj = objectives[0]
-                per_objective_loss[obj] = per_objective_loss.get(obj, 0.0) + loss.item()
-                per_objective_count[obj] = per_objective_count.get(obj, 0) + 1
-
-            # Collect survivors for drift metrics
-            total_vecs = sum(s.size(0) for s in all_survivors)
-            if total_vecs < 512:
-                flat = survivors[survivor_mask].detach() if survivor_mask is not None else (
-                    survivors.reshape(-1, survivors.size(-1)).detach()
-                )
-                remaining = 512 - total_vecs
-                all_survivors.append(flat[:remaining])
-
-        avg_loss = total_loss / max(total_tokens, 1)
-        perplexity = torch.exp(torch.tensor(avg_loss)).item()
-
-        metrics: dict[str, float] = {
-            "loss": avg_loss,
-            "perplexity": perplexity,
-        }
-
-        # Per-objective losses
-        for obj, total in per_objective_loss.items():
-            count = per_objective_count.get(obj, 1)
-            metrics[f"{obj}_loss"] = total / count
-
-        # Embedding drift metrics
-        if all_survivors:
-            combined = torch.cat(all_survivors, dim=0)
-            token_emb = (
-                self.encoder.compressor.backbone.get_input_embeddings().weight.detach()
-            )
-            health = embedding_drift_metrics(combined, token_emb)
-            metrics["mean_max_cosine_sim"] = health["mean_max_cosine_sim"]
-            metrics["std_max_cosine_sim"] = health["std_max_cosine_sim"]
-
-        self.encoder.train()
-        self.decoder.train()
+                health = embedding_drift_metrics(combined, token_emb)
+                metrics["mean_max_cosine_sim"] = health["mean_max_cosine_sim"]
+                metrics["std_max_cosine_sim"] = health["std_max_cosine_sim"]
+        finally:
+            self._is_evaluating = False
+            self.encoder.train()
+            self.decoder.train()
 
         return metrics
 
@@ -1298,8 +1388,9 @@ class CompressionTrainer(BaseTrainer):
             "l1_enabled": self._l1_enabled,
             "l1_transitioned": self._l1_transitioned,
             "l1_rebuild_pending": self._l1_rebuild_pending,
-            "ice_threshold": self._ice_threshold,
             "lora_active": self._lora_active,
+            "l1_batches_seen": self._l1_batches_seen,
+            "target_ratio_override": self._target_ratio_override,
         })
 
         metadata = CheckpointMetadata(
@@ -1317,6 +1408,8 @@ class CompressionTrainer(BaseTrainer):
             encoder=self.encoder.state_dict(),
             decoder=self.decoder.state_dict(),
             optimizer=self.optimizer.state_dict(),
+            l0_calibrator=self._l0_calibrator.state_dict(),
+            l1_calibrator=self._l1_calibrator.state_dict(),
         )
         self._last_checkpoint_path = str(ckpt_path)
         return ckpt_path
@@ -1340,8 +1433,11 @@ class CompressionTrainer(BaseTrainer):
             self._l1_enabled = ts.get("l1_enabled", False)
             self._l1_transitioned = ts.get("l1_transitioned", False)
             self._l1_rebuild_pending = ts.get("l1_rebuild_pending", False)
-            self._ice_threshold = ts.get("ice_threshold", self._ice_threshold_start)
             self._lora_active = ts.get("lora_active", False)
+            self._l1_batches_seen = ts.get("l1_batches_seen", 0)
+            if self._l1_batches_seen >= self._l1_calibrator_fast_batches:
+                self._l1_calibrator.set_decay(self._l1_calibrator_slow_decay)
+            self._target_ratio_override = ts.get("target_ratio_override")
 
         # If LoRA was active when checkpoint was saved, apply LoRA wrapper
         # to the decoder BEFORE loading state dict (which contains LoRA keys).
@@ -1365,6 +1461,12 @@ class CompressionTrainer(BaseTrainer):
                     hint="config topology may have changed; fresh optimizer moments",
                 )
 
+        # Restore calibrators (saved as .pt sidecar files)
+        if "l0_calibrator" in state_dicts:
+            self._l0_calibrator.load_state_dict(state_dicts["l0_calibrator"])
+        if "l1_calibrator" in state_dicts:
+            self._l1_calibrator.load_state_dict(state_dicts["l1_calibrator"])
+
         logger.info("restored_from_checkpoint", step=self.global_step)
 
     # ------------------------------------------------------------------
@@ -1372,29 +1474,12 @@ class CompressionTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     def apply_live_config(self, changes: dict) -> None:
-        """Support live tuning of ICE threshold and compression ratio bounds."""
-        if "ice_threshold" in changes:
-            val = changes["ice_threshold"]
-            if isinstance(val, (int, float)) and val >= 0:
-                self._ice_threshold = float(val)
-                logger.info("live_ice_threshold_update", ice_threshold=self._ice_threshold)
-
-        if "compression_ratio_min" in changes:
-            val = changes["compression_ratio_min"]
-            if isinstance(val, (int, float)) and 0 < val < 1:
-                self._min_compression_ratio = float(val)
-                logger.info(
-                    "live_compression_ratio_update",
-                    min=self._min_compression_ratio,
-                    max=self._max_compression_ratio,
-                )
-
-        if "compression_ratio_max" in changes:
-            val = changes["compression_ratio_max"]
-            if isinstance(val, (int, float)) and 0 < val < 1:
-                self._max_compression_ratio = float(val)
-                logger.info(
-                    "live_compression_ratio_update",
-                    min=self._min_compression_ratio,
-                    max=self._max_compression_ratio,
-                )
+        """Support live tuning of target compression ratio."""
+        if "target_ratio" in changes:
+            val = changes["target_ratio"]
+            if val is None:
+                self._target_ratio_override = None
+                logger.info("live_target_ratio_cleared", resuming="ramp")
+            elif isinstance(val, (int, float)) and 0 < val < 1:
+                self._target_ratio_override = float(val)
+                logger.info("live_target_ratio_update", target_ratio=self._target_ratio_override)
