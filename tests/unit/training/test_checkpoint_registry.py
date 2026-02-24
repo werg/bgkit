@@ -3,10 +3,13 @@
 import json
 from unittest.mock import MagicMock
 
+import pytest
+
 from bgkit.training.checkpoint_registry import (
     CheckpointRegistry,
     RegistryEntry,
     normalize_checkpoint_name,
+    resolve_checkpoint,
 )
 
 # ---------------------------------------------------------------------------
@@ -582,3 +585,77 @@ def test_input_sources_in_registry_entry():
     )
     assert entry.input_sources["ice"] == "ice_step29999_20260220_220522"
     assert entry.input_sources["step1"] == "step1_ckpt"
+
+
+# ---------------------------------------------------------------------------
+# resolve_checkpoint()
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_checkpoint_finds_best(tmp_path):
+    """resolve_checkpoint should backfill and return the best on-disk checkpoint."""
+    _make_ckpt_on_disk(tmp_path, "ice_step100_20260220_220522", 100, metrics={"eval/mse": 5.0})
+    _make_ckpt_on_disk(tmp_path, "ice_step200_20260221_100000", 200, metrics={"eval/mse": 3.0})
+
+    result = resolve_checkpoint(tmp_path, phase="ice", metric="eval/mse")
+    assert result == tmp_path / "ice_step200_20260221_100000"
+
+
+def test_resolve_checkpoint_no_match_raises(tmp_path):
+    """resolve_checkpoint should raise ValueError when no matching checkpoint exists."""
+    with pytest.raises(ValueError, match="no ice checkpoint found"):
+        resolve_checkpoint(tmp_path, phase="ice", metric="eval/mse")
+
+
+def test_resolve_checkpoint_skips_pruned(tmp_path):
+    """resolve_checkpoint should skip pruned checkpoints and return the on-disk one."""
+    # Create two checkpoints, delete the better one's dir
+    _make_ckpt_on_disk(tmp_path, "ice_step100_20260220_220522", 100, metrics={"eval/mse": 5.0})
+    _make_ckpt_on_disk(tmp_path, "ice_step200_20260221_100000", 200, metrics={"eval/mse": 1.0})
+
+    # Register the better one, then mark pruned (simulate deletion)
+    reg = CheckpointRegistry(tmp_path)
+    reg.backfill(tmp_path)
+    reg.mark_pruned("ice_step200_20260221_100000")
+
+    # resolve_checkpoint creates a fresh registry, so re-backfill will reconcile
+    import shutil
+    shutil.rmtree(tmp_path / "ice_step200_20260221_100000")
+
+    result = resolve_checkpoint(tmp_path, phase="ice", metric="eval/mse")
+    assert result == tmp_path / "ice_step100_20260220_220522"
+
+
+def test_resolve_checkpoint_with_label(tmp_path):
+    """Label appears in the error message."""
+    with pytest.raises(ValueError, match="bgkit_checkpoint"):
+        resolve_checkpoint(
+            tmp_path, phase="joint_block_pretrain", metric="eval/mse_repro",
+            label="bgkit_checkpoint",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Backfill: reappearing checkpoint recovery
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_recovers_reappearing_checkpoint(tmp_path):
+    """Backfill should un-prune entries whose dirs have reappeared."""
+    # Create checkpoint and register it
+    _make_ckpt_on_disk(tmp_path, "ice_step100_20260220_220522", 100, metrics={"eval/mse": 2.0})
+    reg = CheckpointRegistry(tmp_path)
+    reg.backfill(tmp_path)
+    assert reg.get("ice_step100_20260220_220522").on_disk is True
+
+    # Mark as pruned (simulate deletion)
+    reg.mark_pruned("ice_step100_20260220_220522")
+    assert reg.get("ice_step100_20260220_220522").status == "pruned"
+    assert reg.get("ice_step100_20260220_220522").on_disk is False
+
+    # Dir still exists on disk (or was restored) -- backfill should recover it
+    reg2 = CheckpointRegistry(tmp_path)
+    reg2.backfill(tmp_path)
+    e = reg2.get("ice_step100_20260220_220522")
+    assert e.on_disk is True
+    assert e.status == "completed"

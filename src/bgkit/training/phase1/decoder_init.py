@@ -32,6 +32,7 @@ from bgkit.eval.metrics.reconstruction import parse_success_rate
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
+from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import clip_grad_norm, enable_gradient_checkpointing
 from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
@@ -81,7 +82,7 @@ class DecoderInitTrainer(BaseTrainer):
         # Load BgKIT from checkpoint if available.
         # Joint block pretrain checkpoints save under key "encoder";
         # legacy auto-repro checkpoints save under "model".
-        bgkit_checkpoint = self.cfg.get("bgkit_checkpoint", None)
+        bgkit_checkpoint = self._resolve_bgkit_checkpoint()
         if bgkit_checkpoint is not None:
             logger.info("loading_bgkit_checkpoint", path=bgkit_checkpoint)
             _, state_dicts = load_checkpoint(Path(bgkit_checkpoint))
@@ -197,6 +198,26 @@ class DecoderInitTrainer(BaseTrainer):
             eval_samples=eval_size,
             device=str(device),
         )
+
+    def _resolve_bgkit_checkpoint(self) -> str | None:
+        """Resolve bgkit_checkpoint: 'auto' -> best joint_block_pretrain."""
+        bgkit_checkpoint = self.cfg.get("bgkit_checkpoint", None)
+        if bgkit_checkpoint == "auto":
+            checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
+            resolved = resolve_checkpoint(
+                checkpoint_dir,
+                phase="joint_block_pretrain",
+                metric="eval/mse_repro",
+                label="bgkit_checkpoint",
+            )
+            bgkit_checkpoint = str(resolved)
+
+        # Track lineage for BOTH auto-resolved and explicit paths
+        self._input_sources = {}
+        if bgkit_checkpoint is not None:
+            self._input_sources["joint_block_pretrain"] = Path(bgkit_checkpoint).name
+
+        return bgkit_checkpoint
 
     def _apply_freeze(self) -> None:
         """Freeze top transformer layer, lm_head, and embed_tokens if configured."""

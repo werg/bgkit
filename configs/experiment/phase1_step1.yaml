@@ -6,3 +6,5 @@ defaults:
   - _self_
 
 run_name: phase1_step1
+
+bgkit_checkpoint: auto

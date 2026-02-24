@@ -32,7 +32,7 @@ from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_manager import CheckpointManager
-from bgkit.training.checkpoint_registry import CheckpointRegistry
+from bgkit.training.checkpoint_registry import CheckpointRegistry, resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import clip_grad_norm, enable_gradient_checkpointing
 from bgkit.training.interruption import GracefulInterruptor
@@ -85,13 +85,14 @@ class CompressionTrainer(BaseTrainer):
         )
         self.encoder.to(device)
 
-        # Load encoder from Step 1 checkpoint
-        step1_checkpoint = self.cfg.get("step1_checkpoint", None)
+        # Load encoder+decoder from Step 1 checkpoint
+        step1_checkpoint = self._resolve_step1_checkpoint()
+        step1_state_dicts: dict | None = None
         if step1_checkpoint is not None:
             logger.info("loading_step1_checkpoint", path=step1_checkpoint)
-            _, state_dicts = load_checkpoint(Path(step1_checkpoint))
-            if "encoder" in state_dicts:
-                self.encoder.load_state_dict(state_dicts["encoder"])
+            _, step1_state_dicts = load_checkpoint(Path(step1_checkpoint))
+            if "encoder" in step1_state_dicts:
+                self.encoder.load_state_dict(step1_state_dicts["encoder"])
 
         # Encoder is trainable in Step 2
         self.encoder.requires_grad_(True)
@@ -117,8 +118,8 @@ class CompressionTrainer(BaseTrainer):
         self.decoder.to(device)
 
         # Load decoder from Step 1 checkpoint
-        if step1_checkpoint is not None and "decoder" in state_dicts:
-            self.decoder.load_state_dict(state_dicts["decoder"])
+        if step1_state_dicts is not None and "decoder" in step1_state_dicts:
+            self.decoder.load_state_dict(step1_state_dicts["decoder"])
 
         enable_gradient_checkpointing(self.decoder.backbone)
 
@@ -141,11 +142,6 @@ class CompressionTrainer(BaseTrainer):
             revision=tokenizer_revision,
         )
 
-        # --- Cross-phase input sources ---
-        self._input_sources = {}
-        if step1_checkpoint is not None:
-            self._input_sources["step1"] = Path(step1_checkpoint).name
-
         # --- Frozen ICE model ---
         from bgkit.models.ice import ICE
 
@@ -159,18 +155,14 @@ class CompressionTrainer(BaseTrainer):
         # Auto-resolution: find best ICE checkpoint from registry
         if ice_cfg.checkpoint_path == "auto":
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
-            ice_registry = CheckpointRegistry(checkpoint_dir)
-            ice_registry.backfill(checkpoint_dir)
-            best = ice_registry.best(phase="ice", metric="eval/mse")
-            if best is None:
-                raise ValueError(
-                    "checkpoint_path=auto but no ICE checkpoint found in registry or "
-                    "on disk. Run a completed ICE training first, or set an explicit "
-                    "checkpoint path."
-                )
-            ice_ckpt_path = checkpoint_dir / best.name
-            self._input_sources["ice"] = best.name
-            logger.info("ice_auto_resolved", checkpoint=best.name, metric=best.metrics)
+            ice_ckpt_path = resolve_checkpoint(
+                checkpoint_dir,
+                phase="ice",
+                metric="eval/mse",
+                label="training.ice.checkpoint_path",
+            )
+            self._input_sources["ice"] = ice_ckpt_path.name
+            logger.info("ice_auto_resolved", checkpoint=ice_ckpt_path.name)
         else:
             ice_ckpt_path = Path(ice_cfg.checkpoint_path)
             self._input_sources["ice"] = ice_ckpt_path.name
@@ -324,6 +316,29 @@ class CompressionTrainer(BaseTrainer):
             device=str(device),
             l1_introduction_step=self._l1_introduction_step,
         )
+
+    def _resolve_step1_checkpoint(self) -> str | None:
+        """Resolve step1_checkpoint config: 'auto' -> best phase1_step1, explicit -> pass.
+
+        Also populates self._input_sources["step1"] for lineage tracking.
+        """
+        step1_checkpoint = self.cfg.get("step1_checkpoint", None)
+        if step1_checkpoint == "auto":
+            checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
+            resolved = resolve_checkpoint(
+                checkpoint_dir,
+                phase="phase1_step1",
+                metric="eval/loss",
+                label="step1_checkpoint",
+            )
+            step1_checkpoint = str(resolved)
+
+        # Track lineage for BOTH auto-resolved and explicit paths
+        self._input_sources = {}
+        if step1_checkpoint is not None:
+            self._input_sources["step1"] = Path(step1_checkpoint).name
+
+        return step1_checkpoint
 
     def _setup_optimizer(self) -> None:
         """Create AdamW optimizer with encoder + decoder param groups."""

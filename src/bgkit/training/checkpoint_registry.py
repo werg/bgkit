@@ -19,6 +19,28 @@ logger = structlog.get_logger()
 _SCHEMA_VERSION = 1
 
 
+def resolve_checkpoint(
+    checkpoint_dir: Path,
+    phase: str,
+    metric: str,
+    lower_is_better: bool = True,
+    label: str = "",
+) -> Path:
+    """Backfill registry, find best on-disk checkpoint for a phase.
+
+    Raises ValueError if no checkpoint found.
+    """
+    registry = CheckpointRegistry(checkpoint_dir)
+    registry.backfill(checkpoint_dir)
+    best = registry.best(phase=phase, metric=metric, lower_is_better=lower_is_better)
+    if best is None:
+        raise ValueError(
+            f"{label or phase} checkpoint_path=auto but no {phase} checkpoint found "
+            f"in registry or on disk. Run {phase} training first, or set an explicit path."
+        )
+    return checkpoint_dir / best.name
+
+
 def normalize_checkpoint_name(path_or_name: str) -> str:
     """Extract checkpoint directory name from an absolute path or bare name.
 
@@ -228,6 +250,18 @@ class CheckpointRegistry:
                 entry.status = "pruned"
                 dirty = True
                 logger.info("registry_reconcile_pruned", name=entry.name)
+        # Recovery: un-prune entries whose dirs have reappeared (e.g. restored from backup).
+        # Note: if status was "interrupted" before pruning, mark_pruned() overwrote it to
+        # "pruned". We can't distinguish that case, so we recover to "completed" as the
+        # pragmatic default.
+        for entry in self._entries.values():
+            if not entry.on_disk and (scan_dir / entry.name).exists():
+                entry.on_disk = True
+                if entry.status == "pruned":
+                    entry.status = "completed"
+                dirty = True
+                logger.info("registry_reconcile_recovered", name=entry.name)
+
         if dirty:
             self._save()
 

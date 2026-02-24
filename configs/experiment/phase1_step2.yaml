@@ -1,10 +1,10 @@
 # @package _global_
-# Full experiment preset: Phase 1 (all steps)
+# Experiment preset: Phase 1 Step 2 compression training
 defaults:
   - /config
   - /training/phase1_step2
   - _self_
 
-run_name: phase1_full
+run_name: phase1_step2
 
 step1_checkpoint: auto

@@ -723,6 +723,55 @@ class TestScoreAndSelect:
         assert len(trainer._pending_l0_scores) == 0
 
 
+# ---------------------------------------------------------------------------
+# _resolve_step1_checkpoint wiring tests
+# ---------------------------------------------------------------------------
+
+
+class TestResolveStep1Checkpoint:
+    def test_auto_calls_resolve_checkpoint(self, trainer):
+        """step1_checkpoint='auto' should call resolve_checkpoint with correct args."""
+        from unittest.mock import patch
+
+        from omegaconf import OmegaConf
+        trainer.cfg = OmegaConf.merge(trainer.cfg, {
+            "step1_checkpoint": "auto",
+            "checkpoint_dir": "/tmp/ckpts",
+        })
+
+        with patch(
+            "bgkit.training.phase1.compression.resolve_checkpoint",
+            return_value=Path("/tmp/ckpts/phase1_step1_step5000_20260224"),
+        ) as mock_resolve:
+            result = trainer._resolve_step1_checkpoint()
+
+        mock_resolve.assert_called_once_with(
+            Path("/tmp/ckpts"),
+            phase="phase1_step1",
+            metric="eval/loss",
+            label="step1_checkpoint",
+        )
+        assert result == "/tmp/ckpts/phase1_step1_step5000_20260224"
+        assert trainer._input_sources["step1"] == "phase1_step1_step5000_20260224"
+
+    def test_explicit_path_passthrough(self, trainer):
+        """Explicit path should pass through and populate _input_sources."""
+        from omegaconf import OmegaConf
+        trainer.cfg = OmegaConf.merge(trainer.cfg, {
+            "step1_checkpoint": "/workspace/checkpoints/step1_ckpt_300",
+        })
+
+        result = trainer._resolve_step1_checkpoint()
+        assert result == "/workspace/checkpoints/step1_ckpt_300"
+        assert trainer._input_sources["step1"] == "step1_ckpt_300"
+
+    def test_none_returns_none(self, trainer):
+        """No step1_checkpoint config should return None and no step1 in _input_sources."""
+        result = trainer._resolve_step1_checkpoint()
+        assert result is None
+        assert "step1" not in trainer._input_sources
+
+
 class TestL0ToL1AutoRepro:
     def test_auto_reproduce_called_in_repo_batch(self, trainer):
         """_compress_repo_batch should call auto_reproduce for L0→L1 handoff."""

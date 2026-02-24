@@ -517,3 +517,55 @@ class TestDifferentialLR:
         # Only norm group (the single layer is frozen)
         assert len(t.optimizer.param_groups) == 1
         assert abs(t.optimizer.param_groups[0]["lr"] - 1e-3) < 1e-10
+
+
+# ---------------------------------------------------------------------------
+# _resolve_bgkit_checkpoint wiring tests
+# ---------------------------------------------------------------------------
+
+
+class TestResolveBgkitCheckpoint:
+    def test_auto_calls_resolve_checkpoint(self, trainer):
+        """bgkit_checkpoint='auto' should call resolve_checkpoint with correct args."""
+        from unittest.mock import patch
+
+        trainer.cfg = trainer.cfg.copy()
+        from omegaconf import OmegaConf
+        trainer.cfg = OmegaConf.merge(trainer.cfg, {
+            "bgkit_checkpoint": "auto",
+            "checkpoint_dir": "/tmp/ckpts",
+        })
+
+        with patch(
+            "bgkit.training.phase1.decoder_init.resolve_checkpoint",
+            return_value=Path("/tmp/ckpts/jbp_step500_20260224_120000"),
+        ) as mock_resolve:
+            result = trainer._resolve_bgkit_checkpoint()
+
+        mock_resolve.assert_called_once_with(
+            Path("/tmp/ckpts"),
+            phase="joint_block_pretrain",
+            metric="eval/mse_repro",
+            label="bgkit_checkpoint",
+        )
+        assert result == "/tmp/ckpts/jbp_step500_20260224_120000"
+        assert trainer._input_sources["joint_block_pretrain"] == (
+            "jbp_step500_20260224_120000"
+        )
+
+    def test_explicit_path_passthrough(self, trainer):
+        """Explicit path should pass through and populate _input_sources."""
+        from omegaconf import OmegaConf
+        trainer.cfg = OmegaConf.merge(trainer.cfg, {
+            "bgkit_checkpoint": "/workspace/checkpoints/jbp_step300",
+        })
+
+        result = trainer._resolve_bgkit_checkpoint()
+        assert result == "/workspace/checkpoints/jbp_step300"
+        assert trainer._input_sources["joint_block_pretrain"] == "jbp_step300"
+
+    def test_none_returns_none(self, trainer):
+        """No bgkit_checkpoint config should return None and empty _input_sources."""
+        result = trainer._resolve_bgkit_checkpoint()
+        assert result is None
+        assert "joint_block_pretrain" not in trainer._input_sources

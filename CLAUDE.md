@@ -68,9 +68,15 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 - `bgkit-ckpt annotate <name> [--notes "..."] [--tag X]` — add notes/tags
 - `bgkit-ckpt backfill` — populate registry from existing on-disk checkpoints
 
-**Auto-resolution**: Set `checkpoint_path: auto` in training configs (e.g. `phase1_step2.yaml`) to automatically resolve the best ICE checkpoint from the registry. Backfill runs first to catch any on-disk checkpoints not yet registered.
+**Auto-resolution**: Set checkpoint paths to `auto` in experiment configs to automatically resolve the best checkpoint from the registry. Backfill runs first to catch any on-disk checkpoints not yet registered.
 
-**Training phase pipeline**: ICE → Step 1 (frozen encoder pretraining) → Step 2 (compression training, uses ICE checkpoint) → Phase 2 (end-to-end injection).
+| Dependency | Config Key | Source Phase | Target Phase | Metric |
+|---|---|---|---|---|
+| ICE → Step 2 | `training.ice.checkpoint_path` | `ice` | `phase1_step2` | `eval/mse` |
+| Joint Block → Step 1 | `bgkit_checkpoint` | `joint_block_pretrain` | `phase1_step1` | `eval/mse_repro` |
+| Step 1 → Step 2 | `step1_checkpoint` | `phase1_step1` | `phase1_step2` | `eval/loss` |
+
+**Training phase pipeline**: ICE → Joint Block Pretrain → Step 1 (frozen encoder pretraining) → Step 2 (compression training) → Phase 2 (end-to-end injection).
 
 | Task | Command |
 |---|---|
