@@ -42,7 +42,7 @@ This plan covers training BgKIT for a single knowledge source (repository file c
 
 Train offline before all other work. Run Qwen3-0.6B (decoder) in causal mode over the training corpus to generate per-token cross-entropy values. Train the convolutional predictor to regress these values from token embedding sequences, with a uniformity regularizer on random inputs.
 
-Cost: Negligible. Output: A frozen predictor used for live survivor selection throughout all subsequent training. During compression training, ICE runs in inference mode on input embeddings to score positions; survivors are selected by thresholding against a curriculum-ramped ICE score cutoff, clamped to per-file [min, max] compression ratio bounds.
+Cost: Negligible. Output: A frozen predictor used for live survivor selection throughout all subsequent training. During compression training, ICE runs in inference mode on input embeddings to score positions. A `ThresholdCalibrator` maintains an EMA quantile estimate of observed ICE scores and converts the current target ratio into a threshold; gap-filling inserts survivors to prevent long unrepresented stretches.
 
 ### 2. Joint Block Pretraining and Source Model Selection
 
@@ -83,7 +83,7 @@ Introduce the drop-flag mechanism. Four core reconstruction objectives, all usin
 
 - Start with level 0 objectives (file reconstruction) plus commit reproduction at level 1.
 - Introduce full multi-file level 1 compression (over level 0 survivors) once level 0 reconstruction quality stabilizes.
-- ICE threshold ramps linearly from permissive (2.0 nats) to strict (4.0 nats) over training. At each file, positions with ICE score above the threshold survive, clamped to static [min, max] compression ratio bounds (5%–30%). This produces variable survivor counts per file that naturally adapt to information density — high-entropy files retain more positions, low-entropy files fewer — without explicit cross-file budget allocation.
+- Target compression ratio ramps linearly from 30% (permissive) to 15% (strict) over training. The `ThresholdCalibrator` converts this ratio to an ICE score threshold via EMA quantile tracking, adapting automatically to the observed score distribution. Gap-filling (max 64 tokens) prevents long stretches without survivors.
 
 **Training mix (starting point):** ~40% data reconstruction, ~20% description generation, ~15% structural/relational, ~25% commit reproduction. Shift toward data reconstruction with the decoder consuming from output from level 0, toward cross-item tasks from level 1.
 
