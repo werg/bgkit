@@ -92,6 +92,9 @@ convert-commits:
 
 generate-variants:
 	.venv/bin/python scripts/generate_prompt_variants.py \
+		--template configs/templates/file_read_repro.yaml \
+		--num-variants 40 --output data/prompt_variants/file_read_repro.json
+	.venv/bin/python scripts/generate_prompt_variants.py \
 		--template configs/templates/description_gen.yaml \
 		--num-variants 40 --output data/prompt_variants/description_gen.json
 	.venv/bin/python scripts/generate_prompt_variants.py \

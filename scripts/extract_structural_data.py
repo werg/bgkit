@@ -21,7 +21,7 @@ import os
 import sys
 import tempfile
 import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
 
 import structlog
@@ -201,8 +201,8 @@ def main() -> None:
         help="Process at most this many repos",
     )
     parser.add_argument(
-        "--workers", type=int, default=os.cpu_count(),
-        help="Number of parallel workers (default: cpu_count)",
+        "--workers", type=int, default=min(os.cpu_count() or 4, 8),
+        help="Number of parallel workers (default: min(cpu_count, 8))",
     )
     args = parser.parse_args()
 
@@ -234,41 +234,83 @@ def main() -> None:
     total_files = 0
     total_parsed = 0
 
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {
-            executor.submit(process_single_repo, rp, args.output_dir): rp
-            for rp in repo_paths
-        }
+    done_count = 0
+    remaining = list(repo_paths)
 
-        for i, future in enumerate(as_completed(futures)):
-            result = future.result()
-            status = result["status"]
+    while remaining:
+        batch_done: set[Path] = set()
+        try:
+            with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                futures = {
+                    executor.submit(process_single_repo, rp, args.output_dir): rp
+                    for rp in remaining
+                }
 
-            if status == "ok":
-                total_ok += 1
-                total_tier_a += result.get("tier_a", 0)
-                total_tier_b += result.get("tier_b", 0)
-                total_files += result.get("files", 0)
-                total_parsed += result.get("parsed", 0)
-            elif status == "skipped":
-                total_skipped += 1
-            elif status == "error":
-                total_errors += 1
-                logger.error(
-                    "repo_failed", repo=result["repo"],
-                    error=result.get("error", "")[:200],
-                )
-            # empty, no_parseable, no_records count as ok but produce no output
+                for future in as_completed(futures):
+                    repo_path = futures[future]
+                    try:
+                        result = future.result()
+                    except BrokenExecutor:
+                        # Worker process crashed (segfault, OOM). The executor is
+                        # dead — break out and restart with remaining repos.
+                        logger.error(
+                            "worker_crash",
+                            repo=f"{repo_path.parent.name}/{repo_path.name}",
+                            msg="Worker process died; restarting pool for remaining repos",
+                        )
+                        total_errors += 1
+                        batch_done.add(repo_path)
+                        raise  # exit the for-loop via the outer except
+                    except Exception as exc:
+                        logger.error(
+                            "future_error",
+                            repo=f"{repo_path.parent.name}/{repo_path.name}",
+                            error=str(exc)[:200],
+                        )
+                        total_errors += 1
+                        batch_done.add(repo_path)
+                        continue
 
-            if (i + 1) % 100 == 0 or (i + 1) == len(repo_paths):
-                logger.info(
-                    "progress",
-                    done=i + 1,
-                    total=len(repo_paths),
-                    ok=total_ok,
-                    skipped=total_skipped,
-                    errors=total_errors,
-                )
+                    batch_done.add(repo_path)
+                    status = result["status"]
+
+                    if status == "ok":
+                        total_ok += 1
+                        total_tier_a += result.get("tier_a", 0)
+                        total_tier_b += result.get("tier_b", 0)
+                        total_files += result.get("files", 0)
+                        total_parsed += result.get("parsed", 0)
+                    elif status == "skipped":
+                        total_skipped += 1
+                    elif status == "error":
+                        total_errors += 1
+                        logger.error(
+                            "repo_failed", repo=result["repo"],
+                            error=result.get("error", "")[:200],
+                        )
+
+                    done_count += 1
+                    if done_count % 100 == 0 or done_count == len(repo_paths):
+                        logger.info(
+                            "progress",
+                            done=done_count,
+                            total=len(repo_paths),
+                            ok=total_ok,
+                            skipped=total_skipped,
+                            errors=total_errors,
+                        )
+        except BrokenExecutor:
+            # Pool crashed — remove completed repos and retry the rest
+            remaining = [rp for rp in remaining if rp not in batch_done]
+            logger.info(
+                "pool_restart",
+                remaining=len(remaining),
+                completed_before_crash=len(batch_done),
+            )
+            continue
+
+        # Normal completion — all remaining repos processed
+        break
 
     # Compute unsupported as total_files - total_parsed (files that couldn't be parsed)
     total_unsupported = total_files - total_parsed

@@ -366,11 +366,18 @@ class CompressionTrainer(BaseTrainer):
 
         try:
             import bitsandbytes as bnb
+
+            _test_p = torch.nn.Parameter(torch.zeros(1, device=self.device, dtype=torch.bfloat16))
+            _test_opt = bnb.optim.AdamW8bit([_test_p], lr=1e-3)
+            _test_p.grad = torch.ones_like(_test_p)
+            _test_opt.step()
+            del _test_opt, _test_p
+
             self.optimizer = bnb.optim.AdamW8bit(param_groups, lr=tcfg.lr)
             logger.info("using_adamw8bit")
-        except ImportError:
+        except Exception:
             self.optimizer = torch.optim.AdamW(param_groups, lr=tcfg.lr)
-            logger.info("using_adamw_fp32", reason="bitsandbytes not available")
+            logger.info("using_adamw_fp32", reason="bitsandbytes not available or broken")
 
     def _trainable_params(self) -> list[torch.nn.Parameter]:
         """Collect all trainable parameters for gradient clipping."""

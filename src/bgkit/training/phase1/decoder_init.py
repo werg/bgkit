@@ -133,9 +133,7 @@ class DecoderInitTrainer(BaseTrainer):
         # --- Dataset ---
         data_dir = self.cfg.data.tokens.input_dir
         max_seq_len = self.cfg.data.tokens.get("max_seq_len", 8192)
-        variant_bank_path = self.cfg.data.get(
-            "variant_bank_path", "data/prompt_variants/file_read_repro.json",
-        )
+        variant_bank_path = self.cfg.data.tokens.variant_bank_path
 
         inner_dataset = MmapTokenDataset(data_dir, max_seq_len=max_seq_len)
         full_dataset = ChatReproDataset(
@@ -308,16 +306,23 @@ class DecoderInitTrainer(BaseTrainer):
         if not self._decoder_frozen:
             param_groups.extend(self._build_decoder_param_groups())
 
-        # 8-bit AdamW: reduces optimizer memory. If bnb causes issues,
-        # fall back to torch.optim.AdamW -- correctness is unaffected.
+        # 8-bit AdamW: reduces optimizer memory. If bnb causes issues
+        # (missing import or CUDA binary mismatch), fall back to torch AdamW.
         try:
             import bitsandbytes as bnb
 
+            # Verify CUDA kernels work before committing to 8-bit optimizer
+            _test_p = torch.nn.Parameter(torch.zeros(1, device=self.device, dtype=torch.bfloat16))
+            _test_opt = bnb.optim.AdamW8bit([_test_p], lr=1e-3)
+            _test_p.grad = torch.ones_like(_test_p)
+            _test_opt.step()
+            del _test_opt, _test_p
+
             self.optimizer = bnb.optim.AdamW8bit(param_groups, lr=tcfg.lr)
             logger.info("using_adamw8bit")
-        except ImportError:
+        except Exception:
             self.optimizer = torch.optim.AdamW(param_groups, lr=tcfg.lr)
-            logger.info("using_adamw_fp32", reason="bitsandbytes not available")
+            logger.info("using_adamw_fp32", reason="bitsandbytes not available or broken")
 
     def _build_param_groups(self, base_lr: float, lr_scale_bottom: float) -> list[dict]:
         """Build optimizer param groups with rising LR from bottom to top.

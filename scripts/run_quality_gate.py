@@ -115,9 +115,7 @@ def main(cfg: DictConfig) -> None:
     # Dataset
     data_dir = cfg.data.tokens.input_dir
     max_seq_len = cfg.data.tokens.get("max_seq_len", 8192)
-    variant_bank_path = cfg.data.get(
-        "variant_bank_path", "data/prompt_variants/file_read_repro.json",
-    )
+    variant_bank_path = cfg.data.tokens.variant_bank_path
     inner_dataset = MmapTokenDataset(data_dir, max_seq_len=max_seq_len)
     chat_dataset = ChatReproDataset(
         inner_dataset, tokenizer=tokenizer, variant_bank_path=variant_bank_path,

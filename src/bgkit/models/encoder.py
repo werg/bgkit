@@ -255,4 +255,9 @@ class BgKITEncoder(nn.Module):
             projection_layer, projection_norm, rotary_emb, hidden_dim=hidden_dim,
         )
 
-        return cls(compressor, projection_block)
+        encoder = cls(compressor, projection_block)
+
+        # Cast all parameters (including newly-initialized ones like flag embeddings,
+        # separator, auto_repro_head) to match the pretrained model dtype.
+        encoder.to(dtype=torch_dtype)
+        return encoder

@@ -251,7 +251,8 @@ class TestBgKITEncoderFactory:
 
         encoder = BgKITEncoder.from_pretrained(backbone, hidden_dim=64)
 
-        x = torch.randn(2, 10, 64)
+        # from_pretrained casts to bfloat16; input must match
+        x = torch.randn(2, 10, 64, dtype=torch.bfloat16)
         out = encoder(x, survivor_mask=None)
         assert isinstance(out, CompressionOutput)
         assert out.survivor_embeddings.shape == (2, 10, 64)

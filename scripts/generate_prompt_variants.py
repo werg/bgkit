@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -338,6 +340,27 @@ def parse_language_tiers(tier_str: str) -> list[str]:
     return languages
 
 
+def _check_claude_cli() -> None:
+    """Verify claude CLI is available and not running inside Claude Code."""
+    if os.environ.get("CLAUDECODE"):
+        print(
+            "ERROR: Cannot generate prompt variants inside a Claude Code session.\n"
+            "The claude CLI cannot be nested within Claude Code.\n"
+            "Run this command in a separate terminal:\n"
+            "    make generate-variants",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not shutil.which("claude"):
+        print(
+            "ERROR: 'claude' CLI not found on PATH.\n"
+            "Install it from https://docs.anthropic.com/en/docs/claude-code",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate prompt variant banks")
     parser.add_argument(
@@ -361,6 +384,9 @@ def main():
         help="Print meta-prompts without calling claude",
     )
     args = parser.parse_args()
+
+    if not args.dry_run:
+        _check_claude_cli()
 
     template = load_template(args.template)
     print(f"Loaded template: {template['name']}")
