@@ -135,7 +135,10 @@ class ICETrainer(BaseTrainer):
         )
 
         # Optimizer — ICE params only
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=tcfg.lr)
+        self.optimizer = self._create_optimizer(
+            [{"params": list(self.model.parameters()), "lr": tcfg.lr, "base_lr": tcfg.lr}],
+            tcfg.lr,
+        )
 
         self.uniform_reg_weight = tcfg.get("uniform_output_reg_weight", 0.0)
 

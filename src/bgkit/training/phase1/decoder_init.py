@@ -296,6 +296,15 @@ class DecoderInitTrainer(BaseTrainer):
             return [{"params": proj_params, "lr": proj_lr, "base_lr": proj_lr}]
         return []
 
+    def _muon_excluded_param_ids(self) -> frozenset[int]:
+        """Return param IDs of embedding/lm_head — 2D but should not use Muon."""
+        exclude = set()
+        for p in self.decoder.backbone.model.embed_tokens.parameters():
+            exclude.add(id(p))
+        for p in self.decoder.backbone.lm_head.parameters():
+            exclude.add(id(p))
+        return frozenset(exclude)
+
     def _setup_optimizer(self) -> None:
         """Create optimizer from current trainable param groups."""
         tcfg = self.cfg.training
@@ -306,23 +315,9 @@ class DecoderInitTrainer(BaseTrainer):
         if not self._decoder_frozen:
             param_groups.extend(self._build_decoder_param_groups())
 
-        # 8-bit AdamW: reduces optimizer memory. If bnb causes issues
-        # (missing import or CUDA binary mismatch), fall back to torch AdamW.
-        try:
-            import bitsandbytes as bnb
-
-            # Verify CUDA kernels work before committing to 8-bit optimizer
-            _test_p = torch.nn.Parameter(torch.zeros(1, device=self.device, dtype=torch.bfloat16))
-            _test_opt = bnb.optim.AdamW8bit([_test_p], lr=1e-3)
-            _test_p.grad = torch.ones_like(_test_p)
-            _test_opt.step()
-            del _test_opt, _test_p
-
-            self.optimizer = bnb.optim.AdamW8bit(param_groups, lr=tcfg.lr)
-            logger.info("using_adamw8bit")
-        except Exception:
-            self.optimizer = torch.optim.AdamW(param_groups, lr=tcfg.lr)
-            logger.info("using_adamw_fp32", reason="bitsandbytes not available or broken")
+        self.optimizer = self._create_optimizer(
+            param_groups, tcfg.lr, exclude_from_muon=self._muon_excluded_param_ids()
+        )
 
     def _build_param_groups(self, base_lr: float, lr_scale_bottom: float) -> list[dict]:
         """Build optimizer param groups with rising LR from bottom to top.
@@ -374,7 +369,7 @@ class DecoderInitTrainer(BaseTrainer):
         # Add decoder param groups to existing optimizer (preserves projection momentum)
         decoder_groups = self._build_decoder_param_groups()
         for group in decoder_groups:
-            self.optimizer.add_param_group(group)
+            self._add_param_group_to_optimizer(group)
 
         # Sync LR schedule for new groups
         sp = self._schedule_params or {
@@ -629,6 +624,7 @@ class DecoderInitTrainer(BaseTrainer):
             metrics=metrics,
             schedule_params=self._schedule_params,
             training_state=self._training_state,
+            optimizer_type=self._optimizer_type,
         )
         ckpt_path = save_checkpoint(
             checkpoint_dir,
@@ -643,6 +639,7 @@ class DecoderInitTrainer(BaseTrainer):
     def load_checkpoint(self, checkpoint_path: Path) -> None:
         """Load both BgKIT encoder and decoder models."""
         metadata, state_dicts = load_checkpoint(checkpoint_path)
+        self._check_optimizer_type_compat(metadata)
 
         # Restore model weights
         if "encoder" in state_dicts:

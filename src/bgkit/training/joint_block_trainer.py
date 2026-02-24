@@ -193,7 +193,10 @@ class JointBlockTrainer(BaseTrainer):
 
         # Optimizer -- trainable params only
         trainable_params = [p for p in self.encoder.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.AdamW(trainable_params, lr=tcfg.lr)
+        self.optimizer = self._create_optimizer(
+            [{"params": trainable_params, "lr": tcfg.lr, "base_lr": tcfg.lr}],
+            tcfg.lr,
+        )
 
         logger.info(
             "joint_block_trainer_setup",
@@ -365,6 +368,7 @@ class JointBlockTrainer(BaseTrainer):
             metrics=metrics,
             schedule_params=self._schedule_params,
             training_state=self._training_state,
+            optimizer_type=self._optimizer_type,
         )
         ckpt_path = save_checkpoint(
             checkpoint_dir,
@@ -378,23 +382,22 @@ class JointBlockTrainer(BaseTrainer):
     def load_checkpoint(self, checkpoint_path: Path) -> None:
         """Load encoder state dict and restore training state.
 
-        Optimizer state is loaded if the parameter count matches; otherwise
-        (e.g. switching heads_only mode) it is skipped with a warning so the
-        optimizer starts fresh for the new trainable set.
+        Raises on optimizer type mismatch (e.g. checkpoint saved with adamw,
+        config now says muon). Topology mismatches within the same optimizer
+        type (e.g. switching heads_only mode) are warned and the optimizer
+        starts fresh.
         """
         metadata, state_dicts = load_checkpoint(checkpoint_path)
+        self._check_optimizer_type_compat(metadata)
         self.encoder.load_state_dict(state_dicts["encoder"])
         if "optimizer" in state_dicts:
-            saved_n = len(state_dicts["optimizer"]["state"])
-            current_n = len(self.optimizer.param_groups[0]["params"])
-            if saved_n == current_n:
+            try:
                 self.optimizer.load_state_dict(state_dicts["optimizer"])
-            else:
+            except (ValueError, KeyError, RuntimeError) as e:
                 logger.warning(
-                    "optimizer_state_skipped",
-                    reason="trainable param count changed",
-                    saved=saved_n,
-                    current=current_n,
+                    "optimizer_state_load_failed",
+                    error=str(e),
+                    hint="config topology may have changed; fresh optimizer moments",
                 )
         self.global_step = metadata.step
         self.epoch = metadata.epoch

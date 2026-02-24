@@ -26,6 +26,9 @@ class CheckpointMetadata:
     schedule_params: dict[str, float] | None = None
     # Training loop state for seamless resume (early stopping, wandb run ID, etc.)
     training_state: dict | None = None
+    # Optimizer type used when saving ("adamw", "adamw8bit", "muon").
+    # None for checkpoints saved before this field was added.
+    optimizer_type: str | None = None
 
 
 def save_checkpoint(

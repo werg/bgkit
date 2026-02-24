@@ -67,6 +67,9 @@ class BaseTrainer(ABC):
         self._training_state: dict | None = None
         self._input_sources: dict[str, str] | None = None
         self._accum_steps = 1
+        # Optimizer type: set from config, overridden by _create_optimizer()
+        self._optimizer_type: str = cfg.training.get("optimizer", "adamw")
+        self._muon_exclude_set: frozenset[int] = frozenset()
 
     @abstractmethod
     def setup(self) -> None:
@@ -98,6 +101,142 @@ class BaseTrainer(ABC):
             raise ValueError(f"gradient_accumulation_steps must be int >= 1, got {value}")
         return value
 
+    def _create_optimizer(
+        self,
+        param_groups: list[dict],
+        default_lr: float,
+        exclude_from_muon: frozenset[int] | None = None,
+    ) -> object:
+        """Create optimizer based on config: 'muon', 'adamw8bit', or 'adamw'.
+
+        For muon: splits params into Muon (2D+) and AdamW (1D/embedding).
+        For adamw8bit: tries bnb with explicit CUDA probe, raises on failure.
+        For adamw: standard torch.optim.AdamW.
+
+        Args:
+            param_groups: List of param group dicts (standard PyTorch format).
+            default_lr: Fallback LR for the optimizer constructor.
+            exclude_from_muon: Set of param ``id()``s that should use AdamW
+                even if they are 2D+ (e.g. embedding tables, lm_head).
+        """
+        import torch
+
+        optimizer_type = self.cfg.training.get("optimizer", "adamw")
+        self._optimizer_type = optimizer_type
+        self._muon_exclude_set = exclude_from_muon or frozenset()
+
+        if optimizer_type == "muon":
+            from bgkit.training.muon import Muon
+
+            split_groups = self._split_for_muon(param_groups, self._muon_exclude_set)
+            optimizer = Muon(split_groups)
+            muon_count = sum(
+                sum(p.numel() for p in g["params"])
+                for g in split_groups
+                if g.get("use_muon")
+            )
+            adam_count = sum(
+                sum(p.numel() for p in g["params"])
+                for g in split_groups
+                if not g.get("use_muon")
+            )
+            logger.info(
+                "optimizer_created",
+                type="muon",
+                muon_params=muon_count,
+                adam_params=adam_count,
+                groups=len(split_groups),
+            )
+            return optimizer
+
+        if optimizer_type == "adamw8bit":
+            try:
+                import bitsandbytes as bnb
+            except ImportError as e:
+                raise ImportError(
+                    "optimizer: adamw8bit requires bitsandbytes. "
+                    "Install with pip install bitsandbytes, or use "
+                    "optimizer: adamw or optimizer: muon."
+                ) from e
+
+            # CUDA probe: verify bnb kernels actually work on this GPU
+            device = getattr(self, "device", torch.device("cpu"))
+            try:
+                _test_p = torch.nn.Parameter(
+                    torch.zeros(1, device=device, dtype=torch.bfloat16)
+                )
+                _test_opt = bnb.optim.AdamW8bit([_test_p], lr=1e-3)
+                _test_p.grad = torch.ones_like(_test_p)
+                _test_opt.step()
+                del _test_opt, _test_p
+            except Exception as e:
+                raise RuntimeError(
+                    f"bitsandbytes CUDA probe failed: {e}. "
+                    "This GPU (sm_121 / Blackwell) may not be supported by bnb. "
+                    "Use optimizer: adamw or optimizer: muon instead."
+                ) from e
+
+            optimizer = bnb.optim.AdamW8bit(param_groups, lr=default_lr)
+            total = sum(sum(p.numel() for p in g["params"]) for g in param_groups)
+            logger.info("optimizer_created", type="adamw8bit", params=total)
+            return optimizer
+
+        if optimizer_type == "adamw":
+            optimizer = torch.optim.AdamW(param_groups, lr=default_lr)
+            total = sum(sum(p.numel() for p in g["params"]) for g in param_groups)
+            logger.info("optimizer_created", type="adamw", params=total)
+            return optimizer
+
+        raise ValueError(
+            f"Unknown optimizer type: {optimizer_type!r}. "
+            "Supported: 'adamw', 'adamw8bit', 'muon'."
+        )
+
+    def _split_for_muon(
+        self, param_groups: list[dict], exclude_ids: frozenset[int] = frozenset()
+    ) -> list[dict]:
+        """Split param groups by ndim for Muon. Preserves all group metadata.
+
+        Params with ndim >= 2 and not in exclude_ids get ``use_muon=True``.
+        Everything else gets ``use_muon=False``.
+
+        Output order: for each input group, the Muon subgroup comes first,
+        then the AdamW subgroup. This preserves a stable ordering whether
+        groups are built all at once or added incrementally (critical for
+        optimizer state restore on checkpoint resume).
+        """
+        result: list[dict] = []
+        for group in param_groups:
+            meta = {k: v for k, v in group.items() if k != "params"}
+            muon_ps = [
+                p
+                for p in group["params"]
+                if p.ndim >= 2 and id(p) not in exclude_ids
+            ]
+            adam_ps = [
+                p
+                for p in group["params"]
+                if p.ndim < 2 or id(p) in exclude_ids
+            ]
+            if muon_ps:
+                result.append({"params": muon_ps, "use_muon": True, **meta})
+            if adam_ps:
+                result.append({"params": adam_ps, "use_muon": False, **meta})
+        return result
+
+    def _add_param_group_to_optimizer(self, group: dict) -> None:
+        """Add a param group to the optimizer, applying Muon split if needed.
+
+        For Muon optimizers, splits the group by ndim and adds up to two
+        sub-groups. For AdamW/AdamW8bit, passes through unchanged.
+        """
+        if self._optimizer_type == "muon":
+            split = self._split_for_muon([group], self._muon_exclude_set)
+            for sg in split:
+                self.optimizer.add_param_group(sg)
+        else:
+            self.optimizer.add_param_group(group)
+
     def train_step(self, batch) -> dict[str, float]:
         """Complete training step: zero_grad + forward_backward + clip + step.
 
@@ -123,6 +262,7 @@ class BaseTrainer(ABC):
             metrics=metrics,
             schedule_params=self._schedule_params,
             training_state=self._training_state,
+            optimizer_type=self._optimizer_type,
         )
         ckpt_path = save_checkpoint(
             checkpoint_dir,
@@ -133,12 +273,33 @@ class BaseTrainer(ABC):
         self._last_checkpoint_path = str(ckpt_path)
         return ckpt_path
 
+    def _check_optimizer_type_compat(self, metadata: CheckpointMetadata) -> None:
+        """Raise if saved optimizer type doesn't match current config."""
+        saved = metadata.optimizer_type
+        if saved is None:
+            return  # old checkpoint, no type info — allow
+        if saved != self._optimizer_type:
+            raise RuntimeError(
+                f"Optimizer type mismatch: checkpoint was saved with "
+                f"'{saved}' but current config uses '{self._optimizer_type}'. "
+                f"Cannot resume — start a fresh run or change the optimizer config."
+            )
+
     def load_checkpoint(self, checkpoint_path: Path) -> None:
         """Load checkpoint and restore training state."""
         metadata, state_dicts = load_checkpoint(checkpoint_path)
+        self._check_optimizer_type_compat(metadata)
         self.model.load_state_dict(state_dicts["model"])
         if "optimizer" in state_dicts:
-            self.optimizer.load_state_dict(state_dicts["optimizer"])
+            try:
+                self.optimizer.load_state_dict(state_dicts["optimizer"])
+            except (ValueError, KeyError, RuntimeError) as e:
+                logger.warning(
+                    "optimizer_state_load_failed",
+                    error=str(e),
+                    hint="optimizer topology changed (e.g. old checkpoint resumed "
+                    "with different optimizer type); fresh optimizer moments",
+                )
         self.global_step = metadata.step
         self.epoch = metadata.epoch
         self._last_checkpoint_path = str(checkpoint_path)

@@ -340,8 +340,38 @@ class CompressionTrainer(BaseTrainer):
 
         return step1_checkpoint
 
+    def _muon_excluded_param_ids(self) -> frozenset[int]:
+        """Return param IDs of decoder embedding/lm_head — 2D but should not use Muon.
+
+        After LoRA wrapping, embed_tokens and lm_head are frozen (only LoRA
+        adapters are trainable), so the exclusion set only matters for the
+        non-LoRA case.
+
+        Qwen CausalLM structure: backbone.model.embed_tokens, backbone.lm_head.
+        PeftModel wraps backbone: backbone.base_model.model → original CausalLM.
+        """
+        exclude = set()
+        # Unwrap PeftModel if present to reach the original CausalLM
+        backbone = self.decoder.backbone
+        causal_lm = (
+            backbone.base_model.model if hasattr(backbone, "base_model") else backbone
+        )
+        # embed_tokens lives on causal_lm.model (the inner Qwen model)
+        inner = getattr(causal_lm, "model", None)
+        if inner is not None and hasattr(inner, "embed_tokens"):
+            for p in inner.embed_tokens.parameters():
+                if p.requires_grad:
+                    exclude.add(id(p))
+        # lm_head lives on causal_lm (the CausalLM wrapper)
+        lm_head = getattr(causal_lm, "lm_head", None)
+        if lm_head is not None:
+            for p in lm_head.parameters():
+                if p.requires_grad:
+                    exclude.add(id(p))
+        return frozenset(exclude)
+
     def _setup_optimizer(self) -> None:
-        """Create AdamW optimizer with encoder + decoder param groups."""
+        """Create optimizer with encoder + decoder param groups."""
         tcfg = self.cfg.training
 
         encoder_params = [p for p in self.encoder.parameters() if p.requires_grad]
@@ -364,20 +394,9 @@ class CompressionTrainer(BaseTrainer):
                 "base_lr": decoder_lr,
             })
 
-        try:
-            import bitsandbytes as bnb
-
-            _test_p = torch.nn.Parameter(torch.zeros(1, device=self.device, dtype=torch.bfloat16))
-            _test_opt = bnb.optim.AdamW8bit([_test_p], lr=1e-3)
-            _test_p.grad = torch.ones_like(_test_p)
-            _test_opt.step()
-            del _test_opt, _test_p
-
-            self.optimizer = bnb.optim.AdamW8bit(param_groups, lr=tcfg.lr)
-            logger.info("using_adamw8bit")
-        except Exception:
-            self.optimizer = torch.optim.AdamW(param_groups, lr=tcfg.lr)
-            logger.info("using_adamw_fp32", reason="bitsandbytes not available or broken")
+        self.optimizer = self._create_optimizer(
+            param_groups, tcfg.lr, exclude_from_muon=self._muon_excluded_param_ids()
+        )
 
     def _trainable_params(self) -> list[torch.nn.Parameter]:
         """Collect all trainable parameters for gradient clipping."""
@@ -1498,6 +1517,7 @@ class CompressionTrainer(BaseTrainer):
             metrics=metrics,
             schedule_params=self._schedule_params,
             training_state=self._training_state,
+            optimizer_type=self._optimizer_type,
         )
         ckpt_path = save_checkpoint(
             checkpoint_dir,
@@ -1514,6 +1534,7 @@ class CompressionTrainer(BaseTrainer):
     def load_checkpoint(self, checkpoint_path: Path) -> None:
         """Load checkpoint and restore all training state."""
         metadata, state_dicts = load_checkpoint(checkpoint_path)
+        self._check_optimizer_type_compat(metadata)
 
         # Restore step position and curriculum state BEFORE loading weights,
         # so LoRA can be applied to the decoder first if needed.

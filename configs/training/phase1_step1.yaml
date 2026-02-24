@@ -1,5 +1,6 @@
 # Phase 1 Step 1: Decoder initialization on uncompressed output
 phase: phase1_step1
+optimizer: muon
 max_steps: 5000
 lr: 1.0e-4
 warmup_steps: 200

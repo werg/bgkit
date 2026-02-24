@@ -1,5 +1,6 @@
 # Phase 1 Step 2: Compression training (4 objectives, curriculum)
 phase: phase1_step2
+optimizer: muon
 max_steps: 200000
 lr: 5.0e-5
 warmup_steps: 5000
