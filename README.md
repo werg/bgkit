@@ -46,6 +46,31 @@ configs/             # Hydra configs: model, data, training, eval, compute, expe
 scripts/             # Entry points: train, eval, ablation, preprocessing, profiling
 ```
 
+## Checkpoint Management
+
+Training checkpoints are tracked in a persistent `registry.json` that survives pruning. The registry records metrics, config snapshots, cross-phase lineage, and human annotations.
+
+```bash
+# Populate registry from existing on-disk checkpoints
+bgkit-ckpt backfill
+
+# List ICE checkpoints
+bgkit-ckpt list --phase ice
+
+# Find the best ICE checkpoint by MSE
+bgkit-ckpt best --phase ice --metric eval/mse
+
+# Annotate a checkpoint
+bgkit-ckpt annotate ice_step29999_20260220_220522 --notes "Final ICE run" --tag baseline
+
+# Show full details
+bgkit-ckpt show ice_step29999_20260220_220522
+```
+
+**Auto-resolution**: Set `checkpoint_path: auto` in training configs to automatically use the best checkpoint from a prior phase. For example, Phase 1 Step 2 auto-resolves the best ICE checkpoint by `eval/mse`.
+
+**Training pipeline**: ICE (budget allocation) → Step 1 (frozen encoder pretraining) → Step 2 (multi-objective compression) → Phase 2 (end-to-end injection with target LLM).
+
 ## Design Docs
 
 - [`docs/01_overview.md`](docs/01_overview.md) — architecture and approach

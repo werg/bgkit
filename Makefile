@@ -1,4 +1,4 @@
-.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 extract-structural generate-descriptions extract-commits convert-structural convert-descriptions convert-commits generate-variants
+.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits convert-structural convert-descriptions convert-commits generate-variants
 
 install:
 	uv sync --extra dev --extra data
@@ -61,6 +61,9 @@ docker-build-deps:
 
 docker-build-data:
 	docker build -f docker/Dockerfile.data -t bgkit-data:latest .
+
+ckpt-backfill:
+	.venv/bin/bgkit-ckpt backfill
 
 # Data preprocessing pipeline (host-only, uses local data/ paths)
 extract-structural:

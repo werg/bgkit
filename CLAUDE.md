@@ -57,6 +57,27 @@ Full local dev (with torch + GPU packages): `make install-gpu` or `uv sync --gro
 - **PyTorch in Docker:** NGC container provides torch. `pip install ".[gpu]"` sees it and skips reinstalling.
 - **PyTorch locally:** Installed via the `torch` dependency group (`uv sync --group torch`).
 
+## Training Runs & Checkpoints
+
+Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names like `{phase}_step{N}_{timestamp}`. A persistent `registry.json` in the checkpoint directory tracks all checkpoints ever saved, surviving pruning.
+
+**Checkpoint registry CLI** (`bgkit-ckpt`):
+- `bgkit-ckpt list [--phase X] [--status X] [--tag X]` — tabular summary
+- `bgkit-ckpt show <name>` — full JSON detail
+- `bgkit-ckpt best --phase X --metric X [--higher-is-better]` — find best checkpoint
+- `bgkit-ckpt annotate <name> [--notes "..."] [--tag X]` — add notes/tags
+- `bgkit-ckpt backfill` — populate registry from existing on-disk checkpoints
+
+**Auto-resolution**: Set `checkpoint_path: auto` in training configs (e.g. `phase1_step2.yaml`) to automatically resolve the best ICE checkpoint from the registry. Backfill runs first to catch any on-disk checkpoints not yet registered.
+
+**Training phase pipeline**: ICE → Step 1 (frozen encoder pretraining) → Step 2 (compression training, uses ICE checkpoint) → Phase 2 (end-to-end injection).
+
+| Task | Command |
+|---|---|
+| Backfill registry | `make ckpt-backfill` or `.venv/bin/bgkit-ckpt backfill` |
+| List checkpoints | `.venv/bin/bgkit-ckpt list --phase ice` |
+| Best checkpoint | `.venv/bin/bgkit-ckpt best --phase ice --metric eval/mse` |
+
 ## Code Quality
 
 - Ruff for linting and formatting (line-length 100)

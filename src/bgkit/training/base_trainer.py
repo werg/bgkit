@@ -7,13 +7,20 @@ with bf16 autocast). Add Accelerate later for Phase 1/2.
 
 from __future__ import annotations
 
+import contextlib
 from abc import ABC, abstractmethod
+from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
 from omegaconf import OmegaConf
 
 from bgkit.training.checkpoint_manager import CheckpointManager
+from bgkit.training.checkpoint_registry import (
+    CheckpointRegistry,
+    RegistryEntry,
+    normalize_checkpoint_name,
+)
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.interruption import GracefulInterruptor
 from bgkit.training.live_config import LiveConfig
@@ -38,6 +45,7 @@ class BaseTrainer(ABC):
         self._last_checkpoint_path: str | None = None
         self._schedule_params: dict[str, float] | None = None
         self._training_state: dict | None = None
+        self._input_sources: dict[str, str] | None = None
 
     @abstractmethod
     def setup(self) -> None:
@@ -102,6 +110,51 @@ class BaseTrainer(ABC):
     def apply_live_config(self, changes: dict) -> None:  # noqa: B027
         """Apply trainer-specific live config changes. Override in subclasses."""
 
+    def _registry_parent(self) -> str | None:
+        """Return normalized parent checkpoint name, or None."""
+        if self._last_checkpoint_path:
+            return normalize_checkpoint_name(self._last_checkpoint_path)
+        return None
+
+    def _build_registry_entry(
+        self,
+        ckpt_path: Path,
+        metrics: dict[str, float] | None,
+        wandb_run,
+        status: str = "completed",
+        parent_checkpoint: str | None = None,
+    ) -> RegistryEntry:
+        """Build a RegistryEntry for a saved checkpoint.
+
+        Args:
+            parent_checkpoint: Dir name of the previous checkpoint. Must be
+                captured *before* ``save_checkpoint()`` which mutates
+                ``self._last_checkpoint_path``.
+        """
+        config_snapshot = None
+        with contextlib.suppress(Exception):
+            config_snapshot = OmegaConf.to_container(self.cfg.training, resolve=True)
+
+        disk_size = None
+        if ckpt_path.exists():
+            disk_size = sum(f.stat().st_size for f in ckpt_path.rglob("*") if f.is_file())
+
+        return RegistryEntry(
+            name=ckpt_path.name,
+            phase=self.cfg.training.phase,
+            step=self.global_step,
+            epoch=self.epoch,
+            timestamp=datetime.now(UTC).isoformat(),
+            status=status,
+            on_disk=True,
+            metrics=metrics,
+            config_snapshot=config_snapshot,
+            wandb_run_id=wandb_run.id if wandb_run is not None else None,
+            disk_size_bytes=disk_size,
+            parent_checkpoint=parent_checkpoint,
+            input_sources=self._input_sources,
+        )
+
     def train(self) -> None:
         """Main training loop.
 
@@ -134,6 +187,9 @@ class BaseTrainer(ABC):
         eval_every = tcfg.eval_every
         save_every = tcfg.save_every
         checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
+
+        # Checkpoint registry
+        registry = CheckpointRegistry(checkpoint_dir)
 
         # Early stopping config (disabled by default; enable per-phase in YAML)
         es_cfg = tcfg.get("early_stopping", {})
@@ -261,6 +317,7 @@ class BaseTrainer(ABC):
                 metric=prune_cfg.get("metric", es_metric),
                 lower_is_better=prune_cfg.get("lower_is_better", True),
                 phase=tcfg.phase,
+                registry=registry,
             )
             ckpt_manager.load_existing(checkpoint_dir)
         else:
@@ -403,9 +460,14 @@ class BaseTrainer(ABC):
                         step_metrics = (
                             last_eval_metrics if last_eval_step == step else None
                         )
+                        parent = self._registry_parent()
                         ckpt_path = self.save_checkpoint(
                             checkpoint_dir, metrics=step_metrics
                         )
+                        registry.register(self._build_registry_entry(
+                            ckpt_path, step_metrics, wandb_run,
+                            parent_checkpoint=parent,
+                        ))
                         if ckpt_manager is not None:
                             ckpt_manager.record(ckpt_path, step, step_metrics)
                             ckpt_manager.prune()
@@ -428,7 +490,13 @@ class BaseTrainer(ABC):
                                     else None
                                 ),
                             }
+                            parent = self._registry_parent()
                             ckpt_path = self.save_checkpoint(checkpoint_dir)
+                            registry.register(self._build_registry_entry(
+                                ckpt_path, None, wandb_run,
+                                status="interrupted",
+                                parent_checkpoint=parent,
+                            ))
                             if ckpt_manager is not None:
                                 ckpt_manager.record(ckpt_path, step, None)
                                 ckpt_manager.prune()
@@ -457,9 +525,14 @@ class BaseTrainer(ABC):
                         wandb_run.id if wandb_run is not None else None
                     ),
                 }
+                parent = self._registry_parent()
                 ckpt_path = self.save_checkpoint(
                     checkpoint_dir, metrics=eval_metrics
                 )
+                registry.register(self._build_registry_entry(
+                    ckpt_path, eval_metrics, wandb_run,
+                    parent_checkpoint=parent,
+                ))
                 if ckpt_manager is not None:
                     ckpt_manager.record(
                         ckpt_path, self.global_step, eval_metrics

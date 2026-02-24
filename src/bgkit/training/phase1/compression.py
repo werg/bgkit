@@ -32,6 +32,7 @@ from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_manager import CheckpointManager
+from bgkit.training.checkpoint_registry import CheckpointRegistry
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import clip_grad_norm, enable_gradient_checkpointing
 from bgkit.training.interruption import GracefulInterruptor
@@ -140,15 +141,40 @@ class CompressionTrainer(BaseTrainer):
             revision=tokenizer_revision,
         )
 
+        # --- Cross-phase input sources ---
+        self._input_sources = {}
+        if step1_checkpoint is not None:
+            self._input_sources["step1"] = Path(step1_checkpoint).name
+
         # --- Frozen ICE model ---
         from bgkit.models.ice import ICE
 
         ice_cfg = tcfg.ice
         if not ice_cfg.get("checkpoint_path"):
             raise ValueError(
-                "training.ice.checkpoint_path must be set to a trained ICE checkpoint"
+                "training.ice.checkpoint_path must be set to a trained ICE checkpoint "
+                "or 'auto' for automatic resolution"
             )
-        ice_ckpt_path = Path(ice_cfg.checkpoint_path)
+
+        # Auto-resolution: find best ICE checkpoint from registry
+        if ice_cfg.checkpoint_path == "auto":
+            checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
+            ice_registry = CheckpointRegistry(checkpoint_dir)
+            ice_registry.backfill(checkpoint_dir)
+            best = ice_registry.best(phase="ice", metric="eval/mse")
+            if best is None:
+                raise ValueError(
+                    "checkpoint_path=auto but no ICE checkpoint found in registry or "
+                    "on disk. Run a completed ICE training first, or set an explicit "
+                    "checkpoint path."
+                )
+            ice_ckpt_path = checkpoint_dir / best.name
+            self._input_sources["ice"] = best.name
+            logger.info("ice_auto_resolved", checkpoint=best.name, metric=best.metrics)
+        else:
+            ice_ckpt_path = Path(ice_cfg.checkpoint_path)
+            self._input_sources["ice"] = ice_ckpt_path.name
+
         if not ice_ckpt_path.exists():
             raise FileNotFoundError(
                 f"ICE checkpoint not found: {ice_ckpt_path}\n"
@@ -987,6 +1013,9 @@ class CompressionTrainer(BaseTrainer):
         save_every = tcfg.save_every
         checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
 
+        # Checkpoint registry
+        registry = CheckpointRegistry(checkpoint_dir)
+
         # Early stopping config
         es_cfg = tcfg.get("early_stopping", {})
         if isinstance(es_cfg, bool):
@@ -1094,6 +1123,7 @@ class CompressionTrainer(BaseTrainer):
                 metric=prune_cfg.get("metric", es_metric),
                 lower_is_better=prune_cfg.get("lower_is_better", True),
                 phase=tcfg.phase,
+                registry=registry,
             )
             ckpt_manager.load_existing(checkpoint_dir)
         else:
@@ -1203,9 +1233,14 @@ class CompressionTrainer(BaseTrainer):
                         step_metrics = (
                             last_eval_metrics if last_eval_step == step else None
                         )
+                        parent = self._registry_parent()
                         ckpt_path = self.save_checkpoint(
                             checkpoint_dir, metrics=step_metrics,
                         )
+                        registry.register(self._build_registry_entry(
+                            ckpt_path, step_metrics, wandb_run,
+                            parent_checkpoint=parent,
+                        ))
                         if ckpt_manager is not None:
                             ckpt_manager.record(ckpt_path, step, step_metrics)
                             ckpt_manager.prune()
@@ -1218,7 +1253,13 @@ class CompressionTrainer(BaseTrainer):
                             self._training_state = self._build_training_state(
                                 es_best, es_evals_without_improvement, wandb_run,
                             )
+                            parent = self._registry_parent()
                             ckpt_path = self.save_checkpoint(checkpoint_dir)
+                            registry.register(self._build_registry_entry(
+                                ckpt_path, None, wandb_run,
+                                status="interrupted",
+                                parent_checkpoint=parent,
+                            ))
                             if ckpt_manager is not None:
                                 ckpt_manager.record(ckpt_path, step, None)
                                 ckpt_manager.prune()
@@ -1241,7 +1282,12 @@ class CompressionTrainer(BaseTrainer):
                 self._training_state = self._build_training_state(
                     es_best, es_evals_without_improvement, wandb_run,
                 )
+                parent = self._registry_parent()
                 ckpt_path = self.save_checkpoint(checkpoint_dir, metrics=eval_metrics)
+                registry.register(self._build_registry_entry(
+                    ckpt_path, eval_metrics, wandb_run,
+                    parent_checkpoint=parent,
+                ))
                 if ckpt_manager is not None:
                     ckpt_manager.record(ckpt_path, self.global_step, eval_metrics)
                     ckpt_manager.prune()

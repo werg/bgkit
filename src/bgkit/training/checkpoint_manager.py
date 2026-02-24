@@ -27,6 +27,7 @@ class CheckpointManager:
         keep_latest: Number of most-recent checkpoints to keep.
         metric: Eval metric key for best-K ranking (e.g. ``"eval/mse"``).
         lower_is_better: If True, lower metric values are better.
+        registry: Optional CheckpointRegistry to notify on prune.
     """
 
     def __init__(
@@ -36,12 +37,14 @@ class CheckpointManager:
         metric: str = "eval/loss",
         lower_is_better: bool = True,
         phase: str | None = None,
+        registry=None,
     ) -> None:
         self.keep_best = keep_best
         self.keep_latest = keep_latest
         self.metric = metric
         self.lower_is_better = lower_is_better
         self.phase = phase
+        self._registry = registry
         self._records: list[_CheckpointRecord] = []
 
     def record(self, path: Path, step: int, metrics: dict[str, float] | None = None) -> None:
@@ -118,6 +121,8 @@ class CheckpointManager:
                 if rec.path.exists():
                     shutil.rmtree(rec.path)
                     logger.info("checkpoint_pruned", path=str(rec.path), step=rec.step)
+                if self._registry is not None:
+                    self._registry.mark_pruned(rec.path.name)
                 deleted.append(rec.path)
 
         self._records = surviving

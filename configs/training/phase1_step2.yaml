@@ -11,7 +11,7 @@ objectives:
   commit_reproduction: 0.25
 
 ice:
-  checkpoint_path: ${checkpoint_dir}/ice_step29999_20260220_220522
+  checkpoint_path: auto
   input_dim: 1024
   hidden_dim: 128
   num_layers: 2
