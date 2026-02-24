@@ -39,6 +39,7 @@ MmapTokenDataset          MmapDescriptionDataset
     2. Get repo_indices from _repo_commit_groups  <-- ONLY JOINED FILES
     3. _gather_l1_files reads token_ds[joined_indices[ri][0]]
     4. Target: repo-level description (or file-level fallback)
+    5. ICE scoring done live during training (not precomputed in dataset)
 ```
 
 ### Key files
@@ -91,21 +92,18 @@ raw token dataset indices directly.
 def _gather_l1_all_files(
     tok_indices: list[int],
     token_ds,
-    ice_ds,
     max_files: int = DEFAULT_MAX_FILES_PER_REPO,
     max_tokens: int = DEFAULT_MAX_TOKENS_PER_FILE,
     skip_extensions: frozenset[str] | None = None,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor] | None]:
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Gather repo files for L1 from the full token dataset.
 
     Unlike _gather_l1_files(), this reads directly from token dataset indices
     (not joined indices), so it includes files without description/structural
-    targets.
+    targets. ICE scoring is done live during training, not precomputed.
     """
     file_ids_list = []
     file_masks_list = []
-    file_ice_list = []
-    has_ice = ice_ds is not None
 
     for tok_idx in tok_indices:
         if len(file_ids_list) >= max_files:
@@ -128,14 +126,7 @@ def _gather_l1_all_files(
         file_ids_list.append(rids)
         file_masks_list.append(torch.ones(rids.size(0), dtype=torch.bool))
 
-        if has_ice and tok_idx < len(ice_ds):
-            ice_vals = ice_ds[tok_idx]["ce_values"]
-            if ice_vals.size(0) > max_tokens:
-                ice_vals = ice_vals[:max_tokens]
-            file_ice_list.append(ice_vals)
-
-    ice_result = file_ice_list if has_ice and file_ice_list else None
-    return file_ids_list, file_masks_list, ice_result
+    return file_ids_list, file_masks_list
 ```
 
 ### 3. Define skip extensions
@@ -178,8 +169,8 @@ repo_indices = (
     self._repo_commit_groups.get(group_key, [idx])
     if self._repo_commit_groups else [idx]
 )
-file_ids_list, file_masks_list, ice_result = _gather_l1_files(
-    repo_indices, self._joined_indices, self._token_ds, self._ice_ds,
+file_ids_list, file_masks_list = _gather_l1_files(
+    repo_indices, self._joined_indices, self._token_ds,
     max_files=self._max_files_per_repo,
     max_tokens=self._max_tokens_per_file,
 )
@@ -189,8 +180,8 @@ all_tok_indices = self._all_repo_files.get(group_key, [])
 if not all_tok_indices:
     # Fallback: use joined files only (shouldn't happen)
     all_tok_indices = [self._joined_indices[idx][0]]
-file_ids_list, file_masks_list, ice_result = _gather_l1_all_files(
-    all_tok_indices, self._token_ds, self._ice_ds,
+file_ids_list, file_masks_list = _gather_l1_all_files(
+    all_tok_indices, self._token_ds,
     max_files=self._max_files_per_repo,
     max_tokens=self._max_tokens_per_file,
     skip_extensions=_SKIP_EXTENSIONS,
@@ -237,7 +228,7 @@ joined indices in the same repo should share L1 context. The new
 ### Unit tests
 
 1. **Test `_gather_l1_all_files` directly:**
-   - Mock token dataset with 5 files, verify all 5 returned
+   - Mock token dataset with 5 files, verify all 5 returned (returns file_ids, file_masks only — no ICE scores, those are computed live)
    - Verify `max_files` cap works
    - Verify `max_tokens` truncation works
    - Verify `skip_extensions` filtering works (add a `.png` file, confirm skipped)

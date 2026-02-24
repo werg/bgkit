@@ -15,7 +15,7 @@ This plan covers training BgKIT for a single knowledge source (repository file c
 | BgKIT compressor | Qwen3-Embedding-0.6B layers 0–26 | ~580M | Compressor (shared weights, levels 0 and 1). Hidden dim 1024. |
 | Projection block | Qwen3-Embedding-0.6B layer 27 | ~25M | Context-aware projection from compressor output to target embedding space. Full transformer block: attends to all positions, outputs for survivors only. Extended via block-diagonal initialization for higher-dim targets. |
 | Reconstruction decoder | Qwen3-0.6B | ~600M | Co-trained decoder, provides primary training signal |
-| ICE | Custom 1D CNN | ~2–5M | Information content estimator for budget allocation |
+| ICE | Custom 1D CNN | ~0.7M | Information content estimator for survivor selection |
 | Target LLM | Qwen3-Coder-Next | QLoRA only | 80B total / 3B active MoE. 48-layer hybrid: 12 × (3 × gated DeltaNet-MoE + 1 × gated attention-MoE). 512 experts, 10 active + 1 shared per token. 256K context. Hidden dim 2048. Loaded in 4-bit (~40 GB) due to memory constraints; LoRA adapters train in BF16. |
 
 ## Data
@@ -42,7 +42,7 @@ This plan covers training BgKIT for a single knowledge source (repository file c
 
 Train offline before all other work. Run Qwen3-0.6B (decoder) in causal mode over the training corpus to generate per-token cross-entropy values. Train the convolutional predictor to regress these values from token embedding sequences, with a uniformity regularizer on random inputs.
 
-Cost: Negligible. Output: A frozen predictor used for survivor selection throughout all subsequent training.
+Cost: Negligible. Output: A frozen predictor used for live survivor selection throughout all subsequent training. During compression training, ICE runs in inference mode on input embeddings to score positions; survivors are selected by thresholding against a curriculum-ramped ICE score cutoff, clamped to per-file [min, max] compression ratio bounds.
 
 ### 2. Joint Block Pretraining and Source Model Selection
 
@@ -83,8 +83,7 @@ Introduce the drop-flag mechanism. Four core reconstruction objectives, all usin
 
 - Start with level 0 objectives (file reconstruction) plus commit reproduction at level 1.
 - Introduce full multi-file level 1 compression (over level 0 survivors) once level 0 reconstruction quality stabilizes.
-- Vary the total survivor budget K across examples so the model learns to work at different compression ratios.
-- Mix ~60% ICE-biased survivor selection with ~40% random selection, shifting toward ICE-biased over training.
+- ICE threshold ramps linearly from permissive (2.0 nats) to strict (4.0 nats) over training. At each file, positions with ICE score above the threshold survive, clamped to static [min, max] compression ratio bounds (5%–30%). This produces variable survivor counts per file that naturally adapt to information density — high-entropy files retain more positions, low-entropy files fewer — without explicit cross-file budget allocation.
 
 **Training mix (starting point):** ~40% data reconstruction, ~20% description generation, ~15% structural/relational, ~25% commit reproduction. Shift toward data reconstruction with the decoder consuming from output from level 0, toward cross-item tasks from level 1.
 

@@ -189,11 +189,11 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 **Mitigation:** The compressor is one layer shorter (27 vs 28 layers) than the full base model, marginally helping gradient flow. More importantly: gradient checkpointing, separate learning rates for the projection block vs. compressor layers, and a curriculum of verifiable knowledge extraction at every level. Freezing the compressor during Phase 2 (Section 4.4) eliminates the deepest gradient path if viable.
 
-### 5.3 ICE Calibration at Level 1+
+### 5.3 ICE Input Space Mismatch
 
-**Risk:** ICE is trained on token embeddings to predict decoder cross-entropy. At level 1, it receives survivor embeddings that are neither tokens nor the distribution it trained on. The uniformity regularizer causes it to default to ~uniform selection, meaning ICE is effectively doing nothing useful at level 1.
+**Risk:** ICE is trained on contextualized representations (the full backbone's `last_hidden_state`) to predict decoder cross-entropy. During compression training, ICE receives raw token embeddings (`get_input_embeddings()` lookup) at level 0, and auto-reproduced embeddings (mapped back toward input space via the `auto_repro_head`) at level 1. Neither matches the training distribution. At level 0 the mismatch is between uncontextualized embedding lookups and contextualized transformer outputs. At level 1 the inputs are compressed survivors mapped through a learned linear head, further from what ICE was trained on.
 
-**Mitigation:** If level 1 selection quality matters, options include: (a) periodic recalibration on actual BgKIT survivor distributions, (b) attention-based importance from the level 1 forward pass itself, (c) simply accept uniform/random selection at level 1. The honest answer may be that ICE's value is concentrated at level 0 (budget allocation across files + within-file selection), and level 1 selection is uniform. This is fine — acknowledge it and move on.
+**Mitigation:** Options include: (a) run the full backbone forward pass before ICE scoring (correct input space, but 2× compute at L0 since the encoder must also process the sequence for compression), (b) restructure the encoder to score after the compressor backbone but before the projection block (backbone always processes the full sequence; compression happens in the projection block), (c) retrain ICE on raw embedding lookups to match the compression training input, (d) accept that ICE's scores are approximate and rely on the threshold + ratio clamping to produce reasonable survivor counts regardless of score calibration. The current implementation uses approach (d) — ICE scores may not be well-calibrated, but the min/max compression ratio clamping ensures reasonable survivor counts. If compression quality is poor, approach (b) or (c) should be investigated.
 
 ### 5.4 Level 1 Sequence Length
 
@@ -287,8 +287,8 @@ Beyond the mandatory survivors-present vs. zeroed ablation:
 
 - (a) Compression ratio sweep — performance vs. survivor budget.
 - (b) Level 0 only vs. level 0 + level 1 — does cross-file interaction add value?
-- (c) ICE-biased vs. random vs. uniform survivor selection.
-- (d) ICE-weighted vs. uniform budget allocation across files.
+- (c) ICE threshold-based vs. random vs. uniform survivor selection.
+- (d) Per-file independent thresholding vs. cross-file proportional budget allocation.
 - (e) Shared weights vs. per-level LoRA adapters.
 - (f) Decoder adaptation: full fine-tuning vs. high-rank LoRA (if both trained in Phase 1).
 - (g) Individual knowledge source ablation (when additional sources are added).

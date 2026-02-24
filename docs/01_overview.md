@@ -26,7 +26,7 @@ BgKIT is a single transformer network (~600M parameters) derived from a pre-trai
 
 **Reconstruction decoder:** A separate small causal LM (Qwen3-0.6B) is co-trained to reconstruct content from BgKIT's compressed representations, providing the primary training signal for compression quality.
 
-**Survivor budget allocation:** An Information Content Estimator (ICE), a lightweight convolutional network, estimates per-position information density. The total survivor budget is distributed across files proportionally to estimated information content. Very small files can be mainlined directly into Level 1.
+**Survivor selection:** An Information Content Estimator (ICE), a lightweight 1D convolutional network (~0.7M parameters), estimates per-position information density. During compression training, ICE runs live (frozen, in inference mode) on input embeddings at each compression level. Positions with ICE score above a curriculum-ramped threshold survive, clamped to per-file [min, max] compression ratio bounds. This produces variable survivor counts that naturally adapt to information density — high-entropy files retain more positions, low-entropy files fewer — without explicit cross-file budget allocation. Very small files can be mainlined directly into Level 1.
 
 ## Injection into the Target LLM
 
