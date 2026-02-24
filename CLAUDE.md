@@ -17,12 +17,17 @@ The container runs as the host user (uid 1000 by default) so files written to bi
 # Build deps image (only needed when pyproject.toml changes)
 make docker-build-deps
 
-# Run training
+# Run training (interactive — tails logs, Ctrl-C to detach)
 make train-ice
 
+# Run training (non-blocking — starts container and returns)
+scripts/run-train.sh --no-follow train-ice
+
 # Or via compose directly
-docker compose -f docker/docker-compose.yaml up train-ice
+docker compose -f docker/docker-compose.yaml up -d train-ice
 ```
+
+**IMPORTANT for AI agents:** `make train-*` and `scripts/run-train.sh` without `--no-follow` will tail logs forever and block. Always use `scripts/run-train.sh --no-follow <service>` when launching training from a non-interactive context. Check status afterwards with `docker compose -f docker/docker-compose.yaml ps` and `docker compose -f docker/docker-compose.yaml logs --tail 30 <service>`.
 
 **Why:** The host venv's PyTorch (pip cu130 wheels) lacks the full CUDA toolkit needed for JIT kernel compilation, TransformerEngine, and other GPU-accelerated libraries. The NGC container has all of this pre-validated.
 
@@ -50,6 +55,7 @@ Full local dev (with torch + GPU packages): `make install-gpu` or `uv sync --gro
 | Build deps image | `make docker-build-deps` |
 | Build data container | `make docker-build-data` |
 | Train (in container) | `make train-ice` or `docker compose -f docker/docker-compose.yaml up train-ice` |
+| Train (no log tail) | `scripts/run-train.sh --no-follow <service>` |
 
 ## Dependency Management
 
