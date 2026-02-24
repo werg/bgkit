@@ -10,6 +10,8 @@ Any work involving PyTorch, CUDA, or GPU computation **must** be run inside the 
 
 The Docker image contains only third-party dependencies. bgkit source is bind-mounted at runtime via docker-compose. The entrypoint verifies mounts exist before starting. Do not use bare `docker run` without mounting src/, configs/, and scripts/.
 
+The container runs as the host user (uid 1000 by default) so files written to bind mounts (checkpoints, HF cache) are owned by `werg`, not root. Override with `DOCKER_UID`/`DOCKER_GID` env vars if needed.
+
 **Build and run the training container:**
 ```bash
 # Build deps image (only needed when pyproject.toml changes)

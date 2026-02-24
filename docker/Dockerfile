@@ -31,6 +31,10 @@ ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/workspace/hf_cache \
     CHECKPOINT_DIR=/workspace/checkpoints
 
+# Ensure writable dirs for non-root user (container runs as host uid via compose)
+RUN mkdir -p /workspace/bgkit /workspace/.cache /workspace/.triton && \
+    chmod 777 /workspace /workspace/bgkit /workspace/.cache /workspace/.triton
+
 # Startup script verifies mounts exist before running anything
 COPY --chmod=755 docker/entrypoint.sh /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]

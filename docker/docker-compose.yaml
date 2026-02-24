@@ -2,6 +2,9 @@ x-gpu-common: &gpu-common
   build:
     context: ..
     dockerfile: docker/Dockerfile
+  # Run as host user so files written to bind mounts (checkpoints, HF cache)
+  # are owned by the host user, not root.
+  user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
   deploy:
     resources:
       reservations:
@@ -9,6 +12,8 @@ x-gpu-common: &gpu-common
           - driver: nvidia
             count: all
             capabilities: [gpu]
+  environment:
+    - HOME=/workspace
   volumes:
     - ${DATA_DIR:-../data}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
@@ -19,7 +24,7 @@ x-gpu-common: &gpu-common
     - ../configs:/workspace/bgkit/configs:ro
     - ../scripts:/workspace/bgkit/scripts:ro
     # Wandb authenticates via netrc (machine api.wandb.ai).
-    - ~/.netrc:/root/.netrc:ro
+    - ~/.netrc:/workspace/.netrc:ro
 
 services:
   train:
