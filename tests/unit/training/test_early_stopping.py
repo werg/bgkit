@@ -13,7 +13,6 @@ from omegaconf import OmegaConf
 
 from bgkit.training.base_trainer import BaseTrainer
 
-
 # ---------------------------------------------------------------------------
 # Concrete test trainer
 # ---------------------------------------------------------------------------
@@ -44,7 +43,7 @@ class _FakeTrainer(BaseTrainer):
 
         self.train_dataloader = _InfiniteLoader()
 
-    def train_step(self, batch):
+    def _forward_backward(self, batch):
         self._train_steps += 1
         return {"loss": 0.5}
 

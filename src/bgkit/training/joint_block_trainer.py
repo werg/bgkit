@@ -25,7 +25,6 @@ from bgkit.models.components.auto_reproduction import auto_reproduction_loss
 from bgkit.models.encoder import BgKITEncoder, _resolve_layers
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
-from bgkit.training.gradient_utils import clip_grad_norm
 from bgkit.utils.model_utils import count_parameters, slerp_merge
 
 logger = structlog.get_logger()
@@ -258,7 +257,10 @@ class JointBlockTrainer(BaseTrainer):
             loss=loss,
         )
 
-    def train_step(self, batch) -> dict[str, float]:
+    def trainable_parameters(self) -> list:
+        return [p for p in self.encoder.parameters() if p.requires_grad]
+
+    def _forward_backward(self, batch) -> dict[str, float]:
         self.encoder.train()
 
         token_ids = batch["token_ids"].to(self.device)
@@ -272,13 +274,8 @@ class JointBlockTrainer(BaseTrainer):
         with self._amp_context():
             fwd = self._forward_both(input_embeddings, attention_mask, target_repro, target_proj)
 
-        # Backward
-        self.optimizer.zero_grad()
-        fwd.loss.backward()
-        grad_norm = clip_grad_norm(
-            [p for p in self.encoder.parameters() if p.requires_grad]
-        )
-        self.optimizer.step()
+        # Scaled backward (for gradient accumulation)
+        (fwd.loss / self._accum_steps).backward()
 
         # Cosine similarity metrics
         with torch.no_grad():
@@ -297,7 +294,6 @@ class JointBlockTrainer(BaseTrainer):
             "loss_proj": fwd.loss_proj.item(),
             "cosine_sim_repro": cos_repro_avg.item(),
             "cosine_sim_proj": cos_proj_avg.item(),
-            "grad_norm": grad_norm,
         }
 
     @torch.no_grad()

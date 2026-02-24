@@ -30,7 +30,7 @@ from bgkit.data.threshold_calibrator import ThresholdCalibrator
 from bgkit.eval.metrics.embedding_health import embedding_drift_metrics
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
-from bgkit.training.base_trainer import BaseTrainer
+from bgkit.training.base_trainer import BaseTrainer, _average_metrics
 from bgkit.training.checkpoint_manager import CheckpointManager
 from bgkit.training.checkpoint_registry import CheckpointRegistry, resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
@@ -888,8 +888,22 @@ class CompressionTrainer(BaseTrainer):
     # Train step
     # ------------------------------------------------------------------
 
+    def trainable_parameters(self) -> list:
+        return self._trainable_params()
+
     def train_step(self, batch: dict) -> dict[str, float]:
-        """Execute a single training step."""
+        """Override base train_step to add drift check after optimizer step."""
+        self._last_survivors = None
+        metrics = super().train_step(batch)
+        if self._last_survivors is not None:
+            self._check_decoder_drift(self._last_survivors)
+        return metrics
+
+    def _forward_backward(self, batch: dict) -> dict[str, float]:
+        """Forward pass + scaled backward. No optimizer ops.
+
+        Stashes survivors on self._last_survivors for post-step drift check.
+        """
         self.encoder.train()
         self.decoder.train()
 
@@ -898,7 +912,7 @@ class CompressionTrainer(BaseTrainer):
 
         # Handle mixed batches
         if batch.get("mixed", False):
-            return self._train_step_mixed(batch)
+            return self._forward_backward_mixed(batch)
 
         sample_type = batch["sample_type"]
 
@@ -920,17 +934,14 @@ class CompressionTrainer(BaseTrainer):
         # Compute loss
         loss = self._compute_loss(logits, batch)
 
-        # Flush calibrator scores (once per train_step)
+        # Flush calibrator scores (once per micro-batch)
         self._flush_calibrator_scores()
 
-        # Backward
-        self.optimizer.zero_grad()
-        loss.backward()
-        grad_norm = clip_grad_norm(self._trainable_params())
-        self.optimizer.step()
+        # Scaled backward (for gradient accumulation)
+        (loss / self._accum_steps).backward()
 
-        # Drift check
-        self._check_decoder_drift(survivors)
+        # Stash survivors for post-step drift check
+        self._last_survivors = survivors.detach()
 
         target_ratio = self._current_target_ratio()
         n_survivors = int(survivor_mask.sum().item())
@@ -941,7 +952,6 @@ class CompressionTrainer(BaseTrainer):
         actual_ratio = n_survivors / max(n_valid, 1)
         metrics = {
             "loss": loss.item(),
-            "grad_norm": grad_norm,
             "sample_type": sample_type,
             "target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
@@ -952,8 +962,8 @@ class CompressionTrainer(BaseTrainer):
             metrics["calibrated_threshold_l1"] = self._l1_calibrator.get_threshold(target_ratio)
         return metrics
 
-    def _train_step_mixed(self, batch: dict) -> dict[str, float]:
-        """Handle mixed batch containing both file and repo samples."""
+    def _forward_backward_mixed(self, batch: dict) -> dict[str, float]:
+        """Handle mixed batch: forward + scaled backward, no optimizer ops."""
         file_batch = batch["file_batch"]
         repo_batch = batch["repo_batch"]
 
@@ -982,13 +992,14 @@ class CompressionTrainer(BaseTrainer):
         # Average losses
         loss = (file_loss + repo_loss) / 2.0
 
-        # Flush calibrator scores (once per train_step)
+        # Flush calibrator scores (once per micro-batch)
         self._flush_calibrator_scores()
 
-        self.optimizer.zero_grad()
-        loss.backward()
-        grad_norm = clip_grad_norm(self._trainable_params())
-        self.optimizer.step()
+        # Scaled backward (for gradient accumulation)
+        (loss / self._accum_steps).backward()
+
+        # Stash survivors for post-step drift check (use repo portion)
+        self._last_survivors = repo_survivors.detach()
 
         target_ratio = self._current_target_ratio()
         total_survivors = int(file_mask.sum().item()) + int(repo_mask.sum().item())
@@ -997,7 +1008,6 @@ class CompressionTrainer(BaseTrainer):
         actual_ratio = total_survivors / max(n_valid_file + n_valid_repo, 1)
         metrics = {
             "loss": loss.item(),
-            "grad_norm": grad_norm,
             "sample_type": "mixed",
             "target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
@@ -1122,11 +1132,18 @@ class CompressionTrainer(BaseTrainer):
 
         dataloader_iter = iter(self.train_dataloader)
 
+        accum_steps = self._validate_accum_steps(
+            tcfg.get("gradient_accumulation_steps", 1)
+        )
+        self._accum_steps = accum_steps
+        self._last_survivors = None
+
         logger.info(
             "training_start",
             max_steps=max_steps,
             lr=base_lr,
             start_step=self.global_step,
+            gradient_accumulation_steps=accum_steps,
         )
 
         # Live config
@@ -1173,17 +1190,29 @@ class CompressionTrainer(BaseTrainer):
                             step, max_steps, warmup_steps, group_base,
                         )
 
-                    # Get batch
-                    try:
-                        batch = next(dataloader_iter)
-                    except StopIteration:
-                        self.epoch += 1
-                        self._sync_epoch(self.epoch)
-                        dataloader_iter = iter(self.train_dataloader)
-                        batch = next(dataloader_iter)
+                    # Accumulation loop
+                    self.optimizer.zero_grad()
+                    accum_metrics = []
+                    for _micro in range(accum_steps):
+                        try:
+                            batch = next(dataloader_iter)
+                        except StopIteration:
+                            self.epoch += 1
+                            self._sync_epoch(self.epoch)
+                            dataloader_iter = iter(self.train_dataloader)
+                            batch = next(dataloader_iter)
+                        micro_metrics = self._forward_backward(batch)
+                        accum_metrics.append(micro_metrics)
 
-                    # Train step
-                    metrics = self.train_step(batch)
+                    grad_norm = clip_grad_norm(self.trainable_parameters())
+                    self.optimizer.step()
+
+                    # Drift check AFTER optimizer step (can rebuild optimizer)
+                    if self._last_survivors is not None:
+                        self._check_decoder_drift(self._last_survivors)
+
+                    metrics = _average_metrics(accum_metrics)
+                    metrics["grad_norm"] = grad_norm
                     metrics["lr"] = lr
                     if len(self.optimizer.param_groups) > 1:
                         metrics["lr_min"] = min(

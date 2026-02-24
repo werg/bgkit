@@ -16,7 +16,6 @@ from bgkit.data.datasets.mmap_ice_dataset import MmapICEDataset
 from bgkit.data.samplers import TokenBudgetBatchSampler
 from bgkit.models.ice import ICE
 from bgkit.training.base_trainer import BaseTrainer
-from bgkit.training.gradient_utils import clip_grad_norm
 
 logger = structlog.get_logger()
 
@@ -189,7 +188,10 @@ class ICETrainer(BaseTrainer):
             ce_mask[:, :min_len],
         )
 
-    def train_step(self, batch) -> dict[str, float]:
+    def trainable_parameters(self) -> list:
+        return list(self.model.parameters())
+
+    def _forward_backward(self, batch) -> dict[str, float]:
         self.model.train()
 
         token_ids = batch["token_ids"].to(self.device)
@@ -246,19 +248,17 @@ class ICETrainer(BaseTrainer):
                 uniform_output_loss = rand_pred.new_tensor(0.0)
             loss = loss + self.uniform_reg_weight * uniform_output_loss
             uniform_output_loss_val = uniform_output_loss.item()
-            rand_pred_var_val = rand_valid.var(correction=0).item() if rand_valid.numel() > 1 else 0.0
+            rand_pred_var_val = (
+                rand_valid.var(correction=0).item() if rand_valid.numel() > 1 else 0.0
+            )
 
-        # Backward
-        self.optimizer.zero_grad()
-        loss.backward()
-        grad_norm = clip_grad_norm(self.model.parameters())
-        self.optimizer.step()
+        # Scaled backward (for gradient accumulation)
+        (loss / self._accum_steps).backward()
 
         return {
             "loss": loss.item(),
             "mse_loss": mse_loss.item(),
             "pred_variance": pred_var,
-            "grad_norm": grad_norm,
             "uniform_output_loss": uniform_output_loss_val,
             "rand_pred_variance": rand_pred_var_val,
         }

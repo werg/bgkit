@@ -34,7 +34,7 @@ from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
-from bgkit.training.gradient_utils import clip_grad_norm, enable_gradient_checkpointing
+from bgkit.training.gradient_utils import enable_gradient_checkpointing
 from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
 from bgkit.training.scheduling import cosine_with_warmup
 
@@ -394,7 +394,15 @@ class DecoderInitTrainer(BaseTrainer):
             decoder_param_groups=len(decoder_groups),
         )
 
-    def train_step(self, batch) -> dict[str, float]:
+    def trainable_parameters(self) -> list:
+        params = [p for p in self.decoder.parameters() if p.requires_grad]
+        if self._train_projection:
+            params += [
+                p for p in self.encoder.projection_block.parameters() if p.requires_grad
+            ]
+        return params
+
+    def _forward_backward(self, batch) -> dict[str, float]:
         self.decoder.train()
         if self._train_projection:
             self.encoder.projection_block.train()
@@ -425,21 +433,11 @@ class DecoderInitTrainer(BaseTrainer):
                 logits, token_ids, attention_mask, loss_mask=loss_mask,
             )
 
-        # Backward
-        self.optimizer.zero_grad()
-        loss.backward()
-
-        trainable_params = [p for p in self.decoder.parameters() if p.requires_grad]
-        if self._train_projection:
-            trainable_params += [
-                p for p in self.encoder.projection_block.parameters() if p.requires_grad
-            ]
-        grad_norm = clip_grad_norm(trainable_params)
-        self.optimizer.step()
+        # Scaled backward (for gradient accumulation)
+        (loss / self._accum_steps).backward()
 
         return {
             "loss": loss.item(),
-            "grad_norm": grad_norm,
         }
 
     def _compute_survivors(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:

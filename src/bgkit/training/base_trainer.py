@@ -22,11 +22,31 @@ from bgkit.training.checkpoint_registry import (
     normalize_checkpoint_name,
 )
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
+from bgkit.training.gradient_utils import clip_grad_norm
 from bgkit.training.interruption import GracefulInterruptor
 from bgkit.training.live_config import LiveConfig
 from bgkit.training.scheduling import cosine_with_warmup
 
 logger = structlog.get_logger()
+
+
+def _average_metrics(accum_metrics: list[dict[str, float]]) -> dict[str, float]:
+    """Average metrics across accumulation micro-batches.
+
+    Numeric values are averaged; non-numeric values take the last value.
+    """
+    if len(accum_metrics) == 1:
+        return accum_metrics[0]
+
+    result: dict[str, float] = {}
+    keys = accum_metrics[0].keys()
+    for key in keys:
+        values = [m[key] for m in accum_metrics if key in m]
+        if values and isinstance(values[0], (int, float)):
+            result[key] = sum(values) / len(values)
+        else:
+            result[key] = values[-1] if values else 0.0
+    return result
 
 
 class BaseTrainer(ABC):
@@ -46,18 +66,50 @@ class BaseTrainer(ABC):
         self._schedule_params: dict[str, float] | None = None
         self._training_state: dict | None = None
         self._input_sources: dict[str, str] | None = None
+        self._accum_steps = 1
 
     @abstractmethod
     def setup(self) -> None:
         """Create model, optimizer, dataloader. Called before train()."""
 
     @abstractmethod
-    def train_step(self, batch) -> dict[str, float]:
-        """Execute a single training step. Returns dict of metrics."""
+    def _forward_backward(self, batch) -> dict[str, float]:
+        """Forward pass + scaled backward. No optimizer ops.
+
+        Subclasses implement this. Must:
+        - Compute loss
+        - Call (loss / self._accum_steps).backward()
+        - Return dict with unscaled metrics (e.g. {"loss": loss.item()})
+        - NOT call optimizer.zero_grad(), optimizer.step(), or clip_grad_norm
+        """
 
     @abstractmethod
     def evaluate(self) -> dict[str, float]:
         """Run evaluation. Returns dict of metrics."""
+
+    def trainable_parameters(self) -> list:
+        """Parameters for gradient clipping. Override in subclasses."""
+        return [p for p in self.model.parameters() if p.requires_grad]
+
+    @staticmethod
+    def _validate_accum_steps(value) -> int:
+        """Validate gradient_accumulation_steps config value."""
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"gradient_accumulation_steps must be int >= 1, got {value}")
+        return value
+
+    def train_step(self, batch) -> dict[str, float]:
+        """Complete training step: zero_grad + forward_backward + clip + step.
+
+        Public API for tests and standalone use. The train() loop calls
+        _forward_backward() directly for accumulation support.
+        """
+        self.optimizer.zero_grad()
+        metrics = self._forward_backward(batch)
+        grad_norm = clip_grad_norm(self.trainable_parameters())
+        self.optimizer.step()
+        metrics["grad_norm"] = grad_norm
+        return metrics
 
     def save_checkpoint(
         self, checkpoint_dir: Path, metrics: dict[str, float] | None = None
@@ -293,12 +345,18 @@ class BaseTrainer(ABC):
 
         dataloader_iter = iter(self.train_dataloader)
 
+        accum_steps = self._validate_accum_steps(
+            tcfg.get("gradient_accumulation_steps", 1)
+        )
+        self._accum_steps = accum_steps
+
         logger.info(
             "training_start",
             max_steps=max_steps,
             lr=base_lr,
             start_step=self.global_step,
             early_stopping=es_enabled,
+            gradient_accumulation_steps=accum_steps,
         )
 
         # Live config (file-based HP control)
@@ -340,17 +398,25 @@ class BaseTrainer(ABC):
                             step, max_steps, warmup_steps, group_base
                         )
 
-                    # Get batch, cycling dataloader
-                    try:
-                        batch = next(dataloader_iter)
-                    except StopIteration:
-                        self.epoch += 1
-                        self._sync_epoch(self.epoch)
-                        dataloader_iter = iter(self.train_dataloader)
-                        batch = next(dataloader_iter)
+                    # Accumulation loop
+                    self.optimizer.zero_grad()
+                    accum_metrics = []
+                    for _micro in range(accum_steps):
+                        try:
+                            batch = next(dataloader_iter)
+                        except StopIteration:
+                            self.epoch += 1
+                            self._sync_epoch(self.epoch)
+                            dataloader_iter = iter(self.train_dataloader)
+                            batch = next(dataloader_iter)
+                        micro_metrics = self._forward_backward(batch)
+                        accum_metrics.append(micro_metrics)
 
-                    # Train step
-                    metrics = self.train_step(batch)
+                    grad_norm = clip_grad_norm(self.trainable_parameters())
+                    self.optimizer.step()
+
+                    metrics = _average_metrics(accum_metrics)
+                    metrics["grad_norm"] = grad_norm
                     metrics["lr"] = lr
                     if len(self.optimizer.param_groups) > 1:
                         metrics["lr_min"] = min(

@@ -307,7 +307,7 @@ class TestResume:
                     ])
                 ]
 
-            def train_step(self, batch):
+            def _forward_backward(self, batch):
                 trained_steps.append(self.global_step)
                 return {"loss": 0.1}
 
@@ -381,7 +381,7 @@ class TestResume:
             def setup(self):
                 pass
 
-            def train_step(self, batch):
+            def _forward_backward(self, batch):
                 return {}
 
             def evaluate(self):

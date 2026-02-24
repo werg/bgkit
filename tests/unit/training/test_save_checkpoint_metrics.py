@@ -32,7 +32,7 @@ class TestBaseTrainerSaveMetrics:
 
         class DummyTrainer(BaseTrainer):
             def setup(self): pass
-            def train_step(self, batch): return {}
+            def _forward_backward(self, batch): return {}
             def evaluate(self): return {}
 
         trainer = DummyTrainer(_make_cfg())
@@ -50,7 +50,7 @@ class TestBaseTrainerSaveMetrics:
 
         class DummyTrainer(BaseTrainer):
             def setup(self): pass
-            def train_step(self, batch): return {}
+            def _forward_backward(self, batch): return {}
             def evaluate(self): return {}
 
         trainer = DummyTrainer(_make_cfg())

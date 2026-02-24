@@ -12,6 +12,8 @@ lr_scale_bottom: 0.1
 # Chat template adds ~257 tokens of overhead per sample.
 # 128 GB unified memory fits ~16K tokens with Qwen3-0.6B decoder (152K vocab).
 max_batch_tokens: 16384
+gradient_accumulation_steps: 4    # 16K × 4 = 64K effective tokens per step
+max_eval_samples: 2000
 eval_every: 200
 save_every: 1000
 # Train projection block alongside decoder (bridge between compressor and decoder)
