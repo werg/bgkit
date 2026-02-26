@@ -26,6 +26,28 @@ x-gpu-common: &gpu-common
     # Wandb authenticates via netrc (machine api.wandb.ai).
     - ~/.netrc:/workspace/.netrc:ro
 
+x-llama-common: &llama-common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.llama
+  user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  restart: unless-stopped
+  volumes:
+    - ${MODELS_DIR:-../data/models}:/models:ro
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 30
+    start_period: 120s
+
 services:
   train:
     <<: *gpu-common
@@ -58,3 +80,15 @@ services:
     volumes:
       - ${DATA_DIR:-../data}:/workspace/data
     command: ["scripts/process_repos.py"]
+
+  llama:
+    <<: *llama-common
+    ports:
+      - "${LLAMA_PORT:-8080}:8080"
+    command: >-
+      --model /models/${LLAMA_MODEL:-Qwen3-0.6B-Q8_0.gguf}
+      --host 0.0.0.0 --port 8080
+      --ctx-size ${LLAMA_CTX:-262144}
+      --n-gpu-layers 999
+      --parallel ${LLAMA_PARALLEL:-32}
+      --flash-attn on --no-mmap --jinja

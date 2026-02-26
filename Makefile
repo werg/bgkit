@@ -1,4 +1,4 @@
-.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits convert-structural convert-descriptions convert-commits generate-variants
+.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits convert-structural convert-descriptions convert-commits generate-variants download-models llama-server llama-server-stop llama-server-logs llama-bench
 
 install:
 	uv sync --extra dev --extra data
@@ -62,6 +62,27 @@ docker-build-deps:
 docker-build-data:
 	docker build -f docker/Dockerfile.data -t bgkit-data:latest .
 
+docker-build-llama:
+	docker compose -f docker/docker-compose.yaml build llama
+
+download-models:
+	scripts/download-model.sh Qwen/Qwen3-0.6B-GGUF Qwen3-0.6B-Q8_0.gguf
+
+llama-server:
+	docker compose -f docker/docker-compose.yaml up -d llama
+	@echo "Waiting for llama-server health..."
+	@timeout 120 bash -c 'until curl -sf http://localhost:$${LLAMA_PORT:-8080}/health; do sleep 2; done' && echo " OK" || { echo " TIMEOUT"; exit 1; }
+
+llama-server-stop:
+	docker compose -f docker/docker-compose.yaml stop llama
+	docker compose -f docker/docker-compose.yaml rm -f llama
+
+llama-server-logs:
+	docker compose -f docker/docker-compose.yaml logs -f llama
+
+llama-bench:
+	scripts/llama-bench.sh
+
 ckpt-backfill:
 	.venv/bin/bgkit-ckpt backfill
 
@@ -73,7 +94,7 @@ extract-structural:
 generate-descriptions:
 	.venv/bin/python scripts/generate_descriptions.py \
 		--repos-dir data/repos/ --output-dir data/descriptions/ \
-		--structural-dir data/structural/ --backend local --workers 4
+		--structural-dir data/structural/ --backend local
 
 extract-commits:
 	.venv/bin/python scripts/process_commit_repro.py $(ARGS)

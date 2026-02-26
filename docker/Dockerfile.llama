@@ -1,0 +1,41 @@
+# Multi-stage build for llama-server optimized for Blackwell sm_121.
+# Builder: NGC CUDA devel (full toolkit for compilation)
+FROM nvcr.io/nvidia/cuda:13.1.1-devel-ubuntu24.04 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build from latest main; pin to a specific ref only if a regression appears
+RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp /build/llama.cpp
+
+WORKDIR /build/llama.cpp
+# No GPU present during build — link against CUDA driver stubs.
+# The stubs dir has libcuda.so but the shared lib needs libcuda.so.1;
+# create the versioned symlink so transitive deps resolve.
+ENV LIBRARY_PATH=/usr/local/cuda/targets/sbsa-linux/lib/stubs${LIBRARY_PATH:+:${LIBRARY_PATH}}
+RUN ln -sf /usr/local/cuda/targets/sbsa-linux/lib/stubs/libcuda.so \
+           /usr/local/cuda/targets/sbsa-linux/lib/stubs/libcuda.so.1 \
+    && cmake -B build \
+        -DGGML_CUDA=ON \
+        -DGGML_CUDA_F16=ON \
+        -DGGML_CUDA_USE_FLASH_ATTENTION=ON \
+        -DGGML_CUDA_FA_ALL_QUANTS=ON \
+        -DGGML_CUDA_FORCE_CUBLAS=ON \
+        -DCMAKE_CUDA_ARCHITECTURES=121 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link=/usr/local/cuda/targets/sbsa-linux/lib/stubs" \
+    && cmake --build build -j$(nproc) --target llama-server
+
+# Runtime: NGC CUDA runtime (minimal, ~2 GB)
+FROM nvcr.io/nvidia/cuda:13.1.1-runtime-ubuntu24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/llama.cpp/build/bin/llama-server /usr/local/bin/
+# Copy companion shared libraries built alongside llama-server.
+COPY --from=builder /build/llama.cpp/build/bin/lib*.so* /usr/local/lib/
+RUN ldconfig
+
+ENTRYPOINT ["llama-server"]

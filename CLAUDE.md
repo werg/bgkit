@@ -92,6 +92,25 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 | List checkpoints | `.venv/bin/bgkit-ckpt list --phase ice` |
 | Best checkpoint | `.venv/bin/bgkit-ckpt best --phase ice --metric eval/mse` |
 
+## Inference Server (llama-server)
+
+Local LLM inference via llama-server (llama.cpp) in Docker, optimized for Blackwell sm_121. Default: Qwen3-0.6B Q8_0, 32 parallel slots, 256K total ctx (8K per slot) on :8080.
+
+| Task | Command |
+|---|---|
+| Build llama image | `make docker-build-llama` |
+| Download GGUF models | `make download-models` |
+| Start server | `make llama-server` |
+| Stop server | `make llama-server-stop` |
+| Tail logs | `make llama-server-logs` |
+| Benchmark/tune | `make llama-bench` |
+
+Override model/params via env: `LLAMA_MODEL`, `LLAMA_PARALLEL`, `LLAMA_CTX`, `LLAMA_PORT`.
+
+**Python client** (`bgkit.inference.LlamaClient`): async/sync HTTP client with concurrency control, retry on 503/429, warmup. Used by `generate_descriptions.py` (`--backend local`) and available for any script needing local LLM inference.
+
+Models are stored in `data/models/` (git-ignored via `/data/` rule). Download with `scripts/download-model.sh <hf-repo> <filename>`.
+
 ## Code Quality
 
 - Ruff for linting and formatting (line-length 100)

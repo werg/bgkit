@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Batch description generation for repo files, modules, and repos.
 
-Dual-backend description generation using Claude CLI (haiku) and/or a local
-Qwen model. Produces per-repo JSONL files with file-level, module-level,
-and repo-level descriptions.
+Dual-backend description generation using Claude CLI (haiku) and/or local
+llama-server instances. Produces per-repo JSONL files with file-level,
+module-level, and repo-level descriptions.
 
 Usage:
     python scripts/generate_descriptions.py \
         --repos-dir data/repos/ \
         --output-dir data/descriptions/ \
         --backend mixed \
-        --workers 4
+        --workers 12
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from threading import Lock, Semaphore
 import structlog
 
 from bgkit.data.repo_processing import extract_repo_snapshot
+from bgkit.inference import InferenceConfig, LlamaClient
 from bgkit.utils.git_utils import is_git_repo
 
 logger = structlog.get_logger()
@@ -44,6 +45,9 @@ MAX_CONTENT_CHARS = 12000
 
 # Maximum number of file descriptions to include in module/repo prompts
 MAX_FILE_DESCS_IN_PROMPT = 30
+
+# Llama-server client (initialized by init_local_client)
+_llama_client: LlamaClient | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -101,62 +105,48 @@ def _backoff(attempt: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Local model backend
+# Local llama-server backend
 # ---------------------------------------------------------------------------
 
-_local_model = None
-_local_tokenizer = None
+def init_local_client(
+    url: str = "http://localhost:8080",
+    readiness_timeout: float = 120.0,
+) -> None:
+    """Initialize the llama-server client and verify readiness."""
+    global _llama_client
 
-
-def load_local_model(model_name: str) -> None:
-    """Load the local model and tokenizer into module-level globals."""
-    global _local_model, _local_tokenizer
-
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    logger.info("loading_local_model", model=model_name)
-    _local_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    _local_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    _local_model.eval()
-    logger.info("local_model_loaded", model=model_name)
+    _llama_client = LlamaClient(InferenceConfig(base_url=url, max_concurrent=32))
+    logger.info("waiting_for_llama_server", url=url)
+    if not _llama_client.wait_ready_sync(timeout=readiness_timeout):
+        print(
+            f"ERROR: llama-server at {url} not ready after {readiness_timeout}s. "
+            f"Start it with: make llama-server",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    _llama_client.warmup_sync()
+    logger.info("llama_server_ready", url=url)
 
 
 def call_local(prompt: str, max_new_tokens: int = 512) -> str | None:
-    """Generate a description using the local model."""
-    import torch
-
-    if _local_model is None or _local_tokenizer is None:
+    """Generate a description using the llama-server."""
+    if _llama_client is None:
         return None
+    return _llama_client.generate_sync(prompt, max_tokens=max_new_tokens)
 
-    try:
-        messages = [{"role": "user", "content": prompt}]
-        text = _local_tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inputs = _local_tokenizer(text, return_tensors="pt").to(_local_model.device)
 
-        with torch.no_grad():
-            outputs = _local_model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                temperature=1.0,
-            )
+def call_local_batch(
+    prompts: list[str], max_new_tokens: int = 512
+) -> list[str | None]:
+    """Generate descriptions for multiple prompts concurrently via llama-server.
 
-        # Decode only the generated part
-        generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
-        result = _local_tokenizer.decode(generated_ids, skip_special_tokens=True)
-        return result.strip() if result else None
+    Uses async batch internally — fills all server slots in parallel.
+    """
+    if _llama_client is None:
+        return [None] * len(prompts)
+    from bgkit.inference.client import _run_sync
 
-    except Exception as e:
-        logger.warning("local_model_error", error=str(e))
-        return None
+    return _run_sync(_llama_client.generate_batch(prompts, max_tokens=max_new_tokens))
 
 
 # ---------------------------------------------------------------------------
@@ -346,22 +336,46 @@ def process_single_repo(
         file_descriptions: list[dict] = []
 
         if scope in ("file", "all"):
-            for fr in snapshot.files:
-                prompt = build_file_prompt(fr.path, fr.content, fr.language)
-                desc, used_backend = generate_description(
-                    prompt, backend, backend_cycle
+            # Build all prompts first, then generate in batch for local backend
+            file_prompts = [
+                (fr, build_file_prompt(fr.path, fr.content, fr.language))
+                for fr in snapshot.files
+            ]
+
+            if backend == "local":
+                # Batch: all prompts sent concurrently, fills server slots in parallel
+                results = call_local_batch(
+                    [p for _, p in file_prompts]
                 )
-                if desc:
-                    rec = {
-                        "scope": "file",
-                        "file_path": fr.path,
-                        "commit_sha": commit_sha,
-                        "description": desc,
-                        "language": fr.language or "",
-                        "backend": used_backend,
-                    }
-                    records.append(rec)
-                    file_descriptions.append(rec)
+                for (fr, _prompt), desc in zip(file_prompts, results, strict=True):
+                    if desc:
+                        rec = {
+                            "scope": "file",
+                            "file_path": fr.path,
+                            "commit_sha": commit_sha,
+                            "description": desc,
+                            "language": fr.language or "",
+                            "backend": "local",
+                        }
+                        records.append(rec)
+                        file_descriptions.append(rec)
+            else:
+                # Sequential: haiku/mixed backends use per-request dispatch
+                for fr, prompt in file_prompts:
+                    desc, used_backend = generate_description(
+                        prompt, backend, backend_cycle
+                    )
+                    if desc:
+                        rec = {
+                            "scope": "file",
+                            "file_path": fr.path,
+                            "commit_sha": commit_sha,
+                            "description": desc,
+                            "language": fr.language or "",
+                            "backend": used_backend,
+                        }
+                        records.append(rec)
+                        file_descriptions.append(rec)
 
         # --- Module-level descriptions ---
         module_descriptions: list[dict] = []
@@ -468,7 +482,7 @@ def process_single_repo(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate file/module/repo descriptions using Claude and/or local model."
+        description="Generate file/module/repo descriptions using Claude and/or llama-server."
     )
     parser.add_argument(
         "--repos-dir", type=Path, default=Path("data/repos"),
@@ -483,8 +497,8 @@ def main() -> None:
         help="Description generation backend (default: mixed)",
     )
     parser.add_argument(
-        "--local-model", type=str, default="Qwen/Qwen3-Coder-0.6B",
-        help="Local model name for the 'local' or 'mixed' backend",
+        "--llama-url", type=str, default="http://localhost:8080",
+        help="URL for the llama-server",
     )
     parser.add_argument(
         "--structural-dir", type=Path, default=None,
@@ -499,8 +513,8 @@ def main() -> None:
         help="Process at most this many repos",
     )
     parser.add_argument(
-        "--workers", type=int, default=4,
-        help="Number of parallel workers (default: 4)",
+        "--workers", type=int, default=12,
+        help="Number of parallel workers (default: 12)",
     )
     args = parser.parse_args()
 
@@ -519,9 +533,9 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load local model if needed
+    # Initialize llama-server clients if needed
     if args.backend in ("local", "mixed"):
-        load_local_model(args.local_model)
+        init_local_client(url=args.llama_url)
 
     # Set up backend cycle for mixed mode
     backend_cycle: itertools.cycle | None = None
@@ -538,7 +552,7 @@ def main() -> None:
     total_module_descs = 0
     total_repo_descs = 0
 
-    # Use ThreadPoolExecutor since the work is I/O-bound (Claude calls, model inference)
+    # Use ThreadPoolExecutor since the work is I/O-bound (HTTP calls to llama-server)
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
             executor.submit(
