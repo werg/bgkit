@@ -105,7 +105,7 @@ get_gpu_memory() {
 }
 
 PORT="${LLAMA_PORT:-8080}"
-MODEL="${LLAMA_MODEL:-GLM-4.7-Flash-Q4_K_M.gguf}"
+MODEL="${LLAMA_MODEL:-LFM2-8B-A1B-Q4_K_M.gguf}"
 
 echo "Llama-server benchmark"
 echo "Results: $OUTPUT"

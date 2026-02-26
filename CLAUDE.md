@@ -94,7 +94,7 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 
 ## Inference Server (llama-server)
 
-Local LLM inference via llama-server (llama.cpp) in Docker, optimized for Blackwell sm_121. Default: GLM-4.7-Flash Q4_K_M (30B-A3B MoE, ~18.3 GB), 16 parallel slots, 128K total ctx (8K per slot) on :8080.
+Local LLM inference via llama-server (llama.cpp) in Docker, optimized for Blackwell sm_121. Default: LFM2-8B-A1B Q4_K_M (8B MoE, 1.5B active, ~4.7 GB), 8 parallel slots, 32K total ctx (4K per slot) on :8080.
 
 | Task | Command |
 |---|---|

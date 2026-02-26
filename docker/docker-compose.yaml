@@ -86,9 +86,9 @@ services:
     ports:
       - "${LLAMA_PORT:-8080}:8080"
     command: >-
-      --model /models/${LLAMA_MODEL:-GLM-4.7-Flash-Q4_K_M.gguf}
+      --model /models/${LLAMA_MODEL:-LFM2-8B-A1B-Q4_K_M.gguf}
       --host 0.0.0.0 --port 8080
-      --ctx-size ${LLAMA_CTX:-131072}
+      --ctx-size ${LLAMA_CTX:-32768}
       --n-gpu-layers 999
-      --parallel ${LLAMA_PARALLEL:-16}
+      --parallel ${LLAMA_PARALLEL:-8}
       --flash-attn on --no-mmap --jinja

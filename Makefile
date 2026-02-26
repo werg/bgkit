@@ -66,7 +66,7 @@ docker-build-llama:
 	docker compose -f docker/docker-compose.yaml build llama
 
 download-models:
-	scripts/download-model.sh unsloth/GLM-4.7-Flash-GGUF GLM-4.7-Flash-Q4_K_M.gguf
+	scripts/download-model.sh LiquidAI/LFM2-8B-A1B-GGUF LFM2-8B-A1B-Q4_K_M.gguf
 
 llama-server:
 	docker compose -f docker/docker-compose.yaml up -d llama
