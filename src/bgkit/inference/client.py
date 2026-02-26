@@ -102,9 +102,9 @@ class LlamaClient:
             "messages": messages,
             "max_tokens": max_tokens or self.config.max_new_tokens,
             "temperature": temperature if temperature is not None else self.config.temperature,
-            # Disable Qwen3 thinking mode — we want direct answers, not reasoning traces.
-            "chat_template_kwargs": {"enable_thinking": False},
         }
+        if self.config.disable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
 
         sem = await self._get_semaphore()
         client = await self._get_client()
@@ -143,7 +143,7 @@ class LlamaClient:
                 choices = data.get("choices", [])
                 if choices:
                     content = choices[0].get("message", {}).get("content", "")
-                    if content:
+                    if content and self.config.disable_thinking:
                         content = _THINK_RE.sub("", content).strip()
                     return content if content else None
                 return None

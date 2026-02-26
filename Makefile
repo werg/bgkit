@@ -66,7 +66,7 @@ docker-build-llama:
 	docker compose -f docker/docker-compose.yaml build llama
 
 download-models:
-	scripts/download-model.sh Qwen/Qwen3-0.6B-GGUF Qwen3-0.6B-Q8_0.gguf
+	scripts/download-model.sh unsloth/GLM-4.7-Flash-GGUF GLM-4.7-Flash-Q4_K_M.gguf
 
 llama-server:
 	docker compose -f docker/docker-compose.yaml up -d llama

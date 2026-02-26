@@ -158,7 +158,22 @@ def test_warmup_idempotent():
     assert call_count == 1
 
 
-def test_strips_thinking_blocks():
+def test_strips_thinking_blocks_when_enabled():
+    """When disable_thinking=True, <think> blocks are stripped from output."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            content = "<think>\nLet me analyze this...\n</think>\nThis file handles authentication."
+            return httpx.Response(200, json=_make_completion_response(content))
+        return httpx.Response(404)
+
+    client = _make_client(handler, disable_thinking=True)
+    result = client.generate_sync("describe this")
+    assert result == "This file handles authentication."
+    assert "<think>" not in result
+
+
+def test_preserves_thinking_blocks_by_default():
+    """When disable_thinking=False (default), <think> blocks are preserved."""
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/chat/completions":
             content = "<think>\nLet me analyze this...\n</think>\nThis file handles authentication."
@@ -167,8 +182,37 @@ def test_strips_thinking_blocks():
 
     client = _make_client(handler)
     result = client.generate_sync("describe this")
-    assert result == "This file handles authentication."
-    assert "<think>" not in result
+    assert "<think>" in result
+
+
+def test_disable_thinking_sends_chat_template_kwargs():
+    """When disable_thinking=True, chat_template_kwargs is included in the payload."""
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            received["body"] = json.loads(request.content)
+            return httpx.Response(200, json=_make_completion_response("ok"))
+        return httpx.Response(404)
+
+    client = _make_client(handler, disable_thinking=True)
+    _run_sync(client.generate("Hello"))
+    assert received["body"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_default_config_no_chat_template_kwargs():
+    """Default config (disable_thinking=False) does not include chat_template_kwargs."""
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            received["body"] = json.loads(request.content)
+            return httpx.Response(200, json=_make_completion_response("ok"))
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    _run_sync(client.generate("Hello"))
+    assert "chat_template_kwargs" not in received["body"]
 
 
 def test_generate_sync():

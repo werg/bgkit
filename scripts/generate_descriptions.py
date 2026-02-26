@@ -46,6 +46,9 @@ MAX_CONTENT_CHARS = 12000
 # Maximum number of file descriptions to include in module/repo prompts
 MAX_FILE_DESCS_IN_PROMPT = 30
 
+# Maximum characters for embedded descriptions in module/repo prompts
+MAX_DESC_CHARS_IN_PROMPT = 200
+
 # Llama-server client (initialized by init_local_client)
 _llama_client: LlamaClient | None = None
 
@@ -109,23 +112,38 @@ def _backoff(attempt: int) -> None:
 # ---------------------------------------------------------------------------
 
 def init_local_client(
-    url: str = "http://localhost:8080",
+    url: str | None = None,
     readiness_timeout: float = 120.0,
 ) -> None:
     """Initialize the llama-server client and verify readiness."""
     global _llama_client
 
-    _llama_client = LlamaClient(InferenceConfig(base_url=url, max_concurrent=32))
-    logger.info("waiting_for_llama_server", url=url)
+    try:
+        parallel = int(os.environ.get("LLAMA_PARALLEL", 16))
+    except ValueError:
+        raw = os.environ.get("LLAMA_PARALLEL")
+        logger.warning("invalid_LLAMA_PARALLEL, using default", value=raw)
+        parallel = 16
+    model = os.environ.get("LLAMA_MODEL", "")
+    disable_thinking = "qwen3" in model.lower()
+    base_url = url or os.environ.get("LLAMA_URL", "http://localhost:8080")
+
+    config = InferenceConfig(
+        base_url=base_url,
+        max_concurrent=parallel,
+        disable_thinking=disable_thinking,
+    )
+    _llama_client = LlamaClient(config)
+    logger.info("waiting_for_llama_server", url=base_url)
     if not _llama_client.wait_ready_sync(timeout=readiness_timeout):
         print(
-            f"ERROR: llama-server at {url} not ready after {readiness_timeout}s. "
+            f"ERROR: llama-server at {base_url} not ready after {readiness_timeout}s. "
             f"Start it with: make llama-server",
             file=sys.stderr,
         )
         sys.exit(1)
     _llama_client.warmup_sync()
-    logger.info("llama_server_ready", url=url)
+    logger.info("llama_server_ready", url=base_url)
 
 
 def call_local(prompt: str, max_new_tokens: int = 512) -> str | None:
@@ -187,19 +205,30 @@ def generate_description(
 
 def build_file_prompt(file_path: str, content: str, language: str | None) -> str:
     """Build a prompt asking for a file-level description."""
-    # Truncate content if too long
     if len(content) > MAX_CONTENT_CHARS:
         content = content[:MAX_CONTENT_CHARS] + "\n... (truncated)"
 
     lang_note = f" ({language})" if language else ""
     return (
-        f"Describe what the following source file does in 1-3 sentences. "
-        f"Be specific about its purpose, key functions, and how it fits into "
-        f"a larger project.\n\n"
+        f"Analyze the following source file and provide a structured description.\n\n"
         f"File: {file_path}{lang_note}\n\n"
         f"```\n{content}\n```\n\n"
-        f"Description:"
+        f"Provide:\n"
+        f"1. Purpose: What this file does (1-2 sentences)\n"
+        f"2. Key exports: Main classes, functions, or constants defined here, "
+        f"by name (N/A if none)\n"
+        f"3. Dependencies: What this file imports or depends on (N/A if none)\n"
+        f"4. Role: How this file fits into the larger project (1 sentence)\n\n"
+        f"Be specific — use actual names from the code. "
+        f"If a section does not apply, write N/A."
     )
+
+
+def _truncate_desc(desc: str) -> str:
+    """Truncate a description for embedding in module/repo prompts."""
+    if len(desc) <= MAX_DESC_CHARS_IN_PROMPT:
+        return desc
+    return desc[:MAX_DESC_CHARS_IN_PROMPT] + "..."
 
 
 def build_module_prompt(
@@ -209,18 +238,23 @@ def build_module_prompt(
 ) -> str:
     """Build a prompt asking for a module-level description."""
     parts = [
-        f"Describe what the directory/module '{module_path}' provides in 2-4 sentences. "
-        f"Focus on the module's purpose, its public API, and how its files work together.\n\n"
+        f"Analyze the module/directory '{module_path}' based on its files.\n\n"
         f"Files in this module:\n"
     ]
 
     for fd in file_descriptions[:MAX_FILE_DESCS_IN_PROMPT]:
-        parts.append(f"- {fd['file_path']}: {fd['description']}")
+        parts.append(f"- {fd['file_path']}: {_truncate_desc(fd['description'])}")
 
     if skeleton_text:
         parts.append(f"\nStructural skeleton:\n{skeleton_text}")
 
-    parts.append("\nModule description:")
+    parts.append(
+        "\nProvide:\n"
+        "1. Purpose: What this module provides (1-2 sentences)\n"
+        "2. Public API: Key classes/functions exported by this module\n"
+        "3. Internal structure: How the files depend on each other\n"
+        "4. External dependencies: What outside packages/modules this depends on"
+    )
     return "\n".join(parts)
 
 
@@ -231,23 +265,28 @@ def build_repo_prompt(
 ) -> str:
     """Build a prompt asking for a repo-level description."""
     parts = [
-        f"Describe what the project at '{repo_path}' does in 2-5 sentences. "
-        f"Focus on its purpose, main functionality, technology stack, and target users.\n\n"
+        f"Analyze the project at '{repo_path}' based on its modules and files.\n\n"
     ]
 
     if module_descriptions:
         parts.append("Modules:")
         for md in module_descriptions[:MAX_FILE_DESCS_IN_PROMPT]:
-            parts.append(f"- {md['module_path']}: {md['description']}")
+            parts.append(f"- {md['module_path']}: {_truncate_desc(md['description'])}")
         parts.append("")
 
     if file_descriptions:
         parts.append("Key files:")
         for fd in file_descriptions[:MAX_FILE_DESCS_IN_PROMPT]:
-            parts.append(f"- {fd['file_path']}: {fd['description']}")
+            parts.append(f"- {fd['file_path']}: {_truncate_desc(fd['description'])}")
         parts.append("")
 
-    parts.append("Project description:")
+    parts.append(
+        "Provide:\n"
+        "1. Purpose: What this project does and who it's for (1-2 sentences)\n"
+        "2. Architecture: Key patterns (monorepo, client-server, library, CLI, etc.)\n"
+        "3. Technology stack: Languages, frameworks, and key dependencies\n"
+        "4. Entry points: Main executables, servers, or library entry points"
+    )
     return "\n".join(parts)
 
 
@@ -497,8 +536,8 @@ def main() -> None:
         help="Description generation backend (default: mixed)",
     )
     parser.add_argument(
-        "--llama-url", type=str, default="http://localhost:8080",
-        help="URL for the llama-server",
+        "--llama-url", type=str, default=None,
+        help="URL for the llama-server (default: LLAMA_URL env or http://localhost:8080)",
     )
     parser.add_argument(
         "--structural-dir", type=Path, default=None,
