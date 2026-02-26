@@ -11,8 +11,8 @@ COMPOSE="docker compose -f docker/docker-compose.yaml"
 OUTPUT="${1:-data/llama-bench-results.csv}"
 
 # Representative prompts (similar to description pipeline workload)
-PROMPT_SHORT='Describe what the following source file does in 1-3 sentences. File: utils.py\n\ndef add(a, b):\n    return a + b'
-PROMPT_MEDIUM='Describe what the directory/module provides in 2-4 sentences. Focus on purpose and API.\n\nFiles:\n- auth.py: Handles user authentication via JWT tokens\n- middleware.py: Express middleware for route protection\n- utils.py: Password hashing and token generation helpers'
+PROMPT_SHORT='File: utils.py (Python)\n\ndef add(a, b):\n    return a + b\n\nWrite a single dense paragraph describing this file. Include: what it does, the names of key exports (classes, functions, constants), and what it imports or depends on. Omit any category that does not apply. No headers, bullet points, or labels — just a compact paragraph where every word carries information. Use actual identifier names from the code.'
+PROMPT_MEDIUM='Module: src/auth\n\nFiles:\n- auth.py: JWT-based user authentication exposing authenticate and create_token, depends on jsonwebtoken and ../models/User.\n- middleware.py: Express middleware exporting requireAuth and requireRole, wraps route handlers with token verification from auth.py.\n- utils.py: Password hashing helpers hash_password and verify_password using bcrypt.\n\nWrite a single dense paragraph describing this module. Include: what it provides, its public API (by name), how its files relate to each other, and what external packages it depends on. No headers or bullet points — just a compact paragraph.'
 
 mkdir -p "$(dirname "$OUTPUT")"
 
@@ -105,7 +105,7 @@ get_gpu_memory() {
 }
 
 PORT="${LLAMA_PORT:-8080}"
-MODEL="${LLAMA_MODEL:-Qwen3-0.6B-Q8_0.gguf}"
+MODEL="${LLAMA_MODEL:-GLM-4.7-Flash-Q4_K_M.gguf}"
 
 echo "Llama-server benchmark"
 echo "Results: $OUTPUT"

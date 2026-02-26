@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from generate_descriptions import (
     MAX_CONTENT_CHARS,
     MAX_DESC_CHARS_IN_PROMPT,
+    PROMPT_VERSION,
     _truncate_desc,
     build_file_prompt,
     build_module_prompt,
@@ -41,16 +42,19 @@ class TestBuildFilePrompt:
         assert "README\n" in prompt
         assert "()" not in prompt
 
-    def test_asks_for_exports_and_deps(self):
+    def test_asks_for_dense_paragraph(self):
         prompt = build_file_prompt("src/utils.py", "def foo(): pass", "Python")
-        assert "Key exports" in prompt
-        assert "Dependencies" in prompt
-        assert "Purpose" in prompt
-        assert "Role" in prompt
+        assert "dense paragraph" in prompt
+        assert "identifier names" in prompt
 
-    def test_asks_for_na_on_missing(self):
-        prompt = build_file_prompt("config.json", '{"key": "val"}', None)
-        assert "N/A" in prompt
+    def test_asks_for_exports_and_imports(self):
+        prompt = build_file_prompt("src/utils.py", "def foo(): pass", "Python")
+        assert "exports" in prompt
+        assert "imports" in prompt
+
+    def test_no_headers_or_bullets(self):
+        prompt = build_file_prompt("src/utils.py", "def foo(): pass", "Python")
+        assert "No headers" in prompt
 
 
 class TestBuildModulePrompt:
@@ -68,20 +72,18 @@ class TestBuildModulePrompt:
         file_descs = [{"file_path": "src/a.py", "description": "desc"}]
         prompt = build_module_prompt("src", file_descs, skeleton_text="class Foo:\n  pass")
         assert "class Foo:" in prompt
-        assert "Structural skeleton:" in prompt
+        assert "Skeleton:" in prompt
 
     def test_no_skeleton_when_none(self):
         file_descs = [{"file_path": "src/a.py", "description": "desc"}]
         prompt = build_module_prompt("src", file_descs, skeleton_text=None)
-        assert "Structural skeleton:" not in prompt
+        assert "Skeleton:" not in prompt
 
-    def test_asks_for_structured_sections(self):
+    def test_asks_for_dense_paragraph(self):
         file_descs = [{"file_path": "src/a.py", "description": "desc"}]
         prompt = build_module_prompt("src", file_descs)
-        assert "Purpose" in prompt
-        assert "Public API" in prompt
-        assert "Internal structure" in prompt
-        assert "External dependencies" in prompt
+        assert "dense paragraph" in prompt
+        assert "public API" in prompt
 
     def test_truncates_long_descriptions(self):
         long_desc = "A" * 300
@@ -105,12 +107,11 @@ class TestBuildRepoPrompt:
         assert "README.md" in prompt
         assert "Project readme" in prompt
 
-    def test_asks_for_structured_sections(self):
+    def test_asks_for_dense_paragraph(self):
         prompt = build_repo_prompt("owner/repo", [], [])
-        assert "Purpose" in prompt
-        assert "Architecture" in prompt
-        assert "Technology stack" in prompt
-        assert "Entry points" in prompt
+        assert "dense paragraph" in prompt
+        assert "architecture" in prompt
+        assert "entry points" in prompt
 
     def test_handles_empty_descriptions(self):
         prompt = build_repo_prompt("owner/repo", [], [])
@@ -138,3 +139,8 @@ class TestTruncateDesc:
     def test_exact_limit_unchanged(self):
         exact = "y" * MAX_DESC_CHARS_IN_PROMPT
         assert _truncate_desc(exact) == exact
+
+
+class TestPromptVersion:
+    def test_version_is_3(self):
+        assert PROMPT_VERSION == 3

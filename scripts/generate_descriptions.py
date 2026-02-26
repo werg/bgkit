@@ -33,6 +33,7 @@ import structlog
 
 from bgkit.data.repo_processing import extract_repo_snapshot
 from bgkit.inference import InferenceConfig, LlamaClient
+from bgkit.inference.models import resolve_profile
 from bgkit.utils.git_utils import is_git_repo
 
 logger = structlog.get_logger()
@@ -48,6 +49,9 @@ MAX_FILE_DESCS_IN_PROMPT = 30
 
 # Maximum characters for embedded descriptions in module/repo prompts
 MAX_DESC_CHARS_IN_PROMPT = 200
+
+# Prompt format version — increment when prompt builders change
+PROMPT_VERSION = 3
 
 # Llama-server client (initialized by init_local_client)
 _llama_client: LlamaClient | None = None
@@ -124,14 +128,20 @@ def init_local_client(
         raw = os.environ.get("LLAMA_PARALLEL")
         logger.warning("invalid_LLAMA_PARALLEL, using default", value=raw)
         parallel = 16
-    model = os.environ.get("LLAMA_MODEL", "")
-    disable_thinking = "qwen3" in model.lower()
     base_url = url or os.environ.get("LLAMA_URL", "http://localhost:8080")
+
+    model_filename = os.environ.get("LLAMA_MODEL", "")
+    if not model_filename:
+        logger.warning(
+            "LLAMA_MODEL not set, using default model profile (no thinking-mode handling)"
+        )
+    profile = resolve_profile(model_filename)
+    logger.info("resolved_model_profile", model=model_filename, profile=profile.name)
 
     config = InferenceConfig(
         base_url=base_url,
         max_concurrent=parallel,
-        disable_thinking=disable_thinking,
+        model_profile=profile,
     )
     _llama_client = LlamaClient(config)
     logger.info("waiting_for_llama_server", url=base_url)
@@ -210,17 +220,14 @@ def build_file_prompt(file_path: str, content: str, language: str | None) -> str
 
     lang_note = f" ({language})" if language else ""
     return (
-        f"Analyze the following source file and provide a structured description.\n\n"
         f"File: {file_path}{lang_note}\n\n"
         f"```\n{content}\n```\n\n"
-        f"Provide:\n"
-        f"1. Purpose: What this file does (1-2 sentences)\n"
-        f"2. Key exports: Main classes, functions, or constants defined here, "
-        f"by name (N/A if none)\n"
-        f"3. Dependencies: What this file imports or depends on (N/A if none)\n"
-        f"4. Role: How this file fits into the larger project (1 sentence)\n\n"
-        f"Be specific — use actual names from the code. "
-        f"If a section does not apply, write N/A."
+        f"Write a single dense paragraph describing this file. "
+        f"Include: what it does, the names of key exports (classes, functions, constants), "
+        f"and what it imports or depends on. "
+        f"Omit any category that doesn't apply. "
+        f"No headers, bullet points, or labels — just a compact paragraph "
+        f"where every word carries information. Use actual identifier names from the code."
     )
 
 
@@ -237,23 +244,19 @@ def build_module_prompt(
     skeleton_text: str | None = None,
 ) -> str:
     """Build a prompt asking for a module-level description."""
-    parts = [
-        f"Analyze the module/directory '{module_path}' based on its files.\n\n"
-        f"Files in this module:\n"
-    ]
+    parts = [f"Module: {module_path}\n\nFiles:\n"]
 
     for fd in file_descriptions[:MAX_FILE_DESCS_IN_PROMPT]:
         parts.append(f"- {fd['file_path']}: {_truncate_desc(fd['description'])}")
 
     if skeleton_text:
-        parts.append(f"\nStructural skeleton:\n{skeleton_text}")
+        parts.append(f"\nSkeleton:\n{skeleton_text}")
 
     parts.append(
-        "\nProvide:\n"
-        "1. Purpose: What this module provides (1-2 sentences)\n"
-        "2. Public API: Key classes/functions exported by this module\n"
-        "3. Internal structure: How the files depend on each other\n"
-        "4. External dependencies: What outside packages/modules this depends on"
+        "\nWrite a single dense paragraph describing this module. "
+        "Include: what it provides, its public API (by name), "
+        "how its files relate to each other, and what external packages it depends on. "
+        "No headers or bullet points — just a compact paragraph."
     )
     return "\n".join(parts)
 
@@ -264,9 +267,7 @@ def build_repo_prompt(
     file_descriptions: list[dict],
 ) -> str:
     """Build a prompt asking for a repo-level description."""
-    parts = [
-        f"Analyze the project at '{repo_path}' based on its modules and files.\n\n"
-    ]
+    parts = [f"Project: {repo_path}\n\n"]
 
     if module_descriptions:
         parts.append("Modules:")
@@ -281,11 +282,10 @@ def build_repo_prompt(
         parts.append("")
 
     parts.append(
-        "Provide:\n"
-        "1. Purpose: What this project does and who it's for (1-2 sentences)\n"
-        "2. Architecture: Key patterns (monorepo, client-server, library, CLI, etc.)\n"
-        "3. Technology stack: Languages, frameworks, and key dependencies\n"
-        "4. Entry points: Main executables, servers, or library entry points"
+        "Write a single dense paragraph describing this project. "
+        "Include: what it does, its architecture (monorepo, client-server, library, CLI, etc.), "
+        "key technologies and frameworks, and main entry points. "
+        "No headers or bullet points — just a compact paragraph."
     )
     return "\n".join(parts)
 
@@ -395,6 +395,7 @@ def process_single_repo(
                             "description": desc,
                             "language": fr.language or "",
                             "backend": "local",
+                            "prompt_version": PROMPT_VERSION,
                         }
                         records.append(rec)
                         file_descriptions.append(rec)
@@ -412,6 +413,7 @@ def process_single_repo(
                             "description": desc,
                             "language": fr.language or "",
                             "backend": used_backend,
+                            "prompt_version": PROMPT_VERSION,
                         }
                         records.append(rec)
                         file_descriptions.append(rec)
@@ -459,6 +461,7 @@ def process_single_repo(
                         "description": desc,
                         "language": primary_lang,
                         "backend": used_backend,
+                        "prompt_version": PROMPT_VERSION,
                     }
                     records.append(rec)
                     module_descriptions.append(rec)
@@ -486,6 +489,7 @@ def process_single_repo(
                     "commit_sha": commit_sha,
                     "description": desc,
                     "backend": used_backend,
+                    "prompt_version": PROMPT_VERSION,
                 })
 
         if not records:

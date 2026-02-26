@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from bgkit.inference.models import ModelProfile
 
 
 @dataclass
@@ -16,4 +20,4 @@ class InferenceConfig:
     retry_base_delay: float = 2.0
     max_new_tokens: int = 512
     temperature: float = 0.0
-    disable_thinking: bool = False
+    model_profile: ModelProfile | None = None

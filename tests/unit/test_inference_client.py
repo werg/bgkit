@@ -9,6 +9,7 @@ import pytest
 
 from bgkit.inference.client import LlamaClient, _run_sync
 from bgkit.inference.config import InferenceConfig
+from bgkit.inference.models import DEFAULT_PROFILE, MODEL_PROFILES, ModelProfile
 
 
 def _make_completion_response(content: str = "Hello world") -> dict:
@@ -46,6 +47,10 @@ def _make_client(handler, **config_kwargs) -> LlamaClient:
         timeout=5.0,
     )
     return client
+
+
+# Convenience: a profile with thinking enabled (strips tags + sends kwargs)
+_THINKING_PROFILE = MODEL_PROFILES["GLM-4"]
 
 
 def test_generate_success():
@@ -158,35 +163,38 @@ def test_warmup_idempotent():
     assert call_count == 1
 
 
-def test_strips_thinking_blocks_when_enabled():
-    """When disable_thinking=True, <think> blocks are stripped from output."""
+def test_strips_thinking_blocks_with_profile():
+    """Profile with thinking_tag_pattern strips <think> blocks from output."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/chat/completions":
             content = "<think>\nLet me analyze this...\n</think>\nThis file handles authentication."
             return httpx.Response(200, json=_make_completion_response(content))
         return httpx.Response(404)
 
-    client = _make_client(handler, disable_thinking=True)
+    client = _make_client(handler, model_profile=_THINKING_PROFILE)
     result = client.generate_sync("describe this")
     assert result == "This file handles authentication."
     assert "<think>" not in result
 
 
-def test_preserves_thinking_blocks_by_default():
-    """When disable_thinking=False (default), <think> blocks are preserved."""
+def test_preserves_thinking_blocks_without_profile():
+    """Without a model profile, <think> blocks are preserved."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/chat/completions":
             content = "<think>\nLet me analyze this...\n</think>\nThis file handles authentication."
             return httpx.Response(200, json=_make_completion_response(content))
         return httpx.Response(404)
 
+    # No model_profile = default None = no stripping
     client = _make_client(handler)
     result = client.generate_sync("describe this")
     assert "<think>" in result
 
 
-def test_disable_thinking_sends_chat_template_kwargs():
-    """When disable_thinking=True, chat_template_kwargs is included in the payload."""
+def test_profile_sends_chat_template_kwargs():
+    """Profile with chat_template_kwargs includes them in the request."""
     received = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -195,13 +203,13 @@ def test_disable_thinking_sends_chat_template_kwargs():
             return httpx.Response(200, json=_make_completion_response("ok"))
         return httpx.Response(404)
 
-    client = _make_client(handler, disable_thinking=True)
+    client = _make_client(handler, model_profile=_THINKING_PROFILE)
     _run_sync(client.generate("Hello"))
     assert received["body"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
-def test_default_config_no_chat_template_kwargs():
-    """Default config (disable_thinking=False) does not include chat_template_kwargs."""
+def test_no_chat_template_kwargs_without_profile():
+    """Without a model profile, chat_template_kwargs is not included."""
     received = {}
 
     def handler(request: httpx.Request) -> httpx.Response:

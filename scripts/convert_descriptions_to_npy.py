@@ -31,9 +31,9 @@ import pyarrow.parquet as pq
 
 # Metadata columns per scope
 SCOPE_META_COLUMNS: dict[str, list[str]] = {
-    "file": ["file_path", "commit_sha", "language", "repo_path"],
-    "module": ["module_path", "commit_sha", "language", "repo_path"],
-    "repo": ["commit_sha", "repo_path"],
+    "file": ["file_path", "commit_sha", "language", "repo_path", "prompt_version"],
+    "module": ["module_path", "commit_sha", "language", "repo_path", "prompt_version"],
+    "repo": ["commit_sha", "repo_path", "prompt_version"],
 }
 
 
@@ -71,6 +71,7 @@ def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: 
             "commit_sha": [],
             "language": [],
             "repo_path": [],
+            "prompt_version": [],
             "skipped": 0,
         },
         "module": {
@@ -80,6 +81,7 @@ def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: 
             "commit_sha": [],
             "language": [],
             "repo_path": [],
+            "prompt_version": [],
             "skipped": 0,
         },
         "repo": {
@@ -87,6 +89,7 @@ def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: 
             "lengths": [],
             "commit_sha": [],
             "repo_path": [],
+            "prompt_version": [],
             "skipped": 0,
         },
     }
@@ -121,6 +124,7 @@ def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: 
                 sd["lengths"].append(len(arr))
                 sd["repo_path"].append(repo_path)
                 sd["commit_sha"].append(record.get("commit_sha", ""))
+                sd["prompt_version"].append(record.get("prompt_version", 0))
 
                 if scope == "file":
                     sd["file_path"].append(record.get("file_path", ""))
@@ -166,7 +170,10 @@ def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: 
         # Build metadata table
         meta_columns: dict[str, pa.Array] = {}
         for col_name in SCOPE_META_COLUMNS[scope]:
-            meta_columns[col_name] = pa.array(sd[col_name], type=pa.string())
+            if col_name == "prompt_version":
+                meta_columns[col_name] = pa.array(sd[col_name], type=pa.int32())
+            else:
+                meta_columns[col_name] = pa.array(sd[col_name], type=pa.string())
 
         meta_table = pa.table(meta_columns)
         pq.write_table(meta_table, scope_dir / "metadata.parquet")

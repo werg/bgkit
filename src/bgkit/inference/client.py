@@ -14,9 +14,6 @@ from bgkit.inference.config import InferenceConfig
 
 logger = logging.getLogger(__name__)
 
-# Qwen3 models emit <think>...</think> blocks; strip them from completions.
-_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
-
 # Shared background event loop for all sync callers.
 _bg_loop: asyncio.AbstractEventLoop | None = None
 _bg_thread: threading.Thread | None = None
@@ -61,6 +58,13 @@ class LlamaClient:
         self._semaphore: asyncio.Semaphore | None = None
         self._async_client: httpx.AsyncClient | None = None
         self._warmed_up = False
+        # Cache compiled regex from model profile
+        self._think_re: re.Pattern[str] | None = None
+        self._chat_template_kwargs: dict[str, Any] | None = None
+        profile = self.config.model_profile
+        if profile is not None:
+            self._think_re = profile.compile_thinking_re()
+            self._chat_template_kwargs = profile.get_chat_template_kwargs()
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._async_client is None or self._async_client.is_closed:
@@ -103,8 +107,8 @@ class LlamaClient:
             "max_tokens": max_tokens or self.config.max_new_tokens,
             "temperature": temperature if temperature is not None else self.config.temperature,
         }
-        if self.config.disable_thinking:
-            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        if self._chat_template_kwargs is not None:
+            payload["chat_template_kwargs"] = self._chat_template_kwargs
 
         sem = await self._get_semaphore()
         client = await self._get_client()
@@ -143,8 +147,8 @@ class LlamaClient:
                 choices = data.get("choices", [])
                 if choices:
                     content = choices[0].get("message", {}).get("content", "")
-                    if content and self.config.disable_thinking:
-                        content = _THINK_RE.sub("", content).strip()
+                    if content and self._think_re is not None:
+                        content = self._think_re.sub("", content).strip()
                     return content if content else None
                 return None
 
