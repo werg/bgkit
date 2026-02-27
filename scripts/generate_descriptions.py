@@ -59,9 +59,57 @@ PROMPT_VERSION = 4
 # Llama-server clients (initialized by init_local_client)
 _llama_client_large: LlamaClient | None = None
 _llama_client_small: LlamaClient | None = None
+_llama_client_tiny: LlamaClient | None = None
 
-# Files above this char count go to the small model
+# Files above this char count go to the small model (unless routed to tiny)
 SMALL_MODEL_CHAR_THRESHOLD = 3000
+
+# Languages where a tiny model suffices (config, data, markup — declarative, no logic)
+_TINY_LANGUAGES: frozenset[str] = frozenset({
+    "JSON", "YAML", "TOML", "XML", "Markdown", "reStructuredText",
+    "HTML", "CSS", "SQL", "Dockerfile", "Terraform", "Nix",
+    "Protocol Buffers", "CMake", "Gradle",
+})
+
+# Path patterns that indicate easy-to-describe files (test, config, boilerplate, generated)
+_TINY_PATH_STEMS: frozenset[str] = frozenset({
+    "__init__", "setup", "conftest",
+})
+_TINY_PATH_NAMES: frozenset[str] = frozenset({
+    "setup.cfg", "pyproject.toml", "package.json", "package-lock.json",
+    "tsconfig.json", "tslint.json", ".eslintrc", ".eslintrc.json", ".eslintrc.js",
+    ".prettierrc", ".prettierrc.json", ".babelrc", ".editorconfig",
+    "requirements.txt", "Pipfile", "Pipfile.lock", "Cargo.lock", "go.sum",
+    "yarn.lock", "pnpm-lock.yaml", "composer.lock", "Gemfile.lock",
+    "LICENSE", "LICENSE.md", "LICENSE.txt", "LICENCE",
+    "CHANGELOG.md", "CHANGELOG", "CHANGES.md",
+})
+
+# Very short files are trivial to describe regardless of language
+TINY_SIZE_THRESHOLD = 500
+
+
+def _is_tiny_routable(path: str, language: str | None, size_bytes: int) -> bool:
+    """Return True if a file is simple enough for the tiny model."""
+    if size_bytes <= TINY_SIZE_THRESHOLD:
+        return True
+    if language and language in _TINY_LANGUAGES:
+        return True
+    name = path.rsplit("/", 1)[-1] if "/" in path else path
+    if name in _TINY_PATH_NAMES:
+        return True
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    if stem in _TINY_PATH_STEMS:
+        return True
+    # test files, migrations, generated code
+    if stem.startswith("test_") or stem.endswith("_test") or stem.endswith(".spec"):
+        return True
+    lower_path = path.lower()
+    if "/test/" in lower_path or "/tests/" in lower_path or "/spec/" in lower_path:
+        return True
+    if "/migrations/" in lower_path or ".generated." in lower_path:
+        return True
+    return name.endswith(".lock") or ".lock." in name
 
 
 # ---------------------------------------------------------------------------
@@ -124,20 +172,18 @@ def _backoff(attempt: int) -> None:
 
 def _make_client(
     base_url: str,
-    model_env: str,
     parallel: int,
     readiness_timeout: float,
     label: str,
 ) -> LlamaClient:
-    """Create and verify a single LlamaClient."""
-    model_filename = os.environ.get(model_env, "")
-    profile = resolve_profile(model_filename)
-    logger.info("resolved_model_profile", label=label, model=model_filename, profile=profile.name)
+    """Create, verify, and auto-configure a single LlamaClient.
 
+    After the server is healthy, queries /v1/models to detect the loaded model
+    and resolves the appropriate ModelProfile (thinking-tag stripping, etc.).
+    """
     config = InferenceConfig(
         base_url=base_url,
         max_concurrent=parallel,
-        model_profile=profile,
     )
     client = LlamaClient(config)
     logger.info("waiting_for_llama_server", label=label, url=base_url)
@@ -148,81 +194,127 @@ def _make_client(
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # Auto-detect model and apply the correct profile
+    model_id = client.detect_model_sync()
+    if not model_id:
+        print(
+            f"ERROR: could not detect model from llama-server ({label}) at {base_url}. "
+            f"Is /v1/models endpoint available?",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    profile = resolve_profile(model_id)
+    client.apply_profile(profile)
+    logger.info("auto_detected_model", label=label, model=model_id, profile=profile.name)
+
     client.warmup_sync()
     logger.info("llama_server_ready", label=label, url=base_url)
     return client
 
 
 def init_local_client(
-    url: str | None = None,
+    url_large: str | None = None,
+    url_small: str | None = None,
+    url_tiny: str | None = None,
     readiness_timeout: float = 120.0,
 ) -> None:
-    """Initialize both llama-server clients and verify readiness.
+    """Initialize all three llama-server clients and verify readiness.
 
-    Both large and small model servers must be running. Exits if either is
-    unreachable. Start both with: make llama-server
+    All three model servers (large, small, tiny) must be running. Exits if any
+    is unreachable. Start all with: make llama-server
     """
-    global _llama_client_large, _llama_client_small
+    global _llama_client_large, _llama_client_small, _llama_client_tiny
 
-    try:
-        parallel_large = int(os.environ.get("LLAMA_PARALLEL_LARGE", 8))
-    except ValueError:
-        parallel_large = 8
-    try:
-        parallel_small = int(os.environ.get("LLAMA_PARALLEL_SMALL", 16))
-    except ValueError:
-        parallel_small = 16
+    def _parallel_env(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, default))
+        except ValueError:
+            return default
 
-    url_large = url or os.environ.get("LLAMA_URL", "http://localhost:8080")
-    url_small = os.environ.get("LLAMA_URL_SMALL", "http://localhost:8081")
+    parallel_large = _parallel_env("LLAMA_PARALLEL_LARGE", 8)
+    parallel_small = _parallel_env("LLAMA_PARALLEL_SMALL", 16)
+    parallel_tiny = _parallel_env("LLAMA_PARALLEL_TINY", 24)
+
+    resolved_large = url_large or os.environ.get("LLAMA_URL", "http://localhost:8080")
+    resolved_small = url_small or os.environ.get("LLAMA_URL_SMALL", "http://localhost:8081")
+    resolved_tiny = url_tiny or os.environ.get("LLAMA_URL_TINY", "http://localhost:8082")
 
     _llama_client_large = _make_client(
-        url_large, "LLAMA_MODEL_LARGE", parallel_large, readiness_timeout, "large"
+        resolved_large, parallel_large, readiness_timeout, "large"
     )
     _llama_client_small = _make_client(
-        url_small, "LLAMA_MODEL_SMALL", parallel_small, readiness_timeout, "small"
+        resolved_small, parallel_small, readiness_timeout, "small"
     )
+    _llama_client_tiny = _make_client(
+        resolved_tiny, parallel_tiny, readiness_timeout, "tiny"
+    )
+
+
+def _pick_tier(
+    content_chars: int,
+    file_path: str = "",
+    language: str | None = None,
+    size_bytes: int = 0,
+) -> str:
+    """Return the tier label for a file: 'tiny', 'small', or 'large'."""
+    if file_path and _is_tiny_routable(file_path, language, size_bytes):
+        return "tiny"
+    if content_chars > SMALL_MODEL_CHAR_THRESHOLD:
+        return "small"
+    return "large"
+
+
+def _client_for_tier(tier: str) -> LlamaClient:
+    """Return the LlamaClient for the given tier."""
+    if tier == "tiny":
+        return _llama_client_tiny
+    if tier == "small":
+        return _llama_client_small
+    return _llama_client_large
 
 
 def call_local(
-    prompt: str, max_new_tokens: int = 512, content_chars: int = 0
+    prompt: str,
+    max_new_tokens: int = 512,
+    content_chars: int = 0,
+    file_path: str = "",
+    language: str | None = None,
+    size_bytes: int = 0,
 ) -> tuple[str | None, str]:
-    """Generate a description using the llama-server.
+    """Generate a description using the appropriate llama-server tier.
 
-    Routes to small model if content_chars > SMALL_MODEL_CHAR_THRESHOLD.
     Returns (description, backend_label).
     """
-    if content_chars > SMALL_MODEL_CHAR_THRESHOLD:
-        return (_llama_client_small.generate_sync(prompt, max_tokens=max_new_tokens), "local-small")
-    return (_llama_client_large.generate_sync(prompt, max_tokens=max_new_tokens), "local-large")
+    tier = _pick_tier(content_chars, file_path, language, size_bytes)
+    client = _client_for_tier(tier)
+    return (client.generate_sync(prompt, max_tokens=max_new_tokens), f"local-{tier}")
 
 
 def call_local_batch(
     prompts: list[str],
-    content_lengths: list[int] | None = None,
+    tiers: list[str] | None = None,
     max_new_tokens: int = 512,
 ) -> list[tuple[str | None, str]]:
-    """Generate descriptions for multiple prompts with size-based routing.
+    """Generate descriptions for multiple prompts with tier-based routing.
 
-    Routes each prompt to large or small model based on content_lengths.
-    Both models' semaphores independently control their own concurrency.
+    Each prompt is routed to its tier's model. All three models' semaphores
+    independently control their own concurrency.
     Returns list of (description, backend_label) tuples.
     """
-    if content_lengths is None:
-        content_lengths = [0] * len(prompts)
+    if tiers is None:
+        tiers = ["large"] * len(prompts)
 
     import asyncio
 
     async def _generate_routed() -> list[tuple[str | None, str]]:
-        async def _one(prompt: str, chars: int) -> tuple[str | None, str]:
-            if chars > SMALL_MODEL_CHAR_THRESHOLD:
-                result = await _llama_client_small.generate(prompt, max_tokens=max_new_tokens)
-                return (result, "local-small")
-            result = await _llama_client_large.generate(prompt, max_tokens=max_new_tokens)
-            return (result, "local-large")
+        async def _one(prompt: str, tier: str) -> tuple[str | None, str]:
+            client = _client_for_tier(tier)
+            result = await client.generate(prompt, max_tokens=max_new_tokens)
+            return (result, f"local-{tier}")
 
         return await asyncio.gather(
-            *[_one(p, c) for p, c in zip(prompts, content_lengths, strict=True)]
+            *[_one(p, t) for p, t in zip(prompts, tiers, strict=True)]
         )
 
     from bgkit.inference.client import _run_sync
@@ -242,6 +334,9 @@ def generate_description(
     backend: str,
     backend_cycle: itertools.cycle | None = None,
     content_chars: int = 0,
+    file_path: str = "",
+    language: str | None = None,
+    size_bytes: int = 0,
 ) -> tuple[str | None, str]:
     """Generate a description using the specified backend.
 
@@ -257,7 +352,10 @@ def generate_description(
         result = call_claude(prompt)
         return (result, "haiku")
     elif chosen == "local":
-        return call_local(prompt, content_chars=content_chars)
+        return call_local(
+            prompt, content_chars=content_chars, file_path=file_path,
+            language=language, size_bytes=size_bytes,
+        )
     else:
         return (None, chosen)
 
@@ -451,11 +549,14 @@ def process_single_repo(
             ]
 
             if backend == "local":
-                # Batch: all prompts sent concurrently, routed by content size
-                content_lengths = [len(fr.content) for fr, _ in file_prompts]
+                # Batch: all prompts sent concurrently, routed by tier
+                file_tiers = [
+                    _pick_tier(len(fr.content), fr.path, fr.language, fr.size_bytes)
+                    for fr, _ in file_prompts
+                ]
                 results = call_local_batch(
                     [p for _, p in file_prompts],
-                    content_lengths=content_lengths,
+                    tiers=file_tiers,
                 )
                 for (fr, _prompt), (desc, backend_label) in zip(
                     file_prompts, results, strict=True
@@ -483,6 +584,9 @@ def process_single_repo(
                     desc, used_backend = generate_description(
                         prompt, backend, backend_cycle,
                         content_chars=len(fr.content),
+                        file_path=fr.path,
+                        language=fr.language,
+                        size_bytes=fr.size_bytes,
                     )
                     if desc is None:
                         logger.warning(
@@ -624,8 +728,16 @@ def main() -> None:
         help="Description generation backend (default: mixed)",
     )
     parser.add_argument(
-        "--llama-url", type=str, default=None,
-        help="URL for the llama-server (default: LLAMA_URL env or http://localhost:8080)",
+        "--llama-url-large", type=str, default=None,
+        help="URL for the large llama-server (default: LLAMA_URL env or http://localhost:8080)",
+    )
+    parser.add_argument(
+        "--llama-url-small", type=str, default=None,
+        help="URL for the small llama-server (default: LLAMA_URL_SMALL env or http://localhost:8081)",
+    )
+    parser.add_argument(
+        "--llama-url-tiny", type=str, default=None,
+        help="URL for the tiny llama-server (default: LLAMA_URL_TINY env or http://localhost:8082)",
     )
     parser.add_argument(
         "--structural-dir", type=Path, default=None,
@@ -662,7 +774,11 @@ def main() -> None:
 
     # Initialize llama-server clients if needed
     if args.backend in ("local", "mixed"):
-        init_local_client(url=args.llama_url)
+        init_local_client(
+            url_large=args.llama_url_large,
+            url_small=args.llama_url_small,
+            url_tiny=args.llama_url_tiny,
+        )
 
     # Set up backend cycle for mixed mode
     backend_cycle: itertools.cycle | None = None

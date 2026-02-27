@@ -266,6 +266,61 @@ def test_bad_request_returns_none():
     assert call_count == 1  # no retries on 400
 
 
+def test_detect_model_returns_id():
+    """detect_model queries /v1/models and returns the model id."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={
+                "object": "list",
+                "data": [{"id": "Qwen3-0.6B-Q8_0.gguf", "object": "model"}],
+            })
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    model_id = client.detect_model_sync()
+    assert model_id == "Qwen3-0.6B-Q8_0.gguf"
+
+
+def test_detect_model_returns_none_on_error():
+    """detect_model returns None when the endpoint is unavailable."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    assert client.detect_model_sync() is None
+
+
+def test_apply_profile_updates_behavior():
+    """apply_profile switches thinking-tag stripping and chat_template_kwargs."""
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            received["body"] = json.loads(request.content)
+            content = "<think>\nhmm\n</think>\nActual answer."
+            return httpx.Response(200, json=_make_completion_response(content))
+        return httpx.Response(404)
+
+    # Start with no profile (default)
+    client = _make_client(handler)
+    result = client.generate_sync("test")
+    assert "<think>" in result
+    assert "chat_template_kwargs" not in received["body"]
+
+    # Apply a thinking profile
+    client.apply_profile(_THINKING_PROFILE)
+    result = client.generate_sync("test")
+    assert result == "Actual answer."
+    assert received["body"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+    # Apply default profile to revert
+    client.apply_profile(DEFAULT_PROFILE)
+    result = client.generate_sync("test")
+    assert "<think>" in result
+
+
 def test_generate_sync_thread_safety():
     """Verify multiple threads can call generate_sync concurrently."""
     from concurrent.futures import ThreadPoolExecutor, as_completed

@@ -63,25 +63,28 @@ docker-build-data:
 	docker build -f docker/Dockerfile.data -t bgkit-data:latest .
 
 docker-build-llama:
-	docker compose -f docker/docker-compose.yaml build llama-large llama-small
+	docker compose -f docker/docker-compose.yaml build llama-large llama-small llama-tiny
 
 download-models:
 	scripts/download-model.sh LiquidAI/LFM2-8B-A1B-GGUF LFM2-8B-A1B-Q4_K_M.gguf
 	scripts/download-model.sh LiquidAI/LFM2.5-1.2B-Instruct-GGUF LFM2.5-1.2B-Instruct-Q8_0.gguf
+	scripts/download-model.sh Qwen/Qwen3-0.6B-GGUF Qwen3-0.6B-Q8_0.gguf
 
 llama-server:
-	docker compose -f docker/docker-compose.yaml up -d llama-large llama-small
+	docker compose -f docker/docker-compose.yaml up -d llama-large llama-small llama-tiny
 	@echo "Waiting for llama-large health..."
 	@timeout 120 bash -c 'until curl -sf http://localhost:$${LLAMA_PORT_LARGE:-8080}/health; do sleep 2; done' && echo " OK" || { echo " TIMEOUT"; exit 1; }
 	@echo "Waiting for llama-small health..."
 	@timeout 120 bash -c 'until curl -sf http://localhost:$${LLAMA_PORT_SMALL:-8081}/health; do sleep 2; done' && echo " OK" || { echo " TIMEOUT"; exit 1; }
+	@echo "Waiting for llama-tiny health..."
+	@timeout 120 bash -c 'until curl -sf http://localhost:$${LLAMA_PORT_TINY:-8082}/health; do sleep 2; done' && echo " OK" || { echo " TIMEOUT"; exit 1; }
 
 llama-server-stop:
-	docker compose -f docker/docker-compose.yaml stop llama-large llama-small
-	docker compose -f docker/docker-compose.yaml rm -f llama-large llama-small
+	docker compose -f docker/docker-compose.yaml stop llama-large llama-small llama-tiny
+	docker compose -f docker/docker-compose.yaml rm -f llama-large llama-small llama-tiny
 
 llama-server-logs:
-	docker compose -f docker/docker-compose.yaml logs -f llama-large llama-small
+	docker compose -f docker/docker-compose.yaml logs -f llama-large llama-small llama-tiny
 
 llama-bench:
 	scripts/llama-bench.sh

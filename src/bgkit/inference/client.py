@@ -6,11 +6,14 @@ import asyncio
 import logging
 import re
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from bgkit.inference.config import InferenceConfig
+
+if TYPE_CHECKING:
+    from bgkit.inference.models import ModelProfile
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +216,35 @@ class LlamaClient:
     def wait_ready_sync(self, timeout: float = 120.0) -> bool:
         """Synchronous wrapper around wait_ready(). Thread-safe."""
         return _run_sync(self.wait_ready(timeout))
+
+    def apply_profile(self, profile: ModelProfile) -> None:
+        """Update the client's model profile, re-caching regex and template kwargs."""
+        self.config.model_profile = profile
+        self._think_re = profile.compile_thinking_re()
+        self._chat_template_kwargs = profile.get_chat_template_kwargs()
+
+    async def detect_model(self) -> str | None:
+        """Query /v1/models to get the loaded model identifier.
+
+        Returns the model id string (typically the GGUF filename), or None
+        if the endpoint is unavailable or returns unexpected data.
+        """
+        client = await self._get_client()
+        try:
+            resp = await client.get("/v1/models")
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            models = data.get("data", [])
+            if models:
+                return models[0].get("id")
+        except (httpx.HTTPError, ValueError, KeyError):
+            pass
+        return None
+
+    def detect_model_sync(self) -> str | None:
+        """Synchronous wrapper around detect_model(). Thread-safe."""
+        return _run_sync(self.detect_model())
 
     async def warmup(self) -> None:
         """Fire one short completion to JIT-compile CUDA kernels. No-op after first call."""

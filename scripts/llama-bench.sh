@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Benchmark llama-server to find optimal --parallel and --ctx-size settings.
+# Benchmark all llama-server tiers to find optimal --parallel and --ctx-size.
 #
-# Sweeps configurations, measures throughput and memory, writes results to CSV.
+# Sweeps configurations per model, measures throughput and memory, writes CSV.
 #
 # Usage: scripts/llama-bench.sh [OUTPUT_FILE]
 
@@ -18,7 +18,7 @@ mkdir -p "$(dirname "$OUTPUT")"
 
 # CSV header
 if [[ ! -f "$OUTPUT" ]]; then
-    echo "timestamp,model,parallel,ctx_size,ok,fired,total_time_s,avg_latency_s,p95_latency_s,throughput_req_per_s,gpu_memory_mb" > "$OUTPUT"
+    echo "timestamp,tier,model,parallel,ctx_size,ok,fired,total_time_s,avg_latency_s,p95_latency_s,throughput_req_per_s,gpu_memory_mb" > "$OUTPUT"
 fi
 
 wait_healthy() {
@@ -104,44 +104,62 @@ get_gpu_memory() {
     nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 || echo "0"
 }
 
-PORT="${LLAMA_PORT_LARGE:-8080}"
-MODEL="${LLAMA_MODEL_LARGE:-LFM2-8B-A1B-Q4_K_M.gguf}"
+# Model tier definitions: service|port_env_default|parallel_env|ctx_env|model_env_default|parallel_values
+TIERS=(
+    "llama-large|8080|LLAMA_PARALLEL_LARGE|LLAMA_CTX_LARGE|LFM2-8B-A1B-Q4_K_M.gguf|8 16 24 32 48"
+    "llama-small|8081|LLAMA_PARALLEL_SMALL|LLAMA_CTX_SMALL|LFM2.5-1.2B-Instruct-Q8_0.gguf|8 16 24 32 48 64"
+    "llama-tiny|8082|LLAMA_PARALLEL_TINY|LLAMA_CTX_TINY|Qwen3-0.6B-Q8_0.gguf|16 24 32 48 64 96"
+)
 
-echo "Llama-server benchmark"
+CTX_VALUES="32768 65536 131072"
+
+echo "Llama-server benchmark (all tiers)"
 echo "Results: $OUTPUT"
 echo ""
 
-for parallel in 8 16 24 32 48; do
-    for ctx in 32768 65536 131072 262144; do
-        echo "=== parallel=${parallel} ctx_size=${ctx} ==="
+for tier_def in "${TIERS[@]}"; do
+    IFS='|' read -r service port_default parallel_env ctx_env model parallel_list <<< "$tier_def"
+    port="${!port_default:-$port_default}"  # not an env ref, just the default
 
-        LLAMA_PARALLEL_LARGE="$parallel" LLAMA_CTX_LARGE="$ctx" \
-            $COMPOSE up -d --force-recreate llama-large
+    echo "========================================"
+    echo "Tier: $service  Model: $model"
+    echo "========================================"
 
-        if ! wait_healthy "$PORT" 120; then
-            echo "SKIP (unhealthy)"
-            continue
-        fi
-        warmup_server "$PORT"
+    for parallel in $parallel_list; do
+        for ctx in $CTX_VALUES; do
+            echo "--- ${service}: parallel=${parallel} ctx_size=${ctx} ---"
 
-        # Fire N concurrent requests matching parallel slots
-        result=$(fire_requests "$PORT" "$parallel" "$PROMPT_MEDIUM")
-        IFS=',' read -r total_ms avg_ms p95_ms n_ok <<< "$result"
+            env "${parallel_env}=${parallel}" "${ctx_env}=${ctx}" \
+                $COMPOSE up -d --force-recreate "$service"
 
-        gpu_mem=$(get_gpu_memory)
+            if ! wait_healthy "$port_default" 120; then
+                echo "SKIP (unhealthy)"
+                continue
+            fi
+            warmup_server "$port_default"
 
-        total_s=$(awk "BEGIN{printf \"%.2f\", ${total_ms}/1000}")
-        avg_s=$(awk "BEGIN{printf \"%.3f\", ${avg_ms}/1000}")
-        p95_s=$(awk "BEGIN{printf \"%.3f\", ${p95_ms}/1000}")
-        throughput=$(awk "BEGIN{printf \"%.2f\", ${n_ok}/(${total_ms}/1000)}")
+            # Fire N concurrent requests matching parallel slots
+            result=$(fire_requests "$port_default" "$parallel" "$PROMPT_MEDIUM")
+            IFS=',' read -r total_ms avg_ms p95_ms n_ok <<< "$result"
 
-        ts=$(date -Iseconds)
-        echo "${ts},${MODEL},${parallel},${ctx},${n_ok},${parallel},${total_s},${avg_s},${p95_s},${throughput},${gpu_mem}" >> "$OUTPUT"
-        echo "  ok=${n_ok}/${parallel} total=${total_s}s avg=${avg_s}s p95=${p95_s}s throughput=${throughput}req/s gpu=${gpu_mem}MB"
+            gpu_mem=$(get_gpu_memory)
+
+            total_s=$(awk "BEGIN{printf \"%.2f\", ${total_ms}/1000}")
+            avg_s=$(awk "BEGIN{printf \"%.3f\", ${avg_ms}/1000}")
+            p95_s=$(awk "BEGIN{printf \"%.3f\", ${p95_ms}/1000}")
+            throughput=$(awk "BEGIN{printf \"%.2f\", ${n_ok}/(${total_ms}/1000)}")
+
+            ts=$(date -Iseconds)
+            echo "${ts},${service},${model},${parallel},${ctx},${n_ok},${parallel},${total_s},${avg_s},${p95_s},${throughput},${gpu_mem}" >> "$OUTPUT"
+            echo "  ok=${n_ok}/${parallel} total=${total_s}s avg=${avg_s}s p95=${p95_s}s throughput=${throughput}req/s gpu=${gpu_mem}MB"
+        done
     done
+
+    # Stop this tier before starting the next to free GPU memory
+    $COMPOSE stop "$service"
+    echo ""
 done
 
-echo ""
 echo "=== Results ==="
 column -t -s',' "$OUTPUT" 2>/dev/null || cat "$OUTPUT"
 echo ""
