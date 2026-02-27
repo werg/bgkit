@@ -11,7 +11,6 @@ from pathlib import PurePosixPath
 
 import pygit2
 
-
 # Extensions to always skip (binary, generated, vendored, large data)
 SKIP_EXTENSIONS: frozenset[str] = frozenset({
     # Images
@@ -34,6 +33,14 @@ SKIP_EXTENSIONS: frozenset[str] = frozenset({
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
     # Misc
     ".min.js", ".min.css", ".map",
+    # Test snapshots
+    ".snap",
+    # Data files
+    ".csv", ".tsv", ".srt", ".ipset",
+    # 3D / firmware / binary-ish
+    ".stl", ".uf2", ".dex",
+    # Resource / project files (generated)
+    ".resx", ".pbxproj", ".sln",
 })
 
 # Filenames to always skip
@@ -42,6 +49,8 @@ SKIP_FILENAMES: frozenset[str] = frozenset({
     "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock",
     "poetry.lock", "uv.lock", "Pipfile.lock",
     ".DS_Store", "Thumbs.db",
+    "shrinkwrap.json",
+    "Gopkg.lock",
 })
 
 # Directories to skip entirely
@@ -51,6 +60,8 @@ SKIP_DIRS: frozenset[str] = frozenset({
     "vendor", "third_party", "3rdparty",
     "dist", "build", "_build", ".next", ".nuxt",
     ".gradle", ".idea", ".vscode", ".settings",
+    "__snapshots__", "coverage", ".cache",
+    "target", "Godeps", "site", "external",
 })
 
 # Extension -> language mapping (most common)
@@ -106,6 +117,24 @@ EXTENSION_LANGUAGES: dict[str, str] = {
 
 # Maximum file size to read (256 KB) — larger files are typically data, not code
 MAX_FILE_SIZE: int = 256 * 1024
+
+# Per-extension size limits (bytes) for types that are often data/generated when large
+EXTENSION_SIZE_CAPS: dict[str, int] = {
+    ".html": 20 * 1024,
+    ".htm": 20 * 1024,
+    ".xml": 20 * 1024,
+    ".json": 10 * 1024,
+    ".txt": 10 * 1024,
+    ".css": 20 * 1024,
+    ".ipynb": 20 * 1024,
+    "": 5 * 1024,  # No extension: usually data/binary
+}
+
+# In public/ dirs, only keep actual code files (not static assets)
+_PUBLIC_KEEP_EXTS: frozenset[str] = frozenset({
+    ".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte",
+    ".py", ".rb", ".go", ".rs", ".java", ".php",
+})
 
 
 @dataclass
@@ -180,7 +209,21 @@ def _should_skip_path(path: str) -> bool:
     if suffix in SKIP_EXTENSIONS:
         return True
 
-    return False
+    # Skip protobuf generated bindings (compound extensions — .suffix only returns last part)
+    if name.endswith((".pb.go", ".pb.rs", "_pb2.py")):
+        return True
+
+    # Skip files with generated-code suffixes
+    if name.endswith((
+        "_generated.go", "_generated.ts", "_generated.js",
+        ".generated.cs", ".designer.cs",
+    )):
+        return True
+    if "swagger_doc_generated" in name:
+        return True
+
+    # In public/ dirs, only keep actual code files (not static assets like HTML/CSS)
+    return "public" in parts[:-1] and suffix not in _PUBLIC_KEEP_EXTS
 
 
 def _walk_tree(
@@ -263,6 +306,13 @@ def extract_repo_snapshot(
 
         # Skip large files
         if size > max_file_size:
+            snapshot.skipped_large += 1
+            continue
+
+        # Per-extension size cap (e.g., large HTML/JSON are usually generated/data)
+        ext = PurePosixPath(path).suffix.lower()
+        ext_cap = EXTENSION_SIZE_CAPS.get(ext)
+        if ext_cap is not None and size > ext_cap:
             snapshot.skipped_large += 1
             continue
 

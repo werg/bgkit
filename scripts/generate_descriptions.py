@@ -42,7 +42,7 @@ logger = structlog.get_logger()
 _HAIKU_SEMAPHORE = Semaphore(10)
 
 # Maximum file content length to include in prompts (characters)
-MAX_CONTENT_CHARS = 12000
+MAX_CONTENT_CHARS = 8000
 
 # Maximum number of file descriptions to include in module/repo prompts
 MAX_FILE_DESCS_IN_PROMPT = 30
@@ -50,8 +50,11 @@ MAX_FILE_DESCS_IN_PROMPT = 30
 # Maximum characters for embedded descriptions in module/repo prompts
 MAX_DESC_CHARS_IN_PROMPT = 200
 
+# Maximum files per repo (sort by path, take first N)
+MAX_FILES_PER_REPO = 1000
+
 # Prompt format version — increment when prompt builders change
-PROMPT_VERSION = 3
+PROMPT_VERSION = 4
 
 # Llama-server client (initialized by init_local_client)
 _llama_client: LlamaClient | None = None
@@ -360,8 +363,24 @@ def process_single_repo(
 
     try:
         snapshot = extract_repo_snapshot(str(repo_path))
+
+        logger.info(
+            "repo_snapshot", repo=rel_key, files=snapshot.total_files,
+            skipped_binary=snapshot.skipped_binary,
+            skipped_large=snapshot.skipped_large,
+            skipped_pattern=snapshot.skipped_pattern,
+        )
+
         if not snapshot.files:
             return {"repo": rel_key, "status": "empty"}
+
+        # Cap file count per repo for deterministic, bounded processing
+        if len(snapshot.files) > MAX_FILES_PER_REPO:
+            logger.warning(
+                "repo_truncated", repo=rel_key,
+                total=len(snapshot.files), kept=MAX_FILES_PER_REPO,
+            )
+            snapshot.files = snapshot.files[:MAX_FILES_PER_REPO]
 
         commit_sha = snapshot.commit_sha
         records: list[dict] = []
@@ -387,7 +406,12 @@ def process_single_repo(
                     [p for _, p in file_prompts]
                 )
                 for (fr, _prompt), desc in zip(file_prompts, results, strict=True):
-                    if desc:
+                    if not desc:
+                        logger.warning(
+                            "file_description_failed", file_path=fr.path,
+                            content_chars=len(fr.content), repo=rel_key,
+                        )
+                    else:
                         rec = {
                             "scope": "file",
                             "file_path": fr.path,
@@ -405,7 +429,12 @@ def process_single_repo(
                     desc, used_backend = generate_description(
                         prompt, backend, backend_cycle
                     )
-                    if desc:
+                    if desc is None:
+                        logger.warning(
+                            "file_description_failed", file_path=fr.path,
+                            content_chars=len(fr.content), repo=rel_key,
+                        )
+                    elif desc:
                         rec = {
                             "scope": "file",
                             "file_path": fr.path,

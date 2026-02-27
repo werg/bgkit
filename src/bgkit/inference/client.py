@@ -118,7 +118,7 @@ class LlamaClient:
                 async with sem:
                     resp = await client.post("/v1/chat/completions", json=payload)
 
-                if resp.status_code in (503, 429):
+                if resp.status_code in (500, 503, 429):
                     delay = self.config.retry_base_delay * (2**attempt)
                     logger.warning(
                         "llama_server_busy (status=%d attempt=%d delay=%.1fs)",

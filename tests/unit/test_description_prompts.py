@@ -142,5 +142,5 @@ class TestTruncateDesc:
 
 
 class TestPromptVersion:
-    def test_version_is_3(self):
-        assert PROMPT_VERSION == 3
+    def test_version_is_4(self):
+        assert PROMPT_VERSION == 4
