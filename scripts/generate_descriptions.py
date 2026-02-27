@@ -172,18 +172,21 @@ def _backoff(attempt: int) -> None:
 
 def _make_client(
     base_url: str,
-    parallel: int,
+    max_concurrent: int,
     readiness_timeout: float,
     label: str,
 ) -> LlamaClient:
     """Create, verify, and auto-configure a single LlamaClient.
+
+    max_concurrent should match the server's --parallel slot count to avoid
+    sending more requests than the server can handle.
 
     After the server is healthy, queries /v1/models to detect the loaded model
     and resolves the appropriate ModelProfile (thinking-tag stripping, etc.).
     """
     config = InferenceConfig(
         base_url=base_url,
-        max_concurrent=parallel,
+        max_concurrent=max_concurrent,
     )
     client = LlamaClient(config)
     logger.info("waiting_for_llama_server", label=label, url=base_url)
@@ -232,9 +235,9 @@ def init_local_client(
         except ValueError:
             return default
 
-    parallel_large = _parallel_env("LLAMA_PARALLEL_LARGE", 8)
-    parallel_small = _parallel_env("LLAMA_PARALLEL_SMALL", 16)
-    parallel_tiny = _parallel_env("LLAMA_PARALLEL_TINY", 24)
+    parallel_large = _parallel_env("LLAMA_PARALLEL_LARGE", 2)
+    parallel_small = _parallel_env("LLAMA_PARALLEL_SMALL", 2)
+    parallel_tiny = _parallel_env("LLAMA_PARALLEL_TINY", 16)
 
     resolved_large = url_large or os.environ.get("LLAMA_URL", "http://localhost:8080")
     resolved_small = url_small or os.environ.get("LLAMA_URL_SMALL", "http://localhost:8081")
@@ -286,9 +289,22 @@ def call_local(
 
     Returns (description, backend_label).
     """
+    from bgkit.inference.client import ContextOverflowError
+
     tier = _pick_tier(content_chars, file_path, language, size_bytes)
     client = _client_for_tier(tier)
-    return (client.generate_sync(prompt, max_tokens=max_new_tokens), f"local-{tier}")
+    try:
+        return (client.generate_sync(prompt, max_tokens=max_new_tokens), f"local-{tier}")
+    except ContextOverflowError:
+        if tier != "tiny":
+            return (None, f"local-{tier}")
+        # Tiny has the smallest per-slot context; fall back to small.
+        logger.info("context_overflow_fallback", from_tier="tiny", to_tier="small")
+        try:
+            result = _llama_client_small.generate_sync(prompt, max_tokens=max_new_tokens)
+            return (result, "local-small")
+        except ContextOverflowError:
+            return (None, "local-tiny")
 
 
 def call_local_batch(
@@ -307,10 +323,27 @@ def call_local_batch(
 
     import asyncio
 
+    from bgkit.inference.client import ContextOverflowError
+
     async def _generate_routed() -> list[tuple[str | None, str]]:
         async def _one(prompt: str, tier: str) -> tuple[str | None, str]:
             client = _client_for_tier(tier)
-            result = await client.generate(prompt, max_tokens=max_new_tokens)
+            try:
+                result = await client.generate(prompt, max_tokens=max_new_tokens)
+            except ContextOverflowError:
+                if tier != "tiny":
+                    return (None, f"local-{tier}")
+                # Tiny has the smallest per-slot context; fall back to small.
+                logger.info(
+                    "context_overflow_fallback", from_tier="tiny", to_tier="small"
+                )
+                try:
+                    result = await _llama_client_small.generate(
+                        prompt, max_tokens=max_new_tokens
+                    )
+                except ContextOverflowError:
+                    return (None, "local-tiny")
+                return (result, "local-small")
             return (result, f"local-{tier}")
 
         return await asyncio.gather(

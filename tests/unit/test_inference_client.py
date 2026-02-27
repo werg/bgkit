@@ -241,8 +241,10 @@ def test_empty_choices_returns_none():
     assert result is None
 
 
-def test_bad_request_returns_none():
-    """400 responses return None immediately without retrying."""
+def test_bad_request_context_overflow_raises():
+    """400 with n_prompt_tokens/n_ctx raises ContextOverflowError."""
+    from bgkit.inference.client import ContextOverflowError
+
     call_count = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -261,9 +263,31 @@ def test_bad_request_returns_none():
         return httpx.Response(404)
 
     client = _make_client(handler)
+    with pytest.raises(ContextOverflowError) as exc_info:
+        client.generate_sync("test")
+    assert exc_info.value.n_tokens == 8000
+    assert exc_info.value.n_ctx == 4096
+    assert call_count == 1  # no retries on 400
+
+
+def test_bad_request_without_overflow_type_returns_none():
+    """400 with token fields but wrong error type returns None, not ContextOverflowError."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(400, json={
+                "error": {
+                    "code": 400,
+                    "message": "some other error",
+                    "type": "invalid_request_error",
+                    "n_prompt_tokens": 100,
+                    "n_ctx": 4096,
+                }
+            })
+        return httpx.Response(404)
+
+    client = _make_client(handler)
     result = client.generate_sync("test")
     assert result is None
-    assert call_count == 1  # no retries on 400
 
 
 def test_detect_model_returns_id():

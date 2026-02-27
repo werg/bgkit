@@ -17,6 +17,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class ContextOverflowError(Exception):
+    """Raised when a request exceeds the server's per-slot context size."""
+
+    def __init__(self, n_tokens: int | None = None, n_ctx: int | None = None):
+        self.n_tokens = n_tokens
+        self.n_ctx = n_ctx
+        super().__init__(f"request ({n_tokens} tokens) exceeds context ({n_ctx} tokens)")
+
 # Shared background event loop for all sync callers.
 _bg_loop: asyncio.AbstractEventLoop | None = None
 _bg_thread: threading.Thread | None = None
@@ -136,11 +145,16 @@ class LlamaClient:
                     try:
                         err = resp.json().get("error", {})
                         logger.warning(
-                            "llama_server_bad_request: %s (tokens=%s ctx=%s)",
+                            "llama_server_bad_request: %s",
                             err.get("message", resp.text[:200]),
-                            err.get("n_prompt_tokens"),
-                            err.get("n_ctx"),
                         )
+                        if err.get("type") == "exceed_context_size_error":
+                            raise ContextOverflowError(
+                                err.get("n_prompt_tokens"),
+                                err.get("n_ctx"),
+                            )
+                    except ContextOverflowError:
+                        raise
                     except Exception:
                         logger.warning("llama_server_bad_request: %s", resp.text[:200])
                     return None
