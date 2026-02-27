@@ -61,14 +61,21 @@ _llama_client_large: LlamaClient | None = None
 _llama_client_small: LlamaClient | None = None
 _llama_client_tiny: LlamaClient | None = None
 
+# Model IDs per tier, populated by init_local_client after auto-detection
+_tier_models: dict[str, str] = {}
+
 # Files above this char count go to the small model (unless routed to tiny)
 SMALL_MODEL_CHAR_THRESHOLD = 3000
 
-# Languages where a tiny model suffices (config, data, markup — declarative, no logic)
+
+# Languages where a tiny model suffices (config, data, markup, scripting — low complexity)
 _TINY_LANGUAGES: frozenset[str] = frozenset({
     "JSON", "YAML", "TOML", "XML", "Markdown", "reStructuredText",
     "HTML", "CSS", "SQL", "Dockerfile", "Terraform", "Nix",
     "Protocol Buffers", "CMake", "Gradle",
+    "Shell", "Batchfile", "PowerShell", "Makefile",
+    "INI", "Properties", "Dotenv",
+    "Plain Text", "CSV", "TSV",
 })
 
 # Path patterns that indicate easy-to-describe files (test, config, boilerplate, generated)
@@ -83,10 +90,14 @@ _TINY_PATH_NAMES: frozenset[str] = frozenset({
     "yarn.lock", "pnpm-lock.yaml", "composer.lock", "Gemfile.lock",
     "LICENSE", "LICENSE.md", "LICENSE.txt", "LICENCE",
     "CHANGELOG.md", "CHANGELOG", "CHANGES.md",
+    "Makefile", "Rakefile", "Justfile", "justfile",
+    "Dockerfile", ".dockerignore", ".gitignore", ".gitattributes",
+    ".env.example", ".env.sample", ".env.template",
+    "README.md", "README.rst", "README.txt", "README",
 })
 
-# Very short files are trivial to describe regardless of language
-TINY_SIZE_THRESHOLD = 500
+# Short files are trivial to describe regardless of language
+TINY_SIZE_THRESHOLD = 1500
 
 
 def _is_tiny_routable(path: str, language: str | None, size_bytes: int) -> bool:
@@ -209,6 +220,7 @@ def _make_client(
         sys.exit(1)
     profile = resolve_profile(model_id)
     client.apply_profile(profile)
+    _tier_models[label] = model_id
     logger.info("auto_detected_model", label=label, model=model_id, profile=profile.name)
 
     client.warmup_sync()
@@ -237,7 +249,7 @@ def init_local_client(
 
     parallel_large = _parallel_env("LLAMA_PARALLEL_LARGE", 2)
     parallel_small = _parallel_env("LLAMA_PARALLEL_SMALL", 2)
-    parallel_tiny = _parallel_env("LLAMA_PARALLEL_TINY", 16)
+    parallel_tiny = _parallel_env("LLAMA_PARALLEL_TINY", 8)
 
     resolved_large = url_large or os.environ.get("LLAMA_URL", "http://localhost:8080")
     resolved_small = url_small or os.environ.get("LLAMA_URL_SMALL", "http://localhost:8081")
@@ -266,6 +278,12 @@ def _pick_tier(
     if content_chars > SMALL_MODEL_CHAR_THRESHOLD:
         return "small"
     return "large"
+
+
+def _model_for_backend(backend_label: str) -> str:
+    """Return the model ID for a backend label like 'local-tiny'."""
+    tier = backend_label.removeprefix("local-")
+    return _tier_models.get(tier, "")
 
 
 def _client_for_tier(tier: str) -> LlamaClient:
@@ -607,6 +625,7 @@ def process_single_repo(
                             "description": desc,
                             "language": fr.language or "",
                             "backend": backend_label,
+                            "model": _model_for_backend(backend_label),
                             "prompt_version": PROMPT_VERSION,
                         }
                         records.append(rec)
@@ -634,6 +653,7 @@ def process_single_repo(
                             "description": desc,
                             "language": fr.language or "",
                             "backend": used_backend,
+                            "model": _model_for_backend(used_backend),
                             "prompt_version": PROMPT_VERSION,
                         }
                         records.append(rec)
@@ -682,6 +702,7 @@ def process_single_repo(
                         "description": desc,
                         "language": primary_lang,
                         "backend": used_backend,
+                        "model": _model_for_backend(used_backend),
                         "prompt_version": PROMPT_VERSION,
                     }
                     records.append(rec)
@@ -710,6 +731,7 @@ def process_single_repo(
                     "commit_sha": commit_sha,
                     "description": desc,
                     "backend": used_backend,
+                    "model": _model_for_backend(used_backend),
                     "prompt_version": PROMPT_VERSION,
                 })
 
