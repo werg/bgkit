@@ -19,13 +19,15 @@ from bgkit.data.datasets.chat_repro_dataset import (
     _build_messages,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 SEED_VARIANT = {
-    "system_prompt": "You are an AI coding assistant with access to the bgkit_read_file tool for reading file contents.",
+    "system_prompt": (
+        "You are an AI coding assistant with access to the"
+        " bgkit_read_file tool for reading file contents."
+    ),
     "user_prompt": "Read the file `{file_path}`",
     "compression_prompt": "Return the file contents verbatim",
     "response_prefix": "Here are the contents of `{file_path}`:",

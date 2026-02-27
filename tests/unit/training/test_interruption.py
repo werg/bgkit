@@ -21,9 +21,8 @@ def test_restore_on_exception():
     original_sigterm = signal.getsignal(signal.SIGTERM)
     original_sigint = signal.getsignal(signal.SIGINT)
 
-    with pytest.raises(RuntimeError):
-        with GracefulInterruptor():
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), GracefulInterruptor():
+        raise RuntimeError("boom")
 
     # Handlers should be restored
     assert signal.getsignal(signal.SIGTERM) == original_sigterm

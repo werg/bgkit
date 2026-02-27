@@ -9,7 +9,6 @@ Coordinates discovery and download phases with:
 import json
 from dataclasses import asdict
 from datetime import datetime
-from typing import Optional
 
 from bgkit.data.crawler.config import CrawlerConfig
 from bgkit.data.crawler.database import CrawlDatabase, RepoStatus
@@ -30,11 +29,11 @@ class CrawlOrchestrator:
 
     def __init__(self, config: CrawlerConfig):
         self.config = config
-        self.db: Optional[CrawlDatabase] = None
-        self.downloader: Optional[RepoDownloader] = None
-        self.discovery: Optional[RepoDiscovery] = None
-        self.token_rotator: Optional[TokenRotator] = None
-        self._run_id: Optional[int] = None
+        self.db: CrawlDatabase | None = None
+        self.downloader: RepoDownloader | None = None
+        self.discovery: RepoDiscovery | None = None
+        self.token_rotator: TokenRotator | None = None
+        self._run_id: int | None = None
 
     async def init(self) -> None:
         """Initialize all components."""
@@ -67,7 +66,7 @@ class CrawlOrchestrator:
 
     async def discover_repos(
         self,
-        target_count: Optional[int] = None,
+        target_count: int | None = None,
     ) -> int:
         """Discover repositories via GitHub API and add to database.
 
@@ -90,7 +89,7 @@ class CrawlOrchestrator:
                 exclude_forks=self.config.exclude_forks,
             )
 
-    async def queue_repos(self, count: Optional[int] = None) -> int:
+    async def queue_repos(self, count: int | None = None) -> int:
         """Move discovered repos to download queue.
 
         Args:
@@ -108,7 +107,7 @@ class CrawlOrchestrator:
     async def download_repos(
         self,
         batch_size: int = 100,
-        progress_callback: Optional[callable] = None,
+        progress_callback: callable | None = None,
         randomize: bool = False,
     ) -> dict:
         """Download all queued repositories.
@@ -166,7 +165,10 @@ class CrawlOrchestrator:
             # Discovery phase (skip if we have enough)
             total_available = pending_count + downloading_count
             if total_available < self.config.target_repo_count:
-                print(f"Discovering repos (have {total_available}, need {self.config.target_repo_count})...")
+                print(
+                    f"Discovering repos (have {total_available},"
+                    f" need {self.config.target_repo_count})..."
+                )
                 stats["discovered"] = await self.discover_repos()
 
             # Queue phase
@@ -230,7 +232,7 @@ class CrawlOrchestrator:
             if not local_path or not Path(local_path).exists():
                 missing.append((full_name, local_path, status, size_kb))
 
-        for full_name, local_path, status, size_kb in missing:
+        for full_name, _local_path, status, size_kb in missing:
             size_mb = (size_kb or 0) / 1024
             await self.db.mark_failed(
                 full_name,

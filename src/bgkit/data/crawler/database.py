@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
 
 import aiosqlite
 
@@ -42,14 +41,14 @@ class RepoMetadata:
 
     full_name: str  # owner/repo
     stars: int
-    language: Optional[str]
-    license_key: Optional[str]
+    language: str | None
+    license_key: str | None
     size_kb: int
     default_branch: str
     fork: bool = False
     archived: bool = False
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 SCHEMA = """
@@ -129,7 +128,7 @@ class CrawlDatabase:
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
-        self._db: Optional[aiosqlite.Connection] = None
+        self._db: aiosqlite.Connection | None = None
         self._lock = asyncio.Lock()
 
     async def init(self) -> None:
@@ -153,7 +152,7 @@ class CrawlDatabase:
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         await self.close()
 
-    async def add_discovered_repos(self, repos: List[RepoMetadata]) -> int:
+    async def add_discovered_repos(self, repos: list[RepoMetadata]) -> int:
         """Bulk insert discovered repos. Returns number inserted."""
         async with self._lock:
             cursor = await self._db.executemany(
@@ -200,8 +199,8 @@ class CrawlDatabase:
 
     async def get_pending_repos(
         self, batch_size: int = 100, randomize: bool = False,
-        max_size_kb: Optional[int] = None,
-    ) -> List[RepoMetadata]:
+        max_size_kb: int | None = None,
+    ) -> list[RepoMetadata]:
         """Get next batch of repos to download.
 
         Args:
@@ -457,7 +456,7 @@ class CrawlDatabase:
 
     async def get_downloaded_repos(
         self, batch_size: int = 100, offset: int = 0
-    ) -> List[tuple]:
+    ) -> list[tuple]:
         """Get downloaded repos for processing."""
         async with self._db.execute(
             """
@@ -472,7 +471,7 @@ class CrawlDatabase:
             rows = await cursor.fetchall()
             return [(row["full_name"], row["local_path"], row["language"]) for row in rows]
 
-    async def get_repos_with_local_paths(self) -> List[tuple]:
+    async def get_repos_with_local_paths(self) -> list[tuple]:
         """Get all repos that claim to have a local clone on disk.
 
         Returns list of (full_name, local_path, status, size_kb) for repos
@@ -538,7 +537,7 @@ class CrawlDatabase:
         tier: str,
         language: str,
         star_range_low: int,
-        star_range_high: Optional[int],
+        star_range_high: int | None,
         repos_found: int,
     ) -> None:
         """Mark a discovery query (tier x language x star_range) as complete."""
@@ -570,7 +569,7 @@ class CrawlDatabase:
             row = await cursor.fetchone()
             return row is not None
 
-    async def clear_discovery_progress(self, tier: Optional[str] = None) -> int:
+    async def clear_discovery_progress(self, tier: str | None = None) -> int:
         """Clear discovery progress to force re-discovery.
 
         Args:
@@ -667,7 +666,8 @@ class CrawlDatabase:
                     (full_name, owner, name, stars, language, license_key,
                      size_kb, default_branch, fork, archived, created_at,
                      updated_at, status, status_updated_at, metadata_updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """,
                     (
                         repo.full_name,
@@ -689,7 +689,7 @@ class CrawlDatabase:
 
     async def get_stale_repos(
         self, max_age_days: int = 30, limit: int = 1000
-    ) -> List[str]:
+    ) -> list[str]:
         """Get repos whose metadata hasn't been updated recently.
 
         Useful for periodic refresh of star counts, etc.

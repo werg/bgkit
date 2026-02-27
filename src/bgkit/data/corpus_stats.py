@@ -78,9 +78,10 @@ def tokenize_repo(
     file_tokens: list[dict] = []
 
     for f in snapshot.files:
-        if language_allowlist is not None:
-            if f.language is None or f.language not in language_allowlist:
-                continue
+        if language_allowlist is not None and (
+            f.language is None or f.language not in language_allowlist
+        ):
+            continue
 
         token_ids = tokenizer.encode(f.content, add_special_tokens=False)
         token_count = len(token_ids)
@@ -194,7 +195,7 @@ def process_corpus(
                 capped_files = []
                 capped_file_tokens = []
                 running = 0
-                for fs, ft in zip(repo_stats.files, file_tokens):
+                for fs, ft in zip(repo_stats.files, file_tokens, strict=False):
                     if running + fs.token_count > max_tokens_per_repo and capped_files:
                         break
                     capped_files.append(fs)

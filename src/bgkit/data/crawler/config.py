@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
 
 
 @dataclass
@@ -32,10 +31,10 @@ class CrawlerConfig:
     clone_timeout_seconds: int = 3600
     retry_attempts: int = 3
     retry_delay_seconds: int = 60
-    github_tokens: List[str] = field(default_factory=list)
+    github_tokens: list[str] = field(default_factory=list)
     exclude_forks: bool = True
     exclude_archived: bool = False
-    max_repo_size_kb: Optional[int] = None
+    max_repo_size_kb: int | None = None
     bare_clone: bool = True
 
     def __post_init__(self):

@@ -9,10 +9,10 @@ import pytest
 from bgkit.data.repo_processing import (
     FileRecord,
     RepoSnapshot,
+    _should_skip_path,
     detect_language,
     extract_repo_snapshot,
     load_repo_files,
-    _should_skip_path,
 )
 from bgkit.utils.git_utils import is_git_repo
 

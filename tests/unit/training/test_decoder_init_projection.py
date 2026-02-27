@@ -18,7 +18,6 @@ from bgkit.models.encoder import BgKITEncoder
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
-
 # ---------------------------------------------------------------------------
 # Mock backbones (same pattern as test_decoder_init_trainer.py)
 # ---------------------------------------------------------------------------
@@ -327,7 +326,7 @@ class TestPhaseTransition:
         t._maybe_end_projection_only()
 
         # Verify optimizer state is preserved (not reset)
-        for pid, old_state in pre_state.items():
+        for _pid, old_state in pre_state.items():
             new_state = t.optimizer.state[old_state["param"]]
             assert torch.equal(old_state["exp_avg"], new_state["exp_avg"]), \
                 "exp_avg should be preserved across transition"
@@ -552,7 +551,7 @@ class TestProjectionCheckpoint:
             projection_only_steps=100,
         )
         t.global_step = 5
-        ckpt_path = t.save_checkpoint(tmp_path)
+        t.save_checkpoint(tmp_path)
         assert "decoder_frozen" in t._training_state
         assert t._training_state["decoder_frozen"] is True
 

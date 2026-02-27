@@ -227,7 +227,7 @@ class TestPerRepoTokenCap:
             capped_files = []
             capped_file_tokens = []
             running = 0
-            for fs, ft in zip(stats.files, file_tokens):
+            for fs, ft in zip(stats.files, file_tokens, strict=False):
                 if running + fs.token_count > max_tokens_per_repo and capped_files:
                     break
                 capped_files.append(fs)
@@ -267,7 +267,7 @@ class TestPerRepoTokenCap:
             capped_files = []
             capped_file_tokens = []
             running = 0
-            for fs, ft in zip(stats.files, file_tokens):
+            for fs, ft in zip(stats.files, file_tokens, strict=False):
                 if running + fs.token_count > max_tokens_per_repo and capped_files:
                     break
                 capped_files.append(fs)

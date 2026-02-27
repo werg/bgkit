@@ -46,10 +46,10 @@ async def cmd_discover(args):
     """Discover repositories from GitHub API."""
     from bgkit.data.crawler.database import CrawlDatabase
     from bgkit.data.crawler.discovery import (
-        RepoDiscovery,
+        EMERGING_LANGUAGES,
         MAINSTREAM_LANGUAGES,
         NICHE_LANGUAGES,
-        EMERGING_LANGUAGES,
+        RepoDiscovery,
     )
     from bgkit.data.crawler.rate_limiter import RateLimitedClient, TokenRotator
 
@@ -142,7 +142,7 @@ async def cmd_download(args):
                 randomize=args.randomize,
             )
 
-        print(f"\nDownload complete:")
+        print("\nDownload complete:")
         print(f"  Downloaded: {stats.get('total_downloaded', 0)}")
         print(f"  Failed:     {stats.get('total_failed', 0)}")
         print(f"  Skipped:    {stats.get('total_skipped', 0)}")
@@ -168,12 +168,12 @@ async def cmd_stats(args):
     async with CrawlDatabase(db_path) as db:
         stats = await db.get_stats()
 
-        print(f"\nRepository Status:")
+        print("\nRepository Status:")
         for status, count in stats.items():
             if isinstance(count, int) and count > 0:
                 print(f"  {status:20} {count:,}")
 
-        print(f"\nLanguage Distribution (top 20):")
+        print("\nLanguage Distribution (top 20):")
         lang_dist = await db.get_language_distribution()
         for lang, count in list(lang_dist.items())[:20]:
             print(f"  {lang:20} {count:,}")
@@ -181,11 +181,14 @@ async def cmd_stats(args):
         # Show discovery progress
         disc_stats = await db.get_discovery_stats()
         if disc_stats["total_queries_complete"] > 0:
-            print(f"\nDiscovery Progress:")
+            print("\nDiscovery Progress:")
             print(f"  Total queries complete: {disc_stats['total_queries_complete']}")
             print(f"  Total repos found:      {disc_stats['total_repos_found']:,}")
             for tier, tier_stats in disc_stats["tiers"].items():
-                print(f"    {tier}: {tier_stats['queries_complete']} queries, {tier_stats['repos_found']:,} repos")
+                print(
+                    f"    {tier}: {tier_stats['queries_complete']} queries,"
+                    f" {tier_stats['repos_found']:,} repos"
+                )
 
     return 0
 
@@ -261,7 +264,7 @@ async def cmd_reconcile(args):
         print("Checking for repos with missing local directories...")
         stats = await orchestrator.reconcile_missing()
 
-        print(f"\nReconciliation complete:")
+        print("\nReconciliation complete:")
         print(f"  Checked:  {stats['checked']}")
         print(f"  OK:       {stats['ok']}")
         print(f"  Missing:  {stats['missing']} (marked as failed)")
@@ -294,7 +297,7 @@ async def cmd_full(args):
         print("Starting full crawl pipeline...")
         stats = await orchestrator.run_full_crawl()
 
-        print(f"\nCrawl complete:")
+        print("\nCrawl complete:")
         print(json.dumps(stats, indent=2))
 
     return 0
@@ -320,7 +323,8 @@ def main():
         "--target", type=int, default=100000, help="Target number of repos"
     )
     discover_parser.add_argument(
-        "--min-stars", type=int, default=50, help="Minimum star count for mainstream languages (default: 50)"
+        "--min-stars", type=int, default=50,
+        help="Minimum star count for mainstream languages (default: 50)",
     )
     discover_parser.add_argument(
         "--include-forks", action="store_true", help="Include forked repos"
@@ -375,7 +379,8 @@ def main():
     )
     download_parser.add_argument(
         "--max-size", type=int, default=None,
-        help="Maximum repo size in MB (based on GitHub API size estimate). Repos larger than this are skipped."
+        help="Maximum repo size in MB (based on GitHub API size estimate)."
+        " Repos larger than this are skipped.",
     )
 
     # Stats command
@@ -387,7 +392,8 @@ def main():
         "--target", type=int, default=100000, help="Target number of repos"
     )
     full_parser.add_argument(
-        "--min-stars", type=int, default=50, help="Minimum star count for mainstream languages (default: 50)"
+        "--min-stars", type=int, default=50,
+        help="Minimum star count for mainstream languages (default: 50)",
     )
     full_parser.add_argument(
         "--output",
@@ -418,13 +424,15 @@ def main():
     )
     full_parser.add_argument(
         "--max-size", type=int, default=None,
-        help="Maximum repo size in MB (based on GitHub API size estimate). Repos larger than this are skipped."
+        help="Maximum repo size in MB (based on GitHub API size estimate)."
+        " Repos larger than this are skipped.",
     )
 
     # Reconcile command
     subparsers.add_parser(
         "reconcile",
-        help="Check for repos marked as downloaded whose local files are missing, and mark them as failed"
+        help="Check for repos marked as downloaded whose local files are missing,"
+        " and mark them as failed",
     )
 
     # Refresh command - for periodic re-runs

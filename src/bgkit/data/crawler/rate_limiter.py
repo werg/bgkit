@@ -11,14 +11,14 @@ This module implements conservative throttling to avoid secondary rate limits.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import random
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import UTC, datetime
+from typing import Any, ClassVar
 
 import httpx
-
 
 # Search API has a separate 30 req/min limit. Be conservative.
 SEARCH_API_MIN_DELAY = 2.5  # seconds between search requests
@@ -33,14 +33,14 @@ class TokenState:
     token: str
     token_hash: str
     remaining: int = 5000  # Default GitHub rate limit
-    reset_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    reset_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     @property
     def is_available(self) -> bool:
         """Check if token has available requests."""
         if self.remaining > 0:
             return True
-        return datetime.now(timezone.utc) >= self.reset_at
+        return datetime.now(UTC) >= self.reset_at
 
 
 class TokenRotator:
@@ -53,8 +53,8 @@ class TokenRotator:
     - Sleep when all tokens exhausted
     """
 
-    def __init__(self, tokens: List[str]):
-        self.tokens: List[TokenState] = []
+    def __init__(self, tokens: list[str]):
+        self.tokens: list[TokenState] = []
         self._lock = asyncio.Lock()
 
         for token in tokens:
@@ -86,7 +86,7 @@ class TokenRotator:
                     raise RuntimeError("No API tokens configured")
 
                 next_reset = min(t.reset_at for t in self.tokens)
-                wait_seconds = (next_reset - datetime.now(timezone.utc)).total_seconds()
+                wait_seconds = (next_reset - datetime.now(UTC)).total_seconds()
 
                 if wait_seconds > 0:
                     print(f"Rate limited. Waiting {wait_seconds:.0f}s until reset.")
@@ -96,7 +96,7 @@ class TokenRotator:
         self, token: str, remaining: int, reset_timestamp: int
     ) -> None:
         """Update token state from API response headers."""
-        reset_at = datetime.fromtimestamp(reset_timestamp, tz=timezone.utc)
+        reset_at = datetime.fromtimestamp(reset_timestamp, tz=UTC)
 
         async with self._lock:
             for t in self.tokens:
@@ -105,7 +105,7 @@ class TokenRotator:
                     t.reset_at = reset_at
                     break
 
-    def get_status(self) -> List[Dict[str, Any]]:
+    def get_status(self) -> list[dict[str, Any]]:
         """Get status of all tokens (for debugging/monitoring)."""
         return [
             {
@@ -132,12 +132,12 @@ class RateLimitedClient:
 
     BASE_URL = "https://api.github.com"
     MAX_RETRIES = 3
-    SECONDARY_RATE_LIMIT_BACKOFF = [60, 120, 300]  # seconds
+    SECONDARY_RATE_LIMIT_BACKOFF: ClassVar[list[int]] = [60, 120, 300]  # seconds
 
     def __init__(self, token_rotator: TokenRotator, timeout: float = 30.0):
         self.rotator = token_rotator
         self.timeout = timeout
-        self._client: Optional[httpx.AsyncClient] = None
+        self._client: httpx.AsyncClient | None = None
         self._last_search_time: float = 0
 
     async def __aenter__(self) -> "RateLimitedClient":
@@ -185,7 +185,7 @@ class RateLimitedClient:
         self,
         method: str,
         endpoint: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
         retry_count: int = 0,
         **kwargs,
     ) -> httpx.Response:
@@ -214,34 +214,42 @@ class RateLimitedClient:
         # Handle secondary rate limits (abuse detection)
         if self._is_secondary_rate_limit(response):
             if retry_count < self.MAX_RETRIES:
-                backoff = self.SECONDARY_RATE_LIMIT_BACKOFF[min(retry_count, len(self.SECONDARY_RATE_LIMIT_BACKOFF) - 1)]
+                idx = min(retry_count, len(self.SECONDARY_RATE_LIMIT_BACKOFF) - 1)
+                backoff = self.SECONDARY_RATE_LIMIT_BACKOFF[idx]
                 retry_after = response.headers.get("Retry-After")
                 if retry_after:
-                    try:
+                    with contextlib.suppress(ValueError):
                         backoff = int(retry_after)
-                    except ValueError:
-                        pass
-                print(f"Secondary rate limit hit. Backing off for {backoff}s (attempt {retry_count + 1}/{self.MAX_RETRIES})")
+                print(
+                    f"Secondary rate limit hit. Backing off for {backoff}s"
+                    f" (attempt {retry_count + 1}/{self.MAX_RETRIES})"
+                )
                 await asyncio.sleep(backoff)
-                return await self.request(method, endpoint, params=params, retry_count=retry_count + 1, **kwargs)
+                return await self.request(
+                    method, endpoint, params=params,
+                    retry_count=retry_count + 1, **kwargs,
+                )
             else:
                 print(f"Secondary rate limit: max retries exceeded for {endpoint}")
 
         # Handle primary rate limit errors
         if response.status_code == 403 and remaining == 0:
             # Rate limited - retry with different token
-            return await self.request(method, endpoint, params=params, retry_count=retry_count, **kwargs)
+            return await self.request(
+                method, endpoint, params=params,
+                retry_count=retry_count, **kwargs,
+            )
 
         return response
 
     async def get(
-        self, endpoint: str, params: Optional[Dict[str, Any]] = None
+        self, endpoint: str, params: dict[str, Any] | None = None
     ) -> httpx.Response:
         """GET request."""
         return await self.request("GET", endpoint, params=params)
 
     async def get_json(
-        self, endpoint: str, params: Optional[Dict[str, Any]] = None
+        self, endpoint: str, params: dict[str, Any] | None = None
     ) -> Any:
         """GET request returning JSON."""
         response = await self.get(endpoint, params=params)
@@ -251,9 +259,9 @@ class RateLimitedClient:
     async def get_paginated(
         self,
         endpoint: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
         max_pages: int = 10,
-    ) -> List[Any]:
+    ) -> list[Any]:
         """GET request with pagination, returning all results."""
         if params is None:
             params = {}
@@ -288,7 +296,7 @@ class RateLimitedClient:
 
         return all_results
 
-    async def get_repo(self, full_name: str) -> Dict[str, Any]:
+    async def get_repo(self, full_name: str) -> dict[str, Any]:
         """Get repository details."""
         return await self.get_json(f"/repos/{full_name}")
 
@@ -299,18 +307,12 @@ class RateLimitedClient:
         order: str = "desc",
         per_page: int = 100,
         max_pages: int = 10,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Search repositories with pagination and throttling.
 
         The Search API has a separate rate limit of 30 requests/minute.
         This method enforces delays between requests to stay within limits.
         """
-        params = {
-            "q": query,
-            "sort": sort,
-            "order": order,
-            "per_page": per_page,
-        }
         results, _ = await self.search_repos_with_count(query, sort, order, per_page, max_pages)
         return results
 
@@ -321,7 +323,7 @@ class RateLimitedClient:
         order: str = "desc",
         per_page: int = 100,
         max_pages: int = 10,
-    ) -> Tuple[List[Dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int]:
         """Search repositories and return (results, total_count).
 
         Returns:
@@ -339,9 +341,9 @@ class RateLimitedClient:
     async def get_paginated_search(
         self,
         endpoint: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
         max_pages: int = 10,
-    ) -> List[Any]:
+    ) -> list[Any]:
         """GET request with pagination for search endpoints (with throttling)."""
         if params is None:
             params = {}
@@ -386,9 +388,9 @@ class RateLimitedClient:
     async def get_paginated_search_with_count(
         self,
         endpoint: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: dict[str, Any] | None = None,
         max_pages: int = 10,
-    ) -> Tuple[List[Any], int]:
+    ) -> tuple[list[Any], int]:
         """GET request with pagination for search endpoints, returning (results, total_count).
 
         Returns:
@@ -438,6 +440,6 @@ class RateLimitedClient:
 
         return all_results, total_count
 
-    async def check_rate_limit(self) -> Dict[str, Any]:
+    async def check_rate_limit(self) -> dict[str, Any]:
         """Check current rate limit status."""
         return await self.get_json("/rate_limit")

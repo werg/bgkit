@@ -26,7 +26,7 @@ def _create_ice_data(
     all_ce = []
     offsets = [0]
     ce_offsets = [0]
-    for tids, cev in zip(file_token_ids, file_ce_values):
+    for tids, cev in zip(file_token_ids, file_ce_values, strict=False):
         all_tokens.extend(tids)
         offsets.append(len(all_tokens))
         all_ce.extend(cev)

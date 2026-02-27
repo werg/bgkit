@@ -7,11 +7,10 @@ API calls. Only subdivides queries when results exceed GitHub's 1000-result limi
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 from bgkit.data.crawler.database import CrawlDatabase, RepoMetadata
 from bgkit.data.crawler.rate_limiter import RateLimitedClient
-
 
 # GitHub Search API hard limit - cannot retrieve more than 1000 results per query
 GITHUB_SEARCH_LIMIT = 1000
@@ -22,7 +21,7 @@ SUBDIVISION_THRESHOLDS = [100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 20
 
 # Starting star thresholds by language popularity
 # Avoids wasting API calls checking 100K+ stars for niche languages
-LANGUAGE_START_THRESHOLD: Dict[str, int] = {
+LANGUAGE_START_THRESHOLD: dict[str, int] = {
     # Mega-popular: start at 100K
     "python": 100000,
     "javascript": 100000,
@@ -82,7 +81,7 @@ DEFAULT_START_THRESHOLD = 1000
 
 # Mainstream languages (high activity, many repos)
 # Use standard star threshold (50+)
-MAINSTREAM_LANGUAGES: List[str] = [
+MAINSTREAM_LANGUAGES: list[str] = [
     "python",
     "javascript",
     "typescript",
@@ -102,7 +101,7 @@ MAINSTREAM_LANGUAGES: List[str] = [
 
 # Niche high-quality languages (functional, academic, specialized)
 # Use lower star threshold (20+) as there are fewer repos
-NICHE_LANGUAGES: List[str] = [
+NICHE_LANGUAGES: list[str] = [
     # Functional programming
     "haskell",
     "ocaml",
@@ -145,7 +144,7 @@ NICHE_LANGUAGES: List[str] = [
 
 # Emerging/new languages (growing ecosystems)
 # Use lowest star threshold (10+) as many are very new
-EMERGING_LANGUAGES: List[str] = [
+EMERGING_LANGUAGES: list[str] = [
     "zig",
     "gleam",
     "mojo",
@@ -165,14 +164,14 @@ NICHE_MIN_STARS = 20
 EMERGING_MIN_STARS = 10
 
 # Combined for backward compatibility
-LANGUAGES: List[str] = MAINSTREAM_LANGUAGES
+LANGUAGES: list[str] = MAINSTREAM_LANGUAGES
 
 
 @dataclass
 class DiscoveryResult:
     """Result of repository discovery."""
 
-    repos: List[RepoMetadata]
+    repos: list[RepoMetadata]
     total_found: int
 
 
@@ -187,7 +186,7 @@ class RepoDiscovery:
         self.client = client
         self.db = db
 
-    def _parse_repo(self, data: Dict[str, Any]) -> RepoMetadata:
+    def _parse_repo(self, data: dict[str, Any]) -> RepoMetadata:
         """Parse GitHub API response into RepoMetadata."""
         return RepoMetadata(
             full_name=data["full_name"],
@@ -209,11 +208,11 @@ class RepoDiscovery:
     async def discover_by_star_range(
         self,
         min_stars: int,
-        max_stars: Optional[int] = None,
-        language: Optional[str] = None,
+        max_stars: int | None = None,
+        language: str | None = None,
         exclude_forks: bool = True,
         max_pages: int = 10,
-    ) -> Tuple[List[RepoMetadata], int]:
+    ) -> tuple[list[RepoMetadata], int]:
         """Discover repos within a star range.
 
         Returns:
@@ -221,10 +220,10 @@ class RepoDiscovery:
             total_count indicates how many repos match (may exceed 1000 limit)
         """
         # Build query
-        if max_stars:
-            query = f"stars:{min_stars}..{max_stars}"
-        else:
-            query = f"stars:>={min_stars}"
+        query = (
+            f"stars:{min_stars}..{max_stars}" if max_stars
+            else f"stars:>={min_stars}"
+        )
 
         if language:
             query += f" language:{language}"
@@ -249,7 +248,7 @@ class RepoDiscovery:
         target_count: int = 100000,
         min_stars: int = 100,
         exclude_forks: bool = True,
-        progress_callback: Optional[callable] = None,
+        progress_callback: callable | None = None,
     ) -> DiscoveryResult:
         """Discover top repositories by stars.
 
@@ -265,7 +264,7 @@ class RepoDiscovery:
         Returns:
             DiscoveryResult with discovered repos
         """
-        all_repos: List[RepoMetadata] = []
+        all_repos: list[RepoMetadata] = []
         seen_names: set = set()
 
         # Start with a broad query
@@ -313,16 +312,16 @@ class RepoDiscovery:
         exclude_forks: bool,
         seen_names: set,
         target_count: int,
-        language: Optional[str] = None,
-        progress_callback: Optional[callable] = None,
-    ) -> List[RepoMetadata]:
+        language: str | None = None,
+        progress_callback: callable | None = None,
+    ) -> list[RepoMetadata]:
         """Recursively subdivide star ranges when results exceed 1000.
 
         Strategy: binary search through star thresholds to find ranges
         with <1000 results each.
         """
-        all_repos: List[RepoMetadata] = list()
-        for name in seen_names:
+        all_repos: list[RepoMetadata] = list()
+        for _name in seen_names:
             pass  # seen_names already tracked, repos added below
 
         # Get thresholds above our min_stars
@@ -343,7 +342,7 @@ class RepoDiscovery:
             if len(all_repos) >= target_count:
                 break
 
-            repos, total_count = await self.discover_by_star_range(
+            repos, _total_count = await self.discover_by_star_range(
                 min_stars=range_min,
                 max_stars=range_max,
                 language=language,
@@ -368,13 +367,13 @@ class RepoDiscovery:
         self,
         language: str,
         min_stars: int,
-        max_stars: Optional[int],
+        max_stars: int | None,
         exclude_forks: bool,
         seen_names: set,
         tier_name: str,
-        target_count: Optional[int] = None,
+        target_count: int | None = None,
         current_total: int = 0,
-    ) -> Tuple[int, int]:
+    ) -> tuple[int, int]:
         """Discover repos for a single language, starting high and backing off.
 
         Strategy:
@@ -412,7 +411,7 @@ class RepoDiscovery:
         # Track the upper bound as we descend through thresholds
         upper_bound = max_stars
 
-        for i, threshold in enumerate(thresholds):
+        for _i, threshold in enumerate(thresholds):
             # Check if we've hit our target
             if target_count and (current_total + total_new) >= target_count:
                 break
@@ -454,7 +453,10 @@ class RepoDiscovery:
 
             # Log progress
             if query_total > GITHUB_SEARCH_LIMIT:
-                print(f"    {threshold}-{upper_bound or '∞'} stars: {len(repos)} retrieved ({query_total} total, truncated)")
+                print(
+                    f"    {threshold}-{upper_bound or '∞'} stars:"
+                    f" {len(repos)} retrieved ({query_total} total, truncated)"
+                )
             elif len(repos) > 0:
                 print(f"    {threshold}-{upper_bound or '∞'} stars: {len(repos)} repos")
 
@@ -470,7 +472,7 @@ class RepoDiscovery:
 
     async def _discover_language_tier(
         self,
-        languages: List[str],
+        languages: list[str],
         min_stars: int,
         exclude_forks: bool,
         seen_names: set,
@@ -526,7 +528,10 @@ class RepoDiscovery:
             )
 
             tier_stored += new_count
-            print(f"  Total for {lang}: {total_found} found, {new_count} new (tier: {tier_stored}, total: {current_total + tier_stored})")
+            print(
+                f"  Total for {lang}: {total_found} found, {new_count} new"
+                f" (tier: {tier_stored}, total: {current_total + tier_stored})"
+            )
 
         if skipped_languages > 0:
             print(f"  (Skipped {skipped_languages} already-completed languages)")
@@ -538,7 +543,7 @@ class RepoDiscovery:
         target_count: int = 100000,
         min_stars: int = 50,
         exclude_forks: bool = True,
-        languages: Optional[List[str]] = None,
+        languages: list[str] | None = None,
         include_niche: bool = True,
         include_emerging: bool = True,
         resume: bool = True,
@@ -578,9 +583,15 @@ class RepoDiscovery:
         if resume:
             disc_stats = await self.db.get_discovery_stats()
             if disc_stats["total_queries_complete"] > 0:
-                print(f"Resuming discovery: {disc_stats['total_queries_complete']} queries already complete")
+                print(
+                    f"Resuming discovery: {disc_stats['total_queries_complete']}"
+                    " queries already complete"
+                )
                 for tier, stats in disc_stats["tiers"].items():
-                    print(f"  {tier}: {stats['queries_complete']} queries, {stats['repos_found']} repos")
+                    print(
+                        f"  {tier}: {stats['queries_complete']} queries,"
+                        f" {stats['repos_found']} repos"
+                    )
 
         total_stored = 0
         seen_names: set = set()
@@ -607,7 +618,10 @@ class RepoDiscovery:
                 )
 
                 total_stored += new_count
-                print(f"  Total for {lang}: {total_found} found, {new_count} new (total: {total_stored})")
+                print(
+                    f"  Total for {lang}: {total_found} found,"
+                    f" {new_count} new (total: {total_stored})"
+                )
 
             return total_stored
 
@@ -658,7 +672,7 @@ class RepoDiscovery:
         print(f"\n=== Discovery complete: {total_stored} new repos stored ===")
         return total_stored
 
-    async def validate_repo(self, full_name: str) -> Optional[RepoMetadata]:
+    async def validate_repo(self, full_name: str) -> RepoMetadata | None:
         """Validate a repo still exists and get current metadata.
 
         Returns None if repo doesn't exist or is inaccessible.
@@ -669,7 +683,7 @@ class RepoDiscovery:
         except Exception:
             return None
 
-    async def resolve_redirect(self, full_name: str) -> Optional[str]:
+    async def resolve_redirect(self, full_name: str) -> str | None:
         """Check if repo has been renamed and return new name."""
         try:
             data = await self.client.get_repo(full_name)
