@@ -56,8 +56,12 @@ MAX_FILES_PER_REPO = 1000
 # Prompt format version — increment when prompt builders change
 PROMPT_VERSION = 4
 
-# Llama-server client (initialized by init_local_client)
-_llama_client: LlamaClient | None = None
+# Llama-server clients (initialized by init_local_client)
+_llama_client_large: LlamaClient | None = None
+_llama_client_small: LlamaClient | None = None
+
+# Files above this char count go to the small model
+SMALL_MODEL_CHAR_THRESHOLD = 3000
 
 
 # ---------------------------------------------------------------------------
@@ -118,66 +122,112 @@ def _backoff(attempt: int) -> None:
 # Local llama-server backend
 # ---------------------------------------------------------------------------
 
-def init_local_client(
-    url: str | None = None,
-    readiness_timeout: float = 120.0,
-) -> None:
-    """Initialize the llama-server client and verify readiness."""
-    global _llama_client
-
-    try:
-        parallel = int(os.environ.get("LLAMA_PARALLEL", 16))
-    except ValueError:
-        raw = os.environ.get("LLAMA_PARALLEL")
-        logger.warning("invalid_LLAMA_PARALLEL, using default", value=raw)
-        parallel = 16
-    base_url = url or os.environ.get("LLAMA_URL", "http://localhost:8080")
-
-    model_filename = os.environ.get("LLAMA_MODEL", "")
-    if not model_filename:
-        logger.warning(
-            "LLAMA_MODEL not set, using default model profile (no thinking-mode handling)"
-        )
+def _make_client(
+    base_url: str,
+    model_env: str,
+    parallel: int,
+    readiness_timeout: float,
+    label: str,
+) -> LlamaClient:
+    """Create and verify a single LlamaClient."""
+    model_filename = os.environ.get(model_env, "")
     profile = resolve_profile(model_filename)
-    logger.info("resolved_model_profile", model=model_filename, profile=profile.name)
+    logger.info("resolved_model_profile", label=label, model=model_filename, profile=profile.name)
 
     config = InferenceConfig(
         base_url=base_url,
         max_concurrent=parallel,
         model_profile=profile,
     )
-    _llama_client = LlamaClient(config)
-    logger.info("waiting_for_llama_server", url=base_url)
-    if not _llama_client.wait_ready_sync(timeout=readiness_timeout):
+    client = LlamaClient(config)
+    logger.info("waiting_for_llama_server", label=label, url=base_url)
+    if not client.wait_ready_sync(timeout=readiness_timeout):
         print(
-            f"ERROR: llama-server at {base_url} not ready after {readiness_timeout}s. "
+            f"ERROR: llama-server ({label}) at {base_url} not ready after {readiness_timeout}s. "
             f"Start it with: make llama-server",
             file=sys.stderr,
         )
         sys.exit(1)
-    _llama_client.warmup_sync()
-    logger.info("llama_server_ready", url=base_url)
+    client.warmup_sync()
+    logger.info("llama_server_ready", label=label, url=base_url)
+    return client
 
 
-def call_local(prompt: str, max_new_tokens: int = 512) -> str | None:
-    """Generate a description using the llama-server."""
-    if _llama_client is None:
-        return None
-    return _llama_client.generate_sync(prompt, max_tokens=max_new_tokens)
+def init_local_client(
+    url: str | None = None,
+    readiness_timeout: float = 120.0,
+) -> None:
+    """Initialize both llama-server clients and verify readiness.
+
+    Both large and small model servers must be running. Exits if either is
+    unreachable. Start both with: make llama-server
+    """
+    global _llama_client_large, _llama_client_small
+
+    try:
+        parallel_large = int(os.environ.get("LLAMA_PARALLEL_LARGE", 8))
+    except ValueError:
+        parallel_large = 8
+    try:
+        parallel_small = int(os.environ.get("LLAMA_PARALLEL_SMALL", 16))
+    except ValueError:
+        parallel_small = 16
+
+    url_large = url or os.environ.get("LLAMA_URL", "http://localhost:8080")
+    url_small = os.environ.get("LLAMA_URL_SMALL", "http://localhost:8081")
+
+    _llama_client_large = _make_client(
+        url_large, "LLAMA_MODEL_LARGE", parallel_large, readiness_timeout, "large"
+    )
+    _llama_client_small = _make_client(
+        url_small, "LLAMA_MODEL_SMALL", parallel_small, readiness_timeout, "small"
+    )
+
+
+def call_local(
+    prompt: str, max_new_tokens: int = 512, content_chars: int = 0
+) -> tuple[str | None, str]:
+    """Generate a description using the llama-server.
+
+    Routes to small model if content_chars > SMALL_MODEL_CHAR_THRESHOLD.
+    Returns (description, backend_label).
+    """
+    if content_chars > SMALL_MODEL_CHAR_THRESHOLD:
+        return (_llama_client_small.generate_sync(prompt, max_tokens=max_new_tokens), "local-small")
+    return (_llama_client_large.generate_sync(prompt, max_tokens=max_new_tokens), "local-large")
 
 
 def call_local_batch(
-    prompts: list[str], max_new_tokens: int = 512
-) -> list[str | None]:
-    """Generate descriptions for multiple prompts concurrently via llama-server.
+    prompts: list[str],
+    content_lengths: list[int] | None = None,
+    max_new_tokens: int = 512,
+) -> list[tuple[str | None, str]]:
+    """Generate descriptions for multiple prompts with size-based routing.
 
-    Uses async batch internally — fills all server slots in parallel.
+    Routes each prompt to large or small model based on content_lengths.
+    Both models' semaphores independently control their own concurrency.
+    Returns list of (description, backend_label) tuples.
     """
-    if _llama_client is None:
-        return [None] * len(prompts)
+    if content_lengths is None:
+        content_lengths = [0] * len(prompts)
+
+    import asyncio
+
+    async def _generate_routed() -> list[tuple[str | None, str]]:
+        async def _one(prompt: str, chars: int) -> tuple[str | None, str]:
+            if chars > SMALL_MODEL_CHAR_THRESHOLD:
+                result = await _llama_client_small.generate(prompt, max_tokens=max_new_tokens)
+                return (result, "local-small")
+            result = await _llama_client_large.generate(prompt, max_tokens=max_new_tokens)
+            return (result, "local-large")
+
+        return await asyncio.gather(
+            *[_one(p, c) for p, c in zip(prompts, content_lengths, strict=True)]
+        )
+
     from bgkit.inference.client import _run_sync
 
-    return _run_sync(_llama_client.generate_batch(prompts, max_tokens=max_new_tokens))
+    return _run_sync(_generate_routed())
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +241,7 @@ def generate_description(
     prompt: str,
     backend: str,
     backend_cycle: itertools.cycle | None = None,
+    content_chars: int = 0,
 ) -> tuple[str | None, str]:
     """Generate a description using the specified backend.
 
@@ -206,8 +257,7 @@ def generate_description(
         result = call_claude(prompt)
         return (result, "haiku")
     elif chosen == "local":
-        result = call_local(prompt)
-        return (result, "local")
+        return call_local(prompt, content_chars=content_chars)
     else:
         return (None, chosen)
 
@@ -401,11 +451,15 @@ def process_single_repo(
             ]
 
             if backend == "local":
-                # Batch: all prompts sent concurrently, fills server slots in parallel
+                # Batch: all prompts sent concurrently, routed by content size
+                content_lengths = [len(fr.content) for fr, _ in file_prompts]
                 results = call_local_batch(
-                    [p for _, p in file_prompts]
+                    [p for _, p in file_prompts],
+                    content_lengths=content_lengths,
                 )
-                for (fr, _prompt), desc in zip(file_prompts, results, strict=True):
+                for (fr, _prompt), (desc, backend_label) in zip(
+                    file_prompts, results, strict=True
+                ):
                     if not desc:
                         logger.warning(
                             "file_description_failed", file_path=fr.path,
@@ -418,7 +472,7 @@ def process_single_repo(
                             "commit_sha": commit_sha,
                             "description": desc,
                             "language": fr.language or "",
-                            "backend": "local",
+                            "backend": backend_label,
                             "prompt_version": PROMPT_VERSION,
                         }
                         records.append(rec)
@@ -427,7 +481,8 @@ def process_single_repo(
                 # Sequential: haiku/mixed backends use per-request dispatch
                 for fr, prompt in file_prompts:
                     desc, used_backend = generate_description(
-                        prompt, backend, backend_cycle
+                        prompt, backend, backend_cycle,
+                        content_chars=len(fr.content),
                     )
                     if desc is None:
                         logger.warning(

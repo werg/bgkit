@@ -104,8 +104,8 @@ get_gpu_memory() {
     nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 || echo "0"
 }
 
-PORT="${LLAMA_PORT:-8080}"
-MODEL="${LLAMA_MODEL:-LFM2-8B-A1B-Q4_K_M.gguf}"
+PORT="${LLAMA_PORT_LARGE:-8080}"
+MODEL="${LLAMA_MODEL_LARGE:-LFM2-8B-A1B-Q4_K_M.gguf}"
 
 echo "Llama-server benchmark"
 echo "Results: $OUTPUT"
@@ -115,8 +115,8 @@ for parallel in 8 16 24 32 48; do
     for ctx in 32768 65536 131072 262144; do
         echo "=== parallel=${parallel} ctx_size=${ctx} ==="
 
-        LLAMA_PARALLEL="$parallel" LLAMA_CTX="$ctx" \
-            $COMPOSE up -d --force-recreate llama
+        LLAMA_PARALLEL_LARGE="$parallel" LLAMA_CTX_LARGE="$ctx" \
+            $COMPOSE up -d --force-recreate llama-large
 
         if ! wait_healthy "$PORT" 120; then
             echo "SKIP (unhealthy)"

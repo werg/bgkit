@@ -81,14 +81,26 @@ services:
       - ${DATA_DIR:-../data}:/workspace/data
     command: ["scripts/process_repos.py"]
 
-  llama:
+  llama-large:
     <<: *llama-common
     ports:
-      - "${LLAMA_PORT:-8080}:8080"
+      - "${LLAMA_PORT_LARGE:-8080}:8080"
     command: >-
-      --model /models/${LLAMA_MODEL:-LFM2-8B-A1B-Q4_K_M.gguf}
+      --model /models/${LLAMA_MODEL_LARGE:-LFM2-8B-A1B-Q4_K_M.gguf}
       --host 0.0.0.0 --port 8080
-      --ctx-size ${LLAMA_CTX:-32768}
+      --ctx-size ${LLAMA_CTX_LARGE:-32768}
       --n-gpu-layers 999
-      --parallel ${LLAMA_PARALLEL:-8}
+      --parallel ${LLAMA_PARALLEL_LARGE:-8}
+      --flash-attn on --no-mmap --jinja
+
+  llama-small:
+    <<: *llama-common
+    ports:
+      - "${LLAMA_PORT_SMALL:-8081}:8080"
+    command: >-
+      --model /models/${LLAMA_MODEL_SMALL:-LFM2.5-1.2B-Instruct-Q8_0.gguf}
+      --host 0.0.0.0 --port 8080
+      --ctx-size ${LLAMA_CTX_SMALL:-32768}
+      --n-gpu-layers 999
+      --parallel ${LLAMA_PARALLEL_SMALL:-16}
       --flash-attn on --no-mmap --jinja
