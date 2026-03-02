@@ -1,4 +1,4 @@
-.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits convert-structural convert-descriptions convert-commits generate-variants download-models llama-server llama-server-stop llama-server-logs llama-bench
+.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits convert-structural convert-descriptions convert-commits generate-variants download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs
 
 install:
 	uv sync --extra dev --extra data
@@ -88,6 +88,27 @@ llama-server-logs:
 
 llama-bench:
 	scripts/llama-bench.sh
+
+# --- vLLM inference ---
+
+download-models-hf:
+	huggingface-cli download openai/gpt-oss-20b
+	huggingface-cli download Qwen/Qwen3.5-0.8B
+
+vllm-server:
+	docker compose -f docker/docker-compose.yaml up -d vllm-primary
+	@echo "Waiting for vllm-primary health..."
+	@timeout 300 bash -c 'until curl -sf http://localhost:$${VLLM_PORT_PRIMARY:-8090}/health; do sleep 3; done' && echo " OK" || { echo " TIMEOUT"; exit 1; }
+	docker compose -f docker/docker-compose.yaml up -d vllm-fast
+	@echo "Waiting for vllm-fast health..."
+	@timeout 300 bash -c 'until curl -sf http://localhost:$${VLLM_PORT_FAST:-8091}/health; do sleep 3; done' && echo " OK" || { echo " TIMEOUT"; exit 1; }
+
+vllm-server-stop:
+	docker compose -f docker/docker-compose.yaml stop vllm-primary vllm-fast
+	docker compose -f docker/docker-compose.yaml rm -f vllm-primary vllm-fast
+
+vllm-server-logs:
+	docker compose -f docker/docker-compose.yaml logs -f vllm-primary vllm-fast
 
 ckpt-backfill:
 	.venv/bin/bgkit-ckpt backfill

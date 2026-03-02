@@ -241,6 +241,47 @@ def test_empty_choices_returns_none():
     assert result is None
 
 
+def test_reasoning_content_fallback():
+    """When content is null, reasoning_content is used (GPT-OSS behavior)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, json={
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "This is the actual response.",
+                    },
+                    "finish_reason": "stop",
+                }],
+            })
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    result = client.generate_sync("test")
+    assert result == "This is the actual response."
+
+
+def test_extra_body_sent_in_payload():
+    """ModelProfile extra_body fields (include_reasoning, reasoning_effort) are sent."""
+
+    captured_body = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            captured_body.update(json.loads(request.content))
+            return httpx.Response(200, json=_make_completion_response("ok"))
+        return httpx.Response(404)
+
+    profile = MODEL_PROFILES["GPT-OSS"]
+    client = _make_client(handler, model_profile=profile)
+    client.generate_sync("test")
+    assert captured_body.get("include_reasoning") is False
+    assert captured_body.get("reasoning_effort") == "low"
+
+
 def test_bad_request_context_overflow_raises():
     """400 with n_prompt_tokens/n_ctx raises ContextOverflowError."""
     from bgkit.inference.client import ContextOverflowError
@@ -343,6 +384,118 @@ def test_apply_profile_updates_behavior():
     client.apply_profile(DEFAULT_PROFILE)
     result = client.generate_sync("test")
     assert "<think>" in result
+
+
+def test_vllm_context_overflow_raises():
+    """vLLM 400 with 'prompt is too long' raises ContextOverflowError."""
+    from bgkit.inference.client import ContextOverflowError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(400, json={
+                "error": {
+                    "message": "The model's maximum context length is 32768 tokens. "
+                    "However, your prompt is too long with 40000 tokens.",
+                    "type": "invalid_request_error",
+                }
+            })
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    with pytest.raises(ContextOverflowError):
+        client.generate_sync("test")
+
+
+def test_detect_backend_vllm():
+    """detect_backend returns 'vllm' when /version responds with version info."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "0.16.0"})
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    result = _run_sync(client.detect_backend())
+    assert result == "vllm"
+    assert client.is_vllm is True
+
+
+def test_detect_backend_llama():
+    """detect_backend returns 'llama' when /version returns 404."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    result = _run_sync(client.detect_backend())
+    assert result == "llama"
+    assert client.is_vllm is False
+
+
+def test_detect_backend_cached():
+    """detect_backend only probes once and caches the result."""
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        if request.url.path == "/version":
+            call_count += 1
+            return httpx.Response(200, json={"version": "0.16.0"})
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    _run_sync(client.detect_backend())
+    _run_sync(client.detect_backend())
+    assert call_count == 1
+
+
+def test_backend_type_overrides_auto_detection():
+    """Explicit backend_type='llama' is respected even if /version would say vllm."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "0.16.0"})
+        return httpx.Response(404)
+
+    client = _make_client(handler, backend_type="llama")
+    assert client.is_vllm is False
+
+    client2 = _make_client(handler, backend_type="vllm")
+    assert client2.is_vllm is True
+
+
+def test_vllm_omits_chat_template_kwargs():
+    """When backend is vLLM, chat_template_kwargs is NOT sent in the request."""
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            received["body"] = json.loads(request.content)
+            return httpx.Response(200, json=_make_completion_response("ok"))
+        return httpx.Response(404)
+
+    client = _make_client(handler, model_profile=_THINKING_PROFILE, backend_type="vllm")
+    _run_sync(client.generate("Hello"))
+    assert "chat_template_kwargs" not in received["body"]
+
+
+def test_llama_sends_chat_template_kwargs():
+    """When backend is llama, chat_template_kwargs IS sent in the request."""
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            received["body"] = json.loads(request.content)
+            return httpx.Response(200, json=_make_completion_response("ok"))
+        return httpx.Response(404)
+
+    client = _make_client(handler, model_profile=_THINKING_PROFILE, backend_type="llama")
+    _run_sync(client.generate("Hello"))
+    assert received["body"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_generate_sync_thread_safety():

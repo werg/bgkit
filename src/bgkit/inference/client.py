@@ -1,4 +1,4 @@
-"""Async and sync inference client for llama-server's OpenAI-compatible API."""
+"""Async and sync inference client for OpenAI-compatible APIs (llama-server and vLLM)."""
 
 from __future__ import annotations
 
@@ -70,13 +70,55 @@ class LlamaClient:
         self._semaphore: asyncio.Semaphore | None = None
         self._async_client: httpx.AsyncClient | None = None
         self._warmed_up = False
+        self._detected_backend: str | None = None  # "llama" or "vllm" after probe
         # Cache compiled regex from model profile
         self._think_re: re.Pattern[str] | None = None
         self._chat_template_kwargs: dict[str, Any] | None = None
+        self._extra_body: dict[str, Any] | None = None
         profile = self.config.model_profile
         if profile is not None:
             self._think_re = profile.compile_thinking_re()
             self._chat_template_kwargs = profile.get_chat_template_kwargs()
+            self._extra_body = profile.get_extra_body()
+
+    @property
+    def is_vllm(self) -> bool:
+        """Return True if the backend is known to be vLLM."""
+        bt = self.config.backend_type
+        if bt == "vllm":
+            return True
+        if bt == "llama":
+            return False
+        # "auto" — use detected value if available
+        return self._detected_backend == "vllm"
+
+    async def detect_backend(self) -> str:
+        """Probe /version to distinguish vLLM from llama-server.
+
+        vLLM returns 200 with ``{"version": "..."}``.  Any other response
+        (404, connection error) means llama-server.  The result is cached
+        in ``_detected_backend`` and also returned.
+        """
+        if self._detected_backend is not None:
+            return self._detected_backend
+        client = await self._get_client()
+        try:
+            resp = await client.get("/version")
+            if resp.status_code == 200:
+                data = resp.json()
+                if "version" in data:
+                    self._detected_backend = "vllm"
+                    logger.info("detected_backend", backend="vllm", url=self.config.base_url)
+                    return "vllm"
+        except (httpx.HTTPError, ValueError, KeyError):
+            pass
+        self._detected_backend = "llama"
+        logger.info("detected_backend", backend="llama", url=self.config.base_url)
+        return "llama"
+
+    def detect_backend_sync(self) -> str:
+        """Synchronous wrapper around detect_backend(). Thread-safe."""
+        return _run_sync(self.detect_backend())
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._async_client is None or self._async_client.is_closed:
@@ -119,8 +161,13 @@ class LlamaClient:
             "max_tokens": max_tokens or self.config.max_new_tokens,
             "temperature": temperature if temperature is not None else self.config.temperature,
         }
-        if self._chat_template_kwargs is not None:
+        # llama-server accepts chat_template_kwargs in the request body;
+        # vLLM does not (it uses server-level --chat-template-kwargs).
+        if self._chat_template_kwargs is not None and not self.is_vllm:
             payload["chat_template_kwargs"] = self._chat_template_kwargs
+        # Model-specific extra body fields (e.g. include_reasoning for GPT-OSS)
+        if self._extra_body is not None:
+            payload.update(self._extra_body)
 
         sem = await self._get_semaphore()
         client = await self._get_client()
@@ -144,26 +191,29 @@ class LlamaClient:
                 if resp.status_code == 400:
                     try:
                         err = resp.json().get("error", {})
-                        logger.warning(
-                            "llama_server_bad_request: %s",
-                            err.get("message", resp.text[:200]),
-                        )
-                        if err.get("type") == "exceed_context_size_error":
+                        msg = err.get("message", "") if isinstance(err, dict) else str(err)
+                        logger.warning("server_bad_request: %s", msg or resp.text[:200])
+                        # llama-server: {"error": {"type": "exceed_context_size_error", ...}}
+                        if isinstance(err, dict) and err.get("type") == "exceed_context_size_error":
                             raise ContextOverflowError(
                                 err.get("n_prompt_tokens"),
                                 err.get("n_ctx"),
                             )
+                        # vLLM: 400 with "prompt is too long" in message
+                        if "prompt is too long" in msg.lower():
+                            raise ContextOverflowError()
                     except ContextOverflowError:
                         raise
                     except Exception:
-                        logger.warning("llama_server_bad_request: %s", resp.text[:200])
+                        logger.warning("server_bad_request: %s", resp.text[:200])
                     return None
 
                 resp.raise_for_status()
                 data = resp.json()
                 choices = data.get("choices", [])
                 if choices:
-                    content = choices[0].get("message", {}).get("content", "")
+                    msg = choices[0].get("message", {})
+                    content = msg.get("content") or msg.get("reasoning_content") or ""
                     if content and self._think_re is not None:
                         content = self._think_re.sub("", content).strip()
                     return content if content else None
@@ -236,6 +286,7 @@ class LlamaClient:
         self.config.model_profile = profile
         self._think_re = profile.compile_thinking_re()
         self._chat_template_kwargs = profile.get_chat_template_kwargs()
+        self._extra_body = profile.get_extra_body()
 
     async def detect_model(self) -> str | None:
         """Query /v1/models to get the loaded model identifier.

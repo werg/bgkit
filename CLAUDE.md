@@ -92,9 +92,26 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 | List checkpoints | `.venv/bin/bgkit-ckpt list --phase ice` |
 | Best checkpoint | `.venv/bin/bgkit-ckpt best --phase ice --metric eval/mse` |
 
-## Inference Server (llama-server)
+## Inference Server
 
-Local LLM inference via llama-server (llama.cpp) in Docker, optimized for Blackwell sm_121. Default: LFM2-8B-A1B Q4_K_M (8B MoE, 1.5B active, ~4.7 GB), 8 parallel slots, 32K total ctx (4K per slot) on :8080.
+### vLLM (primary)
+
+Local LLM inference via vLLM in Docker, two-tier routing: primary model (GPT-OSS-20B, MXFP4 quantization via `vllm-mxfp4-spark` image) for complex files, fast model (Qwen3.5-0.8B via `vllm-node` image) for config/test/simple files. Uses continuous batching and prefix caching for high throughput.
+
+| Task | Command |
+|---|---|
+| Download HF models | `make download-models-hf` |
+| Start vLLM servers | `make vllm-server` |
+| Stop vLLM servers | `make vllm-server-stop` |
+| Tail logs | `make vllm-server-logs` |
+
+Override model/params via env: `VLLM_IMAGE_PRIMARY`, `VLLM_IMAGE_FAST`, `VLLM_MODEL_PRIMARY`, `VLLM_MODEL_FAST`, `VLLM_GPU_UTIL_PRIMARY` (default 0.65), `VLLM_GPU_UTIL_FAST` (default 0.10), `VLLM_PORT_PRIMARY` (default 8090), `VLLM_PORT_FAST` (default 8091).
+
+HF models are cached in `~/.cache/huggingface` (bind-mounted into container).
+
+### llama-server (legacy)
+
+Three-tier llama.cpp setup still available for GGUF models.
 
 | Task | Command |
 |---|---|
@@ -105,11 +122,13 @@ Local LLM inference via llama-server (llama.cpp) in Docker, optimized for Blackw
 | Tail logs | `make llama-server-logs` |
 | Benchmark/tune | `make llama-bench` |
 
-Override model/params via env: `LLAMA_MODEL`, `LLAMA_PARALLEL`, `LLAMA_CTX`, `LLAMA_PORT`.
+### Python client
 
-**Python client** (`bgkit.inference.LlamaClient`): async/sync HTTP client with concurrency control, retry on 503/429, warmup. Used by `generate_descriptions.py` (`--backend local`) and available for any script needing local LLM inference.
+`bgkit.inference.LlamaClient`: async/sync HTTP client compatible with both vLLM and llama-server. Auto-detects backend via `/version` probe (vLLM returns version info, llama-server 404s). Handles concurrency control, retry on 503/429, warmup, and backend-specific behavior (e.g., `chat_template_kwargs` sent to llama-server but omitted for vLLM).
 
-Models are stored in `data/models/` (git-ignored via `/data/` rule). Download with `scripts/download-model.sh <hf-repo> <filename>`.
+Configure via `InferenceConfig.backend_type`: `"auto"` (default, probes `/version`), `"vllm"`, or `"llama"`.
+
+`generate_descriptions.py` uses two-tier routing (`--server-url-primary` / `--server-url-fast`). Old `--llama-url-*` flags still work as deprecated aliases.
 
 ## Code Quality
 

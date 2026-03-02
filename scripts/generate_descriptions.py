@@ -56,16 +56,12 @@ MAX_FILES_PER_REPO = 1000
 # Prompt format version — increment when prompt builders change
 PROMPT_VERSION = 4
 
-# Llama-server clients (initialized by init_local_client)
-_llama_client_large: LlamaClient | None = None
-_llama_client_small: LlamaClient | None = None
-_llama_client_tiny: LlamaClient | None = None
+# Inference clients (initialized by init_local_client)
+_client_primary: LlamaClient | None = None
+_client_fast: LlamaClient | None = None
 
 # Model IDs per tier, populated by init_local_client after auto-detection
 _tier_models: dict[str, str] = {}
-
-# Files above this char count go to the small model (unless routed to tiny)
-SMALL_MODEL_CHAR_THRESHOLD = 3000
 
 
 # Languages where a tiny model suffices (config, data, markup, scripting — low complexity)
@@ -189,10 +185,8 @@ def _make_client(
 ) -> LlamaClient:
     """Create, verify, and auto-configure a single LlamaClient.
 
-    max_concurrent should match the server's --parallel slot count to avoid
-    sending more requests than the server can handle.
-
-    After the server is healthy, queries /v1/models to detect the loaded model
+    After the server is healthy, probes /version to detect whether the backend
+    is vLLM or llama-server, then queries /v1/models to detect the loaded model
     and resolves the appropriate ModelProfile (thinking-tag stripping, etc.).
     """
     config = InferenceConfig(
@@ -200,20 +194,24 @@ def _make_client(
         max_concurrent=max_concurrent,
     )
     client = LlamaClient(config)
-    logger.info("waiting_for_llama_server", label=label, url=base_url)
+    logger.info("waiting_for_server", label=label, url=base_url)
     if not client.wait_ready_sync(timeout=readiness_timeout):
         print(
-            f"ERROR: llama-server ({label}) at {base_url} not ready after {readiness_timeout}s. "
-            f"Start it with: make llama-server",
+            f"ERROR: inference server ({label}) at {base_url} not ready "
+            f"after {readiness_timeout}s. Start with: make vllm-server",
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # Detect backend type (vLLM vs llama-server) so the client knows
+    # whether to send chat_template_kwargs in request bodies.
+    client.detect_backend_sync()
 
     # Auto-detect model and apply the correct profile
     model_id = client.detect_model_sync()
     if not model_id:
         print(
-            f"ERROR: could not detect model from llama-server ({label}) at {base_url}. "
+            f"ERROR: could not detect model from server ({label}) at {base_url}. "
             f"Is /v1/models endpoint available?",
             file=sys.stderr,
         )
@@ -221,63 +219,69 @@ def _make_client(
     profile = resolve_profile(model_id)
     client.apply_profile(profile)
     _tier_models[label] = model_id
-    logger.info("auto_detected_model", label=label, model=model_id, profile=profile.name)
+    logger.info(
+        "server_ready", label=label, model=model_id,
+        profile=profile.name, backend=client.config.backend_type,
+        detected=client._detected_backend,
+    )
 
     client.warmup_sync()
-    logger.info("llama_server_ready", label=label, url=base_url)
     return client
 
 
 def init_local_client(
-    url_large: str | None = None,
-    url_small: str | None = None,
-    url_tiny: str | None = None,
-    readiness_timeout: float = 120.0,
+    url_primary: str | None = None,
+    url_fast: str | None = None,
+    readiness_timeout: float = 300.0,
 ) -> None:
-    """Initialize all three llama-server clients and verify readiness.
+    """Initialize primary and fast inference clients and verify readiness.
 
-    All three model servers (large, small, tiny) must be running. Exits if any
-    is unreachable. Start all with: make llama-server
+    Both model servers must be running. Exits if either is unreachable.
+    Start with: make vllm-server (or make llama-server for legacy).
     """
-    global _llama_client_large, _llama_client_small, _llama_client_tiny
+    global _client_primary, _client_fast
 
-    def _parallel_env(name: str, default: int) -> int:
+    def _concurrent_env(name: str, default: int) -> int:
         try:
             return int(os.environ.get(name, default))
         except ValueError:
             return default
 
-    parallel_large = _parallel_env("LLAMA_PARALLEL_LARGE", 2)
-    parallel_small = _parallel_env("LLAMA_PARALLEL_SMALL", 2)
-    parallel_tiny = _parallel_env("LLAMA_PARALLEL_TINY", 8)
+    concurrent_primary = _concurrent_env("VLLM_CONCURRENT_PRIMARY", 32)
+    concurrent_fast = _concurrent_env("VLLM_CONCURRENT_FAST", 64)
 
-    resolved_large = url_large or os.environ.get("LLAMA_URL", "http://localhost:8080")
-    resolved_small = url_small or os.environ.get("LLAMA_URL_SMALL", "http://localhost:8081")
-    resolved_tiny = url_tiny or os.environ.get("LLAMA_URL_TINY", "http://localhost:8082")
+    # Env var fallback chain: VLLM_URL → LLAMA_URL → LLAMA_URL_SMALL → default
+    resolved_primary = (
+        url_primary
+        or os.environ.get("VLLM_URL")
+        or os.environ.get("LLAMA_URL")
+        or os.environ.get("LLAMA_URL_SMALL")
+        or "http://localhost:8090"
+    )
+    resolved_fast = (
+        url_fast
+        or os.environ.get("VLLM_URL_FAST")
+        or os.environ.get("LLAMA_URL_TINY")
+        or "http://localhost:8091"
+    )
 
-    _llama_client_large = _make_client(
-        resolved_large, parallel_large, readiness_timeout, "large"
+    _client_primary = _make_client(
+        resolved_primary, concurrent_primary, readiness_timeout, "primary"
     )
-    _llama_client_small = _make_client(
-        resolved_small, parallel_small, readiness_timeout, "small"
-    )
-    _llama_client_tiny = _make_client(
-        resolved_tiny, parallel_tiny, readiness_timeout, "tiny"
+    _client_fast = _make_client(
+        resolved_fast, concurrent_fast, readiness_timeout, "fast"
     )
 
 
 def _pick_tier(
-    content_chars: int,
     file_path: str = "",
     language: str | None = None,
     size_bytes: int = 0,
 ) -> str:
-    """Return the tier label for a file: 'tiny', 'small', or 'large'."""
+    """Return the tier label for a file: 'fast' or 'primary'."""
     if file_path and _is_tiny_routable(file_path, language, size_bytes):
-        return "tiny"
-    if content_chars > SMALL_MODEL_CHAR_THRESHOLD:
-        return "small"
-    return "large"
+        return "fast"
+    return "primary"
 
 
 def _model_for_backend(backend_label: str) -> str:
@@ -288,41 +292,38 @@ def _model_for_backend(backend_label: str) -> str:
 
 def _client_for_tier(tier: str) -> LlamaClient:
     """Return the LlamaClient for the given tier."""
-    if tier == "tiny":
-        return _llama_client_tiny
-    if tier == "small":
-        return _llama_client_small
-    return _llama_client_large
+    if tier == "fast":
+        return _client_fast
+    return _client_primary
 
 
 def call_local(
     prompt: str,
     max_new_tokens: int = 512,
-    content_chars: int = 0,
     file_path: str = "",
     language: str | None = None,
     size_bytes: int = 0,
 ) -> tuple[str | None, str]:
-    """Generate a description using the appropriate llama-server tier.
+    """Generate a description using the appropriate server tier.
 
     Returns (description, backend_label).
     """
     from bgkit.inference.client import ContextOverflowError
 
-    tier = _pick_tier(content_chars, file_path, language, size_bytes)
+    tier = _pick_tier(file_path, language, size_bytes)
     client = _client_for_tier(tier)
     try:
         return (client.generate_sync(prompt, max_tokens=max_new_tokens), f"local-{tier}")
     except ContextOverflowError:
-        if tier != "tiny":
+        if tier != "fast":
             return (None, f"local-{tier}")
-        # Tiny has the smallest per-slot context; fall back to small.
-        logger.info("context_overflow_fallback", from_tier="tiny", to_tier="small")
+        # Fast model has smaller context; fall back to primary.
+        logger.info("context_overflow_fallback", from_tier="fast", to_tier="primary")
         try:
-            result = _llama_client_small.generate_sync(prompt, max_tokens=max_new_tokens)
-            return (result, "local-small")
+            result = _client_primary.generate_sync(prompt, max_tokens=max_new_tokens)
+            return (result, "local-primary")
         except ContextOverflowError:
-            return (None, "local-tiny")
+            return (None, "local-fast")
 
 
 def call_local_batch(
@@ -337,7 +338,7 @@ def call_local_batch(
     Returns list of (description, backend_label) tuples.
     """
     if tiers is None:
-        tiers = ["large"] * len(prompts)
+        tiers = ["primary"] * len(prompts)
 
     import asyncio
 
@@ -349,19 +350,19 @@ def call_local_batch(
             try:
                 result = await client.generate(prompt, max_tokens=max_new_tokens)
             except ContextOverflowError:
-                if tier != "tiny":
+                if tier != "fast":
                     return (None, f"local-{tier}")
-                # Tiny has the smallest per-slot context; fall back to small.
+                # Fast model has smaller context; fall back to primary.
                 logger.info(
-                    "context_overflow_fallback", from_tier="tiny", to_tier="small"
+                    "context_overflow_fallback", from_tier="fast", to_tier="primary"
                 )
                 try:
-                    result = await _llama_client_small.generate(
+                    result = await _client_primary.generate(
                         prompt, max_tokens=max_new_tokens
                     )
                 except ContextOverflowError:
-                    return (None, "local-tiny")
-                return (result, "local-small")
+                    return (None, "local-fast")
+                return (result, "local-primary")
             return (result, f"local-{tier}")
 
         return await asyncio.gather(
@@ -384,7 +385,6 @@ def generate_description(
     prompt: str,
     backend: str,
     backend_cycle: itertools.cycle | None = None,
-    content_chars: int = 0,
     file_path: str = "",
     language: str | None = None,
     size_bytes: int = 0,
@@ -404,7 +404,7 @@ def generate_description(
         return (result, "haiku")
     elif chosen == "local":
         return call_local(
-            prompt, content_chars=content_chars, file_path=file_path,
+            prompt, file_path=file_path,
             language=language, size_bytes=size_bytes,
         )
     else:
@@ -602,7 +602,7 @@ def process_single_repo(
             if backend == "local":
                 # Batch: all prompts sent concurrently, routed by tier
                 file_tiers = [
-                    _pick_tier(len(fr.content), fr.path, fr.language, fr.size_bytes)
+                    _pick_tier(fr.path, fr.language, fr.size_bytes)
                     for fr, _ in file_prompts
                 ]
                 results = call_local_batch(
@@ -635,7 +635,6 @@ def process_single_repo(
                 for fr, prompt in file_prompts:
                     desc, used_backend = generate_description(
                         prompt, backend, backend_cycle,
-                        content_chars=len(fr.content),
                         file_path=fr.path,
                         language=fr.language,
                         size_bytes=fr.size_bytes,
@@ -783,17 +782,17 @@ def main() -> None:
         help="Description generation backend (default: mixed)",
     )
     parser.add_argument(
-        "--llama-url-large", type=str, default=None,
-        help="URL for the large llama-server (default: LLAMA_URL env or http://localhost:8080)",
+        "--server-url-primary", type=str, default=None,
+        help="URL for the primary model server (default: VLLM_URL env or http://localhost:8090)",
     )
     parser.add_argument(
-        "--llama-url-small", type=str, default=None,
-        help="URL for the small llama-server (default: LLAMA_URL_SMALL env or http://localhost:8081)",
+        "--server-url-fast", type=str, default=None,
+        help="URL for the fast model server (default: VLLM_URL_FAST env or http://localhost:8091)",
     )
-    parser.add_argument(
-        "--llama-url-tiny", type=str, default=None,
-        help="URL for the tiny llama-server (default: LLAMA_URL_TINY env or http://localhost:8082)",
-    )
+    # Deprecated aliases (kept for backwards compatibility)
+    parser.add_argument("--llama-url-large", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--llama-url-small", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--llama-url-tiny", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--structural-dir", type=Path, default=None,
         help="Directory with structural JSONL files (optional, improves module/repo prompts)",
@@ -827,13 +826,21 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize llama-server clients if needed
+    # Initialize inference clients if needed
     if args.backend in ("local", "mixed"):
-        init_local_client(
-            url_large=args.llama_url_large,
-            url_small=args.llama_url_small,
-            url_tiny=args.llama_url_tiny,
-        )
+        # Handle deprecated --llama-url-* aliases
+        url_primary = args.server_url_primary
+        url_fast = args.server_url_fast
+        if args.llama_url_large and not url_primary:
+            logger.warning("deprecated_arg", arg="--llama-url-large", use="--server-url-primary")
+            url_primary = args.llama_url_large
+        if args.llama_url_small and not url_primary:
+            logger.warning("deprecated_arg", arg="--llama-url-small", use="--server-url-primary")
+            url_primary = args.llama_url_small
+        if args.llama_url_tiny and not url_fast:
+            logger.warning("deprecated_arg", arg="--llama-url-tiny", use="--server-url-fast")
+            url_fast = args.llama_url_tiny
+        init_local_client(url_primary=url_primary, url_fast=url_fast)
 
     # Set up backend cycle for mixed mode
     backend_cycle: itertools.cycle | None = None

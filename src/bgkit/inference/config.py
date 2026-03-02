@@ -1,4 +1,4 @@
-"""Configuration for the llama-server inference client."""
+"""Configuration for the inference client (llama-server and vLLM)."""
 
 from __future__ import annotations
 
@@ -21,3 +21,4 @@ class InferenceConfig:
     max_new_tokens: int = 512
     temperature: float = 0.0
     model_profile: ModelProfile | None = None
+    backend_type: str = "auto"  # "llama", "vllm", or "auto" (probe /version)

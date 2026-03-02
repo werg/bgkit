@@ -58,6 +58,33 @@ def test_get_chat_template_kwargs_returns_copy():
     assert kwargs2 == {"enable_thinking": False}
 
 
+def test_resolve_gpt_oss_hf_id():
+    """HuggingFace model ID for GPT-OSS resolves correctly."""
+    profile = resolve_profile("openai/gpt-oss-20b")
+    assert profile.name == "GPT-OSS"
+    assert profile.thinking_tag_pattern is None
+    assert profile.get_chat_template_kwargs() is None
+
+
+def test_resolve_qwen35_hf_id():
+    """HuggingFace model ID for Qwen3.5 resolves correctly."""
+    profile = resolve_profile("Qwen/Qwen3.5-35B-A3B-FP8")
+    assert profile.name == "Qwen3.5"
+
+
+def test_resolve_qwen35_08b_hf_id():
+    """Small Qwen3.5 model resolves to Qwen3.5 profile, not Qwen3."""
+    profile = resolve_profile("Qwen/Qwen3.5-0.8B-Instruct")
+    assert profile.name == "Qwen3.5"
+
+
+def test_gpt_oss_no_thinking_no_kwargs():
+    """GPT-OSS profile has no thinking tags and no chat_template_kwargs."""
+    profile = MODEL_PROFILES["GPT-OSS"]
+    assert profile.compile_thinking_re() is None
+    assert profile.get_chat_template_kwargs() is None
+
+
 def test_compile_thinking_re():
     """Profile with a pattern compiles a regex; default returns None."""
     profile = MODEL_PROFILES["GLM-4"]

@@ -46,14 +46,13 @@ def _make_mock_client(name: str) -> LlamaClient:
     return client
 
 
-def _patch_all_clients(gd, large, small, tiny):
-    """Context manager to patch all three llama clients."""
+def _patch_all_clients(gd, primary, fast):
+    """Context manager to patch both inference clients."""
     from contextlib import ExitStack
 
     stack = ExitStack()
-    stack.enter_context(patch.object(gd, "_llama_client_large", large))
-    stack.enter_context(patch.object(gd, "_llama_client_small", small))
-    stack.enter_context(patch.object(gd, "_llama_client_tiny", tiny))
+    stack.enter_context(patch.object(gd, "_client_primary", primary))
+    stack.enter_context(patch.object(gd, "_client_fast", fast))
     return stack
 
 
@@ -101,18 +100,18 @@ class TestTierRouting:
     def test_complex_rust_not_tiny(self):
         assert not self.gd._is_tiny_routable("src/main.rs", "Rust", 2000)
 
-    def test_pick_tier_tiny(self):
-        assert self.gd._pick_tier(1000, "config.json", "JSON", 1000) == "tiny"
+    def test_pick_tier_fast(self):
+        assert self.gd._pick_tier("config.json", "JSON", 1000) == "fast"
 
-    def test_pick_tier_small_big_source(self):
-        assert self.gd._pick_tier(5000, "src/engine.py", "Python", 5000) == "small"
+    def test_pick_tier_primary_big_source(self):
+        assert self.gd._pick_tier("src/engine.py", "Python", 5000) == "primary"
 
-    def test_pick_tier_large_moderate_source(self):
-        assert self.gd._pick_tier(2000, "src/engine.py", "Python", 2000) == "large"
+    def test_pick_tier_primary_moderate_source(self):
+        assert self.gd._pick_tier("src/engine.py", "Python", 2000) == "primary"
 
-    def test_pick_tier_tiny_beats_small_threshold(self):
-        # A large JSON file should still go to tiny, not small
-        assert self.gd._pick_tier(5000, "data.json", "JSON", 5000) == "tiny"
+    def test_pick_tier_fast_beats_size(self):
+        # A large JSON file should still go to fast
+        assert self.gd._pick_tier("data.json", "JSON", 5000) == "fast"
 
 
 class TestCallLocal:
@@ -123,71 +122,64 @@ class TestCallLocal:
 
         self.gd = gd
 
-    def test_moderate_source_routes_large(self):
-        large = _make_mock_client("large")
-        small = _make_mock_client("small")
-        tiny = _make_mock_client("tiny")
+    def test_source_file_routes_primary(self):
+        primary = _make_mock_client("primary")
+        fast = _make_mock_client("fast")
 
-        with _patch_all_clients(self.gd, large, small, tiny):
+        with _patch_all_clients(self.gd, primary, fast):
             result, backend = self.gd.call_local(
-                "describe", content_chars=2000, file_path="src/app.py",
+                "describe", file_path="src/app.py",
                 language="Python", size_bytes=2000,
             )
-            assert "[large]" in result
-            assert backend == "local-large"
+            assert "[primary]" in result
+            assert backend == "local-primary"
 
-    def test_big_source_routes_small(self):
-        large = _make_mock_client("large")
-        small = _make_mock_client("small")
-        tiny = _make_mock_client("tiny")
+    def test_big_source_routes_primary(self):
+        primary = _make_mock_client("primary")
+        fast = _make_mock_client("fast")
 
-        with _patch_all_clients(self.gd, large, small, tiny):
+        with _patch_all_clients(self.gd, primary, fast):
             result, backend = self.gd.call_local(
-                "describe", content_chars=5000, file_path="src/app.py",
+                "describe", file_path="src/app.py",
                 language="Python", size_bytes=5000,
             )
-            assert "[small]" in result
-            assert backend == "local-small"
+            assert "[primary]" in result
+            assert backend == "local-primary"
 
-    def test_config_file_routes_tiny(self):
-        large = _make_mock_client("large")
-        small = _make_mock_client("small")
-        tiny = _make_mock_client("tiny")
+    def test_config_file_routes_fast(self):
+        primary = _make_mock_client("primary")
+        fast = _make_mock_client("fast")
 
-        with _patch_all_clients(self.gd, large, small, tiny):
+        with _patch_all_clients(self.gd, primary, fast):
             result, backend = self.gd.call_local(
-                "describe", content_chars=1000, file_path="config.json",
+                "describe", file_path="config.json",
                 language="JSON", size_bytes=1000,
             )
-            assert "[tiny]" in result
-            assert backend == "local-tiny"
+            assert "[fast]" in result
+            assert backend == "local-fast"
 
     def test_batch_routes_by_tier(self):
-        large = _make_mock_client("large")
-        small = _make_mock_client("small")
-        tiny = _make_mock_client("tiny")
+        primary = _make_mock_client("primary")
+        fast = _make_mock_client("fast")
 
-        with _patch_all_clients(self.gd, large, small, tiny):
+        with _patch_all_clients(self.gd, primary, fast):
             results = self.gd.call_local_batch(
-                ["p1", "p2", "p3"],
-                tiers=["large", "small", "tiny"],
+                ["p1", "p2"],
+                tiers=["primary", "fast"],
             )
-            assert len(results) == 3
-            assert results[0][1] == "local-large"
-            assert results[1][1] == "local-small"
-            assert results[2][1] == "local-tiny"
-            assert "[large]" in results[0][0]
-            assert "[small]" in results[1][0]
-            assert "[tiny]" in results[2][0]
+            assert len(results) == 2
+            assert results[0][1] == "local-primary"
+            assert results[1][1] == "local-fast"
+            assert "[primary]" in results[0][0]
+            assert "[fast]" in results[1][0]
 
-    def test_batch_defaults_to_large_without_tiers(self):
-        large = _make_mock_client("large")
-        small = _make_mock_client("small")
-        tiny = _make_mock_client("tiny")
+    def test_batch_defaults_to_primary_without_tiers(self):
+        primary = _make_mock_client("primary")
+        fast = _make_mock_client("fast")
 
-        with _patch_all_clients(self.gd, large, small, tiny):
+        with _patch_all_clients(self.gd, primary, fast):
             results = self.gd.call_local_batch(["p1", "p2"])
-            assert all(b == "local-large" for _, b in results)
+            assert all(b == "local-primary" for _, b in results)
 
 
 class TestGenerateDescription:
@@ -199,30 +191,27 @@ class TestGenerateDescription:
         self.gd = gd
 
     def test_local_backend_source_file(self):
-        large = _make_mock_client("large")
-        small = _make_mock_client("small")
-        tiny = _make_mock_client("tiny")
+        primary = _make_mock_client("primary")
+        fast = _make_mock_client("fast")
 
-        with _patch_all_clients(self.gd, large, small, tiny):
+        with _patch_all_clients(self.gd, primary, fast):
             result, backend = self.gd.generate_description(
-                "test prompt", "local", content_chars=2000,
+                "test prompt", "local",
                 file_path="src/app.py", language="Python", size_bytes=2000,
             )
-            assert backend == "local-large"
-            assert "[large]" in result
+            assert backend == "local-primary"
+            assert "[primary]" in result
 
     def test_local_backend_config_file(self):
-        large = _make_mock_client("large")
-        small = _make_mock_client("small")
-        tiny = _make_mock_client("tiny")
+        primary = _make_mock_client("primary")
+        fast = _make_mock_client("fast")
 
-        with _patch_all_clients(self.gd, large, small, tiny):
+        with _patch_all_clients(self.gd, primary, fast):
             result, backend = self.gd.generate_description(
-                "test prompt", "local", content_chars=500,
-                file_path="config.yaml", language="YAML", size_bytes=500,
+                "test prompt", "local", file_path="config.yaml", language="YAML", size_bytes=500,
             )
-            assert backend == "local-tiny"
-            assert "[tiny]" in result
+            assert backend == "local-fast"
+            assert "[fast]" in result
 
     def test_haiku_backend(self):
         with patch.object(self.gd, "call_claude", return_value="haiku response"):
@@ -231,23 +220,22 @@ class TestGenerateDescription:
             assert result == "haiku response"
 
     def test_mixed_backend_cycles(self):
-        large = _make_mock_client("large")
-        small = _make_mock_client("small")
-        tiny = _make_mock_client("tiny")
+        primary = _make_mock_client("primary")
+        fast = _make_mock_client("fast")
         cycle = itertools.cycle(["haiku", "local"])
 
-        with _patch_all_clients(self.gd, large, small, tiny), \
+        with _patch_all_clients(self.gd, primary, fast), \
              patch.object(self.gd, "call_claude", return_value="haiku response"):
             _r1, b1 = self.gd.generate_description(
-                "p1", "mixed", cycle, content_chars=2000,
+                "p1", "mixed", cycle,
                 file_path="src/app.py", language="Python", size_bytes=2000,
             )
             _r2, b2 = self.gd.generate_description(
-                "p2", "mixed", cycle, content_chars=2000,
+                "p2", "mixed", cycle,
                 file_path="src/app.py", language="Python", size_bytes=2000,
             )
             assert b1 == "haiku"
-            assert b2 == "local-large"
+            assert b2 == "local-primary"
 
 
 class TestReadinessGate:
@@ -258,7 +246,7 @@ class TestReadinessGate:
 
         self.gd = gd
 
-    def test_exits_when_large_server_unavailable(self):
+    def test_exits_when_primary_server_unavailable(self):
         with patch.object(
             LlamaClient,
             "wait_ready_sync",
@@ -266,6 +254,6 @@ class TestReadinessGate:
         ):
             with pytest.raises(SystemExit) as exc_info:
                 self.gd.init_local_client(
-                    url_large="http://localhost:9999", readiness_timeout=1.0,
+                    url_primary="http://localhost:9999", readiness_timeout=1.0,
                 )
             assert exc_info.value.code == 1

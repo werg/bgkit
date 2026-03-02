@@ -48,6 +48,26 @@ x-llama-common: &llama-common
     retries: 30
     start_period: 120s
 
+x-vllm-common: &vllm-common
+  ipc: host
+  shm_size: "64gb"
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  restart: unless-stopped
+  volumes:
+    - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 60
+    start_period: 300s
+
 services:
   train:
     <<: *gpu-common
@@ -116,3 +136,39 @@ services:
       --n-gpu-layers 999
       --parallel ${LLAMA_PARALLEL_TINY:-8}
       --flash-attn on --no-mmap --jinja
+
+  # --- vLLM inference (primary + fast) ---
+
+  vllm-primary:
+    <<: *vllm-common
+    image: "${VLLM_IMAGE_PRIMARY:-vllm-mxfp4-spark:latest}"
+    ports:
+      - "${VLLM_PORT_PRIMARY:-8090}:8000"
+    environment:
+      TIKTOKEN_ENCODINGS_BASE: /workspace/tiktoken_encodings
+    command: >-
+      vllm serve ${VLLM_MODEL_PRIMARY:-openai/gpt-oss-20b}
+      --quantization mxfp4
+      --mxfp4-backend CUTLASS
+      --mxfp4-layers moe,qkv,o,lm_head
+      --gpu-memory-utilization ${VLLM_GPU_UTIL_PRIMARY:-0.65}
+      --max-model-len 32768
+      --enable-prefix-caching
+      --enable-chunked-prefill
+      --max-num-seqs 64
+      --kv-cache-dtype fp8
+      --attention-backend FLASHINFER
+
+  vllm-fast:
+    <<: *vllm-common
+    image: "${VLLM_IMAGE_FAST:-vllm-node:latest}"
+    ports:
+      - "${VLLM_PORT_FAST:-8091}:8000"
+    environment:
+      NVIDIA_DISABLE_REQUIRE: "1"
+    command: >-
+      vllm serve ${VLLM_MODEL_FAST:-Qwen/Qwen3.5-0.8B}
+      --gpu-memory-utilization ${VLLM_GPU_UTIL_FAST:-0.10}
+      --max-model-len 32768
+      --enable-prefix-caching
+      --enable-chunked-prefill
