@@ -7,8 +7,6 @@ import pickle
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -16,42 +14,12 @@ torch = pytest.importorskip("torch")
 from bgkit.data.datasets.mmap_ice_dataset import MmapICEDataset
 
 
-def _create_ice_data(
-    data_dir: Path,
-    file_token_ids: list[list[int]],
-    file_ce_values: list[list[float]],
-) -> None:
-    """Helper to write mmap ICE artifacts from known data."""
-    all_tokens = []
-    all_ce = []
-    offsets = [0]
-    ce_offsets = [0]
-    for tids, cev in zip(file_token_ids, file_ce_values, strict=False):
-        all_tokens.extend(tids)
-        offsets.append(len(all_tokens))
-        all_ce.extend(cev)
-        ce_offsets.append(len(all_ce))
-
-    np.save(data_dir / "tokens.npy", np.array(all_tokens, dtype=np.int32))
-    np.save(data_dir / "offsets.npy", np.array(offsets, dtype=np.int64))
-    np.save(data_dir / "ce_values.npy", np.array(all_ce, dtype=np.float32))
-    np.save(data_dir / "ce_offsets.npy", np.array(ce_offsets, dtype=np.int64))
-
-    manifest = {
-        "schema_version": 1,
-        "row_count": len(file_token_ids),
-        "total_tokens": len(all_tokens),
-        "total_ce_values": len(all_ce),
-    }
-    (data_dir / "manifest.json").write_text(json.dumps(manifest))
-
-
 @pytest.fixture
-def ice_data_dir(tmp_path: Path) -> Path:
+def ice_data_dir(tmp_path: Path, create_ice_artifacts) -> Path:
     """Create a small mmap ICE dataset (5 files)."""
     d = tmp_path / "ice"
     d.mkdir()
-    _create_ice_data(
+    create_ice_artifacts(
         d,
         file_token_ids=[
             list(range(10 + i * 5)) for i in range(5)
@@ -146,11 +114,11 @@ class TestMmapICEDataset:
         with pytest.raises(ValueError, match="Manifest row_count"):
             MmapICEDataset(str(d))
 
-    def test_multi_file_data(self, tmp_path: Path):
+    def test_multi_file_data(self, tmp_path: Path, create_ice_artifacts):
         """Verify correct indexing across multiple files."""
         d = tmp_path / "multi"
         d.mkdir()
-        _create_ice_data(
+        create_ice_artifacts(
             d,
             file_token_ids=[[1, 2, 3], [10, 20, 30, 40], [100, 200]],
             file_ce_values=[[0.1, 0.2], [0.3, 0.4, 0.5], [0.6]],
@@ -168,11 +136,11 @@ class TestMmapICEDataset:
         s2 = ds[2]
         assert torch.equal(s2["token_ids"], torch.tensor([100, 200], dtype=torch.int64))
 
-    def test_zero_length_file_skipped(self, tmp_path: Path):
+    def test_zero_length_file_skipped(self, tmp_path: Path, create_ice_artifacts):
         """Files with 0 tokens are excluded."""
         d = tmp_path / "zero"
         d.mkdir()
-        _create_ice_data(
+        create_ice_artifacts(
             d,
             file_token_ids=[[], [1, 2, 3], []],
             file_ce_values=[[], [0.1, 0.2], []],

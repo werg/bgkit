@@ -6,7 +6,6 @@ page cache instead of each building independent Arrow table caches.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import ClassVar
 
@@ -15,6 +14,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
+
+from bgkit.data.datasets.base_mmap_dataset import (
+    check_required_files,
+    load_and_validate_manifest,
+    validate_manifest_counts,
+)
 
 
 class MmapTokenDataset(Dataset):
@@ -46,20 +51,13 @@ class MmapTokenDataset(Dataset):
         required_files = list(self.REQUIRED_FILES)
         if self._include_metadata:
             required_files.append(self.METADATA_FILE)
-        missing = [f for f in required_files if not (data_path / f).exists()]
-        if missing:
-            raise FileNotFoundError(
-                f"Missing mmap artifacts in {data_path.resolve()}: {missing}. "
-                f"Convert with: python scripts/convert_tokens_to_npy.py "
-                f"--input-dir {data_path.resolve()}"
-            )
+        check_required_files(
+            data_path, required_files,
+            "Convert with: python scripts/convert_tokens_to_npy.py "
+            f"--input-dir {data_path.resolve()}",
+        )
 
-        # Validate manifest
-        manifest = json.loads((data_path / "manifest.json").read_text())
-        if manifest.get("schema_version") != 1:
-            raise ValueError(
-                f"Unsupported manifest schema version: {manifest.get('schema_version')}"
-            )
+        manifest = load_and_validate_manifest(data_path)
 
         if require_commit_sha and self._include_metadata:
             schema = pq.read_schema(data_path / "metadata.parquet")
@@ -76,20 +74,7 @@ class MmapTokenDataset(Dataset):
         self._metadata: pa.Table | None = None  # lazy-loaded, NOT pickled
         self._max_seq_len = max_seq_len
 
-        # Validate manifest counts against actual array sizes
-        expected_rows = manifest.get("row_count")
-        n_rows = len(offsets) - 1
-        if expected_rows is not None and expected_rows != n_rows:
-            raise ValueError(
-                f"Manifest row_count ({expected_rows}) != offsets length ({n_rows}). "
-                "Artifacts may be stale — re-run conversion."
-            )
-        expected_tokens = manifest.get("total_tokens")
-        if expected_tokens is not None and expected_tokens != len(self._tokens):
-            raise ValueError(
-                f"Manifest total_tokens ({expected_tokens}) != tokens.npy length "
-                f"({len(self._tokens)}). Artifacts may be stale — re-run conversion."
-            )
+        validate_manifest_counts(manifest, offsets, self._tokens)
 
         # Vectorized chunk index from offsets (no Python loops)
         file_lengths = (offsets[1:] - offsets[:-1]).astype(np.int64)

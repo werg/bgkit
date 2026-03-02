@@ -15,26 +15,20 @@ Includes a full verification pass by default (--skip-verify to disable).
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import sys
-import time
 from pathlib import Path
+
+# Allow running as `python scripts/convert_*.py` without editable install
+_src = str(Path(__file__).resolve().parent.parent / "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-
-def _arrow_to_numpy(arr: pa.Array | pa.ChunkedArray, dtype=None) -> np.ndarray:
-    """Convert Arrow array (plain or chunked) to contiguous numpy."""
-    if isinstance(arr, pa.ChunkedArray):
-        arr = arr.combine_chunks()
-    out = arr.to_numpy(zero_copy_only=False)
-    if dtype is not None:
-        out = out.astype(dtype)
-    return out
+from bgkit.data.mmap_writer import arrow_to_numpy, build_csr_offsets, write_mmap_artifacts
 
 
 def convert(input_dir: Path) -> dict:
@@ -58,16 +52,16 @@ def convert(input_dir: Path) -> dict:
         tok_col = table.column("token_ids")
         ce_col = table.column("ce_values")
 
-        # Flatten list columns → contiguous arrays
-        token_chunks.append(_arrow_to_numpy(pc.list_flatten(tok_col)))
-        ce_chunks.append(_arrow_to_numpy(pc.list_flatten(ce_col), dtype=np.float32))
+        # Flatten list columns -> contiguous arrays
+        token_chunks.append(arrow_to_numpy(pc.list_flatten(tok_col)))
+        ce_chunks.append(arrow_to_numpy(pc.list_flatten(ce_col), dtype=np.float32))
 
         # Per-row lengths for building CSR offsets
         token_length_chunks.append(
-            _arrow_to_numpy(pc.list_value_length(tok_col)).astype(np.int64)
+            arrow_to_numpy(pc.list_value_length(tok_col)).astype(np.int64)
         )
         ce_length_chunks.append(
-            _arrow_to_numpy(pc.list_value_length(ce_col)).astype(np.int64)
+            arrow_to_numpy(pc.list_value_length(ce_col)).astype(np.int64)
         )
 
         meta_tables.append(table.select(["file_path", "language", "repo_path"]))
@@ -81,14 +75,8 @@ def convert(input_dir: Path) -> dict:
     all_token_lengths = np.concatenate(token_length_chunks)
     all_ce_lengths = np.concatenate(ce_length_chunks)
 
-    # Build CSR offsets from per-file lengths
-    offsets = np.empty(len(all_token_lengths) + 1, dtype=np.int64)
-    offsets[0] = 0
-    np.cumsum(all_token_lengths, out=offsets[1:])
-
-    ce_offsets = np.empty(len(all_ce_lengths) + 1, dtype=np.int64)
-    ce_offsets[0] = 0
-    np.cumsum(all_ce_lengths, out=ce_offsets[1:])
+    offsets = build_csr_offsets(all_token_lengths)
+    ce_offsets = build_csr_offsets(all_ce_lengths)
 
     meta_table = pa.concat_tables(meta_tables)
 
@@ -98,25 +86,18 @@ def convert(input_dir: Path) -> dict:
 
     print(f"Total rows: {total_rows}, total tokens: {total_tokens}, total CE values: {total_ce}")
 
-    # Write outputs
-    np.save(input_dir / "tokens.npy", tokens)
-    np.save(input_dir / "offsets.npy", offsets)
-    np.save(input_dir / "ce_values.npy", ce_values)
-    np.save(input_dir / "ce_offsets.npy", ce_offsets)
-    pq.write_table(meta_table, input_dir / "metadata.parquet")
-
-    offsets_hash = hashlib.sha256(offsets.tobytes()).hexdigest()
-
-    manifest = {
-        "schema_version": 1,
-        "row_count": total_rows,
-        "total_tokens": total_tokens,
-        "total_ce_values": total_ce,
-        "offsets_sha256": offsets_hash,
-        "source_shard_count": len(shard_files),
-        "conversion_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    (input_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    manifest = write_mmap_artifacts(
+        input_dir, tokens, offsets,
+        manifest_extra={
+            "total_ce_values": total_ce,
+            "source_shard_count": len(shard_files),
+        },
+        metadata_table=meta_table,
+        extra_arrays={
+            "ce_values.npy": ce_values,
+            "ce_offsets.npy": ce_offsets,
+        },
+    )
 
     print(f"Wrote tokens.npy ({tokens.nbytes / 1e9:.2f} GB), "
           f"ce_values.npy ({ce_values.nbytes / 1e9:.2f} GB), "
@@ -145,7 +126,7 @@ def verify(input_dir: Path) -> None:
         n_rows = table.num_rows
 
         # Verify flattened tokens for entire shard at once
-        shard_tokens = _arrow_to_numpy(pc.list_flatten(tok_col))
+        shard_tokens = arrow_to_numpy(pc.list_flatten(tok_col))
         t_start = int(offsets[row_idx])
         t_end = int(offsets[row_idx + n_rows])
         assert np.array_equal(shard_tokens, np.array(tokens[t_start:t_end])), (
@@ -153,7 +134,7 @@ def verify(input_dir: Path) -> None:
         )
 
         # Verify flattened CE values for entire shard at once
-        shard_ce = _arrow_to_numpy(pc.list_flatten(ce_col), dtype=np.float32)
+        shard_ce = arrow_to_numpy(pc.list_flatten(ce_col), dtype=np.float32)
         c_start = int(ce_offsets[row_idx])
         c_end = int(ce_offsets[row_idx + n_rows])
         assert np.allclose(shard_ce, np.array(ce_values[c_start:c_end]), atol=1e-3), (

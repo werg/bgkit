@@ -24,7 +24,11 @@ def _create_mmap_data(
     repo_paths: list[str] | None = None,
     commit_shas: list[str] | None = None,
 ) -> None:
-    """Helper to write mmap artifacts from known data."""
+    """Helper to write mmap artifacts from known data.
+
+    MmapTokenDataset requires metadata.parquet with file_path+language,
+    so this helper is specific to its needs (unlike the generic conftest fixture).
+    """
     all_tokens = []
     offsets = [0]
     for tids in file_token_ids:

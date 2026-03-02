@@ -13,23 +13,20 @@ Includes a full verification pass by default (--skip-verify to disable).
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import sys
-import time
 from pathlib import Path
+
+# Allow running as `python scripts/convert_*.py` without editable install
+_src = str(Path(__file__).resolve().parent.parent / "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-
-def _arrow_to_numpy(arr: pa.Array | pa.ChunkedArray) -> np.ndarray:
-    """Convert Arrow array (plain or chunked) to contiguous numpy."""
-    if isinstance(arr, pa.ChunkedArray):
-        arr = arr.combine_chunks()
-    return arr.to_numpy(zero_copy_only=False)
+from bgkit.data.mmap_writer import arrow_to_numpy, build_csr_offsets, write_mmap_artifacts
 
 
 def convert(input_dir: Path) -> dict:
@@ -50,12 +47,12 @@ def convert(input_dir: Path) -> dict:
         table = pq.read_table(sf)
         token_col = table.column("token_ids")
 
-        # Flatten list<int32> → contiguous int32 array (zero-copy within Arrow)
-        flat_tokens = _arrow_to_numpy(pc.list_flatten(token_col))
+        # Flatten list<int32> -> contiguous int32 array (zero-copy within Arrow)
+        flat_tokens = arrow_to_numpy(pc.list_flatten(token_col))
         token_chunks.append(flat_tokens)
 
         # Per-row lengths for building CSR offsets
-        lengths = _arrow_to_numpy(pc.list_value_length(token_col)).astype(np.int64)
+        lengths = arrow_to_numpy(pc.list_value_length(token_col)).astype(np.int64)
         length_chunks.append(lengths)
 
         # Metadata columns (keep as Arrow for efficient concat)
@@ -70,11 +67,7 @@ def convert(input_dir: Path) -> dict:
     # Concatenate across shards
     tokens = np.concatenate(token_chunks)
     all_lengths = np.concatenate(length_chunks)
-
-    # Build CSR offsets from per-file lengths
-    offsets = np.empty(len(all_lengths) + 1, dtype=np.int64)
-    offsets[0] = 0
-    np.cumsum(all_lengths, out=offsets[1:])
+    offsets = build_csr_offsets(all_lengths)
 
     # Concatenate metadata (promote schemas so shards with/without commit_sha merge)
     meta_table = pa.concat_tables(meta_tables, promote_options="default")
@@ -85,27 +78,13 @@ def convert(input_dir: Path) -> dict:
             "commit_sha", pa.array([""] * meta_table.num_rows, type=pa.string())
         )
 
-    total_rows = len(all_lengths)
-    total_tokens = int(offsets[-1])
+    print(f"Total rows: {len(all_lengths)}, total tokens: {int(offsets[-1])}")
 
-    print(f"Total rows: {total_rows}, total tokens: {total_tokens}")
-
-    # Write outputs
-    np.save(input_dir / "tokens.npy", tokens)
-    np.save(input_dir / "offsets.npy", offsets)
-    pq.write_table(meta_table, input_dir / "metadata.parquet")
-
-    offsets_hash = hashlib.sha256(offsets.tobytes()).hexdigest()
-
-    manifest = {
-        "schema_version": 1,
-        "row_count": total_rows,
-        "total_tokens": total_tokens,
-        "offsets_sha256": offsets_hash,
-        "source_shard_count": len(shard_files),
-        "conversion_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    (input_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    manifest = write_mmap_artifacts(
+        input_dir, tokens, offsets,
+        manifest_extra={"source_shard_count": len(shard_files)},
+        metadata_table=meta_table,
+    )
 
     print(f"Wrote tokens.npy ({tokens.nbytes / 1e9:.2f} GB), "
           f"offsets.npy ({offsets.nbytes / 1e6:.1f} MB), "
@@ -131,7 +110,7 @@ def verify(input_dir: Path) -> None:
         lang_col = table.column("language")
 
         # Verify entire shard's flattened tokens at once
-        shard_flat = _arrow_to_numpy(pc.list_flatten(token_col))
+        shard_flat = arrow_to_numpy(pc.list_flatten(token_col))
         shard_start = int(offsets[row_idx])
         shard_end = int(offsets[row_idx + table.num_rows])
         npy_flat = np.array(tokens[shard_start:shard_end])

@@ -21,15 +21,24 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
-import time
 from pathlib import Path
+
+# Allow running as `python scripts/convert_*.py` without editable install
+_src = str(Path(__file__).resolve().parent.parent / "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
+
+from bgkit.data.mmap_writer import (
+    build_csr_offsets,
+    collect_jsonl_files,
+    infer_repo_path,
+    write_mmap_artifacts,
+)
 
 # Structural type keys and the corresponding JSONL field names
 STRUCTURAL_TYPES: list[tuple[str, str]] = [
@@ -37,19 +46,6 @@ STRUCTURAL_TYPES: list[tuple[str, str]] = [
     ("dependency", "dependency_text"),
     ("module_summary", "module_summary_text"),
 ]
-
-
-def collect_jsonl_files(input_dir: Path) -> list[Path]:
-    """Recursively find all .jsonl files under input_dir."""
-    files = sorted(input_dir.rglob("*.jsonl"))
-    return [f for f in files if not f.name.endswith(".tmp")]
-
-
-def infer_repo_path(jsonl_path: Path, input_dir: Path) -> str:
-    """Derive owner/repo from JSONL path relative to input_dir."""
-    rel = jsonl_path.relative_to(input_dir)
-    # e.g. owner/repo.jsonl -> owner/repo
-    return str(rel.with_suffix(""))
 
 
 def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: int) -> dict:
@@ -122,21 +118,13 @@ def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: 
 
     # Build CSR offsets
     lengths_arr = np.array(lengths, dtype=np.int64)
-    offsets = np.empty(len(lengths_arr) + 1, dtype=np.int64)
-    offsets[0] = 0
-    np.cumsum(lengths_arr, out=offsets[1:])
+    offsets = build_csr_offsets(lengths_arr)
 
     total_rows = len(lengths)
     total_tokens = int(offsets[-1])
 
     print(f"Total rows: {total_rows}, total tokens: {total_tokens}, "
           f"skipped (over {max_tokens} tokens): {total_skipped}")
-
-    # Write outputs
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    np.save(output_dir / "tokens.npy", tokens)
-    np.save(output_dir / "offsets.npy", offsets)
 
     meta_table = pa.table({
         "file_path": pa.array(meta_file_path, type=pa.string()),
@@ -145,22 +133,17 @@ def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: 
         "language": pa.array(meta_language, type=pa.string()),
         "repo_path": pa.array(meta_repo_path, type=pa.string()),
     })
-    pq.write_table(meta_table, output_dir / "metadata.parquet")
 
-    offsets_hash = hashlib.sha256(offsets.tobytes()).hexdigest()
-
-    manifest = {
-        "schema_version": 1,
-        "row_count": total_rows,
-        "total_tokens": total_tokens,
-        "skipped_over_max_tokens": total_skipped,
-        "max_tokens": max_tokens,
-        "tokenizer": tokenizer_name,
-        "offsets_sha256": offsets_hash,
-        "source_jsonl_count": len(jsonl_files),
-        "conversion_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    manifest = write_mmap_artifacts(
+        output_dir, tokens, offsets,
+        manifest_extra={
+            "skipped_over_max_tokens": total_skipped,
+            "max_tokens": max_tokens,
+            "tokenizer": tokenizer_name,
+            "source_jsonl_count": len(jsonl_files),
+        },
+        metadata_table=meta_table,
+    )
 
     print(f"Wrote tokens.npy ({tokens.nbytes / 1e9:.2f} GB), "
           f"offsets.npy ({offsets.nbytes / 1e6:.1f} MB), "

@@ -14,36 +14,14 @@ torch = pytest.importorskip("torch")
 from bgkit.data.datasets.commit_repro_dataset import CommitReproDataset
 
 
-def _create_commit_data(
-    data_dir: Path,
-    commit_token_ids: list[list[int]],
-) -> None:
-    """Helper to write mmap artifacts from known commit data."""
-    all_tokens = []
-    offsets = [0]
-    for tids in commit_token_ids:
-        all_tokens.extend(tids)
-        offsets.append(len(all_tokens))
-
-    np.save(data_dir / "tokens.npy", np.array(all_tokens, dtype=np.int32))
-    np.save(data_dir / "offsets.npy", np.array(offsets, dtype=np.int64))
-
-    manifest = {
-        "schema_version": 1,
-        "row_count": len(commit_token_ids),
-        "total_tokens": len(all_tokens),
-    }
-    (data_dir / "manifest.json").write_text(json.dumps(manifest))
-
-
 @pytest.fixture
-def commit_data_dir(tmp_path: Path) -> Path:
+def commit_data_dir(tmp_path: Path, create_mmap_artifacts) -> Path:
     """Create a small mmap commit dataset."""
     d = tmp_path / "commits"
     d.mkdir()
-    _create_commit_data(
+    create_mmap_artifacts(
         d,
-        commit_token_ids=[
+        token_lists=[
             list(range(10)),        # commit 0: 10 tokens
             list(range(20, 25)),    # commit 1: 5 tokens
             list(range(100, 103)),  # commit 2: 3 tokens
@@ -53,17 +31,10 @@ def commit_data_dir(tmp_path: Path) -> Path:
 
 
 class TestCommitReproDataset:
-    def test_len(self, tmp_path: Path):
+    def test_len(self, tmp_path: Path, create_mmap_artifacts):
         d = tmp_path / "data"
         d.mkdir()
-        _create_commit_data(
-            d,
-            commit_token_ids=[
-                [1, 2, 3],
-                [4, 5, 6, 7, 8],
-                [10, 20],
-            ],
-        )
+        create_mmap_artifacts(d, token_lists=[[1, 2, 3], [4, 5, 6, 7, 8], [10, 20]])
         ds = CommitReproDataset(str(d))
         assert len(ds) == 3
 
@@ -89,10 +60,10 @@ class TestCommitReproDataset:
             assert sample["token_ids"].ndim == 1
             assert sample["token_ids"].shape[0] > 0
 
-    def test_max_seq_len_truncates(self, tmp_path: Path):
+    def test_max_seq_len_truncates(self, tmp_path: Path, create_mmap_artifacts):
         d = tmp_path / "trunc"
         d.mkdir()
-        _create_commit_data(d, commit_token_ids=[list(range(100))])
+        create_mmap_artifacts(d, token_lists=[list(range(100))])
         ds = CommitReproDataset(str(d), max_seq_len=10)
         sample = ds[0]
         assert sample["token_ids"].shape[0] == 10
@@ -105,13 +76,10 @@ class TestCommitReproDataset:
         samples = list(loader)
         assert len(samples) == 3
 
-    def test_zero_length_commits_skipped(self, tmp_path: Path):
+    def test_zero_length_commits_skipped(self, tmp_path: Path, create_mmap_artifacts):
         d = tmp_path / "zeros"
         d.mkdir()
-        _create_commit_data(
-            d,
-            commit_token_ids=[[], [1, 2, 3], []],
-        )
+        create_mmap_artifacts(d, token_lists=[[], [1, 2, 3], []])
         ds = CommitReproDataset(str(d))
         assert len(ds) == 1
         assert torch.equal(ds[0]["token_ids"], torch.tensor([1, 2, 3], dtype=torch.int64))
@@ -157,12 +125,12 @@ class TestCommitReproDataset:
         with pytest.raises(ValueError, match="Manifest total_tokens"):
             CommitReproDataset(str(d))
 
-    def test_lengths_property(self, tmp_path: Path):
+    def test_lengths_property(self, tmp_path: Path, create_mmap_artifacts):
         d = tmp_path / "lengths"
         d.mkdir()
-        _create_commit_data(
+        create_mmap_artifacts(
             d,
-            commit_token_ids=[
+            token_lists=[
                 list(range(20)),   # 20 tokens, truncated to 10
                 list(range(5)),    # 5 tokens, not truncated
                 [],                # 0 tokens, skipped
@@ -177,12 +145,12 @@ class TestGoldenOutput:
     """Golden-output test: exact expected values for known commit sequences."""
 
     @pytest.fixture
-    def golden_dir(self, tmp_path: Path) -> Path:
+    def golden_dir(self, tmp_path: Path, create_mmap_artifacts) -> Path:
         d = tmp_path / "golden"
         d.mkdir()
-        _create_commit_data(
+        create_mmap_artifacts(
             d,
-            commit_token_ids=[
+            token_lists=[
                 [10, 20, 30, 40, 50],  # commit 0: 5 tokens
                 [100, 200, 300],        # commit 1: 3 tokens
                 [],                     # commit 2: empty, skipped

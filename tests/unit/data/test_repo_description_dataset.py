@@ -1,11 +1,8 @@
 """Tests for MmapRepoDescriptionDataset."""
 from __future__ import annotations
 
-import json
+from pathlib import Path
 
-import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -13,50 +10,16 @@ torch = pytest.importorskip("torch")
 from bgkit.data.datasets.description_dataset import MmapRepoDescriptionDataset
 
 
-def _create_repo_desc_artifacts(
-    tmpdir,
-    repo_paths: list[str],
-    commit_shas: list[str],
-    token_lengths: list[int],
-):
-    """Create synthetic mmap artifacts for repo-scope descriptions."""
-    n = len(repo_paths)
-    assert len(commit_shas) == n
-    assert len(token_lengths) == n
-
-    # Build tokens and offsets
-    offsets = [0]
-    all_tokens = []
-    for length in token_lengths:
-        tokens = list(range(1, length + 1))
-        all_tokens.extend(tokens)
-        offsets.append(offsets[-1] + length)
-
-    np.save(tmpdir / "tokens.npy", np.array(all_tokens, dtype=np.int32))
-    np.save(tmpdir / "offsets.npy", np.array(offsets, dtype=np.int64))
-
-    manifest = {
-        "schema_version": 1,
-        "row_count": n,
-        "total_tokens": len(all_tokens),
-    }
-    (tmpdir / "manifest.json").write_text(json.dumps(manifest))
-
-    table = pa.table({
-        "repo_path": repo_paths,
-        "commit_sha": commit_shas,
-    })
-    pq.write_table(table, tmpdir / "metadata.parquet")
-
-
 class TestMmapRepoDescriptionDataset:
-    def test_basic_load_and_lookup(self, tmp_path):
+    def test_basic_load_and_lookup(self, tmp_path, create_mmap_artifacts):
         """Synthetic repo-scope mmap, verify 2-tuple key lookup."""
-        _create_repo_desc_artifacts(
+        create_mmap_artifacts(
             tmp_path,
-            repo_paths=["owner/repo1", "owner/repo2"],
-            commit_shas=["abc123", "def456"],
-            token_lengths=[10, 15],
+            token_lists=[list(range(1, 11)), list(range(1, 16))],
+            metadata_columns={
+                "repo_path": ["owner/repo1", "owner/repo2"],
+                "commit_sha": ["abc123", "def456"],
+            },
         )
 
         ds = MmapRepoDescriptionDataset(str(tmp_path), max_seq_len=2048)
@@ -81,25 +44,29 @@ class TestMmapRepoDescriptionDataset:
         assert sample2 is not None
         assert sample2["token_ids"].shape == (15,)
 
-    def test_missing_key_returns_none(self, tmp_path):
+    def test_missing_key_returns_none(self, tmp_path, create_mmap_artifacts):
         """Absent key should return None."""
-        _create_repo_desc_artifacts(
+        create_mmap_artifacts(
             tmp_path,
-            repo_paths=["owner/repo1"],
-            commit_shas=["abc123"],
-            token_lengths=[10],
+            token_lists=[list(range(1, 11))],
+            metadata_columns={
+                "repo_path": ["owner/repo1"],
+                "commit_sha": ["abc123"],
+            },
         )
 
         ds = MmapRepoDescriptionDataset(str(tmp_path), max_seq_len=2048)
         assert ds.get_by_key("nonexistent/repo", "xyz") is None
 
-    def test_getitem(self, tmp_path):
+    def test_getitem(self, tmp_path, create_mmap_artifacts):
         """Direct index access should return token_ids dict."""
-        _create_repo_desc_artifacts(
+        create_mmap_artifacts(
             tmp_path,
-            repo_paths=["owner/repo1"],
-            commit_shas=["abc123"],
-            token_lengths=[8],
+            token_lists=[list(range(1, 9))],
+            metadata_columns={
+                "repo_path": ["owner/repo1"],
+                "commit_sha": ["abc123"],
+            },
         )
 
         ds = MmapRepoDescriptionDataset(str(tmp_path), max_seq_len=2048)
@@ -107,28 +74,32 @@ class TestMmapRepoDescriptionDataset:
         assert "token_ids" in sample
         assert sample["token_ids"].shape == (8,)
 
-    def test_max_seq_len_truncation(self, tmp_path):
+    def test_max_seq_len_truncation(self, tmp_path, create_mmap_artifacts):
         """Tokens longer than max_seq_len should be truncated."""
-        _create_repo_desc_artifacts(
+        create_mmap_artifacts(
             tmp_path,
-            repo_paths=["owner/repo1"],
-            commit_shas=["abc123"],
-            token_lengths=[100],
+            token_lists=[list(range(1, 101))],
+            metadata_columns={
+                "repo_path": ["owner/repo1"],
+                "commit_sha": ["abc123"],
+            },
         )
 
         ds = MmapRepoDescriptionDataset(str(tmp_path), max_seq_len=50)
         sample = ds[0]
         assert sample["token_ids"].shape == (50,)
 
-    def test_pickle_roundtrip(self, tmp_path):
+    def test_pickle_roundtrip(self, tmp_path, create_mmap_artifacts):
         """Dataset should survive pickle (for DataLoader workers)."""
         import pickle
 
-        _create_repo_desc_artifacts(
+        create_mmap_artifacts(
             tmp_path,
-            repo_paths=["owner/repo1"],
-            commit_shas=["abc123"],
-            token_lengths=[10],
+            token_lists=[list(range(1, 11))],
+            metadata_columns={
+                "repo_path": ["owner/repo1"],
+                "commit_sha": ["abc123"],
+            },
         )
 
         ds = MmapRepoDescriptionDataset(str(tmp_path), max_seq_len=2048)
