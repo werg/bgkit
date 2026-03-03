@@ -122,9 +122,17 @@ class LlamaClient:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._async_client is None or self._async_client.is_closed:
+            # Pool limits must accommodate the concurrency semaphore plus headroom
+            # for health/model probes. Default httpx limit (100) is too low when
+            # multiple thread workers submit large batches concurrently.
+            pool = httpx.Limits(
+                max_connections=self.config.max_concurrent + 20,
+                max_keepalive_connections=self.config.max_concurrent,
+            )
             self._async_client = httpx.AsyncClient(
                 base_url=self.config.base_url,
                 timeout=self.config.timeout,
+                limits=pool,
             )
         return self._async_client
 

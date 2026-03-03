@@ -121,7 +121,7 @@ extract-structural:
 generate-descriptions: vllm-server
 	.venv/bin/python scripts/generate_descriptions.py \
 		--repos-dir data/repos/ --output-dir data/descriptions/ \
-		--structural-dir data/structural/ --backend local
+		--structural-dir data/structural/ --backend local --workers 2
 
 extract-commits:
 	.venv/bin/python scripts/process_commit_repro.py $(ARGS)

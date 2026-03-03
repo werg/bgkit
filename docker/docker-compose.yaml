@@ -151,7 +151,7 @@ services:
       --quantization mxfp4
       --mxfp4-backend CUTLASS
       --mxfp4-layers moe,qkv,o,lm_head
-      --gpu-memory-utilization ${VLLM_GPU_UTIL_PRIMARY:-0.65}
+      --gpu-memory-utilization ${VLLM_GPU_UTIL_PRIMARY:-0.55}
       --max-model-len 32768
       --enable-prefix-caching
       --enable-chunked-prefill

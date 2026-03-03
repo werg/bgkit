@@ -107,7 +107,7 @@ Local LLM inference via vLLM in Docker, two-tier routing: primary model (GPT-OSS
 | Stop vLLM servers | `make vllm-server-stop` |
 | Tail logs | `make vllm-server-logs` |
 
-Override model/params via env: `VLLM_IMAGE_PRIMARY`, `VLLM_IMAGE_FAST`, `VLLM_MODEL_PRIMARY`, `VLLM_MODEL_FAST`, `VLLM_GPU_UTIL_PRIMARY` (default 0.65), `VLLM_GPU_UTIL_FAST` (default 0.10), `VLLM_PORT_PRIMARY` (default 8090), `VLLM_PORT_FAST` (default 8091).
+Override model/params via env: `VLLM_IMAGE_PRIMARY`, `VLLM_IMAGE_FAST`, `VLLM_MODEL_PRIMARY`, `VLLM_MODEL_FAST`, `VLLM_GPU_UTIL_PRIMARY` (default 0.55), `VLLM_GPU_UTIL_FAST` (default 0.10), `VLLM_PORT_PRIMARY` (default 8090), `VLLM_PORT_FAST` (default 8091).
 
 HF models are cached in `~/.cache/huggingface` (bind-mounted into container).
 
