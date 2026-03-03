@@ -118,7 +118,7 @@ extract-structural:
 	.venv/bin/python scripts/extract_structural_data.py \
 		--repos-dir data/repos/ --output-dir data/structural/ --workers 8
 
-generate-descriptions:
+generate-descriptions: vllm-server
 	.venv/bin/python scripts/generate_descriptions.py \
 		--repos-dir data/repos/ --output-dir data/descriptions/ \
 		--structural-dir data/structural/ --backend local

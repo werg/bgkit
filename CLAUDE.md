@@ -56,6 +56,7 @@ Full local dev (with torch + GPU packages): `make install-gpu` or `uv sync --gro
 | Build data container | `make docker-build-data` |
 | Train (in container) | `make train-ice` or `docker compose -f docker/docker-compose.yaml up train-ice` |
 | Train (no log tail) | `scripts/run-train.sh --no-follow <service>` |
+| Generate descriptions | `make generate-descriptions` |
 
 ## Dependency Management
 
@@ -100,6 +101,7 @@ Local LLM inference via vLLM in Docker, two-tier routing: primary model (GPT-OSS
 
 | Task | Command |
 |---|---|
+| Generate descriptions | `make generate-descriptions` |
 | Download HF models | `make download-models-hf` |
 | Start vLLM servers | `make vllm-server` |
 | Stop vLLM servers | `make vllm-server-stop` |
@@ -129,6 +131,8 @@ Three-tier llama.cpp setup still available for GGUF models.
 Configure via `InferenceConfig.backend_type`: `"auto"` (default, probes `/version`), `"vllm"`, or `"llama"`.
 
 `generate_descriptions.py` uses two-tier routing (`--server-url-primary` / `--server-url-fast`). Old `--llama-url-*` flags still work as deprecated aliases.
+
+`make generate-descriptions` is the single entry point: starts vLLM servers if needed, waits for health, then runs generation. Idempotent and resumable — skips repos that already have output files, safe to Ctrl-C and re-run.
 
 ## Code Quality
 
