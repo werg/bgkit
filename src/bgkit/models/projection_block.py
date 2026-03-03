@@ -95,11 +95,13 @@ class ProjectionBlock(nn.Module):
             attn_mask_4d = attention_mask[:, None, None, :].to(hidden_states.dtype)
             attn_mask_4d = (1.0 - attn_mask_4d) * torch.finfo(hidden_states.dtype).min
 
-        all_out = self.transformer_layer(
+        layer_out = self.transformer_layer(
             hidden_states,
             attention_mask=attn_mask_4d,
             position_embeddings=position_embeddings,
         )
+        # HF decoder layers return (hidden_states, ...) tuples; unwrap.
+        all_out = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
         if survivor_mask is not None:
             survivor_list = extract_survivors(all_out, survivor_mask)

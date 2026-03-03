@@ -97,7 +97,7 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 
 ### vLLM (primary)
 
-Local LLM inference via vLLM in Docker, two-tier routing: primary model (GPT-OSS-20B, MXFP4 quantization via `vllm-mxfp4-spark` image) for complex files, fast model (Qwen3.5-0.8B via `vllm-node` image) for config/test/simple files. Uses continuous batching and prefix caching for high throughput.
+Local LLM inference via vLLM in Docker, two-tier routing: primary model (GPT-OSS-20B, MXFP4 quantization via `vllm-node-mxfp4` image from eugr) for complex files, fast model (Qwen3.5-0.8B via `vllm-node` image) for config/test/simple files. Uses continuous batching, prefix caching, and FlashInfer MOE kernels for high throughput.
 
 | Task | Command |
 |---|---|

@@ -1,7 +1,9 @@
 # Joint block pretraining configuration
-# Penultimate block (layer 26): auto-reproduction (output ≈ input embeddings)
-# Ultimate block (layer 27): decoder projection (output ≈ decoder token embeddings)
-# Both trained jointly; projection loss gradients flow freely through layer 26.
+# Penultimate block (layer 22): auto-reproduction (output ≈ input embeddings)
+# Ultimate block (layer 23): decoder projection (output ≈ decoder token embeddings)
+# Both trained jointly; projection loss gradients flow freely through layer 22.
+# Layer 22 is DeltaNet (both forward + backward passes trained).
+# Layer 23 is full attention (ideal for bidirectional projection).
 phase: joint_block_pretrain
 max_steps: 4000
 lr: 5.0e-6

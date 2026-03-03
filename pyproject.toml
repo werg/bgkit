@@ -10,7 +10,7 @@ readme = "docs/01_overview.md"
 requires-python = ">=3.11,<3.13"
 license = "MIT"
 dependencies = [
-    "transformers>=4.51",
+    "transformers>=5.2",
     "safetensors",
     "datasets>=3.0",
     "tokenizers",
@@ -32,6 +32,7 @@ gpu = [
     "peft>=0.14",
     "bitsandbytes",
     "einops",
+    "flash-linear-attention",
 ]
 dev = [
     "pytest",

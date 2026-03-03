@@ -11,7 +11,8 @@ freeze_top_layer: true
 lr_scale_bottom: 0.1
 # Budget is based on chat-formatted token counts (decoder input size).
 # Chat template adds ~257 tokens of overhead per sample.
-# 128 GB unified memory fits ~16K tokens with Qwen3-0.6B decoder (152K vocab).
+# 128 GB unified memory fits ~16K tokens with Qwen3.5-0.8B decoder (248K vocab).
+# May need reduction to 12288 if OOM occurs due to larger vocab logits.
 max_batch_tokens: 16384
 gradient_accumulation_steps: 4    # 16K × 4 = 64K effective tokens per step
 max_eval_samples: 2000

@@ -9,6 +9,7 @@ torch = pytest.importorskip("torch")
 from torch import nn
 
 from bgkit.models.bgkit_compressor import BgKITCompressor, CompressionOutput
+from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
 from bgkit.models.encoder import BgKITEncoder, _expand_survivor_mask, _resolve_layers
 from bgkit.models.projection_block import ProjectionBlock
 
@@ -256,3 +257,102 @@ class TestBgKITEncoderFactory:
         out = encoder(x, survivor_mask=None)
         assert isinstance(out, CompressionOutput)
         assert out.survivor_embeddings.shape == (2, 10, 64)
+
+
+class TestQwen35Wrapping:
+    """Test that Qwen3.5 models are wrapped in BidirectionalQwen35."""
+
+    def test_preloaded_qwen35_module_gets_wrapped(self):
+        """Pre-loaded module with qwen3_5 model_type should be wrapped.
+
+        This is the code path used by JointBlockTrainer, which loads the
+        backbone via AutoModel.from_pretrained() then passes the module
+        to BgKITEncoder.from_pretrained().
+        """
+
+        class Qwen35Config:
+            model_type = "qwen3_5"
+
+        backbone = MockBackbone(hidden_dim=64, num_layers=4)
+        backbone.config = Qwen35Config()
+        backbone.norm = nn.LayerNorm(64)
+        backbone.layers[-1] = MockTransformerLayer(64)
+
+        encoder = BgKITEncoder.from_pretrained(backbone, hidden_dim=64)
+
+        # Compressor backbone should be BidirectionalQwen35, not raw MockBackbone
+        assert isinstance(encoder.compressor.backbone, BidirectionalQwen35)
+
+    def test_non_qwen35_module_not_wrapped(self):
+        """Pre-loaded module without qwen3_5 model_type should not be wrapped."""
+
+        class OtherConfig:
+            model_type = "qwen2"
+
+        backbone = MockBackbone(hidden_dim=64, num_layers=4)
+        backbone.config = OtherConfig()
+        backbone.norm = nn.LayerNorm(64)
+        backbone.layers[-1] = MockTransformerLayer(64)
+
+        encoder = BgKITEncoder.from_pretrained(backbone, hidden_dim=64)
+
+        # Should NOT be wrapped
+        assert not isinstance(encoder.compressor.backbone, BidirectionalQwen35)
+
+    def test_already_wrapped_module_not_double_wrapped(self):
+        """A BidirectionalQwen35 instance should not be wrapped again."""
+        backbone = MockBackbone(hidden_dim=64, num_layers=8)
+
+        class Qwen35Config:
+            model_type = "qwen3_5"
+
+        backbone.config = Qwen35Config()
+        backbone.norm = nn.LayerNorm(64)
+
+        bidi = BidirectionalQwen35(backbone, clone_backward_weights=True)
+
+        # Pop from bidi.layers to match what from_pretrained expects
+        # (needs at least 2 layers to pop one for projection)
+        encoder = BgKITEncoder.from_pretrained(bidi, hidden_dim=64)
+
+        # Should be the same BidirectionalQwen35, not a nested one
+        assert isinstance(encoder.compressor.backbone, BidirectionalQwen35)
+
+    def test_string_path_extracts_text_model_and_wraps(self):
+        """String path should extract language_model and wrap in BidirectionalQwen35.
+
+        Mocks AutoModel.from_pretrained to return a multimodal-style model
+        (with language_model attribute) that has qwen3_5 model_type.
+        """
+        from unittest.mock import patch
+
+        class Qwen35Config:
+            model_type = "qwen3_5"
+            hidden_size = 64
+
+        # Inner text model (what language_model returns)
+        text_model = MockBackbone(hidden_dim=64, num_layers=4)
+        text_model.config = Qwen35Config()
+        text_model.norm = nn.LayerNorm(64)
+        text_model.layers[-1] = MockTransformerLayer(64)
+
+        # Outer multimodal wrapper
+        outer_model = nn.Module()
+        outer_model.language_model = text_model
+        outer_model.config = Qwen35Config()
+
+        with patch("transformers.AutoModel") as mock_auto:
+            mock_auto.from_pretrained.return_value = outer_model
+            encoder = BgKITEncoder.from_pretrained("fake/model-name", hidden_dim=64)
+
+        # Should have called AutoModel.from_pretrained with the string
+        mock_auto.from_pretrained.assert_called_once()
+        call_args = mock_auto.from_pretrained.call_args
+        assert call_args[0][0] == "fake/model-name"
+
+        # Compressor backbone should be BidirectionalQwen35 wrapping the text model
+        assert isinstance(encoder.compressor.backbone, BidirectionalQwen35)
+        assert not isinstance(
+            getattr(encoder.compressor.backbone, "_hf_model", None),
+            BidirectionalQwen35,
+        )

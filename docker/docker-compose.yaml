@@ -141,11 +141,12 @@ services:
 
   vllm-primary:
     <<: *vllm-common
-    image: "${VLLM_IMAGE_PRIMARY:-vllm-mxfp4-spark:latest}"
+    image: "${VLLM_IMAGE_PRIMARY:-vllm-node-mxfp4:latest}"
     ports:
       - "${VLLM_PORT_PRIMARY:-8090}:8000"
     environment:
       TIKTOKEN_ENCODINGS_BASE: /workspace/tiktoken_encodings
+      VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: "1"
     command: >-
       vllm serve ${VLLM_MODEL_PRIMARY:-openai/gpt-oss-20b}
       --quantization mxfp4
@@ -154,11 +155,10 @@ services:
       --gpu-memory-utilization ${VLLM_GPU_UTIL_PRIMARY:-0.45}
       --max-model-len 32768
       --enable-prefix-caching
-      --enable-chunked-prefill
-      --max-num-seqs 16
+      --max-num-batched-tokens 8192
       --kv-cache-dtype fp8
       --attention-backend FLASHINFER
-      --enforce-eager
+      --load-format fastsafetensors
 
   vllm-fast:
     <<: *vllm-common

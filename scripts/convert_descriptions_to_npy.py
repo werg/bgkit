@@ -200,8 +200,8 @@ def main() -> None:
         help="Output directory (will contain file/, module/, repo/ subdirectories)",
     )
     parser.add_argument(
-        "--tokenizer", type=str, default="Qwen/Qwen3-0.6B",
-        help="HuggingFace tokenizer name (default: Qwen/Qwen3-0.6B)",
+        "--tokenizer", type=str, default="Qwen/Qwen3.5-0.8B",
+        help="HuggingFace tokenizer name (default: Qwen/Qwen3.5-0.8B)",
     )
     parser.add_argument(
         "--max-tokens", type=int, default=4096,

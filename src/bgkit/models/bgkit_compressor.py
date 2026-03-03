@@ -1,7 +1,7 @@
 """BgKIT compressor: hierarchical compression via drop-flag mechanism.
 
-Based on Qwen3-Embedding-0.6B (~600M params, hidden dim 1024), applied
-recursively at two compression levels:
+Based on Qwen3.5-0.8B-Base (~800M params, hidden dim 1024), bidirectionalized
+via BidirectionalQwen35. Applied recursively at two compression levels:
 
 - Level 0 (within-file): Each chunk processed independently. Bidirectional
   self-attention, then drop-flag mechanism compresses by discarding "doomed"
@@ -46,7 +46,7 @@ class CompressionOutput:
 class BgKITCompressor(nn.Module):
     """BgKIT hierarchical compressor.
 
-    Wraps a pretrained Qwen3-Embedding-0.6B backbone with:
+    Wraps a pretrained backbone (BidirectionalQwen35 for Qwen3.5) with:
     - Learned binary embeddings for survive/doomed flags
     - Drop-flag mechanism for compression
     - Auto-reproduction output head

@@ -1,8 +1,12 @@
-"""Reconstruction decoder: Qwen3-0.6B wrapper.
+"""Reconstruction decoder: Qwen3.5-0.8B (instruct) wrapper.
 
 Co-trained with BgKIT to reconstruct original content from compressed
 survivor representations via prefix-conditioning. Survivor embeddings are
 prepended to the decoder input and attended to via causal self-attention.
+
+The Qwen3.5 decoder uses the same hybrid architecture (18 DeltaNet + 6 full
+attention) as the encoder, but in standard causal mode. DeltaNet layers
+provide O(L) inference, reducing KV cache memory for long survivor sequences.
 
 Provides the primary training signal for compression quality across four
 objectives:
@@ -32,7 +36,7 @@ class GenerationOutput:
 class ReconstructionDecoder(nn.Module):
     """Causal LM decoder for reconstructing content from BgKIT survivors.
 
-    Wraps Qwen3-0.6B with prefix-conditioning: survivor embeddings are
+    Wraps Qwen3.5-0.8B with prefix-conditioning: survivor embeddings are
     prepended to the target sequence and attended to via standard causal
     self-attention. No architectural changes to the underlying model.
     """

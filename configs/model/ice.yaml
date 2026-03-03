@@ -1,8 +1,8 @@
 # ICE: Information Content Estimator
 ice:
-  embedding_model: Qwen/Qwen3-Embedding-0.6B
-  embedding_model_revision: c54f2e6e80b2d7b7de06f51cec4959f6b3e03418
-  input_dim: 1024  # Qwen3-Embedding hidden dim
+  embedding_model: Qwen/Qwen3.5-0.8B-Base
+  # embedding_model_revision: <pin after release stabilizes>
+  input_dim: 1024  # Qwen3.5-0.8B hidden dim
   hidden_dim: 128
   num_layers: 2
   kernel_size: 5

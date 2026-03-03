@@ -36,8 +36,9 @@ class MockTransformerLayer(nn.Module):
             weights = (attention_mask.squeeze(1).squeeze(1) > -1.0).float()  # (B, L)
             weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1)
             ctx = torch.bmm(weights.unsqueeze(1), h)  # (B, 1, D)
-            return h + 0.1 * ctx
-        return h
+            h = h + 0.1 * ctx
+        # Return tuple like real HF decoder layers: (hidden_states, ...)
+        return (h,)
 
 
 class MockRotaryEmb(nn.Module):
@@ -124,7 +125,8 @@ class TestProjectionBlockForward:
         # Get pre-head output for comparison
         position_ids = torch.arange(5).unsqueeze(0)
         position_embeddings = block._rotary_emb(x, position_ids)
-        pre_norm = block.transformer_layer(x, position_embeddings=position_embeddings)
+        layer_out = block.transformer_layer(x, position_embeddings=position_embeddings)
+        pre_norm = layer_out[0] if isinstance(layer_out, tuple) else layer_out
         normed = block.output_norm(pre_norm)
         expected = block.projection_head(normed)
 

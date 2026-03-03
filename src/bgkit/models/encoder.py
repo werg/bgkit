@@ -4,6 +4,10 @@ Orchestrates the full encoding pipeline from input embeddings to projected
 output embeddings. The compressor runs the bulk of transformer layers and
 produces dense hidden states; the projection block (a single transformer
 layer) performs context-aware projection into the decoder's embedding space.
+
+For Qwen3.5-0.8B backbones, the model is wrapped in BidirectionalQwen35
+which adds bidirectional attention (unmasked full attention layers + dual-pass
+DeltaNet layers with separate backward weights).
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ import torch
 import torch.nn as nn
 
 from bgkit.models.bgkit_compressor import BgKITCompressor, CompressionOutput
+from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
 from bgkit.models.projection_block import ProjectionBlock
 
 
@@ -55,6 +60,34 @@ def _resolve_rotary_emb(backbone: nn.Module) -> nn.Module:
         f"Cannot find rotary embedding in {type(backbone).__name__}. "
         f"Known attributes: {[n for n, _ in backbone.named_children()]}"
     )
+
+
+def _is_qwen35_model(model: nn.Module) -> bool:
+    """Check if a model is a Qwen3.5 variant (by config model_type).
+
+    Handles both the multimodal wrapper (model_type='qwen3_5') and
+    the text model (model_type='qwen3_5_text').
+    """
+    config = getattr(model, "config", None)
+    if config is None:
+        return False
+    model_type = getattr(config, "model_type", "")
+    return "qwen3_5" in model_type.lower()
+
+
+def _extract_text_model(model: nn.Module) -> nn.Module:
+    """Extract the text model from a multimodal Qwen3.5 model.
+
+    Qwen3.5 models are multimodal (Qwen3_5ForConditionalGeneration or
+    Qwen3_5Model) with vision + language_model. The text model (language_model)
+    has the standard HF structure: embed_tokens, layers, norm, rotary_emb.
+
+    Returns the text model if found, otherwise returns the model unchanged.
+    """
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None and hasattr(language_model, "layers"):
+        return language_model
+    return model
 
 
 def _set_norm_to_identity(backbone: nn.Module) -> None:
@@ -216,16 +249,28 @@ class BgKITEncoder(nn.Module):
             from transformers import AutoModel
 
             load_kwargs: dict = {
-                "torch_dtype": torch_dtype,
+                "dtype": torch_dtype,
                 "trust_remote_code": trust_remote_code,
             }
             if revision is not None:
                 load_kwargs["revision"] = revision
             if attn_implementation is not None:
                 load_kwargs["attn_implementation"] = attn_implementation
-            backbone = AutoModel.from_pretrained(backbone_name_or_module, **load_kwargs)
+            raw_model = AutoModel.from_pretrained(backbone_name_or_module, **load_kwargs)
         else:
-            backbone = backbone_name_or_module
+            raw_model = backbone_name_or_module
+
+        # Qwen3.5 models are multimodal (visual + language_model). Extract the
+        # text model (language_model) which has the standard HF structure:
+        # embed_tokens, layers, norm, rotary_emb.
+        raw_model = _extract_text_model(raw_model)
+
+        # Wrap Qwen3.5 text models in BidirectionalQwen35 for dual-pass DeltaNet
+        # and unmasked full attention layers.
+        if not isinstance(raw_model, BidirectionalQwen35) and _is_qwen35_model(raw_model):
+            backbone = BidirectionalQwen35(raw_model)
+        else:
+            backbone = raw_model
 
         # 1. Get the layers list
         layers = _resolve_layers(backbone)
@@ -233,6 +278,9 @@ class BgKITEncoder(nn.Module):
         # 2. Pop the last layer -> projection layer
         projection_layer = layers[-1]
         del layers[-1]
+
+        # For BidirectionalQwen35, the popped layer (index 23) is a full attention
+        # layer (23 % 4 == 3), so there's no backward DeltaNet entry to clean up.
 
         # 3. Get rotary embedding (shared reference, not deepcopy)
         rotary_emb = _resolve_rotary_emb(backbone)
