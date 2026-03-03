@@ -6,8 +6,8 @@ produces dense hidden states; the projection block (a single transformer
 layer) performs context-aware projection into the decoder's embedding space.
 
 For Qwen3.5-0.8B backbones, the model is wrapped in BidirectionalQwen35
-which adds bidirectional attention (unmasked full attention layers + dual-pass
-DeltaNet layers with separate backward weights).
+which makes full attention layers bidirectional (causal mask removed) while
+keeping DeltaNet layers causal for efficient O(L) processing.
 """
 
 from __future__ import annotations
@@ -265,8 +265,8 @@ class BgKITEncoder(nn.Module):
         # embed_tokens, layers, norm, rotary_emb.
         raw_model = _extract_text_model(raw_model)
 
-        # Wrap Qwen3.5 text models in BidirectionalQwen35 for dual-pass DeltaNet
-        # and unmasked full attention layers.
+        # Wrap Qwen3.5 text models in BidirectionalQwen35 (bidirectional
+        # full attention layers, causal DeltaNet layers).
         if not isinstance(raw_model, BidirectionalQwen35) and _is_qwen35_model(raw_model):
             backbone = BidirectionalQwen35(raw_model)
         else:
@@ -278,9 +278,6 @@ class BgKITEncoder(nn.Module):
         # 2. Pop the last layer -> projection layer
         projection_layer = layers[-1]
         del layers[-1]
-
-        # For BidirectionalQwen35, the popped layer (index 23) is a full attention
-        # layer (23 % 4 == 3), so there's no backward DeltaNet entry to clean up.
 
         # 3. Get rotary embedding (shared reference, not deepcopy)
         rotary_emb = _resolve_rotary_emb(backbone)

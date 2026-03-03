@@ -1,14 +1,18 @@
 """Bidirectional Qwen3.5-0.8B wrapper for BgKIT compression.
 
-Wraps the Qwen3.5 text model (Qwen3_5TextModel) with bidirectional attention:
+Wraps the Qwen3.5 text model (Qwen3_5TextModel) with bidirectional attention
+on full attention layers while keeping DeltaNet layers causal:
 
 - Full attention layers (indices 3, 7, 11, 15, 19, 23): causal mask removed,
   replaced with padding-only 2D mask for bidirectional attention.
-- Gated DeltaNet layers (all others): dual-pass with separate forward and
-  backward weights. Forward pass is standard causal; backward pass reverses
-  input, runs through a separate weight copy, and flips output back.
-  Outputs are combined via a learned per-dimension sigmoid gate (inspired by
-  Hydra/Vision Mamba), initialized to 0.5 for equal mixing.
+- Gated DeltaNet layers (all others): kept causal (left-to-right). These
+  provide efficient O(L) local feature extraction between the bidirectional
+  mixing points.
+
+The 6 full attention layers provide periodic bidirectional context mixing,
+analogous to Longformer's local+global attention pattern. DeltaNet layers
+receive bidirectionally-mixed input from preceding attention layers and
+propagate it forward with O(L) efficiency.
 
 The wrapper preserves the HuggingFace model API surface required by
 existing trainers (get_input_embeddings, gradient_checkpointing_enable, config).
@@ -24,24 +28,27 @@ Architecture notes (from model inspection):
 
 from __future__ import annotations
 
-import copy
-
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
 
 class BidirectionalQwen35(nn.Module):
-    """Qwen3.5-0.8B with bidirectional attention for BgKIT compression.
+    """Qwen3.5-0.8B with bidirectional full attention for BgKIT compression.
 
     - Full attention layers: causal mask removed (bidirectional)
-    - DeltaNet layers: dual-pass with learned per-dimension gate for mixing
+    - DeltaNet layers: kept causal (efficient O(L) local processing)
+
+    The 6 full attention layers (every 4th) provide bidirectional context
+    mixing. DeltaNet layers between them process bidirectionally-informed
+    representations with O(L) efficiency. No parameter increase over the
+    base model.
 
     Preserves HF API surface: get_input_embeddings(),
     gradient_checkpointing_enable(), config, etc.
     """
 
-    def __init__(self, base_model: nn.Module, clone_backward_weights: bool = True):
+    def __init__(self, base_model: nn.Module):
         super().__init__()
         # Store original HF model for config access only. Bypass nn.Module
         # __setattr__ to avoid registering as a submodule (which would duplicate
@@ -53,25 +60,7 @@ class BidirectionalQwen35(nn.Module):
         self.embed_tokens = base_model.embed_tokens
         self.norm = base_model.norm
         self.rotary_emb = base_model.rotary_emb
-
-        self.layers = nn.ModuleList()
-        self.backward_deltanet_layers = nn.ModuleDict()
-        # Per-layer learned gate for forward/backward mixing (Hydra-inspired).
-        # gate = sigmoid(gate_logit): 0 = all-backward, 1 = all-forward.
-        # Initialized to 0 → sigmoid(0) = 0.5 → equal mix at init.
-        self.fwd_bwd_gate_logits = nn.ParameterDict()
-
-        hidden_dim = getattr(
-            base_model.config, "hidden_size", base_model.embed_tokens.embedding_dim
-        )
-        for i, layer in enumerate(base_model.layers):
-            self.layers.append(layer)
-            if self._is_deltanet_layer(layer):
-                bwd_layer = copy.deepcopy(layer) if clone_backward_weights else layer
-                self.backward_deltanet_layers[str(i)] = bwd_layer
-                self.fwd_bwd_gate_logits[str(i)] = nn.Parameter(
-                    torch.zeros(hidden_dim)
-                )
+        self.layers = base_model.layers
 
     # --- HF API proxies (required by trainers) ---
 
@@ -88,8 +77,7 @@ class BidirectionalQwen35(nn.Module):
         """Enable gradient checkpointing on all layers.
 
         Uses explicit torch.utils.checkpoint.checkpoint() in forward loop
-        rather than HF's internal mechanism, covering both forward and
-        backward DeltaNet layers uniformly.
+        rather than HF's internal mechanism.
         """
         self._gradient_checkpointing = True
 
@@ -104,61 +92,21 @@ class BidirectionalQwen35(nn.Module):
         """
         return hasattr(layer, "linear_attn")
 
-    @staticmethod
-    def _pad_aware_reverse(
-        tensor: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Reverse non-pad positions so pad ends up on the right.
-
-        For right-padded sequences, a naive flip(1) puts pad tokens at the
-        front of the reversed sequence. A causal DeltaNet then processes
-        pad tokens first and their state (non-zero due to layer biases)
-        contaminates all subsequent real tokens.
-
-        This method reverses only real positions within each batch element
-        and right-pads with zeros, keeping pad harmless at the end of the
-        causal processing order.
-
-        Args:
-            tensor: (B, L, D) or (1, L, D) tensor to reverse.
-            attention_mask: (B, L) float mask (1=real, 0=pad), or None.
-
-        Returns:
-            Reversed tensor with same shape as input.
-        """
-        if attention_mask is None:
-            return tensor.flip(1)
-
-        batch_size, max_len = attention_mask.shape
-
-        # Expand broadcast batch dim if needed (e.g. rotary embeddings are (1, L, D))
-        if tensor.size(0) == 1 and batch_size > 1:
-            tensor = tensor.expand(batch_size, -1, -1)
-
-        real_lens = attention_mask.sum(dim=1).long()  # (B,)
-        positions = torch.arange(max_len, device=tensor.device).unsqueeze(0)  # (1, L)
-
-        # For position p in batch element b: reversed index = real_lens[b] - 1 - p
-        # Clamp to 0 for pad positions (they'll be zeroed by the mask anyway)
-        reversed_idx = (real_lens.unsqueeze(1) - 1 - positions).clamp(min=0)  # (B, L)
-        real_mask = (positions < real_lens.unsqueeze(1)).to(tensor.dtype)  # (B, L)
-
-        idx = reversed_idx.unsqueeze(-1).expand_as(tensor)  # (B, L, D)
-        return torch.gather(tensor, 1, idx) * real_mask.unsqueeze(-1)
-
     def forward(
         self,
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> BaseModelOutputWithPast:
-        """Run bidirectional forward pass.
+        """Run forward pass with bidirectional full attention.
+
+        DeltaNet layers run causally (no mask). Full attention layers run
+        with a bidirectional (non-causal) padding mask.
 
         Args:
             inputs_embeds: (B, L, D) input embeddings.
             attention_mask: (B, L) padding mask (1=real, 0=pad). Used as
                 bidirectional (non-causal) mask for full attention layers.
-                DeltaNet layers use pad-aware reversal for the backward pass.
+                DeltaNet layers ignore this (causal recurrent state).
 
         Returns:
             BaseModelOutputWithPast with last_hidden_state.
@@ -193,33 +141,12 @@ class BidirectionalQwen35(nn.Module):
             out = layer(h, pos_emb, attention_mask=mask)
             return out[0] if isinstance(out, tuple) else out
 
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             if self._is_deltanet_layer(layer):
-                # Forward pass (causal, standard direction)
-                y_fwd = _run_layer(layer, hidden, None, position_embeddings)
-
-                # Backward pass (reversed sequence, separate weights).
-                # Use pad-aware reversal: real tokens are reversed to the front,
-                # pad tokens become zeros at the back. This prevents pad state
-                # from contaminating real tokens in the causal recurrence.
-                bwd_layer = self.backward_deltanet_layers[str(i)]
-                hidden_rev = self._pad_aware_reverse(hidden, attention_mask)
-                pos_emb_rev = (
-                    self._pad_aware_reverse(position_embeddings[0], attention_mask),
-                    self._pad_aware_reverse(position_embeddings[1], attention_mask),
-                )
-                y_bwd = self._pad_aware_reverse(
-                    _run_layer(bwd_layer, hidden_rev, None, pos_emb_rev),
-                    attention_mask,
-                )
-
-                # Learned per-dimension gate for forward/backward mixing.
-                # sigmoid(0) = 0.5 at init → equal mix, same as unweighted
-                # mean but with the capacity to specialize per dimension.
-                gate = torch.sigmoid(self.fwd_bwd_gate_logits[str(i)])
-                hidden = gate * y_fwd + (1.0 - gate) * y_bwd
+                # DeltaNet: causal (no mask), O(L) via recurrent state
+                hidden = _run_layer(layer, hidden, None, position_embeddings)
             else:
-                # Full attention layer — use bidirectional mask
+                # Full attention: bidirectional mask (no causal component)
                 hidden = _run_layer(layer, hidden, bidi_mask, position_embeddings)
 
         hidden = self.norm(hidden)

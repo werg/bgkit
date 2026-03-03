@@ -1,6 +1,6 @@
 # BgKIT compressor
 # Based on Qwen3.5-0.8B-Base (~800M params, bidirectionalized via BidirectionalQwen35)
-# 24 layers: 18 Gated DeltaNet (dual-pass) + 6 full attention (unmasked)
+# 24 layers: 18 Gated DeltaNet (causal) + 6 full attention (bidirectional)
 bgkit:
   backbone_name: Qwen/Qwen3.5-0.8B-Base
   # backbone_revision: <pin after release stabilizes>

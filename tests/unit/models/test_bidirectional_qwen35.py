@@ -115,7 +115,7 @@ def base_model():
 
 @pytest.fixture
 def bidi_model(base_model):
-    return BidirectionalQwen35(base_model, clone_backward_weights=True)
+    return BidirectionalQwen35(base_model)
 
 
 class TestInit:
@@ -123,57 +123,15 @@ class TestInit:
         """Should have 8 layers total (2 groups of 4)."""
         assert len(bidi_model.layers) == 8
 
-    def test_backward_deltanet_count(self, bidi_model):
-        """Should have backward layers for all DeltaNet layers (6 of 8)."""
-        assert len(bidi_model.backward_deltanet_layers) == 6
+    def test_no_backward_layers(self, bidi_model):
+        """Should not have backward DeltaNet layers (causal-only design)."""
+        assert not hasattr(bidi_model, "backward_deltanet_layers")
 
-    def test_backward_layers_are_deltanet_indices(self, bidi_model):
-        """Backward layers should exist for indices 0,1,2, 4,5,6."""
-        expected = {"0", "1", "2", "4", "5", "6"}
-        assert set(bidi_model.backward_deltanet_layers.keys()) == expected
-
-    def test_no_backward_for_full_attention(self, bidi_model):
-        """Full attention layers (indices 3, 7) should not have backward copies."""
-        assert "3" not in bidi_model.backward_deltanet_layers
-        assert "7" not in bidi_model.backward_deltanet_layers
-
-    def test_backward_weights_are_separate(self, bidi_model):
-        """Backward weights should be separate copies (not shared references)."""
-        for key in bidi_model.backward_deltanet_layers:
-            idx = int(key)
-            fwd = bidi_model.layers[idx]
-            bwd = bidi_model.backward_deltanet_layers[key]
-            assert fwd is not bwd
-            # Weights should initially be equal (deep copied)
-            fwd_p = list(fwd.parameters())
-            bwd_p = list(bwd.parameters())
-            for fp, bp in zip(fwd_p, bwd_p, strict=True):
-                assert torch.allclose(fp, bp)
-
-    def test_shared_weights_mode(self, base_model):
-        """When clone_backward_weights=False, backward layers share forward weights."""
-        model = BidirectionalQwen35(base_model, clone_backward_weights=False)
-        for key in model.backward_deltanet_layers:
-            idx = int(key)
-            assert model.layers[idx] is model.backward_deltanet_layers[key]
-
-    def test_gate_logits_created(self, bidi_model):
-        """Should have gate logits for each DeltaNet layer."""
-        assert len(bidi_model.fwd_bwd_gate_logits) == 6
-        assert set(bidi_model.fwd_bwd_gate_logits.keys()) == {"0", "1", "2", "4", "5", "6"}
-
-    def test_gate_logits_init_zero(self, bidi_model):
-        """Gate logits should be initialized to zero (sigmoid=0.5 → equal mix)."""
-        for key in bidi_model.fwd_bwd_gate_logits:
-            assert torch.allclose(
-                bidi_model.fwd_bwd_gate_logits[key],
-                torch.zeros(HIDDEN_DIM),
-            )
-
-    def test_gate_logits_correct_dim(self, bidi_model):
-        """Gate logits should be per-dimension (hidden_dim)."""
-        for key in bidi_model.fwd_bwd_gate_logits:
-            assert bidi_model.fwd_bwd_gate_logits[key].shape == (HIDDEN_DIM,)
+    def test_no_extra_parameters(self, base_model, bidi_model):
+        """Should have same parameter count as base model (no backward copies)."""
+        base_count = sum(p.numel() for p in base_model.parameters())
+        bidi_count = sum(p.numel() for p in bidi_model.parameters())
+        assert bidi_count == base_count
 
 
 class TestIsDeltaNetLayer:
@@ -227,26 +185,19 @@ class TestForward:
         assert out.last_hidden_state.shape == (BATCH, SEQ_LEN, HIDDEN_DIM)
 
     def test_gradient_flows(self, bidi_model):
-        """Gradients should flow through both forward and backward DeltaNet passes."""
+        """Gradients should flow through all layers."""
         x = torch.randn(BATCH, SEQ_LEN, HIDDEN_DIM, requires_grad=True)
         out = bidi_model(inputs_embeds=x)
         loss = out.last_hidden_state.sum()
         loss.backward()
 
-        # Input should have gradients
         assert x.grad is not None
         assert x.grad.shape == (BATCH, SEQ_LEN, HIDDEN_DIM)
 
-        # Both forward and backward DeltaNet layers should have gradients
-        for key in bidi_model.backward_deltanet_layers:
-            bwd_layer = bidi_model.backward_deltanet_layers[key]
-            for p in bwd_layer.parameters():
-                assert p.grad is not None, f"No gradient for backward layer {key}"
-
-        # Gate logits should have gradients
-        for key in bidi_model.fwd_bwd_gate_logits:
-            gate = bidi_model.fwd_bwd_gate_logits[key]
-            assert gate.grad is not None, f"No gradient for gate logit {key}"
+        # All layers should have gradients
+        for i, layer in enumerate(bidi_model.layers):
+            for p in layer.parameters():
+                assert p.grad is not None, f"No gradient for layer {i}"
 
     def test_gradient_checkpointing(self, bidi_model):
         """Forward should work with gradient checkpointing enabled."""
@@ -258,40 +209,11 @@ class TestForward:
         loss.backward()
         assert x.grad is not None
 
-    def test_padding_does_not_leak_through_backward_pass(self, bidi_model):
-        """Pad tokens should not affect real token outputs.
-
-        Run the same real tokens with and without trailing padding. Real
-        token outputs should be identical — padding must not leak through
-        the backward DeltaNet pass (where flipping moves pads to the front).
-        """
-        bidi_model.eval()
-        real_len = 8
-        pad_len = 4
-        real_tokens = torch.randn(1, real_len, HIDDEN_DIM)
-
-        # Run without padding
-        with torch.no_grad():
-            out_no_pad = bidi_model(inputs_embeds=real_tokens).last_hidden_state
-
-        # Run with trailing padding
-        padded = torch.cat([real_tokens, torch.randn(1, pad_len, HIDDEN_DIM)], dim=1)
-        mask = torch.ones(1, real_len + pad_len)
-        mask[:, real_len:] = 0
-        with torch.no_grad():
-            out_padded = bidi_model(inputs_embeds=padded, attention_mask=mask).last_hidden_state
-
-        # Real positions should produce identical outputs
-        assert torch.allclose(
-            out_no_pad[:, :real_len, :],
-            out_padded[:, :real_len, :],
-            atol=1e-5,
-        ), "Pad tokens leaked into real token outputs through backward DeltaNet pass"
-
     def test_bidirectionality(self, bidi_model):
-        """Output at position i should depend on tokens after position i.
+        """Output at position 0 should depend on tokens after it.
 
-        Perturb the last token and check that outputs at earlier positions change.
+        Full attention layers mix all positions bidirectionally, so perturbing
+        the last token should change output at position 0.
         """
         bidi_model.eval()
         x = torch.randn(1, SEQ_LEN, HIDDEN_DIM)
@@ -305,27 +227,46 @@ class TestForward:
         with torch.no_grad():
             out2 = bidi_model(inputs_embeds=x_perturbed).last_hidden_state
 
-        # Position 0 should differ (bidirectional means future tokens affect past)
         diff = (out1[:, 0, :] - out2[:, 0, :]).abs().sum()
         assert diff > 1e-3, "Output at position 0 should change when last token is perturbed"
+
+    def test_padding_does_not_affect_real_tokens(self, bidi_model):
+        """Pad tokens should not affect real token outputs in full attention layers."""
+        bidi_model.eval()
+        real_len = 8
+        pad_len = 4
+        real_tokens = torch.randn(1, real_len, HIDDEN_DIM)
+
+        with torch.no_grad():
+            out_no_pad = bidi_model(inputs_embeds=real_tokens).last_hidden_state
+
+        padded = torch.cat([real_tokens, torch.randn(1, pad_len, HIDDEN_DIM)], dim=1)
+        mask = torch.ones(1, real_len + pad_len)
+        mask[:, real_len:] = 0
+        with torch.no_grad():
+            out_padded = bidi_model(
+                inputs_embeds=padded, attention_mask=mask
+            ).last_hidden_state
+
+        assert torch.allclose(
+            out_no_pad[:, :real_len, :],
+            out_padded[:, :real_len, :],
+            atol=1e-5,
+        ), "Pad tokens leaked into real token outputs"
 
 
 class TestCheckpointRoundTrip:
     def test_state_dict_save_load(self, bidi_model):
-        """State dict should contain both forward and backward DeltaNet weights."""
+        """State dict round-trip should produce identical outputs."""
         state = bidi_model.state_dict()
 
-        # Should contain backward layer keys
-        bwd_keys = [k for k in state if "backward_deltanet_layers" in k]
-        assert len(bwd_keys) > 0, "State dict should contain backward DeltaNet weights"
-
-        # Should contain gate logit keys
-        gate_keys = [k for k in state if "fwd_bwd_gate_logits" in k]
-        assert len(gate_keys) == 6, "State dict should contain 6 gate logit parameters"
+        # Should NOT contain backward layer or gate keys
+        assert not any("backward" in k for k in state)
+        assert not any("gate" in k for k in state)
 
         # Round-trip: create a new model and load state
         base2 = MockQwen35BaseModel(hidden_dim=HIDDEN_DIM, num_groups=2)
-        model2 = BidirectionalQwen35(base2, clone_backward_weights=True)
+        model2 = BidirectionalQwen35(base2)
 
         # Perturb model2 weights to verify loading actually works
         with torch.no_grad():

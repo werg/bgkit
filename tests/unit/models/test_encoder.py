@@ -309,7 +309,7 @@ class TestQwen35Wrapping:
         backbone.config = Qwen35Config()
         backbone.norm = nn.LayerNorm(64)
 
-        bidi = BidirectionalQwen35(backbone, clone_backward_weights=True)
+        bidi = BidirectionalQwen35(backbone)
 
         # Pop from bidi.layers to match what from_pretrained expects
         # (needs at least 2 layers to pop one for projection)
