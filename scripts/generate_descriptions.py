@@ -16,13 +16,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import contextlib
 import itertools
 import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -538,6 +536,43 @@ def _load_structural_skeletons(structural_dir: Path, rel_key: str) -> dict[str, 
     return skeletons
 
 
+def _load_partial(partial_file: Path) -> tuple[list[dict], set[str], set[str]]:
+    """Load records from a partial JSONL file.
+
+    Returns (records, done_file_paths, done_module_paths).
+    """
+    records: list[dict] = []
+    done_files: set[str] = set()
+    done_modules: set[str] = set()
+    if not partial_file.exists():
+        return records, done_files, done_modules
+    for line in partial_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        records.append(rec)
+        if rec.get("scope") == "file":
+            done_files.add(rec["file_path"])
+        elif rec.get("scope") == "module":
+            done_modules.add(rec["module_path"])
+    return records, done_files, done_modules
+
+
+def _append_records(partial_file: Path, new_records: list[dict]) -> None:
+    """Append records to the partial JSONL file (flush immediately)."""
+    if not new_records:
+        return
+    with open(partial_file, "a", encoding="utf-8") as f:
+        for rec in new_records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def process_single_repo(
     repo_path: Path,
     output_dir: Path,
@@ -548,6 +583,10 @@ def process_single_repo(
 ) -> dict:
     """Process a single repo and write descriptions JSONL.
 
+    Uses incremental persistence via .partial.jsonl files so that work
+    survives server crashes. On completion, the partial file is atomically
+    renamed to .jsonl.
+
     Returns stats dict.
     """
     owner = repo_path.parent.name
@@ -555,12 +594,22 @@ def process_single_repo(
     rel_key = f"{owner}/{repo_name}"
 
     output_file = output_dir / f"{rel_key}.jsonl"
+    partial_file = output_file.with_suffix(".partial.jsonl")
 
     # Skip if already done
     if output_file.exists():
         return {"repo": rel_key, "status": "skipped"}
 
     try:
+        # Resume from partial if it exists
+        records, done_file_paths, done_module_paths = _load_partial(partial_file)
+        resumed = bool(records)
+        if resumed:
+            logger.info(
+                "resuming_partial", repo=rel_key,
+                done_files=len(done_file_paths), done_modules=len(done_module_paths),
+            )
+
         snapshot = extract_repo_snapshot(str(repo_path))
 
         logger.info(
@@ -582,7 +631,7 @@ def process_single_repo(
             snapshot.files = snapshot.files[:MAX_FILES_PER_REPO]
 
         commit_sha = snapshot.commit_sha
-        records: list[dict] = []
+        output_file.parent.mkdir(parents=True, exist_ok=True)
 
         # Load structural skeletons if available
         module_skeletons: dict[str, str] = {}
@@ -590,76 +639,88 @@ def process_single_repo(
             module_skeletons = _load_structural_skeletons(structural_dir, rel_key)
 
         # --- File-level descriptions ---
-        file_descriptions: list[dict] = []
+        # Include previously-saved file descriptions for downstream module/repo prompts
+        file_descriptions: list[dict] = [
+            r for r in records if r.get("scope") == "file"
+        ]
 
         if scope in ("file", "all"):
-            # Build all prompts first, then generate in batch for local backend
+            # Build prompts only for files not yet described
             file_prompts = [
                 (fr, build_file_prompt(fr.path, fr.content, fr.language))
                 for fr in snapshot.files
+                if fr.path not in done_file_paths
             ]
 
-            if backend == "local":
-                # Batch: all prompts sent concurrently, routed by tier
-                file_tiers = [
-                    _pick_tier(fr.path, fr.language, fr.size_bytes)
-                    for fr, _ in file_prompts
-                ]
-                results = call_local_batch(
-                    [p for _, p in file_prompts],
-                    tiers=file_tiers,
-                )
-                for (fr, _prompt), (desc, backend_label) in zip(
-                    file_prompts, results, strict=True
-                ):
-                    if not desc:
-                        logger.warning(
-                            "file_description_failed", file_path=fr.path,
-                            content_chars=len(fr.content), repo=rel_key,
-                        )
-                    else:
-                        rec = {
-                            "scope": "file",
-                            "file_path": fr.path,
-                            "commit_sha": commit_sha,
-                            "description": desc,
-                            "language": fr.language or "",
-                            "backend": backend_label,
-                            "model": _model_for_backend(backend_label),
-                            "prompt_version": PROMPT_VERSION,
-                        }
-                        records.append(rec)
-                        file_descriptions.append(rec)
-            else:
-                # Sequential: haiku/mixed backends use per-request dispatch
-                for fr, prompt in file_prompts:
-                    desc, used_backend = generate_description(
-                        prompt, backend, backend_cycle,
-                        file_path=fr.path,
-                        language=fr.language,
-                        size_bytes=fr.size_bytes,
+            if file_prompts:
+                new_file_recs: list[dict] = []
+
+                if backend == "local":
+                    # Batch: all prompts sent concurrently, routed by tier
+                    file_tiers = [
+                        _pick_tier(fr.path, fr.language, fr.size_bytes)
+                        for fr, _ in file_prompts
+                    ]
+                    results = call_local_batch(
+                        [p for _, p in file_prompts],
+                        tiers=file_tiers,
                     )
-                    if desc is None:
-                        logger.warning(
-                            "file_description_failed", file_path=fr.path,
-                            content_chars=len(fr.content), repo=rel_key,
+                    for (fr, _prompt), (desc, backend_label) in zip(
+                        file_prompts, results, strict=True
+                    ):
+                        if not desc:
+                            logger.warning(
+                                "file_description_failed", file_path=fr.path,
+                                content_chars=len(fr.content), repo=rel_key,
+                            )
+                        else:
+                            rec = {
+                                "scope": "file",
+                                "file_path": fr.path,
+                                "commit_sha": commit_sha,
+                                "description": desc,
+                                "language": fr.language or "",
+                                "backend": backend_label,
+                                "model": _model_for_backend(backend_label),
+                                "prompt_version": PROMPT_VERSION,
+                            }
+                            new_file_recs.append(rec)
+                else:
+                    # Sequential: haiku/mixed backends use per-request dispatch
+                    for fr, prompt in file_prompts:
+                        desc, used_backend = generate_description(
+                            prompt, backend, backend_cycle,
+                            file_path=fr.path,
+                            language=fr.language,
+                            size_bytes=fr.size_bytes,
                         )
-                    elif desc:
-                        rec = {
-                            "scope": "file",
-                            "file_path": fr.path,
-                            "commit_sha": commit_sha,
-                            "description": desc,
-                            "language": fr.language or "",
-                            "backend": used_backend,
-                            "model": _model_for_backend(used_backend),
-                            "prompt_version": PROMPT_VERSION,
-                        }
-                        records.append(rec)
-                        file_descriptions.append(rec)
+                        if desc is None:
+                            logger.warning(
+                                "file_description_failed", file_path=fr.path,
+                                content_chars=len(fr.content), repo=rel_key,
+                            )
+                        elif desc:
+                            rec = {
+                                "scope": "file",
+                                "file_path": fr.path,
+                                "commit_sha": commit_sha,
+                                "description": desc,
+                                "language": fr.language or "",
+                                "backend": used_backend,
+                                "model": _model_for_backend(used_backend),
+                                "prompt_version": PROMPT_VERSION,
+                            }
+                            new_file_recs.append(rec)
+
+                # Persist new file descriptions immediately
+                _append_records(partial_file, new_file_recs)
+                records.extend(new_file_recs)
+                file_descriptions.extend(new_file_recs)
 
         # --- Module-level descriptions ---
-        module_descriptions: list[dict] = []
+        module_descriptions: list[dict] = [
+            r for r in records if r.get("scope") == "module"
+        ]
 
         if scope in ("module", "all"):
             # Group files by parent directory
@@ -681,7 +742,10 @@ def process_single_repo(
                 if parent and parent != ".":
                     modules.setdefault(parent, []).append(fd)
 
+            new_module_recs: list[dict] = []
             for mod_path, mod_files in sorted(modules.items()):
+                if mod_path in done_module_paths:
+                    continue
                 skeleton_text = module_skeletons.get(mod_path)
                 prompt = build_module_prompt(mod_path, mod_files, skeleton_text)
                 desc, used_backend = generate_description(
@@ -704,11 +768,16 @@ def process_single_repo(
                         "model": _model_for_backend(used_backend),
                         "prompt_version": PROMPT_VERSION,
                     }
-                    records.append(rec)
+                    new_module_recs.append(rec)
                     module_descriptions.append(rec)
 
+            # Persist new module descriptions
+            _append_records(partial_file, new_module_recs)
+            records.extend(new_module_recs)
+
         # --- Repo-level description ---
-        if scope in ("repo", "all"):
+        has_repo_desc = any(r.get("scope") == "repo" for r in records)
+        if scope in ("repo", "all") and not has_repo_desc:
             # Use module descriptions if available, else file descriptions
             descs_for_repo = file_descriptions
             if not descs_for_repo:
@@ -725,32 +794,22 @@ def process_single_repo(
                 prompt, backend, backend_cycle
             )
             if desc:
-                records.append({
+                rec = {
                     "scope": "repo",
                     "commit_sha": commit_sha,
                     "description": desc,
                     "backend": used_backend,
                     "model": _model_for_backend(used_backend),
                     "prompt_version": PROMPT_VERSION,
-                })
+                }
+                _append_records(partial_file, [rec])
+                records.append(rec)
 
         if not records:
             return {"repo": rel_key, "status": "no_descriptions"}
 
-        # Atomic write
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        fd_num, tmp_path = tempfile.mkstemp(
-            dir=str(output_file.parent), suffix=".jsonl.tmp"
-        )
-        try:
-            with os.fdopen(fd_num, "w", encoding="utf-8") as f:
-                for rec in records:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            os.rename(tmp_path, str(output_file))
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-            raise
+        # All scopes done — atomic rename partial → final
+        os.rename(str(partial_file), str(output_file))
 
         return {
             "repo": rel_key,

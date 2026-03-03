@@ -141,11 +141,12 @@ services:
 
   vllm-primary:
     <<: *vllm-common
-    image: "${VLLM_IMAGE_PRIMARY:-vllm-node-mxfp4:latest}"
+    image: "${VLLM_IMAGE_PRIMARY:-vllm-mxfp4-spark:latest}"
     ports:
       - "${VLLM_PORT_PRIMARY:-8090}:8000"
     environment:
-      TIKTOKEN_ENCODINGS_BASE: /workspace/tiktoken_encodings
+      NVIDIA_DISABLE_REQUIRE: "1"
+      TIKTOKEN_ENCODINGS_BASE: /workspace/vllm/tiktoken_encodings
       VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: "1"
     command: >-
       vllm serve ${VLLM_MODEL_PRIMARY:-openai/gpt-oss-20b}
@@ -159,6 +160,7 @@ services:
       --kv-cache-dtype fp8
       --attention-backend FLASHINFER
       --load-format fastsafetensors
+      --enforce-eager
 
   vllm-fast:
     <<: *vllm-common
