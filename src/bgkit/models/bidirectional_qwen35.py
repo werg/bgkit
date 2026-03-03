@@ -5,14 +5,18 @@ on full attention layers while keeping DeltaNet layers causal:
 
 - Full attention layers (indices 3, 7, 11, 15, 19, 23): causal mask removed,
   replaced with padding-only 2D mask for bidirectional attention.
-- Gated DeltaNet layers (all others): kept causal (left-to-right). These
-  provide efficient O(L) local feature extraction between the bidirectional
-  mixing points.
+- Gated DeltaNet layers (all others): kept causal (left-to-right) for the
+  recurrent state, but with **bidirectional conv1d** replacing the original
+  causal conv1d. This injects local bidirectional context (kernel_size=4
+  window) into the QKV projections before the recurrent scan.
 
 The 6 full attention layers provide periodic bidirectional context mixing,
 analogous to Longformer's local+global attention pattern. DeltaNet layers
 receive bidirectionally-mixed input from preceding attention layers and
-propagate it forward with O(L) efficiency.
+propagate it forward with O(L) efficiency. The bidirectional conv1d adds
+a cheap local receptive field that lets each token see 1 position behind
+and 2 ahead (for kernel_size=4), bridging the gap between the global
+bidirectional attention layers.
 
 The wrapper preserves the HuggingFace model API surface required by
 existing trainers (get_input_embeddings, gradient_checkpointing_enable, config).
@@ -22,7 +26,8 @@ Layer pattern: [DeltaNet, DeltaNet, DeltaNet, FullAttention] x 6 = 24 layers.
 Architecture notes (from model inspection):
 - Qwen3.5 decoder layers return plain Tensor (not tuples like older Qwen models)
 - Rotary embeddings use partial_rotary_factor=0.25 (cos/sin are 64-dim, not 1024)
-- DeltaNet layers have a causal conv1d (kernel_size=4, left-padding, depthwise)
+- DeltaNet conv1d: kernel_size=4, depthwise, converted to bidirectional "same"
+  padding at init time (original left-padding replaced with symmetric padding)
 - DeltaNet layers use `linear_attn` attribute, full attention uses `self_attn`
 """
 
@@ -30,19 +35,61 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
 
+def _make_conv_bidirectional(layer: nn.Module) -> None:
+    """Convert a DeltaNet layer's causal conv1d to bidirectional in-place.
+
+    Mutates the existing nn.Conv1d's padding from left-only (causal) to
+    symmetric ("same"), so each position sees both past and future within
+    the kernel window. For kernel_size=4: pad_left=1, pad_right=2, giving
+    a receptive field of [t-1, t, t+1, t+2] instead of [t-3, t-2, t-1, t].
+
+    This preserves the original module identity and state_dict keys — no
+    wrapper module, so HF pretrained weights load without key remapping.
+
+    Also disables the causal_conv1d CUDA fast paths (which hardcode causal
+    padding) and monkey-patches the conv1d forward to apply asymmetric
+    F.pad before the convolution.
+    """
+    attn = layer.linear_attn
+    conv = attn.conv1d
+
+    # Compute symmetric padding for "same" output length
+    k = conv.kernel_size[0]
+    pad_left = (k - 1) // 2  # 1 for k=4
+    pad_right = k // 2  # 2 for k=4
+
+    # Remove the built-in left-padding (was kernel_size-1 for causal)
+    conv.padding = (0,)
+
+    # Monkey-patch forward to apply symmetric padding
+    original_forward = conv.forward
+
+    def _bidi_forward(x: torch.Tensor) -> torch.Tensor:
+        return original_forward(F.pad(x, (pad_left, pad_right)))
+
+    conv.forward = _bidi_forward
+
+    # Force the torch fallback path (F.silu(self.conv1d(x)[:, :, :seq_len]))
+    # instead of the causal_conv1d CUDA kernel which hardcodes left-padding.
+    attn.causal_conv1d_fn = None
+    attn.causal_conv1d_update = None
+
+
 class BidirectionalQwen35(nn.Module):
-    """Qwen3.5-0.8B with bidirectional full attention for BgKIT compression.
+    """Qwen3.5-0.8B with bidirectional attention for BgKIT compression.
 
     - Full attention layers: causal mask removed (bidirectional)
-    - DeltaNet layers: kept causal (efficient O(L) local processing)
+    - DeltaNet layers: causal recurrent state, but with bidirectional conv1d
+      replacing the original causal conv1d for local context mixing
 
     The 6 full attention layers (every 4th) provide bidirectional context
     mixing. DeltaNet layers between them process bidirectionally-informed
-    representations with O(L) efficiency. No parameter increase over the
-    base model.
+    representations with O(L) efficiency. The bidirectional conv1d adds
+    ~0 parameters (same weights, different padding).
 
     Preserves HF API surface: get_input_embeddings(),
     gradient_checkpointing_enable(), config, etc.
@@ -61,6 +108,11 @@ class BidirectionalQwen35(nn.Module):
         self.norm = base_model.norm
         self.rotary_emb = base_model.rotary_emb
         self.layers = base_model.layers
+
+        # Convert causal conv1d → bidirectional conv1d in all DeltaNet layers
+        for layer in self.layers:
+            if self._is_deltanet_layer(layer):
+                _make_conv_bidirectional(layer)
 
     # --- HF API proxies (required by trainers) ---
 

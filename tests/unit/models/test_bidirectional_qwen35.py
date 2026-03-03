@@ -8,27 +8,49 @@ torch = pytest.importorskip("torch")
 
 from torch import nn
 
-from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
+from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35, _make_conv_bidirectional
 
 # ---------------------------------------------------------------------------
 # Mock components
 # ---------------------------------------------------------------------------
 
+CONV_KERNEL_SIZE = 4
+
+
+class MockLinearAttn(nn.Module):
+    """Mock linear attention submodule with conv1d (matching real Qwen3.5)."""
+
+    def __init__(self, hidden_dim: int = 64):
+        super().__init__()
+        self.proj = nn.Linear(hidden_dim, hidden_dim)
+        # Mimic the real Qwen3.5 causal conv1d: depthwise, left-padded
+        self.conv1d = nn.Conv1d(
+            in_channels=hidden_dim,
+            out_channels=hidden_dim,
+            kernel_size=CONV_KERNEL_SIZE,
+            groups=hidden_dim,
+            bias=False,
+            padding=CONV_KERNEL_SIZE - 1,
+        )
+        # These attributes are set on the real layer and cleared by _make_conv_bidirectional
+        self.causal_conv1d_fn = None
+        self.causal_conv1d_update = None
+
 
 class MockDeltaNetLayer(nn.Module):
     """Mock DeltaNet (linear attention) layer.
 
-    Has `linear_attn` attribute for hasattr-based detection (matching real
-    Qwen3.5 Qwen3_5DecoderLayer). Uses causal cumsum to simulate recurrence.
-    Returns plain Tensor (matching real Qwen3.5 behavior).
+    Has `linear_attn` attribute with conv1d for hasattr-based detection
+    (matching real Qwen3.5 Qwen3_5DecoderLayer). Uses causal cumsum to
+    simulate recurrence. Returns plain Tensor.
     """
 
     def __init__(self, hidden_dim: int = 64):
         super().__init__()
-        self.linear_attn = nn.Linear(hidden_dim, hidden_dim)  # detection marker + transform
+        self.linear_attn = MockLinearAttn(hidden_dim)
 
     def forward(self, hidden_states, position_embeddings=None, attention_mask=None):
-        x = self.linear_attn(hidden_states)
+        x = self.linear_attn.proj(hidden_states)
         x = torch.cumsum(x, dim=1)
         return x
 
@@ -118,6 +140,83 @@ def bidi_model(base_model):
     return BidirectionalQwen35(base_model)
 
 
+class TestBidirectionalConv:
+    """Tests for the in-place bidirectional conv1d patching."""
+
+    @staticmethod
+    def _make_patched_conv(kernel_size=4, channels=8):
+        """Create a causal conv and patch it to bidirectional."""
+        conv = nn.Conv1d(
+            channels, channels, kernel_size=kernel_size,
+            groups=channels, bias=False, padding=kernel_size - 1,
+        )
+        # Patch in-place (same approach as _make_conv_bidirectional)
+        k = conv.kernel_size[0]
+        pad_left = (k - 1) // 2
+        pad_right = k // 2
+        conv.padding = (0,)
+        original_forward = conv.forward
+
+        def _bidi_forward(x):
+            return original_forward(torch.nn.functional.pad(x, (pad_left, pad_right)))
+
+        conv.forward = _bidi_forward
+        return conv
+
+    def test_output_length_equals_input(self):
+        """Bidirectional conv should produce same-length output (no truncation needed)."""
+        conv = self._make_patched_conv()
+        x = torch.randn(2, 8, 16)
+        out = conv(x)
+        assert out.shape == (2, 8, 16)
+
+    def test_not_causal(self):
+        """Output at position t should depend on positions after t (non-causal)."""
+        conv = self._make_patched_conv(kernel_size=4, channels=1)
+        with torch.no_grad():
+            conv.weight.fill_(1.0)
+
+        x = torch.zeros(1, 1, 8)
+        x[0, 0, 4] = 1.0  # spike at position 4
+
+        out = conv(x)
+        # With pad_left=1, pad_right=2, kernel=4:
+        # padded input: [0, x0, x1, ..., x7, 0, 0]  (length 11)
+        # output[t] = sum(padded[t : t+4])
+        # For spike at x4 (padded index 5):
+        #   out[2] = padded[2:6] includes idx 5 → nonzero
+        #   out[5] = padded[5:9] includes idx 5 → nonzero
+        #   out[1] = padded[1:5] does NOT include idx 5 → zero
+        #   out[6] = padded[6:10] does NOT include idx 5 → zero
+        # Key: position 2 (before the spike) sees it — proves non-causal
+        assert out[0, 0, 2].item() != 0.0, "Position 2 should see future spike at 4"
+        assert out[0, 0, 5].item() != 0.0, "Position 5 should see past spike at 4"
+        assert out[0, 0, 1].item() == 0.0, "Position 1 should not see spike at 4"
+        assert out[0, 0, 6].item() == 0.0, "Position 6 should not see spike at 4"
+
+    def test_state_dict_keys_unchanged(self):
+        """Patching should not change state_dict key names."""
+        conv = nn.Conv1d(8, 8, kernel_size=4, groups=8, bias=False, padding=3)
+        keys_before = list(conv.state_dict().keys())
+        # Patch in-place
+        conv.padding = (0,)
+        original_forward = conv.forward
+        conv.forward = lambda x: original_forward(
+            torch.nn.functional.pad(x, (1, 2))
+        )
+        keys_after = list(conv.state_dict().keys())
+        assert keys_before == keys_after
+
+    def test_gradient_flows(self):
+        """Gradients should flow through the patched conv."""
+        conv = self._make_patched_conv()
+        x = torch.randn(2, 8, 16, requires_grad=True)
+        out = conv(x)
+        out.sum().backward()
+        assert x.grad is not None
+        assert conv.weight.grad is not None
+
+
 class TestInit:
     def test_layers_count(self, bidi_model):
         """Should have 8 layers total (2 groups of 4)."""
@@ -132,6 +231,20 @@ class TestInit:
         base_count = sum(p.numel() for p in base_model.parameters())
         bidi_count = sum(p.numel() for p in bidi_model.parameters())
         assert bidi_count == base_count
+
+    def test_deltanet_conv1d_is_bidirectional(self, bidi_model):
+        """All DeltaNet layers should have patched (zero-padding) conv1d after init."""
+        for layer in bidi_model.layers:
+            if BidirectionalQwen35._is_deltanet_layer(layer):
+                conv = layer.linear_attn.conv1d
+                # Padding should be zeroed out (patched forward handles it)
+                assert conv.padding == (0,), f"Expected padding=(0,), got {conv.padding}"
+
+    def test_full_attention_layers_unchanged(self, bidi_model):
+        """Full attention layers should not be modified."""
+        for layer in bidi_model.layers:
+            if not BidirectionalQwen35._is_deltanet_layer(layer):
+                assert not hasattr(layer, "linear_attn")
 
 
 class TestIsDeltaNetLayer:
@@ -194,10 +307,12 @@ class TestForward:
         assert x.grad is not None
         assert x.grad.shape == (BATCH, SEQ_LEN, HIDDEN_DIM)
 
-        # All layers should have gradients
+        # Check that at least some parameters in each layer have gradients.
+        # (Mock layers don't use conv1d in forward, so conv weights won't
+        # get gradients — only check the parameters that actually participate.)
         for i, layer in enumerate(bidi_model.layers):
-            for p in layer.parameters():
-                assert p.grad is not None, f"No gradient for layer {i}"
+            grads = [p.grad for p in layer.parameters() if p.grad is not None]
+            assert len(grads) > 0, f"No gradients for any parameter in layer {i}"
 
     def test_gradient_checkpointing(self, bidi_model):
         """Forward should work with gradient checkpointing enabled."""
@@ -263,6 +378,12 @@ class TestCheckpointRoundTrip:
         # Should NOT contain backward layer or gate keys
         assert not any("backward" in k for k in state)
         assert not any("gate" in k for k in state)
+
+        # Conv1d keys should be unchanged (in-place patching, no wrapper)
+        conv_keys = [k for k in state if "conv1d" in k]
+        assert all("conv1d.weight" in k for k in conv_keys), (
+            f"Conv keys should use original paths (no wrapper): {conv_keys}"
+        )
 
         # Round-trip: create a new model and load state
         base2 = MockQwen35BaseModel(hidden_dim=HIDDEN_DIM, num_groups=2)
