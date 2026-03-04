@@ -14,7 +14,6 @@ from bgkit.data.chat_template import (
     tokenize_with_sentinel,
 )
 
-
 # ---------------------------------------------------------------------------
 # Mock tokenizer (reuse pattern from test_chat_template.py)
 # ---------------------------------------------------------------------------
