@@ -4,6 +4,21 @@
 
 This project runs on an **NVIDIA DGX Spark** (Blackwell GB10, ARM64, sm_121, 128 GB unified memory).
 
+## Storage Configuration
+
+**Required:** A `.env` file at the project root (gitignored) is the single source of truth for storage paths. Without it, all Python scripts, Make targets, and Docker services will fail fast with setup instructions.
+
+```bash
+cp .env.example .env   # then edit DATA_DIR / CHECKPOINT_DIR
+```
+
+| Variable | Description |
+|---|---|
+| `DATA_DIR` | Root data directory (repos, descriptions, structural, models, crawl DB) |
+| `CHECKPOINT_DIR` | Training checkpoints and registry |
+
+The `.env` file is read by: Python (`bgkit.env` via python-dotenv), Makefile (`-include .env`), shell scripts (source `.env`), and Docker Compose (native `.env` support). There are no fallback defaults anywhere — `.env` is it.
+
 ## GPU Work Must Use the Docker Container
 
 Any work involving PyTorch, CUDA, or GPU computation **must** be run inside the NGC-based Docker container — not directly in the host venv. The container (`docker/Dockerfile`) is based on `nvcr.io/nvidia/pytorch:26.01-py3` and provides the correct ARM64 + CUDA 13.1 + sm_121 PyTorch build.

@@ -828,12 +828,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate file/module/repo descriptions using Claude and/or llama-server."
     )
+    from bgkit.env import get_data_dir
+    _data = get_data_dir(must_exist=False)
     parser.add_argument(
-        "--repos-dir", type=Path, default=Path("data/repos"),
+        "--repos-dir", type=Path, default=_data / "repos",
         help="Directory containing owner/repo/ subdirectories",
     )
     parser.add_argument(
-        "--output-dir", type=Path, default=Path("data/descriptions"),
+        "--output-dir", type=Path, default=_data / "descriptions",
         help="Output directory for per-repo JSONL files",
     )
     parser.add_argument(

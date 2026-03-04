@@ -1,3 +1,7 @@
+# Load .env (single source of truth for DATA_DIR, CHECKPOINT_DIR, etc.)
+-include .env
+export
+
 .PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits convert-structural convert-descriptions convert-commits generate-variants download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs
 
 install:
@@ -113,41 +117,39 @@ vllm-server-logs:
 ckpt-backfill:
 	.venv/bin/bgkit-ckpt backfill
 
-# Data preprocessing pipeline (host-only, uses local data/ paths)
+# Data preprocessing pipeline (paths from .env via bgkit.env / DATA_DIR)
 extract-structural:
-	.venv/bin/python scripts/extract_structural_data.py \
-		--repos-dir data/repos/ --output-dir data/structural/ --workers 8
+	.venv/bin/python scripts/extract_structural_data.py --workers 8
 
 generate-descriptions: vllm-server
+	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
 	.venv/bin/python scripts/generate_descriptions.py \
-		--repos-dir data/repos/ --output-dir data/descriptions/ \
-		--structural-dir data/structural/ --backend local --workers 2
+		--structural-dir $(DATA_DIR)/structural/ --backend local --workers 2
 
 extract-commits:
 	.venv/bin/python scripts/process_commit_repro.py $(ARGS)
 
 convert-structural:
+	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
 	.venv/bin/python scripts/convert_structural_to_npy.py \
-		--input-dir data/structural/ --output-dir data/mmap/structural/
+		--input-dir $(DATA_DIR)/structural/ --output-dir $(DATA_DIR)/mmap/structural/
 
 convert-descriptions:
+	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
 	.venv/bin/python scripts/convert_descriptions_to_npy.py \
-		--input-dir data/descriptions/ --output-dir data/mmap/descriptions/
+		--input-dir $(DATA_DIR)/descriptions/ --output-dir $(DATA_DIR)/mmap/descriptions/
 
 convert-commits:
+	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
 	.venv/bin/python scripts/convert_commits_to_npy.py \
-		--input-dir data/processed/commit_reproduction/
+		--input-dir $(DATA_DIR)/processed/commit_reproduction/
 
 generate-variants:
 	.venv/bin/python scripts/generate_prompt_variants.py \
-		--template configs/templates/file_read_repro.yaml \
-		--num-variants 40 --output data/prompt_variants/file_read_repro.json
+		--template configs/templates/file_read_repro.yaml --num-variants 40
 	.venv/bin/python scripts/generate_prompt_variants.py \
-		--template configs/templates/description_gen.yaml \
-		--num-variants 40 --output data/prompt_variants/description_gen.json
+		--template configs/templates/description_gen.yaml --num-variants 40
 	.venv/bin/python scripts/generate_prompt_variants.py \
-		--template configs/templates/structural_repro.yaml \
-		--num-variants 40 --output data/prompt_variants/structural_repro.json
+		--template configs/templates/structural_repro.yaml --num-variants 40
 	.venv/bin/python scripts/generate_prompt_variants.py \
-		--template configs/templates/commit_repro.yaml \
-		--num-variants 40 --output data/prompt_variants/commit_repro.json
+		--template configs/templates/commit_repro.yaml --num-variants 40

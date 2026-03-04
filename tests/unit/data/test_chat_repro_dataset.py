@@ -443,7 +443,7 @@ class TestFullVariantBank:
 
     @pytest.fixture()
     def full_bank(self):
-        bank_path = Path("data/prompt_variants/file_read_repro.json")
+        bank_path = Path("configs/prompt_variants/file_read_repro.json")
         if not bank_path.exists():
             pytest.skip("Full variant bank not present")
         with open(bank_path) as f:

@@ -1,5 +1,5 @@
 ice_labels:
   model_name: Qwen/Qwen3.5-0.8B
   max_seq_len: 8192
-  output_dir: ${oc.env:DATA_DIR,./data}/processed/ice_labels
-  input_dir: ${oc.env:DATA_DIR,./data}/processed/tokens
+  output_dir: ${oc.env:DATA_DIR}/processed/ice_labels
+  input_dir: ${oc.env:DATA_DIR}/processed/tokens

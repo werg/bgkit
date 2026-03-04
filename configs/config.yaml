@@ -18,7 +18,7 @@ seed: 42
 project_name: bgkit
 run_name: null  # auto-generated if null
 batch_size: 32
-checkpoint_dir: ${oc.env:CHECKPOINT_DIR,./checkpoints}
+checkpoint_dir: ${oc.env:CHECKPOINT_DIR}
 resume_checkpoint: null  # path to checkpoint dir for resume
 
 control_file: null  # optional path to live HP control JSON

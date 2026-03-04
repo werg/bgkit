@@ -15,9 +15,9 @@ x-gpu-common: &gpu-common
   environment:
     - HOME=/workspace
   volumes:
-    - ${DATA_DIR:-../data}:/workspace/data
+    - ${DATA_DIR}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
-    - ${CHECKPOINT_DIR:-../checkpoints}:/workspace/checkpoints
+    - ${CHECKPOINT_DIR}:/workspace/checkpoints
     # Source code — the ONLY way bgkit code enters the container.
     # Image has deps only; no bgkit in dist-packages.
     - ../src:/workspace/bgkit/src:ro
@@ -40,7 +40,7 @@ x-llama-common: &llama-common
             capabilities: [gpu]
   restart: unless-stopped
   volumes:
-    - ${MODELS_DIR:-../data/models}:/models:ro
+    - ${DATA_DIR}/models:/models:ro
   healthcheck:
     test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
     interval: 10s
@@ -98,7 +98,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.data
     volumes:
-      - ${DATA_DIR:-../data}:/workspace/data
+      - ${DATA_DIR}:/workspace/data
     command: ["scripts/process_repos.py"]
 
   llama-large:

@@ -7,8 +7,13 @@
 
 set -euo pipefail
 
+# Load .env from project root
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+[ -f "$SCRIPT_DIR/../.env" ] && set -a && . "$SCRIPT_DIR/../.env" && set +a
+
 COMPOSE="docker compose -f docker/docker-compose.yaml"
-OUTPUT="${1:-data/llama-bench-results.csv}"
+OUTPUT="${1:-${DATA_DIR:?DATA_DIR not set — copy .env.example to .env}/llama-bench-results.csv}"
 
 # Representative prompts (similar to description pipeline workload)
 PROMPT_SHORT='File: utils.py (Python)\n\ndef add(a, b):\n    return a + b\n\nWrite a single dense paragraph describing this file. Include: what it does, the names of key exports (classes, functions, constants), and what it imports or depends on. Omit any category that does not apply. No headers, bullet points, or labels — just a compact paragraph where every word carries information. Use actual identifier names from the code.'

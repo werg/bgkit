@@ -39,11 +39,11 @@ freeze:
   decoder: false
 
 data:
-  file_tokens_path: ${oc.env:DATA_DIR,./data}/processed/tokens
-  commit_tokens_path: ${oc.env:DATA_DIR,./data}/processed/commit_reproduction
-  description_tokens_path: ${oc.env:DATA_DIR,./data}/mmap/descriptions
-  structural_tokens_path: ${oc.env:DATA_DIR,./data}/mmap/structural
-  prompt_variants_dir: ${oc.env:DATA_DIR,./data}/prompt_variants
+  file_tokens_path: ${oc.env:DATA_DIR}/processed/tokens
+  commit_tokens_path: ${oc.env:DATA_DIR}/processed/commit_reproduction
+  description_tokens_path: ${oc.env:DATA_DIR}/mmap/descriptions
+  structural_tokens_path: ${oc.env:DATA_DIR}/mmap/structural
+  prompt_variants_dir: configs/prompt_variants
 
 eval:
   generation_samples: 8

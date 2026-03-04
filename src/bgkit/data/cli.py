@@ -5,11 +5,10 @@ Usage:
     bgkit-data download --concurrency 10
     bgkit-data stats
 
-Environment Variables (can be set in .env file):
+Environment Variables (set in .env file):
     GITHUB_TOKEN      - Single GitHub personal access token
     GITHUB_TOKENS     - Multiple tokens, comma-separated (for higher throughput)
-    BGKIT_DB_PATH     - Path to SQLite database (default: ./data/crawl_state.db)
-    BGKIT_REPOS_PATH  - Path to clone repos (default: ./data/repos)
+    DATA_DIR          - Root data directory (required, set in .env)
 """
 
 import argparse
@@ -19,12 +18,11 @@ import os
 import sys
 from pathlib import Path
 
-# Load .env file if present
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass  # dotenv is optional
+from bgkit.env import get_db_path, get_repos_dir
+
+# Lazy defaults — resolved after arg parsing so --help works without .env
+_SENTINEL = object()
+
 
 
 def get_github_tokens() -> list:
@@ -311,8 +309,8 @@ def main():
 
     parser.add_argument(
         "--db",
-        default=os.environ.get("BGKIT_DB_PATH", "./data/crawl_state.db"),
-        help="Path to SQLite database (env: BGKIT_DB_PATH, default: ./data/crawl_state.db)",
+        default=_SENTINEL,
+        help="Path to SQLite database (default: DATA_DIR/crawl_state.db)",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -358,8 +356,8 @@ def main():
     download_parser = subparsers.add_parser("download", help="Download repositories")
     download_parser.add_argument(
         "--output",
-        default=os.environ.get("BGKIT_REPOS_PATH", "./data/repos"),
-        help="Output directory (env: BGKIT_REPOS_PATH, default: ./data/repos)",
+        default=_SENTINEL,
+        help="Output directory (default: DATA_DIR/repos)",
     )
     download_parser.add_argument(
         "--concurrency", type=int, default=10, help="Parallel downloads"
@@ -397,8 +395,8 @@ def main():
     )
     full_parser.add_argument(
         "--output",
-        default=os.environ.get("BGKIT_REPOS_PATH", "./data/repos"),
-        help="Output directory (env: BGKIT_REPOS_PATH)",
+        default=_SENTINEL,
+        help="Output directory (default: DATA_DIR/repos)",
     )
     full_parser.add_argument(
         "--concurrency", type=int, default=10, help="Parallel downloads"
@@ -450,6 +448,12 @@ def main():
     if args.command is None:
         parser.print_help()
         return 1
+
+    # Resolve lazy defaults (deferred so --help works without .env)
+    if args.db is _SENTINEL:
+        args.db = str(get_db_path())
+    if hasattr(args, "output") and args.output is _SENTINEL:
+        args.output = str(get_repos_dir(must_exist=False))
 
     # Run the appropriate command
     if args.command == "discover":

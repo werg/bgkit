@@ -274,6 +274,7 @@ dependencies = [
     { name = "numpy" },
     { name = "omegaconf" },
     { name = "pygit2" },
+    { name = "python-dotenv" },
     { name = "rich" },
     { name = "safetensors" },
     { name = "structlog" },
@@ -286,7 +287,6 @@ dependencies = [
 [package.optional-dependencies]
 data = [
     { name = "aiosqlite" },
-    { name = "python-dotenv" },
     { name = "tree-sitter-language-pack" },
 ]
 dev = [
@@ -339,7 +339,7 @@ requires-dist = [
     { name = "pygit2" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
-    { name = "python-dotenv", marker = "extra == 'data'", specifier = ">=1.0" },
+    { name = "python-dotenv", specifier = ">=1.0" },
     { name = "rich" },
     { name = "rouge-score", marker = "extra == 'eval'", specifier = ">=0.1.2" },
     { name = "ruff", marker = "extra == 'dev'" },

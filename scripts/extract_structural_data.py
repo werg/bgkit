@@ -188,12 +188,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Extract structural metadata from repos using tree-sitter."
     )
+    from bgkit.env import get_data_dir
+    _data = get_data_dir(must_exist=False)
     parser.add_argument(
-        "--repos-dir", type=Path, default=Path("data/repos"),
+        "--repos-dir", type=Path, default=_data / "repos",
         help="Directory containing owner/repo/ subdirectories",
     )
     parser.add_argument(
-        "--output-dir", type=Path, default=Path("data/structural"),
+        "--output-dir", type=Path, default=_data / "structural",
         help="Output directory for per-repo JSONL files",
     )
     parser.add_argument(

@@ -411,7 +411,9 @@ def main():
 
     output_path = args.output
     if output_path is None:
-        output_path = Path("data/prompt_variants") / f"{template['name']}.json"
+        from bgkit.env import get_data_dir
+        variants_dir = get_data_dir(must_exist=False) / "prompt_variants"
+        output_path = variants_dir / f"{template['name']}.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(output_path, "w") as f:

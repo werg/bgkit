@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from bgkit.env import get_db_path, get_repos_dir
+
 
 @dataclass
 class CrawlerConfig:
@@ -25,8 +27,8 @@ class CrawlerConfig:
 
     target_repo_count: int = 100_000
     min_stars: int = 50  # Default for mainstream languages; niche/emerging use lower thresholds
-    storage_base_path: Path = field(default_factory=lambda: Path("./data/repos"))
-    db_path: Path = field(default_factory=lambda: Path("./data/crawl_state.db"))
+    storage_base_path: Path = field(default_factory=lambda: get_repos_dir(must_exist=False))
+    db_path: Path = field(default_factory=lambda: get_db_path())
     max_concurrent_downloads: int = 10
     clone_timeout_seconds: int = 3600
     retry_attempts: int = 3

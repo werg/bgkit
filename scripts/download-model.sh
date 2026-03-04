@@ -9,6 +9,11 @@
 
 set -euo pipefail
 
+# Load .env from project root
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+[ -f "$SCRIPT_DIR/../.env" ] && set -a && . "$SCRIPT_DIR/../.env" && set +a
+
 if [[ $# -lt 2 ]]; then
     echo "Usage: $0 <hf-repo> <filename> [output-dir]" >&2
     exit 1
@@ -16,7 +21,7 @@ fi
 
 HF_REPO="$1"
 FILENAME="$2"
-OUTPUT_DIR="${3:-data/models}"
+OUTPUT_DIR="${3:-${DATA_DIR:?DATA_DIR not set — copy .env.example to .env}/models}"
 
 mkdir -p "$OUTPUT_DIR"
 

@@ -7,23 +7,23 @@ Usage:
     bgkit-ckpt best --phase X --metric X [--higher-is-better]
     bgkit-ckpt backfill
 
-Environment Variables:
-    CHECKPOINT_DIR - Path to checkpoint directory (default: ./checkpoints)
+Environment Variables (set in .env):
+    CHECKPOINT_DIR - Path to checkpoint directory (required)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
+from bgkit.env import get_checkpoint_dir
 from bgkit.training.checkpoint_registry import CheckpointRegistry
 
 
 def _get_checkpoint_dir() -> Path:
-    return Path(os.environ.get("CHECKPOINT_DIR", "./checkpoints"))
+    return get_checkpoint_dir()
 
 
 def cmd_list(args: argparse.Namespace) -> None:

@@ -1,4 +1,4 @@
 tokens:
-  input_dir: ${oc.env:DATA_DIR,./data}/processed/tokens
+  input_dir: ${oc.env:DATA_DIR}/processed/tokens
   max_seq_len: 8192
-  variant_bank_path: ${oc.env:DATA_DIR,./data}/prompt_variants/file_read_repro.json
+  variant_bank_path: configs/prompt_variants/file_read_repro.json

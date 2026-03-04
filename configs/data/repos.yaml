@@ -1,6 +1,6 @@
 # Repository dataset configuration
 repos:
-  data_dir: ${oc.env:DATA_DIR,./data/repos}
+  data_dir: ${oc.env:DATA_DIR}/repos
   # Max files per repo for L1 processing
   max_files_per_repo: 2000
   # File extensions to include

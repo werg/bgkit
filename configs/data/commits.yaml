@@ -17,7 +17,7 @@ commits:
   commit_reproduction:
     enabled: true
     max_diff_tokens: 4096
-    output_dir: ${oc.env:DATA_DIR,./data}/processed/commit_reproduction
+    output_dir: ${oc.env:DATA_DIR}/processed/commit_reproduction
     max_commits_per_repo: 200
     max_repos: null
     tokenizer_name: Qwen/Qwen3.5-0.8B
