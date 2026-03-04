@@ -2,7 +2,7 @@
 -include .env
 export
 
-.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits convert-structural convert-descriptions convert-commits generate-variants download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs
+.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits convert-structural convert-descriptions convert-commits generate-variants download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full
 
 install:
 	uv sync --extra dev --extra data
@@ -143,6 +143,12 @@ convert-commits:
 	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
 	.venv/bin/python scripts/convert_commits_to_npy.py \
 		--input-dir $(DATA_DIR)/processed/commit_reproduction/
+
+prepare-data:
+	scripts/prepare-data.sh $(ARGS)
+
+prepare-data-full:
+	scripts/prepare-data.sh --with-descriptions $(ARGS)
 
 generate-variants:
 	.venv/bin/python scripts/generate_prompt_variants.py \
