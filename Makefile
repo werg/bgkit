@@ -2,6 +2,11 @@
 -include .env
 export
 
+# Compose command — always pass --env-file so direct invocation also works
+# (Makefile export covers `make` targets, but --env-file covers docker compose
+# reading the file itself for ${VAR} interpolation in the YAML).
+DC := docker compose --env-file .env -f docker/docker-compose.yaml
+
 .PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits convert-structural convert-descriptions convert-commits generate-variants download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full
 
 install:
@@ -49,7 +54,7 @@ process-repos:
 	.venv/bin/python scripts/process_repos.py $(ARGS)
 
 ice-labels:
-	docker compose -f docker/docker-compose.yaml run --rm ice-labels $(ARGS)
+	$(DC) run --rm ice-labels $(ARGS)
 
 train-ice:
 	scripts/run-train.sh train-ice
@@ -61,13 +66,13 @@ train-phase1-step2:
 	scripts/run-train.sh train-phase1-step2
 
 docker-build-deps:
-	docker compose -f docker/docker-compose.yaml build train
+	$(DC) build train
 
 docker-build-data:
 	docker build -f docker/Dockerfile.data -t bgkit-data:latest .
 
 docker-build-llama:
-	docker compose -f docker/docker-compose.yaml build llama-large llama-small llama-tiny
+	$(DC) build llama-large llama-small llama-tiny
 
 download-models:
 	scripts/download-model.sh LiquidAI/LFM2-8B-A1B-GGUF LFM2-8B-A1B-Q4_K_M.gguf
@@ -75,7 +80,7 @@ download-models:
 	scripts/download-model.sh Qwen/Qwen3-0.6B-GGUF Qwen3-0.6B-Q8_0.gguf
 
 llama-server:
-	docker compose -f docker/docker-compose.yaml up -d llama-large llama-small llama-tiny
+	$(DC) up -d llama-large llama-small llama-tiny
 	@echo "Waiting for llama-large health..."
 	@timeout 120 bash -c 'until curl -sf http://localhost:$${LLAMA_PORT_LARGE:-8080}/health; do sleep 2; done' && echo " OK" || { echo " TIMEOUT"; exit 1; }
 	@echo "Waiting for llama-small health..."
@@ -84,11 +89,11 @@ llama-server:
 	@timeout 120 bash -c 'until curl -sf http://localhost:$${LLAMA_PORT_TINY:-8082}/health; do sleep 2; done' && echo " OK" || { echo " TIMEOUT"; exit 1; }
 
 llama-server-stop:
-	docker compose -f docker/docker-compose.yaml stop llama-large llama-small llama-tiny
-	docker compose -f docker/docker-compose.yaml rm -f llama-large llama-small llama-tiny
+	$(DC) stop llama-large llama-small llama-tiny
+	$(DC) rm -f llama-large llama-small llama-tiny
 
 llama-server-logs:
-	docker compose -f docker/docker-compose.yaml logs -f llama-large llama-small llama-tiny
+	$(DC) logs -f llama-large llama-small llama-tiny
 
 llama-bench:
 	scripts/llama-bench.sh
@@ -100,19 +105,19 @@ download-models-hf:
 	huggingface-cli download Qwen/Qwen3.5-0.8B
 
 vllm-server:
-	docker compose -f docker/docker-compose.yaml up -d vllm-primary
+	$(DC) up -d vllm-primary
 	@echo "Waiting for vllm-primary health..."
 	@timeout 300 bash -c 'until curl -sf http://localhost:$${VLLM_PORT_PRIMARY:-8090}/health; do sleep 3; done' && echo " OK" || { echo " TIMEOUT"; exit 1; }
-	docker compose -f docker/docker-compose.yaml up -d vllm-fast
+	$(DC) up -d vllm-fast
 	@echo "Waiting for vllm-fast health..."
 	@timeout 300 bash -c 'until curl -sf http://localhost:$${VLLM_PORT_FAST:-8091}/health; do sleep 3; done' && echo " OK" || { echo " TIMEOUT"; exit 1; }
 
 vllm-server-stop:
-	docker compose -f docker/docker-compose.yaml stop vllm-primary vllm-fast
-	docker compose -f docker/docker-compose.yaml rm -f vllm-primary vllm-fast
+	$(DC) stop vllm-primary vllm-fast
+	$(DC) rm -f vllm-primary vllm-fast
 
 vllm-server-logs:
-	docker compose -f docker/docker-compose.yaml logs -f vllm-primary vllm-fast
+	$(DC) logs -f vllm-primary vllm-fast
 
 ckpt-backfill:
 	.venv/bin/bgkit-ckpt backfill

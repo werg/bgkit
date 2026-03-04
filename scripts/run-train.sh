@@ -15,19 +15,25 @@ fi
 
 SERVICE="${1:?Usage: $0 [--no-follow] <service-name>}"
 shift
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE_FILE="docker/docker-compose.yaml"
 
+# Load .env so DATA_DIR/CHECKPOINT_DIR are available for compose interpolation
+DC="docker compose --env-file ${PROJECT_ROOT}/.env -f $COMPOSE_FILE"
+
 echo "==> Stopping and removing old container for ${SERVICE}..."
-docker compose -f "$COMPOSE_FILE" rm -fs "$SERVICE" 2>/dev/null || true
+$DC rm -fs "$SERVICE" 2>/dev/null || true
 
 echo "==> Starting ${SERVICE} (detached)..."
-docker compose -f "$COMPOSE_FILE" up -d "$SERVICE" "$@"
+$DC up -d "$SERVICE" "$@"
 
 echo "==> Container started: ${SERVICE}"
 
 if [[ "$FOLLOW" == true ]]; then
     echo "==> Tailing logs (Ctrl-C to detach, container keeps running)..."
-    docker compose -f "$COMPOSE_FILE" logs -f "$SERVICE"
+    $DC logs -f "$SERVICE"
 else
-    echo "==> Logs: docker compose -f ${COMPOSE_FILE} logs -f ${SERVICE}"
+    echo "==> Logs: $DC logs -f ${SERVICE}"
 fi
