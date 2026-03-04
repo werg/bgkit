@@ -16,7 +16,6 @@ from bgkit.data.collators import collate_chat_repro
 from bgkit.data.datasets.chat_repro_dataset import (
     CONTENT_SENTINEL,
     ChatReproDataset,
-    _build_messages,
 )
 
 # ---------------------------------------------------------------------------
@@ -44,12 +43,11 @@ ALT_VARIANT = {
 class MockTokenizer:
     """Minimal tokenizer mock for testing template construction.
 
-    Uses a simple word-level tokenization (split on characters) to make
-    token boundaries predictable.
+    Handles tool_calls on assistant messages and role="tool" messages,
+    mimicking Qwen3.5's apply_chat_template behavior.
     """
 
     def __init__(self):
-        # Simple char-level "tokenizer" for predictable behavior
         self._vocab = {}
         self._next_id = 100
 
@@ -67,12 +65,35 @@ class MockTokenizer:
         return "".join(reverse.get(i, "?") for i in ids)
 
     def apply_chat_template(
-        self, messages, tokenize=True, add_generation_prompt=False
+        self, messages, tokenize=True, add_generation_prompt=False, **kwargs,
     ) -> str | list[int]:
         """Simple template: join messages with role markers."""
         parts = []
+        prev_role = None
         for msg in messages:
-            parts.append(f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n")
+            role = msg["role"]
+            content = msg.get("content", "")
+            if role == "assistant" and "tool_calls" in msg:
+                tc_parts = []
+                for tc in msg["tool_calls"]:
+                    fn = tc["function"]
+                    args = fn["arguments"]
+                    param_strs = "".join(
+                        f"<parameter={k}>\n{v}\n</parameter>"
+                        for k, v in args.items()
+                    )
+                    tc_parts.append(
+                        f"<tool_call>\n<function={fn['name']}>"
+                        f"{param_strs}</function>\n</tool_call>"
+                    )
+                content = "".join(tc_parts)
+            if role == "tool":
+                role = "user"
+                content = f"<tool_response>\n{content}\n</tool_response>"
+            if msg["role"] == "assistant" and prev_role in ("user", "tool"):
+                content = f"<think>\n\n</think>\n\n{content}"
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+            prev_role = msg["role"]
         result = "".join(parts)
         if tokenize:
             return self.encode(result, add_special_tokens=False)
@@ -148,53 +169,6 @@ def dataset(inner_dataset, variant_bank):
 
 # ---------------------------------------------------------------------------
 # Template construction tests
-# ---------------------------------------------------------------------------
-
-
-class TestBuildMessages:
-    def test_messages_have_correct_roles(self):
-        messages = _build_messages(SEED_VARIANT, "test.py", "python", "content here")
-        roles = [m["role"] for m in messages]
-        assert roles == ["system", "user", "assistant", "user", "assistant"]
-
-    def test_file_path_in_user_message(self):
-        messages = _build_messages(SEED_VARIANT, "src/foo.py", "python", "content")
-        assert "src/foo.py" in messages[1]["content"]
-
-    def test_file_path_in_response_prefix(self):
-        messages = _build_messages(SEED_VARIANT, "src/foo.py", "python", "content")
-        assert "src/foo.py" in messages[4]["content"]
-
-    def test_tool_call_in_assistant_message(self):
-        messages = _build_messages(SEED_VARIANT, "test.py", "python", "content")
-        assert "<tool_call>" in messages[2]["content"]
-        assert "bgkit_read_file" in messages[2]["content"]
-
-    def test_tool_response_in_user_message(self):
-        messages = _build_messages(SEED_VARIANT, "test.py", "python", "content")
-        assert "<tool_response>" in messages[3]["content"]
-
-    def test_think_block_in_final_response(self):
-        messages = _build_messages(SEED_VARIANT, "test.py", "python", "content")
-        assert "<think>" in messages[4]["content"]
-        assert "</think>" in messages[4]["content"]
-
-    def test_code_fence_with_language(self):
-        messages = _build_messages(SEED_VARIANT, "test.py", "python", "CONTENT")
-        assert "```python" in messages[4]["content"]
-        assert "CONTENT" in messages[4]["content"]
-
-    def test_compression_prompt_in_tool_call(self):
-        messages = _build_messages(SEED_VARIANT, "test.py", "python", "content")
-        assert "Return the file contents verbatim" in messages[2]["content"]
-
-    def test_sentinel_preserved(self):
-        messages = _build_messages(SEED_VARIANT, "test.py", "python", CONTENT_SENTINEL)
-        assert CONTENT_SENTINEL in messages[4]["content"]
-
-
-# ---------------------------------------------------------------------------
-# ChatReproDataset tests
 # ---------------------------------------------------------------------------
 
 

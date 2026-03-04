@@ -18,38 +18,16 @@ from bgkit.data.chat_template import (
     CONTENT_SENTINEL,
     TOOL_CONFIGS,
     build_messages,
+    build_tools,
     compute_suffix_ids,
-    make_tool_definition,
     select_variant,
     tokenize_with_sentinel,
 )
 from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
 
-# Re-export for backward compatibility — other modules import these from here.
-__all__ = ["CONTENT_SENTINEL", "ChatReproDataset", "_build_messages"]
+__all__ = ["CONTENT_SENTINEL", "ChatReproDataset"]
 
 _FILE_READ_CONFIG = TOOL_CONFIGS["file_read_repro"]
-
-# Re-export the tool definition string for backward compatibility
-TOOL_DEFINITION = make_tool_definition(_FILE_READ_CONFIG)
-
-
-def _build_messages(
-    variant: dict[str, str],
-    file_path: str,
-    language: str,
-    file_content_placeholder: str,
-) -> list[dict[str, str]]:
-    """Build the chat messages list from a variant and sample metadata.
-
-    Backward-compatible wrapper around the shared build_messages function.
-    The file_content_placeholder is inserted where the actual file content
-    goes — either real content for tokenization or CONTENT_SENTINEL for
-    boundary detection.
-    """
-    return build_messages(
-        variant, _FILE_READ_CONFIG, file_path, language, file_content_placeholder,
-    )
 
 
 class ChatReproDataset(Dataset):
@@ -104,6 +82,7 @@ class ChatReproDataset(Dataset):
         dummy_path = "src/example/placeholder_file.py"
         test_languages = ["python", "typescript", "javascript", ""]
 
+        tools = build_tools(_FILE_READ_CONFIG)
         for variant in self._variants:
             for lang in test_languages:
                 messages = build_messages(
@@ -111,6 +90,7 @@ class ChatReproDataset(Dataset):
                 )
                 template_str = self._tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=False,
+                    tools=tools,
                 )
                 overhead_str = template_str.replace("X", "", 1)
                 overhead_tokens = len(

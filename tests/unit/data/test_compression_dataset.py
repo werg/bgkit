@@ -634,10 +634,33 @@ class _MockTokenizer:
     def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
         return [self._get_id(c) for c in text]
 
-    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False, **kwargs):
         parts = []
+        prev_role = None
         for msg in messages:
-            parts.append(f"<|im_start|>{msg['role']}\n{msg['content']}<|im_end|>\n")
+            role = msg["role"]
+            content = msg.get("content", "")
+            if role == "assistant" and "tool_calls" in msg:
+                tc_parts = []
+                for tc in msg["tool_calls"]:
+                    fn = tc["function"]
+                    args = fn["arguments"]
+                    param_strs = "".join(
+                        f"<parameter={k}>\n{v}\n</parameter>"
+                        for k, v in args.items()
+                    )
+                    tc_parts.append(
+                        f"<tool_call>\n<function={fn['name']}>"
+                        f"{param_strs}</function>\n</tool_call>"
+                    )
+                content = "".join(tc_parts)
+            if role == "tool":
+                role = "user"
+                content = f"<tool_response>\n{content}\n</tool_response>"
+            if msg["role"] == "assistant" and prev_role in ("user", "tool"):
+                content = f"<think>\n\n</think>\n\n{content}"
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+            prev_role = msg["role"]
         result = "".join(parts)
         if tokenize:
             return self.encode(result, add_special_tokens=False)

@@ -70,12 +70,26 @@ class _CausalLMOutput:
         self.logits = logits
 
 
+class _MockAttentionLayer(nn.Module):
+    """Mock layer with q/k/v/o_proj so PEFT can find LoRA targets."""
+
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.o_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+    def forward(self, x):
+        return self.o_proj(self.q_proj(x) + self.k_proj(x) + self.v_proj(x))
+
+
 class _MockQwen3Model(nn.Module):
     def __init__(self, vocab_size, hidden_dim, num_layers=2):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size, hidden_dim)
         self.layers = nn.ModuleList(
-            [nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)]
+            [_MockAttentionLayer(hidden_dim) for _ in range(num_layers)]
         )
         self.norm = nn.LayerNorm(hidden_dim)
 

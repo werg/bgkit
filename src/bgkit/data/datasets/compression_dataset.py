@@ -20,6 +20,7 @@ from bgkit.data.chat_template import (
     TOOL_CONFIGS,
     ChatTemplateConfig,
     build_messages,
+    build_tools,
     select_variant,
     tokenize_with_sentinel,
 )
@@ -55,11 +56,13 @@ def _compute_max_overhead(
         step = n / _MAX_OVERHEAD_PROBE_VARIANTS
         probe_indices = [int(i * step) for i in range(_MAX_OVERHEAD_PROBE_VARIANTS)]
 
+    tools = build_tools(config)
     for vi in probe_indices:
         variant = variants[vi]
         messages = build_messages(variant, config, dummy_path, dummy_lang, "X")
         template_str = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False,
+            tools=tools,
         )
         overhead_str = template_str.replace("X", "", 1)
         overhead_tokens = len(

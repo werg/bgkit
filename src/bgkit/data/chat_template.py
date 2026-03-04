@@ -7,7 +7,6 @@ commit reproduction, description generation, and structural reconstruction.
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 
 import torch
@@ -115,19 +114,17 @@ TOOL_CONFIGS: dict[str, ChatTemplateConfig] = {
 }
 
 
-def make_tool_definition(config: ChatTemplateConfig) -> str:
-    """Create JSON tool definition string from config."""
-    return json.dumps(
-        {
-            "type": "function",
-            "function": {
-                "name": config.tool_name,
-                "description": config.tool_description,
-                "parameters": config.tool_parameters,
-            },
-        },
-        ensure_ascii=False,
-    )
+def build_tools(config: ChatTemplateConfig) -> list[dict]:
+    """Build tools list for apply_chat_template(tools=...).
+
+    Returns the format expected by Qwen3.5's chat template: a list of
+    tool dicts with type/function/name/description/parameters.
+    """
+    return [{"type": "function", "function": {
+        "name": config.tool_name,
+        "description": config.tool_description,
+        "parameters": config.tool_parameters,
+    }}]
 
 
 def _build_tool_call_arguments(
@@ -164,42 +161,26 @@ def build_messages(
     file_path: str,
     language: str,
     content_placeholder: str,
-) -> list[dict[str, str]]:
-    """Build chat messages from a variant and config.
+) -> list[dict]:
+    """Build chat messages in Qwen3.5's official tool-call format.
 
-    Generalizes _build_messages from chat_repro_dataset.py.
-    - Uses config.tool_name for tool call identity
-    - Uses config.tool_parameters for tool call arguments
-    - Wraps content in code fence only if config.content_in_code_fence
-    - Uses config.code_fence_language or falls back to file language
+    Uses tool_calls attribute on assistant messages and role="tool" for
+    tool responses, matching the format that apply_chat_template(tools=...)
+    renders natively. The template auto-injects tool format instructions
+    into the system prompt and <think> blocks into assistant turns.
     """
     system_prompt = variant["system_prompt"]
     user_prompt = variant["user_prompt"].replace("{file_path}", file_path)
     compression_prompt = variant["compression_prompt"]
     response_prefix = variant["response_prefix"].replace("{file_path}", file_path)
 
-    tool_definition = make_tool_definition(config)
-
-    # Build tool call arguments
+    # Build tool call arguments as a dict (not JSON string)
     tool_args = _build_tool_call_arguments(config, file_path, compression_prompt)
-    tool_call_json = json.dumps(
-        {"name": config.tool_name, "arguments": tool_args},
-        ensure_ascii=False,
-    )
 
-    # System message with tool definition
-    system_text = (
-        f"{system_prompt}\n\n# Tools\n\n"
-        f"You may call one or more functions to assist with the user query.\n\n"
-        f"You are provided with function signatures within <tools></tools> XML tags:\n"
-        f"<tools>\n{tool_definition}\n</tools>"
-    )
-
-    # Build final assistant response content
+    # Build final assistant response content (no <think> — template injects it)
     if config.content_in_code_fence:
         fence_lang = config.code_fence_language if config.code_fence_language else language
         response_content = (
-            f"<think>\n\n</think>\n\n"
             f"{response_prefix}\n\n"
             f"```{fence_lang}\n"
             f"{content_placeholder}\n"
@@ -207,25 +188,32 @@ def build_messages(
         )
     else:
         response_content = (
-            f"<think>\n\n</think>\n\n"
             f"{response_prefix}\n\n"
             f"{content_placeholder}"
         )
 
+    # Assistant tool-call message with tool_calls attribute
+    tool_call_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "type": "function",
+                "function": {
+                    "name": config.tool_name,
+                    "arguments": tool_args,
+                },
+            }
+        ],
+    }
+
     messages = [
-        {"role": "system", "content": system_text},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
+        tool_call_msg,
         {
-            "role": "assistant",
-            "content": f"<tool_call>\n{tool_call_json}\n</tool_call>",
-        },
-        {
-            "role": "user",
-            "content": (
-                "<tool_response>\n"
-                "File contents provided as BgKIT compressed context.\n"
-                "</tool_response>"
-            ),
+            "role": "tool",
+            "content": "File contents provided as BgKIT compressed context.",
         },
         {"role": "assistant", "content": response_content},
     ]
@@ -243,6 +231,7 @@ def compute_suffix_ids(
     text *before* the sentinel differs per variant. Verify across a few
     variants as a sanity check.
     """
+    tools = build_tools(config)
     suffix_ids = None
     for variant in variants:
         messages = build_messages(
@@ -250,6 +239,7 @@ def compute_suffix_ids(
         )
         template_str = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False,
+            tools=tools,
         )
         _, suffix_str = template_str.split(CONTENT_SENTINEL)
         ids = tokenizer.encode(suffix_str, add_special_tokens=False)
@@ -279,6 +269,43 @@ def select_variant(
     return variants[h % len(variants)]
 
 
+def build_encoder_prefix_ids(tokenizer, compression_prompt: str) -> torch.Tensor:
+    """Build ChatML-wrapped encoder prefix token IDs.
+
+    Produces: <|im_start|>system\\n{compression_prompt}<|im_end|>\\n<|im_start|>user\\n
+
+    Uses apply_chat_template with a sentinel to locate the exact boundary
+    between the template prefix and the user content.
+    """
+    messages = [
+        {"role": "system", "content": compression_prompt},
+        {"role": "user", "content": CONTENT_SENTINEL},
+    ]
+    template_str = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False,
+    )
+    prefix_str, _ = template_str.split(CONTENT_SENTINEL)
+    ids = tokenizer.encode(prefix_str, add_special_tokens=False)
+    return torch.tensor(ids, dtype=torch.long)
+
+
+def build_encoder_user_only_prefix_ids(tokenizer) -> torch.Tensor:
+    """Build a user-only ChatML prefix: <|im_start|>user\\n
+
+    For joint block pretrain where no compression prompt is needed.
+    Uses apply_chat_template with a sentinel to extract just the user turn opener.
+    """
+    messages = [
+        {"role": "user", "content": CONTENT_SENTINEL},
+    ]
+    template_str = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False,
+    )
+    prefix_str, _ = template_str.split(CONTENT_SENTINEL)
+    ids = tokenizer.encode(prefix_str, add_special_tokens=False)
+    return torch.tensor(ids, dtype=torch.long)
+
+
 def tokenize_with_sentinel(
     tokenizer,
     variant: dict[str, str],
@@ -293,11 +320,13 @@ def tokenize_with_sentinel(
     compression_prompt_ids, prefix_ids
     """
     # Build template with sentinel for boundary detection
+    tools = build_tools(config)
     messages_with_sentinel = build_messages(
         variant, config, file_path, language, CONTENT_SENTINEL,
     )
     template_str = tokenizer.apply_chat_template(
         messages_with_sentinel, tokenize=False, add_generation_prompt=False,
+        tools=tools,
     )
 
     # Validate sentinel uniqueness
@@ -328,12 +357,9 @@ def tokenize_with_sentinel(
     content_end = content_start + len(content_ids)
     loss_mask[content_start:content_end] = 1
 
-    # Tokenize compression prompt for BgKIT conditioning
+    # Tokenize compression prompt as ChatML prefix for BgKIT conditioning
     compression_prompt = variant["compression_prompt"]
-    compression_prompt_ids = torch.tensor(
-        tokenizer.encode(compression_prompt, add_special_tokens=False),
-        dtype=torch.long,
-    )
+    compression_prompt_ids = build_encoder_prefix_ids(tokenizer, compression_prompt)
 
     return {
         "token_ids": token_ids,
