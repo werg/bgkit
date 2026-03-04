@@ -250,6 +250,75 @@ class TestJointBlockEvaluate:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# ChatML prefix tests
+# ---------------------------------------------------------------------------
+
+
+def _set_chatml_prefix(trainer, prefix_ids=None):
+    """Pre-compute and cache prompt embeddings on a trainer, mirroring setup()."""
+    if prefix_ids is None:
+        prefix_ids = torch.tensor([10, 20, 30], dtype=torch.long)
+    with torch.no_grad():
+        trainer._prompt_embeddings = trainer._get_input_embeddings(prefix_ids.unsqueeze(0))
+
+
+class TestJointBlockChatMLPrefix:
+    def test_train_step_with_chatml_prefix(self, trainer):
+        """train_step with ChatML prefix should produce finite loss without shape mismatch."""
+        _set_chatml_prefix(trainer)
+
+        batch = _make_batch(batch_size=2, seq_len=20)
+        metrics = trainer.train_step(batch)
+        assert torch.isfinite(torch.tensor(metrics["loss"]))
+        assert "loss_repro" in metrics
+        assert "loss_proj" in metrics
+        assert "cosine_sim_repro" in metrics
+        assert "cosine_sim_proj" in metrics
+
+    def test_evaluate_with_chatml_prefix(self, trainer):
+        """evaluate() with ChatML prefix should return finite metrics."""
+        from torch.utils.data import DataLoader
+
+        _set_chatml_prefix(trainer)
+
+        eval_data = [
+            {"token_ids": torch.randint(0, 1000, (10,))},
+            {"token_ids": torch.randint(0, 1000, (8,))},
+        ]
+        trainer.eval_dataloader = DataLoader(
+            eval_data, batch_size=2, collate_fn=joint_block_collate_fn,
+        )
+
+        metrics = trainer.evaluate()
+        assert "mse_repro" in metrics
+        assert "mse_proj" in metrics
+        assert "cosine_sim_repro" in metrics
+        assert "cosine_sim_proj" in metrics
+        for k, v in metrics.items():
+            assert torch.isfinite(torch.tensor(v)), f"{k} is not finite: {v}"
+
+    def test_loss_decreases_with_chatml_prefix(self, trainer):
+        """Loss should decrease over steps even with ChatML prefix."""
+        torch.manual_seed(42)
+        _set_chatml_prefix(trainer)
+
+        batch = _make_batch(batch_size=4, seq_len=30)
+        losses = []
+        for _ in range(50):
+            metrics = trainer.train_step(batch)
+            losses.append(metrics["loss"])
+
+        early_avg = sum(losses[:5]) / 5
+        late_avg = sum(losses[-5:]) / 5
+        assert late_avg < early_avg, f"Loss didn't decrease: {early_avg:.4f} -> {late_avg:.4f}"
+
+
+# ---------------------------------------------------------------------------
+# Collation tests
+# ---------------------------------------------------------------------------
+
+
 class TestJointBlockCollateFn:
     def test_pads_to_max_length(self):
         """Variable-length inputs should be padded to max length in batch."""

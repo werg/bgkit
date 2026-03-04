@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from transformers import AutoModel
 
+from bgkit.data.chat_template import build_encoder_user_only_prefix_ids
 from bgkit.data.collators import collate_token_ids
 from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
 from bgkit.data.samplers import TokenBudgetBatchSampler
@@ -40,8 +41,9 @@ class _ForwardResult:
     """Intermediate forward pass results for both objectives."""
 
     comp_out: object  # CompressorOutput
-    auto_repro_pred: torch.Tensor
+    auto_repro_pred: torch.Tensor  # content-only slice
     proj_out: object  # ProjectionOutput
+    proj_content: torch.Tensor  # content-only slice of projected embeddings
     loss_repro: torch.Tensor
     loss_proj: torch.Tensor
     loss: torch.Tensor
@@ -198,6 +200,18 @@ class JointBlockTrainer(BaseTrainer):
             tcfg.lr,
         )
 
+        # ChatML user-only prefix for encoder conditioning
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            backbone_name, revision=backbone_revision, trust_remote_code=True,
+        )
+        prefix_ids = build_encoder_user_only_prefix_ids(tokenizer).to(device)
+        # Pre-compute and freeze the prompt embeddings (1, prefix_len, hidden_dim)
+        with torch.no_grad():
+            self._prompt_embeddings = self._get_input_embeddings(prefix_ids.unsqueeze(0))
+        logger.info("encoder_chatml_prefix", prefix_len=prefix_ids.size(0))
+
         logger.info(
             "joint_block_trainer_setup",
             train_samples=train_size,
@@ -223,6 +237,10 @@ class JointBlockTrainer(BaseTrainer):
             return torch.autocast("cuda", dtype=torch.bfloat16)
         return nullcontext()
 
+    def _get_prompt_embeddings(self) -> torch.Tensor | None:
+        """Return cached ChatML prefix embeddings (1, prefix_len, hidden_dim)."""
+        return getattr(self, "_prompt_embeddings", None)
+
     def _forward_both(
         self,
         input_embeddings: torch.Tensor,
@@ -231,11 +249,22 @@ class JointBlockTrainer(BaseTrainer):
         target_proj: torch.Tensor,
     ) -> _ForwardResult:
         """Run both forward passes and compute losses."""
+        prompt_emb = self._get_prompt_embeddings()
+        if prompt_emb is not None:
+            # Expand to batch size
+            prompt_emb = prompt_emb.expand(input_embeddings.size(0), -1, -1)
+
         comp_out = self.encoder.compressor(
             input_embeddings, survivor_mask=None, attention_mask=attention_mask,
+            prompt_embeddings=prompt_emb,
         )
 
-        auto_repro_pred = self.encoder.compressor.auto_reproduce(comp_out.normed_embeddings)
+        auto_repro_pred_full = self.encoder.compressor.auto_reproduce(
+            comp_out.normed_embeddings,
+        )
+        # Slice to content-only positions (targets don't include prefix)
+        cs = comp_out.content_slice
+        auto_repro_pred = auto_repro_pred_full[:, cs, :]
         loss_repro = auto_reproduction_loss(
             auto_repro_pred, target_repro, mask=attention_mask.float(),
         )
@@ -245,8 +274,9 @@ class JointBlockTrainer(BaseTrainer):
             attention_mask=comp_out.attention_mask,
             survivor_mask=None,
         )
+        proj_content = proj_out.projected_embeddings[:, cs, :]
         loss_proj = auto_reproduction_loss(
-            proj_out.projected_embeddings, target_proj, mask=attention_mask.float(),
+            proj_content, target_proj, mask=attention_mask.float(),
         )
 
         loss = self.w_repro * loss_repro + self.w_proj * loss_proj
@@ -255,6 +285,7 @@ class JointBlockTrainer(BaseTrainer):
             comp_out=comp_out,
             auto_repro_pred=auto_repro_pred,
             proj_out=proj_out,
+            proj_content=proj_content,
             loss_repro=loss_repro,
             loss_proj=loss_proj,
             loss=loss,
@@ -280,15 +311,13 @@ class JointBlockTrainer(BaseTrainer):
         # Scaled backward (for gradient accumulation)
         (fwd.loss / self._accum_steps).backward()
 
-        # Cosine similarity metrics
+        # Cosine similarity metrics (content-only, matching targets)
         with torch.no_grad():
             mask_f = attention_mask.float()
             cos_repro = F.cosine_similarity(fwd.auto_repro_pred, target_repro, dim=-1)
             cos_repro_avg = (cos_repro * mask_f).sum() / mask_f.sum().clamp(min=1)
 
-            cos_proj = F.cosine_similarity(
-                fwd.proj_out.projected_embeddings, target_proj, dim=-1,
-            )
+            cos_proj = F.cosine_similarity(fwd.proj_content, target_proj, dim=-1)
             cos_proj_avg = (cos_proj * mask_f).sum() / mask_f.sum().clamp(min=1)
 
         return {
@@ -336,7 +365,7 @@ class JointBlockTrainer(BaseTrainer):
             total_mse_repro += (mse_repro * mask_f).sum().item()
 
             mse_proj = F.mse_loss(
-                fwd.proj_out.projected_embeddings, target_proj, reduction="none",
+                fwd.proj_content, target_proj, reduction="none",
             ).mean(dim=-1)
             total_mse_proj += (mse_proj * mask_f).sum().item()
 
@@ -344,9 +373,7 @@ class JointBlockTrainer(BaseTrainer):
             cos_repro = F.cosine_similarity(fwd.auto_repro_pred, target_repro, dim=-1)
             total_cosine_repro += (cos_repro * mask_f).sum().item()
 
-            cos_proj = F.cosine_similarity(
-                fwd.proj_out.projected_embeddings, target_proj, dim=-1,
-            )
+            cos_proj = F.cosine_similarity(fwd.proj_content, target_proj, dim=-1)
             total_cosine_proj += (cos_proj * mask_f).sum().item()
 
         return {
