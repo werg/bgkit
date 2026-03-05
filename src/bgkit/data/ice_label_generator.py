@@ -125,20 +125,21 @@ def _batched_ce_inference(
         with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             outputs = model(input_ids, attention_mask=attention_mask)
 
-        # Shift for causal LM: predict token[i+1] from logits[i]
-        logits = outputs.logits[:, :-1, :]
-        targets = input_ids[:, 1:].clone()
-
-        # Mask padding positions in targets so CE ignores them
-        target_mask = attention_mask[:, 1:]
-        targets[target_mask == 0] = -100
-
-        ce = compute_per_token_cross_entropy(logits, targets)  # (batch, seq_len-1)
+        # Process CE per-row to avoid materializing full (batch, seq, vocab) tensor.
+        # Peak memory: (1, seq_len, vocab_size) instead of (batch, seq_len, vocab_size).
+        logits = outputs.logits  # (batch, seq_len, vocab)
+        del outputs
 
         for i, (orig_idx, seq) in enumerate(zip(batch_indices, batch_seqs, strict=True)):
             real_len = len(seq) - 1  # CE has one fewer value than tokens
-            ce_values = ce[i, :real_len].float().cpu().numpy().astype(np.float16)
+            row_logits = logits[i : i + 1, :-1, :]  # (1, seq_len-1, vocab)
+            row_targets = input_ids[i : i + 1, 1:].clone()
+            row_targets[attention_mask[i, 1:].unsqueeze(0) == 0] = -100
+            row_ce = compute_per_token_cross_entropy(row_logits, row_targets)
+            ce_values = row_ce[0, :real_len].float().cpu().numpy().astype(np.float16)
             results.append((orig_idx, ce_values))
+
+        del logits
 
     for orig_idx, seq in indexed:
         seq_len = len(seq)
@@ -172,6 +173,7 @@ def generate_labels_for_corpus(
     device: str = "cuda",
     max_batch_tokens: int = 65536,
     files_per_slice: int = 1000,
+    max_shards: int | None = None,
 ) -> None:
     """Generate CE labels for all token shards using batched inference.
 
@@ -184,6 +186,7 @@ def generate_labels_for_corpus(
         max_batch_tokens: Max total tokens per batch for GPU utilization.
         files_per_slice: Number of files to process per sub-batch (controls
             memory usage and progress granularity).
+        max_shards: If set, stop after processing this many shards.
     """
     import sys
 
@@ -204,6 +207,8 @@ def generate_labels_for_corpus(
     model.eval()
 
     shard_files = sorted(shards_path.glob("shard_*.parquet"))
+    if max_shards is not None:
+        shard_files = shard_files[:max_shards]
     log.info("Found %d token shards (max_batch_tokens=%d)", len(shard_files), max_batch_tokens)
     sys.stderr.flush()
 

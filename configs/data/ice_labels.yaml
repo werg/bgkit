@@ -1,5 +1,7 @@
 ice_labels:
   model_name: Qwen/Qwen3.5-0.8B
   max_seq_len: 8192
+  max_batch_tokens: 65536
   output_dir: ${oc.env:DATA_DIR}/processed/ice_labels
   input_dir: ${oc.env:DATA_DIR}/processed/tokens
+  max_shards: 30

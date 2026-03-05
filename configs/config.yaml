@@ -13,6 +13,14 @@ defaults:
   - data/ice_labels
   - compute/dgx_spark
   - _self_
+  - override hydra/job_logging: default
+
+# Write Hydra outputs to /tmp so scripts work in read-only containers
+hydra:
+  run:
+    dir: /tmp/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: /tmp/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 seed: 42
 project_name: bgkit

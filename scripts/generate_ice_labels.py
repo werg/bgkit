@@ -32,6 +32,8 @@ def main(cfg: DictConfig) -> None:
         model_name=ice_cfg.model_name,
         output_dir=ice_cfg.output_dir,
         max_seq_len=ice_cfg.max_seq_len,
+        max_batch_tokens=ice_cfg.get("max_batch_tokens", 65536),
+        max_shards=ice_cfg.get("max_shards"),
     )
 
     log.info("ICE label generation complete")

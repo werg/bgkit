@@ -124,12 +124,12 @@ ckpt-backfill:
 
 # Data preprocessing pipeline (paths from .env via bgkit.env / DATA_DIR)
 extract-structural:
-	.venv/bin/python scripts/extract_structural_data.py --workers 8
+	.venv/bin/python scripts/extract_structural_data.py --workers 8 $(ARGS)
 
 generate-descriptions: vllm-server
 	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
 	.venv/bin/python scripts/generate_descriptions.py \
-		--structural-dir $(DATA_DIR)/structural/ --backend local --workers 2
+		--structural-dir $(DATA_DIR)/structural/ --backend local --workers 2 $(ARGS)
 
 extract-commits:
 	.venv/bin/python scripts/process_commit_repro.py $(ARGS)
