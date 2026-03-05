@@ -70,6 +70,7 @@ class DecoderInitTrainer(BaseTrainer):
             trust_remote_code=True,
             revision=backbone_revision,
             attn_implementation="sdpa",
+            bidi_warmup_steps=0,  # encoder is frozen in Step 1
         )
         self.encoder.to(device)
         self.encoder.requires_grad_(False)

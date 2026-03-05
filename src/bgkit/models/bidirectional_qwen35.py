@@ -91,11 +91,18 @@ class BidirectionalQwen35(nn.Module):
     representations with O(L) efficiency. The bidirectional conv1d adds
     ~0 parameters (same weights, different padding).
 
+    Gradual mask relaxation: full attention layers transition from causal to
+    bidirectional over ``bidi_warmup_steps`` training steps. At step 0 the
+    model behaves exactly as pretrained (fully causal). The causal component
+    is linearly faded out, reaching fully bidirectional at the end of warmup.
+    Set ``bidi_warmup_steps=0`` to disable (immediate bidirectional).
+    Set ``bidi_warmup_steps=-1`` to stay fully causal (no bidirectional transition).
+
     Preserves HF API surface: get_input_embeddings(),
     gradient_checkpointing_enable(), config, etc.
     """
 
-    def __init__(self, base_model: nn.Module):
+    def __init__(self, base_model: nn.Module, bidi_warmup_steps: int = 0):
         super().__init__()
         # Store original HF model for config access only. Bypass nn.Module
         # __setattr__ to avoid registering as a submodule (which would duplicate
@@ -108,6 +115,10 @@ class BidirectionalQwen35(nn.Module):
         self.norm = base_model.norm
         self.rotary_emb = base_model.rotary_emb
         self.layers = base_model.layers
+
+        # Gradual mask relaxation: causal → bidirectional over warmup period
+        self.bidi_warmup_steps = bidi_warmup_steps
+        self.register_buffer("_step", torch.tensor(0, dtype=torch.long))
 
         # Convert causal conv1d → bidirectional conv1d in all DeltaNet layers
         for layer in self.layers:
@@ -132,6 +143,22 @@ class BidirectionalQwen35(nn.Module):
         rather than HF's internal mechanism.
         """
         self._gradient_checkpointing = True
+
+    def step_bidi_warmup(self) -> None:
+        """Advance the warmup step counter. Call once per training step."""
+        self._step += 1
+
+    @property
+    def bidi_alpha(self) -> float:
+        """Current interpolation factor: 0.0 = fully causal, 1.0 = fully bidirectional.
+
+        -1 = permanently causal, 0 = immediate bidi, >0 = gradual warmup.
+        """
+        if self.bidi_warmup_steps < 0:
+            return 0.0
+        if self.bidi_warmup_steps == 0:
+            return 1.0
+        return min(1.0, self._step.item() / self.bidi_warmup_steps)
 
     # --- Core logic ---
 
@@ -171,12 +198,34 @@ class BidirectionalQwen35(nn.Module):
         position_embeddings = self.rotary_emb(hidden, position_ids)
         use_ckpt = getattr(self, "_gradient_checkpointing", False) and self.training
 
-        # Build bidirectional 4D mask for full attention layers (no causal component).
-        # DeltaNet layers don't use this — they operate via recurrent state.
-        bidi_mask = None
+        # Build blended 4D mask for full attention layers.
+        # During warmup, interpolate between causal and bidirectional masks so
+        # the pretrained attention weights gradually adapt to seeing future tokens.
+        alpha = self.bidi_alpha
+        neg_inf = torch.finfo(hidden.dtype).min
+
+        # Padding mask component (always present if attention_mask given)
+        pad_mask_4d = None
         if attention_mask is not None:
-            bidi_mask = attention_mask[:, None, None, :].to(hidden.dtype)
-            bidi_mask = (1.0 - bidi_mask) * torch.finfo(hidden.dtype).min
+            pad_mask_4d = attention_mask[:, None, None, :].to(hidden.dtype)
+            pad_mask_4d = (1.0 - pad_mask_4d) * neg_inf
+
+        # Causal component: upper-triangular -inf matrix
+        if alpha < 1.0:
+            causal = torch.triu(
+                torch.full((seq_len, seq_len), neg_inf, device=hidden.device, dtype=hidden.dtype),
+                diagonal=1,
+            )
+            # Scale causal component: full at alpha=0, gone at alpha=1
+            causal = causal * (1.0 - alpha)
+            # Combine: causal + padding (either or both may be active)
+            if pad_mask_4d is not None:
+                full_attn_mask = pad_mask_4d + causal[None, None, :, :]
+            else:
+                full_attn_mask = causal[None, None, :, :]
+        else:
+            # Fully bidirectional — just padding mask (or None)
+            full_attn_mask = pad_mask_4d
 
         def _run_layer(layer, h, mask, pos_emb):
             """Run a single layer, with optional gradient checkpointing.
@@ -198,8 +247,8 @@ class BidirectionalQwen35(nn.Module):
                 # DeltaNet: causal (no mask), O(L) via recurrent state
                 hidden = _run_layer(layer, hidden, None, position_embeddings)
             else:
-                # Full attention: bidirectional mask (no causal component)
-                hidden = _run_layer(layer, hidden, bidi_mask, position_embeddings)
+                # Full attention: blended causal→bidirectional mask
+                hidden = _run_layer(layer, hidden, full_attn_mask, position_embeddings)
 
         hidden = self.norm(hidden)
         return BaseModelOutputWithPast(last_hidden_state=hidden)

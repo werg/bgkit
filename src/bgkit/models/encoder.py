@@ -219,6 +219,12 @@ class BgKITEncoder(nn.Module):
         """
         return self.compressor.auto_reproduce(normed_embeddings)
 
+    def step_bidi_warmup(self) -> None:
+        """Advance the bidirectional warmup counter on all BidirectionalQwen35 modules."""
+        for module in self.modules():
+            if isinstance(module, BidirectionalQwen35):
+                module.step_bidi_warmup()
+
     @classmethod
     def from_pretrained(
         cls,
@@ -228,6 +234,7 @@ class BgKITEncoder(nn.Module):
         trust_remote_code: bool = True,
         revision: str | None = None,
         attn_implementation: str | None = None,
+        bidi_warmup_steps: int = 0,
     ) -> BgKITEncoder:
         """Construct a BgKITEncoder from a pretrained HF model.
 
@@ -268,7 +275,7 @@ class BgKITEncoder(nn.Module):
         # Wrap Qwen3.5 text models in BidirectionalQwen35 (bidirectional
         # full attention layers, causal DeltaNet layers).
         if not isinstance(raw_model, BidirectionalQwen35) and _is_qwen35_model(raw_model):
-            backbone = BidirectionalQwen35(raw_model)
+            backbone = BidirectionalQwen35(raw_model, bidi_warmup_steps=bidi_warmup_steps)
         else:
             backbone = raw_model
 

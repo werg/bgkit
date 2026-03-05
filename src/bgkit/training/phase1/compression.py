@@ -75,6 +75,7 @@ class CompressionTrainer(BaseTrainer):
         backbone_revision = bgkit_cfg.get("backbone_revision", None)
         hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
         logger.info("loading_bgkit_encoder", model=backbone_name, revision=backbone_revision)
+        bidi_warmup = self.cfg.training.get("bidi_warmup_steps", 1000)
         self.encoder = BgKITEncoder.from_pretrained(
             backbone_name,
             hidden_dim=hidden_dim,
@@ -82,6 +83,7 @@ class CompressionTrainer(BaseTrainer):
             trust_remote_code=True,
             revision=backbone_revision,
             attn_implementation="sdpa",
+            bidi_warmup_steps=bidi_warmup,
         )
         self.encoder.to(device)
 
@@ -403,6 +405,16 @@ class CompressionTrainer(BaseTrainer):
         params = [p for p in self.encoder.parameters() if p.requires_grad]
         params += [p for p in self.decoder.parameters() if p.requires_grad]
         return params
+
+    # ------------------------------------------------------------------
+    def _get_bidi_alpha(self) -> float:
+        """Get the current bidirectional warmup alpha from the encoder."""
+        from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
+
+        for module in self.encoder.modules():
+            if isinstance(module, BidirectionalQwen35):
+                return module.bidi_alpha
+        return 1.0
 
     # ------------------------------------------------------------------
     # Curriculum
@@ -1225,6 +1237,7 @@ class CompressionTrainer(BaseTrainer):
 
                     grad_norm = clip_grad_norm(self.trainable_parameters())
                     self.optimizer.step()
+                    self.encoder.step_bidi_warmup()
 
                     # Drift check AFTER optimizer step (can rebuild optimizer)
                     if self._last_survivors is not None:
@@ -1233,6 +1246,7 @@ class CompressionTrainer(BaseTrainer):
                     metrics = _average_metrics(accum_metrics)
                     metrics["grad_norm"] = grad_norm
                     metrics["lr"] = lr
+                    metrics["bidi_alpha"] = self._get_bidi_alpha()
                     if len(self.optimizer.param_groups) > 1:
                         metrics["lr_min"] = min(
                             pg["lr"] for pg in self.optimizer.param_groups

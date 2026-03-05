@@ -100,8 +100,12 @@ class JointBlockTrainer(BaseTrainer):
             backbone.load_state_dict(merged_sd, strict=False)
             del decoder_for_slerp, sd_a, sd_b, merged_sd
 
-        # Construct encoder (splits backbone into compressor + projection block)
-        self.encoder = BgKITEncoder.from_pretrained(backbone, hidden_dim=hidden_dim)
+        # Construct encoder (splits backbone into compressor + projection block).
+        # Stay fully causal (-1): frozen backbone layers can't adapt to bidi masks,
+        # and the task is too trivial to benefit. Step 2 handles the gradual warmup.
+        self.encoder = BgKITEncoder.from_pretrained(
+            backbone, hidden_dim=hidden_dim, bidi_warmup_steps=-1,
+        )
         self.encoder.to(device)
 
         # Load decoder's embedding matrix as frozen reference target

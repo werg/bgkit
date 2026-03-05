@@ -69,10 +69,18 @@ class MockFullAttentionLayer(nn.Module):
     def forward(self, hidden_states, position_embeddings=None, attention_mask=None):
         x = self.self_attn(hidden_states)
         if attention_mask is not None:
-            # attention_mask: (B, 1, 1, L) with 0.0 (attend) / -inf (ignore)
-            weights = (attention_mask.squeeze(1).squeeze(1) > -1.0).float()  # (B, L)
+            # attention_mask may be (B, 1, 1, L) or (B, 1, L, L) depending on
+            # bidi warmup state. Use per-query weights from the mask.
+            mask_4d = attention_mask  # (B, 1, Q, K) where Q=1 or Q=L
+            # Collapse to (B, L, L) by broadcasting the head dim
+            # Expand to (B, L, L) handling broadcast dims
+            B, L = x.shape[:2]
+            mask_3d = mask_4d.squeeze(1).expand(B, -1, -1)  # (B, Q, K)
+            if mask_3d.shape[1] == 1:
+                mask_3d = mask_3d.expand(-1, L, -1)  # (B, L, L)
+            weights = (mask_3d > -1.0).float()
             weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1)
-            x = x + torch.bmm(weights.unsqueeze(1), x).expand_as(x)
+            x = x + torch.bmm(weights, x)
         else:
             x = x + x.mean(dim=1, keepdim=True)
         return x
@@ -137,7 +145,7 @@ def base_model():
 
 @pytest.fixture
 def bidi_model(base_model):
-    return BidirectionalQwen35(base_model)
+    return BidirectionalQwen35(base_model, bidi_warmup_steps=0)
 
 
 class TestBidirectionalConv:
@@ -387,7 +395,7 @@ class TestCheckpointRoundTrip:
 
         # Round-trip: create a new model and load state
         base2 = MockQwen35BaseModel(hidden_dim=HIDDEN_DIM, num_groups=2)
-        model2 = BidirectionalQwen35(base2)
+        model2 = BidirectionalQwen35(base2, bidi_warmup_steps=0)
 
         # Perturb model2 weights to verify loading actually works
         with torch.no_grad():
@@ -404,3 +412,81 @@ class TestCheckpointRoundTrip:
             out1 = bidi_model(inputs_embeds=x).last_hidden_state
             out2 = model2(inputs_embeds=x).last_hidden_state
         assert torch.allclose(out1, out2, atol=1e-5)
+
+
+class TestBidiWarmup:
+    """Tests for gradual causal→bidirectional mask warmup."""
+
+    def test_alpha_starts_at_zero(self):
+        """With warmup, alpha should start at 0 (fully causal)."""
+        base = MockQwen35BaseModel(hidden_dim=HIDDEN_DIM, num_groups=2)
+        model = BidirectionalQwen35(base, bidi_warmup_steps=100)
+        assert model.bidi_alpha == 0.0
+
+    def test_alpha_increases_with_steps(self):
+        """Alpha should increase linearly with step_bidi_warmup() calls."""
+        base = MockQwen35BaseModel(hidden_dim=HIDDEN_DIM, num_groups=2)
+        model = BidirectionalQwen35(base, bidi_warmup_steps=100)
+        for _ in range(50):
+            model.step_bidi_warmup()
+        assert abs(model.bidi_alpha - 0.5) < 1e-6
+
+    def test_alpha_caps_at_one(self):
+        """Alpha should cap at 1.0 after warmup completes."""
+        base = MockQwen35BaseModel(hidden_dim=HIDDEN_DIM, num_groups=2)
+        model = BidirectionalQwen35(base, bidi_warmup_steps=10)
+        for _ in range(20):
+            model.step_bidi_warmup()
+        assert model.bidi_alpha == 1.0
+
+    def test_zero_warmup_is_immediate(self):
+        """bidi_warmup_steps=0 should be fully bidirectional from start."""
+        base = MockQwen35BaseModel(hidden_dim=HIDDEN_DIM, num_groups=2)
+        model = BidirectionalQwen35(base, bidi_warmup_steps=0)
+        assert model.bidi_alpha == 1.0
+
+    def test_causal_at_step_zero(self):
+        """At step 0 (alpha=0), output at position 0 should NOT depend on last token."""
+        base = MockQwen35BaseModel(hidden_dim=HIDDEN_DIM, num_groups=2)
+        model = BidirectionalQwen35(base, bidi_warmup_steps=100)
+        model.eval()
+
+        x = torch.randn(1, SEQ_LEN, HIDDEN_DIM)
+        x_perturbed = x.clone()
+        x_perturbed[:, -1, :] += 10.0
+
+        with torch.no_grad():
+            out1 = model(inputs_embeds=x).last_hidden_state
+            out2 = model(inputs_embeds=x_perturbed).last_hidden_state
+
+        diff = (out1[:, 0, :] - out2[:, 0, :]).abs().sum()
+        assert diff < 1e-5, "At alpha=0, full attention should be causal (no backward flow)"
+
+    def test_bidi_after_warmup(self):
+        """After warmup completes, output should be bidirectional."""
+        base = MockQwen35BaseModel(hidden_dim=HIDDEN_DIM, num_groups=2)
+        model = BidirectionalQwen35(base, bidi_warmup_steps=10)
+        for _ in range(10):
+            model.step_bidi_warmup()
+        model.eval()
+
+        x = torch.randn(1, SEQ_LEN, HIDDEN_DIM)
+        x_perturbed = x.clone()
+        x_perturbed[:, -1, :] += 10.0
+
+        with torch.no_grad():
+            out1 = model(inputs_embeds=x).last_hidden_state
+            out2 = model(inputs_embeds=x_perturbed).last_hidden_state
+
+        diff = (out1[:, 0, :] - out2[:, 0, :]).abs().sum()
+        assert diff > 1e-3, "After warmup, full attention should be bidirectional"
+
+    def test_step_buffer_in_state_dict(self):
+        """The _step buffer should be saved in state_dict for checkpoint resume."""
+        base = MockQwen35BaseModel(hidden_dim=HIDDEN_DIM, num_groups=2)
+        model = BidirectionalQwen35(base, bidi_warmup_steps=100)
+        for _ in range(42):
+            model.step_bidi_warmup()
+        state = model.state_dict()
+        assert "_step" in state
+        assert state["_step"].item() == 42

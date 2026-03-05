@@ -94,6 +94,9 @@ class BaseTrainer(ABC):
         """Parameters for gradient clipping. Override in subclasses."""
         return [p for p in self.model.parameters() if p.requires_grad]
 
+    def _post_step(self, step: int) -> None:
+        """Hook called after each optimizer step. Override for per-step bookkeeping."""
+
     @staticmethod
     def _validate_accum_steps(value) -> int:
         """Validate gradient_accumulation_steps config value."""
@@ -575,6 +578,7 @@ class BaseTrainer(ABC):
 
                     grad_norm = clip_grad_norm(self.trainable_parameters())
                     self.optimizer.step()
+                    self._post_step(step)
 
                     metrics = _average_metrics(accum_metrics)
                     metrics["grad_norm"] = grad_norm

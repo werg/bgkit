@@ -4,6 +4,7 @@ optimizer: muon
 max_steps: 200000
 lr: 5.0e-5
 warmup_steps: 5000
+bidi_warmup_steps: 1000
 
 objectives:
   data_reconstruction: 0.40
