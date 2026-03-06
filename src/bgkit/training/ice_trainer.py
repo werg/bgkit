@@ -55,6 +55,10 @@ def ice_collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tens
 class ICETrainer(BaseTrainer):
     """Trainer for the ICE convolutional predictor."""
 
+    LIVE_CONFIG_FIELDS = {
+        "uniform_output_reg_weight": "uniform_reg_weight",
+    }
+
     def setup(self) -> None:
         """Load frozen embedding model, create ICE, dataset, optimizer."""
         tcfg = self.cfg.training
@@ -154,10 +158,6 @@ class ICETrainer(BaseTrainer):
             eval_samples=eval_size,
             device=str(device),
         )
-
-    def apply_live_config(self, changes: dict) -> None:
-        if "uniform_output_reg_weight" in changes:
-            self.uniform_reg_weight = changes["uniform_output_reg_weight"]
 
     def _embed_tokens(self, token_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """Look up token embeddings from frozen embedding table.

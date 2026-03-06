@@ -56,7 +56,16 @@ class BaseTrainer(ABC):
     - Training loop with LR scheduling
     - WandB logging
     - Checkpoint save/load with phase metadata
+
+    Subclasses can declare ``LIVE_CONFIG_FIELDS`` to enable live tuning
+    of hyperparameters via a JSON control file (written to
+    ``checkpoints/control.json`` by default).  The dict maps
+    control-file key → instance attribute name.  Simple numeric fields
+    are applied automatically; override ``apply_live_config`` for
+    fields needing custom validation.
     """
+
+    LIVE_CONFIG_FIELDS: dict[str, str] = {}
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -323,8 +332,28 @@ class BaseTrainer(ABC):
         if hasattr(inner, "set_epoch"):
             inner.set_epoch(epoch)
 
-    def apply_live_config(self, changes: dict) -> None:  # noqa: B027
-        """Apply trainer-specific live config changes. Override in subclasses."""
+    def apply_live_config(self, changes: dict) -> None:
+        """Apply trainer-specific live config changes.
+
+        Automatically handles fields declared in ``LIVE_CONFIG_FIELDS``
+        (merged across MRO).  Override for custom validation and call
+        ``super().apply_live_config(changes)`` to keep auto-apply.
+        """
+        # Merge LIVE_CONFIG_FIELDS from all classes in MRO
+        fields: dict[str, str] = {}
+        for cls in reversed(type(self).__mro__):
+            fields.update(getattr(cls, "LIVE_CONFIG_FIELDS", {}))
+
+        for key, attr in fields.items():
+            if key not in changes:
+                continue
+            val = changes[key]
+            old = getattr(self, attr, None)
+            if not isinstance(val, (int, float)):
+                logger.warning("live_config_type_error", key=key, value=val, expected="numeric")
+                continue
+            setattr(self, attr, type(old)(val) if old is not None else float(val))
+            logger.info("live_config_update", key=key, attr=attr, old=old, new=val)
 
     def _registry_parent(self) -> str | None:
         """Return normalized parent checkpoint name, or None."""
@@ -551,7 +580,8 @@ class BaseTrainer(ABC):
         stopped_early = False
         try:
             with GracefulInterruptor() as interruptor:
-                for step in range(self.global_step, max_steps):
+                step = self.global_step
+                while step < max_steps:
                     self.global_step = step
 
                     # LR schedule
@@ -673,6 +703,24 @@ class BaseTrainer(ABC):
                                     patience=es_patience,
                                 )
 
+                        # Apply eval/save frequency and max_steps
+                        if "eval_every" in changes:
+                            val = changes["eval_every"]
+                            if isinstance(val, int) and val > 0:
+                                eval_every = val
+                                logger.info("live_eval_every_update", eval_every=val)
+                        if "save_every" in changes:
+                            val = changes["save_every"]
+                            if isinstance(val, int) and val > 0:
+                                save_every = val
+                                logger.info("live_save_every_update", save_every=val)
+                        if "max_steps" in changes:
+                            val = changes["max_steps"]
+                            if isinstance(val, int) and val > step:
+                                max_steps = val
+                                self._schedule_params["max_steps"] = val
+                                logger.info("live_max_steps_update", max_steps=val)
+
                         # Apply trainer-specific changes (loss weights, etc.)
                         self.apply_live_config(changes)
 
@@ -742,6 +790,8 @@ class BaseTrainer(ABC):
                             else None,
                         )
                         return
+
+                    step += 1
 
                 # Final eval + checkpoint
                 eval_metrics = self.evaluate()

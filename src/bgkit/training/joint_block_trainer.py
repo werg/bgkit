@@ -52,6 +52,11 @@ class _ForwardResult:
 class JointBlockTrainer(BaseTrainer):
     """Trainer for joint block pretraining: auto-repro + decoder alignment."""
 
+    LIVE_CONFIG_FIELDS = {
+        "w_repro": "w_repro",
+        "w_proj": "w_proj",
+    }
+
     def setup(self) -> None:
         """Construct encoder, load decoder embeddings, freeze layers, create dataset."""
         tcfg = self.cfg.training
@@ -224,12 +229,6 @@ class JointBlockTrainer(BaseTrainer):
             w_repro=self.w_repro,
             w_proj=self.w_proj,
         )
-
-    def apply_live_config(self, changes: dict) -> None:
-        if "w_repro" in changes:
-            self.w_repro = changes["w_repro"]
-        if "w_proj" in changes:
-            self.w_proj = changes["w_proj"]
 
     def _get_input_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Get input embeddings from the compressor's backbone embedding layer."""

@@ -63,6 +63,11 @@ class CompressionTrainer(BaseTrainer):
     fetching the next batch.
     """
 
+    LIVE_CONFIG_FIELDS = {
+        "max_survivor_gap": "_max_gap",
+        "drift_threshold": "_drift_threshold",
+    }
+
     def setup(self) -> None:
         """Load trainable encoder/decoder, frozen ICE, create dataset and optimizer."""
         tcfg = self.cfg.training
@@ -1205,7 +1210,8 @@ class CompressionTrainer(BaseTrainer):
         stopped_early = False
         try:
             with GracefulInterruptor() as interruptor:
-                for step in range(self.global_step, max_steps):
+                step = self.global_step
+                while step < max_steps:
                     self.global_step = step
 
                     # PRE-FETCH HOOK: rebuild dataloader if L1 transition pending
@@ -1306,6 +1312,27 @@ class CompressionTrainer(BaseTrainer):
                                 self._schedule_params["base_lr"] = base_lr
                                 for pg in self.optimizer.param_groups:
                                     pg["base_lr"] = pg.get("base_lr", old_base_lr) * ratio
+                        if "early_stopping_patience" in changes:
+                            val = changes["early_stopping_patience"]
+                            if isinstance(val, int) and val > 0:
+                                es_patience = val
+                                logger.info("live_es_patience_update", patience=val)
+                        if "eval_every" in changes:
+                            val = changes["eval_every"]
+                            if isinstance(val, int) and val > 0:
+                                eval_every = val
+                                logger.info("live_eval_every_update", eval_every=val)
+                        if "save_every" in changes:
+                            val = changes["save_every"]
+                            if isinstance(val, int) and val > 0:
+                                save_every = val
+                                logger.info("live_save_every_update", save_every=val)
+                        if "max_steps" in changes:
+                            val = changes["max_steps"]
+                            if isinstance(val, int) and val > step:
+                                max_steps = val
+                                self._schedule_params["max_steps"] = val
+                                logger.info("live_max_steps_update", max_steps=val)
                         self.apply_live_config(changes)
 
                     # Checkpoint
@@ -1358,6 +1385,8 @@ class CompressionTrainer(BaseTrainer):
                             else None,
                         )
                         return
+
+                    step += 1
 
                 # Final eval + checkpoint
                 eval_metrics = self.evaluate()
@@ -1606,7 +1635,7 @@ class CompressionTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     def apply_live_config(self, changes: dict) -> None:
-        """Support live tuning of target compression ratio."""
+        """Support live tuning of target compression ratio + base fields."""
         if "target_ratio" in changes:
             val = changes["target_ratio"]
             if val is None:
@@ -1615,3 +1644,4 @@ class CompressionTrainer(BaseTrainer):
             elif isinstance(val, (int, float)) and 0 < val < 1:
                 self._target_ratio_override = float(val)
                 logger.info("live_target_ratio_update", target_ratio=self._target_ratio_override)
+        super().apply_live_config(changes)
