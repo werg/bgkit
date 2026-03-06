@@ -45,6 +45,7 @@ data:
   description_tokens_path: ${oc.env:DATA_DIR}/mmap/descriptions
   structural_tokens_path: ${oc.env:DATA_DIR}/mmap/structural
   prompt_variants_dir: configs/prompt_variants
+  qa_data_dir: ${oc.env:DATA_DIR}/mmap/qa_conditioned
 
 eval:
   generation_samples: 8

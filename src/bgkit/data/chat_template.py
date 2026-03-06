@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -105,6 +106,27 @@ TOOL_CONFIGS: dict[str, ChatTemplateConfig] = {
                 "prompt": {
                     "type": "string",
                     "description": "Instructions for structural extraction",
+                },
+            },
+            "required": ["file_path", "prompt"],
+        },
+        content_in_code_fence=False,
+    ),
+    "file_read_query": ChatTemplateConfig(
+        tool_name="bgkit_read_file",
+        tool_description="Read and analyze file contents from BgKIT compressed context.",
+        tool_parameters={
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the file to read",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "Question or instructions for analyzing the file contents"
+                    ),
                 },
             },
             "required": ["file_path", "prompt"],
@@ -267,6 +289,31 @@ def select_variant(
     key = f"{epoch_seed}:{idx}".encode()
     h = int.from_bytes(hashlib.md5(key).digest()[:8], "little")
     return variants[h % len(variants)]
+
+
+def load_all_variant_banks(variant_dir: str | Path) -> list[dict[str, str]]:
+    """Load and deduplicate compression prompts from all variant bank JSON files.
+
+    Concatenates all *.json files in variant_dir, extracts the compression_prompt
+    field from each variant, deduplicates, and returns a list of minimal variant
+    dicts suitable for encoder prefix construction.
+    """
+    import json
+
+    variant_dir = Path(variant_dir)
+    all_prompts: set[str] = set()
+    variants: list[dict[str, str]] = []
+
+    for json_path in sorted(variant_dir.glob("*.json")):
+        with open(json_path) as f:
+            bank = json.load(f)
+        for v in bank:
+            prompt = v.get("compression_prompt", "")
+            if prompt and prompt not in all_prompts:
+                all_prompts.add(prompt)
+                variants.append(v)
+
+    return variants
 
 
 def build_encoder_prefix_ids(tokenizer, compression_prompt: str) -> torch.Tensor:

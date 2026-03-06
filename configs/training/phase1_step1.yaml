@@ -32,6 +32,7 @@ early_stopping:
   patience: 3           # stop after 3 evals without improvement
   min_delta: 0.01       # minimum loss improvement to reset patience
   metric: eval/loss     # which eval metric to track
+qa_ratio: 0.0   # fraction of QA samples (0.0 = disabled, 0.3 = recommended with QA data)
 eval:
   generation_samples: 50      # examples for generation metrics (expensive)
   generation_eval_every: 4    # run generation metrics every Nth eval

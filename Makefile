@@ -7,7 +7,7 @@ export
 # reading the file itself for ${VAR} interpolation in the YAML).
 DC := docker compose --env-file .env -f docker/docker-compose.yaml
 
-.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits convert-structural convert-descriptions convert-commits generate-variants download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full
+.PHONY: install install-gpu test test-unit test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits convert-tokens convert-structural convert-descriptions convert-commits generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full prepare-data-all
 
 install:
 	uv sync --extra dev --extra data
@@ -134,6 +134,11 @@ generate-descriptions: vllm-server
 extract-commits:
 	.venv/bin/python scripts/process_commit_repro.py $(ARGS)
 
+convert-tokens:
+	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
+	.venv/bin/python scripts/convert_tokens_to_npy.py \
+		--input-dir $(DATA_DIR)/processed/tokens/
+
 convert-structural:
 	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
 	.venv/bin/python scripts/convert_structural_to_npy.py \
@@ -154,6 +159,23 @@ prepare-data:
 
 prepare-data-full:
 	scripts/prepare-data.sh --with-descriptions $(ARGS)
+
+prepare-data-all:
+	scripts/prepare-data.sh --with-descriptions --with-qa $(ARGS)
+
+generate-qa-pairs: vllm-server
+	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
+	.venv/bin/python scripts/generate_qa_pairs.py \
+		--repos-dir $(DATA_DIR)/repos/ \
+		--output-dir $(DATA_DIR)/qa_pairs/ \
+		--server-url-primary http://localhost:$${VLLM_PORT_PRIMARY:-8090}/v1 \
+		--server-url-fast http://localhost:$${VLLM_PORT_FAST:-8091}/v1
+
+convert-qa-pairs:
+	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
+	.venv/bin/python scripts/convert_qa_pairs_to_npy.py \
+		--input-dir $(DATA_DIR)/qa_pairs/ \
+		--output-dir $(DATA_DIR)/mmap/qa_conditioned/
 
 generate-variants:
 	.venv/bin/python scripts/generate_prompt_variants.py \

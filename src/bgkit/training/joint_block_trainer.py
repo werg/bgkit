@@ -18,7 +18,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from transformers import AutoModel
 
-from bgkit.data.chat_template import build_encoder_user_only_prefix_ids
+from bgkit.data.chat_template import (
+    build_encoder_prefix_ids,
+    build_encoder_user_only_prefix_ids,
+    load_all_variant_banks,
+    select_variant,
+)
 from bgkit.data.collators import collate_token_ids
 from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
 from bgkit.data.samplers import TokenBudgetBatchSampler
@@ -26,6 +31,7 @@ from bgkit.models.components.auto_reproduction import auto_reproduction_loss
 from bgkit.models.encoder import BgKITEncoder, _resolve_layers
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
+from bgkit.training.gradient_utils import enable_gradient_checkpointing
 from bgkit.utils.model_utils import count_parameters, slerp_merge
 
 logger = structlog.get_logger()
@@ -112,6 +118,10 @@ class JointBlockTrainer(BaseTrainer):
             backbone, hidden_dim=hidden_dim, bidi_warmup_steps=-1,
         )
         self.encoder.to(device)
+
+        # Enable gradient checkpointing on the backbone to reduce memory
+        # (essential when using torch DeltaNet fallback without fla Triton kernels)
+        enable_gradient_checkpointing(self.encoder.compressor.backbone)
 
         # Load decoder's embedding matrix as frozen reference target
         decoder_name = self.cfg.model.decoder.backbone_name
@@ -209,17 +219,45 @@ class JointBlockTrainer(BaseTrainer):
             tcfg.lr,
         )
 
-        # ChatML user-only prefix for encoder conditioning
+        # ChatML prefix for encoder conditioning (with prompt rotation)
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(
             backbone_name, revision=backbone_revision, trust_remote_code=True,
         )
-        prefix_ids = build_encoder_user_only_prefix_ids(tokenizer).to(device)
+        self._tokenizer = tokenizer
+        self._seed = self.cfg.get("seed", 42)
+
+        # Load variant banks for per-epoch prompt rotation
+        variant_dir = getattr(tcfg, "prompt_variants_dir", None)
+        if variant_dir and Path(variant_dir).is_dir():
+            self._variant_bank = load_all_variant_banks(variant_dir)
+            logger.info(
+                "variant_bank_loaded",
+                variant_dir=str(variant_dir),
+                num_variants=len(self._variant_bank),
+            )
+        else:
+            self._variant_bank = []
+
+        if self._variant_bank:
+            # Start with first variant
+            variant = select_variant(self._variant_bank, 0, self._seed)
+            prefix_ids = build_encoder_prefix_ids(
+                tokenizer, variant["compression_prompt"]
+            ).to(device)
+            logger.info(
+                "encoder_chatml_prefix",
+                prefix_len=prefix_ids.size(0),
+                prompt=variant["compression_prompt"][:60],
+            )
+        else:
+            prefix_ids = build_encoder_user_only_prefix_ids(tokenizer).to(device)
+            logger.info("encoder_chatml_prefix", prefix_len=prefix_ids.size(0))
+
         # Pre-compute and freeze the prompt embeddings (1, prefix_len, hidden_dim)
         with torch.no_grad():
             self._prompt_embeddings = self._get_input_embeddings(prefix_ids.unsqueeze(0))
-        logger.info("encoder_chatml_prefix", prefix_len=prefix_ids.size(0))
 
         logger.info(
             "joint_block_trainer_setup",
@@ -233,6 +271,25 @@ class JointBlockTrainer(BaseTrainer):
     def _get_input_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         """Get input embeddings from the compressor's backbone embedding layer."""
         return self.encoder.compressor.backbone.get_input_embeddings()(token_ids)
+
+    def _sync_epoch(self, epoch: int) -> None:
+        """Propagate epoch + rotate encoder prompt if variant bank is loaded."""
+        super()._sync_epoch(epoch)
+
+        if not self._variant_bank:
+            return
+
+        variant = select_variant(self._variant_bank, epoch, self._seed + epoch)
+        prefix_ids = build_encoder_prefix_ids(
+            self._tokenizer, variant["compression_prompt"]
+        ).to(self.device)
+        with torch.no_grad():
+            self._prompt_embeddings = self._get_input_embeddings(prefix_ids.unsqueeze(0))
+        logger.info(
+            "epoch_prompt_rotation",
+            epoch=epoch,
+            prompt=variant["compression_prompt"][:60],
+        )
 
     def _amp_context(self):
         """Return autocast context for CUDA, or nullcontext for CPU."""

@@ -41,6 +41,68 @@ from bgkit.training.scheduling import cosine_with_warmup
 logger = structlog.get_logger()
 
 
+class _InterleavingDataLoader:
+    """Wraps two dataloaders, alternating batches to maintain a target ratio.
+
+    The ratio is tracked by sample count (batch size), not batch count,
+    since TokenBudgetBatchSampler produces variable-size batches.
+
+    When the primary loader exhausts, raises StopIteration (signals epoch end
+    to the base trainer). The secondary loader cycles independently.
+    """
+
+    def __init__(self, primary, secondary, secondary_ratio: float = 0.3):
+        self._primary = primary
+        self._secondary = secondary
+        self._ratio = secondary_ratio
+
+    @property
+    def batch_sampler(self):
+        return self._primary.batch_sampler
+
+    @property
+    def dataset(self):
+        return self._primary.dataset
+
+    def __iter__(self):
+        return _InterleavingIterator(
+            self._primary, self._secondary, self._ratio,
+        )
+
+    def __len__(self):
+        return len(self._primary)
+
+
+class _InterleavingIterator:
+    def __init__(self, primary, secondary, ratio):
+        self._primary_loader = primary
+        self._secondary_loader = secondary
+        self._primary_iter = iter(primary)
+        self._secondary_iter = iter(secondary)
+        self._ratio = ratio
+        self._primary_samples = 0
+        self._secondary_samples = 0
+
+    def __next__(self):
+        total = self._primary_samples + self._secondary_samples + 1
+        current_ratio = self._secondary_samples / total
+
+        if current_ratio < self._ratio:
+            try:
+                batch = next(self._secondary_iter)
+                self._secondary_samples += batch["token_ids"].size(0)
+                return batch
+            except StopIteration:
+                # Secondary exhausted — restart it
+                self._secondary_iter = iter(self._secondary_loader)
+                # Fall through to primary
+
+        # Primary batch (or secondary was exhausted)
+        batch = next(self._primary_iter)  # StopIteration propagates = epoch end
+        self._primary_samples += batch["token_ids"].size(0)
+        return batch
+
+
 class DecoderInitTrainer(BaseTrainer):
     """Step 1: Initialize decoder on uncompressed BgKIT output."""
 
@@ -136,7 +198,13 @@ class DecoderInitTrainer(BaseTrainer):
         max_seq_len = self.cfg.data.tokens.get("max_seq_len", 8192)
         variant_bank_path = self.cfg.data.tokens.variant_bank_path
 
-        inner_dataset = MmapTokenDataset(data_dir, max_seq_len=max_seq_len)
+        # QA dataset needs metadata for join; enable only when configured
+        qa_data_dir = getattr(self.cfg.data, "qa_data_dir", None)
+        qa_ratio = tcfg.get("qa_ratio", 0.0)
+        needs_metadata = bool(qa_data_dir and qa_ratio > 0)
+        inner_dataset = MmapTokenDataset(
+            data_dir, max_seq_len=max_seq_len, include_metadata=needs_metadata,
+        )
         full_dataset = ChatReproDataset(
             inner_dataset,
             tokenizer=self.tokenizer,
@@ -162,12 +230,13 @@ class DecoderInitTrainer(BaseTrainer):
         max_batch_tokens = tcfg.get("max_batch_tokens", 65536)
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
+        seed = self.cfg.get("seed", 42)
 
         train_lengths = full_dataset.lengths[np.array(self.train_dataset.indices)]
         eval_lengths = full_dataset.lengths[np.array(self.eval_dataset.indices)]
 
         self.train_sampler = TokenBudgetBatchSampler(
-            train_lengths, max_batch_tokens, shuffle=True, seed=self.cfg.get("seed", 42),
+            train_lengths, max_batch_tokens, shuffle=True, seed=seed,
         )
         eval_sampler = TokenBudgetBatchSampler(
             eval_lengths, max_batch_tokens, shuffle=False,
@@ -188,6 +257,73 @@ class DecoderInitTrainer(BaseTrainer):
             pin_memory=pin_memory,
         )
 
+        # --- Optional QA dataset for dual-loader training ---
+        self._qa_ratio = qa_ratio
+        self._qa_dataset = None
+        self._qa_train_dataloader = None
+        self._qa_eval_dataloader = None
+
+        if qa_data_dir and Path(qa_data_dir).exists() and self._qa_ratio > 0:
+            from bgkit.data.datasets.qa_chat_repro_dataset import QAChatReproDataset
+            from bgkit.data.datasets.qa_conditioned_dataset import MmapQAConditionedDataset
+
+            try:
+                qa_mmap = MmapQAConditionedDataset(qa_data_dir, max_seq_len=2048)
+                qa_full = QAChatReproDataset(
+                    qa_mmap, inner_dataset, self.tokenizer, seed=seed,
+                )
+
+                if len(qa_full) > 0:
+                    qa_eval_size = min(
+                        max(1, int(len(qa_full) * 0.1)), max_eval_samples // 3,
+                    )
+                    qa_train_size = len(qa_full) - qa_eval_size
+                    self._qa_dataset = qa_full
+                    qa_train_ds, qa_eval_ds = random_split(
+                        qa_full, [qa_train_size, qa_eval_size]
+                    )
+
+                    qa_train_lengths = qa_full.lengths[np.array(qa_train_ds.indices)]
+                    qa_eval_lengths = qa_full.lengths[np.array(qa_eval_ds.indices)]
+
+                    qa_train_sampler = TokenBudgetBatchSampler(
+                        qa_train_lengths, max_batch_tokens, shuffle=True, seed=seed,
+                    )
+                    qa_eval_sampler = TokenBudgetBatchSampler(
+                        qa_eval_lengths, max_batch_tokens, shuffle=False,
+                    )
+
+                    self._qa_train_dataloader = DataLoader(
+                        qa_train_ds,
+                        batch_sampler=qa_train_sampler,
+                        collate_fn=collate_chat_repro,
+                        num_workers=num_workers,
+                        pin_memory=pin_memory,
+                    )
+                    self._qa_eval_dataloader = DataLoader(
+                        qa_eval_ds,
+                        batch_sampler=qa_eval_sampler,
+                        collate_fn=collate_chat_repro,
+                        num_workers=num_workers,
+                        pin_memory=pin_memory,
+                    )
+                    logger.info(
+                        "qa_dataset_loaded",
+                        qa_train=qa_train_size,
+                        qa_eval=qa_eval_size,
+                        qa_ratio=self._qa_ratio,
+                    )
+            except (FileNotFoundError, ValueError) as e:
+                logger.warning("qa_dataset_load_failed", error=str(e))
+
+        # If QA dataset is loaded, wrap train_dataloader with interleaving
+        if self._qa_train_dataloader is not None:
+            self.train_dataloader = _InterleavingDataLoader(
+                primary=self.train_dataloader,
+                secondary=self._qa_train_dataloader,
+                secondary_ratio=self._qa_ratio,
+            )
+
         # --- Optimizer (with projection-aware freeze/unfreeze) ---
         self._configure_trainable_state()
 
@@ -196,7 +332,15 @@ class DecoderInitTrainer(BaseTrainer):
             train_samples=train_size,
             eval_samples=eval_size,
             device=str(device),
+            qa_enabled=self._qa_train_dataloader is not None,
         )
+
+    def _sync_epoch(self, epoch: int) -> None:
+        """Propagate epoch to both verbatim and QA datasets."""
+        super()._sync_epoch(epoch)
+        qa_ds = getattr(self, "_qa_dataset", None)
+        if qa_ds is not None and hasattr(qa_ds, "set_epoch"):
+            qa_ds.set_epoch(epoch)
 
     def _resolve_bgkit_checkpoint(self) -> str | None:
         """Resolve bgkit_checkpoint: 'auto' -> best joint_block_pretrain."""
@@ -534,6 +678,44 @@ class DecoderInitTrainer(BaseTrainer):
             "loss": avg_loss,
             "perplexity": perplexity,
         }
+
+        # QA eval (separate dataloader with different suffix_ids)
+        qa_eval_loader = getattr(self, "_qa_eval_dataloader", None)
+        qa_dataset = getattr(self, "_qa_dataset", None)
+        if qa_eval_loader is not None and qa_dataset is not None:
+            qa_loss, qa_tokens = 0.0, 0.0
+            for batch in qa_eval_loader:
+                token_ids = batch["token_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                loss_mask = batch["loss_mask"].to(self.device)
+                content_attention_mask = batch["content_attention_mask"].to(self.device)
+                survivors = self._compute_survivors(batch)
+                with torch.autocast(
+                    "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"
+                ):
+                    logits = self.decoder(
+                        survivor_embeddings=survivors,
+                        target_ids=token_ids,
+                        target_attention_mask=attention_mask,
+                        survivor_attention_mask=content_attention_mask,
+                    )
+                    loss = data_reconstruction_loss(
+                        logits, token_ids, attention_mask, loss_mask=loss_mask,
+                    )
+                bt = loss_mask[:, 1:].sum().item()
+                qa_loss += loss.item() * bt
+                qa_tokens += bt
+
+            qa_avg = qa_loss / max(qa_tokens, 1)
+            metrics["qa_loss"] = qa_avg
+            metrics["qa_perplexity"] = torch.exp(torch.tensor(qa_avg)).item()
+
+            # Combined loss weighted by content tokens
+            combined_tokens = total_content_tokens + qa_tokens
+            if combined_tokens > 0:
+                metrics["combined_loss"] = (
+                    total_loss + qa_loss
+                ) / combined_tokens
 
         # Generation metrics (expensive -- only every Nth eval)
         tcfg = self.cfg.training

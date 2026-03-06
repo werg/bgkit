@@ -2,3 +2,5 @@ tokens:
   input_dir: ${oc.env:DATA_DIR}/processed/tokens
   max_seq_len: 8192
   variant_bank_path: configs/prompt_variants/file_read_repro.json
+
+qa_data_dir: null  # set to ${oc.env:DATA_DIR}/mmap/qa_conditioned when QA data exists

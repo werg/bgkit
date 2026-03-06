@@ -72,6 +72,10 @@ Full local dev (with torch + GPU packages): `make install-gpu` or `uv sync --gro
 | Train (in container) | `make train-ice` or `docker compose -f docker/docker-compose.yaml up train-ice` |
 | Train (no log tail) | `scripts/run-train.sh --no-follow <service>` |
 | Generate descriptions | `make generate-descriptions` |
+| Generate QA pairs | `make generate-qa-pairs` |
+| Convert QA to mmap | `make convert-qa-pairs` |
+| Generate variant banks | `make generate-variants` (all 4 templates) |
+| Full data pipeline | `make prepare-data-all` or `scripts/prepare-data.sh --with-descriptions --with-qa` |
 
 ## Dependency Management
 

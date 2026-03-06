@@ -678,13 +678,15 @@ class CompressionDataset(Dataset):
         "description_generation",
         "structural_relational",
         "commit_reproduction",
+        "query_conditioned",
     ]
 
     DEFAULT_WEIGHTS: ClassVar[dict[str, float]] = {
-        "data_reconstruction": 0.40,
-        "description_generation": 0.20,
-        "structural_relational": 0.15,
-        "commit_reproduction": 0.25,
+        "data_reconstruction": 0.35,
+        "description_generation": 0.15,
+        "structural_relational": 0.12,
+        "commit_reproduction": 0.20,
+        "query_conditioned": 0.18,
     }
 
     def __init__(
@@ -912,6 +914,22 @@ class CompressionDataset(Dataset):
                 )
             except (FileNotFoundError, ValueError) as e:
                 logger.warning("Could not load commit dataset: %s", e)
+
+        # Objective 5: Query-conditioned compression
+        qa_path = getattr(cfg, "qa_data_dir", None)
+        if token_ds is not None and qa_path and Path(qa_path).exists():
+            try:
+                from bgkit.data.datasets.qa_conditioned_dataset import (
+                    MmapQAConditionedDataset,
+                    QAConditionedSubset,
+                )
+
+                qa_ds = MmapQAConditionedDataset(qa_path, max_seq_len=2048)
+                subsets["query_conditioned"] = QAConditionedSubset(
+                    token_ds, qa_ds, tokenizer, seed=seed,
+                )
+            except (FileNotFoundError, ValueError) as e:
+                logger.warning("Could not load QA conditioned dataset: %s", e)
 
         return cls(subsets=subsets, weights=weights, seed=seed)
 

@@ -13,9 +13,13 @@
 #   6  convert-descriptions    opt-in, after 4, always re-runs
 #   7  convert-commits         fast, after 3, always re-runs
 #   8  ice-labels              GPU/Docker, after 2, marker-gated
+#   9  generate-qa-pairs       opt-in (--with-qa), after 2, needs vLLM, marker-gated
+#  10  convert-qa-pairs        opt-in, after 9, always re-runs
+#  11  convert-tokens          fast, after 2, always re-runs
 #
 # Options:
 #   --with-descriptions   Include LLM description generation (slow, needs vLLM)
+#   --with-qa             Include QA pair generation (slow, needs vLLM)
 #   --from N              Resume from stage N (clears markers for N onward,
 #                         validates that skipped stages' outputs exist)
 #   --force               Delete tokenized artifacts + markers, re-run
@@ -30,6 +34,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- Parse arguments ---
 WITH_DESCRIPTIONS=false
+WITH_QA=false
 FROM_STAGE=0
 FORCE=false
 FORCE_ALL=false
@@ -38,10 +43,11 @@ DRY_RUN=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --with-descriptions) WITH_DESCRIPTIONS=true; shift ;;
+        --with-qa) WITH_QA=true; shift ;;
         --from)
             FROM_STAGE="${2:?--from requires a stage number}"
-            if ! [[ "$FROM_STAGE" =~ ^[1-8]$ ]]; then
-                echo "ERROR: --from requires a number between 1 and 8, got: $FROM_STAGE"
+            if ! [[ "$FROM_STAGE" =~ ^([1-9]|1[01])$ ]]; then
+                echo "ERROR: --from requires a number between 1 and 11, got: $FROM_STAGE"
                 exit 1
             fi
             shift 2
@@ -184,7 +190,7 @@ if [[ "$FORCE" == true ]]; then
         echo "  Would remove: $DATA_DIR/processed/ice_labels/"
         echo "  Would remove: $DATA_DIR/processed/commit_reproduction/"
         echo "  Would remove: $PIPELINE_DIR/"
-        DRYRUN_CLEARED_MARKERS="1 2 3 4 5 6 7 8"
+        DRYRUN_CLEARED_MARKERS="1 2 3 4 5 6 7 8 9 10"
     else
         rm -rf "$DATA_DIR/processed/tokens/"
         rm -rf "$DATA_DIR/processed/ice_labels/"
@@ -195,13 +201,15 @@ if [[ "$FORCE" == true ]]; then
 fi
 
 if [[ "$FORCE_ALL" == true ]]; then
-    log "Force-all mode: also deleting structural/ and descriptions/"
+    log "Force-all mode: also deleting structural/, descriptions/, qa_pairs/"
     if [[ "$DRY_RUN" == true ]]; then
         echo "  Would remove: $DATA_DIR/structural/"
         echo "  Would remove: $DATA_DIR/descriptions/"
+        echo "  Would remove: $DATA_DIR/qa_pairs/"
     else
         rm -rf "$DATA_DIR/structural/"
         rm -rf "$DATA_DIR/descriptions/"
+        rm -rf "$DATA_DIR/qa_pairs/"
     fi
 fi
 
@@ -295,12 +303,41 @@ else
 fi
 
 # ============================================================
-# Wave 1b: Descriptions (opt-in, after structural completes)
-#   Stage 4: generate-descriptions
+# Wave 1b: LLM generation (opt-in, needs vLLM)
+#   Stage 4: generate-descriptions (after stage 1)
+#   Stage 9: generate-qa-pairs (after stage 2)
 # ============================================================
-if [[ "$WITH_DESCRIPTIONS" == true ]]; then
-    log "Wave 1b: Generate descriptions (needs vLLM)"
-    run_stage 4 "generate-descriptions" generate-descriptions
+if [[ "$WITH_DESCRIPTIONS" == true ]] || [[ "$WITH_QA" == true ]]; then
+    log "Wave 1b: LLM generation (needs vLLM)"
+
+    if [[ "$DRY_RUN" == true ]]; then
+        if [[ "$WITH_DESCRIPTIONS" == true ]]; then
+            run_stage 4 "generate-descriptions" generate-descriptions
+        fi
+        if [[ "$WITH_QA" == true ]]; then
+            run_stage 9 "generate-qa-pairs" generate-qa-pairs
+        fi
+    else
+        PIDS=(); NAMES=()
+
+        if [[ "$WITH_DESCRIPTIONS" == true ]]; then
+            run_stage 4 "generate-descriptions" generate-descriptions &
+            PIDS+=($!); NAMES+=("generate-descriptions")
+        fi
+        if [[ "$WITH_QA" == true ]]; then
+            run_stage 9 "generate-qa-pairs" generate-qa-pairs &
+            PIDS+=($!); NAMES+=("generate-qa-pairs")
+        fi
+
+        FAIL=0
+        for i in "${!PIDS[@]}"; do
+            if ! wait "${PIDS[$i]}"; then
+                echo "FAILED: ${NAMES[$i]}"
+                FAIL=1
+            fi
+        done
+        (( FAIL == 0 )) || die "Wave 1b (LLM generation) failed"
+    fi
 fi
 
 # ============================================================
@@ -308,14 +345,19 @@ fi
 #   Stage 5: convert-structural   (depends on stage 1)
 #   Stage 6: convert-descriptions (depends on stage 4, opt-in)
 #   Stage 7: convert-commits      (depends on stage 3)
+#   Stage 11: convert-tokens      (depends on stage 2)
 # ============================================================
 log "Wave 2: Parallel conversion"
 
 if [[ "$DRY_RUN" == true ]]; then
     run_stage_always 5 "convert-structural" convert-structural
     run_stage_always 7 "convert-commits" convert-commits
+    run_stage_always 11 "convert-tokens" convert-tokens
     if [[ "$WITH_DESCRIPTIONS" == true ]]; then
         run_stage_always 6 "convert-descriptions" convert-descriptions
+    fi
+    if [[ "$WITH_QA" == true ]]; then
+        run_stage_always 10 "convert-qa-pairs" convert-qa-pairs
     fi
 else
     PIDS=()
@@ -327,9 +369,17 @@ else
     run_stage_always 7 "convert-commits" convert-commits &
     PIDS+=($!); NAMES+=("convert-commits")
 
+    run_stage_always 11 "convert-tokens" convert-tokens &
+    PIDS+=($!); NAMES+=("convert-tokens")
+
     if [[ "$WITH_DESCRIPTIONS" == true ]]; then
         run_stage_always 6 "convert-descriptions" convert-descriptions &
         PIDS+=($!); NAMES+=("convert-descriptions")
+    fi
+
+    if [[ "$WITH_QA" == true ]]; then
+        run_stage_always 10 "convert-qa-pairs" convert-qa-pairs &
+        PIDS+=($!); NAMES+=("convert-qa-pairs")
     fi
 
     FAIL=0

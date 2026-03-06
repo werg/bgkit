@@ -16,8 +16,9 @@ w_repro: 1.0
 w_proj: 1.0
 eval_every: 100
 save_every: 200
-max_batch_tokens: 65536
+max_batch_tokens: 32768
 max_eval_samples: 10000
+prompt_variants_dir: configs/prompt_variants
 checkpoint_pruning:
   enabled: true
   keep_best: 3
