@@ -41,6 +41,23 @@ def resolve_checkpoint(
     return checkpoint_dir / best.name
 
 
+def resolve_latest_checkpoint(
+    checkpoint_dir: Path,
+    phase: str,
+) -> Path | None:
+    """Find the latest on-disk checkpoint for a phase, or None if no match.
+
+    Used for auto-resume: silently returns None when no checkpoint exists
+    (first run), unlike resolve_checkpoint which raises.
+    """
+    registry = CheckpointRegistry(checkpoint_dir)
+    registry.backfill(checkpoint_dir)
+    latest = registry.latest(phase=phase)
+    if latest is None:
+        return None
+    return checkpoint_dir / latest.name
+
+
 def normalize_checkpoint_name(path_or_name: str) -> str:
     """Extract checkpoint directory name from an absolute path or bare name.
 
@@ -201,6 +218,27 @@ class CheckpointRegistry:
         if not candidates:
             return None
         return min(candidates, key=lambda e: e.metrics[metric] * (1 if lower_is_better else -1))
+
+    def latest(
+        self,
+        phase: str,
+        on_disk_only: bool = True,
+    ) -> RegistryEntry | None:
+        """Find the latest (highest step) checkpoint for a phase.
+
+        Args:
+            phase: Filter to this training phase.
+            on_disk_only: If True (default), exclude pruned checkpoints.
+
+        Returns:
+            Latest RegistryEntry or None if no matching entries.
+        """
+        candidates = [e for e in self._entries.values() if e.phase == phase]
+        if on_disk_only:
+            candidates = [e for e in candidates if e.on_disk]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda e: e.step)
 
     def annotate(
         self,

@@ -20,6 +20,7 @@ from bgkit.training.checkpoint_registry import (
     CheckpointRegistry,
     RegistryEntry,
     normalize_checkpoint_name,
+    resolve_latest_checkpoint,
 )
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import clip_grad_norm
@@ -449,8 +450,15 @@ class BaseTrainer(ABC):
         es_best: float | None = None
         es_evals_without_improvement = 0
 
-        # Resume from checkpoint if specified
+        # Resume from checkpoint: explicit path, or auto-resolve latest for this phase
         resume_path = self.cfg.get("resume_checkpoint", None)
+        if resume_path is None:
+            phase = getattr(tcfg, "phase", None)
+            if phase:
+                auto_resolved = resolve_latest_checkpoint(checkpoint_dir, phase)
+                if auto_resolved is not None:
+                    resume_path = str(auto_resolved)
+                    logger.info("auto_resume_resolved", checkpoint=resume_path, phase=phase)
         is_resuming = False
         if resume_path is not None:
             self.load_checkpoint(Path(resume_path))

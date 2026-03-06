@@ -32,7 +32,11 @@ from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer, _average_metrics
 from bgkit.training.checkpoint_manager import CheckpointManager
-from bgkit.training.checkpoint_registry import CheckpointRegistry, resolve_checkpoint
+from bgkit.training.checkpoint_registry import (
+    CheckpointRegistry,
+    resolve_checkpoint,
+    resolve_latest_checkpoint,
+)
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import clip_grad_norm, enable_gradient_checkpointing
 from bgkit.training.interruption import GracefulInterruptor
@@ -1097,8 +1101,15 @@ class CompressionTrainer(BaseTrainer):
         es_best: float | None = None
         es_evals_without_improvement = 0
 
-        # Resume from checkpoint
+        # Resume from checkpoint: explicit path, or auto-resolve latest for this phase
         resume_path = self.cfg.get("resume_checkpoint", None)
+        if resume_path is None:
+            phase = getattr(tcfg, "phase", None)
+            if phase:
+                auto_resolved = resolve_latest_checkpoint(checkpoint_dir, phase)
+                if auto_resolved is not None:
+                    resume_path = str(auto_resolved)
+                    logger.info("auto_resume_resolved", checkpoint=resume_path, phase=phase)
         is_resuming = False
         if resume_path is not None:
             self.load_checkpoint(Path(resume_path))

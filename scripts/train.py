@@ -72,7 +72,7 @@ def main(cfg: DictConfig) -> None:
             last_ckpt_file.unlink()
 
         def _train_attempt():
-            # Resolve resume path: .last_checkpoint > original > None
+            # Resolve resume path: .last_checkpoint > original > auto-resolve
             resume_path = None
             if last_ckpt_file.exists():
                 candidate = last_ckpt_file.read_text().strip()
@@ -81,7 +81,8 @@ def main(cfg: DictConfig) -> None:
             if resume_path is None:
                 resume_path = original_resume
 
-            # Update config with resolved resume path
+            # Update config with resolved resume path (None triggers auto-resolve
+            # inside the trainer's train() method)
             with _open_dict(cfg):
                 cfg.resume_checkpoint = resume_path
 
@@ -95,6 +96,7 @@ def main(cfg: DictConfig) -> None:
             max_delay=retry_cfg.get("max_delay", 300.0),
         )
     else:
+        # Auto-resume is handled inside trainer.train() when resume_checkpoint is None
         trainer = _create_trainer(cfg)
         trainer.train()
 

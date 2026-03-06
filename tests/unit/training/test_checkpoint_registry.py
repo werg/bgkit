@@ -659,3 +659,55 @@ def test_backfill_recovers_reappearing_checkpoint(tmp_path):
     e = reg2.get("ice_step100_20260220_220522")
     assert e.on_disk is True
     assert e.status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# latest() and resolve_latest_checkpoint()
+# ---------------------------------------------------------------------------
+
+from bgkit.training.checkpoint_registry import resolve_latest_checkpoint
+
+
+def test_latest_returns_highest_step(tmp_path):
+    """latest() should return the checkpoint with the highest step."""
+    _make_ckpt_on_disk(tmp_path, "ice_step100_20260220_220522", 100, metrics={"eval/mse": 5.0})
+    _make_ckpt_on_disk(tmp_path, "ice_step200_20260221_100000", 200, metrics={"eval/mse": 3.0})
+    _make_ckpt_on_disk(tmp_path, "ice_step150_20260221_050000", 150, metrics={"eval/mse": 1.0})
+
+    reg = CheckpointRegistry(tmp_path)
+    reg.backfill(tmp_path)
+    result = reg.latest(phase="ice")
+    assert result is not None
+    assert result.name == "ice_step200_20260221_100000"
+
+
+def test_latest_skips_pruned(tmp_path):
+    """latest() should skip pruned checkpoints."""
+    _make_ckpt_on_disk(tmp_path, "ice_step100_20260220_220522", 100, metrics={"eval/mse": 5.0})
+    _make_ckpt_on_disk(tmp_path, "ice_step200_20260221_100000", 200, metrics={"eval/mse": 3.0})
+
+    reg = CheckpointRegistry(tmp_path)
+    reg.backfill(tmp_path)
+    reg.mark_pruned("ice_step200_20260221_100000")
+
+    result = reg.latest(phase="ice")
+    assert result is not None
+    assert result.name == "ice_step100_20260220_220522"
+
+
+def test_latest_returns_none_for_empty_phase(tmp_path):
+    reg = CheckpointRegistry(tmp_path)
+    assert reg.latest(phase="ice") is None
+
+
+def test_resolve_latest_checkpoint_finds_latest(tmp_path):
+    _make_ckpt_on_disk(tmp_path, "ice_step100_20260220_220522", 100, metrics={"eval/mse": 5.0})
+    _make_ckpt_on_disk(tmp_path, "ice_step200_20260221_100000", 200, metrics={"eval/mse": 3.0})
+
+    result = resolve_latest_checkpoint(tmp_path, phase="ice")
+    assert result == tmp_path / "ice_step200_20260221_100000"
+
+
+def test_resolve_latest_checkpoint_returns_none_when_empty(tmp_path):
+    result = resolve_latest_checkpoint(tmp_path, phase="ice")
+    assert result is None
