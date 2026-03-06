@@ -3,7 +3,7 @@ ice:
   embedding_model: Qwen/Qwen3.5-0.8B-Base
   # embedding_model_revision: <pin after release stabilizes>
   input_dim: 1024  # Qwen3.5-0.8B hidden dim
-  hidden_dim: 128
-  num_layers: 2
+  hidden_dim: 192
+  num_layers: 3
   kernel_size: 5
   dropout: 0.1

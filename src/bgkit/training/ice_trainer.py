@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, random_split
 from transformers import AutoModel
 
 from bgkit.data.datasets.mmap_ice_dataset import MmapICEDataset
-from bgkit.data.samplers import TokenBudgetBatchSampler
+from bgkit.data.samplers import LengthSortedBatchSampler
 from bgkit.models.ice import ICE
 from bgkit.training.base_trainer import BaseTrainer
 
@@ -108,15 +108,21 @@ class ICETrainer(BaseTrainer):
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
 
-        # Token-budget batching: pack samples so batch_size * max_seq_len <= budget
+        # Length-sorted batching: sort within batches for packing efficiency,
+        # shuffle batch order to avoid systematic short→long progression
+        # that causes loss spikes at epoch boundaries.
         train_lengths = full_dataset.lengths[np.array(self.train_dataset.indices)]
         eval_lengths = full_dataset.lengths[np.array(self.eval_dataset.indices)]
 
-        self.train_sampler = TokenBudgetBatchSampler(
-            train_lengths, max_batch_tokens, shuffle=True, seed=self.cfg.get("seed", 42),
+        self.train_sampler = LengthSortedBatchSampler(
+            self.train_dataset, max_batch_tokens,
+            shuffle=True, seed=self.cfg.get("seed", 42),
+            lengths=train_lengths,
         )
-        eval_sampler = TokenBudgetBatchSampler(
-            eval_lengths, max_batch_tokens, shuffle=False,
+        eval_sampler = LengthSortedBatchSampler(
+            self.eval_dataset, max_batch_tokens,
+            shuffle=False,
+            lengths=eval_lengths,
         )
 
         self.train_dataloader = DataLoader(

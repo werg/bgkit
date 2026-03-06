@@ -4,4 +4,4 @@ ice_labels:
   max_batch_tokens: 65536
   output_dir: ${oc.env:DATA_DIR}/processed/ice_labels
   input_dir: ${oc.env:DATA_DIR}/processed/tokens
-  max_shards: 30
+  max_shards: 45
