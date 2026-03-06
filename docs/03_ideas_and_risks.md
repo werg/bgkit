@@ -24,9 +24,9 @@
 BgKIT can serve multiple target LLMs via separate projection blocks sharing the same compressor backbone:
 
 ```
-                       ┌─ Projection block (Qwen-Coder, 2048-dim)  → Qwen3-Coder-Next
-BgKIT compressor ──────┤─ Projection block (GLM, 4096-dim)         → GLM-4.7-Flash
-                       └─ Projection block (Qwen-4B, 2560-dim)     → Qwen3 4B 2507
+                       ┌─ Projection block (Qwen3.5-35B, 2560-dim)  → Qwen3.5-35B
+BgKIT compressor ──────┤─ Projection block (GLM, 4096-dim)          → GLM-4.7-Flash
+                       └─ Projection block (Qwen3.5-4B, 2560-dim)   → Qwen3.5-4B
 ```
 
 The v1 projection block (~25M parameters at native 1024-dim) is extended for higher-dimensional targets via **block-diagonal parameter initialization**: existing pretrained weights occupy the original-dimension subspace, and new parameters are added for the extra dimensions, initialized near-zero. At initialization the block behaves like the pretrained version on the original dimensions with zero cross-interaction; fine-tuning then learns the cross-terms. This is strictly better than random initialization of a full target-dim block — the learned attention patterns and MLP transformations in the original subspace transfer directly.
@@ -49,17 +49,25 @@ Two mechanisms to strengthen attention pathways to BgKIT positions early in Phas
 
 **Risk:** Privileged encodings could teach the model a dependency on information that won't be present at inference. Should be short and carefully annealed.
 
-### 1.3 Phase 3: RLVR
+### 1.3 Phase 2: Distillation Training (Primary Post-Phase-1 Strategy)
 
-Reinforcement learning with verifiable rewards for sharpening after Phase 2. Reward = task completion weighted by retrieval efficiency (tool-call budget). Short and focused.
+Before end-to-end injection with RL, validate the BgKIT hypothesis through progressive distillation using the Qwen3.5 model family ladder.
+
+**Phase 2a — Logprob distillation:** Distill larger Qwen3.5 models (2B → 4B → 9B) down to the 0.8B decoder using BgKIT context. Teacher logprobs are pre-computed on agentic coding prompts; the student trains on KL divergence. The key metric is how close the BgKIT-augmented 0.8B student gets to each teacher — matching a 4B teacher with 0.8B + BgKIT would be strong evidence that dense injection compensates for reduced model capacity.
+
+**Phase 2b — Trajectory distillation:** Run progressively stronger teachers (2B → 4B → 9B → 35B) in an agentic coding harness, recording full interaction trajectories (tool calls, file reads, reasoning, diffs). Same ladder principle as 2a — a student learns more effectively from a moderately stronger teacher than from a vastly stronger one. Filter trajectories where teacher reasoning references details unrecoverable from BgKIT vectors. Train the BgKIT-augmented 0.8B student to reproduce filtered trajectories via teacher forcing. Stop climbing the ladder when the with-BgKIT vs. without-BgKIT gap stops growing.
+
+**Phase 2c — End-to-end injection:** Once distillation validates the approach, train the full pipeline with Qwen3.5-35B as the target LLM (QLoRA, 4-bit quantization).
+
+See `docs/02_training_plan.md` for full details on each sub-phase.
+
+### 1.4 Phase 3: RLVR (Deferred)
+
+Reinforcement learning with verifiable rewards for sharpening after distillation validates the approach. Reward = task completion weighted by retrieval efficiency (tool-call budget). Short and focused.
+
+**Prerequisite:** Phase 2 distillation must show clear evidence that BgKIT injection adds value. RLVR is only worth pursuing if the model ladder gap metric confirms the hypothesis.
 
 **Key risk:** RL may teach the model to succeed *without* BgKIT — the ablation infrastructure is the safeguard. If the survivors-present vs. survivors-zeroed gap shrinks during RLVR, stop.
-
-### 1.4 Distillation Trajectories
-
-A stronger model (without BgKIT, with full text context) produces high-quality agentic trajectories. The target model reproduces those outcomes using BgKIT instead.
-
-**Open problem:** Teacher reasoning steps may reference fine-grained details unrecoverable from BgKIT vectors. These must be filtered or edited, but the filtering criteria are hard to automate and the quality risk is subtle. Needs a concrete protocol before deployment.
 
 ---
 
@@ -222,14 +230,14 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 ### 5.7 Hybrid DeltaNet Architecture and Dense Injection
 
-**Risk:** Qwen3-Coder-Next uses a hybrid architecture where 36 of 48 layers are gated DeltaNet (linear attention with a delta update rule) and only 12 are gated softmax attention. The BgKIT injection design assumes the target LLM can freely attend to injected tool-call positions, which is naturally true for softmax attention layers (any position can attend to any other). DeltaNet layers instead compress context into a fixed-size recurrent state via a delta rule — information from early positions (where BgKIT vectors are injected) may be progressively overwritten as later tokens are processed, degrading the model's ability to use BgKIT context in deeper DeltaNet layers.
+**Risk:** Qwen3.5-35B uses a hybrid architecture where 48 of 64 layers are gated DeltaNet (linear attention with a delta update rule) and only 16 are gated softmax attention. The BgKIT injection design assumes the target LLM can freely attend to injected tool-call positions, which is naturally true for softmax attention layers (any position can attend to any other). DeltaNet layers instead compress context into a fixed-size recurrent state via a delta rule — information from early positions (where BgKIT vectors are injected) may be progressively overwritten as later tokens are processed, degrading the model's ability to use BgKIT context in deeper DeltaNet layers.
 
 **Mitigation options:**
 
-- **Monitor per-layer attention to BgKIT positions.** In the 12 softmax attention layers, measure attention weight on BgKIT positions directly. In DeltaNet layers, probe whether BgKIT-derived information persists in the recurrent state by comparing outputs with vs. without BgKIT injection.
+- **Monitor per-layer attention to BgKIT positions.** In the 16 softmax attention layers, measure attention weight on BgKIT positions directly. In DeltaNet layers, probe whether BgKIT-derived information persists in the recurrent state by comparing outputs with vs. without BgKIT injection.
 - **Repeated injection.** Insert BgKIT tool-call frames at multiple positions in the input sequence (not just the beginning) so that DeltaNet layers encounter BgKIT vectors at various points and can refresh their recurrent state.
-- **Target LoRA at attention layers preferentially.** The 12 gated attention layers are the primary pathway for the model to "look up" BgKIT information. LoRA on these layers may matter more than on DeltaNet layers for injection quality.
-- **Evaluate DeltaNet-only vs. attention-only ablation.** If the model only uses BgKIT through the attention layers and DeltaNet layers ignore it, that's acceptable — it just means BgKIT's effective depth is 12 layers, not 48.
+- **Target LoRA at attention layers preferentially.** The 16 gated attention layers are the primary pathway for the model to "look up" BgKIT information. LoRA on these layers may matter more than on DeltaNet layers for injection quality.
+- **Evaluate DeltaNet-only vs. attention-only ablation.** If the model only uses BgKIT through the attention layers and DeltaNet layers ignore it, that's acceptable — it just means BgKIT's effective depth is 16 layers, not 64.
 
 **Severity:** Unknown until tested. This is the most architecturally novel risk in v1 — previous dense injection work (LLaVA, etc.) targeted pure-attention transformers.
 
@@ -237,7 +245,7 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 **Risk:** The entire projection pipeline is trained against a specific target LLM's embedding space. If that model's architecture or embedding space changes in the next release, everything from Phase 1 Step 3 onward needs retraining.
 
-**Mitigation:** Multi-target projection (Section 1.1) helps the compressor's internal representations stay target-agnostic. But in v1, this risk is accepted. The key question is whether the compressor's output space is stable enough that adapting to a new target requires only a fresh projection block (cheap, with block-diagonal warm-start from the v1 block) rather than full Phase 2 retraining (expensive).
+**Mitigation:** Using Qwen3.5-35B as the target — the same model family as our encoder and decoder — reduces architectural mismatch and simplifies the projection block's task. Multi-target projection (Section 1.1) helps the compressor's internal representations stay target-agnostic. But in v1, this risk is accepted. The key question is whether the compressor's output space is stable enough that adapting to a new target requires only a fresh projection block (cheap, with block-diagonal warm-start from the v1 block) rather than full Phase 2 retraining (expensive). The Qwen3.5 model ladder (0.8B/2B/4B/9B/35B) offers a natural progression for testing this.
 
 ### 5.9 Decoder Co-Adaptation
 
@@ -249,7 +257,7 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 **Risk:** Distillation trajectories from a stronger teacher model may contain reasoning that references fine-grained details unrecoverable from BgKIT vectors. Subtle data quality issues.
 
-**Mitigation:** This is why distillation is deferred. When introduced, it needs a concrete filtering protocol (e.g., verify that every file reference in the teacher's reasoning corresponds to a file with above-threshold survivor representation). Spot-check extensively.
+**Mitigation:** Phase 2b (trajectory distillation) includes an automated filtering step: cross-reference every file read/tool call in the teacher's trajectory against BgKIT's survivor map. Reject trajectories where the teacher targets files with low survivor coverage. For Phase 2a (logprob distillation), the risk is lower — the student isn't reproducing reasoning traces, just matching output distributions. Spot-check extensively in both cases.
 
 ---
 
@@ -257,7 +265,7 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 ### 6.1 Context Window Budgeting
 
-K_total is set at inference time. ICE allocates across files proportionally to information content. A 2,000-file repository at typical budget produces ~3,000–3,500 final positions (including metadata). With Qwen3-Coder-Next's 262K context window, a 25% reservation yields ~65K positions — sufficient for large repositories.
+K_total is set at inference time. ICE allocates across files proportionally to information content. A 2,000-file repository at typical budget produces ~3,000–3,500 final positions (including metadata). With Qwen3.5-35B's 262K context window, a 25% reservation yields ~65K positions — sufficient for large repositories.
 
 BgKIT internally processes much longer sequences (full tokens at level 0, all survivors at level 1), but this cost is borne by the ~600M model, not the target LLM's context window.
 
@@ -295,6 +303,7 @@ Beyond the mandatory survivors-present vs. zeroed ablation:
 - (h) With vs. without compression prompt at level 1.
 - (i) BgKIT information utilization in gated attention vs. gated DeltaNet layers — does disabling LoRA on DeltaNet layers affect BgKIT-dependent performance?
 - (j) BgKIT tool-call frame placement: beginning-only vs. distributed across the input sequence (relevant to DeltaNet recurrent state retention, see Section 5.7).
+- (k) Model ladder distillation gap: 0.8B + BgKIT vs. 2B/4B/9B teachers — how much of the teacher's capability does BgKIT injection recover?
 
 ---
 

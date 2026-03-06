@@ -117,7 +117,7 @@ class ProjectionBlock(nn.Module):
     def extend_to_dim(self, target_dim: int, init_scale: float = 0.01) -> None:
         """Extend output dimensionality for target LLM alignment.
 
-        Will be implemented for Phase 1 Step 3 (1024 -> 2048).
+        Will be implemented for Phase 1 Step 3 (1024 -> 2560).
         """
         raise NotImplementedError(
             f"extend_to_dim({target_dim}) not yet implemented. "

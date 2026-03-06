@@ -100,7 +100,7 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 | Joint Block → Step 1 | `bgkit_checkpoint` | `joint_block_pretrain` | `phase1_step1` | `eval/mse_repro` |
 | Step 1 → Step 2 | `step1_checkpoint` | `phase1_step1` | `phase1_step2` | `eval/loss` |
 
-**Training phase pipeline**: ICE → Joint Block Pretrain → Step 1 (frozen encoder pretraining) → Step 2 (compression training) → Phase 2 (end-to-end injection).
+**Training phase pipeline**: ICE → Joint Block Pretrain → Step 1 (frozen encoder pretraining) → Step 2 (compression training) → Phase 2a (model ladder distillation) → Phase 2b (trajectory distillation) → Phase 2c (end-to-end injection with Qwen3.5-35B).
 
 | Task | Command |
 |---|---|

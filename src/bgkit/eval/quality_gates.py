@@ -3,8 +3,8 @@
 Before proceeding from Phase 1 to Phase 2, verify:
 - Decoder reconstruction loss at target compression ratios
 - Reconstructed code parses successfully
-- Frozen target LLM reproduces text from projected survivors (3a)
-- Frozen target LLM generates coherent descriptions (3b)
+- Frozen target LLM (Qwen3.5-35B) reproduces text from projected survivors (3a)
+- Frozen target LLM (Qwen3.5-35B) generates coherent descriptions (3b)
 - Quality across compression ratio range
 """
 

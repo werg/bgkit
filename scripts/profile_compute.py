@@ -27,14 +27,14 @@ def profile_phase1() -> dict[str, float]:
 def profile_phase2() -> dict[str, float]:
     """Profile Phase 2 memory: full pipeline with 4-bit target LLM.
 
-    Memory budget:
-    - Target LLM 4-bit: ~40 GB
-    - BgKIT BF16: ~1.2 GB
-    - Decoder BF16: ~1.2 GB
-    - Projection MLP: ~20 MB
-    - LoRA adapters: ~0.5 GB
-    - Optimizer states: ~7 GB
-    - Activations: ~78 GB remaining
+    Memory budget (Qwen3.5-35B target):
+    - Target LLM 4-bit: ~18 GB
+    - BgKIT BF16: ~2.1 GB
+    - Decoder BF16: ~1.6 GB
+    - Projection block: ~70 MB
+    - LoRA adapters: ~0.3 GB
+    - Optimizer states: ~5 GB
+    - Activations: ~101 GB remaining
     """
     print("=== Phase 2 Memory Profile ===")
     # TODO: Load all models, run one fwd+bwd step, capture peak memory

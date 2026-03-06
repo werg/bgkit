@@ -3,7 +3,7 @@
 # For targets with hidden_dim > source_dim, extended via block-diagonal initialization.
 projection:
   source_dim: 1024   # BgKIT compressor output dim (Qwen3-Embedding-0.6B layer 26)
-  target_dim: 2048   # Target LLM hidden dim (Qwen3-Coder-Next)
+  target_dim: 2560   # Target LLM hidden dim (Qwen3.5-35B)
   # The block itself is initialized from the base model's last layer.
   # When target_dim > source_dim, block-diagonal extension adds new parameters
   # for the extra dimensions (initialized near-zero, preserving pretrained subspace).

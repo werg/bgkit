@@ -1,12 +1,12 @@
-# Target LLM: Qwen3-Coder-Next
-# 80B total / 3B active MoE, hidden dim 2048
-# 48-layer hybrid: 12x(3x gated DeltaNet-MoE + 1x gated attention-MoE)
-# 512 experts, 10 active + 1 shared per token, 256K context
+# Target LLM: Qwen3.5-35B
+# 35B total / ~3B active MoE, hidden dim 2560
+# 64-layer hybrid: 16x(3x Gated DeltaNet-MoE + 1x gated attention-MoE)
+# 262K context, same architecture family as our 0.8B encoder/decoder
 target_lm:
-  model_name: Qwen/Qwen3-Coder-Next  # placeholder -- actual HF name TBD
-  hidden_dim: 2048
-  num_layers: 48
-  num_attention_layers: 12  # gated attention layers (rest are gated DeltaNet)
+  model_name: Qwen/Qwen3.5-35B  # instruct variant (no -Instruct suffix)
+  hidden_dim: 2560
+  num_layers: 64
+  num_attention_layers: 16  # gated attention layers (rest are gated DeltaNet)
   context_length: 262144
   # Quantization for memory-constrained training
   quantization:

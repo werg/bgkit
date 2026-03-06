@@ -14,7 +14,7 @@ A Background Knowledge Interaction Transformer (BgKIT) hierarchically compresses
 
 ## Architecture
 
-BgKIT is a single transformer network (~600M parameters) derived from a pre-trained embedding model (Qwen3-Embedding-0.6B). The architecture separates the base model's layers into two functional components:
+BgKIT is a single transformer network (~1.1B parameters) derived from Qwen3.5-0.8B-Base, bidirectionalized via dual-pass Gated DeltaNet + unmasked full attention. The architecture separates the base model's layers into two functional components:
 
 **BgKIT compressor (layers 0 through N-2):** The bulk of the encoder, responsible for compression and recursive re-representation. Applied at two compression levels with shared weights:
 
@@ -24,7 +24,7 @@ BgKIT is a single transformer network (~600M parameters) derived from a pre-trai
 
 **Projection block (layer N-1):** The final transformer block of the base model, separated from the compressor and repurposed as a context-aware projection module. It receives the compressor's output for all positions (not just survivors), performs self-attention over the full sequence, and produces projected embeddings only for survivor positions. This is more expressive than a pointwise MLP — each survivor's projection can attend to the full context including doomed positions, enabling holistic, position-aware mapping into the target decoder's embedding space. For target models with different hidden dimensions, the block is extended via block-diagonal parameter initialization (preserving pretrained weights in the original-dimension subspace while adding new capacity for the extra dimensions).
 
-**Reconstruction decoder:** A separate small causal LM (Qwen3-0.6B) is co-trained to reconstruct content from BgKIT's compressed representations, providing the primary training signal for compression quality.
+**Reconstruction decoder:** A separate small causal LM (Qwen3.5-0.8B) is co-trained to reconstruct content from BgKIT's compressed representations, providing the primary training signal for compression quality.
 
 **Survivor selection:** An Information Content Estimator (ICE), a lightweight 1D convolutional network (~0.7M parameters), estimates per-position information density. During compression training, ICE runs live (frozen, in inference mode) on input embeddings at each compression level. A `ThresholdCalibrator` tracks the EMA of the ICE score distribution and converts a curriculum-ramped target compression ratio (30% → 15% over training) into a threshold at the corresponding quantile. Positions scoring above the threshold survive, with gap-filling to prevent long stretches without survivors. This produces variable survivor counts that naturally adapt to information density. Very small files can be mainlined directly into Level 1.
 
@@ -60,7 +60,7 @@ Repository file contents are the focus of v1. Other sources are extensions using
 
 **Phase 1 — BgKIT pre-training:** Train BgKIT's compression and the reconstruction decoder on code repositories. The decoder reconstructs original content from compressed survivors, providing gradient signal for consolidation quality. Multiple complementary objectives (data reconstruction, description generation, structural QA, commit reproduction) ensure survivors preserve diverse information types.
 
-**Phase 2 — End-to-end injection:** Train the full pipeline (BgKIT compressor → projection block → target LLM with LoRA) on agentic coding tasks derived from commit history. The target LLM learns to attend to and use dense BgKIT vectors for file retrieval guidance, structural reasoning, and code generation.
+**Phase 2 — Distillation and injection:** First validate the hypothesis via progressive distillation — distill larger Qwen3.5 models (2B/4B/9B) down to the 0.8B decoder using BgKIT context, measuring how much of the teacher's capability BgKIT injection recovers. Then distill agentic trajectories from Qwen3.5-35B running in an agentic harness. Finally, train the full pipeline (BgKIT compressor → projection block → Qwen3.5-35B with LoRA) end-to-end on agentic coding tasks.
 
 ## Deployment
 

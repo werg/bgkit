@@ -4,7 +4,7 @@
 
 ## What
 
-BgKIT is a ~600M transformer (Qwen3-Embedding-0.6B) that recursively compresses a codebase into a compact set of survivor embeddings via a drop-flag mechanism. A projection block (the encoder's last transformer layer, repurposed) maps these into the target LLM's embedding space (LLaVA-style), where they're framed as tool-call responses. The target LLM receives a compressed, variable-sized representation of the entire repo without consuming text context.
+BgKIT is a ~1.1B transformer (bidirectionalized Qwen3.5-0.8B-Base) that recursively compresses a codebase into a compact set of survivor embeddings via a drop-flag mechanism. A projection block (the encoder's last transformer block, repurposed) maps these into the target LLM's embedding space (LLaVA-style), where they're framed as tool-call responses. The target LLM receives a compressed, variable-sized representation of the entire repo without consuming text context.
 
 ## Architecture
 
@@ -14,12 +14,12 @@ Files → [ICE budget allocation] → [Level 0: within-file compression]
      → Target LLM (as tool-call response embeddings)
 ```
 
-**Components**: ICE (2-5M, budget allocator), BgKIT compressor (layers 0-26, ~580M, shared weights L0/L1), projection block (layer 27, ~25M, context-aware projection), reconstruction decoder (600M, training signal), target LLM LoRA adapters.
+**Components**: ICE (~0.7M, budget allocator), BgKIT compressor (layers 0-22, ~1,040M incl. backward DeltaNet, shared weights L0/L1), projection block (layer 23, ~35M, context-aware projection), reconstruction decoder (800M, training signal), target LLM LoRA adapters.
 
 ## Training
 
 - **Phase 1**: BgKIT pre-training via compression + reconstruction (4 objectives: data reconstruction, description generation, structural/relational, commit reproduction)
-- **Phase 2**: End-to-end injection training with QLoRA on the target LLM
+- **Phase 2**: Distillation training (model ladder + trajectory) then end-to-end injection with QLoRA on Qwen3.5-35B
 
 Target hardware: NVIDIA DGX Spark (Blackwell GB10, 128GB unified, sm_121).
 
@@ -69,7 +69,7 @@ bgkit-ckpt show ice_step29999_20260220_220522
 
 **Auto-resolution**: Set `checkpoint_path: auto` in training configs to automatically use the best checkpoint from a prior phase. For example, Phase 1 Step 2 auto-resolves the best ICE checkpoint by `eval/mse`.
 
-**Training pipeline**: ICE (budget allocation) → Step 1 (frozen encoder pretraining) → Step 2 (multi-objective compression) → Phase 2 (end-to-end injection with target LLM).
+**Training pipeline**: ICE (budget allocation) → Step 1 (frozen encoder pretraining) → Step 2 (multi-objective compression) → Phase 2a (model ladder distillation) → Phase 2b (trajectory distillation) → Phase 2c (end-to-end injection with Qwen3.5-35B).
 
 ## Design Docs
 

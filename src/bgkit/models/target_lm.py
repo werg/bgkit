@@ -1,10 +1,10 @@
 """Target LLM with LoRA and tool-call injection points.
 
-Wraps Qwen3-Coder-Next (80B total / 3B active MoE, hidden dim 2048,
-48-layer hybrid: 12x(3x gated DeltaNet-MoE + 1x gated attention-MoE),
-512 experts, 10 active + 1 shared per token, 256K context).
+Wraps Qwen3.5-35B (35B total / ~3B active MoE, hidden dim 2560,
+64-layer hybrid: 16x(3x Gated DeltaNet-MoE + 1x gated attention-MoE),
+262K context). Same architecture family as our 0.8B encoder/decoder.
 
-Loaded in 4-bit quantization (~40GB) for QLoRA training.
+Loaded in 4-bit quantization (~18GB) for QLoRA training.
 LoRA adapters train in BF16.
 """
 

@@ -1,4 +1,4 @@
-"""Projection MLP: BgKIT hidden dim (1024) -> target LLM hidden dim (2048).
+"""Projection MLP: BgKIT hidden dim (1024) -> target LLM hidden dim (2560).
 
 .. deprecated::
     Replaced by :class:`bgkit.models.projection_block.ProjectionBlock` which
@@ -21,8 +21,8 @@ class ProjectionMLP(nn.Module):
     def __init__(
         self,
         input_dim: int = 1024,
-        output_dim: int = 2048,
-        hidden_dim: int = 2048,
+        output_dim: int = 2560,
+        hidden_dim: int = 2560,
     ):
         super().__init__()
         self.net = nn.Sequential(

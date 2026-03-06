@@ -5,7 +5,7 @@
 #
 # Examples:
 #   scripts/download-model.sh Qwen/Qwen3-0.6B-GGUF qwen3-0.6b-q8_0.gguf
-#   scripts/download-model.sh bartowski/Qwen3-Coder-Next-3B-GGUF qwen3-coder-next-3b-q4_k_m.gguf data/models
+#   scripts/download-model.sh Qwen/Qwen3.5-35B-GGUF qwen3.5-35b-q4_k_m.gguf data/models
 
 set -euo pipefail
 

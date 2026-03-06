@@ -1,8 +1,8 @@
 """Phase 2: End-to-end injection training.
 
-Full pipeline: BgKIT -> projection MLP -> Qwen3-Coder-Next with QLoRA.
-Target LLM in 4-bit quantization (~40GB), LoRA adapters in BF16.
-Full backprop through projection MLP, L1, L0 with gradient checkpointing.
+Full pipeline: BgKIT -> projection block -> Qwen3.5-35B with QLoRA.
+Target LLM in 4-bit quantization (~18GB), LoRA adapters in BF16.
+Full backprop through projection block, L1, L0 with gradient checkpointing.
 """
 
 from __future__ import annotations

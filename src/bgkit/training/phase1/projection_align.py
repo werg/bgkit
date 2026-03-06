@@ -1,7 +1,7 @@
 """Phase 1, Step 3: Frozen-target projection alignment.
 
-Step 3a - Text regurgitation: Frozen target LLM + frozen BgKIT,
-    only projection MLP trains. High volume, simple data.
+Step 3a - Text regurgitation: Frozen target LLM (Qwen3.5-35B) + frozen BgKIT,
+    only projection block trains. High volume, simple data.
 
 Step 3b - Content tasks: Unfreeze BgKIT at low LR. Train on description
     generation and structural QA through frozen target LLM.
