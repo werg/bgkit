@@ -387,12 +387,15 @@ class TestPhaseTransition:
 
 class TestOptimizerGroups:
     def test_optimizer_groups_projection_only(self):
-        """During projection-only phase, optimizer has 1 group (projection)."""
+        """During projection-only phase, optimizer covers only projection params."""
         t = _make_trainer(
             train_projection_block=True,
             projection_only_steps=100,
         )
-        assert len(t.optimizer.param_groups) == 1
+        # Muon may split into multiple sub-groups, but all params should be projection
+        all_opt_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
+        proj_params = {id(p) for p in t.encoder.projection_block.parameters() if p.requires_grad}
+        assert all_opt_params == proj_params
 
     def test_optimizer_groups_after_transition(self):
         """After transition with freeze_top_layer, optimizer has projection + decoder groups."""
@@ -402,14 +405,20 @@ class TestOptimizerGroups:
             freeze_top_layer=True,
             num_layers=4,
         )
-        # Before: 1 group (projection)
-        assert len(t.optimizer.param_groups) == 1
+        # Before: only projection params
+        pre_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
+        proj_params = {id(p) for p in t.encoder.projection_block.parameters() if p.requires_grad}
+        assert pre_params == proj_params
 
         t.global_step = 10
         t._maybe_end_projection_only()
 
-        # After: 1 projection + 3 trainable layers + 1 norm = 5 groups
-        assert len(t.optimizer.param_groups) == 5
+        # After: projection + decoder trainable params
+        post_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
+        dec_params = {id(p) for p in t.decoder.parameters() if p.requires_grad}
+        assert proj_params.issubset(post_params)
+        assert dec_params.issubset(post_params)
+        assert len(post_params) > len(pre_params)
 
     def test_optimizer_groups_no_projection(self):
         """Without projection training, optimizer has only decoder groups."""
@@ -418,8 +427,12 @@ class TestOptimizerGroups:
             freeze_top_layer=True,
             num_layers=4,
         )
-        # 3 trainable layers + 1 norm = 4 groups (no projection)
-        assert len(t.optimizer.param_groups) == 4
+        # All optimizer params should be decoder params only
+        all_opt_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
+        dec_params = {id(p) for p in t.decoder.parameters() if p.requires_grad}
+        proj_params = {id(p) for p in t.encoder.projection_block.parameters()}
+        assert all_opt_params == dec_params
+        assert not proj_params.intersection(all_opt_params)
 
     def test_projection_lr_custom(self):
         """Custom projection_lr should be used for projection param group."""

@@ -5,6 +5,7 @@
 # Layer 22 is DeltaNet (causal).
 # Layer 23 is full attention (ideal for bidirectional projection).
 phase: joint_block_pretrain
+optimizer: muon
 max_steps: 4000
 lr: 5.0e-6
 warmup_steps: 2100

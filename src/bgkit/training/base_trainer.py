@@ -140,7 +140,7 @@ class BaseTrainer(ABC):
         self._input_sources: dict[str, str] | None = None
         self._accum_steps = 1
         # Optimizer type: set from config, overridden by _create_optimizer()
-        self._optimizer_type: str = cfg.training.get("optimizer", "adamw")
+        self._optimizer_type: str = cfg.training.get("optimizer", "muon")
         self._muon_exclude_set: frozenset[int] = frozenset()
 
     @abstractmethod
@@ -196,7 +196,7 @@ class BaseTrainer(ABC):
         """
         import torch
 
-        optimizer_type = self.cfg.training.get("optimizer", "adamw")
+        optimizer_type = self.cfg.training.get("optimizer", "muon")
         self._optimizer_type = optimizer_type
         self._muon_exclude_set = exclude_from_muon or frozenset()
 
