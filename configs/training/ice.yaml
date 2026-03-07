@@ -1,6 +1,6 @@
 # ICE training configuration
 phase: ice
-max_steps: 45000
+max_steps: 90000
 lr: 3.0e-4
 warmup_steps: 1000
 # Uniform-output regularizer on random embeddings: log-spacing loss
