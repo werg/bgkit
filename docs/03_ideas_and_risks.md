@@ -107,14 +107,14 @@ These supplement the four core objectives in the training plan. Introduced after
 
 ### 3.1 Structured Format Content Extraction
 
-Documents in noisy structured formats are compressed at level 0, and the decoder reconstructs only the meaningful content:
+BgKIT compresses a noisy or verbose structured document, and the decoder reconstructs only the meaningful content. Teaches content-vs-noise discrimination. Differs from the existing description generation objective because the *input* to BgKIT is a transformed version of the file (not the original), and the *output* is structured (not natural language). Runs at level 0.
 
-- **HTML → plaintext:** Raw web pages stripped to article content.
-- **JSON → human-readable summary:** API responses and config files flattened or selectively extracted.
-- **Unix logs → salient events:** Routine entries discarded, errors and state changes preserved.
-- **Bash history → workflow summary:** Noise removed, meaningful workflow summarized.
+- **HTML → Markdown roundtrip:** Render Markdown files from repos to HTML, feed the HTML to BgKIT, decoder reconstructs the original Markdown. Fully synthetic from existing data (unlimited scale). Teaches stripping of HTML boilerplate, tags, and attributes.
+- **JSON/YAML → schema extraction:** Feed verbose config/data files to BgKIT, decoder produces a compact schema summary (key names, types, nesting structure). Scriptable target generation via parsing.
+- **SQL → DDL summary:** Feed SQL migration/schema files to BgKIT, decoder produces compact CREATE TABLE summaries. Regex-extractable targets.
+- **Unix logs → salient events:** Routine entries discarded, errors and state changes preserved. Hardest variant — ground truth for "salient" is subjective. Defer until the above are working.
 
-Provides clean signal for content-vs-noise discrimination. Runs primarily at level 0.
+Note: config file summarization (JSON/YAML/TOML → purpose description) is already covered by the existing description generation objective, which trains on config files alongside source code. No separate objective needed.
 
 ### 3.2 Web Search Summarization
 

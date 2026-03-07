@@ -50,7 +50,7 @@ These are just a few examples. Each knowledge domain is processed by the shared 
 - **Web search results** — query-guided compression of retrieved pages
 - **Past agent conversations** — interaction logs from prior sessions
 - **User memories** — accumulated facts about the user
-- **Structured and rote data** — HTML, JSON, logfiles to salient plaintext information
+- **Structured format extraction** — HTML→Markdown stripping, JSON/YAML→schema, SQL→DDL summaries, log→salient events
 
 Repository file contents are the focus of v1. Other sources are extensions using the same architecture.
 
