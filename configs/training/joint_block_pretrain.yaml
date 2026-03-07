@@ -17,7 +17,8 @@ w_proj: 1.0
 eval_every: 100
 save_every: 200
 max_batch_tokens: 32768
-max_eval_samples: 10000
+gradient_accumulation_steps: 4  # 4 micro-batches per optimizer step
+max_eval_samples: 3000
 prompt_variants_dir: configs/prompt_variants
 checkpoint_pruning:
   enabled: true

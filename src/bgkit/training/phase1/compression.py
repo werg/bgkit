@@ -1170,6 +1170,8 @@ class CompressionTrainer(BaseTrainer):
                     wandb_kwargs["id"] = wandb_run_id
                     wandb_kwargs["resume"] = "must"
                 wandb_run = wandb.init(**wandb_kwargs)
+                wandb.define_metric("trainer/step")
+                wandb.define_metric("*", step_metric="trainer/step")
             except ImportError:
                 logger.warning("wandb_not_installed")
 
@@ -1282,7 +1284,7 @@ class CompressionTrainer(BaseTrainer):
                     if step % 100 == 0:
                         logger.info("train_step", step=step, **metrics)
                     if wandb_run is not None:
-                        wandb_run.log(metrics, step=step)
+                        wandb_run.log({"trainer/step": step, **metrics})
 
                     # Eval
                     if eval_every > 0 and step > 0 and step % eval_every == 0:
@@ -1292,7 +1294,7 @@ class CompressionTrainer(BaseTrainer):
                         }
                         logger.info("eval", step=step, **eval_metrics)
                         if wandb_run is not None:
-                            wandb_run.log(eval_metrics, step=step)
+                            wandb_run.log({"trainer/step": step, **eval_metrics})
 
                         last_eval_metrics = eval_metrics
                         last_eval_step = step

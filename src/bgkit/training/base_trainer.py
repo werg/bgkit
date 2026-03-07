@@ -32,6 +32,58 @@ from bgkit.training.scheduling import cosine_with_warmup
 logger = structlog.get_logger()
 
 
+class _DevicePrefetcher:
+    """Prefetch dataloader batches to GPU on a background CUDA stream.
+
+    Overlaps host→device transfer with ongoing GPU compute so the next
+    batch is ready by the time the current forward/backward finishes.
+    Existing ``.to(device)`` calls in ``_forward_backward`` become no-ops
+    since the tensors are already on the target device.
+    """
+
+    def __init__(self, iterator, device):
+        import torch
+
+        self.iterator = iterator
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+        self._next_batch = None
+        self._prefetch()
+
+    def _to_device(self, batch):
+        import torch
+
+        return {
+            k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
+
+    def _prefetch(self):
+        try:
+            batch = next(self.iterator)
+        except StopIteration:
+            self._next_batch = None
+            return
+        if self.stream is None:
+            self._next_batch = batch
+            return
+        import torch
+
+        with torch.cuda.stream(self.stream):
+            self._next_batch = self._to_device(batch)
+
+    def __next__(self):
+        if self.stream is not None:
+            import torch
+
+            torch.cuda.current_stream().wait_stream(self.stream)
+        if self._next_batch is None:
+            raise StopIteration
+        batch = self._next_batch
+        self._prefetch()
+        return batch
+
+
 def _average_metrics(accum_metrics: list[dict[str, float]]) -> dict[str, float]:
     """Average metrics across accumulation micro-batches.
 
@@ -546,13 +598,18 @@ class BaseTrainer(ABC):
                     wandb_kwargs["resume"] = "must"
                     logger.info("wandb_resuming_run", run_id=wandb_run_id)
                 wandb_run = wandb.init(**wandb_kwargs)
+                wandb.define_metric("trainer/step")
+                wandb.define_metric("*", step_metric="trainer/step")
             except ImportError:
                 logger.warning("wandb_not_installed")
 
         # Sync sampler + dataset epoch before first iter (needed after resume)
         self._sync_epoch(self.epoch)
 
-        dataloader_iter = iter(self.train_dataloader)
+        device = getattr(self, "device", None)
+        dataloader_iter = _DevicePrefetcher(
+            iter(self.train_dataloader), device
+        ) if device is not None and hasattr(device, "type") else iter(self.train_dataloader)
 
         accum_steps = self._validate_accum_steps(
             tcfg.get("gradient_accumulation_steps", 1)
@@ -617,7 +674,12 @@ class BaseTrainer(ABC):
                         except StopIteration:
                             self.epoch += 1
                             self._sync_epoch(self.epoch)
-                            dataloader_iter = iter(self.train_dataloader)
+                            raw_iter = iter(self.train_dataloader)
+                            dataloader_iter = (
+                                _DevicePrefetcher(raw_iter, device)
+                                if device is not None and hasattr(device, "type")
+                                else raw_iter
+                            )
                             batch = next(dataloader_iter)
                         micro_metrics = self._forward_backward(batch)
                         accum_metrics.append(micro_metrics)
@@ -644,7 +706,7 @@ class BaseTrainer(ABC):
                     if step % 100 == 0:
                         logger.info("train_step", step=step, **metrics)
                     if wandb_run is not None:
-                        wandb_run.log(metrics, step=step)
+                        wandb_run.log({"trainer/step": step, **metrics})
 
                     # Eval
                     if eval_every > 0 and step > 0 and step % eval_every == 0:
@@ -654,7 +716,7 @@ class BaseTrainer(ABC):
                         }
                         logger.info("eval", step=step, **eval_metrics)
                         if wandb_run is not None:
-                            wandb_run.log(eval_metrics, step=step)
+                            wandb_run.log({"trainer/step": step, **eval_metrics})
 
                         last_eval_metrics = eval_metrics
                         last_eval_step = step
