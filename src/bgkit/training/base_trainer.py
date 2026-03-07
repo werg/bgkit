@@ -8,6 +8,7 @@ with bf16 autocast). Add Accelerate later for Phase 1/2.
 from __future__ import annotations
 
 import contextlib
+import math
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from pathlib import Path
@@ -259,6 +260,11 @@ class BaseTrainer(ABC):
         self.optimizer.zero_grad()
         metrics = self._forward_backward(batch)
         grad_norm = clip_grad_norm(self.trainable_parameters())
+        if not math.isfinite(grad_norm):
+            raise RuntimeError(
+                f"NaN/Inf grad_norm in train_step (grad_norm={grad_norm}). "
+                "This usually indicates a numerical stability issue."
+            )
         self.optimizer.step()
         metrics["grad_norm"] = grad_norm
         return metrics
@@ -450,9 +456,11 @@ class BaseTrainer(ABC):
         es_best: float | None = None
         es_evals_without_improvement = 0
 
-        # Resume from checkpoint: explicit path, or auto-resolve latest for this phase
+        # Resume from checkpoint: explicit path, "none" to disable, or auto-resolve
         resume_path = self.cfg.get("resume_checkpoint", None)
-        if resume_path is None:
+        if resume_path == "none":
+            resume_path = None  # explicitly disabled
+        elif resume_path is None:
             phase = getattr(tcfg, "phase", None)
             if phase:
                 auto_resolved = resolve_latest_checkpoint(checkpoint_dir, phase)
@@ -615,6 +623,12 @@ class BaseTrainer(ABC):
                         accum_metrics.append(micro_metrics)
 
                     grad_norm = clip_grad_norm(self.trainable_parameters())
+
+                    if not math.isfinite(grad_norm):
+                        raise RuntimeError(
+                            f"NaN/Inf grad_norm at step {step} (grad_norm={grad_norm}). "
+                            "This usually indicates a numerical stability issue."
+                        )
                     self.optimizer.step()
                     self._post_step(step)
 

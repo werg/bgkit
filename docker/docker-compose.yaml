@@ -14,6 +14,8 @@ x-gpu-common: &gpu-common
             capabilities: [gpu]
   environment:
     - HOME=/workspace
+    - HYDRA_FULL_ERROR=1
+    # Triton autotuner crash on sm_121 is handled by bgkit.utils.triton_patch
   volumes:
     - ${DATA_DIR}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache

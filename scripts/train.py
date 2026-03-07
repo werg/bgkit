@@ -8,8 +8,10 @@ from pathlib import Path
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
+from bgkit.utils.deltanet_patch import patch_gated_delta_rule_numerics
 from bgkit.utils.logging import setup_logging
 from bgkit.utils.reproducibility import set_seed
+from bgkit.utils.triton_patch import patch_triton_autotuner
 
 
 def _create_trainer(cfg: DictConfig):
@@ -40,6 +42,8 @@ def _create_trainer(cfg: DictConfig):
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig) -> None:
+    patch_triton_autotuner()
+    patch_gated_delta_rule_numerics()
     setup_logging()
     set_seed(cfg.seed)
 

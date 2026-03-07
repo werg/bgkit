@@ -20,18 +20,20 @@ RUN mkdir -p src/bgkit && \
     pip uninstall -y bgkit && \
     rm -rf src/
 
+# fla (flash-linear-attention): no patches needed — Triton codegen bugs (triton#3017, fla#607,
+# fla#734) are fixed in Triton 3.6.0 (bundled with NGC pytorch:26.01-py3).
+# Remaining numerical issue (backward NaN from extreme gate values) is handled at runtime
+# by bgkit.utils.deltanet_patch.
+
 # causal-conv1d: pre-built aarch64 wheel from GitHub Releases.
 # PyPI source builds fail on aarch64 (setup.py hardcodes linux_x86_64).
 # This wheel matches our NGC 26.01 + CUDA 13 + Python 3.12 environment.
 RUN pip install --no-cache-dir \
     "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.0/causal_conv1d-1.6.0%2Bcu13torch26.01cxx11abiTRUE-cp312-cp312-linux_aarch64.whl"
 
-# Verify key deps are importable (fla + causal-conv1d = full fast path
-# for Qwen3.5 DeltaNet layers: Triton gated_delta_rule, fused conv1d,
-# FusedRMSNormGated)
+# Verify key deps are importable
 RUN python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')" && \
     python -c "import accelerate; print(f'accelerate {accelerate.__version__}')" && \
-    python -c "from fla.ops.gated_delta_rule import chunk_gated_delta_rule; print('fla: gated_delta_rule OK')" && \
     python -c "from causal_conv1d import causal_conv1d_fn; print('causal_conv1d OK')"
 
 ENV PYTHONUNBUFFERED=1 \
