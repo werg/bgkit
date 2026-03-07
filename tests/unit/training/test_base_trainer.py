@@ -10,7 +10,7 @@ from bgkit.training.base_trainer import BaseTrainer, _average_metrics
 class TestAverageMetrics:
     def test_single_dict_passthrough(self):
         m = {"loss": 0.5, "grad_norm": 1.0}
-        assert _average_metrics([m]) is m
+        assert _average_metrics([m]) == m
 
     def test_multiple_dicts_averaged(self):
         result = _average_metrics([

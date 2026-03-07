@@ -87,10 +87,17 @@ class _DevicePrefetcher:
 def _average_metrics(accum_metrics: list[dict[str, float]]) -> dict[str, float]:
     """Average metrics across accumulation micro-batches.
 
-    Numeric values are averaged; non-numeric values take the last value.
+    Numeric values (including 0-dim CUDA tensors from _forward_backward)
+    are averaged.  A single ``.item()`` call at the end converts any
+    remaining tensors to Python floats — this is the only GPU sync point,
+    avoiding per-micro-batch synchronisation inside the accumulation loop.
     """
     if len(accum_metrics) == 1:
-        return accum_metrics[0]
+        m = accum_metrics[0]
+        return {
+            k: v.item() if hasattr(v, "item") else v
+            for k, v in m.items()
+        }
 
     result: dict[str, float] = {}
     keys = accum_metrics[0].keys()
@@ -98,6 +105,8 @@ def _average_metrics(accum_metrics: list[dict[str, float]]) -> dict[str, float]:
         values = [m[key] for m in accum_metrics if key in m]
         if values and isinstance(values[0], (int, float)):
             result[key] = sum(values) / len(values)
+        elif values and hasattr(values[0], "item"):
+            result[key] = (sum(v.item() for v in values)) / len(values)
         else:
             result[key] = values[-1] if values else 0.0
     return result
@@ -310,7 +319,10 @@ class BaseTrainer(ABC):
         _forward_backward() directly for accumulation support.
         """
         self.optimizer.zero_grad()
-        metrics = self._forward_backward(batch)
+        metrics = {
+            k: v.item() if hasattr(v, "item") else v
+            for k, v in self._forward_backward(batch).items()
+        }
         grad_norm = clip_grad_norm(self.trainable_parameters())
         if not math.isfinite(grad_norm):
             raise RuntimeError(

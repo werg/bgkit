@@ -372,6 +372,8 @@ class JointBlockTrainer(BaseTrainer):
         (fwd.loss / self._accum_steps).backward()
 
         # Cosine similarity metrics (content-only, matching targets)
+        # Return detached tensors — .item() is deferred to _average_metrics
+        # to avoid GPU sync between micro-batches in the accumulation loop.
         with torch.no_grad():
             mask_f = attention_mask.float()
             cos_repro = F.cosine_similarity(fwd.auto_repro_pred, target_repro, dim=-1)
@@ -381,11 +383,11 @@ class JointBlockTrainer(BaseTrainer):
             cos_proj_avg = (cos_proj * mask_f).sum() / mask_f.sum().clamp(min=1)
 
         return {
-            "loss": fwd.loss.item(),
-            "loss_repro": fwd.loss_repro.item(),
-            "loss_proj": fwd.loss_proj.item(),
-            "cosine_sim_repro": cos_repro_avg.item(),
-            "cosine_sim_proj": cos_proj_avg.item(),
+            "loss": fwd.loss.detach(),
+            "loss_repro": fwd.loss_repro.detach(),
+            "loss_proj": fwd.loss_proj.detach(),
+            "cosine_sim_repro": cos_repro_avg.detach(),
+            "cosine_sim_proj": cos_proj_avg.detach(),
         }
 
     @torch.no_grad()
