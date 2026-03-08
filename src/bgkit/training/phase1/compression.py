@@ -669,8 +669,14 @@ class CompressionTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """Run L0 per-file + collect survivors for one sample -> (total_surv, D).
 
+        Only runs the compressor (layers 0..N-2) for L0, not the full encoder.
+        The projection block is unnecessary here — L0 survivors are mapped back
+        to input embedding space via auto_repro for the subsequent L1 pass,
+        which will handle projection.
+
         Returns L0 survivors mapped back to input embedding space via auto_repro.
         """
+        compressor = self.encoder.compressor
         sample_survivors = []
         for f in range(n_files):
             f_ids = file_ids[f].unsqueeze(0)
@@ -679,19 +685,20 @@ class CompressionTrainer(BaseTrainer):
 
             s_mask = self._score_and_select(f_emb, f_mask)
 
-            enc_out = self.encoder(
-                input_embeddings=f_emb,
+            # Compressor only (skip projection block — it's wasted for L0
+            # intermediates that will go through L1 with projection afterwards)
+            comp_out = compressor(
+                f_emb,
                 survivor_mask=s_mask,
                 attention_mask=f_mask,
                 prompt_embeddings=prompt_emb,
                 prompt_attention_mask=prompt_mask,
             )
 
-            # Map L0 output back to input embedding space for L1
-            all_normed = enc_out.all_embeddings[0]
-            surv_mask_out = enc_out.survivor_mask[0]
-            survivor_normed = all_normed[surv_mask_out]
-            survivor_input_space = self.encoder.auto_reproduce(
+            # Extract L0 survivors from content-only normed embeddings
+            content_normed = comp_out.normed_embeddings[:, comp_out.content_slice, :]
+            survivor_normed = content_normed[0][s_mask[0]]
+            survivor_input_space = compressor.auto_reproduce(
                 survivor_normed.unsqueeze(0),
             )[0]
             sample_survivors.append(survivor_input_space)
@@ -699,7 +706,7 @@ class CompressionTrainer(BaseTrainer):
         if sample_survivors:
             return torch.cat(sample_survivors, dim=0)
         return torch.zeros(
-            1, self.encoder.compressor.hidden_dim,
+            1, compressor.hidden_dim,
             device=self.device, dtype=torch.bfloat16,
         )
 
@@ -824,7 +831,9 @@ class CompressionTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """Compute loss using the appropriate objective loss function.
 
-        Objective weighting is baked into dataset sizes (uniform average here).
+        All objectives receive loss_mask to ensure loss is computed only on
+        content tokens, excluding chat template markup, thinking blocks, tool
+        call XML, code fences, etc.
         """
         target_ids = batch["target_token_ids"].to(self.device)
         target_mask = batch["target_attention_mask"].to(self.device)
@@ -837,19 +846,7 @@ class CompressionTrainer(BaseTrainer):
         objective = objectives[0] if objectives else "data_reconstruction"
 
         loss_fn = _LOSS_FNS.get(objective, data_reconstruction_loss)
-
-        # data_reconstruction_loss takes loss_mask; others only take attention_mask
-        if objective == "data_reconstruction" and loss_mask is not None:
-            loss = loss_fn(logits, target_ids, target_mask, loss_mask=loss_mask)
-        else:
-            if loss_mask is not None:
-                # Combine attention mask with loss mask for non-DR objectives
-                combined_mask = target_mask * loss_mask
-                loss = loss_fn(logits, target_ids, combined_mask)
-            else:
-                loss = loss_fn(logits, target_ids, target_mask)
-
-        return loss
+        return loss_fn(logits, target_ids, target_mask, loss_mask=loss_mask)
 
     # ------------------------------------------------------------------
     # Decoder drift monitoring
@@ -1234,7 +1231,6 @@ class CompressionTrainer(BaseTrainer):
                         dataloader_iter = iter(self.train_dataloader)
 
                     # LR schedule
-                    lr = cosine_with_warmup(step, max_steps, warmup_steps, base_lr)
                     for pg in self.optimizer.param_groups:
                         group_base = pg.get("base_lr", base_lr)
                         pg["lr"] = cosine_with_warmup(
@@ -1501,8 +1497,12 @@ class CompressionTrainer(BaseTrainer):
                     )
                     loss = self._compute_loss(logits, batch)
 
-                target_mask = batch["target_attention_mask"]
-                batch_tokens = target_mask[:, 1:].sum().item()
+                # Weight by content tokens (loss_mask) not all tokens
+                eval_loss_mask = batch.get("target_loss_mask")
+                if eval_loss_mask is not None:
+                    batch_tokens = eval_loss_mask[:, 1:].sum().item()
+                else:
+                    batch_tokens = batch["target_attention_mask"][:, 1:].sum().item()
                 total_loss += loss.item() * batch_tokens
                 total_tokens += batch_tokens
 

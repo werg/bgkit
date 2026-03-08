@@ -774,15 +774,15 @@ class TestResolveStep1Checkpoint:
 
 class TestL0ToL1AutoRepro:
     def test_auto_reproduce_called_in_repo_batch(self, trainer):
-        """_compress_repo_batch should call auto_reproduce for L0→L1 handoff."""
+        """_compress_repo_batch should call compressor.auto_reproduce for L0→L1 handoff."""
         call_count = [0]
-        original = trainer.encoder.auto_reproduce
+        original = trainer.encoder.compressor.auto_reproduce
 
         def tracking_auto_repro(x):
             call_count[0] += 1
             return original(x)
 
-        trainer.encoder.auto_reproduce = tracking_auto_repro
+        trainer.encoder.compressor.auto_reproduce = tracking_auto_repro
         batch = _make_repo_batch(batch_size=1, n_files=2, file_len=8)
         trainer._compress_repo_batch(batch)
         # Should be called once per file
