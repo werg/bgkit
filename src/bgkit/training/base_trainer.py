@@ -713,7 +713,7 @@ class BaseTrainer(ABC):
                         )
 
                     # Log
-                    if step % 100 == 0:
+                    if step % 10 == 0:
                         logger.info("train_step", step=step, **metrics)
                     if wandb_run is not None:
                         wandb_run.log(metrics, step=step)

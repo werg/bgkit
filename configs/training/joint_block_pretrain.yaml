@@ -7,8 +7,8 @@
 phase: joint_block_pretrain
 optimizer: muon
 max_steps: 4000
-lr: 5.0e-6
-warmup_steps: 2100
+lr: 8.0e-5
+warmup_steps: 100
 reset_schedule: true
 # heads_only: true — only trains linear heads, freeze transformer blocks
 # false — also unfreezes the connected transformer blocks + norms
