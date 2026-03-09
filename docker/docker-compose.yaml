@@ -16,6 +16,8 @@ x-gpu-common: &gpu-common
     - HOME=/workspace
     - HYDRA_FULL_ERROR=1
     # Triton autotuner crash on sm_121 is handled by bgkit.utils.triton_patch
+    # Persist torch.compile cache across container restarts
+    - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
   volumes:
     - ${DATA_DIR}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
@@ -27,6 +29,9 @@ x-gpu-common: &gpu-common
     - ../scripts:/workspace/bgkit/scripts:ro
     # Wandb authenticates via netrc (machine api.wandb.ai).
     - ~/.netrc:/workspace/.netrc:ro
+    # Persist torch.compile (inductor) and Triton kernel caches across restarts
+    - bgkit-compile-cache:/workspace/.cache/torchinductor
+    - bgkit-triton-cache:/workspace/.triton
 
 x-llama-common: &llama-common
   build:
@@ -181,3 +186,7 @@ services:
       --max-model-len 32768
       --enable-prefix-caching
       --enable-chunked-prefill
+
+volumes:
+  bgkit-compile-cache:
+  bgkit-triton-cache:
