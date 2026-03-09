@@ -198,12 +198,11 @@ class DecoderInitTrainer(BaseTrainer):
         max_seq_len = self.cfg.data.tokens.get("max_seq_len", 8192)
         variant_bank_path = self.cfg.data.tokens.variant_bank_path
 
-        # QA dataset needs metadata for join; enable only when configured
         qa_data_dir = getattr(self.cfg.data, "qa_data_dir", None)
         qa_ratio = tcfg.get("qa_ratio", 0.0)
-        needs_metadata = bool(qa_data_dir and qa_ratio > 0)
         inner_dataset = MmapTokenDataset(
-            data_dir, max_seq_len=max_seq_len, include_metadata=needs_metadata,
+            data_dir, max_seq_len=max_seq_len,
+            include_metadata=True,  # ChatReproDataset needs file_path + language
         )
         full_dataset = ChatReproDataset(
             inner_dataset,
