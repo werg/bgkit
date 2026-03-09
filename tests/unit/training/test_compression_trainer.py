@@ -207,10 +207,6 @@ def trainer():
                 "calibrator_warmup_batches": 50,
                 "l1_calibrator_fast_batches": 200,
             },
-            "decoder": {
-                "drift_threshold": 0.5,
-                "drift_check_every": 5000,
-            },
         },
         "compute": {"num_workers": 0, "pin_memory": False},
         "wandb": {"enabled": False},
@@ -263,9 +259,6 @@ def trainer():
     t._l1_enabled = False
     t._l1_transitioned = False
     t._l1_rebuild_pending = False
-    t._drift_threshold = 0.5
-    t._drift_check_every = 5000
-    t._lora_active = False
     t._eval_count = 0
 
     return t
@@ -729,9 +722,9 @@ class TestScoreAndSelect:
 
 
 class TestResolveStep1Checkpoint:
-    def test_auto_calls_resolve_checkpoint(self, trainer):
-        """step1_checkpoint='auto' should call resolve_checkpoint with correct args."""
-        from unittest.mock import patch
+    def test_auto_prefers_commit_encoding(self, trainer):
+        """Auto should try commit_encoding first, then phase1_step1."""
+        from unittest.mock import MagicMock, patch
 
         from omegaconf import OmegaConf
         trainer.cfg = OmegaConf.merge(trainer.cfg, {
@@ -739,20 +732,70 @@ class TestResolveStep1Checkpoint:
             "checkpoint_dir": "/tmp/ckpts",
         })
 
+        mock_registry = MagicMock()
+        mock_entry = MagicMock()
+        mock_entry.name = "commit_encoding_step10000_20260301"
+        mock_registry.best.return_value = mock_entry
+
         with patch(
-            "bgkit.training.phase1.compression.resolve_checkpoint",
-            return_value=Path("/tmp/ckpts/phase1_step1_step5000_20260224"),
-        ) as mock_resolve:
+            "bgkit.training.phase1.compression.CheckpointRegistry",
+            return_value=mock_registry,
+        ):
             result = trainer._resolve_step1_checkpoint()
 
-        mock_resolve.assert_called_once_with(
-            Path("/tmp/ckpts"),
-            phase="phase1_step1",
-            metric="eval/loss",
-            label="step1_checkpoint",
+        # Should try commit_encoding first
+        mock_registry.best.assert_called_once_with(
+            phase="commit_encoding", metric="eval/loss",
+            lower_is_better=True,
         )
+        assert result == "/tmp/ckpts/commit_encoding_step10000_20260301"
+        assert trainer._input_sources["step1"] == "commit_encoding_step10000_20260301"
+
+    def test_auto_falls_back_to_phase1_step1(self, trainer):
+        """Auto should fall back to phase1_step1 when no commit_encoding exists."""
+        from unittest.mock import MagicMock, patch
+
+        from omegaconf import OmegaConf
+        trainer.cfg = OmegaConf.merge(trainer.cfg, {
+            "step1_checkpoint": "auto",
+            "checkpoint_dir": "/tmp/ckpts",
+        })
+
+        mock_registry = MagicMock()
+        mock_step1_entry = MagicMock()
+        mock_step1_entry.name = "phase1_step1_step5000_20260224"
+        # First call (commit_encoding) returns None, second (phase1_step1) returns entry
+        mock_registry.best.side_effect = [None, mock_step1_entry]
+
+        with patch(
+            "bgkit.training.phase1.compression.CheckpointRegistry",
+            return_value=mock_registry,
+        ):
+            result = trainer._resolve_step1_checkpoint()
+
         assert result == "/tmp/ckpts/phase1_step1_step5000_20260224"
         assert trainer._input_sources["step1"] == "phase1_step1_step5000_20260224"
+
+    def test_auto_raises_when_no_checkpoint(self, trainer):
+        """Auto should raise when neither phase has checkpoints."""
+        from unittest.mock import MagicMock, patch
+
+        import pytest
+        from omegaconf import OmegaConf
+        trainer.cfg = OmegaConf.merge(trainer.cfg, {
+            "step1_checkpoint": "auto",
+            "checkpoint_dir": "/tmp/ckpts",
+        })
+
+        mock_registry = MagicMock()
+        mock_registry.best.return_value = None
+
+        with patch(
+            "bgkit.training.phase1.compression.CheckpointRegistry",
+            return_value=mock_registry,
+        ):
+            with pytest.raises(ValueError, match="no commit_encoding or phase1_step1"):
+                trainer._resolve_step1_checkpoint()
 
     def test_explicit_path_passthrough(self, trainer):
         """Explicit path should pass through and populate _input_sources."""

@@ -10,8 +10,7 @@ Curriculum: L0 objectives first, then L1 once L0 stabilizes.
 Survivor selection: deterministic top-k by live ICE scoring with threshold.
 
 The BgKIT encoder and decoder are both trainable (key change from Step 1
-where BgKIT was frozen). ICE model remains frozen. Decoder drift monitoring
-triggers LoRA fallback if embeddings deviate too far from the token manifold.
+where BgKIT was frozen). ICE model remains frozen.
 """
 
 from __future__ import annotations
@@ -28,7 +27,6 @@ from bgkit.data.datasets.compression_dataset import CompressionDataset
 from bgkit.data.samplers import LengthSortedBatchSampler
 from bgkit.data.survivor_selection import fill_survivor_gaps, select_survivors_by_threshold
 from bgkit.data.threshold_calibrator import ThresholdCalibrator
-from bgkit.eval.metrics.embedding_health import embedding_drift_metrics
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer, _average_metrics
@@ -70,7 +68,6 @@ class CompressionTrainer(BaseTrainer):
 
     LIVE_CONFIG_FIELDS = {
         "max_survivor_gap": "_max_gap",
-        "drift_threshold": "_drift_threshold",
     }
 
     def setup(self) -> None:
@@ -312,12 +309,6 @@ class CompressionTrainer(BaseTrainer):
         # Eval isolation flag
         self._is_evaluating = False
 
-        # --- Decoder drift monitoring ---
-        decoder_cfg_section = tcfg.get("decoder", {})
-        self._drift_threshold = decoder_cfg_section.get("drift_threshold", 0.5)
-        self._drift_check_every = decoder_cfg_section.get("drift_check_every", 5000)
-        self._lora_active = False
-
         # --- Metric tracking ---
         self._eval_count = 0
 
@@ -330,23 +321,59 @@ class CompressionTrainer(BaseTrainer):
         )
 
     def _resolve_step1_checkpoint(self) -> str | None:
-        """Resolve step1_checkpoint config: 'auto' -> best phase1_step1, explicit -> pass.
+        """Resolve step1_checkpoint config with fallback chain.
 
-        Also populates self._input_sources["step1"] for lineage tracking.
+        Auto-resolution order:
+        1. commit_encoding phase (more trained, has L0+L1 experience)
+        2. phase1_step1 (frozen encoder pretraining)
+
+        Both phases produce the same multi-artifact checkpoint layout
+        (encoder.pt + decoder.pt), so no loading changes needed.
         """
         step1_checkpoint = self.cfg.get("step1_checkpoint", None)
+
+        # Initialize lineage tracking
+        self._input_sources = {}
+
         if step1_checkpoint == "auto":
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
-            resolved = resolve_checkpoint(
-                checkpoint_dir,
-                phase="phase1_step1",
-                metric="eval/loss",
-                label="step1_checkpoint",
-            )
-            step1_checkpoint = str(resolved)
+            registry = CheckpointRegistry(checkpoint_dir)
+            registry.backfill(checkpoint_dir)
 
-        # Track lineage for BOTH auto-resolved and explicit paths
-        self._input_sources = {}
+            # 1. Try commit_encoding first
+            best = registry.best(
+                phase="commit_encoding", metric="eval/loss",
+                lower_is_better=True,
+            )
+            if best is not None:
+                step1_checkpoint = str(checkpoint_dir / best.name)
+                self._input_sources["step1"] = best.name
+                logger.info(
+                    "step1_auto_resolved_commit_encoding",
+                    checkpoint=best.name,
+                )
+                return step1_checkpoint
+
+            # 2. Fall back to phase1_step1
+            best = registry.best(
+                phase="phase1_step1", metric="eval/loss",
+                lower_is_better=True,
+            )
+            if best is not None:
+                step1_checkpoint = str(checkpoint_dir / best.name)
+                self._input_sources["step1"] = best.name
+                logger.info(
+                    "step1_auto_resolved_phase1_step1",
+                    checkpoint=best.name,
+                )
+                return step1_checkpoint
+
+            raise ValueError(
+                "step1_checkpoint=auto but no commit_encoding or phase1_step1 "
+                "checkpoint found. Run one of those phases first."
+            )
+
+        # Explicit path always wins
         if step1_checkpoint is not None:
             self._input_sources["step1"] = Path(step1_checkpoint).name
 
@@ -849,99 +876,14 @@ class CompressionTrainer(BaseTrainer):
         return loss_fn(logits, target_ids, target_mask, loss_mask=loss_mask)
 
     # ------------------------------------------------------------------
-    # Decoder drift monitoring
-    # ------------------------------------------------------------------
-
-    def _check_decoder_drift(self, survivors: torch.Tensor) -> None:
-        """Check for decoder embedding drift and apply LoRA fallback if needed."""
-        if self.global_step % self._drift_check_every != 0 or self.global_step == 0:
-            return
-
-        token_emb = (
-            self.encoder.compressor.backbone.get_input_embeddings().weight.detach()
-        )
-        metrics = embedding_drift_metrics(survivors.detach(), token_emb)
-
-        logger.info(
-            "decoder_drift_check",
-            step=self.global_step,
-            mean_sim=metrics["mean_max_cosine_sim"],
-            threshold=self._drift_threshold,
-        )
-
-        if metrics["mean_max_cosine_sim"] < self._drift_threshold and not self._lora_active:
-            logger.warning(
-                "decoder_drift_detected",
-                mean_sim=metrics["mean_max_cosine_sim"],
-                threshold=self._drift_threshold,
-            )
-            self._apply_lora_fallback()
-
-    def _apply_lora_fallback(self, rebuild_optimizer: bool = True) -> None:
-        """Switch decoder from full fine-tuning to high-rank LoRA.
-
-        Args:
-            rebuild_optimizer: Whether to rebuild the optimizer after applying
-                LoRA. Set False during checkpoint restore (optimizer is loaded
-                from checkpoint separately).
-        """
-        try:
-            from peft import LoraConfig, get_peft_model
-
-            lora_config = LoraConfig(
-                r=64,
-                lora_alpha=128,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-                lora_dropout=0.05,
-                bias="none",
-            )
-            self.decoder.backbone = get_peft_model(self.decoder.backbone, lora_config)
-            self._lora_active = True
-
-            # Freeze non-LoRA decoder params
-            for name, param in self.decoder.backbone.named_parameters():
-                if "lora_" not in name:
-                    param.requires_grad_(False)
-
-            # Rebuild optimizer with new params (skip during checkpoint restore)
-            if rebuild_optimizer:
-                self._setup_optimizer()
-
-            logger.info(
-                "lora_fallback_applied",
-                step=self.global_step,
-                lora_params=sum(
-                    p.numel()
-                    for p in self.decoder.backbone.parameters()
-                    if p.requires_grad
-                ),
-            )
-        except ImportError:
-            logger.warning(
-                "lora_fallback_skipped",
-                reason="peft not installed",
-            )
-
-    # ------------------------------------------------------------------
     # Train step
     # ------------------------------------------------------------------
 
     def trainable_parameters(self) -> list:
         return self._trainable_params()
 
-    def train_step(self, batch: dict) -> dict[str, float]:
-        """Override base train_step to add drift check after optimizer step."""
-        self._last_survivors = None
-        metrics = super().train_step(batch)
-        if self._last_survivors is not None:
-            self._check_decoder_drift(self._last_survivors)
-        return metrics
-
     def _forward_backward(self, batch: dict) -> dict[str, float]:
-        """Forward pass + scaled backward. No optimizer ops.
-
-        Stashes survivors on self._last_survivors for post-step drift check.
-        """
+        """Forward pass + scaled backward. No optimizer ops."""
         self.encoder.train()
         self.decoder.train()
 
@@ -977,9 +919,6 @@ class CompressionTrainer(BaseTrainer):
 
         # Scaled backward (for gradient accumulation)
         (loss / self._accum_steps).backward()
-
-        # Stash survivors for post-step drift check
-        self._last_survivors = survivors.detach()
 
         target_ratio = self._current_target_ratio()
         n_survivors = int(survivor_mask.sum().item())
@@ -1035,9 +974,6 @@ class CompressionTrainer(BaseTrainer):
 
         # Scaled backward (for gradient accumulation)
         (loss / self._accum_steps).backward()
-
-        # Stash survivors for post-step drift check (use repo portion)
-        self._last_survivors = repo_survivors.detach()
 
         target_ratio = self._current_target_ratio()
         total_survivors = int(file_mask.sum().item()) + int(repo_mask.sum().item())
@@ -1183,7 +1119,6 @@ class CompressionTrainer(BaseTrainer):
             tcfg.get("gradient_accumulation_steps", 1)
         )
         self._accum_steps = accum_steps
-        self._last_survivors = None
 
         logger.info(
             "training_start",
@@ -1260,10 +1195,6 @@ class CompressionTrainer(BaseTrainer):
                         )
                     self.optimizer.step()
                     self.encoder.step_bidi_warmup()
-
-                    # Drift check AFTER optimizer step (can rebuild optimizer)
-                    if self._last_survivors is not None:
-                        self._check_decoder_drift(self._last_survivors)
 
                     metrics = _average_metrics(accum_metrics)
                     metrics["grad_norm"] = grad_norm
@@ -1444,7 +1375,6 @@ class CompressionTrainer(BaseTrainer):
             "l1_enabled": self._l1_enabled,
             "l1_transitioned": self._l1_transitioned,
             "l1_rebuild_pending": self._l1_rebuild_pending,
-            "lora_active": self._lora_active,
             "l1_batches_seen": self._l1_batches_seen,
             "target_ratio_override": self._target_ratio_override,
         }
@@ -1466,8 +1396,6 @@ class CompressionTrainer(BaseTrainer):
             total_tokens = 0.0
             per_objective_loss: dict[str, float] = {}
             per_objective_count: dict[str, int] = {}
-
-            all_survivors: list[torch.Tensor] = []
 
             num_batches = len(self.eval_dataloader)
             for batch_idx, batch in enumerate(self.eval_dataloader):
@@ -1513,15 +1441,6 @@ class CompressionTrainer(BaseTrainer):
                     per_objective_loss[obj] = per_objective_loss.get(obj, 0.0) + loss.item()
                     per_objective_count[obj] = per_objective_count.get(obj, 0) + 1
 
-                # Collect survivors for drift metrics
-                total_vecs = sum(s.size(0) for s in all_survivors)
-                if total_vecs < 512:
-                    flat = survivors[survivor_mask].detach() if survivor_mask is not None else (
-                        survivors.reshape(-1, survivors.size(-1)).detach()
-                    )
-                    remaining = 512 - total_vecs
-                    all_survivors.append(flat[:remaining])
-
             avg_loss = total_loss / max(total_tokens, 1)
             perplexity = torch.exp(torch.tensor(avg_loss)).item()
 
@@ -1534,16 +1453,6 @@ class CompressionTrainer(BaseTrainer):
             for obj, total in per_objective_loss.items():
                 count = per_objective_count.get(obj, 1)
                 metrics[f"{obj}_loss"] = total / count
-
-            # Embedding drift metrics
-            if all_survivors:
-                combined = torch.cat(all_survivors, dim=0)
-                token_emb = (
-                    self.encoder.compressor.backbone.get_input_embeddings().weight.detach()
-                )
-                health = embedding_drift_metrics(combined, token_emb)
-                metrics["mean_max_cosine_sim"] = health["mean_max_cosine_sim"]
-                metrics["std_max_cosine_sim"] = health["std_max_cosine_sim"]
         finally:
             self._is_evaluating = False
             self.encoder.train()
@@ -1567,7 +1476,6 @@ class CompressionTrainer(BaseTrainer):
             "l1_enabled": self._l1_enabled,
             "l1_transitioned": self._l1_transitioned,
             "l1_rebuild_pending": self._l1_rebuild_pending,
-            "lora_active": self._lora_active,
             "l1_batches_seen": self._l1_batches_seen,
             "target_ratio_override": self._target_ratio_override,
         })
@@ -1614,16 +1522,10 @@ class CompressionTrainer(BaseTrainer):
             self._l1_enabled = ts.get("l1_enabled", False)
             self._l1_transitioned = ts.get("l1_transitioned", False)
             self._l1_rebuild_pending = ts.get("l1_rebuild_pending", False)
-            self._lora_active = ts.get("lora_active", False)
             self._l1_batches_seen = ts.get("l1_batches_seen", 0)
             if self._l1_batches_seen >= self._l1_calibrator_fast_batches:
                 self._l1_calibrator.set_decay(self._l1_calibrator_slow_decay)
             self._target_ratio_override = ts.get("target_ratio_override")
-
-        # If LoRA was active when checkpoint was saved, apply LoRA wrapper
-        # to the decoder BEFORE loading state dict (which contains LoRA keys).
-        if self._lora_active:
-            self._apply_lora_fallback(rebuild_optimizer=False)
 
         # Restore model weights
         if "encoder" in state_dicts:

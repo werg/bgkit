@@ -112,6 +112,25 @@ TOOL_CONFIGS: dict[str, ChatTemplateConfig] = {
         },
         content_in_code_fence=False,
     ),
+    "commit_encoding": ChatTemplateConfig(
+        tool_name="bgkit_reproduce_commit",
+        tool_description="Reproduce a commit from BgKIT compressed repository context.",
+        tool_parameters={
+            "type": "object",
+            "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "Repository identifier",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Instructions for reproducing the commit",
+                },
+            },
+            "required": ["repo", "prompt"],
+        },
+        content_in_code_fence=False,
+    ),
     "file_read_query": ChatTemplateConfig(
         tool_name="bgkit_read_file",
         tool_description="Read and analyze file contents from BgKIT compressed context.",

@@ -1,0 +1,9 @@
+# @package _global_
+# Experiment preset: Commit encoding (two-level L0+L1)
+defaults:
+  - /config
+  - /training/commit_encoding
+  - _self_
+
+run_name: commit_encoding
+step1_checkpoint: auto

@@ -21,3 +21,12 @@ commits:
     max_commits_per_repo: 200
     max_repos: null
     tokenizer_name: Qwen/Qwen3.5-0.8B
+  # Commit encoding data: per-file diffs + full commit for two-level compression
+  commit_encoding:
+    enabled: true
+    tokenizer_name: Qwen/Qwen3.5-0.8B
+    output_dir: ${oc.env:DATA_DIR}/processed/commit_encoding
+    max_diff_tokens_per_file: 4096
+    max_diff_tokens: 8192
+    max_commits_per_repo: 200
+    max_repos: null

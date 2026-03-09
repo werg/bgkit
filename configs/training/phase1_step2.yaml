@@ -31,10 +31,6 @@ curriculum:
   calibrator_warmup_batches: 50
   l1_calibrator_fast_batches: 200
 
-decoder:
-  drift_threshold: 0.5
-  drift_check_every: 5000
-
 freeze:
   bgkit: false
   decoder: false

@@ -87,6 +87,10 @@ services:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_step1"]
 
+  train-commit-encoding:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=commit_encoding"]
+
   train-phase1-step2:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_step2"]

@@ -7,7 +7,7 @@ export
 # reading the file itself for ${VAR} interpolation in the YAML).
 DC := docker compose --env-file .env -f docker/docker-compose.yaml
 
-.PHONY: install install-gpu test test-unit test-gpu test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits convert-tokens convert-structural convert-descriptions convert-commits generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full prepare-data-all
+.PHONY: install install-gpu test test-unit test-gpu test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-commit-encoding train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits prepare-commit-encoding convert-tokens convert-structural convert-descriptions convert-commits convert-commit-encoding generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full prepare-data-all
 
 install:
 	uv sync --extra dev --extra data
@@ -67,6 +67,9 @@ train-ice:
 
 train-phase1-step1:
 	scripts/run-train.sh train-phase1-step1
+
+train-commit-encoding:
+	scripts/run-train.sh train-commit-encoding
 
 train-phase1-step2:
 	scripts/run-train.sh train-phase1-step2
@@ -140,6 +143,9 @@ generate-descriptions: vllm-server
 extract-commits:
 	.venv/bin/python scripts/process_commit_repro.py $(ARGS)
 
+prepare-commit-encoding:
+	.venv/bin/python scripts/prepare_commit_encoding_data.py $(ARGS)
+
 convert-tokens:
 	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
 	.venv/bin/python scripts/convert_tokens_to_npy.py \
@@ -159,6 +165,11 @@ convert-commits:
 	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
 	.venv/bin/python scripts/convert_commits_to_npy.py \
 		--input-dir $(DATA_DIR)/processed/commit_reproduction/
+
+convert-commit-encoding:
+	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
+	.venv/bin/python scripts/convert_commit_encoding_to_npy.py \
+		--input-dir $(DATA_DIR)/processed/commit_encoding/
 
 prepare-data:
 	scripts/prepare-data.sh $(ARGS)
