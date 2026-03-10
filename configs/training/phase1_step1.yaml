@@ -17,7 +17,7 @@ max_batch_tokens: 16384
 gradient_accumulation_steps: 4    # 16K × 4 = 64K effective tokens per step
 max_eval_samples: 2000
 eval_every: 200
-save_every: 1000
+save_every: 400
 # Train projection block alongside decoder (bridge between compressor and decoder)
 train_projection_block: true
 projection_only_steps: 200     # warmup: train only projection before unfreezing decoder
