@@ -636,10 +636,14 @@ class BaseTrainer(ABC):
         )
 
         # Live config (file-based HP control)
+        # Clear stale control file so ad-hoc changes don't carry across runs.
         control_file = self.cfg.get("control_file", None)
         if control_file is None:
             control_file = checkpoint_dir / "control.json"
-        live_config = LiveConfig(Path(control_file))
+        control_path = Path(control_file)
+        if control_path.exists():
+            control_path.write_text("{}\n")
+        live_config = LiveConfig(control_path)
 
         # Checkpoint pruning
         prune_cfg = tcfg.get("checkpoint_pruning", {})
