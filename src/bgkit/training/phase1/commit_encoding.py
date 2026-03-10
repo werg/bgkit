@@ -110,12 +110,8 @@ class CommitEncodingTrainer(BaseTrainer):
 
         enable_gradient_checkpointing(self.decoder.backbone)
 
-        # torch.compile for speedup
-        try:
-            self.decoder.backbone = torch.compile(self.decoder.backbone)
-            logger.info("torch_compile_decoder_enabled")
-        except Exception:
-            logger.warning("torch_compile_decoder_failed", exc_info=True)
+        # torch.compile disabled: dynamic batch shapes cause continuous recompilation
+        # on sm_121. See decoder_init.py for details.
 
         # BaseTrainer uses self.model for logging
         self.model = self.decoder

@@ -173,13 +173,9 @@ class DecoderInitTrainer(BaseTrainer):
 
         enable_gradient_checkpointing(self.decoder.backbone)
 
-        # torch.compile: ~15-30% speedup on Blackwell. If compile fails on sm_121,
-        # remove this line -- training is correct without it.
-        try:
-            self.decoder.backbone = torch.compile(self.decoder.backbone)
-            logger.info("torch_compile_enabled")
-        except Exception:
-            logger.warning("torch_compile_failed", exc_info=True)
+        # torch.compile disabled: dynamic batch shapes from variable-length batching
+        # cause continuous recompilation on sm_121, spending >95% of time in codegen.
+        # Re-enable once torch.compile supports dynamic shapes without recompilation.
 
         # BaseTrainer logging/device logic uses self.model
         self.model = self.decoder
