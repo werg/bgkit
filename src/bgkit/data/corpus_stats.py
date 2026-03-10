@@ -18,7 +18,6 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 
 from bgkit.data.repo_processing import extract_repo_snapshot
-from bgkit.utils.git_utils import is_git_repo
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +131,7 @@ def process_corpus(
     max_repos: int | None = None,
     language_allowlist: set[str] | None = None,
     max_tokens_per_repo: int | None = None,
+    shuffle_seed: int | None = None,
 ) -> CorpusStats:
     """Tokenize all repos and write manifest + token shards.
 
@@ -165,16 +165,8 @@ def process_corpus(
     repos_in_shard = 0
 
     # Collect all repo paths
-    repo_paths: list[Path] = []
-    for owner_dir in sorted(repos_path.iterdir()):
-        if not owner_dir.is_dir():
-            continue
-        for repo_dir in sorted(owner_dir.iterdir()):
-            if is_git_repo(repo_dir):
-                repo_paths.append(repo_dir)
-
-    if max_repos is not None:
-        repo_paths = repo_paths[:max_repos]
+    from bgkit.utils.git_utils import collect_repo_paths
+    repo_paths = collect_repo_paths(repos_path, max_repos=max_repos, shuffle_seed=shuffle_seed)
 
     log.info("Processing %d repos from %s", len(repo_paths), repos_dir)
 

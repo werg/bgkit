@@ -34,25 +34,19 @@ from bgkit.data.structural.serializer import (
     serialize_module_summary,
     serialize_skeleton,
 )
-from bgkit.utils.git_utils import is_git_repo
 
 logger = structlog.get_logger()
 
 
-def collect_repo_paths(repos_dir: Path, max_repos: int | None = None) -> list[Path]:
-    """Collect all repo paths sorted deterministically."""
-    repo_paths: list[Path] = []
-    for owner_dir in sorted(repos_dir.iterdir()):
-        if not owner_dir.is_dir():
-            continue
-        for repo_dir in sorted(owner_dir.iterdir()):
-            if is_git_repo(repo_dir):
-                repo_paths.append(repo_dir)
+def collect_repo_paths(
+    repos_dir: Path,
+    max_repos: int | None = None,
+    shuffle_seed: int | None = None,
+) -> list[Path]:
+    """Collect all repo paths, optionally shuffled to avoid alphabetical bias."""
+    from bgkit.utils.git_utils import collect_repo_paths as _collect
 
-    if max_repos is not None:
-        repo_paths = repo_paths[:max_repos]
-
-    return repo_paths
+    return _collect(repos_dir, max_repos=max_repos, shuffle_seed=shuffle_seed)
 
 
 def _get_module_paths(skeletons: list) -> list[str]:
@@ -206,6 +200,10 @@ def main() -> None:
         "--workers", type=int, default=min(os.cpu_count() or 4, 8),
         help="Number of parallel workers (default: min(cpu_count, 8))",
     )
+    parser.add_argument(
+        "--shuffle-seed", type=int, default=42,
+        help="Seed for shuffling repo order (avoids alphabetical bias on partial runs)",
+    )
     args = parser.parse_args()
 
     structlog.configure(
@@ -223,7 +221,7 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    repo_paths = collect_repo_paths(args.repos_dir, args.max_repos)
+    repo_paths = collect_repo_paths(args.repos_dir, args.max_repos, shuffle_seed=args.shuffle_seed)
     logger.info("collected_repos", count=len(repo_paths))
 
     # Track stats

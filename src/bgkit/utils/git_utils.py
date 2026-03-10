@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import random
 import re
+from pathlib import Path
 
 import pygit2
 
@@ -20,6 +22,39 @@ def is_git_repo(path: str | os.PathLike) -> bool:
         return True
     except pygit2.GitError:
         return False
+
+
+def collect_repo_paths(
+    repos_dir: str | os.PathLike,
+    max_repos: int | None = None,
+    shuffle_seed: int | None = None,
+) -> list[Path]:
+    """Collect all git repo paths under *repos_dir* (owner/repo structure).
+
+    Args:
+        repos_dir: Root directory containing owner/repo subdirectories.
+        max_repos: If set, return at most this many repos.
+        shuffle_seed: If set, deterministically shuffle the repo list before
+            truncating to *max_repos*.  Without this, repos are returned in
+            alphabetical order — which biases partial runs toward names early
+            in the alphabet.
+    """
+    repos_dir = Path(repos_dir)
+    repo_paths: list[Path] = []
+    for owner_dir in sorted(repos_dir.iterdir()):
+        if not owner_dir.is_dir():
+            continue
+        for repo_dir in sorted(owner_dir.iterdir()):
+            if is_git_repo(repo_dir):
+                repo_paths.append(repo_dir)
+
+    if shuffle_seed is not None:
+        random.Random(shuffle_seed).shuffle(repo_paths)
+
+    if max_repos is not None:
+        repo_paths = repo_paths[:max_repos]
+
+    return repo_paths
 
 
 def get_file_at_commit(repo_path: str, commit_sha: str, file_path: str) -> str | None:

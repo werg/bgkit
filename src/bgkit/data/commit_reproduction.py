@@ -22,7 +22,6 @@ from tqdm import tqdm
 from bgkit.data.commit_extraction import ExtractedCommit, extract_commits
 from bgkit.data.commit_filters import CommitFilterConfig
 from bgkit.data.commit_serialization import serialize_and_tokenize_commit
-from bgkit.utils.git_utils import is_git_repo
 
 log = logging.getLogger(__name__)
 
@@ -55,20 +54,15 @@ def _cap_commits(
     return commits[:max_commits]
 
 
-def _collect_repo_paths(repos_dir: Path, max_repos: int | None = None) -> list[Path]:
-    """Collect all repo paths sorted deterministically."""
-    repo_paths: list[Path] = []
-    for owner_dir in sorted(repos_dir.iterdir()):
-        if not owner_dir.is_dir():
-            continue
-        for repo_dir in sorted(owner_dir.iterdir()):
-            if is_git_repo(repo_dir):
-                repo_paths.append(repo_dir)
+def _collect_repo_paths(
+    repos_dir: Path,
+    max_repos: int | None = None,
+    shuffle_seed: int | None = None,
+) -> list[Path]:
+    """Collect all repo paths, optionally shuffled to avoid alphabetical bias."""
+    from bgkit.utils.git_utils import collect_repo_paths
 
-    if max_repos is not None:
-        repo_paths = repo_paths[:max_repos]
-
-    return repo_paths
+    return collect_repo_paths(repos_dir, max_repos=max_repos, shuffle_seed=shuffle_seed)
 
 
 def _find_completed_shard_batches(output_dir: Path) -> set[int]:
@@ -164,7 +158,7 @@ def process_commit_reproduction(
 
     prefer_cross_file = filter_config.prefer_cross_file
 
-    repo_paths = _collect_repo_paths(repos_path, max_repos)
+    repo_paths = _collect_repo_paths(repos_path, max_repos, shuffle_seed=seed)
     log.info("Processing %d repos from %s", len(repo_paths), repos_dir)
 
     # Verify repo list + content consistency for resume safety.

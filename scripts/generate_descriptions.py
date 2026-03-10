@@ -32,7 +32,6 @@ import structlog
 from bgkit.data.repo_processing import extract_repo_snapshot
 from bgkit.inference import InferenceConfig, LlamaClient
 from bgkit.inference.models import resolve_profile
-from bgkit.utils.git_utils import is_git_repo
 
 logger = structlog.get_logger()
 
@@ -494,20 +493,15 @@ def build_repo_prompt(
 # Repo-level processing
 # ---------------------------------------------------------------------------
 
-def collect_repo_paths(repos_dir: Path, max_repos: int | None = None) -> list[Path]:
-    """Collect all repo paths sorted deterministically."""
-    repo_paths: list[Path] = []
-    for owner_dir in sorted(repos_dir.iterdir()):
-        if not owner_dir.is_dir():
-            continue
-        for repo_dir in sorted(owner_dir.iterdir()):
-            if is_git_repo(repo_dir):
-                repo_paths.append(repo_dir)
+def collect_repo_paths(
+    repos_dir: Path,
+    max_repos: int | None = None,
+    shuffle_seed: int | None = None,
+) -> list[Path]:
+    """Collect all repo paths, optionally shuffled to avoid alphabetical bias."""
+    from bgkit.utils.git_utils import collect_repo_paths as _collect
 
-    if max_repos is not None:
-        repo_paths = repo_paths[:max_repos]
-
-    return repo_paths
+    return _collect(repos_dir, max_repos=max_repos, shuffle_seed=shuffle_seed)
 
 
 def _load_structural_skeletons(structural_dir: Path, rel_key: str) -> dict[str, str]:
@@ -870,6 +864,10 @@ def main() -> None:
         "--workers", type=int, default=12,
         help="Number of parallel workers (default: 12)",
     )
+    parser.add_argument(
+        "--shuffle-seed", type=int, default=42,
+        help="Seed for shuffling repo order (avoids alphabetical bias on partial runs)",
+    )
     args = parser.parse_args()
 
     structlog.configure(
@@ -908,7 +906,7 @@ def main() -> None:
     if args.backend == "mixed":
         backend_cycle = itertools.cycle(["haiku", "local"])
 
-    repo_paths = collect_repo_paths(args.repos_dir, args.max_repos)
+    repo_paths = collect_repo_paths(args.repos_dir, args.max_repos, shuffle_seed=args.shuffle_seed)
     logger.info("collected_repos", count=len(repo_paths))
 
     total_ok = 0

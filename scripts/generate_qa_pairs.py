@@ -357,20 +357,18 @@ async def run_generation(args):
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Collect repos, prioritizing those without existing QA output
+    # Collect repos, shuffled to avoid alphabetical bias on partial runs
+    from bgkit.utils.git_utils import collect_repo_paths
+
+    all_repos = collect_repo_paths(repos_dir, shuffle_seed=42)
     repo_dirs_done = []
     repo_dirs_todo = []
-    for owner_dir in sorted(repos_dir.iterdir()):
-        if not owner_dir.is_dir():
-            continue
-        for repo_dir in sorted(owner_dir.iterdir()):
-            if not repo_dir.is_dir() or not (repo_dir / ".git").exists():
-                continue
-            qa_path = output_dir / owner_dir.name / repo_dir.name / "qa_pairs.jsonl"
-            if qa_path.exists():
-                repo_dirs_done.append(repo_dir)
-            else:
-                repo_dirs_todo.append(repo_dir)
+    for repo_dir in all_repos:
+        qa_path = output_dir / repo_dir.parent.name / repo_dir.name / "qa_pairs.jsonl"
+        if qa_path.exists():
+            repo_dirs_done.append(repo_dir)
+        else:
+            repo_dirs_todo.append(repo_dir)
 
     # Process unfinished repos first for better diversity on partial runs
     repo_dirs = repo_dirs_todo + repo_dirs_done
