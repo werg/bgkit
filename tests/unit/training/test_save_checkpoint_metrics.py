@@ -96,16 +96,25 @@ class TestJointBlockTrainerSaveMetrics:
 
 
 class TestDecoderInitTrainerSaveMetrics:
-    def test_metrics_persisted(self, tmp_path):
+    @staticmethod
+    def _make_trainer(cfg):
         from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
-        cfg = _make_cfg(training={"phase": "phase1_step1", "lr": 1e-4,
-                                   "max_steps": 10, "warmup_steps": 1})
         trainer = DecoderInitTrainer(cfg)
-        # Minimal state: encoder + decoder + optimizer
         trainer.encoder = torch.nn.Linear(4, 4)
         trainer.decoder = torch.nn.Linear(4, 4)
         trainer.optimizer = torch.optim.SGD(trainer.decoder.parameters(), lr=0.01)
+        trainer._compression_active = False
+        trainer._compression_introduction_step = None
+        trainer._encoder_frozen = True
+        trainer._target_ratio_override = None
+        trainer._decoder_frozen = False
+        return trainer
+
+    def test_metrics_persisted(self, tmp_path):
+        cfg = _make_cfg(training={"phase": "phase1_step1", "lr": 1e-4,
+                                   "max_steps": 10, "warmup_steps": 1})
+        trainer = self._make_trainer(cfg)
 
         metrics = {"eval/loss": 1.23, "eval/perplexity": 3.42}
         ckpt_path = trainer.save_checkpoint(tmp_path, metrics=metrics)
@@ -114,14 +123,9 @@ class TestDecoderInitTrainerSaveMetrics:
         assert meta["metrics"] == metrics
 
     def test_metrics_none(self, tmp_path):
-        from bgkit.training.phase1.decoder_init import DecoderInitTrainer
-
         cfg = _make_cfg(training={"phase": "phase1_step1", "lr": 1e-4,
                                    "max_steps": 10, "warmup_steps": 1})
-        trainer = DecoderInitTrainer(cfg)
-        trainer.encoder = torch.nn.Linear(4, 4)
-        trainer.decoder = torch.nn.Linear(4, 4)
-        trainer.optimizer = torch.optim.SGD(trainer.decoder.parameters(), lr=0.01)
+        trainer = self._make_trainer(cfg)
 
         ckpt_path = trainer.save_checkpoint(tmp_path)
 

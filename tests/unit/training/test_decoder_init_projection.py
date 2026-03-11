@@ -184,6 +184,15 @@ def _make_trainer(
     # Store config flags (normally done in setup())
     t._train_projection = train_projection_block
     t._projection_only_steps = projection_only_steps
+    t._encoder_frozen = True
+    t._encoder_unfreeze_step = None
+    t._compression_active = False
+    t._compression_introduction_step = None
+    t._is_evaluating = False
+    t._pending_scores = []
+    t._calibrator = None
+    t._target_ratio_override = None
+    t.ice_model = None
 
     # Decoder
     decoder_backbone = MockCausalLMBackbone(hidden_dim=HIDDEN_DIM, num_layers=num_layers)
@@ -641,7 +650,7 @@ class TestTrainStepWithProjection:
         """
         t = _make_trainer(train_projection_block=True)
         batch = _make_batch()
-        survivors = t._compute_survivors(batch)
+        survivors, _mask = t._compute_survivors(batch)
         loss = survivors.sum()
         loss.backward()
 
