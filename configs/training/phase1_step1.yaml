@@ -1,12 +1,10 @@
-# Phase 1 Step 1: Decoder initialization + encoder unfreeze + compression curriculum
+# Phase 1 Step 1: Decoder + encoder + compression training
 #
-# Training phases (all on data reconstruction / content reproduction only):
-#   0-200:       Projection block warmup (decoder frozen)
-#   200-2000:    Decoder + projection training (encoder frozen, no compression)
-#   2000:        Encoder unfreezes, bidirectional warmup begins
-#   4000:        Compression introduced (ICE survivor selection)
-#   4000-44000:  Compression ratio ramps from 0.50 → 0.25
-#   44000-50000: Hold at 0.25 compression ratio
+# Resumes from step 800 checkpoint with encoder immediately unfrozen
+# and compression active from the start. Each training sample gets a
+# random compression ratio drawn uniformly between the current min
+# target ratio (ramped) and 1.0 (no compression), training the network
+# on diverse retention levels.
 phase: phase1_step1
 optimizer: muon
 max_steps: 50000
@@ -24,19 +22,19 @@ max_batch_tokens: 16384
 gradient_accumulation_steps: 4    # 16K × 4 = 64K effective tokens per step
 max_eval_samples: 2000
 eval_every: 500
-save_every: 2000
+save_every: 500
 # Train projection block alongside decoder (bridge between compressor and decoder)
 train_projection_block: true
 projection_only_steps: 200     # warmup: train only projection before unfreezing decoder
 projection_lr: null             # defaults to main lr
 
 # --- Encoder unfreeze curriculum ---
-encoder_unfreeze_step: 2000     # when to unfreeze encoder compressor backbone
+encoder_unfreeze_step: 800      # unfreeze immediately on resume (aligned with checkpoint step)
 encoder_lr: 1.0e-4              # encoder LR (higher than decoder — encoder needs to learn compression)
 bidi_warmup_steps: 2000         # duration of bidi warmup after encoder unfreeze
 
 # --- Compression curriculum ---
-compression_introduction_step: 4000   # when to start ICE survivor selection
+compression_introduction_step: 800   # aligned with checkpoint step so ramp starts at 0.75
 ice:
   checkpoint_path: auto
   input_dim: 1024
@@ -45,13 +43,16 @@ ice:
   kernel_size: 5
 
 curriculum:
-  target_ratio_start: 0.50       # start gentle (keep 50% of tokens)
-  target_ratio_end: 0.25         # ramp down to 25% retention
-  target_ratio_ramp_steps: 40000 # ramp over 40k steps from compression intro
+  target_ratio_start: 0.75       # min ratio starts here (actual ratio drawn randomly per sample)
+  target_ratio_end: 0.10         # ramp min ratio down to 10% retention
+  target_ratio_ramp_steps: 3000  # ramp over 3k steps from compression intro (runtime controllable)
   max_survivor_gap: 64           # max positions without survivors (gap-filling)
   fallback_threshold: 3.0        # ICE score threshold until calibrator warms up
   calibrator_ema_decay: 0.99
   calibrator_warmup_batches: 50
+
+# Fresh wandb run for new training regime
+reset_wandb: true
 
 checkpoint_pruning:
   enabled: true
@@ -59,10 +60,7 @@ checkpoint_pruning:
   keep_latest: 2
   metric: eval/loss
 early_stopping:
-  enabled: true
-  patience: 5           # more patience for longer training
-  min_delta: 0.005       # finer minimum improvement
-  metric: eval/loss
+  enabled: false          # disabled — random compression ratios make eval loss noisy
 qa_ratio: 0.0   # fraction of QA samples (0.0 = disabled, 0.3 = recommended with QA data)
 eval:
   generation_samples: 50      # examples for generation metrics (expensive)

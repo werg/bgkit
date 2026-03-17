@@ -15,6 +15,7 @@ code fence (via loss_mask), so the decoder learns pure reconstruction.
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 import numpy as np
@@ -32,7 +33,7 @@ from bgkit.data.threshold_calibrator import ThresholdCalibrator
 from bgkit.eval.metrics.embedding_health import embedding_drift_metrics
 from bgkit.eval.metrics.reconstruction import parse_success_rate
 from bgkit.models.decoder import ReconstructionDecoder
-from bgkit.models.encoder import BgKITEncoder
+from bgkit.models.encoder import BgKITEncoder, _expand_survivor_mask
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
@@ -110,6 +111,7 @@ class DecoderInitTrainer(BaseTrainer):
 
     LIVE_CONFIG_FIELDS = {
         "max_survivor_gap": "_max_gap",
+        "target_ratio_ramp_steps": "_target_ratio_ramp_steps",
     }
 
     def setup(self) -> None:
@@ -768,6 +770,11 @@ class DecoderInitTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """Score embeddings with ICE and select survivors via calibrated threshold.
 
+        During training, each sample in the batch gets a random compression
+        ratio drawn uniformly between the current min target ratio (from the
+        ramp) and 1.0, so the network trains on diverse retention levels.
+        During evaluation, the min target ratio is used for all samples.
+
         Args:
             embeddings: (B, L, D) embeddings to score.
             attention_mask: (B, L) bool mask for valid positions.
@@ -791,8 +798,7 @@ class DecoderInitTrainer(BaseTrainer):
             valid_scores_flat = ice_scores[stats_mask].detach()
             self._pending_scores.append(valid_scores_flat)
 
-        target_ratio = self._current_target_ratio()
-        threshold = self._calibrator.get_threshold(target_ratio)
+        min_target_ratio = self._current_target_ratio()
 
         survivor_mask = torch.zeros(
             batch_size, seq_len, dtype=torch.bool, device=embeddings.device,
@@ -801,6 +807,15 @@ class DecoderInitTrainer(BaseTrainer):
             valid_len = int(attention_mask[b].sum().item())
             if valid_len == 0:
                 continue
+
+            # Random ratio per sample during training; fixed min during eval
+            # Random ratio per sample during training; fixed min during eval
+            if self._is_evaluating:
+                ratio = min_target_ratio
+            else:
+                ratio = random.uniform(min_target_ratio, 1.0)
+
+            threshold = self._calibrator.get_threshold(ratio)
             valid_scores = ice_scores[b, :valid_len]
             indices = select_survivors_by_threshold(valid_scores, threshold)
             indices = fill_survivor_gaps(indices, valid_scores, self._max_gap, valid_len)
@@ -843,9 +858,17 @@ class DecoderInitTrainer(BaseTrainer):
                 content_emb = bgkit_embed(content_token_ids)
                 prompt_emb = bgkit_embed(compression_prompt_ids)
 
+                # ICE scoring on raw embeddings (outside compressor)
+                if self._compression_active:
+                    survivor_mask = self._score_and_select(
+                        content_emb, content_attention_mask,
+                    )
+                else:
+                    survivor_mask = None
+
                 comp_out = self.encoder.compressor(
                     content_emb,
-                    survivor_mask=None,
+                    survivor_mask=survivor_mask,
                     attention_mask=content_attention_mask,
                     prompt_embeddings=prompt_emb,
                     prompt_attention_mask=compression_prompt_mask,
@@ -856,24 +879,39 @@ class DecoderInitTrainer(BaseTrainer):
                 full_raw = comp_out.raw_embeddings.detach()
                 full_mask = comp_out.attention_mask
 
+                # Expand content-only survivor mask to full sequence
+                # (prompt+sep positions marked as doomed)
+                if survivor_mask is not None:
+                    full_survivor_mask = _expand_survivor_mask(
+                        survivor_mask, comp_out.content_slice, full_raw.size(1),
+                    )
+                else:
+                    full_survivor_mask = None
+
                 # Projection block outside no_grad (gets gradients)
                 proj_out = self.encoder.projection_block(
-                    full_raw, full_mask, survivor_mask=None,
+                    full_raw, full_mask, survivor_mask=full_survivor_mask,
                 )
 
-                # Slice to content-only
-                content_proj = proj_out.projected_embeddings[:, comp_out.content_slice, :]
-                return content_proj, content_attention_mask
+                if self._compression_active:
+                    return proj_out.projected_embeddings, proj_out.survivor_attention_mask
+                else:
+                    # Slice to content-only
+                    content_proj = proj_out.projected_embeddings[:, comp_out.content_slice, :]
+                    return content_proj, content_attention_mask
             else:
                 # Entire encoder under no_grad (rare fallback)
                 enc_out = self.encoder(
                     input_embeddings=content_emb,
-                    survivor_mask=None,
+                    survivor_mask=survivor_mask,
                     attention_mask=content_attention_mask,
                     prompt_embeddings=prompt_emb,
                     prompt_attention_mask=compression_prompt_mask,
                 )
-                return enc_out.survivor_embeddings, content_attention_mask
+                if self._compression_active:
+                    return enc_out.survivor_embeddings, enc_out.survivor_attention_mask
+                else:
+                    return enc_out.survivor_embeddings, content_attention_mask
         else:
             # Encoder is trainable (compressor + projection)
             bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
@@ -939,7 +977,7 @@ class DecoderInitTrainer(BaseTrainer):
             content_mask = batch["content_attention_mask"].to(self.device)
             n_survivors = int(survivor_mask.sum().item())
             n_valid = int(content_mask.sum().item())
-            metrics["target_ratio"] = self._current_target_ratio()
+            metrics["min_target_ratio"] = self._current_target_ratio()
             metrics["actual_ratio"] = n_survivors / max(n_valid, 1)
 
         return metrics

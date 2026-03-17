@@ -38,6 +38,10 @@ def save_checkpoint(
 ) -> Path:
     """Save a checkpoint with metadata.
 
+    Writes to a temporary directory first, then atomically renames to the
+    final name.  If the process is killed mid-save the temp directory
+    (``._tmp_*``) is left behind and ignored by auto-resolve / backfill.
+
     Args:
         checkpoint_dir: Base directory for checkpoints.
         metadata: Phase and training metadata.
@@ -48,24 +52,28 @@ def save_checkpoint(
     """
     timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     ckpt_name = f"{metadata.phase}_step{metadata.step}_{timestamp}"
-    ckpt_path = checkpoint_dir / ckpt_name
-    ckpt_path.mkdir(parents=True, exist_ok=True)
+    tmp_path = checkpoint_dir / f"._tmp_{ckpt_name}"
+    final_path = checkpoint_dir / ckpt_name
+    tmp_path.mkdir(parents=True, exist_ok=True)
 
     # Save metadata
-    meta_path = ckpt_path / "metadata.json"
+    meta_path = tmp_path / "metadata.json"
     meta_path.write_text(json.dumps(asdict(metadata), indent=2))
 
     # Save each state dict
     for name, state_dict in state_dicts.items():
-        torch.save(state_dict, ckpt_path / f"{name}.pt")
+        torch.save(state_dict, tmp_path / f"{name}.pt")
+
+    # Atomic rename — if killed before this line, the temp dir is ignored
+    tmp_path.rename(final_path)
 
     logger.info(
         "checkpoint_saved",
-        path=str(ckpt_path),
+        path=str(final_path),
         step=metadata.step,
         keys=list(state_dicts.keys()),
     )
-    return ckpt_path
+    return final_path
 
 
 def load_checkpoint(checkpoint_path: Path) -> tuple[CheckpointMetadata, dict]:

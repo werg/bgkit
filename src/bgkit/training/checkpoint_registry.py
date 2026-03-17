@@ -307,6 +307,9 @@ class CheckpointRegistry:
         for meta_file in scan_dir.glob("*/metadata.json"):
             ckpt_dir = meta_file.parent
             name = ckpt_dir.name
+            # Skip incomplete checkpoints (written by atomic save but not yet renamed)
+            if name.startswith("._tmp_"):
+                continue
             if name in self._entries:
                 continue
 

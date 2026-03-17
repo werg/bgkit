@@ -126,9 +126,29 @@ class BaseTrainer(ABC):
     control-file key → instance attribute name.  Simple numeric fields
     are applied automatically; override ``apply_live_config`` for
     fields needing custom validation.
+
+    Extensibility hooks (override in subclasses):
+    - ``_pre_step_hook()``: called at the top of each training step
+      (before LR schedule). Use for dataloader rebuilds, curriculum changes.
+    - ``_post_optimizer_step(step)``: called after optimizer.step().
+      Use for per-step bookkeeping like bidi warmup.
+    - ``_add_step_metrics(metrics)``: add trainer-specific metrics to
+      the step dict before logging (e.g. bidi_alpha).
+    - ``_build_training_state(...)``: build training state dict for
+      checkpointing (override to add curriculum fields).
+    - ``_create_dataloader_iter()``: create the dataloader iterator.
+      Override to disable DevicePrefetcher or customize iteration.
+    - ``_pre_train_loop()``: called after all setup but before the
+      training loop starts. Use for resume-time rebuilds.
     """
 
     LIVE_CONFIG_FIELDS: dict[str, str] = {}
+
+    #: Steps between structured log messages. Override in subclass.
+    _log_every: int = 10
+
+    #: Whether to use DevicePrefetcher for async batch transfer.
+    _use_device_prefetcher: bool = True
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -139,6 +159,7 @@ class BaseTrainer(ABC):
         self._training_state: dict | None = None
         self._input_sources: dict[str, str] | None = None
         self._accum_steps = 1
+        self._dataloader_invalidated = False  # set True in _pre_step_hook to force re-iter
         # Optimizer type: set from config, overridden by _create_optimizer()
         self._optimizer_type: str = cfg.training.get("optimizer", "muon")
         self._muon_exclude_set: frozenset[int] = frozenset()
@@ -167,7 +188,63 @@ class BaseTrainer(ABC):
         return [p for p in self.model.parameters() if p.requires_grad]
 
     def _post_step(self, step: int) -> None:
-        """Hook called after each optimizer step. Override for per-step bookkeeping."""
+        """Hook called after each optimizer step. Override for per-step bookkeeping.
+
+        .. deprecated:: Use ``_post_optimizer_step`` instead.
+        """
+
+    def _post_optimizer_step(self, step: int) -> None:
+        """Hook called after optimizer.step(). Override for per-step bookkeeping."""
+        self._post_step(step)
+
+    def _pre_step_hook(self) -> None:
+        """Hook called at the top of each training step (before LR schedule).
+
+        Override for dataloader rebuilds, curriculum transitions, etc.
+        Return value is ignored.
+        """
+
+    def _add_step_metrics(self, metrics: dict[str, float]) -> None:
+        """Add trainer-specific metrics to the step dict before logging.
+
+        Override to inject metrics like bidi_alpha, compression ratio, etc.
+        Modify ``metrics`` in place.
+        """
+
+    def _build_training_state(
+        self,
+        es_best: float | None,
+        es_evals_without_improvement: int,
+        wandb_run,
+    ) -> dict:
+        """Build training state dict for checkpointing.
+
+        Override to add curriculum or trainer-specific fields.
+        """
+        return {
+            "es_best": es_best,
+            "es_evals_without_improvement": es_evals_without_improvement,
+            "wandb_run_id": wandb_run.id if wandb_run is not None else None,
+        }
+
+    def _create_dataloader_iter(self):
+        """Create an iterator over the train dataloader.
+
+        Default wraps in _DevicePrefetcher for async GPU transfer.
+        Override to disable prefetching (e.g. to save memory).
+        """
+        if not self._use_device_prefetcher:
+            return iter(self.train_dataloader)
+        device = getattr(self, "device", None)
+        if device is not None and hasattr(device, "type"):
+            return _DevicePrefetcher(iter(self.train_dataloader), device)
+        return iter(self.train_dataloader)
+
+    def _pre_train_loop(self) -> None:
+        """Called after all train() setup but before the loop starts.
+
+        Override for resume-time rebuilds (e.g. L1 dataloader rebuild).
+        """
 
     @staticmethod
     def _validate_accum_steps(value) -> int:
@@ -532,11 +609,13 @@ class BaseTrainer(ABC):
                     resume_path = str(auto_resolved)
                     logger.info("auto_resume_resolved", checkpoint=resume_path, phase=phase)
         is_resuming = False
+        resume_step: int | None = None
         if resume_path is not None:
             self.load_checkpoint(Path(resume_path))
             # Checkpoint was saved after step completed, so resume from next step
             self.global_step += 1
             is_resuming = True
+            resume_step = self.global_step
             # Restore early stopping state
             if self._training_state is not None:
                 es_best = self._training_state.get("es_best")
@@ -605,10 +684,13 @@ class BaseTrainer(ABC):
                     tags=list(self.cfg.wandb.get("tags", [])),
                     config=OmegaConf.to_container(self.cfg, resolve=True),
                 )
-                if is_resuming and wandb_run_id is not None:
+                reset_wandb = tcfg.get("reset_wandb", False)
+                if is_resuming and wandb_run_id is not None and not reset_wandb:
                     wandb_kwargs["id"] = wandb_run_id
                     wandb_kwargs["resume"] = "allow"
                     logger.info("wandb_resuming_run", run_id=wandb_run_id)
+                elif reset_wandb:
+                    logger.info("wandb_fresh_run", old_run_id=wandb_run_id)
                 wandb_run = wandb.init(**wandb_kwargs)
             except ImportError:
                 logger.warning("wandb_not_installed")
@@ -616,15 +698,30 @@ class BaseTrainer(ABC):
         # Sync sampler + dataset epoch before first iter (needed after resume)
         self._sync_epoch(self.epoch)
 
-        device = getattr(self, "device", None)
-        dataloader_iter = _DevicePrefetcher(
-            iter(self.train_dataloader), device
-        ) if device is not None and hasattr(device, "type") else iter(self.train_dataloader)
+        # Subclass hook for resume-time setup (e.g. L1 dataloader rebuild)
+        self._pre_train_loop()
+
+        dataloader_iter = self._create_dataloader_iter()
 
         accum_steps = self._validate_accum_steps(
             tcfg.get("gradient_accumulation_steps", 1)
         )
         self._accum_steps = accum_steps
+
+        # Resume warmup: linear ramp from near-zero to scheduled LR over N steps
+        # after resuming from a checkpoint. Helps optimizer re-stabilize when
+        # training regime changed (new param groups, extended schedule, etc.).
+        resume_warmup_steps = int(tcfg.get("resume_warmup_steps", 200))
+        if resume_warmup_steps > 0 and resume_step is not None:
+            resume_warmup_end = resume_step + resume_warmup_steps
+            logger.info(
+                "resume_warmup_enabled",
+                resume_step=resume_step,
+                warmup_steps=resume_warmup_steps,
+                warmup_end=resume_warmup_end,
+            )
+        else:
+            resume_warmup_end = None
 
         logger.info(
             "training_start",
@@ -671,13 +768,26 @@ class BaseTrainer(ABC):
                 while step < max_steps:
                     self.global_step = step
 
+                    # Subclass hook (dataloader rebuild, curriculum, etc.)
+                    self._pre_step_hook()
+                    if self._dataloader_invalidated:
+                        dataloader_iter = self._create_dataloader_iter()
+                        self._dataloader_invalidated = False
+
                     # LR schedule
-                    lr = cosine_with_warmup(step, max_steps, warmup_steps, base_lr)
                     for pg in self.optimizer.param_groups:
                         group_base = pg.get("base_lr", base_lr)
-                        pg["lr"] = cosine_with_warmup(
+                        lr = cosine_with_warmup(
                             step, max_steps, warmup_steps, group_base
                         )
+                        # Apply resume warmup ramp (linear 0→1 multiplier)
+                        if (
+                            resume_warmup_end is not None
+                            and step < resume_warmup_end
+                        ):
+                            ramp = (step - resume_step + 1) / resume_warmup_steps
+                            lr *= ramp
+                        pg["lr"] = lr
 
                     # Accumulation loop
                     self.optimizer.zero_grad()
@@ -688,12 +798,7 @@ class BaseTrainer(ABC):
                         except StopIteration:
                             self.epoch += 1
                             self._sync_epoch(self.epoch)
-                            raw_iter = iter(self.train_dataloader)
-                            dataloader_iter = (
-                                _DevicePrefetcher(raw_iter, device)
-                                if device is not None and hasattr(device, "type")
-                                else raw_iter
-                            )
+                            dataloader_iter = self._create_dataloader_iter()
                             batch = next(dataloader_iter)
                         micro_metrics = self._forward_backward(batch)
                         accum_metrics.append(micro_metrics)
@@ -706,18 +811,19 @@ class BaseTrainer(ABC):
                             "This usually indicates a numerical stability issue."
                         )
                     self.optimizer.step()
-                    self._post_step(step)
+                    self._post_optimizer_step(step)
 
                     metrics = _average_metrics(accum_metrics)
                     metrics["grad_norm"] = grad_norm
-                    metrics["lr"] = lr
+                    metrics["lr"] = self.optimizer.param_groups[0]["lr"]
                     if len(self.optimizer.param_groups) > 1:
                         metrics["lr_min"] = min(
                             pg["lr"] for pg in self.optimizer.param_groups
                         )
+                    self._add_step_metrics(metrics)
 
                     # Log
-                    if step % 10 == 0:
+                    if step % self._log_every == 0:
                         logger.info("train_step", step=step, **metrics)
                     if wandb_run is not None:
                         wandb_run.log(metrics, step=step)
@@ -825,15 +931,9 @@ class BaseTrainer(ABC):
                     # Checkpoint
                     saved_this_step = False
                     if save_every > 0 and step > 0 and step % save_every == 0:
-                        self._training_state = {
-                            "es_best": es_best,
-                            "es_evals_without_improvement": (
-                                es_evals_without_improvement
-                            ),
-                            "wandb_run_id": (
-                                wandb_run.id if wandb_run is not None else None
-                            ),
-                        }
+                        self._training_state = self._build_training_state(
+                            es_best, es_evals_without_improvement, wandb_run,
+                        )
                         step_metrics = (
                             last_eval_metrics if last_eval_step == step else None
                         )
@@ -856,17 +956,9 @@ class BaseTrainer(ABC):
                     # Graceful shutdown check
                     if interruptor.should_stop:
                         if not saved_this_step:
-                            self._training_state = {
-                                "es_best": es_best,
-                                "es_evals_without_improvement": (
-                                    es_evals_without_improvement
-                                ),
-                                "wandb_run_id": (
-                                    wandb_run.id
-                                    if wandb_run is not None
-                                    else None
-                                ),
-                            }
+                            self._training_state = self._build_training_state(
+                                es_best, es_evals_without_improvement, wandb_run,
+                            )
                             parent = self._registry_parent()
                             ckpt_path = self.save_checkpoint(checkpoint_dir)
                             registry.register(self._build_registry_entry(
@@ -897,13 +989,9 @@ class BaseTrainer(ABC):
                     f"eval/{k}": v for k, v in eval_metrics.items()
                 }
                 logger.info("final_eval", **eval_metrics)
-                self._training_state = {
-                    "es_best": es_best,
-                    "es_evals_without_improvement": es_evals_without_improvement,
-                    "wandb_run_id": (
-                        wandb_run.id if wandb_run is not None else None
-                    ),
-                }
+                self._training_state = self._build_training_state(
+                    es_best, es_evals_without_improvement, wandb_run,
+                )
                 parent = self._registry_parent()
                 ckpt_path = self.save_checkpoint(
                     checkpoint_dir, metrics=eval_metrics
