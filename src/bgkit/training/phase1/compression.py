@@ -15,6 +15,7 @@ where BgKIT was frozen). ICE model remains frozen.
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 
 import structlog
@@ -59,6 +60,7 @@ class CompressionTrainer(BaseTrainer):
 
     LIVE_CONFIG_FIELDS = {
         "max_survivor_gap": "_max_gap",
+        "target_ratio_ramp_steps": "_target_ratio_ramp_steps",
     }
 
     def setup(self) -> None:
@@ -589,14 +591,21 @@ class CompressionTrainer(BaseTrainer):
             else:
                 self._pending_l1_scores.append(valid_scores_flat)
 
-        target_ratio = self._current_target_ratio()
-        threshold = calibrator.get_threshold(target_ratio)
+        min_target_ratio = self._current_target_ratio()
 
         survivor_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=embeddings.device)
         for b in range(batch_size):
             valid_len = int(attention_mask[b].sum().item())
             if valid_len == 0:
                 continue
+
+            # Random ratio per sample during training; fixed min during eval
+            if self._is_evaluating:
+                ratio = min_target_ratio
+            else:
+                ratio = random.uniform(min_target_ratio, 1.0)
+
+            threshold = calibrator.get_threshold(ratio)
             valid_scores = ice_scores[b, :valid_len]
             indices = select_survivors_by_threshold(valid_scores, threshold)
             indices = fill_survivor_gaps(indices, valid_scores, self._max_gap, valid_len)
@@ -929,7 +938,7 @@ class CompressionTrainer(BaseTrainer):
         metrics = {
             "loss": loss.item(),
             "sample_type": sample_type,
-            "target_ratio": target_ratio,
+            "min_target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
             "calibrated_threshold_l0": self._l0_calibrator.get_threshold(target_ratio),
             "l1_enabled": float(self._l1_enabled),
@@ -982,7 +991,7 @@ class CompressionTrainer(BaseTrainer):
         metrics = {
             "loss": loss.item(),
             "sample_type": "mixed",
-            "target_ratio": target_ratio,
+            "min_target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
             "calibrated_threshold_l0": self._l0_calibrator.get_threshold(target_ratio),
             "l1_enabled": float(self._l1_enabled),

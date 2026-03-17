@@ -306,7 +306,7 @@ class TestTrainStepFileSample:
         metrics = trainer.train_step(batch)
         assert "loss" in metrics
         assert "grad_norm" in metrics
-        assert "target_ratio" in metrics
+        assert "min_target_ratio" in metrics
         assert "calibrated_threshold_l0" in metrics
         assert metrics["sample_type"] == "file"
 

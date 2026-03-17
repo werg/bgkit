@@ -30,10 +30,11 @@ ice:
 
 curriculum:
   l1_introduction_step: 10000    # earlier than before — L0 compression established in step 1
-  # Start where step 1 left off (0.25) and push harder
-  target_ratio_start: 0.25
-  target_ratio_end: 0.12
-  target_ratio_ramp_steps: 100000
+  # Random per-sample ratio drawn between min_target_ratio and 1.0.
+  # Step 1 trained across 0.10-1.0; step 2 holds the same range.
+  target_ratio_start: 0.10
+  target_ratio_end: 0.10
+  target_ratio_ramp_steps: 1       # no ramp — fixed at 0.10 from the start
   max_survivor_gap: 64
   fallback_threshold: 3.0       # used before calibrator warms up
   calibrator_ema_decay: 0.99
