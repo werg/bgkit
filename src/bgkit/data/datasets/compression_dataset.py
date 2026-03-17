@@ -714,8 +714,9 @@ class CompressionDataset(Dataset):
             self._effective_sizes = []
             return
 
-        # Normalize weights for present objectives only
-        present_keys = [k for k in self.OBJECTIVE_ORDER if k in self._subsets]
+        # Normalize weights for present objectives only (skip empty subsets)
+        present_keys = [k for k in self.OBJECTIVE_ORDER
+                        if k in self._subsets and len(self._subsets[k]) > 0]
         weight_sum = sum(self._weights.get(k, 0.0) for k in present_keys)
         if weight_sum == 0:
             weight_sum = 1.0
@@ -835,13 +836,11 @@ class CompressionDataset(Dataset):
                 )
                 if n_empty > 0:
                     logger.warning(
-                        "empty_commit_sha_values",
-                        count=n_empty,
-                        total=len(sha_col),
-                        hint="Empty commit_sha values will not join with "
-                             "description/structural targets. Re-run "
-                             "convert_tokens_to_npy.py with commit_sha-aware "
-                             "parquet shards to fix.",
+                        "%d / %d samples have empty commit_sha — they won't "
+                        "join with description/structural targets. Re-run "
+                        "convert_tokens_to_npy.py with commit_sha-aware "
+                        "parquet shards to fix.",
+                        n_empty, len(sha_col),
                     )
 
         # Objective 1: Data reconstruction

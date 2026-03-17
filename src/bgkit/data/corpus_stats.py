@@ -216,6 +216,7 @@ def process_corpus(
                     "file_path": ft["path"],
                     "language": ft["language"],
                     "token_ids": ft["token_ids"],
+                    "commit_sha": repo_stats.commit_sha,
                 })
 
             # Update corpus stats

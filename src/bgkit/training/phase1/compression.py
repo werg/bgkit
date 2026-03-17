@@ -15,7 +15,6 @@ where BgKIT was frozen). ICE model remains frozen.
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 import structlog
@@ -29,22 +28,14 @@ from bgkit.data.survivor_selection import fill_survivor_gaps, select_survivors_b
 from bgkit.data.threshold_calibrator import ThresholdCalibrator
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
-from bgkit.training.base_trainer import BaseTrainer, _average_metrics
-from bgkit.training.checkpoint_manager import CheckpointManager
-from bgkit.training.checkpoint_registry import (
-    CheckpointRegistry,
-    resolve_checkpoint,
-    resolve_latest_checkpoint,
-)
+from bgkit.training.base_trainer import BaseTrainer
+from bgkit.training.checkpoint_registry import CheckpointRegistry, resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
-from bgkit.training.gradient_utils import clip_grad_norm, enable_gradient_checkpointing
-from bgkit.training.interruption import GracefulInterruptor
-from bgkit.training.live_config import LiveConfig
+from bgkit.training.gradient_utils import enable_gradient_checkpointing
 from bgkit.training.objectives.commit_reproduction import commit_reproduction_loss
 from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
 from bgkit.training.objectives.description_generation import description_generation_loss
 from bgkit.training.objectives.structural_relational import structural_relational_loss
-from bgkit.training.scheduling import cosine_with_warmup
 
 logger = structlog.get_logger()
 
@@ -72,6 +63,8 @@ class CompressionTrainer(BaseTrainer):
 
     def setup(self) -> None:
         """Load trainable encoder/decoder, frozen ICE, create dataset and optimizer."""
+        import gc
+
         tcfg = self.cfg.training
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
@@ -100,8 +93,11 @@ class CompressionTrainer(BaseTrainer):
         if step1_checkpoint is not None:
             logger.info("loading_step1_checkpoint", path=step1_checkpoint)
             _, step1_state_dicts = load_checkpoint(Path(step1_checkpoint))
+            # Discard optimizer state — not needed for step2 (fresh optimizer)
+            step1_state_dicts.pop("optimizer", None)
             if "encoder" in step1_state_dicts:
-                self.encoder.load_state_dict(step1_state_dicts["encoder"])
+                self.encoder.load_state_dict(step1_state_dicts.pop("encoder"))
+                gc.collect()
 
         # Encoder is trainable in Step 2
         self.encoder.requires_grad_(True)
@@ -116,19 +112,23 @@ class CompressionTrainer(BaseTrainer):
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        # Load directly to device to avoid CPU→CUDA copy on unified memory
         decoder_backbone = AutoModelForCausalLM.from_pretrained(
             decoder_name,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=decoder_revision,
             attn_implementation="sdpa",
+            device_map=device,
         )
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
         self.decoder.to(device)
 
         # Load decoder from Step 1 checkpoint
         if step1_state_dicts is not None and "decoder" in step1_state_dicts:
-            self.decoder.load_state_dict(step1_state_dicts["decoder"])
+            self.decoder.load_state_dict(step1_state_dicts.pop("decoder"))
+        del step1_state_dicts
+        gc.collect()
 
         enable_gradient_checkpointing(self.decoder.backbone)
 
@@ -388,9 +388,12 @@ class CompressionTrainer(BaseTrainer):
         exclude = set()
         # Unwrap PeftModel if present to reach the original CausalLM
         backbone = self.decoder.backbone
-        causal_lm = (
-            backbone.base_model.model if hasattr(backbone, "base_model") else backbone
-        )
+        try:
+            from peft import PeftModel
+            is_peft = isinstance(backbone, PeftModel)
+        except ImportError:
+            is_peft = False
+        causal_lm = backbone.base_model.model if is_peft else backbone
         # embed_tokens lives on causal_lm.model (the inner Qwen model)
         inner = getattr(causal_lm, "model", None)
         if inner is not None and hasattr(inner, "embed_tokens"):
@@ -992,370 +995,31 @@ class CompressionTrainer(BaseTrainer):
     # Custom train() with pre-fetch L1 rebuild hook
     # ------------------------------------------------------------------
 
-    def train(self) -> None:
-        """Custom training loop with pre-fetch hook for L1 dataloader rebuild.
+    # ------------------------------------------------------------------
+    # BaseTrainer hooks
+    # ------------------------------------------------------------------
 
-        This overrides BaseTrainer.train() to add a check between fetching
-        batches that triggers dataloader rebuild when L1 is introduced.
-        """
-        self.setup()
+    _log_every = 100
+    _use_device_prefetcher = False  # save memory on unified-memory GPU
 
-        tcfg = self.cfg.training
-        if (
-            not hasattr(tcfg, "max_steps")
-            or not hasattr(tcfg, "lr")
-            or not isinstance(tcfg.lr, (int, float))
-        ):
-            phase = getattr(tcfg, "phase", "<unknown>")
-            raise TypeError(
-                f"CompressionTrainer.train() requires scalar training.max_steps and "
-                f"training.lr, but phase '{phase}' uses a different schema."
-            )
-        eval_every = tcfg.eval_every
-        save_every = tcfg.save_every
-        checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
-
-        # Checkpoint registry
-        registry = CheckpointRegistry(checkpoint_dir)
-
-        # Early stopping config
-        es_cfg = tcfg.get("early_stopping", {})
-        if isinstance(es_cfg, bool):
-            es_enabled = es_cfg
-            es_cfg = {}
-        else:
-            es_enabled = es_cfg.get("enabled", False) if es_cfg else False
-        es_patience = es_cfg.get("patience", 5) if es_cfg else 5
-        es_min_delta = es_cfg.get("min_delta", 0.001) if es_cfg else 0.001
-        es_metric = es_cfg.get("metric", "eval/loss") if es_cfg else "eval/loss"
-        es_best: float | None = None
-        es_evals_without_improvement = 0
-
-        # Resume from checkpoint: explicit path, "none" to disable, or auto-resolve
-        resume_path = self.cfg.get("resume_checkpoint", None)
-        if resume_path == "none":
-            resume_path = None  # explicitly disabled
-        elif resume_path is None:
-            phase = getattr(tcfg, "phase", None)
-            if phase:
-                auto_resolved = resolve_latest_checkpoint(checkpoint_dir, phase)
-                if auto_resolved is not None:
-                    resume_path = str(auto_resolved)
-                    logger.info("auto_resume_resolved", checkpoint=resume_path, phase=phase)
-        is_resuming = False
-        if resume_path is not None:
-            self.load_checkpoint(Path(resume_path))
-            self.global_step += 1
-            is_resuming = True
-            if self._training_state is not None:
-                es_best = self._training_state.get("es_best")
-                es_evals_without_improvement = self._training_state.get(
-                    "es_evals_without_improvement", 0,
-                )
-            logger.info(
-                "resuming_training",
-                from_step=self.global_step,
-                es_best=es_best,
-                es_evals_without_improvement=es_evals_without_improvement,
-            )
-
-        # LR schedule params
-        reset_schedule = tcfg.get("reset_schedule", False)
-        if self._schedule_params is not None and not reset_schedule:
-            max_steps = int(self._schedule_params["max_steps"])
-            base_lr = self._schedule_params["base_lr"]
-            warmup_steps = int(self._schedule_params["warmup_steps"])
-            if tcfg.max_steps > max_steps:
-                max_steps = tcfg.max_steps
-        else:
-            max_steps = tcfg.max_steps
-            base_lr = tcfg.lr
-            warmup_steps = tcfg.warmup_steps
-
-        self._schedule_params = {
-            "max_steps": max_steps,
-            "base_lr": base_lr,
-            "warmup_steps": warmup_steps,
-        }
-
-        # Wandb
-        wandb_run = None
-        wandb_run_id = (
-            self._training_state.get("wandb_run_id") if self._training_state else None
-        )
-        if self.cfg.get("wandb", {}).get("enabled", False):
-            try:
-                import wandb
-                from omegaconf import OmegaConf
-
-                wandb_kwargs = dict(
-                    project=self.cfg.wandb.get("project", "bgkit"),
-                    entity=self.cfg.wandb.get("entity", None),
-                    name=self.cfg.get("run_name", None),
-                    tags=list(self.cfg.wandb.get("tags", [])),
-                    config=OmegaConf.to_container(self.cfg, resolve=True),
-                )
-                if is_resuming and wandb_run_id is not None:
-                    wandb_kwargs["id"] = wandb_run_id
-                    wandb_kwargs["resume"] = "allow"
-                wandb_run = wandb.init(**wandb_kwargs)
-            except ImportError:
-                logger.warning("wandb_not_installed")
-
-        # Sync epoch
-        self._sync_epoch(self.epoch)
-
-        # If resuming and L1 was already transitioned, rebuild dataloader
+    def _pre_train_loop(self) -> None:
+        """Rebuild dataloader if resuming from a checkpoint with L1 already active."""
         if self._l1_transitioned or self._l1_rebuild_pending:
             self._perform_l1_rebuild()
 
-        dataloader_iter = iter(self.train_dataloader)
+    def _pre_step_hook(self) -> None:
+        """Rebuild dataloader when L1 curriculum transition is pending."""
+        if self._l1_rebuild_pending:
+            self._perform_l1_rebuild()
+            self._dataloader_invalidated = True
 
-        accum_steps = self._validate_accum_steps(
-            tcfg.get("gradient_accumulation_steps", 1)
-        )
-        self._accum_steps = accum_steps
+    def _post_optimizer_step(self, step: int) -> None:
+        """Advance bidirectional warmup after each optimizer step."""
+        self.encoder.step_bidi_warmup()
 
-        logger.info(
-            "training_start",
-            max_steps=max_steps,
-            lr=base_lr,
-            start_step=self.global_step,
-            gradient_accumulation_steps=accum_steps,
-        )
-
-        # Live config
-        control_file = self.cfg.get("control_file", None)
-        if control_file is None:
-            control_file = checkpoint_dir / "control.json"
-        live_config = LiveConfig(Path(control_file))
-
-        # Checkpoint pruning
-        prune_cfg = tcfg.get("checkpoint_pruning", {})
-        prune_enabled = prune_cfg.get("enabled", False) if prune_cfg else False
-        if prune_enabled:
-            ckpt_manager = CheckpointManager(
-                keep_best=prune_cfg.get("keep_best", 3),
-                keep_latest=prune_cfg.get("keep_latest", 2),
-                metric=prune_cfg.get("metric", es_metric),
-                lower_is_better=prune_cfg.get("lower_is_better", True),
-                phase=tcfg.phase,
-                registry=registry,
-            )
-            ckpt_manager.load_existing(checkpoint_dir)
-        else:
-            ckpt_manager = None
-
-        last_eval_metrics: dict[str, float] | None = None
-        last_eval_step = -1
-
-        stopped_early = False
-        try:
-            with GracefulInterruptor() as interruptor:
-                step = self.global_step
-                while step < max_steps:
-                    self.global_step = step
-
-                    # PRE-FETCH HOOK: rebuild dataloader if L1 transition pending
-                    if self._l1_rebuild_pending:
-                        self._perform_l1_rebuild()
-                        dataloader_iter = iter(self.train_dataloader)
-
-                    # LR schedule
-                    for pg in self.optimizer.param_groups:
-                        group_base = pg.get("base_lr", base_lr)
-                        pg["lr"] = cosine_with_warmup(
-                            step, max_steps, warmup_steps, group_base,
-                        )
-
-                    # Accumulation loop
-                    self.optimizer.zero_grad()
-                    accum_metrics = []
-                    for _micro in range(accum_steps):
-                        try:
-                            batch = next(dataloader_iter)
-                        except StopIteration:
-                            self.epoch += 1
-                            self._sync_epoch(self.epoch)
-                            dataloader_iter = iter(self.train_dataloader)
-                            batch = next(dataloader_iter)
-                        micro_metrics = self._forward_backward(batch)
-                        accum_metrics.append(micro_metrics)
-
-                    grad_norm = clip_grad_norm(self.trainable_parameters())
-
-                    if not math.isfinite(grad_norm):
-                        raise RuntimeError(
-                            f"NaN/Inf grad_norm at step {step} (grad_norm={grad_norm}). "
-                            "This usually indicates a numerical stability issue."
-                        )
-                    self.optimizer.step()
-                    self.encoder.step_bidi_warmup()
-
-                    metrics = _average_metrics(accum_metrics)
-                    metrics["grad_norm"] = grad_norm
-                    metrics["lr"] = lr
-                    metrics["bidi_alpha"] = self._get_bidi_alpha()
-                    if len(self.optimizer.param_groups) > 1:
-                        metrics["lr_min"] = min(
-                            pg["lr"] for pg in self.optimizer.param_groups
-                        )
-
-                    # Log
-                    if step % 100 == 0:
-                        logger.info("train_step", step=step, **metrics)
-                    if wandb_run is not None:
-                        wandb_run.log(metrics, step=step)
-
-                    # Eval
-                    if eval_every > 0 and step > 0 and step % eval_every == 0:
-                        eval_metrics = self.evaluate()
-                        eval_metrics = {
-                            f"eval/{k}": v for k, v in eval_metrics.items()
-                        }
-                        logger.info("eval", step=step, **eval_metrics)
-                        if wandb_run is not None:
-                            wandb_run.log(eval_metrics, step=step)
-
-                        last_eval_metrics = eval_metrics
-                        last_eval_step = step
-
-                        # Early stopping
-                        if es_enabled:
-                            if es_metric not in eval_metrics:
-                                raise KeyError(
-                                    f"Early stopping metric '{es_metric}' not "
-                                    f"found in eval results."
-                                )
-                            current_val = eval_metrics[es_metric]
-                            if es_best is None or current_val < es_best - es_min_delta:
-                                es_best = current_val
-                                es_evals_without_improvement = 0
-                            else:
-                                es_evals_without_improvement += 1
-                                if es_evals_without_improvement >= es_patience:
-                                    logger.info(
-                                        "early_stopping",
-                                        step=step,
-                                        metric=es_metric,
-                                        best=es_best,
-                                    )
-                                    stopped_early = True
-                                    break
-
-                    # Live config
-                    changes = live_config.poll()
-                    if changes:
-                        if "lr" in changes:
-                            new_lr = changes["lr"]
-                            old_base_lr = base_lr
-                            if isinstance(new_lr, (int, float)) and new_lr > 0:
-                                ratio = new_lr / old_base_lr
-                                base_lr = new_lr
-                                self._schedule_params["base_lr"] = base_lr
-                                for pg in self.optimizer.param_groups:
-                                    pg["base_lr"] = pg.get("base_lr", old_base_lr) * ratio
-                        if "early_stopping_patience" in changes:
-                            val = changes["early_stopping_patience"]
-                            if isinstance(val, int) and val > 0:
-                                es_patience = val
-                                logger.info("live_es_patience_update", patience=val)
-                        if "eval_every" in changes:
-                            val = changes["eval_every"]
-                            if isinstance(val, int) and val > 0:
-                                eval_every = val
-                                logger.info("live_eval_every_update", eval_every=val)
-                        if "save_every" in changes:
-                            val = changes["save_every"]
-                            if isinstance(val, int) and val > 0:
-                                save_every = val
-                                logger.info("live_save_every_update", save_every=val)
-                        if "max_steps" in changes:
-                            val = changes["max_steps"]
-                            if isinstance(val, int) and val > step:
-                                max_steps = val
-                                self._schedule_params["max_steps"] = val
-                                logger.info("live_max_steps_update", max_steps=val)
-                        self.apply_live_config(changes)
-
-                    # Checkpoint
-                    saved_this_step = False
-                    if save_every > 0 and step > 0 and step % save_every == 0:
-                        self._training_state = self._build_training_state(
-                            es_best, es_evals_without_improvement, wandb_run,
-                        )
-                        step_metrics = (
-                            last_eval_metrics if last_eval_step == step else None
-                        )
-                        parent = self._registry_parent()
-                        ckpt_path = self.save_checkpoint(
-                            checkpoint_dir, metrics=step_metrics,
-                        )
-                        registry.register(self._build_registry_entry(
-                            ckpt_path, step_metrics, wandb_run,
-                            parent_checkpoint=parent,
-                        ))
-                        if ckpt_manager is not None:
-                            ckpt_manager.record(ckpt_path, step, step_metrics)
-                            ckpt_manager.prune()
-                        (checkpoint_dir / ".last_checkpoint").write_text(str(ckpt_path))
-                        saved_this_step = True
-
-                    # Graceful shutdown
-                    if interruptor.should_stop:
-                        if not saved_this_step:
-                            self._training_state = self._build_training_state(
-                                es_best, es_evals_without_improvement, wandb_run,
-                            )
-                            parent = self._registry_parent()
-                            ckpt_path = self.save_checkpoint(checkpoint_dir)
-                            registry.register(self._build_registry_entry(
-                                ckpt_path, None, wandb_run,
-                                status="interrupted",
-                                parent_checkpoint=parent,
-                            ))
-                            if ckpt_manager is not None:
-                                ckpt_manager.record(ckpt_path, step, None)
-                                ckpt_manager.prune()
-                            (checkpoint_dir / ".last_checkpoint").write_text(
-                                str(ckpt_path)
-                            )
-                        logger.info(
-                            "graceful_shutdown_complete",
-                            step=step,
-                            signal=interruptor.received_signal.name
-                            if interruptor.received_signal
-                            else None,
-                        )
-                        return
-
-                    step += 1
-
-                # Final eval + checkpoint
-                eval_metrics = self.evaluate()
-                eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
-                logger.info("final_eval", **eval_metrics)
-                self._training_state = self._build_training_state(
-                    es_best, es_evals_without_improvement, wandb_run,
-                )
-                parent = self._registry_parent()
-                ckpt_path = self.save_checkpoint(checkpoint_dir, metrics=eval_metrics)
-                registry.register(self._build_registry_entry(
-                    ckpt_path, eval_metrics, wandb_run,
-                    parent_checkpoint=parent,
-                ))
-                if ckpt_manager is not None:
-                    ckpt_manager.record(ckpt_path, self.global_step, eval_metrics)
-                    ckpt_manager.prune()
-                (checkpoint_dir / ".last_checkpoint").write_text(str(ckpt_path))
-        finally:
-            if wandb_run is not None:
-                wandb_run.finish()
-
-        if stopped_early:
-            logger.info("training_complete_early_stop", total_steps=self.global_step)
-        else:
-            logger.info("training_complete", total_steps=max_steps)
+    def _add_step_metrics(self, metrics: dict[str, float]) -> None:
+        """Add compression-specific metrics."""
+        metrics["bidi_alpha"] = self._get_bidi_alpha()
 
     def _build_training_state(
         self,
@@ -1363,17 +1027,18 @@ class CompressionTrainer(BaseTrainer):
         es_evals_without_improvement: int,
         wandb_run,
     ) -> dict:
-        """Build training state dict for checkpointing."""
-        return {
-            "es_best": es_best,
-            "es_evals_without_improvement": es_evals_without_improvement,
-            "wandb_run_id": wandb_run.id if wandb_run is not None else None,
+        """Build training state dict with curriculum fields."""
+        state = super()._build_training_state(
+            es_best, es_evals_without_improvement, wandb_run,
+        )
+        state.update({
             "l1_enabled": self._l1_enabled,
             "l1_transitioned": self._l1_transitioned,
             "l1_rebuild_pending": self._l1_rebuild_pending,
             "l1_batches_seen": self._l1_batches_seen,
             "target_ratio_override": self._target_ratio_override,
-        }
+        })
+        return state
 
     # ------------------------------------------------------------------
     # Evaluation

@@ -18,6 +18,10 @@ x-gpu-common: &gpu-common
     # Triton autotuner crash on sm_121 is handled by bgkit.utils.triton_patch
     # Persist torch.compile cache across container restarts
     - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+    # Unified memory: allocate incrementally instead of large upfront chunks.
+    # Without this, PyTorch pre-allocates huge contiguous blocks that push
+    # other processes into swap on the DGX Spark's shared 128 GB pool.
+    - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
   volumes:
     - ${DATA_DIR}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
