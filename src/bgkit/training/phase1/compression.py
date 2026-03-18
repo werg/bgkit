@@ -61,7 +61,10 @@ class CompressionTrainer(BaseTrainer):
     LIVE_CONFIG_FIELDS = {
         "max_survivor_gap": "_max_gap",
         "target_ratio_ramp_steps": "_target_ratio_ramp_steps",
+        "target_ratio_start": "_target_ratio_start",
+        "target_ratio_end": "_target_ratio_end",
         "l1_introduction_step": "_l1_introduction_step",
+        "l1_calibrator_fast_batches": "_l1_calibrator_fast_batches",
     }
 
     def setup(self) -> None:

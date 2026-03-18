@@ -112,6 +112,10 @@ class DecoderInitTrainer(BaseTrainer):
     LIVE_CONFIG_FIELDS = {
         "max_survivor_gap": "_max_gap",
         "target_ratio_ramp_steps": "_target_ratio_ramp_steps",
+        "target_ratio_start": "_target_ratio_start",
+        "target_ratio_end": "_target_ratio_end",
+        "compression_introduction_step": "_compression_introduction_step",
+        "encoder_unfreeze_step": "_encoder_unfreeze_step",
     }
 
     def setup(self) -> None:

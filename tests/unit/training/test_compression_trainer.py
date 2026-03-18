@@ -764,8 +764,9 @@ class TestResolveStep1Checkpoint:
         mock_registry = MagicMock()
         mock_step1_entry = MagicMock()
         mock_step1_entry.name = "phase1_step1_step5000_20260224"
-        # First call (commit_encoding) returns None, second (phase1_step1) returns entry
-        mock_registry.best.side_effect = [None, mock_step1_entry]
+        # First call (commit_encoding best) returns None, then latest returns entry
+        mock_registry.best.return_value = None
+        mock_registry.latest.return_value = mock_step1_entry
 
         with patch(
             "bgkit.training.phase1.compression.CheckpointRegistry",
@@ -789,6 +790,7 @@ class TestResolveStep1Checkpoint:
 
         mock_registry = MagicMock()
         mock_registry.best.return_value = None
+        mock_registry.latest.return_value = None
 
         with patch(
             "bgkit.training.phase1.compression.CheckpointRegistry",
