@@ -61,6 +61,7 @@ class CompressionTrainer(BaseTrainer):
     LIVE_CONFIG_FIELDS = {
         "max_survivor_gap": "_max_gap",
         "target_ratio_ramp_steps": "_target_ratio_ramp_steps",
+        "l1_introduction_step": "_l1_introduction_step",
     }
 
     def setup(self) -> None:
