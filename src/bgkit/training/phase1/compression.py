@@ -352,11 +352,10 @@ class CompressionTrainer(BaseTrainer):
                 )
                 return step1_checkpoint
 
-            # 2. Fall back to phase1_step1
-            best = registry.best(
-                phase="phase1_step1", metric="eval/loss",
-                lower_is_better=True,
-            )
+            # 2. Fall back to phase1_step1 (use latest, not best-by-metric,
+            #    because early checkpoints without compression have misleadingly
+            #    low eval/loss that doesn't reflect compression capability)
+            best = registry.latest(phase="phase1_step1")
             if best is not None:
                 step1_checkpoint = str(checkpoint_dir / best.name)
                 self._input_sources["step1"] = best.name
