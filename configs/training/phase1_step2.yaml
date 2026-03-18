@@ -16,10 +16,11 @@ bidi_warmup_steps: 0         # already completed in step 1
 max_batch_tokens: 16384
 
 objectives:
-  data_reconstruction: 0.40
-  description_generation: 0.20
-  structural_relational: 0.15
-  commit_reproduction: 0.25
+  data_reconstruction: 0.35
+  description_generation: 0.15
+  structural_relational: 0.12
+  commit_reproduction: 0.20
+  query_conditioned: 0.18
 
 ice:
   checkpoint_path: auto
