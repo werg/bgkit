@@ -185,8 +185,8 @@ generate-qa-pairs: vllm-server
 	.venv/bin/python scripts/generate_qa_pairs.py \
 		--repos-dir $(DATA_DIR)/repos/ \
 		--output-dir $(DATA_DIR)/qa_pairs/ \
-		--server-url-primary http://localhost:$${VLLM_PORT_PRIMARY:-8090}/v1 \
-		--server-url-fast http://localhost:$${VLLM_PORT_FAST:-8091}/v1
+		--server-url-primary http://localhost:$${VLLM_PORT_PRIMARY:-8090} \
+		--server-url-fast http://localhost:$${VLLM_PORT_FAST:-8091}
 
 convert-qa-pairs:
 	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }

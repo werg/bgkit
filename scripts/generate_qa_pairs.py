@@ -186,26 +186,16 @@ async def process_single_file(
     )
 
     try:
-        response = await client.chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
-            temperature=0.7,
-        )
-        text = response.choices[0].message.content or ""
-        questions = _parse_questions_json(text.strip())
+        text = await client.generate(prompt, max_tokens=1024, temperature=0.7)
+        questions = _parse_questions_json((text or "").strip())
     except Exception:
         questions = None
 
     # Retry once on failure
     if not questions:
         try:
-            response = await client.chat_completion(
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=1024,
-                temperature=0.8,
-            )
-            text = response.choices[0].message.content or ""
-            questions = _parse_questions_json(text.strip())
+            text = await client.generate(prompt, max_tokens=1024, temperature=0.8)
+            questions = _parse_questions_json((text or "").strip())
         except Exception:
             return []
 
@@ -227,12 +217,9 @@ async def process_single_file(
         )
 
         try:
-            answer_resp = await client.chat_completion(
-                messages=[{"role": "user", "content": answer_prompt}],
-                max_tokens=512,
-                temperature=0.3,
-            )
-            answer = (answer_resp.choices[0].message.content or "").strip()
+            answer = (await client.generate(
+                answer_prompt, max_tokens=512, temperature=0.3,
+            ) or "").strip()
         except Exception:
             continue
 
@@ -274,14 +261,14 @@ async def process_repo(
     except Exception as e:
         return {"repo": repo_name, "status": f"extract_error: {e}", "pairs": 0}
 
-    commit_sha = snapshot.get("commit_sha", "")
-    files = snapshot.get("files", [])
+    commit_sha = snapshot.commit_sha
+    files = snapshot.files
 
     # Filter and select files
     eligible = []
     for f in files:
-        fp = f.get("path", "")
-        content = f.get("content", "")
+        fp = f.path
+        content = f.content
         if not content:
             continue
         skip = _should_skip_file(fp, content, max_seq_len)
@@ -303,9 +290,9 @@ async def process_repo(
     records = []
 
     for f in eligible:
-        fp = f["path"]
-        content = f["content"]
-        language = f.get("language", Path(fp).suffix.lstrip("."))
+        fp = f.path
+        content = f.content
+        language = f.language or Path(fp).suffix.lstrip(".")
         size = len(content.encode("utf-8", errors="replace"))
 
         # Route to appropriate tier
@@ -351,7 +338,7 @@ async def process_repo(
 
 async def run_generation(args):
     """Main generation loop."""
-    from bgkit.inference import LlamaClient
+    from bgkit.inference import InferenceConfig, LlamaClient
 
     repos_dir = args.repos_dir
     output_dir = args.output_dir
@@ -378,19 +365,19 @@ async def run_generation(args):
     )
 
     # Initialize clients
-    client_primary = LlamaClient(
+    client_primary = LlamaClient(InferenceConfig(
         base_url=args.server_url_primary, max_concurrent=args.workers,
-    )
-    await client_primary.wait_for_ready()
+    ))
+    await client_primary.wait_ready()
     print(f"Primary server ready: {args.server_url_primary}")
 
     client_fast = None
     if args.server_url_fast:
         try:
-            client_fast = LlamaClient(
+            client_fast = LlamaClient(InferenceConfig(
                 base_url=args.server_url_fast, max_concurrent=args.workers,
-            )
-            await client_fast.wait_for_ready()
+            ))
+            await client_fast.wait_ready()
             print(f"Fast server ready: {args.server_url_fast}")
         except Exception as e:
             print(f"Fast server not available ({e}), using primary only")
@@ -463,11 +450,11 @@ def main():
     parser.add_argument("--max-seq-len", type=int, default=8192)
     parser.add_argument(
         "--server-url-primary", type=str,
-        default=os.environ.get("VLLM_URL", "http://localhost:8090/v1"),
+        default=os.environ.get("VLLM_URL", "http://localhost:8090"),
     )
     parser.add_argument(
         "--server-url-fast", type=str,
-        default=os.environ.get("VLLM_URL_FAST", "http://localhost:8091/v1"),
+        default=os.environ.get("VLLM_URL_FAST", "http://localhost:8091"),
     )
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
