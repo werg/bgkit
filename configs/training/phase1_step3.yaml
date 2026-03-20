@@ -1,26 +1,39 @@
-# Phase 1 Step 3: Frozen-target projection alignment
+# Commit encoding: two-level L0+L1 compression for commit reproduction
 phase: phase1_step3
+optimizer: muon
+max_steps: 50000
+lr: 3.0e-5
+encoder_lr: 1.0e-5
+decoder_lr: 5.0e-5
+warmup_steps: 2000
+bidi_warmup_steps: 500
 
-# Step 3a: Text regurgitation (projection block only, warm-started from joint block pretraining)
-step3a:
-  max_steps: 50000
-  projection_lr: 3.0e-4
-  warmup_steps: 2000
-  freeze:
-    bgkit_compressor: true
-    projection_block: false
-    target_lm: true  # Frozen, 4-bit for forward passes only
+ice:
+  checkpoint_path: auto
+  input_dim: 1024
+  hidden_dim: 128
+  num_layers: 2
+  kernel_size: 5
 
-# Step 3b: Content tasks (unfreeze compressor at low LR)
-step3b:
-  max_steps: 50000
-  bgkit_lr: 1.0e-5  # Low LR for compressor
-  projection_lr: 1.0e-4
-  warmup_steps: 2000
-  freeze:
-    bgkit_compressor: false
-    projection_block: false
-    target_lm: true  # Still frozen
+curriculum:
+  target_ratio_start: 0.50
+  target_ratio_end: 0.20
+  target_ratio_ramp_steps: 30000
+  max_survivor_gap: 64
+  fallback_threshold: 3.0
+  calibrator_ema_decay: 0.99
+  calibrator_warmup_batches: 50
 
-eval_every: 2000
-save_every: 10000
+freeze:
+  bgkit: false
+  decoder: false
+
+data:
+  commit_encoding_dir: ${oc.env:DATA_DIR}/processed/commit_encoding
+  prompt_variants_dir: configs/prompt_variants
+  max_diff_tokens_per_file: 4096
+  max_files_per_commit: 16
+  max_message_tokens: 256
+
+eval_every: 1000
+save_every: 5000

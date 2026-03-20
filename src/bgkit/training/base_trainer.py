@@ -204,6 +204,13 @@ class BaseTrainer(ABC):
         Return value is ignored.
         """
 
+    def _post_lr_schedule(self, step: int) -> None:
+        """Hook called after the LR schedule is applied, before the accumulation loop.
+
+        Override to apply per-param-group LR adjustments (e.g. local warmup ramps
+        for newly added param groups at stage transitions).
+        """
+
     def _add_step_metrics(self, metrics: dict[str, float]) -> None:
         """Add trainer-specific metrics to the step dict before logging.
 
@@ -788,6 +795,8 @@ class BaseTrainer(ABC):
                             ramp = (step - resume_step + 1) / resume_warmup_steps
                             lr *= ramp
                         pg["lr"] = lr
+
+                    self._post_lr_schedule(step)
 
                     # Accumulation loop
                     self.optimizer.zero_grad()

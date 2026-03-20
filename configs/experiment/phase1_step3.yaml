@@ -1,0 +1,9 @@
+# @package _global_
+# Experiment preset: Phase 1 Step 3 commit encoding (two-level L0+L1)
+defaults:
+  - /config
+  - /training/phase1_step3
+  - _self_
+
+run_name: phase1_step3
+step1_checkpoint: auto

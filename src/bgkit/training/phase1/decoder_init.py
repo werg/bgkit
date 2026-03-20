@@ -164,11 +164,12 @@ class DecoderInitTrainer(BaseTrainer):
         if bgkit_checkpoint is not None:
             logger.info("loading_bgkit_checkpoint", path=bgkit_checkpoint)
             _, state_dicts = load_checkpoint(Path(bgkit_checkpoint))
-            if "encoder" in state_dicts:
-                self.encoder.load_state_dict(state_dicts["encoder"])
-            elif "model" in state_dicts:
-                logger.info("loading_legacy_auto_repro_checkpoint")
-                self.encoder.compressor.load_state_dict(state_dicts["model"], strict=False)
+            if "encoder" not in state_dicts:
+                raise ValueError(
+                    f"bgkit_checkpoint {bgkit_checkpoint} missing 'encoder' key. "
+                    f"Found keys: {list(state_dicts.keys())}"
+                )
+            self.encoder.load_state_dict(state_dicts["encoder"])
 
         # --- Decoder (trainable) ---
         decoder_cfg = self.cfg.model.decoder
@@ -1263,10 +1264,11 @@ class DecoderInitTrainer(BaseTrainer):
         self._check_optimizer_type_compat(metadata)
 
         # Restore model weights
-        if "encoder" in state_dicts:
-            self.encoder.load_state_dict(state_dicts["encoder"])
-        elif "bgkit_model" in state_dicts:
-            self.encoder.compressor.load_state_dict(state_dicts["bgkit_model"], strict=False)
+        if "encoder" not in state_dicts:
+            raise ValueError(
+                f"Resume checkpoint missing 'encoder' key. Found: {list(state_dicts.keys())}"
+            )
+        self.encoder.load_state_dict(state_dicts["encoder"])
         self.decoder.load_state_dict(state_dicts["decoder"])
 
         # Restore step position

@@ -1,4 +1,4 @@
-"""Phase 1, Step 2: Compression training (4 objectives, curriculum).
+"""Phase 1, Step 4: Compression training (4 objectives, curriculum).
 
 Introduces the drop-flag mechanism with four core objectives:
 1. Data reconstruction (primary, ~40%)
@@ -30,7 +30,7 @@ from bgkit.data.threshold_calibrator import ThresholdCalibrator
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
-from bgkit.training.checkpoint_registry import CheckpointRegistry, resolve_checkpoint
+from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import enable_gradient_checkpointing
 from bgkit.training.objectives.commit_reproduction import commit_reproduction_loss
@@ -80,32 +80,56 @@ class CompressionTrainer(BaseTrainer):
         backbone_name = bgkit_cfg.backbone_name
         backbone_revision = bgkit_cfg.get("backbone_revision", None)
         hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
-        logger.info("loading_bgkit_encoder", model=backbone_name, revision=backbone_revision)
         bidi_warmup = self.cfg.training.get("bidi_warmup_steps", 1000)
-        self.encoder = BgKITEncoder.from_pretrained(
-            backbone_name,
-            hidden_dim=hidden_dim,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            revision=backbone_revision,
-            attn_implementation="sdpa",
-            bidi_warmup_steps=bidi_warmup,
-        )
-        self.encoder.to(device)
 
-        # Load encoder+decoder from Step 1 checkpoint
         step1_checkpoint = self._resolve_step1_checkpoint()
         step1_state_dicts: dict | None = None
         if step1_checkpoint is not None:
             logger.info("loading_step1_checkpoint", path=step1_checkpoint)
             _, step1_state_dicts = load_checkpoint(Path(step1_checkpoint))
-            # Discard optimizer state — not needed for step2 (fresh optimizer)
             step1_state_dicts.pop("optimizer", None)
-            if "encoder" in step1_state_dicts:
-                self.encoder.load_state_dict(step1_state_dicts.pop("encoder"))
-                gc.collect()
+            if "encoder" not in step1_state_dicts:
+                raise ValueError(
+                    f"Step 3 checkpoint missing 'encoder' key: {step1_checkpoint}. "
+                    f"Found keys: {list(step1_state_dicts.keys())}"
+                )
 
-        # Encoder is trainable in Step 2
+        # Auto-detect pruned architecture from state dict keys
+        if step1_state_dicts:
+            from bgkit.models.encoder import is_pruned_encoder_state_dict
+            pruned = is_pruned_encoder_state_dict(step1_state_dicts["encoder"])
+            logger.info(
+                "loading_bgkit_encoder",
+                model=backbone_name, revision=backbone_revision, pruned=pruned,
+            )
+            self.encoder = BgKITEncoder.from_pretrained_with_state_dict(
+                backbone_name,
+                step1_state_dicts.pop("encoder"),
+                hidden_dim=hidden_dim,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                revision=backbone_revision,
+                attn_implementation="sdpa",
+                bidi_warmup_steps=bidi_warmup,
+            )
+        else:
+            logger.info(
+                "loading_bgkit_encoder",
+                model=backbone_name, revision=backbone_revision, pruned=False,
+            )
+            self.encoder = BgKITEncoder.from_pretrained(
+                backbone_name,
+                hidden_dim=hidden_dim,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                revision=backbone_revision,
+                attn_implementation="sdpa",
+                bidi_warmup_steps=bidi_warmup,
+            )
+        self.encoder.to(device)
+        gc.collect()
+
+        # Encoder is trainable in Step 4
         self.encoder.requires_grad_(True)
         self.encoder.train()
         enable_gradient_checkpointing(self.encoder.compressor.backbone)
@@ -323,14 +347,10 @@ class CompressionTrainer(BaseTrainer):
         )
 
     def _resolve_step1_checkpoint(self) -> str | None:
-        """Resolve step1_checkpoint config with fallback chain.
+        """Resolve step1_checkpoint: auto -> best phase1_step3 checkpoint.
 
-        Auto-resolution order:
-        1. commit_encoding phase (more trained, has L0+L1 experience)
-        2. phase1_step1 (frozen encoder pretraining)
-
-        Both phases produce the same multi-artifact checkpoint layout
-        (encoder.pt + decoder.pt), so no loading changes needed.
+        Step 4 expects a checkpoint from step 3 (commit encoding), which has
+        both a trained encoder and decoder.
         """
         step1_checkpoint = self.cfg.get("step1_checkpoint", None)
 
@@ -339,42 +359,14 @@ class CompressionTrainer(BaseTrainer):
 
         if step1_checkpoint == "auto":
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
-            registry = CheckpointRegistry(checkpoint_dir)
-            registry.backfill(checkpoint_dir)
-
-            # 1. Try commit_encoding first
-            best = registry.best(
-                phase="commit_encoding", metric="eval/loss",
-                lower_is_better=True,
+            resolved = resolve_checkpoint(
+                checkpoint_dir,
+                phase="phase1_step3",
+                metric="eval/loss",
+                label="step1_checkpoint",
             )
-            if best is not None:
-                step1_checkpoint = str(checkpoint_dir / best.name)
-                self._input_sources["step1"] = best.name
-                logger.info(
-                    "step1_auto_resolved_commit_encoding",
-                    checkpoint=best.name,
-                )
-                return step1_checkpoint
+            step1_checkpoint = str(resolved)
 
-            # 2. Fall back to phase1_step1 (use latest, not best-by-metric,
-            #    because early checkpoints without compression have misleadingly
-            #    low eval/loss that doesn't reflect compression capability)
-            best = registry.latest(phase="phase1_step1")
-            if best is not None:
-                step1_checkpoint = str(checkpoint_dir / best.name)
-                self._input_sources["step1"] = best.name
-                logger.info(
-                    "step1_auto_resolved_phase1_step1",
-                    checkpoint=best.name,
-                )
-                return step1_checkpoint
-
-            raise ValueError(
-                "step1_checkpoint=auto but no commit_encoding or phase1_step1 "
-                "checkpoint found. Run one of those phases first."
-            )
-
-        # Explicit path always wins
         if step1_checkpoint is not None:
             self._input_sources["step1"] = Path(step1_checkpoint).name
 
@@ -451,9 +443,10 @@ class CompressionTrainer(BaseTrainer):
     def _get_bidi_alpha(self) -> float:
         """Get the current bidirectional warmup alpha from the encoder."""
         from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
+        from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
 
         for module in self.encoder.modules():
-            if isinstance(module, BidirectionalQwen35):
+            if isinstance(module, (BidirectionalQwen35, PrunedBidirectionalQwen35)):
                 return module.bidi_alpha
         return 1.0
 

@@ -5,10 +5,10 @@ from step 0. Asymmetric encoder/decoder prompting: encoder gets commit
 message as conditioning, decoder must reconstruct the full commit purely
 from compressed survivors.
 
-Pipeline position: between Step 1 (frozen encoder pretraining) and Step 2
-(multi-objective compression). Takes Step 1 checkpoint, unfreezes both
-encoder and decoder. Produces checkpoints in the same multi-artifact format
-as CompressionTrainer (encoder.pt + decoder.pt) so Step 2 can consume them.
+Pipeline position: Step 3 — between Step 2 (pruning distillation) and Step 4
+(multi-objective compression). Takes Step 1 or Step 2 checkpoint, unfreezes
+both encoder and decoder. Produces checkpoints in the same multi-artifact
+format as CompressionTrainer (encoder.pt + decoder.pt) so Step 4 can consume them.
 """
 
 from __future__ import annotations
@@ -63,25 +63,41 @@ class CommitEncodingTrainer(BaseTrainer):
         backbone_revision = bgkit_cfg.get("backbone_revision", None)
         hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
         bidi_warmup = tcfg.get("bidi_warmup_steps", 500)
-        self.encoder = BgKITEncoder.from_pretrained(
-            backbone_name,
-            hidden_dim=hidden_dim,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            revision=backbone_revision,
-            attn_implementation="sdpa",
-            bidi_warmup_steps=bidi_warmup,
-        )
-        self.encoder.to(device)
 
-        # Load encoder+decoder from Step 1 checkpoint
         step1_checkpoint = self._resolve_step1_checkpoint()
         step1_state_dicts: dict | None = None
         if step1_checkpoint is not None:
             logger.info("loading_step1_checkpoint", path=step1_checkpoint)
             _, step1_state_dicts = load_checkpoint(Path(step1_checkpoint))
-            if "encoder" in step1_state_dicts:
-                self.encoder.load_state_dict(step1_state_dicts["encoder"])
+            if "encoder" not in step1_state_dicts:
+                raise ValueError(
+                    f"Step 2 checkpoint missing 'encoder' key: {step1_checkpoint}. "
+                    f"Found keys: {list(step1_state_dicts.keys())}"
+                )
+
+        # Auto-detect pruned architecture from state dict keys
+        if step1_state_dicts:
+            self.encoder = BgKITEncoder.from_pretrained_with_state_dict(
+                backbone_name,
+                step1_state_dicts["encoder"],
+                hidden_dim=hidden_dim,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                revision=backbone_revision,
+                attn_implementation="sdpa",
+                bidi_warmup_steps=bidi_warmup,
+            )
+        else:
+            self.encoder = BgKITEncoder.from_pretrained(
+                backbone_name,
+                hidden_dim=hidden_dim,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                revision=backbone_revision,
+                attn_implementation="sdpa",
+                bidi_warmup_steps=bidi_warmup,
+            )
+        self.encoder.to(device)
 
         self.encoder.requires_grad_(True)
         self.encoder.train()
@@ -304,7 +320,7 @@ class CommitEncodingTrainer(BaseTrainer):
         }]
 
     def _resolve_step1_checkpoint(self) -> str | None:
-        """Resolve step1_checkpoint config: 'auto' -> best phase1_step1."""
+        """Resolve step1_checkpoint: auto -> best phase1_step2 checkpoint."""
         step1_checkpoint = self.cfg.get("step1_checkpoint", None)
         self._input_sources = {}
 
@@ -312,7 +328,7 @@ class CommitEncodingTrainer(BaseTrainer):
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
             resolved = resolve_checkpoint(
                 checkpoint_dir,
-                phase="phase1_step1",
+                phase="phase1_step2",
                 metric="eval/loss",
                 label="step1_checkpoint",
             )
@@ -638,9 +654,10 @@ class CommitEncodingTrainer(BaseTrainer):
 
     def _get_bidi_alpha(self) -> float:
         from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
+        from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
 
         for module in self.encoder.modules():
-            if isinstance(module, BidirectionalQwen35):
+            if isinstance(module, (BidirectionalQwen35, PrunedBidirectionalQwen35)):
                 return module.bidi_alpha
         return 1.0
 

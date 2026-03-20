@@ -1,5 +1,5 @@
 # @package _global_
-# Experiment preset: Phase 1 Step 2 compression training
+# Full experiment preset: Phase 1 Step 2 DeltaNet pruning distillation
 defaults:
   - /config
   - /training/phase1_step2

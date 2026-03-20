@@ -32,11 +32,15 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
         return DecoderInitTrainer(cfg)
-    elif phase == "commit_encoding":
+    elif phase == "phase1_step2":
+        from bgkit.training.distillation.pruning_distill import PruningDistillTrainer
+
+        return PruningDistillTrainer(cfg)
+    elif phase == "phase1_step3":
         from bgkit.training.phase1.commit_encoding import CommitEncodingTrainer
 
         return CommitEncodingTrainer(cfg)
-    elif phase == "phase1_step2":
+    elif phase == "phase1_step4":
         from bgkit.training.phase1.compression import CompressionTrainer
 
         return CompressionTrainer(cfg)
