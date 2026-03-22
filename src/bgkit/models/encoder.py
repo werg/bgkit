@@ -313,14 +313,12 @@ class BgKITEncoder(nn.Module):
         # 3. Get rotary embedding (shared reference, not deepcopy)
         rotary_emb = _resolve_rotary_emb(backbone)
 
-        # 4. Deepcopy the final norm for the projection block
+        # 4. Deepcopy norms for compressor and projection block
         original_norm = _resolve_final_norm(backbone)
         projection_norm = deepcopy(original_norm)
+        compressor_norm = deepcopy(original_norm)
 
-        # 5. The original norm stays as the compressor norm
-        compressor_norm = original_norm
-
-        # 6. Replace backbone's norm with Identity (un-normed output)
+        # 5. Replace backbone's norm with Identity (un-normed output)
         _set_norm_to_identity(backbone)
 
         # 7. Construct compressor

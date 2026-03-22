@@ -246,6 +246,11 @@ class PrunedBidirectionalQwen35(nn.Module):
         - No FullAttn
         """
         layers = bidi_model.layers
+        if len(layers) < 23:
+            raise ValueError(
+                f"from_unpruned expects at least 23 layers (24-layer model with "
+                f"projection already popped), got {len(layers)}."
+            )
         blocks = nn.ModuleList()
 
         # 5 complete blocks

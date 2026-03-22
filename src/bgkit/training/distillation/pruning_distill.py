@@ -122,7 +122,7 @@ class PruningDistillTrainer(BaseTrainer):
         student_encoder_full.compressor.backbone = pruned_backbone
 
         self.student_encoder = student_encoder_full
-        self.student_encoder.to(device)
+        self.student_encoder.to(dtype=torch.bfloat16, device=device)
 
         # Enable gradient checkpointing on FullAttn layers in pruned backbone
         enable_gradient_checkpointing(self.student_encoder.compressor.backbone)
@@ -625,6 +625,7 @@ class PruningDistillTrainer(BaseTrainer):
         state["w_repro"] = self._w_repro
         state["w_proj"] = self._w_proj
         state["w_cosine"] = self._w_cosine
+        state["max_gap"] = self._max_gap
         return state
 
     def apply_live_config(self, changes: dict) -> None:
@@ -639,11 +640,18 @@ class PruningDistillTrainer(BaseTrainer):
         super().apply_live_config(changes)
 
     def _post_lr_schedule(self, step: int) -> None:
-        """Apply per-group local warmup ramp after the base trainer sets LR."""
+        """Apply per-group local warmup ramp after the base trainer sets LR.
+
+        Only applies to param groups added mid-training (stage transitions).
+        Skipped for groups with local_warmup_steps=0 (the initial group) to
+        avoid double-ramping with the base trainer's global warmup.
+        """
         for pg in self.optimizer.param_groups:
+            local_warmup = pg.get("local_warmup_steps", 0)
+            if local_warmup <= 0:
+                continue
             local_start = pg.get("warmup_start_step", 0)
-            local_warmup = pg.get("local_warmup_steps", self._local_warmup_steps)
-            if local_warmup > 0 and step < local_start + local_warmup:
+            if step < local_start + local_warmup:
                 ramp = max((step - local_start + 1) / local_warmup, 0.0)
                 pg["lr"] *= ramp
 
@@ -796,6 +804,7 @@ class PruningDistillTrainer(BaseTrainer):
                 ("_w_repro", "w_repro"),
                 ("_w_proj", "w_proj"),
                 ("_w_cosine", "w_cosine"),
+                ("_max_gap", "max_gap"),
             ]:
                 if key in ts:
                     setattr(self, attr, ts[key])
