@@ -1,4 +1,4 @@
-"""Phase 1, Step 4: Compression training (4 objectives, curriculum).
+"""Phase 1, Step 5: Compression training (4 objectives, curriculum).
 
 Introduces the drop-flag mechanism with four core objectives:
 1. Data reconstruction (primary, ~40%)
@@ -347,7 +347,7 @@ class CompressionTrainer(BaseTrainer):
         )
 
     def _resolve_step1_checkpoint(self) -> str | None:
-        """Resolve step1_checkpoint: auto -> best phase1_step3 checkpoint.
+        """Resolve step1_checkpoint: auto -> best phase1_step4 checkpoint.
 
         Step 4 expects a checkpoint from step 3 (commit encoding), which has
         both a trained encoder and decoder.
@@ -361,7 +361,7 @@ class CompressionTrainer(BaseTrainer):
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
             resolved = resolve_checkpoint(
                 checkpoint_dir,
-                phase="phase1_step3",
+                phase="phase1_step4",
                 metric="eval/loss",
                 label="step1_checkpoint",
             )

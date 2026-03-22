@@ -61,13 +61,25 @@ Cost: Cheap (two blocks train). Output: The BgKIT base model with (a) a compress
 
 **Modifications to BgKIT:** (a) Learned binary embeddings for survive/doomed flags added to input representations. (b) Compressor (layers 0–22) pretrained to output near the input embedding space; projection block (layer 23) pretrained to map toward decoder space (from joint block pretraining prerequisite). (c) Compression prompt support via tokenized prefixes.
 
-### Step 1: Decoder Initialization
+### Step 1: Decoder Initialization (`phase1_step1`)
 
-Train the reconstruction decoder to generate text from BgKIT's full (uncompressed) output representations. Near-trivial, but initializes the decoder's ability to read BgKIT's output space before compression is introduced.
+Train the reconstruction decoder to generate text from BgKIT's full (uncompressed) output representations. Four-phase curriculum: projection-only warmup → decoder training → encoder unfreeze with bidi warmup → compression introduction with ICE scoring.
 
-### Step 2: Compression Training
+### Step 2: DeltaNet Pruning Distillation (`phase1_step2`)
 
-Introduce the drop-flag mechanism. Four core reconstruction objectives, all using the co-trained decoder:
+Remove the 18 DeltaNet linear-attention layers from the encoder via structured pruning with knowledge distillation. Replace with lightweight ResidualConv1d (local mixing) + MLP-only layers. Distills the full encoder (teacher) into the pruned encoder (student) using boundary MSE, auto-repro MSE, projection MSE, and cosine losses. Four-stage unfreezing: conv1d → retrained MLPs → all MLPs → everything. Reduces encoder from ~754M to ~499M params, eliminates DeltaNet numerical stability issues.
+
+### Step 3: Pruned Reconstruction (`phase1_step3`)
+
+Retrain the decoder (via LoRA) and encoder (full fine-tune) on the content reproduction task using the pruned encoder from step 2. Skips all curriculum phases — encoder unfrozen and compression active from step 0. Higher encoder LR, lower decoder LR. Bridges the quality gap between the distilled pruned encoder and the original unpruned encoder.
+
+### Step 4: Commit Encoding (`phase1_step4`)
+
+Single-objective trainer with L0 (per-file) + L1 (cross-file) compression on commit reproduction data. Trains both encoder and decoder.
+
+### Step 5: Compression Training (`phase1_step5`)
+
+Introduce the drop-flag mechanism with all four core reconstruction objectives, using the co-trained decoder:
 
 **Objective 1 — Data reconstruction (primary).** Given compressed survivors from a level 0 pass, the decoder regenerates the original file content. Dense per-token gradient for consolidation quality. Scales naturally with compression ratio.
 
@@ -87,11 +99,11 @@ Introduce the drop-flag mechanism. Four core reconstruction objectives, all usin
 
 **Decoder adaptation strategy:** Begin with full fine-tuning. Monitor survivor embedding quality (cosine similarity to nearest token embeddings in BgKIT's vocabulary). If embeddings drift substantially from the token manifold, switch to high-rank LoRA with learning rate throttling on the decoder.
 
-### Step 3: Frozen-Target Projection Alignment
+### Frozen-Target Projection Alignment (Phase 2a prep)
 
-**Sub-step 3a — Text regurgitation.** Frozen Qwen3.5-35B receives projected BgKIT survivors and generates the original text. Only the projection block trains; the compressor is frozen. The projection block is warm-initialized from joint block pretraining (Prerequisite 2), giving it a strong starting point. High volume, simple data. Aligns the projection output to the target LLM's embedding space.
+**Sub-step a — Text regurgitation.** Frozen Qwen3.5-35B receives projected BgKIT survivors and generates the original text. Only the projection block trains; the compressor is frozen. The projection block is warm-initialized from joint block pretraining (Prerequisite 2), giving it a strong starting point. High volume, simple data. Aligns the projection output to the target LLM's embedding space.
 
-**Sub-step 3b — Content tasks.** Unfreeze the compressor at a low learning rate. Train on description generation and structural QA in tool-call format through the frozen target LLM. The projection block trains at a higher rate.
+**Sub-step b — Content tasks.** Unfreeze the compressor at a low learning rate. Train on description generation and structural QA in tool-call format through the frozen target LLM. The projection block trains at a higher rate.
 
 ### Phase 1 Quality Gate
 
@@ -229,7 +241,7 @@ These are **non-invasive** — they replace individual PyTorch modules without m
 Estimates require validation via profiling on the DGX Spark (Blackwell GB10, 128 GB unified memory, 273 GB/s shared bandwidth).
 
 - **ICE:** Negligible one-time cost.
-- **Phase 1:** BgKIT compressor + projection block + decoder co-training (~1,040M + ~35M + ~800M). Dominant cost: compression-reconstruction examples + frozen target LLM forward passes for projection alignment. Phase 1 Step 3 requires loading Qwen3.5-35B in 4-bit for frozen forward passes (~18 GB), but no backward pass through the target LLM, so memory pressure is moderate. Fused cross-entropy on the decoder reduces peak memory substantially.
+- **Phase 1:** BgKIT compressor + projection block + decoder co-training (~1,040M + ~35M + ~800M). Dominant cost: compression-reconstruction examples + frozen target LLM forward passes for projection alignment. Frozen-target projection alignment requires loading Qwen3.5-35B in 4-bit for frozen forward passes (~18 GB), but no backward pass through the target LLM, so memory pressure is moderate. Fused cross-entropy on the decoder reduces peak memory substantially.
 - **Phase 2a (distillation):** Teacher logprobs are pre-computed offline. Student training is BgKIT + 0.8B decoder — same memory footprint as Phase 1. The cheapest Phase 2 variant.
 - **Phase 2b (trajectory distillation):** Trajectory generation requires running Qwen3.5-35B interactively in an agentic harness — expensive but one-time. Student training is again BgKIT + 0.8B.
 - **Phase 2c (end-to-end):** The expensive phase. Approximate memory budget for BgKIT-unfrozen configuration: target LLM 4-bit weights (~18 GB) + BgKIT compressor BF16 (~2.1 GB) + projection block BF16 (~0.07 GB, or more if dimensionally extended) + decoder BF16 (~1.6 GB) + LoRA adapters (~0.3 GB) + optimizer states (~5 GB worst case) ≈ 27 GB fixed, leaving ~101 GB for activations and gradients. With gradient checkpointing (including CPU-offloaded variant) across BgKIT levels and the target LLM, plus fused cross-entropy eliminating logit materialization, this should support sequence lengths of 8K–16K at microbatch 1 with gradient accumulation, but must be profiled. The DGX Spark's shared memory bandwidth (273 GB/s, ~12× lower than A100 HBM) will make Phase 2c bandwidth-bound; expect significantly longer step times than equivalent HBM hardware.

@@ -1,0 +1,62 @@
+# Phase 1 Step 5: Multi-objective compression training (4 objectives, curriculum)
+#
+# Steps 1-4 handle encoder pretraining, pruning distillation, pruned
+# reconstruction, and commit encoding. Step 5 receives a checkpoint with:
+#   - Pruned encoder with compression at ~0.25 ratio
+#   - Completed bidi warmup (fully bidirectional)
+#   - Trained decoder on compressed representations
+#
+# Step 5 focuses on multi-objective training + L1 introduction.
+phase: phase1_step5
+optimizer: muon
+max_steps: 200000
+lr: 5.0e-5
+warmup_steps: 2000          # reduced from 5000 — models already trained from step 1
+bidi_warmup_steps: 0         # already completed in step 1
+max_batch_tokens: 16384
+
+objectives:
+  data_reconstruction: 0.35
+  description_generation: 0.15
+  structural_relational: 0.12
+  commit_reproduction: 0.20
+  query_conditioned: 0.18
+
+ice:
+  checkpoint_path: auto
+  input_dim: 1024
+  hidden_dim: 192
+  num_layers: 3
+  kernel_size: 5
+
+curriculum:
+  l1_introduction_step: 10000    # earlier than before — L0 compression established in step 1
+  # Random per-sample ratio drawn between min_target_ratio and 1.0.
+  # Step 1 trained across 0.10-1.0; step 2 holds the same range.
+  target_ratio_start: 0.10
+  target_ratio_end: 0.10
+  target_ratio_ramp_steps: 1       # no ramp — fixed at 0.10 from the start
+  max_survivor_gap: 64
+  fallback_threshold: 3.0       # used before calibrator warms up
+  calibrator_ema_decay: 0.99
+  calibrator_warmup_batches: 50
+  l1_calibrator_fast_batches: 200
+
+freeze:
+  bgkit: false
+  decoder: false
+
+data:
+  file_tokens_path: ${oc.env:DATA_DIR}/processed/tokens
+  commit_tokens_path: ${oc.env:DATA_DIR}/processed/commit_reproduction
+  description_tokens_path: ${oc.env:DATA_DIR}/mmap/descriptions
+  structural_tokens_path: ${oc.env:DATA_DIR}/mmap/structural
+  prompt_variants_dir: configs/prompt_variants
+  qa_data_dir: ${oc.env:DATA_DIR}/mmap/qa_conditioned
+
+eval:
+  generation_samples: 8
+  generation_every_n_evals: 4
+
+eval_every: 2000
+save_every: 10000

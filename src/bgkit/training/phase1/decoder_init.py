@@ -141,35 +141,48 @@ class DecoderInitTrainer(BaseTrainer):
         backbone_name = bgkit_cfg.backbone_name
         backbone_revision = bgkit_cfg.get("backbone_revision", None)
         hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
-        logger.info("loading_bgkit_encoder", model=backbone_name, revision=backbone_revision)
-        self.encoder = BgKITEncoder.from_pretrained(
-            backbone_name,
-            hidden_dim=hidden_dim,
-            torch_dtype=torch.bfloat16,
-            trust_remote_code=True,
-            revision=backbone_revision,
-            attn_implementation="sdpa",
-            bidi_warmup_steps=bidi_warmup,
-        )
-        self.encoder.to(device)
-        self.encoder.requires_grad_(False)
-        self.encoder.eval()
 
         # Projection block training flags
         self._train_projection = tcfg.get("train_projection_block", True)
         self._projection_only_steps = tcfg.get("projection_only_steps", 0)
 
-        # Load BgKIT from checkpoint if available.
+        # Load BgKIT from checkpoint if available (auto-detects pruned architecture)
         bgkit_checkpoint = self._resolve_bgkit_checkpoint()
         if bgkit_checkpoint is not None:
             logger.info("loading_bgkit_checkpoint", path=bgkit_checkpoint)
-            _, state_dicts = load_checkpoint(Path(bgkit_checkpoint))
-            if "encoder" not in state_dicts:
+            _, bgkit_state_dicts = load_checkpoint(Path(bgkit_checkpoint))
+            if "encoder" not in bgkit_state_dicts:
                 raise ValueError(
                     f"bgkit_checkpoint {bgkit_checkpoint} missing 'encoder' key. "
-                    f"Found keys: {list(state_dicts.keys())}"
+                    f"Found keys: {list(bgkit_state_dicts.keys())}"
                 )
-            self.encoder.load_state_dict(state_dicts["encoder"])
+            self.encoder = BgKITEncoder.from_pretrained_with_state_dict(
+                backbone_name,
+                bgkit_state_dicts["encoder"],
+                hidden_dim=hidden_dim,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                revision=backbone_revision,
+                attn_implementation="sdpa",
+                bidi_warmup_steps=bidi_warmup,
+            )
+            # Also load decoder weights if present (step 2 checkpoints include it)
+            self._bgkit_decoder_state = bgkit_state_dicts.get("decoder", None)
+        else:
+            logger.info("loading_bgkit_encoder", model=backbone_name, revision=backbone_revision)
+            self.encoder = BgKITEncoder.from_pretrained(
+                backbone_name,
+                hidden_dim=hidden_dim,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+                revision=backbone_revision,
+                attn_implementation="sdpa",
+                bidi_warmup_steps=bidi_warmup,
+            )
+            self._bgkit_decoder_state = None
+        self.encoder.to(device)
+        self.encoder.requires_grad_(False)
+        self.encoder.eval()
 
         # --- Decoder (trainable) ---
         decoder_cfg = self.cfg.model.decoder
@@ -185,6 +198,44 @@ class DecoderInitTrainer(BaseTrainer):
         )
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
         self.decoder.to(device)
+
+        # Load decoder weights from bgkit checkpoint if available (step 2 includes decoder)
+        if self._bgkit_decoder_state is not None:
+            self.decoder.load_state_dict(self._bgkit_decoder_state)
+            del self._bgkit_decoder_state
+            logger.info("loaded_decoder_from_bgkit_checkpoint")
+
+        # Optional LoRA wrapping for decoder (step 3 uses this for parameter-efficient adaptation)
+        self._decoder_lora = False
+        lora_cfg = tcfg.get("decoder_lora", {})
+        if lora_cfg.get("enabled", False):
+            from peft import LoraConfig, get_peft_model
+
+            lora_config = LoraConfig(
+                r=lora_cfg.get("r", 16),
+                lora_alpha=lora_cfg.get("alpha", 32),
+                lora_dropout=lora_cfg.get("dropout", 0.05),
+                target_modules=list(lora_cfg.get("target_modules", [
+                    "q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj",
+                ])),
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            self.decoder.backbone = get_peft_model(self.decoder.backbone, lora_config)
+            self._decoder_lora = True
+            trainable = sum(
+                p.numel() for p in self.decoder.backbone.parameters() if p.requires_grad
+            )
+            total = sum(p.numel() for p in self.decoder.backbone.parameters())
+            logger.info(
+                "decoder_lora_applied",
+                trainable_params=trainable,
+                total_params=total,
+                ratio=f"{trainable/total:.4f}",
+                r=lora_config.r,
+                alpha=lora_config.lora_alpha,
+            )
 
         enable_gradient_checkpointing(self.decoder.backbone)
 
@@ -441,22 +492,34 @@ class DecoderInitTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     def _resolve_bgkit_checkpoint(self) -> str | None:
-        """Resolve bgkit_checkpoint: 'auto' -> best joint_block_pretrain."""
+        """Resolve bgkit_checkpoint: 'auto' -> best from preceding phase.
+
+        For phase1_step1: resolves from joint_block_pretrain.
+        For phase1_step3: resolves from phase1_step2 (pruned encoder).
+        """
         bgkit_checkpoint = self.cfg.get("bgkit_checkpoint", None)
         if bgkit_checkpoint == "auto":
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
-            resolved = resolve_checkpoint(
-                checkpoint_dir,
-                phase="joint_block_pretrain",
-                metric="eval/mse_repro",
-                label="bgkit_checkpoint",
-            )
+            phase = self.cfg.training.get("phase", "phase1_step1")
+            if phase == "phase1_step3":
+                resolved = resolve_checkpoint(
+                    checkpoint_dir,
+                    phase="phase1_step2",
+                    metric="eval/loss",
+                    label="bgkit_checkpoint",
+                )
+            else:
+                resolved = resolve_checkpoint(
+                    checkpoint_dir,
+                    phase="joint_block_pretrain",
+                    metric="eval/mse_repro",
+                    label="bgkit_checkpoint",
+                )
             bgkit_checkpoint = str(resolved)
 
-        # Track lineage for BOTH auto-resolved and explicit paths
         self._input_sources = {}
         if bgkit_checkpoint is not None:
-            self._input_sources["joint_block_pretrain"] = Path(bgkit_checkpoint).name
+            self._input_sources["bgkit"] = Path(bgkit_checkpoint).name
 
         return bgkit_checkpoint
 
@@ -644,13 +707,10 @@ class DecoderInitTrainer(BaseTrainer):
                 decoder_lr, tcfg.get("lr_scale_bottom", 0.1),
             )
         else:
-            return [
-                {
-                    "params": list(self.decoder.parameters()),
-                    "lr": decoder_lr,
-                    "base_lr": decoder_lr,
-                }
-            ]
+            params = [p for p in self.decoder.parameters() if p.requires_grad]
+            if params:
+                return [{"params": params, "lr": decoder_lr, "base_lr": decoder_lr}]
+            return []
 
     def _build_layerwise_param_groups(
         self, base_lr: float, lr_scale_bottom: float,
@@ -714,12 +774,25 @@ class DecoderInitTrainer(BaseTrainer):
         return []
 
     def _muon_excluded_param_ids(self) -> frozenset[int]:
-        """Return param IDs of embedding/lm_head — 2D but should not use Muon."""
+        """Return param IDs of embedding/lm_head — 2D but should not use Muon.
+
+        Handles both bare CausalLM and PeftModel-wrapped decoder.
+        """
         exclude = set()
-        for p in self.decoder.backbone.model.embed_tokens.parameters():
-            exclude.add(id(p))
-        for p in self.decoder.backbone.lm_head.parameters():
-            exclude.add(id(p))
+        backbone = self.decoder.backbone
+        try:
+            from peft import PeftModel
+            causal_lm = backbone.base_model.model if isinstance(backbone, PeftModel) else backbone
+        except ImportError:
+            causal_lm = backbone
+        inner = getattr(causal_lm, "model", None)
+        if inner is not None and hasattr(inner, "embed_tokens"):
+            for p in inner.embed_tokens.parameters():
+                exclude.add(id(p))
+        lm_head = getattr(causal_lm, "lm_head", None)
+        if lm_head is not None:
+            for p in lm_head.parameters():
+                exclude.add(id(p))
         return frozenset(exclude)
 
     def _setup_optimizer(self) -> None:

@@ -25,12 +25,18 @@ import json
 import sys
 from pathlib import Path
 
-# Ordered so phase1_step2 (old compression) is renamed BEFORE phase1_step1a
-# claims the phase1_step2 name. We process in reverse specificity order.
+# Phase rename map. Ordered by longest prefix first to avoid partial matches.
+# History of renames:
+#   v1: phase1_step1a -> phase1_step2, commit_encoding -> phase1_step3,
+#       phase1_step2 (old compression) -> phase1_step4
+#   v2: phase1_step3 (commit_encoding) -> phase1_step4,
+#       phase1_step4 (compression) -> phase1_step5
 RENAME_MAP = {
-    "phase1_step2": "phase1_step4",
-    "phase1_step1a": "phase1_step2",
-    "commit_encoding": "phase1_step3",
+    "phase1_step4": "phase1_step5",  # old compression -> step 5
+    "phase1_step3": "phase1_step4",  # old commit_encoding -> step 4
+    # Earlier renames (already applied, kept for completeness):
+    # "phase1_step1a": "phase1_step2",
+    # "commit_encoding": "phase1_step3",
 }
 
 

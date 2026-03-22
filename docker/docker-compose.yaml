@@ -108,6 +108,10 @@ services:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_step4"]
 
+  train-phase1-step5:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step5"]
+
   ice-labels:
     <<: *gpu-common
     command: ["scripts/generate_ice_labels.py"]

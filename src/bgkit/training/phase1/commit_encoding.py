@@ -5,7 +5,7 @@ from step 0. Asymmetric encoder/decoder prompting: encoder gets commit
 message as conditioning, decoder must reconstruct the full commit purely
 from compressed survivors.
 
-Pipeline position: Step 3 — between Step 2 (pruning distillation) and Step 4
+Pipeline position: Step 4 — between Step 3 (pruned reconstruction) and Step 5
 (multi-objective compression). Takes Step 1 or Step 2 checkpoint, unfreezes
 both encoder and decoder. Produces checkpoints in the same multi-artifact
 format as CompressionTrainer (encoder.pt + decoder.pt) so Step 4 can consume them.
@@ -320,7 +320,7 @@ class CommitEncodingTrainer(BaseTrainer):
         }]
 
     def _resolve_step1_checkpoint(self) -> str | None:
-        """Resolve step1_checkpoint: auto -> best phase1_step2 checkpoint."""
+        """Resolve step1_checkpoint: auto -> best phase1_step3 checkpoint."""
         step1_checkpoint = self.cfg.get("step1_checkpoint", None)
         self._input_sources = {}
 
@@ -328,7 +328,7 @@ class CommitEncodingTrainer(BaseTrainer):
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
             resolved = resolve_checkpoint(
                 checkpoint_dir,
-                phase="phase1_step2",
+                phase="phase1_step3",
                 metric="eval/loss",
                 label="step1_checkpoint",
             )

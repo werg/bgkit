@@ -190,7 +190,7 @@ def trainer():
 
     cfg = OmegaConf.create({
         "training": {
-            "phase": "phase1_step4",
+            "phase": "phase1_step5",
             "max_steps": 100,
             "lr": 1e-3,
             "warmup_steps": 10,
@@ -742,7 +742,7 @@ class TestResolveStep1Checkpoint:
 
         mock_resolve.assert_called_once_with(
             Path("/tmp/ckpts"),
-            phase="phase1_step3",
+            phase="phase1_step4",
             metric="eval/loss",
             label="step1_checkpoint",
         )
@@ -762,8 +762,8 @@ class TestResolveStep1Checkpoint:
 
         with patch(
             "bgkit.training.phase1.compression.resolve_checkpoint",
-            side_effect=ValueError("No phase1_step3 checkpoint found"),
-        ), pytest.raises(ValueError, match="phase1_step3"):
+            side_effect=ValueError("No phase1_step4 checkpoint found"),
+        ), pytest.raises(ValueError, match="phase1_step4"):
             trainer._resolve_step1_checkpoint()
 
     def test_explicit_path_passthrough(self, trainer):
