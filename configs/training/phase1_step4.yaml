@@ -42,8 +42,8 @@ data:
   max_files_per_commit: 16
   max_message_tokens: 256
 
-max_batch_tokens: 32768
-gradient_accumulation_steps: 2
+max_batch_tokens: 65536
+gradient_accumulation_steps: 1
 
 eval_every: 1000
 save_every: 5000

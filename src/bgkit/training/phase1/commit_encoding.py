@@ -48,6 +48,9 @@ class CommitEncodingTrainer(BaseTrainer):
 
     LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {
         "max_survivor_gap": "_max_gap",
+        "target_ratio_ramp_steps": "_target_ratio_ramp_steps",
+        "target_ratio_start": "_target_ratio_start",
+        "target_ratio_end": "_target_ratio_end",
     }
 
     def setup(self) -> None:
@@ -110,9 +113,7 @@ class CommitEncodingTrainer(BaseTrainer):
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        # NVFP4: enabled by default for step 4 (high memory pressure)
-        use_nvfp4 = tcfg.get("nvfp4", True)
-
+        # Build decoder WITHOUT NVFP4 first so checkpoint loads cleanly
         decoder_backbone = AutoModelForCausalLM.from_pretrained(
             decoder_name,
             torch_dtype=torch.bfloat16,
@@ -120,9 +121,7 @@ class CommitEncodingTrainer(BaseTrainer):
             revision=decoder_revision,
             attn_implementation="sdpa",
         )
-        self.decoder = ReconstructionDecoder(
-            decoder_backbone, hidden_dim=hidden_dim, nvfp4=use_nvfp4,
-        )
+        self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
         self.decoder.to(device)
 
         if step1_state_dicts is not None:
@@ -133,12 +132,16 @@ class CommitEncodingTrainer(BaseTrainer):
             if decoder_sd is not None:
                 self.decoder.load_state_dict(decoder_sd)
 
-        # LoRA wrapping (after checkpoint load, before gradient checkpointing)
+        # LoRA wrapping (after checkpoint load, before NVFP4/gradient checkpointing)
         self._decoder_lora = False
         lora_cfg = tcfg.get("decoder_lora", {})
         if lora_cfg.get("enabled", False):
             self.decoder.apply_lora(lora_cfg)
             self._decoder_lora = True
+
+        # NVFP4 disabled: TE on sm_121 lacks sm_121a compilation (wgrad kernel
+        # crash) and conflicts with gradient checkpointing (state divergence).
+        # Revisit when TE is rebuilt with NVTE_CUDA_ARCHS=121a.
 
         enable_gradient_checkpointing(self.decoder.backbone)
 

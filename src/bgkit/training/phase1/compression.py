@@ -142,10 +142,7 @@ class CompressionTrainer(BaseTrainer):
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        # NVFP4: enabled by default for step 5 (high memory pressure)
-        use_nvfp4 = tcfg.get("nvfp4", True)
-
-        # Load directly to device to avoid CPU→CUDA copy on unified memory
+        # Build decoder WITHOUT NVFP4 first so checkpoint loads cleanly
         decoder_backbone = AutoModelForCausalLM.from_pretrained(
             decoder_name,
             torch_dtype=torch.bfloat16,
@@ -154,9 +151,7 @@ class CompressionTrainer(BaseTrainer):
             attn_implementation="sdpa",
             device_map=device,
         )
-        self.decoder = ReconstructionDecoder(
-            decoder_backbone, hidden_dim=hidden_dim, nvfp4=use_nvfp4,
-        )
+        self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
         self.decoder.to(device)
 
         # Load decoder from Step 1 checkpoint
@@ -175,6 +170,10 @@ class CompressionTrainer(BaseTrainer):
         if lora_cfg.get("enabled", False):
             self.decoder.apply_lora(lora_cfg)
             self._decoder_lora = True
+
+        # NVFP4 disabled: TE on sm_121 lacks sm_121a compilation (wgrad kernel
+        # crash) and conflicts with gradient checkpointing (state divergence).
+        # Revisit when TE is rebuilt with NVTE_CUDA_ARCHS=121a.
 
         enable_gradient_checkpointing(self.decoder.backbone)
 

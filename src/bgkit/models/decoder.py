@@ -111,7 +111,7 @@ class ReconstructionDecoder(nn.Module):
     self-attention. No architectural changes to the underlying model.
 
     Supports optional NVFP4 quantization via TransformerEngine and LoRA
-    via peft. Construction order: TE conversion → checkpoint load → LoRA.
+    via peft. Setup order: construct → load checkpoint → enable_nvfp4() → apply_lora().
     """
 
     def __init__(
@@ -128,15 +128,74 @@ class ReconstructionDecoder(nn.Module):
         self._has_lora = False
 
         if nvfp4:
+            self.enable_nvfp4()
+
+    def enable_nvfp4(self) -> None:
+        """Convert decoder Linear modules to TE Linear with NVFP4 support.
+
+        Call AFTER loading checkpoint weights (te.Linear adds _extra_state keys
+        that won't be present in bf16 checkpoints).
+
+        Works both before and after apply_lora():
+        - Before LoRA: converts nn.Linear → te.Linear directly
+        - After LoRA: swaps base_layer inside each LoRA wrapper from nn.Linear
+          to te.Linear, freezes base weights (QLoRA pattern — avoids wgrad
+          kernel that requires sm_121a compilation)
+        """
+        if self._use_te:
+            return  # already converted
+
+        from transformer_engine.common.recipe import NVFP4BlockScaling
+
+        if self._has_lora:
+            self._convert_lora_base_layers_to_te()
+        else:
             from bgkit.utils.te_convert import convert_linear_to_te
 
             convert_linear_to_te(self.backbone, skip_names=("embed_tokens", "lm_head"))
-            self._use_te = True
 
-            from transformer_engine.common.recipe import NVFP4BlockScaling
+        self._use_te = True
+        self._te_recipe = NVFP4BlockScaling(disable_rht=True)
+        logger.info("decoder_nvfp4_enabled", mode="qlora" if self._has_lora else "direct")
 
-            self._te_recipe = NVFP4BlockScaling(disable_rht=True)
-            logger.info("decoder_nvfp4_enabled")
+    def _convert_lora_base_layers_to_te(self) -> None:
+        """Swap nn.Linear base_layer inside LoRA wrappers with te.Linear.
+
+        Freezes base weights so the NVFP4 wgrad kernel (which requires sm_121a)
+        is never invoked. LoRA adapters stay bf16 and trainable.
+        """
+        import transformer_engine.pytorch as te
+
+        try:
+            from peft.tuners.lora import Linear as LoraLinear
+        except ImportError:
+            return
+
+        count = 0
+        for name, module in self.backbone.named_modules():
+            if not isinstance(module, LoraLinear):
+                continue
+            base = module.base_layer
+            if isinstance(base, te.Linear):
+                continue  # already converted
+            if not isinstance(base, nn.Linear):
+                continue
+
+            te_linear = te.Linear(
+                base.in_features, base.out_features, bias=base.bias is not None,
+            )
+            te_linear.to(device=base.weight.device, dtype=base.weight.dtype)
+            te_linear.weight.data.copy_(base.weight.data)
+            if base.bias is not None:
+                te_linear.bias.data.copy_(base.bias.data)
+            te_linear.weight.requires_grad_(False)
+            if te_linear.bias is not None:
+                te_linear.bias.requires_grad_(False)
+
+            module.base_layer = te_linear
+            count += 1
+
+        logger.info("lora_base_layers_converted_to_te", count=count)
 
     def _get_inner_model_and_head(self) -> tuple[nn.Module, nn.Module]:
         """Return (inner_model, lm_head) handling plain, PeftModel, and TE cases."""
@@ -228,10 +287,26 @@ class ReconstructionDecoder(nn.Module):
         combined_mask = torch.cat([survivor_attention_mask, target_attention_mask], dim=1)
 
         # Forward through inner model (no lm_head)
+        # NVFP4/FP8 requires batch*seq divisible by 8 and hidden_dim by 16.
+        # Pad sequence length to satisfy alignment, mask padding via attention_mask.
+        seq_pad = 0
         if self._use_te:
             import transformer_engine.pytorch as te
 
-            with te.fp8_autocast(recipe=self._te_recipe):
+            b, s, _h = combined.shape
+            # NVFP4 needs batch*seq divisible by 16 (NVFP4_BLOCK_SIZE)
+            align = 16
+            if (b * s) % align != 0:
+                for seq_pad in range(1, align + 1):
+                    if (b * (s + seq_pad)) % align == 0:
+                        break
+                pad_emb = combined.new_zeros(b, seq_pad, combined.size(-1))
+                combined = torch.cat([combined, pad_emb], dim=1)
+                pad_mask = combined_mask.new_zeros(b, seq_pad)
+                combined_mask = torch.cat([combined_mask, pad_mask], dim=1)
+
+        if self._use_te:
+            with te.fp8_autocast(enabled=True, fp8_recipe=self._te_recipe):
                 hidden = inner_model(
                     inputs_embeds=combined, attention_mask=combined_mask,
                 ).last_hidden_state
@@ -240,7 +315,9 @@ class ReconstructionDecoder(nn.Module):
                 inputs_embeds=combined, attention_mask=combined_mask,
             ).last_hidden_state
 
-        # Slice out target portion hidden states
+        # Strip seq padding and slice out target portion hidden states
+        if seq_pad > 0:
+            hidden = hidden[:, :-seq_pad, :]
         target_hidden = hidden[:, survivor_embeddings.size(1):, :]
 
         if loss_type == "ce":
