@@ -42,6 +42,13 @@ curriculum:
   calibrator_warmup_batches: 50
   l1_calibrator_fast_batches: 200
 
+decoder_lora:
+  enabled: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
 freeze:
   bgkit: false
   decoder: false

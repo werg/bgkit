@@ -77,6 +77,11 @@ class _CausalLMOutput:
         self.logits = logits
 
 
+class _ModelOutput:
+    def __init__(self, last_hidden_state):
+        self.last_hidden_state = last_hidden_state
+
+
 class _MockQwen3Model(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int, num_layers: int = 2):
         super().__init__()
@@ -85,6 +90,16 @@ class _MockQwen3Model(nn.Module):
             [nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)]
         )
         self.norm = nn.LayerNorm(hidden_dim)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+        x = inputs_embeds
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        return _ModelOutput(last_hidden_state=x)
 
 
 class MockCausalLMBackbone(nn.Module):
@@ -295,6 +310,26 @@ class TestForwardBackward:
         assert survivors.ndim == 3  # (batch, max_survivors, hidden_dim)
         assert survivor_mask.ndim == 2  # (batch, max_survivors)
         assert survivor_mask.any(), "Should have at least some survivors"
+
+    def test_calibrator_scores_not_doubled_by_checkpoint(self, trainer):
+        """Scores should be buffered exactly once per file, not doubled.
+
+        _score_and_select lives OUTSIDE the activation checkpoint boundary.
+        If it were inside, checkpoint recomputation would double-append
+        scores to _pending_l0_scores. This test catches that regression.
+        """
+        trainer._pending_l0_scores.clear()
+        n_files = 4
+        batch = _make_commit_batch(batch_size=1, n_files=n_files, file_len=8)
+
+        trainer._compress_repo_batch(batch)
+
+        # L0 scores: one per file, L1 scores: one for the batched L1 pass
+        n_l0_appends = len(trainer._pending_l0_scores)
+        assert n_l0_appends == n_files, (
+            f"Expected {n_files} L0 score appends (one per file), "
+            f"got {n_l0_appends} — checkpoint may be re-executing side effects"
+        )
 
 
 # ---------------------------------------------------------------------------

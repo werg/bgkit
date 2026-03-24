@@ -38,73 +38,9 @@ from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import enable_gradient_checkpointing
-from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
 from bgkit.training.scheduling import cosine_with_warmup
 
 logger = structlog.get_logger()
-
-
-def _merge_lora_state_dict(decoder) -> dict:
-    """Merge LoRA adapters into base weights and return a clean state dict.
-
-    Produces a state dict with standard ReconstructionDecoder keys (no
-    PeftModel prefix, no lora_A/B keys) so downstream trainers can load
-    it as a plain decoder.
-    """
-    import torch
-
-    peft_sd = decoder.state_dict()
-    merged = {}
-    peft_prefix = "backbone.base_model.model."
-    decoder_prefix = "backbone."
-
-    # Collect LoRA A/B pairs keyed by their target module path
-    lora_pairs: dict[str, dict[str, torch.Tensor]] = {}
-    for key, val in peft_sd.items():
-        if ".lora_A." in key:
-            # e.g. backbone.base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight
-            base_key = key.split(".lora_A.")[0]
-            lora_pairs.setdefault(base_key, {})["A"] = val
-        elif ".lora_B." in key:
-            base_key = key.split(".lora_B.")[0]
-            lora_pairs.setdefault(base_key, {})["B"] = val
-
-    # Get scaling factor from LoRA config
-    try:
-        lora_cfg = decoder.backbone.peft_config["default"]
-        scaling = lora_cfg.lora_alpha / lora_cfg.r
-    except (AttributeError, KeyError):
-        scaling = 2.0  # default alpha=32 / r=16
-
-    for key, val in peft_sd.items():
-        # Skip LoRA adapter keys
-        if ".lora_A." in key or ".lora_B." in key:
-            continue
-
-        # Strip PeftModel prefix: backbone.base_model.model.X -> backbone.X
-        if key.startswith(peft_prefix):
-            clean_key = decoder_prefix + key[len(peft_prefix):]
-        else:
-            clean_key = key
-
-        # Strip .base_layer. inserted by peft for LoRA target modules:
-        # e.g. q_proj.base_layer.weight -> q_proj.weight
-        clean_key = clean_key.replace(".base_layer.", ".")
-
-        # If this is a LoRA target weight, merge A/B into it
-        # Match against the peft-prefixed key (before stripping base_layer)
-        peft_key = key.split(".base_layer.weight")[0] if ".base_layer.weight" in key else None
-        if peft_key is None:
-            peft_key = key.split(".weight")[0] if key.endswith(".weight") else None
-        if peft_key and peft_key in lora_pairs:
-            pair = lora_pairs[peft_key]
-            if "A" in pair and "B" in pair:
-                # LoRA: W' = W + scaling * B @ A
-                val = val + scaling * (pair["B"] @ pair["A"])
-
-        merged[clean_key] = val
-
-    return merged
 
 
 class _InterleavingDataLoader:
@@ -272,33 +208,8 @@ class DecoderInitTrainer(BaseTrainer):
         self._decoder_lora = False
         lora_cfg = tcfg.get("decoder_lora", {})
         if lora_cfg.get("enabled", False):
-            from peft import LoraConfig, get_peft_model
-
-            lora_config = LoraConfig(
-                r=lora_cfg.get("r", 16),
-                lora_alpha=lora_cfg.get("alpha", 32),
-                lora_dropout=lora_cfg.get("dropout", 0.05),
-                target_modules=list(lora_cfg.get("target_modules", [
-                    "q_proj", "k_proj", "v_proj", "o_proj",
-                    "gate_proj", "up_proj", "down_proj",
-                ])),
-                bias="none",
-                task_type="CAUSAL_LM",
-            )
-            self.decoder.backbone = get_peft_model(self.decoder.backbone, lora_config)
+            self.decoder.apply_lora(lora_cfg)
             self._decoder_lora = True
-            trainable = sum(
-                p.numel() for p in self.decoder.backbone.parameters() if p.requires_grad
-            )
-            total = sum(p.numel() for p in self.decoder.backbone.parameters())
-            logger.info(
-                "decoder_lora_applied",
-                trainable_params=trainable,
-                total_params=total,
-                ratio=f"{trainable/total:.4f}",
-                r=lora_config.r,
-                alpha=lora_config.lora_alpha,
-            )
 
         enable_gradient_checkpointing(self.decoder.backbone)
 
@@ -1096,14 +1007,12 @@ class DecoderInitTrainer(BaseTrainer):
 
         # BF16 autocast for decoder forward + backward
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-            logits = self.decoder(
+            loss = self.decoder.forward_with_loss(
                 survivor_embeddings=survivors,
                 target_ids=token_ids,
                 target_attention_mask=attention_mask,
                 survivor_attention_mask=survivor_mask,
-            )
-            loss = data_reconstruction_loss(
-                logits, token_ids, attention_mask, loss_mask=loss_mask,
+                loss_mask=loss_mask,
             )
 
         # Scaled backward (for gradient accumulation)
@@ -1156,14 +1065,12 @@ class DecoderInitTrainer(BaseTrainer):
                 with torch.autocast(
                     "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"
                 ):
-                    logits = self.decoder(
+                    loss = self.decoder.forward_with_loss(
                         survivor_embeddings=survivors,
                         target_ids=token_ids,
                         target_attention_mask=attention_mask,
                         survivor_attention_mask=survivor_mask,
-                    )
-                    loss = data_reconstruction_loss(
-                        logits, token_ids, attention_mask, loss_mask=loss_mask,
+                        loss_mask=loss_mask,
                     )
 
                 batch_content_tokens = loss_mask[:, 1:].sum().item()
@@ -1200,14 +1107,12 @@ class DecoderInitTrainer(BaseTrainer):
                     with torch.autocast(
                         "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"
                     ):
-                        logits = self.decoder(
+                        loss = self.decoder.forward_with_loss(
                             survivor_embeddings=survivors,
                             target_ids=token_ids,
                             target_attention_mask=attention_mask,
                             survivor_attention_mask=survivor_mask,
-                        )
-                        loss = data_reconstruction_loss(
-                            logits, token_ids, attention_mask, loss_mask=loss_mask,
+                            loss_mask=loss_mask,
                         )
                     bt = loss_mask[:, 1:].sum().item()
                     qa_loss += loss.item() * bt
@@ -1381,17 +1286,15 @@ class DecoderInitTrainer(BaseTrainer):
             optimizer_type=self._optimizer_type,
         )
 
-        decoder_state = self.decoder.state_dict()
-
         save_kwargs = dict(
             encoder=self.encoder.state_dict(),
-            decoder=decoder_state,
+            decoder=self.decoder.state_dict(),
             optimizer=self.optimizer.state_dict(),
         )
         # For LoRA: also save a merged decoder state dict so downstream steps
         # can load it as a plain decoder without the PeftModel wrapper.
         if getattr(self, "_decoder_lora", False):
-            save_kwargs["decoder_merged"] = _merge_lora_state_dict(self.decoder)
+            save_kwargs["decoder_merged"] = self.decoder.merge_lora()
 
         # Save calibrator state for resume
         if self._compression_active or self._compression_introduction_step is not None:

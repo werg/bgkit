@@ -142,6 +142,9 @@ class CompressionTrainer(BaseTrainer):
 
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
+        # NVFP4: enabled by default for step 5 (high memory pressure)
+        use_nvfp4 = tcfg.get("nvfp4", True)
+
         # Load directly to device to avoid CPU→CUDA copy on unified memory
         decoder_backbone = AutoModelForCausalLM.from_pretrained(
             decoder_name,
@@ -151,7 +154,9 @@ class CompressionTrainer(BaseTrainer):
             attn_implementation="sdpa",
             device_map=device,
         )
-        self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
+        self.decoder = ReconstructionDecoder(
+            decoder_backbone, hidden_dim=hidden_dim, nvfp4=use_nvfp4,
+        )
         self.decoder.to(device)
 
         # Load decoder from Step 1 checkpoint
@@ -163,6 +168,13 @@ class CompressionTrainer(BaseTrainer):
                 self.decoder.load_state_dict(decoder_sd)
         del step1_state_dicts
         gc.collect()
+
+        # LoRA wrapping (after checkpoint load, before gradient checkpointing)
+        self._decoder_lora = False
+        lora_cfg = tcfg.get("decoder_lora", {})
+        if lora_cfg.get("enabled", False):
+            self.decoder.apply_lora(lora_cfg)
+            self._decoder_lora = True
 
         enable_gradient_checkpointing(self.decoder.backbone)
 
@@ -670,6 +682,25 @@ class CompressionTrainer(BaseTrainer):
 
         return enc_out.survivor_embeddings, enc_out.survivor_attention_mask
 
+    @staticmethod
+    def _direct_l1_pure(
+        encoder: torch.nn.Module,
+        f_emb: torch.Tensor,
+        survivor_mask: torch.Tensor,
+        f_mask: torch.Tensor,
+        prompt_emb: torch.Tensor,
+        prompt_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pure (side-effect-free) direct L1 encoder pass for checkpointing."""
+        enc_out = encoder(
+            input_embeddings=f_emb,
+            survivor_mask=survivor_mask,
+            attention_mask=f_mask,
+            prompt_embeddings=prompt_emb,
+            prompt_attention_mask=prompt_mask,
+        )
+        return enc_out.survivor_embeddings[0]  # (n_surv, D)
+
     def _compress_single_direct_l1(
         self,
         f_ids: torch.Tensor,
@@ -681,17 +712,43 @@ class CompressionTrainer(BaseTrainer):
         """Run direct L1 on a single sample (1, L) -> (n_surv, D).
 
         Skips L0; embeds file tokens, scores with ICE, runs one encoder pass.
+        Uses activation checkpointing.
         """
+        from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
         f_emb = bgkit_embed(f_ids)
+        # INVARIANT: _score_and_select MUST stay outside the checkpoint
+        # boundary — it appends to _pending_l0_scores and samples random
+        # ratios (side effects that would be doubled / non-deterministic
+        # if replayed by checkpoint recomputation on backward).
         survivor_mask = self._score_and_select(f_emb, f_mask)
-        enc_out = self.encoder(
-            input_embeddings=f_emb,
-            survivor_mask=survivor_mask,
+        return torch_checkpoint(
+            self._direct_l1_pure,
+            self.encoder, f_emb, survivor_mask, f_mask,
+            prompt_emb, prompt_mask,
+            use_reentrant=False,
+        )
+
+    @staticmethod
+    def _compress_single_file_pure(
+        compressor: torch.nn.Module,
+        f_emb: torch.Tensor,
+        s_mask: torch.Tensor,
+        f_mask: torch.Tensor,
+        prompt_emb: torch.Tensor,
+        prompt_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pure (side-effect-free) single-file L0 compression for checkpointing."""
+        comp_out = compressor(
+            f_emb,
+            survivor_mask=s_mask,
             attention_mask=f_mask,
             prompt_embeddings=prompt_emb,
             prompt_attention_mask=prompt_mask,
         )
-        return enc_out.survivor_embeddings[0]  # (n_surv, D)
+        content_normed = comp_out.normed_embeddings[:, comp_out.content_slice, :]
+        survivor_normed = content_normed[0][s_mask[0]]
+        return compressor.auto_reproduce(survivor_normed.unsqueeze(0))[0]
 
     def _compress_single_l0_l1(
         self,
@@ -704,13 +761,12 @@ class CompressionTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """Run L0 per-file + collect survivors for one sample -> (total_surv, D).
 
-        Only runs the compressor (layers 0..N-2) for L0, not the full encoder.
-        The projection block is unnecessary here — L0 survivors are mapped back
-        to input embedding space via auto_repro for the subsequent L1 pass,
-        which will handle projection.
-
-        Returns L0 survivors mapped back to input embedding space via auto_repro.
+        Uses activation checkpointing per file to limit encoder memory to one
+        file at a time. Side effects (calibrator score buffering) happen outside
+        the checkpointed region.
         """
+        from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
         compressor = self.encoder.compressor
         sample_survivors = []
         for f in range(n_files):
@@ -718,24 +774,20 @@ class CompressionTrainer(BaseTrainer):
             f_mask = file_masks[f].unsqueeze(0)
             f_emb = bgkit_embed(f_ids)
 
+            # INVARIANT: _score_and_select MUST stay outside the checkpoint
+            # boundary — it appends to _pending_l0_scores and samples random
+            # ratios (side effects that would be doubled / non-deterministic
+            # if replayed by checkpoint recomputation on backward).
             s_mask = self._score_and_select(f_emb, f_mask)
 
-            # Compressor only (skip projection block — it's wasted for L0
-            # intermediates that will go through L1 with projection afterwards)
-            comp_out = compressor(
-                f_emb,
-                survivor_mask=s_mask,
-                attention_mask=f_mask,
-                prompt_embeddings=prompt_emb,
-                prompt_attention_mask=prompt_mask,
+            # Pure encoder forward INSIDE checkpoint (recomputed on backward).
+            # All inputs are deterministic (s_mask pre-computed above).
+            survivor_input_space = torch_checkpoint(
+                self._compress_single_file_pure,
+                compressor, f_emb, s_mask, f_mask,
+                prompt_emb, prompt_mask,
+                use_reentrant=False,
             )
-
-            # Extract L0 survivors from content-only normed embeddings
-            content_normed = comp_out.normed_embeddings[:, comp_out.content_slice, :]
-            survivor_normed = content_normed[0][s_mask[0]]
-            survivor_input_space = compressor.auto_reproduce(
-                survivor_normed.unsqueeze(0),
-            )[0]
             sample_survivors.append(survivor_input_space)
 
         if sample_survivors:
@@ -859,16 +911,16 @@ class CompressionTrainer(BaseTrainer):
     # Loss computation
     # ------------------------------------------------------------------
 
-    def _compute_loss(
+    def _decoder_forward_with_loss(
         self,
-        logits: torch.Tensor,
+        survivors: torch.Tensor,
+        survivor_mask: torch.Tensor,
         batch: dict,
     ) -> torch.Tensor:
-        """Compute loss using the appropriate objective loss function.
+        """Run fused decoder forward + CE loss without materializing full logits.
 
-        All objectives receive loss_mask to ensure loss is computed only on
-        content tokens, excluding chat template markup, thinking blocks, tool
-        call XML, code fences, etc.
+        All objectives use the same CE loss (they were always identical);
+        loss_mask ensures loss is computed only on content tokens.
         """
         target_ids = batch["target_token_ids"].to(self.device)
         target_mask = batch["target_attention_mask"].to(self.device)
@@ -876,12 +928,13 @@ class CompressionTrainer(BaseTrainer):
         if loss_mask is not None:
             loss_mask = loss_mask.to(self.device)
 
-        # Determine the dominant objective in this batch (batches typically homogeneous)
-        objectives = batch.get("objectives", [])
-        objective = objectives[0] if objectives else "data_reconstruction"
-
-        loss_fn = _LOSS_FNS.get(objective, data_reconstruction_loss)
-        return loss_fn(logits, target_ids, target_mask, loss_mask=loss_mask)
+        return self.decoder.forward_with_loss(
+            survivor_embeddings=survivors,
+            target_ids=target_ids,
+            target_attention_mask=target_mask,
+            survivor_attention_mask=survivor_mask,
+            loss_mask=loss_mask,
+        )
 
     # ------------------------------------------------------------------
     # Train step
@@ -910,17 +963,9 @@ class CompressionTrainer(BaseTrainer):
         else:
             survivors, survivor_mask = self._compress_repo_batch(batch)
 
-        # Decoder forward
+        # Fused decoder forward + CE loss (no full logits materialized)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-            logits = self.decoder(
-                survivor_embeddings=survivors,
-                target_ids=batch["target_token_ids"].to(self.device),
-                target_attention_mask=batch["target_attention_mask"].to(self.device),
-                survivor_attention_mask=survivor_mask,
-            )
-
-        # Compute loss
-        loss = self._compute_loss(logits, batch)
+            loss = self._decoder_forward_with_loss(survivors, survivor_mask, batch)
 
         # Flush calibrator scores (once per micro-batch)
         self._flush_calibrator_scores()
@@ -955,24 +1000,16 @@ class CompressionTrainer(BaseTrainer):
         # Process file portion
         file_survivors, file_mask = self._compress_file_batch(file_batch)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-            file_logits = self.decoder(
-                survivor_embeddings=file_survivors,
-                target_ids=file_batch["target_token_ids"].to(self.device),
-                target_attention_mask=file_batch["target_attention_mask"].to(self.device),
-                survivor_attention_mask=file_mask,
+            file_loss = self._decoder_forward_with_loss(
+                file_survivors, file_mask, file_batch,
             )
-        file_loss = self._compute_loss(file_logits, file_batch)
 
         # Process repo portion
         repo_survivors, repo_mask = self._compress_repo_batch(repo_batch)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-            repo_logits = self.decoder(
-                survivor_embeddings=repo_survivors,
-                target_ids=repo_batch["target_token_ids"].to(self.device),
-                target_attention_mask=repo_batch["target_attention_mask"].to(self.device),
-                survivor_attention_mask=repo_mask,
+            repo_loss = self._decoder_forward_with_loss(
+                repo_survivors, repo_mask, repo_batch,
             )
-        repo_loss = self._compute_loss(repo_logits, repo_batch)
 
         # Average losses
         loss = (file_loss + repo_loss) / 2.0
@@ -1085,15 +1122,9 @@ class CompressionTrainer(BaseTrainer):
                 with torch.autocast(
                     "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
                 ):
-                    logits = self.decoder(
-                        survivor_embeddings=survivors,
-                        target_ids=batch["target_token_ids"].to(self.device),
-                        target_attention_mask=batch["target_attention_mask"].to(
-                            self.device,
-                        ),
-                        survivor_attention_mask=survivor_mask,
+                    loss = self._decoder_forward_with_loss(
+                        survivors, survivor_mask, batch,
                     )
-                    loss = self._compute_loss(logits, batch)
 
                 # Weight by content tokens (loss_mask) not all tokens
                 eval_loss_mask = batch.get("target_loss_mask")
@@ -1160,15 +1191,17 @@ class CompressionTrainer(BaseTrainer):
             training_state=self._training_state,
             optimizer_type=self._optimizer_type,
         )
-        ckpt_path = save_checkpoint(
-            checkpoint_dir,
-            metadata,
+        save_kwargs = dict(
             encoder=self.encoder.state_dict(),
             decoder=self.decoder.state_dict(),
             optimizer=self.optimizer.state_dict(),
             l0_calibrator=self._l0_calibrator.state_dict(),
             l1_calibrator=self._l1_calibrator.state_dict(),
         )
+        if getattr(self, "_decoder_lora", False):
+            save_kwargs["decoder_merged"] = self.decoder.merge_lora()
+
+        ckpt_path = save_checkpoint(checkpoint_dir, metadata, **save_kwargs)
         self._last_checkpoint_path = str(ckpt_path)
         return ckpt_path
 

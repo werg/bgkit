@@ -20,8 +20,78 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import structlog
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
+logger = structlog.get_logger()
+
+
+def _chunk_ce_fn(
+    lm_head_weight: torch.Tensor,
+    hidden_chunk: torch.Tensor,
+    target_chunk: torch.Tensor,
+    lm_head_bias: torch.Tensor | None,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Compute per-token CE for one chunk. Used inside torch.utils.checkpoint."""
+    logits = F.linear(hidden_chunk, lm_head_weight, lm_head_bias)
+    b, s, v = logits.shape
+    return F.cross_entropy(
+        logits.view(b * s, v),
+        target_chunk.reshape(b * s),
+        ignore_index=ignore_index,
+        reduction="none",
+    ).view(b, s)
+
+
+def _chunked_lm_ce(
+    lm_head: nn.Module,
+    hidden_states: torch.Tensor,
+    target_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    loss_mask: torch.Tensor | None,
+    chunk_size: int,
+) -> torch.Tensor:
+    """CE loss without materializing full (B, S, V) logits tensor.
+
+    Chunks along the sequence dimension and uses activation checkpointing
+    per chunk so backward recomputes rather than stores chunk logits.
+    """
+    # Shift for next-token prediction
+    shift_hidden = hidden_states[:, :-1, :]
+    shift_targets = target_ids[:, 1:]
+    shift_mask = attention_mask[:, 1:].float()
+    if loss_mask is not None:
+        shift_mask = shift_mask * loss_mask[:, 1:].float()
+
+    _b, seq_len, _h = shift_hidden.shape
+    weighted_sum = shift_hidden.new_zeros(())
+
+    lm_head_weight = lm_head.weight
+    lm_head_bias = getattr(lm_head, "bias", None)
+
+    # Skip checkpoint overhead when sequence fits in a single chunk
+    use_checkpoint = seq_len > chunk_size
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        h_chunk = shift_hidden[:, start:end].contiguous()
+        t_chunk = shift_targets[:, start:end].contiguous()
+
+        if use_checkpoint:
+            chunk_loss = torch_checkpoint(
+                _chunk_ce_fn, lm_head_weight, h_chunk, t_chunk,
+                lm_head_bias, use_reentrant=False,
+            )
+        else:
+            chunk_loss = _chunk_ce_fn(lm_head_weight, h_chunk, t_chunk, lm_head_bias)
+
+        weighted_sum = weighted_sum + (chunk_loss * shift_mask[:, start:end]).sum()
+
+    return weighted_sum / shift_mask.sum().clamp(min=1)
 
 
 @dataclass
@@ -39,16 +109,47 @@ class ReconstructionDecoder(nn.Module):
     Wraps Qwen3.5-0.8B with prefix-conditioning: survivor embeddings are
     prepended to the target sequence and attended to via standard causal
     self-attention. No architectural changes to the underlying model.
+
+    Supports optional NVFP4 quantization via TransformerEngine and LoRA
+    via peft. Construction order: TE conversion → checkpoint load → LoRA.
     """
 
     def __init__(
         self,
         backbone: nn.Module,
         hidden_dim: int = 1024,
+        nvfp4: bool = False,
     ):
         super().__init__()
         self.backbone = backbone
         self.hidden_dim = hidden_dim
+        self._use_te = False
+        self._te_recipe = None
+        self._has_lora = False
+
+        if nvfp4:
+            from bgkit.utils.te_convert import convert_linear_to_te
+
+            convert_linear_to_te(self.backbone, skip_names=("embed_tokens", "lm_head"))
+            self._use_te = True
+
+            from transformer_engine.common.recipe import NVFP4BlockScaling
+
+            self._te_recipe = NVFP4BlockScaling(disable_rht=True)
+            logger.info("decoder_nvfp4_enabled")
+
+    def _get_inner_model_and_head(self) -> tuple[nn.Module, nn.Module]:
+        """Return (inner_model, lm_head) handling plain, PeftModel, and TE cases."""
+        backbone = self.backbone
+        try:
+            from peft import PeftModel
+
+            if isinstance(backbone, PeftModel):
+                causal_lm = backbone.base_model.model
+                return causal_lm.model, causal_lm.lm_head
+        except ImportError:
+            pass
+        return backbone.model, backbone.lm_head
 
     def forward(
         self,
@@ -86,6 +187,170 @@ class ReconstructionDecoder(nn.Module):
         logits = outputs.logits[:, num_survivors:, :]
 
         return logits
+
+    def forward_with_loss(
+        self,
+        survivor_embeddings: torch.Tensor,
+        target_ids: torch.Tensor,
+        target_attention_mask: torch.Tensor,
+        survivor_attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor | None = None,
+        chunk_size: int = 256,
+        loss_type: str = "ce",
+        teacher_logprobs: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fused forward + loss without materializing full (B, S, V) logits.
+
+        Runs the inner model (skipping lm_head), then computes loss in chunks
+        along the sequence dimension. Each chunk's logits are computed and
+        discarded, keeping peak memory proportional to chunk_size * vocab_size.
+
+        Args:
+            survivor_embeddings: (batch, num_survivors, hidden_dim) from BgKIT.
+            target_ids: (batch, target_len) token ids for teacher-forced generation.
+            target_attention_mask: (batch, target_len) attention mask for targets.
+            survivor_attention_mask: (batch, num_survivors) mask for real survivors.
+            loss_mask: (batch, target_len) optional mask for content-only tokens.
+            chunk_size: Sequence chunk size for chunked CE computation.
+            loss_type: "ce" for cross-entropy (Phase 1), "kl" for KL divergence
+                (Phase 2a model ladder distillation).
+            teacher_logprobs: (batch, target_len, vocab_size) teacher log-probs
+                for KL loss. Required when loss_type="kl".
+
+        Returns:
+            Scalar loss tensor.
+        """
+        inner_model, lm_head = self._get_inner_model_and_head()
+
+        # Embed target tokens and concatenate with survivors
+        target_emb = inner_model.get_input_embeddings()(target_ids)
+        combined = torch.cat([survivor_embeddings, target_emb], dim=1)
+        combined_mask = torch.cat([survivor_attention_mask, target_attention_mask], dim=1)
+
+        # Forward through inner model (no lm_head)
+        if self._use_te:
+            import transformer_engine.pytorch as te
+
+            with te.fp8_autocast(recipe=self._te_recipe):
+                hidden = inner_model(
+                    inputs_embeds=combined, attention_mask=combined_mask,
+                ).last_hidden_state
+        else:
+            hidden = inner_model(
+                inputs_embeds=combined, attention_mask=combined_mask,
+            ).last_hidden_state
+
+        # Slice out target portion hidden states
+        target_hidden = hidden[:, survivor_embeddings.size(1):, :]
+
+        if loss_type == "ce":
+            return _chunked_lm_ce(
+                lm_head, target_hidden, target_ids,
+                target_attention_mask, loss_mask, chunk_size,
+            )
+        elif loss_type == "kl":
+            raise NotImplementedError("KL loss type for Phase 2a not yet implemented")
+        else:
+            raise ValueError(f"Unknown loss_type: {loss_type}")
+
+    def apply_lora(self, lora_config: dict) -> None:
+        """Wrap backbone with LoRA adapters.
+
+        Args:
+            lora_config: Dict with keys: r, alpha, dropout (optional, default 0.05),
+                target_modules (list of module name strings).
+        """
+        from peft import LoraConfig, get_peft_model
+
+        config = LoraConfig(
+            r=lora_config.get("r", 16),
+            lora_alpha=lora_config.get("alpha", 32),
+            lora_dropout=lora_config.get("dropout", 0.05),
+            target_modules=list(lora_config.get("target_modules", [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ])),
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        self.backbone = get_peft_model(self.backbone, config)
+        self._has_lora = True
+
+        trainable = sum(
+            p.numel() for p in self.backbone.parameters() if p.requires_grad
+        )
+        total = sum(p.numel() for p in self.backbone.parameters())
+        logger.info(
+            "decoder_lora_applied",
+            trainable_params=trainable,
+            total_params=total,
+            ratio=f"{trainable / total:.4f}",
+            r=config.r,
+            alpha=config.lora_alpha,
+        )
+
+    def merge_lora(self) -> dict:
+        """Merge LoRA adapters into base weights and return a clean state dict.
+
+        Produces a state dict with standard ReconstructionDecoder keys (no
+        PeftModel prefix, no lora_A/B keys) so downstream trainers can load
+        it as a plain decoder.
+        """
+        if not self._has_lora:
+            return self.state_dict()
+
+        peft_sd = self.state_dict()
+        merged = {}
+        peft_prefix = "backbone.base_model.model."
+        decoder_prefix = "backbone."
+
+        # Collect LoRA A/B pairs keyed by their target module path
+        lora_pairs: dict[str, dict[str, torch.Tensor]] = {}
+        for key, val in peft_sd.items():
+            if ".lora_A." in key:
+                base_key = key.split(".lora_A.")[0]
+                lora_pairs.setdefault(base_key, {})["A"] = val
+            elif ".lora_B." in key:
+                base_key = key.split(".lora_B.")[0]
+                lora_pairs.setdefault(base_key, {})["B"] = val
+
+        # Get scaling factor from LoRA config
+        try:
+            lora_cfg = self.backbone.peft_config["default"]
+            scaling = lora_cfg.lora_alpha / lora_cfg.r
+        except (AttributeError, KeyError):
+            scaling = 2.0  # default alpha=32 / r=16
+
+        for key, val in peft_sd.items():
+            # Skip LoRA adapter keys
+            if ".lora_A." in key or ".lora_B." in key:
+                continue
+
+            # Strip PeftModel prefix: backbone.base_model.model.X -> backbone.X
+            if key.startswith(peft_prefix):
+                clean_key = decoder_prefix + key[len(peft_prefix):]
+            else:
+                clean_key = key
+
+            # Strip .base_layer. inserted by peft for LoRA target modules
+            clean_key = clean_key.replace(".base_layer.", ".")
+
+            # If this is a LoRA target weight, merge A/B into it
+            peft_key = (
+                key.split(".base_layer.weight")[0]
+                if ".base_layer.weight" in key
+                else None
+            )
+            if peft_key is None:
+                peft_key = key.split(".weight")[0] if key.endswith(".weight") else None
+            if peft_key and peft_key in lora_pairs:
+                pair = lora_pairs[peft_key]
+                if "A" in pair and "B" in pair:
+                    val = val + scaling * (pair["B"] @ pair["A"])
+
+            merged[clean_key] = val
+
+        return merged
 
     @torch.no_grad()
     def generate(
