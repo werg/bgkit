@@ -152,7 +152,6 @@ class CompressionTrainer(BaseTrainer):
             device_map=device,
         )
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
-        self.decoder.to(device)
 
         # Load decoder from Step 1 checkpoint
         if step1_state_dicts is not None:

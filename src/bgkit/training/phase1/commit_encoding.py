@@ -120,9 +120,9 @@ class CommitEncodingTrainer(BaseTrainer):
             trust_remote_code=True,
             revision=decoder_revision,
             attn_implementation="sdpa",
+            device_map=device,  # load directly to CUDA, avoid CPU staging copy
         )
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
-        self.decoder.to(device)
 
         if step1_state_dicts is not None:
             # Prefer merged decoder (LoRA weights folded in) over raw PeftModel state

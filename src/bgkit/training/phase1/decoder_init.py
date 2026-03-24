@@ -194,9 +194,9 @@ class DecoderInitTrainer(BaseTrainer):
             trust_remote_code=True,
             revision=decoder_revision,
             attn_implementation="sdpa",
+            device_map=device,  # load directly to CUDA, avoid CPU staging copy
         )
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
-        self.decoder.to(device)
 
         # Load decoder weights from bgkit checkpoint if available (step 2 includes decoder)
         if self._bgkit_decoder_state is not None:
