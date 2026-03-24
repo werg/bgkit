@@ -21,5 +21,5 @@ max_grad_norm: 1.0
 # Attention: use PyTorch SDPA (flash-attn not supported on sm_121)
 attention_implementation: sdpa
 # Dataloader
-num_workers: 4
+num_workers: 0  # fork workers cause CoW memory exhaustion on unified memory
 pin_memory: false  # unified memory, pinning not applicable
