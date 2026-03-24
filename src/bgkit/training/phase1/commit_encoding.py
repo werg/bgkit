@@ -121,8 +121,13 @@ class CommitEncodingTrainer(BaseTrainer):
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
         self.decoder.to(device)
 
-        if step1_state_dicts is not None and "decoder" in step1_state_dicts:
-            self.decoder.load_state_dict(step1_state_dicts["decoder"])
+        if step1_state_dicts is not None:
+            # Prefer merged decoder (LoRA weights folded in) over raw PeftModel state
+            decoder_sd = step1_state_dicts.get(
+                "decoder_merged", step1_state_dicts.get("decoder")
+            )
+            if decoder_sd is not None:
+                self.decoder.load_state_dict(decoder_sd)
 
         enable_gradient_checkpointing(self.decoder.backbone)
 
@@ -343,9 +348,11 @@ class CommitEncodingTrainer(BaseTrainer):
         """Return param IDs of decoder embedding/lm_head — should not use Muon."""
         exclude = set()
         backbone = self.decoder.backbone
-        causal_lm = (
-            backbone.base_model.model if hasattr(backbone, "base_model") else backbone
-        )
+        try:
+            from peft import PeftModel
+            causal_lm = backbone.base_model.model if isinstance(backbone, PeftModel) else backbone
+        except ImportError:
+            causal_lm = backbone
         inner = getattr(causal_lm, "model", None)
         if inner is not None and hasattr(inner, "embed_tokens"):
             for p in inner.embed_tokens.parameters():
@@ -606,8 +613,32 @@ class CommitEncodingTrainer(BaseTrainer):
         self.encoder.train()
         self.decoder.train()
 
+        # Memory profiling (temporary)
+        if self.global_step < 5:
+            mem = torch.cuda.memory_allocated() / 1e9
+            file_ids = batch["file_token_ids"]
+            n_files_total = int(batch["file_count"].sum().item())
+            encoder_tokens = int(batch["file_attention_masks"].sum().item())
+            decoder_tokens = int(batch["target_attention_mask"].sum().item())
+            logger.info(
+                "memory_pre_forward",
+                gpu_gb=round(mem, 2),
+                batch_size=file_ids.size(0),
+                n_files_total=n_files_total,
+                encoder_tokens=encoder_tokens,
+                decoder_tokens=decoder_tokens,
+                max_file_seq=file_ids.size(2),
+            )
+
         # All commit encoding samples are repo-type (L0→L1)
         survivors, survivor_mask = self._compress_repo_batch(batch)
+
+        if self.global_step < 5:
+            logger.info(
+                "memory_post_encoder",
+                gpu_gb=round(torch.cuda.memory_allocated() / 1e9, 2),
+                n_survivors=int(survivor_mask.sum().item()),
+            )
 
         # Decoder forward
         with torch.autocast(
@@ -629,11 +660,23 @@ class CommitEncodingTrainer(BaseTrainer):
 
         loss = commit_reproduction_loss(logits, target_ids, target_mask, loss_mask=loss_mask)
 
+        if self.global_step < 5:
+            logger.info(
+                "memory_post_decoder",
+                gpu_gb=round(torch.cuda.memory_allocated() / 1e9, 2),
+            )
+
         # Flush calibrator scores (once per micro-batch)
         self._flush_calibrator_scores()
 
         # Scaled backward
         (loss / self._accum_steps).backward()
+
+        if self.global_step < 5:
+            logger.info(
+                "memory_post_backward",
+                gpu_gb=round(torch.cuda.memory_allocated() / 1e9, 2),
+            )
 
         target_ratio = self._current_target_ratio()
         n_survivors = int(survivor_mask.sum().item())

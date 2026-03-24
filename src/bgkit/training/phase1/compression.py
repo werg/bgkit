@@ -155,8 +155,12 @@ class CompressionTrainer(BaseTrainer):
         self.decoder.to(device)
 
         # Load decoder from Step 1 checkpoint
-        if step1_state_dicts is not None and "decoder" in step1_state_dicts:
-            self.decoder.load_state_dict(step1_state_dicts.pop("decoder"))
+        if step1_state_dicts is not None:
+            decoder_sd = step1_state_dicts.pop(
+                "decoder_merged", step1_state_dicts.pop("decoder", None)
+            )
+            if decoder_sd is not None:
+                self.decoder.load_state_dict(decoder_sd)
         del step1_state_dicts
         gc.collect()
 
