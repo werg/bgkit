@@ -568,120 +568,100 @@ class CommitEncodingTrainer(BaseTrainer):
             device=self.device, dtype=torch.bfloat16,
         )
 
-    def _compress_repo_batch(
-        self, batch: dict,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run L0→L1 compression on a batch of commit encoding samples."""
-        file_ids = batch["file_token_ids"].to(self.device)
-        file_masks = batch["file_attention_masks"].to(self.device)
-        file_count = batch["file_count"]
-        prompt_ids = batch["compression_prompt_ids"].to(self.device)
-        prompt_mask = batch["compression_prompt_mask"].to(self.device)
-
-        batch_size = file_ids.size(0)
-        bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
-        prompt_emb = bgkit_embed(prompt_ids)
-
-        # L0 per-file for all samples
-        l0_intermediates: list[torch.Tensor] = []
-        for b in range(batch_size):
-            n_files = int(file_count[b].item())
-            l0_surv = self._compress_single_l0_l1(
-                file_ids[b], file_masks[b], n_files,
-                prompt_emb[b:b + 1], prompt_mask[b:b + 1],
-                bgkit_embed,
-            )
-            l0_intermediates.append(l0_surv)
-
-        # Batched L1
-        max_surv = max(s.size(0) for s in l0_intermediates)
-        hidden_dim = l0_intermediates[0].size(-1)
-        padded = torch.zeros(
-            batch_size, max_surv, hidden_dim,
-            device=self.device, dtype=l0_intermediates[0].dtype,
-        )
-        pad_mask = torch.zeros(
-            batch_size, max_surv, dtype=torch.bool, device=self.device,
-        )
-        for i, surv in enumerate(l0_intermediates):
-            padded[i, :surv.size(0)] = surv
-            pad_mask[i, :surv.size(0)] = True
-
-        l1_survivor_mask = self._score_and_select(padded, pad_mask, level="l1")
-
-        l1_out = self.encoder(
-            input_embeddings=padded,
-            survivor_mask=l1_survivor_mask,
-            attention_mask=pad_mask,
-            prompt_embeddings=prompt_emb,
-            prompt_attention_mask=prompt_mask,
-        )
-
-        # Pad final survivors
-        all_final: list[torch.Tensor] = []
-        for i in range(batch_size):
-            smask = l1_out.survivor_attention_mask[i]
-            n_valid = int(smask.sum().item())
-            all_final.append(l1_out.survivor_embeddings[i, :n_valid])
-
-        max_final = max(s.size(0) for s in all_final)
-        hidden_dim = all_final[0].size(-1)
-        out_emb = torch.zeros(
-            batch_size, max_final, hidden_dim,
-            device=self.device, dtype=all_final[0].dtype,
-        )
-        out_mask = torch.zeros(
-            batch_size, max_final, dtype=torch.bool, device=self.device,
-        )
-        for b, surv in enumerate(all_final):
-            out_emb[b, :surv.size(0)] = surv
-            out_mask[b, :surv.size(0)] = True
-
-        return out_emb, out_mask
-
     # ------------------------------------------------------------------
     # Forward/backward
     # ------------------------------------------------------------------
 
     def _forward_backward(self, batch: dict) -> dict[str, float]:
-        """Forward pass + scaled backward. No optimizer ops."""
+        """Per-sample forward + backward for memory-efficient gradient accumulation.
+
+        Processes each sample's L0→L1→decoder pipeline independently, calling
+        .backward() after each to free the autograd graph immediately. Peak
+        memory is proportional to the single largest sample, not the batch sum.
+        """
         self.encoder.train()
         self.decoder.train()
 
-        # All commit encoding samples are repo-type (L0→L1)
-        survivors, survivor_mask = self._compress_repo_batch(batch)
-
-        # Fused decoder forward + CE loss (no full logits materialized)
+        file_ids = batch["file_token_ids"].to(self.device)
+        file_masks = batch["file_attention_masks"].to(self.device)
+        file_count = batch["file_count"]
+        prompt_ids = batch["compression_prompt_ids"].to(self.device)
+        prompt_mask = batch["compression_prompt_mask"].to(self.device)
         target_ids = batch["target_token_ids"].to(self.device)
         target_mask = batch["target_attention_mask"].to(self.device)
-        loss_mask = batch.get("target_loss_mask")
-        if loss_mask is not None:
-            loss_mask = loss_mask.to(self.device)
+        loss_mask_batch = batch.get("target_loss_mask")
+        if loss_mask_batch is not None:
+            loss_mask_batch = loss_mask_batch.to(self.device)
 
-        with torch.autocast(
-            "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
-        ):
-            loss = self.decoder.forward_with_loss(
-                survivor_embeddings=survivors,
-                target_ids=target_ids,
-                target_attention_mask=target_mask,
-                survivor_attention_mask=survivor_mask,
-                loss_mask=loss_mask,
+        batch_size = file_ids.size(0)
+        bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+        scale = 1.0 / (batch_size * self._accum_steps)
+
+        total_loss = 0.0
+        total_survivors = 0
+        total_valid = 0
+
+        for b in range(batch_size):
+            n_files = int(file_count[b].item())
+
+            # Recompute prompt_emb per sample — .backward() frees the autograd
+            # graph, so a shared prompt_emb would crash on the second sample.
+            prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
+
+            # L0 per-file (checkpointed)
+            l0_surv = self._compress_single_l0_l1(
+                file_ids[b], file_masks[b], n_files,
+                prompt_emb_b, prompt_mask[b:b + 1],
+                bgkit_embed,
             )
+
+            # L1 for this sample only
+            l1_input = l0_surv.unsqueeze(0)
+            l1_mask = torch.ones(
+                1, l0_surv.size(0), dtype=torch.bool, device=self.device,
+            )
+            l1_survivor_mask = self._score_and_select(l1_input, l1_mask, level="l1")
+
+            l1_out = self.encoder(
+                input_embeddings=l1_input,
+                survivor_mask=l1_survivor_mask,
+                attention_mask=l1_mask,
+                prompt_embeddings=prompt_emb_b,
+                prompt_attention_mask=prompt_mask[b:b + 1],
+            )
+
+            sample_survivors = l1_out.survivor_embeddings
+            sample_surv_mask = l1_out.survivor_attention_mask
+
+            sample_loss_mask = loss_mask_batch[b:b + 1] if loss_mask_batch is not None else None
+
+            # Decoder for this sample only
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
+            ):
+                loss = self.decoder.forward_with_loss(
+                    survivor_embeddings=sample_survivors,
+                    target_ids=target_ids[b:b + 1],
+                    target_attention_mask=target_mask[b:b + 1],
+                    survivor_attention_mask=sample_surv_mask,
+                    loss_mask=sample_loss_mask,
+                )
+
+            # Backward immediately — frees this sample's autograd graph
+            (loss * scale).backward()
+
+            total_loss += loss.item()
+            total_survivors += int(sample_surv_mask.sum().item())
+            total_valid += int(file_masks[b].sum().item())
 
         # Flush calibrator scores (once per micro-batch)
         self._flush_calibrator_scores()
 
-        # Scaled backward
-        (loss / self._accum_steps).backward()
-
         target_ratio = self._current_target_ratio()
-        n_survivors = int(survivor_mask.sum().item())
-        n_valid = int(batch["file_attention_masks"].sum().item())
-        actual_ratio = n_survivors / max(n_valid, 1)
+        actual_ratio = total_survivors / max(total_valid, 1)
 
         return {
-            "loss": loss.item(),
+            "loss": total_loss / batch_size,
             "target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
             "calibrated_threshold_l0": self._l0_calibrator.get_threshold(target_ratio),
@@ -720,33 +700,70 @@ class CommitEncodingTrainer(BaseTrainer):
                 if batch_idx % 100 == 0:
                     logger.info("eval_progress", batch=batch_idx, total=num_batches)
 
-                survivors, survivor_mask = self._compress_repo_batch(batch)
-
+                file_ids = batch["file_token_ids"].to(self.device)
+                file_masks = batch["file_attention_masks"].to(self.device)
+                file_count = batch["file_count"]
+                prompt_ids = batch["compression_prompt_ids"].to(self.device)
+                prompt_mask = batch["compression_prompt_mask"].to(self.device)
                 target_ids = batch["target_token_ids"].to(self.device)
                 target_mask = batch["target_attention_mask"].to(self.device)
                 loss_mask_batch = batch.get("target_loss_mask")
                 if loss_mask_batch is not None:
                     loss_mask_batch = loss_mask_batch.to(self.device)
 
-                with torch.autocast(
-                    "cuda", dtype=torch.bfloat16,
-                    enabled=self.device.type == "cuda",
-                ):
-                    loss = self.decoder.forward_with_loss(
-                        survivor_embeddings=survivors,
-                        target_ids=target_ids,
-                        target_attention_mask=target_mask,
-                        survivor_attention_mask=survivor_mask,
-                        loss_mask=loss_mask_batch,
+                batch_size = file_ids.size(0)
+                bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+
+                for b in range(batch_size):
+                    n_files = int(file_count[b].item())
+                    prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
+
+                    l0_surv = self._compress_single_l0_l1(
+                        file_ids[b], file_masks[b], n_files,
+                        prompt_emb_b, prompt_mask[b:b + 1],
+                        bgkit_embed,
                     )
 
-                eval_loss_mask = batch.get("target_loss_mask")
-                if eval_loss_mask is not None:
-                    batch_tokens = eval_loss_mask[:, 1:].sum().item()
-                else:
-                    batch_tokens = batch["target_attention_mask"][:, 1:].sum().item()
-                total_loss += loss.item() * batch_tokens
-                total_tokens += batch_tokens
+                    l1_input = l0_surv.unsqueeze(0)
+                    l1_mask = torch.ones(
+                        1, l0_surv.size(0), dtype=torch.bool, device=self.device,
+                    )
+                    l1_survivor_mask = self._score_and_select(
+                        l1_input, l1_mask, level="l1",
+                    )
+
+                    l1_out = self.encoder(
+                        input_embeddings=l1_input,
+                        survivor_mask=l1_survivor_mask,
+                        attention_mask=l1_mask,
+                        prompt_embeddings=prompt_emb_b,
+                        prompt_attention_mask=prompt_mask[b:b + 1],
+                    )
+
+                    sample_loss_mask = (
+                        loss_mask_batch[b:b + 1] if loss_mask_batch is not None else None
+                    )
+
+                    with torch.autocast(
+                        "cuda", dtype=torch.bfloat16,
+                        enabled=self.device.type == "cuda",
+                    ):
+                        loss = self.decoder.forward_with_loss(
+                            survivor_embeddings=l1_out.survivor_embeddings,
+                            target_ids=target_ids[b:b + 1],
+                            target_attention_mask=target_mask[b:b + 1],
+                            survivor_attention_mask=l1_out.survivor_attention_mask,
+                            loss_mask=sample_loss_mask,
+                        )
+
+                    # Token-weighted accumulation for comparable perplexity
+                    eval_loss_mask = batch.get("target_loss_mask")
+                    if eval_loss_mask is not None:
+                        sample_tokens = eval_loss_mask[b, 1:].sum().item()
+                    else:
+                        sample_tokens = batch["target_attention_mask"][b, 1:].sum().item()
+                    total_loss += loss.item() * sample_tokens
+                    total_tokens += sample_tokens
 
             avg_loss = total_loss / max(total_tokens, 1)
             perplexity = torch.exp(torch.tensor(avg_loss)).item()

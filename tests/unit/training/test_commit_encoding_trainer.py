@@ -304,12 +304,21 @@ class TestForwardBackward:
         assert decoder_has_grad, "Decoder should receive gradients"
 
     def test_multi_file_l0_compression(self, trainer):
-        """L0 should process each file independently."""
+        """L0 should process each file independently via _compress_single_l0_l1."""
         batch = _make_commit_batch(batch_size=1, n_files=4, file_len=8)
-        survivors, survivor_mask = trainer._compress_repo_batch(batch)
-        assert survivors.ndim == 3  # (batch, max_survivors, hidden_dim)
-        assert survivor_mask.ndim == 2  # (batch, max_survivors)
-        assert survivor_mask.any(), "Should have at least some survivors"
+        file_ids = batch["file_token_ids"]
+        file_masks = batch["file_attention_masks"]
+        prompt_ids = batch["compression_prompt_ids"]
+        prompt_mask = batch["compression_prompt_mask"]
+        bgkit_embed = trainer.encoder.compressor.backbone.get_input_embeddings()
+        prompt_emb = bgkit_embed(prompt_ids[0:1])
+
+        l0_surv = trainer._compress_single_l0_l1(
+            file_ids[0], file_masks[0], 4,
+            prompt_emb, prompt_mask[0:1], bgkit_embed,
+        )
+        assert l0_surv.ndim == 2  # (total_survivors, hidden_dim)
+        assert l0_surv.size(0) > 0, "Should have at least some survivors"
 
     def test_calibrator_scores_not_doubled_by_checkpoint(self, trainer):
         """Scores should be buffered exactly once per file, not doubled.
@@ -321,10 +330,19 @@ class TestForwardBackward:
         trainer._pending_l0_scores.clear()
         n_files = 4
         batch = _make_commit_batch(batch_size=1, n_files=n_files, file_len=8)
+        file_ids = batch["file_token_ids"]
+        file_masks = batch["file_attention_masks"]
+        prompt_ids = batch["compression_prompt_ids"]
+        prompt_mask = batch["compression_prompt_mask"]
+        bgkit_embed = trainer.encoder.compressor.backbone.get_input_embeddings()
+        prompt_emb = bgkit_embed(prompt_ids[0:1])
 
-        trainer._compress_repo_batch(batch)
+        trainer._compress_single_l0_l1(
+            file_ids[0], file_masks[0], n_files,
+            prompt_emb, prompt_mask[0:1], bgkit_embed,
+        )
 
-        # L0 scores: one per file, L1 scores: one for the batched L1 pass
+        # L0 scores: one per file
         n_l0_appends = len(trainer._pending_l0_scores)
         assert n_l0_appends == n_files, (
             f"Expected {n_files} L0 score appends (one per file), "

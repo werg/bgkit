@@ -795,116 +795,6 @@ class CompressionTrainer(BaseTrainer):
             device=self.device, dtype=torch.bfloat16,
         )
 
-    def _compress_repo_batch(
-        self, batch: dict,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run compression on a batch of RepoCompressionSamples.
-
-        Handles mixed batches with two distinct paths:
-        - direct_l1 samples: single encoder pass (skip L0), producing final
-          decoder-space survivors directly.
-        - Regular samples: L0 per-file → auto_repro to input space → L1
-          (ICE + encoder), producing decoder-space survivors.
-
-        Final outputs from both paths are padded and combined.
-
-        Returns:
-            (survivor_embeddings, survivor_attention_mask)
-        """
-        file_ids = batch["file_token_ids"].to(self.device)
-        file_masks = batch["file_attention_masks"].to(self.device)
-        file_count = batch["file_count"]
-        prompt_ids = batch["compression_prompt_ids"].to(self.device)
-        prompt_mask = batch["compression_prompt_mask"].to(self.device)
-        direct_l1_flags = batch["direct_l1"]  # (B,) bool tensor
-
-        batch_size = file_ids.size(0)
-        bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
-        prompt_emb = bgkit_embed(prompt_ids)
-
-        # Collect final decoder-space survivors per sample.
-        # direct_l1: one encoder pass → done.
-        # regular: L0 per-file → auto_repro intermediates → batched L1.
-        final_survivors: list[torch.Tensor | None] = [None] * batch_size
-        l0_intermediates: dict[int, torch.Tensor] = {}  # b -> input-space surv
-
-        for b in range(batch_size):
-            n_files = int(file_count[b].item())
-
-            if direct_l1_flags[b]:
-                if n_files != 1:
-                    raise ValueError(
-                        f"direct_l1 sample {b} has file_count={n_files}, expected 1"
-                    )
-                final_survivors[b] = self._compress_single_direct_l1(
-                    file_ids[b, 0].unsqueeze(0),
-                    file_masks[b, 0].unsqueeze(0),
-                    prompt_emb[b:b + 1],
-                    prompt_mask[b:b + 1],
-                    bgkit_embed,
-                )
-            else:
-                l0_intermediates[b] = self._compress_single_l0_l1(
-                    file_ids[b], file_masks[b], n_files,
-                    prompt_emb[b:b + 1], prompt_mask[b:b + 1],
-                    bgkit_embed,
-                )
-
-        # Run batched L1 on non-direct_l1 samples only
-        if l0_intermediates:
-            l1_indices = sorted(l0_intermediates.keys())
-            l1_survs = [l0_intermediates[b] for b in l1_indices]
-            l1_prompts = torch.stack([prompt_emb[b] for b in l1_indices])
-            l1_pmasks = torch.stack([prompt_mask[b] for b in l1_indices])
-
-            max_surv = max(s.size(0) for s in l1_survs)
-            hidden_dim = l1_survs[0].size(-1)
-            n_l1 = len(l1_indices)
-            padded = torch.zeros(
-                n_l1, max_surv, hidden_dim,
-                device=self.device, dtype=l1_survs[0].dtype,
-            )
-            pad_mask = torch.zeros(
-                n_l1, max_surv, dtype=torch.bool, device=self.device,
-            )
-            for i, surv in enumerate(l1_survs):
-                padded[i, :surv.size(0)] = surv
-                pad_mask[i, :surv.size(0)] = True
-
-            l1_survivor_mask = self._score_and_select(padded, pad_mask, level="l1")
-
-            l1_out = self.encoder(
-                input_embeddings=padded,
-                survivor_mask=l1_survivor_mask,
-                attention_mask=pad_mask,
-                prompt_embeddings=l1_prompts,
-                prompt_attention_mask=l1_pmasks,
-            )
-
-            for i, b in enumerate(l1_indices):
-                # Extract per-sample survivors (remove batch padding)
-                smask = l1_out.survivor_attention_mask[i]
-                n_valid = int(smask.sum().item())
-                final_survivors[b] = l1_out.survivor_embeddings[i, :n_valid]
-
-        # Pad all final survivors across the full batch
-        all_final = [s for s in final_survivors if s is not None]
-        assert len(all_final) == batch_size
-        max_final = max(s.size(0) for s in all_final)
-        hidden_dim = all_final[0].size(-1)
-        out_emb = torch.zeros(
-            batch_size, max_final, hidden_dim,
-            device=self.device, dtype=all_final[0].dtype,
-        )
-        out_mask = torch.zeros(
-            batch_size, max_final, dtype=torch.bool, device=self.device,
-        )
-        for b, surv in enumerate(all_final):
-            out_emb[b, :surv.size(0)] = surv
-            out_mask[b, :surv.size(0)] = True
-
-        return out_emb, out_mask
-
     # ------------------------------------------------------------------
     # Loss computation
     # ------------------------------------------------------------------
@@ -942,7 +832,11 @@ class CompressionTrainer(BaseTrainer):
         return self._trainable_params()
 
     def _forward_backward(self, batch: dict) -> dict[str, float]:
-        """Forward pass + scaled backward. No optimizer ops."""
+        """Forward pass + scaled backward. No optimizer ops.
+
+        File batches stay batched (single-file samples are small).
+        Repo batches use per-sample L0→L1→decoder→backward for memory efficiency.
+        """
         self.encoder.train()
         self.decoder.train()
 
@@ -955,31 +849,27 @@ class CompressionTrainer(BaseTrainer):
 
         sample_type = batch["sample_type"]
 
-        # Run compression pipeline (returns actual sampled ratio)
         if sample_type == "file":
+            # File batches: stay batched (single-file, small)
             survivors, survivor_mask = self._compress_file_batch(batch)
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
+            ):
+                loss = self._decoder_forward_with_loss(survivors, survivor_mask, batch)
+            self._flush_calibrator_scores()
+            (loss / self._accum_steps).backward()
+
+            n_survivors = int(survivor_mask.sum().item())
+            n_valid = int(batch["content_attention_mask"].sum().item())
+            total_loss = loss.item()
         else:
-            survivors, survivor_mask = self._compress_repo_batch(batch)
-
-        # Fused decoder forward + CE loss (no full logits materialized)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-            loss = self._decoder_forward_with_loss(survivors, survivor_mask, batch)
-
-        # Flush calibrator scores (once per micro-batch)
-        self._flush_calibrator_scores()
-
-        # Scaled backward (for gradient accumulation)
-        (loss / self._accum_steps).backward()
+            # Repo batches: per-sample accumulation
+            total_loss, n_survivors, n_valid = self._forward_backward_repo_persample(batch)
 
         target_ratio = self._current_target_ratio()
-        n_survivors = int(survivor_mask.sum().item())
-        if sample_type == "file":
-            n_valid = int(batch["content_attention_mask"].sum().item())
-        else:
-            n_valid = int(batch["file_attention_masks"].sum().item())
         actual_ratio = n_survivors / max(n_valid, 1)
         metrics = {
-            "loss": loss.item(),
+            "loss": total_loss,
             "sample_type": sample_type,
             "min_target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
@@ -990,41 +880,173 @@ class CompressionTrainer(BaseTrainer):
             metrics["calibrated_threshold_l1"] = self._l1_calibrator.get_threshold(target_ratio)
         return metrics
 
+    def _forward_backward_repo_persample(
+        self,
+        batch: dict,
+        scale_override: float | None = None,
+        flush_calibrator: bool = True,
+    ) -> tuple[float, int, int]:
+        """Per-sample forward+backward for repo batches.
+
+        Args:
+            batch: Collated repo batch.
+            scale_override: If set, use this as the per-sample gradient scale
+                instead of ``1 / (batch_size * accum_steps)``. Used by
+                ``_forward_backward_mixed`` to weight repo samples relative
+                to the combined file+repo sample count.
+            flush_calibrator: Whether to flush calibrator scores at the end.
+                Set to False when the caller will flush after additional work.
+
+        Returns:
+            ``(avg_loss, total_survivors, total_valid_tokens)``
+        """
+        file_ids = batch["file_token_ids"].to(self.device)
+        file_masks = batch["file_attention_masks"].to(self.device)
+        file_count = batch["file_count"]
+        prompt_ids = batch["compression_prompt_ids"].to(self.device)
+        prompt_mask = batch["compression_prompt_mask"].to(self.device)
+        direct_l1_flags = batch["direct_l1"]
+        target_ids = batch["target_token_ids"].to(self.device)
+        target_mask = batch["target_attention_mask"].to(self.device)
+        loss_mask_batch = batch.get("target_loss_mask")
+        if loss_mask_batch is not None:
+            loss_mask_batch = loss_mask_batch.to(self.device)
+
+        batch_size = file_ids.size(0)
+        bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+        scale = (
+            scale_override
+            if scale_override is not None
+            else 1.0 / (batch_size * self._accum_steps)
+        )
+
+        total_loss = 0.0
+        total_survivors = 0
+        total_valid = 0
+
+        for b in range(batch_size):
+            n_files = int(file_count[b].item())
+            prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
+
+            if direct_l1_flags[b]:
+                if n_files != 1:
+                    raise ValueError(
+                        f"direct_l1 sample {b} has file_count={n_files}, expected 1"
+                    )
+                # direct_l1: single encoder pass, skip L0
+                sample_survivors = self._compress_single_direct_l1(
+                    file_ids[b, 0].unsqueeze(0),
+                    file_masks[b, 0].unsqueeze(0),
+                    prompt_emb_b,
+                    prompt_mask[b:b + 1],
+                    bgkit_embed,
+                ).unsqueeze(0)
+                sample_surv_mask = torch.ones(
+                    1, sample_survivors.size(1),
+                    dtype=torch.bool, device=self.device,
+                )
+            else:
+                # Regular: L0 per-file → L1
+                l0_surv = self._compress_single_l0_l1(
+                    file_ids[b], file_masks[b], n_files,
+                    prompt_emb_b, prompt_mask[b:b + 1],
+                    bgkit_embed,
+                )
+                l1_input = l0_surv.unsqueeze(0)
+                l1_mask = torch.ones(
+                    1, l0_surv.size(0), dtype=torch.bool, device=self.device,
+                )
+                l1_survivor_mask = self._score_and_select(l1_input, l1_mask, level="l1")
+
+                l1_out = self.encoder(
+                    input_embeddings=l1_input,
+                    survivor_mask=l1_survivor_mask,
+                    attention_mask=l1_mask,
+                    prompt_embeddings=prompt_emb_b,
+                    prompt_attention_mask=prompt_mask[b:b + 1],
+                )
+                sample_survivors = l1_out.survivor_embeddings
+                sample_surv_mask = l1_out.survivor_attention_mask
+
+            sample_loss_mask = loss_mask_batch[b:b + 1] if loss_mask_batch is not None else None
+
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
+            ):
+                loss = self.decoder.forward_with_loss(
+                    survivor_embeddings=sample_survivors,
+                    target_ids=target_ids[b:b + 1],
+                    target_attention_mask=target_mask[b:b + 1],
+                    survivor_attention_mask=sample_surv_mask,
+                    loss_mask=sample_loss_mask,
+                )
+
+            (loss * scale).backward()
+
+            total_loss += loss.item()
+            total_survivors += int(sample_surv_mask.sum().item())
+            total_valid += int(file_masks[b].sum().item())
+
+        if flush_calibrator:
+            self._flush_calibrator_scores()
+
+        return total_loss / batch_size, total_survivors, total_valid
+
     def _forward_backward_mixed(self, batch: dict) -> dict[str, float]:
-        """Handle mixed batch: forward + scaled backward, no optimizer ops."""
+        """Handle mixed batch with sample-count-weighted scaling.
+
+        File portion stays batched (token-weighted within the file sub-batch).
+        Repo portion uses per-sample loop (sample-weighted). Each portion is
+        scaled by its sample count relative to the combined total so that
+        file and repo samples contribute roughly equally. The file portion is
+        only approximately sample-weighted — exact equivalence requires all
+        file targets to have the same token count (typical for single-file
+        samples packed by max_batch_tokens).
+        """
         file_batch = batch["file_batch"]
         repo_batch = batch["repo_batch"]
 
-        # Process file portion
+        n_file_samples = file_batch["target_token_ids"].size(0)
+        n_repo_samples = repo_batch["file_token_ids"].size(0)
+        total_samples = n_file_samples + n_repo_samples
+
+        # --- File portion: batched forward, one backward ---
         file_survivors, file_mask = self._compress_file_batch(file_batch)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
+        with torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
+        ):
             file_loss = self._decoder_forward_with_loss(
                 file_survivors, file_mask, file_batch,
             )
+        file_scale = n_file_samples / (total_samples * self._accum_steps)
+        (file_loss * file_scale).backward()
 
-        # Process repo portion
-        repo_survivors, repo_mask = self._compress_repo_batch(repo_batch)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-            repo_loss = self._decoder_forward_with_loss(
-                repo_survivors, repo_mask, repo_batch,
+        # --- Repo portion: per-sample loop (reuse shared helper) ---
+        repo_scale = 1.0 / (total_samples * self._accum_steps)
+        avg_repo_loss, repo_survivors, n_valid_repo = (
+            self._forward_backward_repo_persample(
+                repo_batch,
+                scale_override=repo_scale,
+                flush_calibrator=False,
             )
+        )
 
-        # Average losses
-        loss = (file_loss + repo_loss) / 2.0
-
-        # Flush calibrator scores (once per micro-batch)
         self._flush_calibrator_scores()
 
-        # Scaled backward (for gradient accumulation)
-        (loss / self._accum_steps).backward()
+        # Combined sample-weighted loss: file_loss is token-weighted over the
+        # file sub-batch, avg_repo_loss is sample-weighted over repo samples.
+        # Weight each portion by its sample count for a consistent metric.
+        combined_loss = (
+            file_loss.item() * n_file_samples
+            + avg_repo_loss * n_repo_samples
+        ) / total_samples
+        total_survivors = int(file_mask.sum().item()) + repo_survivors
+        n_valid_file = int(file_batch["content_attention_mask"].sum().item())
+        actual_ratio = total_survivors / max(n_valid_file + n_valid_repo, 1)
 
         target_ratio = self._current_target_ratio()
-        total_survivors = int(file_mask.sum().item()) + int(repo_mask.sum().item())
-        n_valid_file = int(file_batch["content_attention_mask"].sum().item())
-        n_valid_repo = int(repo_batch["file_attention_masks"].sum().item())
-        actual_ratio = total_survivors / max(n_valid_file + n_valid_repo, 1)
         metrics = {
-            "loss": loss.item(),
+            "loss": combined_loss,
             "sample_type": "mixed",
             "min_target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
@@ -1090,7 +1112,12 @@ class CompressionTrainer(BaseTrainer):
 
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
-        """Run evaluation on the eval split."""
+        """Run evaluation on the eval split.
+
+        File batches stay batched. Repo batches use per-sample forward for
+        memory efficiency. Token-weighted loss accumulation preserved for
+        comparable perplexity across runs.
+        """
         self.encoder.eval()
         self.decoder.eval()
         self._is_evaluating = True
@@ -1108,37 +1135,50 @@ class CompressionTrainer(BaseTrainer):
                     logger.info("eval_progress", batch=batch_idx, total=num_batches)
 
                 if batch.get("mixed", False):
-                    # Skip mixed batches in eval for simplicity
                     continue
 
                 sample_type = batch["sample_type"]
                 if sample_type == "file":
                     survivors, survivor_mask = self._compress_file_batch(batch)
-                else:
-                    survivors, survivor_mask = self._compress_repo_batch(batch)
+                    with torch.autocast(
+                        "cuda", dtype=torch.bfloat16,
+                        enabled=self.device.type == "cuda",
+                    ):
+                        loss = self._decoder_forward_with_loss(
+                            survivors, survivor_mask, batch,
+                        )
 
-                with torch.autocast(
-                    "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
-                ):
-                    loss = self._decoder_forward_with_loss(
-                        survivors, survivor_mask, batch,
+                    eval_loss_mask = batch.get("target_loss_mask")
+                    if eval_loss_mask is not None:
+                        batch_tokens = eval_loss_mask[:, 1:].sum().item()
+                    else:
+                        batch_tokens = batch["target_attention_mask"][:, 1:].sum().item()
+                    total_loss += loss.item() * batch_tokens
+                    total_tokens += batch_tokens
+
+                    objectives = batch.get("objectives", [])
+                    if objectives:
+                        obj = objectives[0]
+                        per_objective_loss[obj] = (
+                            per_objective_loss.get(obj, 0.0) + loss.item()
+                        )
+                        per_objective_count[obj] = per_objective_count.get(obj, 0) + 1
+                else:
+                    # Repo batches: per-sample forward
+                    batch_loss_sum, batch_tokens = (
+                        self._evaluate_repo_batch_persample(batch)
                     )
+                    total_loss += batch_loss_sum
+                    total_tokens += batch_tokens
 
-                # Weight by content tokens (loss_mask) not all tokens
-                eval_loss_mask = batch.get("target_loss_mask")
-                if eval_loss_mask is not None:
-                    batch_tokens = eval_loss_mask[:, 1:].sum().item()
-                else:
-                    batch_tokens = batch["target_attention_mask"][:, 1:].sum().item()
-                total_loss += loss.item() * batch_tokens
-                total_tokens += batch_tokens
-
-                # Per-objective tracking
-                objectives = batch.get("objectives", [])
-                if objectives:
-                    obj = objectives[0]
-                    per_objective_loss[obj] = per_objective_loss.get(obj, 0.0) + loss.item()
-                    per_objective_count[obj] = per_objective_count.get(obj, 0) + 1
+                    objectives = batch.get("objectives", [])
+                    if objectives:
+                        obj = objectives[0]
+                        avg = batch_loss_sum / max(batch_tokens, 1)
+                        per_objective_loss[obj] = (
+                            per_objective_loss.get(obj, 0.0) + avg
+                        )
+                        per_objective_count[obj] = per_objective_count.get(obj, 0) + 1
 
             avg_loss = total_loss / max(total_tokens, 1)
             perplexity = torch.exp(torch.tensor(avg_loss)).item()
@@ -1148,7 +1188,6 @@ class CompressionTrainer(BaseTrainer):
                 "perplexity": perplexity,
             }
 
-            # Per-objective losses
             for obj, total in per_objective_loss.items():
                 count = per_objective_count.get(obj, 1)
                 metrics[f"{obj}_loss"] = total / count
@@ -1158,6 +1197,95 @@ class CompressionTrainer(BaseTrainer):
             self.decoder.train()
 
         return metrics
+
+    def _evaluate_repo_batch_persample(
+        self,
+        batch: dict,
+    ) -> tuple[float, float]:
+        """Per-sample eval forward for a repo batch. Returns (weighted_loss_sum, token_count)."""
+        file_ids = batch["file_token_ids"].to(self.device)
+        file_masks = batch["file_attention_masks"].to(self.device)
+        file_count = batch["file_count"]
+        prompt_ids = batch["compression_prompt_ids"].to(self.device)
+        prompt_mask = batch["compression_prompt_mask"].to(self.device)
+        direct_l1_flags = batch["direct_l1"]
+        target_ids = batch["target_token_ids"].to(self.device)
+        target_mask = batch["target_attention_mask"].to(self.device)
+        loss_mask_batch = batch.get("target_loss_mask")
+        if loss_mask_batch is not None:
+            loss_mask_batch = loss_mask_batch.to(self.device)
+
+        batch_size = file_ids.size(0)
+        bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+
+        batch_loss_sum = 0.0
+        batch_token_count = 0.0
+
+        for b in range(batch_size):
+            n_files = int(file_count[b].item())
+            prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
+
+            if direct_l1_flags[b]:
+                if n_files != 1:
+                    raise ValueError(
+                        f"direct_l1 sample {b} has file_count={n_files}, expected 1"
+                    )
+                sample_survivors = self._compress_single_direct_l1(
+                    file_ids[b, 0].unsqueeze(0),
+                    file_masks[b, 0].unsqueeze(0),
+                    prompt_emb_b,
+                    prompt_mask[b:b + 1],
+                    bgkit_embed,
+                ).unsqueeze(0)
+                sample_surv_mask = torch.ones(
+                    1, sample_survivors.size(1),
+                    dtype=torch.bool, device=self.device,
+                )
+            else:
+                l0_surv = self._compress_single_l0_l1(
+                    file_ids[b], file_masks[b], n_files,
+                    prompt_emb_b, prompt_mask[b:b + 1],
+                    bgkit_embed,
+                )
+                l1_input = l0_surv.unsqueeze(0)
+                l1_mask = torch.ones(
+                    1, l0_surv.size(0), dtype=torch.bool, device=self.device,
+                )
+                l1_survivor_mask = self._score_and_select(l1_input, l1_mask, level="l1")
+                l1_out = self.encoder(
+                    input_embeddings=l1_input,
+                    survivor_mask=l1_survivor_mask,
+                    attention_mask=l1_mask,
+                    prompt_embeddings=prompt_emb_b,
+                    prompt_attention_mask=prompt_mask[b:b + 1],
+                )
+                sample_survivors = l1_out.survivor_embeddings
+                sample_surv_mask = l1_out.survivor_attention_mask
+
+            sample_loss_mask = (
+                loss_mask_batch[b:b + 1] if loss_mask_batch is not None else None
+            )
+
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
+            ):
+                loss = self.decoder.forward_with_loss(
+                    survivor_embeddings=sample_survivors,
+                    target_ids=target_ids[b:b + 1],
+                    target_attention_mask=target_mask[b:b + 1],
+                    survivor_attention_mask=sample_surv_mask,
+                    loss_mask=sample_loss_mask,
+                )
+
+            eval_loss_mask = batch.get("target_loss_mask")
+            if eval_loss_mask is not None:
+                sample_tokens = eval_loss_mask[b, 1:].sum().item()
+            else:
+                sample_tokens = batch["target_attention_mask"][b, 1:].sum().item()
+            batch_loss_sum += loss.item() * sample_tokens
+            batch_token_count += sample_tokens
+
+        return batch_loss_sum, batch_token_count
 
     # ------------------------------------------------------------------
     # Checkpointing
