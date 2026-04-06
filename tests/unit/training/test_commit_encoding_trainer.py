@@ -242,6 +242,7 @@ def trainer():
     t._pending_l0_scores = []
     t._pending_l1_scores = []
     t._is_evaluating = False
+    t._profile_enabled = False
 
     return t
 
@@ -304,7 +305,7 @@ class TestForwardBackward:
         assert decoder_has_grad, "Decoder should receive gradients"
 
     def test_multi_file_l0_compression(self, trainer):
-        """L0 should process each file independently via _compress_single_l0_l1."""
+        """L0 should process each file via batched _compress_l0_batched."""
         batch = _make_commit_batch(batch_size=1, n_files=4, file_len=8)
         file_ids = batch["file_token_ids"]
         file_masks = batch["file_attention_masks"]
@@ -313,7 +314,7 @@ class TestForwardBackward:
         bgkit_embed = trainer.encoder.compressor.backbone.get_input_embeddings()
         prompt_emb = bgkit_embed(prompt_ids[0:1])
 
-        l0_surv = trainer._compress_single_l0_l1(
+        l0_surv = trainer._compress_l0_batched(
             file_ids[0], file_masks[0], 4,
             prompt_emb, prompt_mask[0:1], bgkit_embed,
         )
@@ -337,7 +338,7 @@ class TestForwardBackward:
         bgkit_embed = trainer.encoder.compressor.backbone.get_input_embeddings()
         prompt_emb = bgkit_embed(prompt_ids[0:1])
 
-        trainer._compress_single_l0_l1(
+        trainer._compress_l0_batched(
             file_ids[0], file_masks[0], n_files,
             prompt_emb, prompt_mask[0:1], bgkit_embed,
         )

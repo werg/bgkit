@@ -198,8 +198,15 @@ class ReconstructionDecoder(nn.Module):
         logger.info("lora_base_layers_converted_to_te", count=count)
 
     def _get_inner_model_and_head(self) -> tuple[nn.Module, nn.Module]:
-        """Return (inner_model, lm_head) handling plain, PeftModel, and TE cases."""
+        """Return (inner_model, lm_head) handling plain, PeftModel, and TE cases.
+
+        Also handles torch.compile's OptimizedModule wrapper, which breaks
+        isinstance() checks. Unwrap before testing.
+        """
         backbone = self.backbone
+        # Unwrap torch.compile's OptimizedModule if present
+        if hasattr(backbone, "_orig_mod"):
+            backbone = backbone._orig_mod
         try:
             from peft import PeftModel
 

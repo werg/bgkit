@@ -14,6 +14,7 @@ format as CompressionTrainer (encoder.pt + decoder.pt) so Step 4 can consume the
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import ClassVar
 
@@ -139,14 +140,21 @@ class CommitEncodingTrainer(BaseTrainer):
             self.decoder.apply_lora(lora_cfg)
             self._decoder_lora = True
 
-        # NVFP4 disabled: TE on sm_121 lacks sm_121a compilation (wgrad kernel
-        # crash) and conflicts with gradient checkpointing (state divergence).
-        # Revisit when TE is rebuilt with NVTE_CUDA_ARCHS=121a.
+        # NVFP4 disabled: TE's fp8_autocast saves non-deterministic scaling
+        # tensors that break PyTorch gradient checkpointing's save/restore
+        # invariants (122 vs 87 tensors between forward and recompute, causing
+        # AssertionError in unpack_hook). This is a fundamental incompatibility
+        # between TE's stateful fp8 context and PyTorch's checkpoint replay.
+        # Bypassing the validation check isn't enough — the internal handle
+        # mapping also breaks. Needs upstream TE fix.
 
         enable_gradient_checkpointing(self.decoder.backbone)
 
-        # torch.compile disabled: dynamic batch shapes cause continuous recompilation
-        # on sm_121. See decoder_init.py for details.
+        # torch.compile disabled: sm_121 shared memory (101 KB) is too small for
+        # inductor-generated Triton kernels (need ~148 KB). "reduce-overhead" and
+        # "cudagraphs" backends also use inductor or suffer from dynamic shape
+        # re-recording overhead. PeftModel isinstance fix landed in decoder.py
+        # for when this becomes viable.
 
         # BaseTrainer uses self.model for logging
         self.model = self.decoder
@@ -310,11 +318,15 @@ class CommitEncodingTrainer(BaseTrainer):
         # Eval isolation flag
         self._is_evaluating = False
 
+        # --- Profiling ---
+        self._profile_enabled = os.environ.get("BGKIT_PROFILE", "") == "1"
+
         logger.info(
             "commit_encoding_trainer_setup",
             train_samples=train_size,
             eval_samples=eval_size,
             device=str(device),
+            profile=self._profile_enabled,
         )
 
     def _load_variant_bank(self, data_cfg) -> list[dict[str, str]]:
@@ -502,27 +514,38 @@ class CommitEncodingTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compress_single_file_pure(
+    def _compress_files_batched_pure(
         compressor: torch.nn.Module,
-        f_emb: torch.Tensor,
-        s_mask: torch.Tensor,
-        f_mask: torch.Tensor,
+        all_f_emb: torch.Tensor,
+        all_s_mask: torch.Tensor,
+        all_f_mask: torch.Tensor,
         prompt_emb: torch.Tensor,
         prompt_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Pure (side-effect-free) single-file L0 compression for checkpointing."""
+        """Batched L0 compression for checkpointing.
+
+        Returns concatenated survivors as (total_surv, D).
+        """
         comp_out = compressor(
-            f_emb,
-            survivor_mask=s_mask,
-            attention_mask=f_mask,
+            all_f_emb,
+            survivor_mask=all_s_mask,
+            attention_mask=all_f_mask,
             prompt_embeddings=prompt_emb,
             prompt_attention_mask=prompt_mask,
         )
         content_normed = comp_out.normed_embeddings[:, comp_out.content_slice, :]
-        survivor_normed = content_normed[0][s_mask[0]]
-        return compressor.auto_reproduce(survivor_normed.unsqueeze(0))[0]
+        # Extract per-file survivors and auto_reproduce each (variable survivor count)
+        all_survivors = []
+        for f in range(all_f_emb.shape[0]):
+            surv = content_normed[f][all_s_mask[f]]
+            all_survivors.append(compressor.auto_reproduce(surv.unsqueeze(0))[0])
+        if all_survivors:
+            return torch.cat(all_survivors, dim=0)
+        return torch.zeros(
+            1, compressor.hidden_dim, device=all_f_emb.device, dtype=all_f_emb.dtype,
+        )
 
-    def _compress_single_l0_l1(
+    def _compress_l0_batched(
         self,
         file_ids: torch.Tensor,
         file_masks: torch.Tensor,
@@ -531,53 +554,95 @@ class CommitEncodingTrainer(BaseTrainer):
         prompt_mask: torch.Tensor,
         bgkit_embed: torch.nn.Module,
     ) -> torch.Tensor:
-        """Run L0 per-file + collect survivors for one sample -> (total_surv, D).
+        """Batched L0 per-file compression for one sample -> (total_surv, D).
 
-        Uses activation checkpointing per file to limit encoder memory to one
-        file at a time. Side effects (calibrator score buffering) happen outside
-        the checkpointed region.
+        Embeds all files at once, scores each individually (ICE has side
+        effects), then runs a single batched compressor forward with selective
+        activation checkpointing based on total token count.
         """
         from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
         compressor = self.encoder.compressor
-        sample_survivors = []
+
+        # 1. Embed all files at once
+        all_f_emb = bgkit_embed(file_ids[:n_files])          # (n_files, max_seq, D)
+        all_f_mask = file_masks[:n_files]                     # (n_files, max_seq)
+
+        # 2. Score each file individually (ICE scoring has side effects —
+        #    calibrator score buffering, stochastic ratio sampling — must stay per-file)
+        all_s_mask = torch.zeros_like(all_f_mask, dtype=torch.bool)
         for f in range(n_files):
-            f_ids = file_ids[f].unsqueeze(0)
-            f_mask = file_masks[f].unsqueeze(0)
-            f_emb = bgkit_embed(f_ids)
-
-            # INVARIANT: _score_and_select MUST stay outside the checkpoint
-            # boundary — it appends to _pending_l0_scores (side effect that
-            # would be doubled by checkpoint recomputation on backward).
-            s_mask = self._score_and_select(f_emb, f_mask)
-
-            # Pure encoder forward INSIDE checkpoint (recomputed on backward).
-            # All inputs are deterministic (s_mask pre-computed above).
-            survivor_input_space = torch_checkpoint(
-                self._compress_single_file_pure,
-                compressor, f_emb, s_mask, f_mask,
-                prompt_emb, prompt_mask,
-                use_reentrant=False,
+            all_s_mask[f:f + 1] = self._score_and_select(
+                all_f_emb[f:f + 1], all_f_mask[f:f + 1],
             )
-            sample_survivors.append(survivor_input_space)
 
-        if sample_survivors:
-            return torch.cat(sample_survivors, dim=0)
-        return torch.zeros(
-            1, compressor.hidden_dim,
-            device=self.device, dtype=torch.bfloat16,
-        )
+        # 3. Sort files by token count (descending) to reduce padding waste in attention
+        token_counts = all_f_mask.sum(dim=1)  # (n_files,)
+        sorted_indices = token_counts.argsort(descending=True)
+        all_f_emb = all_f_emb[sorted_indices]
+        all_f_mask = all_f_mask[sorted_indices]
+        all_s_mask = all_s_mask[sorted_indices]
+
+        # 4. Sub-batch files to bound peak memory. Full attention layers have
+        #    O(n^2) memory in sequence length; batching all files at once for
+        #    large repos would exhaust unified memory. Process in groups of
+        #    max_files_per_sub with checkpointing per sub-batch.
+        max_files_per_sub = 8
+        checkpoint_threshold = 4096
+        all_survivors = []
+
+        for start in range(0, n_files, max_files_per_sub):
+            end = min(start + max_files_per_sub, n_files)
+            sub_emb = all_f_emb[start:end]
+            sub_f_mask = all_f_mask[start:end]
+            sub_s_mask = all_s_mask[start:end]
+            sub_size = end - start
+            sub_prompt_emb = prompt_emb.expand(sub_size, -1, -1)
+            sub_prompt_mask = prompt_mask.expand(sub_size, -1)
+
+            sub_tokens = sub_f_mask.sum().item()
+            if sub_tokens > checkpoint_threshold:
+                sub_surv = torch_checkpoint(
+                    self._compress_files_batched_pure,
+                    compressor, sub_emb, sub_s_mask, sub_f_mask,
+                    sub_prompt_emb, sub_prompt_mask,
+                    use_reentrant=False,
+                )
+            else:
+                sub_surv = self._compress_files_batched_pure(
+                    compressor, sub_emb, sub_s_mask, sub_f_mask,
+                    sub_prompt_emb, sub_prompt_mask,
+                )
+            all_survivors.append(sub_surv)
+
+        if all_survivors:
+            all_surv = torch.cat(all_survivors, dim=0)
+        else:
+            return torch.zeros(
+                1, compressor.hidden_dim,
+                device=self.device, dtype=torch.bfloat16,
+            )
+
+        if all_surv.shape[0] == 0:
+            return torch.zeros(
+                1, compressor.hidden_dim,
+                device=self.device, dtype=torch.bfloat16,
+            )
+        return all_surv
 
     # ------------------------------------------------------------------
     # Forward/backward
     # ------------------------------------------------------------------
 
     def _forward_backward(self, batch: dict) -> dict[str, float]:
-        """Per-sample forward + backward for memory-efficient gradient accumulation.
+        """Grouped micro-batch forward + backward for efficient gradient accumulation.
 
-        Processes each sample's L0→L1→decoder pipeline independently, calling
-        .backward() after each to free the autograd graph immediately. Peak
-        memory is proportional to the single largest sample, not the batch sum.
+        Two-phase pipeline:
+        1. L0 per-file compression per sample (fast, ~3% of step time)
+        2. Group samples by L0 survivor count, batch L1 encoder + decoder + backward
+
+        Grouping amortizes backward through the 24-layer decoder + 14-layer encoder
+        across multiple samples, replacing batch=1 matmuls with batch=group_size.
         """
         self.encoder.train()
         self.decoder.train()
@@ -595,67 +660,188 @@ class CommitEncodingTrainer(BaseTrainer):
 
         batch_size = file_ids.size(0)
         bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
-        scale = 1.0 / (batch_size * self._accum_steps)
+        hidden_dim = self.encoder.compressor.hidden_dim
+        group_size = 4  # micro-batch size for L1+decoder
 
         total_loss = 0.0
         total_survivors = 0
         total_valid = 0
 
+        # Profiling accumulators
+        if self._profile_enabled:
+            prof_l0 = 0.0
+            prof_l1 = 0.0
+            prof_dec = 0.0  # decoder + backward combined
+
+        # --- Phase 1: L0 compression per sample (fast, ~3% of step time) ---
+        l0_data = []  # list of (l0_surv, prompt_emb, sample_idx)
         for b in range(batch_size):
-            n_files = int(file_count[b].item())
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
+                n_files = int(file_count[b].item())
+                prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
 
-            # Recompute prompt_emb per sample — .backward() frees the autograd
-            # graph, so a shared prompt_emb would crash on the second sample.
-            prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
+                if self._profile_enabled:
+                    ev_l0_start = torch.cuda.Event(enable_timing=True)
+                    ev_l0_end = torch.cuda.Event(enable_timing=True)
+                    ev_l0_start.record()
 
-            # L0 per-file (checkpointed)
-            l0_surv = self._compress_single_l0_l1(
-                file_ids[b], file_masks[b], n_files,
-                prompt_emb_b, prompt_mask[b:b + 1],
-                bgkit_embed,
-            )
-
-            # L1 for this sample only
-            l1_input = l0_surv.unsqueeze(0)
-            l1_mask = torch.ones(
-                1, l0_surv.size(0), dtype=torch.bool, device=self.device,
-            )
-            l1_survivor_mask = self._score_and_select(l1_input, l1_mask, level="l1")
-
-            l1_out = self.encoder(
-                input_embeddings=l1_input,
-                survivor_mask=l1_survivor_mask,
-                attention_mask=l1_mask,
-                prompt_embeddings=prompt_emb_b,
-                prompt_attention_mask=prompt_mask[b:b + 1],
-            )
-
-            sample_survivors = l1_out.survivor_embeddings
-            sample_surv_mask = l1_out.survivor_attention_mask
-
-            sample_loss_mask = loss_mask_batch[b:b + 1] if loss_mask_batch is not None else None
-
-            # Decoder for this sample only
-            with torch.autocast(
-                "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
-            ):
-                loss = self.decoder.forward_with_loss(
-                    survivor_embeddings=sample_survivors,
-                    target_ids=target_ids[b:b + 1],
-                    target_attention_mask=target_mask[b:b + 1],
-                    survivor_attention_mask=sample_surv_mask,
-                    loss_mask=sample_loss_mask,
+                # L0 per-file (batched with selective checkpointing)
+                l0_surv = self._compress_l0_batched(
+                    file_ids[b], file_masks[b], n_files,
+                    prompt_emb_b, prompt_mask[b:b + 1],
+                    bgkit_embed,
                 )
 
-            # Backward immediately — frees this sample's autograd graph
-            (loss * scale).backward()
+                if self._profile_enabled:
+                    ev_l0_end.record()
+                    torch.cuda.synchronize()
+                    prof_l0 += ev_l0_start.elapsed_time(ev_l0_end)
 
-            total_loss += loss.item()
-            total_survivors += int(sample_surv_mask.sum().item())
             total_valid += int(file_masks[b].sum().item())
+            l0_data.append((l0_surv, prompt_emb_b, b))
+
+        # --- Phase 2: Group L1 + decoder + backward ---
+        # Sort by survivor count for efficient padding within groups
+        l0_data.sort(key=lambda x: x[0].size(0))
+
+        for g_start in range(0, batch_size, group_size):
+            g_end = min(g_start + group_size, batch_size)
+            group = l0_data[g_start:g_end]
+            g_size = len(group)
+
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
+                if self._profile_enabled:
+                    ev_l1_start = torch.cuda.Event(enable_timing=True)
+                    ev_l1_end = torch.cuda.Event(enable_timing=True)
+                    ev_l1_start.record()
+
+                # Check padding ratio to decide batched vs per-sample
+                surv_counts = [s.size(0) for s, _, _ in group]
+                min_sc = min(surv_counts)
+                max_sc = max(surv_counts)
+                batch_group = g_size > 1 and (min_sc == 0 or max_sc <= 2 * min_sc)
+
+                if batch_group:
+                    # Pad L0 survivors to max in group
+                    l1_input = torch.zeros(
+                        g_size, max_sc, hidden_dim,
+                        device=self.device, dtype=torch.bfloat16,
+                    )
+                    l1_mask = torch.zeros(
+                        g_size, max_sc, dtype=torch.bool, device=self.device,
+                    )
+                    for j, (surv, _, _) in enumerate(group):
+                        sc = surv.size(0)
+                        l1_input[j, :sc] = surv
+                        l1_mask[j, :sc] = True
+
+                    # L1 scoring (per-sample — calibrator side effects)
+                    l1_survivor_mask = torch.zeros_like(l1_mask)
+                    for j in range(g_size):
+                        l1_survivor_mask[j:j + 1] = self._score_and_select(
+                            l1_input[j:j + 1], l1_mask[j:j + 1], level="l1",
+                        )
+
+                    # Batched L1 encoder + decoder forward
+                    prompt_embs = torch.cat([p for _, p, _ in group], dim=0)
+                    prompt_masks = torch.cat(
+                        [prompt_mask[b:b + 1] for _, _, b in group], dim=0,
+                    )
+                    l1_out = self.encoder(
+                        input_embeddings=l1_input,
+                        survivor_mask=l1_survivor_mask,
+                        attention_mask=l1_mask,
+                        prompt_embeddings=prompt_embs,
+                        prompt_attention_mask=prompt_masks,
+                    )
+
+                    if self._profile_enabled:
+                        ev_l1_end.record()
+                        ev_dec_start = torch.cuda.Event(enable_timing=True)
+                        ev_dec_end = torch.cuda.Event(enable_timing=True)
+                        ev_dec_start.record()
+
+                    group_indices = [b for _, _, b in group]
+                    group_target_ids = target_ids[group_indices]
+                    group_target_mask = target_mask[group_indices]
+                    group_loss_mask = None
+                    if loss_mask_batch is not None:
+                        group_loss_mask = loss_mask_batch[group_indices]
+
+                    loss = self.decoder.forward_with_loss(
+                        survivor_embeddings=l1_out.survivor_embeddings,
+                        target_ids=group_target_ids,
+                        target_attention_mask=group_target_mask,
+                        survivor_attention_mask=l1_out.survivor_attention_mask,
+                        loss_mask=group_loss_mask,
+                    )
+                    group_scale = g_size / (batch_size * self._accum_steps)
+                    (loss * group_scale).backward()
+
+                    total_loss += loss.item() * g_size
+                    total_survivors += int(
+                        l1_out.survivor_attention_mask.sum().item()
+                    )
+                else:
+                    # Per-sample fallback: high padding ratio
+                    if self._profile_enabled:
+                        ev_l1_end.record()
+                        ev_dec_start = torch.cuda.Event(enable_timing=True)
+                        ev_dec_end = torch.cuda.Event(enable_timing=True)
+                        ev_dec_start.record()
+
+                    scale = 1.0 / (batch_size * self._accum_steps)
+                    for surv, p_emb, b_idx in group:
+                        l1_in = surv.unsqueeze(0)
+                        l1_m = torch.ones(
+                            1, surv.size(0), dtype=torch.bool,
+                            device=self.device,
+                        )
+                        l1_sm = self._score_and_select(l1_in, l1_m, level="l1")
+                        l1_o = self.encoder(
+                            input_embeddings=l1_in,
+                            survivor_mask=l1_sm,
+                            attention_mask=l1_m,
+                            prompt_embeddings=p_emb,
+                            prompt_attention_mask=prompt_mask[b_idx:b_idx + 1],
+                        )
+                        s_lm = (
+                            loss_mask_batch[b_idx:b_idx + 1]
+                            if loss_mask_batch is not None else None
+                        )
+                        loss = self.decoder.forward_with_loss(
+                            survivor_embeddings=l1_o.survivor_embeddings,
+                            target_ids=target_ids[b_idx:b_idx + 1],
+                            target_attention_mask=target_mask[b_idx:b_idx + 1],
+                            survivor_attention_mask=l1_o.survivor_attention_mask,
+                            loss_mask=s_lm,
+                        )
+                        (loss * scale).backward()
+                        total_loss += loss.item()
+                        total_survivors += int(
+                            l1_o.survivor_attention_mask.sum().item()
+                        )
+
+                if self._profile_enabled:
+                    ev_dec_end.record()
+                    torch.cuda.synchronize()
+                    prof_l1 += ev_l1_start.elapsed_time(ev_l1_end)
+                    prof_dec += ev_dec_start.elapsed_time(ev_dec_end)
 
         # Flush calibrator scores (once per micro-batch)
         self._flush_calibrator_scores()
+
+        if self._profile_enabled:
+            prof_total = prof_l0 + prof_l1 + prof_dec
+            logger.info(
+                "[PROFILE]",
+                step=self.global_step,
+                l0=f"{prof_l0:.0f}ms",
+                l1=f"{prof_l1:.0f}ms",
+                dec_bwd=f"{prof_dec:.0f}ms",
+                total=f"{prof_total:.0f}ms",
+                batch_size=batch_size,
+            )
 
         target_ratio = self._current_target_ratio()
         actual_ratio = total_survivors / max(total_valid, 1)
@@ -691,6 +877,8 @@ class CommitEncodingTrainer(BaseTrainer):
         self.decoder.eval()
         self._is_evaluating = True
 
+        group_size = 4  # micro-batch size for L1+decoder (same as training)
+
         try:
             total_loss = 0.0
             total_tokens = 0.0
@@ -713,57 +901,113 @@ class CommitEncodingTrainer(BaseTrainer):
 
                 batch_size = file_ids.size(0)
                 bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+                hidden_dim = self.encoder.compressor.hidden_dim
 
+                # --- Phase 1: L0 compression per sample ---
+                l0_data = []  # (l0_surv, prompt_emb, sample_idx)
                 for b in range(batch_size):
-                    n_files = int(file_count[b].item())
-                    prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
+                    with torch.autocast(
+                        "cuda", dtype=torch.bfloat16,
+                        enabled=self.device.type == "cuda",
+                    ):
+                        n_files = int(file_count[b].item())
+                        prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
 
-                    l0_surv = self._compress_single_l0_l1(
-                        file_ids[b], file_masks[b], n_files,
-                        prompt_emb_b, prompt_mask[b:b + 1],
-                        bgkit_embed,
-                    )
+                        l0_surv = self._compress_l0_batched(
+                            file_ids[b], file_masks[b], n_files,
+                            prompt_emb_b, prompt_mask[b:b + 1],
+                            bgkit_embed,
+                        )
 
-                    l1_input = l0_surv.unsqueeze(0)
-                    l1_mask = torch.ones(
-                        1, l0_surv.size(0), dtype=torch.bool, device=self.device,
-                    )
-                    l1_survivor_mask = self._score_and_select(
-                        l1_input, l1_mask, level="l1",
-                    )
+                    l0_data.append((l0_surv, prompt_emb_b, b))
 
-                    l1_out = self.encoder(
-                        input_embeddings=l1_input,
-                        survivor_mask=l1_survivor_mask,
-                        attention_mask=l1_mask,
-                        prompt_embeddings=prompt_emb_b,
-                        prompt_attention_mask=prompt_mask[b:b + 1],
-                    )
+                # --- Phase 2: Group L1 + decoder (no backward) ---
+                # Sort by survivor count for efficient padding
+                l0_data.sort(key=lambda x: x[0].size(0))
 
-                    sample_loss_mask = (
-                        loss_mask_batch[b:b + 1] if loss_mask_batch is not None else None
-                    )
+                for g_start in range(0, batch_size, group_size):
+                    g_end = min(g_start + group_size, batch_size)
+                    group = l0_data[g_start:g_end]
+                    g_size = len(group)
 
                     with torch.autocast(
                         "cuda", dtype=torch.bfloat16,
                         enabled=self.device.type == "cuda",
                     ):
-                        loss = self.decoder.forward_with_loss(
-                            survivor_embeddings=l1_out.survivor_embeddings,
-                            target_ids=target_ids[b:b + 1],
-                            target_attention_mask=target_mask[b:b + 1],
-                            survivor_attention_mask=l1_out.survivor_attention_mask,
-                            loss_mask=sample_loss_mask,
+                        # Pad L0 survivors to max in group
+                        max_surv = max(s.size(0) for s, _, _ in group)
+                        l1_input = torch.zeros(
+                            g_size, max_surv, hidden_dim,
+                            device=self.device, dtype=torch.bfloat16,
+                        )
+                        l1_mask = torch.zeros(
+                            g_size, max_surv, dtype=torch.bool, device=self.device,
+                        )
+                        for j, (surv, _, _) in enumerate(group):
+                            sc = surv.size(0)
+                            l1_input[j, :sc] = surv
+                            l1_mask[j, :sc] = True
+
+                        # L1 scoring (per-sample — calibrator side effects)
+                        l1_survivor_mask = torch.zeros_like(l1_mask)
+                        for j in range(g_size):
+                            l1_survivor_mask[j:j + 1] = self._score_and_select(
+                                l1_input[j:j + 1], l1_mask[j:j + 1], level="l1",
+                            )
+
+                        # Batched L1 encoder forward
+                        prompt_embs = torch.cat([p for _, p, _ in group], dim=0)
+                        prompt_masks = torch.cat(
+                            [prompt_mask[b:b + 1] for _, _, b in group], dim=0,
                         )
 
-                    # Token-weighted accumulation for comparable perplexity
-                    eval_loss_mask = batch.get("target_loss_mask")
-                    if eval_loss_mask is not None:
-                        sample_tokens = eval_loss_mask[b, 1:].sum().item()
-                    else:
-                        sample_tokens = batch["target_attention_mask"][b, 1:].sum().item()
-                    total_loss += loss.item() * sample_tokens
-                    total_tokens += sample_tokens
+                        l1_out = self.encoder(
+                            input_embeddings=l1_input,
+                            survivor_mask=l1_survivor_mask,
+                            attention_mask=l1_mask,
+                            prompt_embeddings=prompt_embs,
+                            prompt_attention_mask=prompt_masks,
+                        )
+
+                        # Batched decoder forward
+                        group_indices = [b for _, _, b in group]
+                        group_target_ids = target_ids[group_indices]
+                        group_target_mask = target_mask[group_indices]
+                        group_loss_mask = None
+                        if loss_mask_batch is not None:
+                            group_loss_mask = loss_mask_batch[group_indices]
+
+                        loss = self.decoder.forward_with_loss(
+                            survivor_embeddings=l1_out.survivor_embeddings,
+                            target_ids=group_target_ids,
+                            target_attention_mask=group_target_mask,
+                            survivor_attention_mask=l1_out.survivor_attention_mask,
+                            loss_mask=group_loss_mask,
+                        )
+
+                        # Token-weighted accumulation for comparable perplexity
+                        eval_loss_mask = batch.get("target_loss_mask")
+                        for _, _, b in group:
+                            if eval_loss_mask is not None:
+                                sample_tokens = eval_loss_mask[b, 1:].sum().item()
+                            else:
+                                sample_tokens = (
+                                    batch["target_attention_mask"][b, 1:].sum().item()
+                                )
+                            total_tokens += sample_tokens
+                        # Loss from forward_with_loss is token-averaged across group;
+                        # weight by total group tokens for proper aggregation
+                        if eval_loss_mask is not None:
+                            group_tokens = sum(
+                                eval_loss_mask[b, 1:].sum().item()
+                                for _, _, b in group
+                            )
+                        else:
+                            group_tokens = sum(
+                                batch["target_attention_mask"][b, 1:].sum().item()
+                                for _, _, b in group
+                            )
+                        total_loss += loss.item() * group_tokens
 
             avg_loss = total_loss / max(total_tokens, 1)
             perplexity = torch.exp(torch.tensor(avg_loss)).item()
