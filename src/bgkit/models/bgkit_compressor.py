@@ -30,6 +30,7 @@ class CompressorOutput:
     normed_embeddings: torch.Tensor  # (B, L_full, D) after compressor norm (for auto-repro)
     attention_mask: torch.Tensor | None  # (B, L_full) mask for full sequence
     content_slice: slice  # slice(prefix_len, None) -- where content starts in L_full
+    intermediates: list[torch.Tensor] | None = None  # block boundary hidden states
 
 
 @dataclass
@@ -86,6 +87,7 @@ class BgKITCompressor(nn.Module):
         attention_mask: torch.Tensor | None = None,
         prompt_embeddings: torch.Tensor | None = None,
         prompt_attention_mask: torch.Tensor | None = None,
+        return_intermediates: bool = False,
     ) -> CompressorOutput:
         """Run the compressor (layers 0..N-2) and return dense output.
 
@@ -156,18 +158,23 @@ class BgKITCompressor(nn.Module):
             content_slice = slice(0, None)
 
         # Forward through backbone (returns un-normed states since backbone.norm = Identity)
-        raw_out = self.backbone(
-            inputs_embeds=x, attention_mask=combined_mask,
-        ).last_hidden_state
+        backbone_kwargs = {"inputs_embeds": x, "attention_mask": combined_mask}
+        if return_intermediates:
+            backbone_kwargs["return_intermediates"] = True
+        backbone_out = self.backbone(**backbone_kwargs)
+        raw_out = backbone_out.last_hidden_state
 
         # Apply compressor norm for auto-reproduction
         normed_out = self.norm(raw_out)
+
+        intermediates = backbone_out.hidden_states if return_intermediates else None
 
         return CompressorOutput(
             raw_embeddings=raw_out,
             normed_embeddings=normed_out,
             attention_mask=combined_mask,
             content_slice=content_slice,
+            intermediates=intermediates,
         )
 
     def auto_reproduce(self, embeddings: torch.Tensor) -> torch.Tensor:

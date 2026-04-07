@@ -175,6 +175,7 @@ class BidirectionalQwen35(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        return_intermediates: bool = False,
     ) -> BaseModelOutputWithPast:
         """Run forward pass with bidirectional full attention.
 
@@ -186,9 +187,13 @@ class BidirectionalQwen35(nn.Module):
             attention_mask: (B, L) padding mask (1=real, 0=pad). Used as
                 bidirectional (non-causal) mask for full attention layers.
                 DeltaNet layers ignore this (causal recurrent state).
+            return_intermediates: If True, collect hidden states after each
+                FullAttn layer (indices 3,7,11,15,19) and after the final
+                layer (index 22). Returned in hidden_states field.
 
         Returns:
-            BaseModelOutputWithPast with last_hidden_state.
+            BaseModelOutputWithPast with last_hidden_state (and hidden_states
+            if return_intermediates=True).
         """
         hidden = inputs_embeds
         seq_len = hidden.shape[1]
@@ -242,7 +247,10 @@ class BidirectionalQwen35(nn.Module):
             out = layer(h, pos_emb, attention_mask=mask)
             return out[0] if isinstance(out, tuple) else out
 
-        for layer in self.layers:
+        intermediates = [] if return_intermediates else None
+        num_layers = len(self.layers)
+
+        for i, layer in enumerate(self.layers):
             if self._is_deltanet_layer(layer):
                 # DeltaNet: causal (no mask), O(L) via recurrent state
                 hidden = _run_layer(layer, hidden, None, position_embeddings)
@@ -250,5 +258,13 @@ class BidirectionalQwen35(nn.Module):
                 # Full attention: blended causal→bidirectional mask
                 hidden = _run_layer(layer, hidden, full_attn_mask, position_embeddings)
 
+            if return_intermediates and (
+                not self._is_deltanet_layer(layer) or i == num_layers - 1
+            ):
+                intermediates.append(hidden)
+
         hidden = self.norm(hidden)
-        return BaseModelOutputWithPast(last_hidden_state=hidden)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden,
+            hidden_states=intermediates,
+        )

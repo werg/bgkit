@@ -76,8 +76,18 @@ def main(cfg: DictConfig) -> None:
     # Load models
     bgkit_cfg = cfg.model.bgkit
     hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
-    encoder = BgKITEncoder.from_pretrained(
+
+    # Load checkpoint first — encoder architecture is auto-detected from keys
+    _, state_dicts = load_checkpoint(Path(checkpoint_path))
+
+    if "encoder" not in state_dicts:
+        raise ValueError(
+            f"Checkpoint missing 'encoder' key: {checkpoint_path}. "
+            f"Found keys: {list(state_dicts.keys())}"
+        )
+    encoder = BgKITEncoder.from_pretrained_with_state_dict(
         bgkit_cfg.backbone_name,
+        state_dicts["encoder"],
         hidden_dim=hidden_dim,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
@@ -99,13 +109,6 @@ def main(cfg: DictConfig) -> None:
     decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
     decoder.to(device)
     decoder.eval()
-
-    # Load checkpoint weights
-    _, state_dicts = load_checkpoint(Path(checkpoint_path))
-    if "encoder" in state_dicts:
-        encoder.load_state_dict(state_dicts["encoder"])
-    elif "bgkit_model" in state_dicts:
-        encoder.compressor.load_state_dict(state_dicts["bgkit_model"], strict=False)
     decoder.load_state_dict(state_dicts["decoder"])
 
     # Tokenizer

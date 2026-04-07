@@ -243,7 +243,7 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 ### 5.8 Target LLM Brittleness
 
-**Risk:** The entire projection pipeline is trained against a specific target LLM's embedding space. If that model's architecture or embedding space changes in the next release, everything from Phase 1 Step 3 onward needs retraining.
+**Risk:** The entire projection pipeline is trained against a specific target LLM's embedding space. If that model's architecture or embedding space changes in the next release, everything from the projection alignment step onward needs retraining.
 
 **Mitigation:** Using Qwen3.5-35B as the target — the same model family as our encoder and decoder — reduces architectural mismatch and simplifies the projection block's task. Multi-target projection (Section 1.1) helps the compressor's internal representations stay target-agnostic. But in v1, this risk is accepted. The key question is whether the compressor's output space is stable enough that adapting to a new target requires only a fresh projection block (cheap, with block-diagonal warm-start from the v1 block) rather than full Phase 2 retraining (expensive). The Qwen3.5 model ladder (0.8B/2B/4B/9B/35B) offers a natural progression for testing this.
 

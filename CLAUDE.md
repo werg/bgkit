@@ -100,11 +100,14 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 
 | Dependency | Config Key | Source Phase | Target Phase | Metric |
 |---|---|---|---|---|
-| ICE → Step 2 | `training.ice.checkpoint_path` | `ice` | `phase1_step2` | `eval/mse` |
+| ICE → Step 5 | `training.ice.checkpoint_path` | `ice` | `phase1_step5` | `eval/mse` |
 | Joint Block → Step 1 | `bgkit_checkpoint` | `joint_block_pretrain` | `phase1_step1` | `eval/mse_repro` |
 | Step 1 → Step 2 | `step1_checkpoint` | `phase1_step1` | `phase1_step2` | `eval/loss` |
+| Step 2 → Step 3 | `bgkit_checkpoint` | `phase1_step2` | `phase1_step3` | `eval/loss` |
+| Step 3 → Step 4 | `step1_checkpoint` | `phase1_step3` | `phase1_step4` | `eval/loss` |
+| Step 4 → Step 5 | `step1_checkpoint` | `phase1_step4` | `phase1_step5` | `eval/loss` |
 
-**Training phase pipeline**: ICE → Joint Block Pretrain → Step 1 (frozen encoder pretraining) → Step 2 (compression training) → Phase 2a (model ladder distillation) → Phase 2b (trajectory distillation) → Phase 2c (end-to-end injection with Qwen3.5-35B).
+**Training phase pipeline**: ICE → Joint Block Pretrain → Step 1 (frozen encoder pretraining) → Step 2 (DeltaNet pruning distillation) → Step 3 (pruned reconstruction with LoRA decoder) → Step 4 (commit encoding) → Step 5 (multi-objective compression) → Phase 2a (model ladder distillation) → Phase 2b (trajectory distillation) → Phase 2c (end-to-end injection with Qwen3.5-35B).
 
 | Task | Command |
 |---|---|

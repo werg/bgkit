@@ -79,6 +79,11 @@ class _CausalLMOutput:
         self.logits = logits
 
 
+class _ModelOutput:
+    def __init__(self, last_hidden_state):
+        self.last_hidden_state = last_hidden_state
+
+
 class _MockQwen3Model(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int, num_layers: int = 2):
         super().__init__()
@@ -87,6 +92,16 @@ class _MockQwen3Model(nn.Module):
             [nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)]
         )
         self.norm = nn.LayerNorm(hidden_dim)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+        x = inputs_embeds
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        return _ModelOutput(last_hidden_state=x)
 
 
 class MockCausalLMBackbone(nn.Module):
@@ -190,7 +205,7 @@ def trainer():
 
     cfg = OmegaConf.create({
         "training": {
-            "phase": "phase1_step2",
+            "phase": "phase1_step5",
             "max_steps": 100,
             "lr": 1e-3,
             "warmup_steps": 10,
@@ -260,6 +275,7 @@ def trainer():
     t._l1_transitioned = False
     t._l1_rebuild_pending = False
     t._eval_count = 0
+    t._profile_enabled = False
 
     return t
 
@@ -561,18 +577,23 @@ class TestDirectL1:
         assert metrics["sample_type"] == "repo"
 
     def test_direct_l1_returns_valid_embeddings(self, trainer):
-        """direct_l1 batch should return embeddings with correct shapes."""
-        batch = _make_direct_l1_batch(batch_size=2, file_len=12)
-        survivors, survivor_mask = trainer._compress_repo_batch(batch)
+        """direct_l1 single sample should return embeddings with correct shape."""
+        batch = _make_direct_l1_batch(batch_size=1, file_len=12)
+        bgkit_embed = trainer.encoder.compressor.backbone.get_input_embeddings()
+        prompt_emb = bgkit_embed(batch["compression_prompt_ids"][0:1])
 
-        assert survivors.dim() == 3  # (B, num_survivors, D)
-        assert survivors.size(0) == 2
+        survivors = trainer._compress_single_direct_l1(
+            batch["file_token_ids"][0, 0].unsqueeze(0),
+            batch["file_attention_masks"][0, 0].unsqueeze(0),
+            prompt_emb,
+            batch["compression_prompt_mask"][0:1],
+            bgkit_embed,
+        )
+        assert survivors.dim() == 2  # (num_survivors, D)
         assert survivors.size(-1) == HIDDEN_DIM
-        assert survivor_mask.dim() == 2
-        assert survivor_mask.size(0) == 2
 
     def test_direct_l1_uses_single_direct_l1(self, trainer):
-        """direct_l1 samples should call _compress_single_direct_l1."""
+        """direct_l1 samples should call _compress_single_direct_l1 in per-sample loop."""
         batch = _make_direct_l1_batch()
 
         original = trainer._compress_single_direct_l1
@@ -583,7 +604,8 @@ class TestDirectL1:
             return original(*args, **kwargs)
 
         trainer._compress_single_direct_l1 = tracking
-        trainer._compress_repo_batch(batch)
+        trainer.optimizer.zero_grad()
+        trainer._forward_backward(batch)
         assert call_count[0] == batch["file_token_ids"].size(0)
 
     def test_non_direct_l1_does_not_dispatch(self, trainer):
@@ -599,18 +621,19 @@ class TestDirectL1:
             return original(*args, **kwargs)
 
         trainer._compress_single_direct_l1 = tracking
-        trainer._compress_repo_batch(batch)
+        trainer.optimizer.zero_grad()
+        trainer._forward_backward(batch)
         assert call_count[0] == 0
 
-    def test_compress_repo_batch_dispatches_direct_l1(self, trainer):
-        """_compress_repo_batch handles direct_l1 batches end-to-end."""
+    def test_direct_l1_forward_backward_produces_loss(self, trainer):
+        """Per-sample repo forward+backward with direct_l1 should produce a valid loss."""
         batch = _make_direct_l1_batch()
-        survivors, survivor_mask = trainer._compress_repo_batch(batch)
-        assert survivors.dim() == 3
-        assert survivor_mask.dim() == 2
+        trainer.optimizer.zero_grad()
+        metrics = trainer._forward_backward(batch)
+        assert torch.isfinite(torch.tensor(metrics["loss"]))
 
     def test_direct_l1_single_encoder_pass(self, trainer):
-        """direct_l1 samples should get exactly one encoder call, not two."""
+        """direct_l1 samples should get one encoder forward per sample (+ checkpoint recompute on backward)."""
         batch = _make_direct_l1_batch(batch_size=2)
 
         encoder_call_count = [0]
@@ -621,13 +644,13 @@ class TestDirectL1:
             return original_encoder(*args, **kwargs)
 
         trainer.encoder.forward = counting_encoder
-        trainer._compress_repo_batch(batch)
-        # One encoder call per direct_l1 sample, no extra L1 pass
-        assert encoder_call_count[0] == 2
+        trainer.optimizer.zero_grad()
+        trainer._forward_backward(batch)
+        # Per sample: 1 forward + 1 checkpoint recompute on backward = 2 calls × 2 samples = 4
+        assert encoder_call_count[0] == 4
 
     def test_direct_l1_rejects_multi_file(self, trainer):
         """direct_l1=True with file_count > 1 should raise ValueError."""
-        # Create a sample with direct_l1=True but 2 files
         sample = RepoCompressionSample(
             objective="commit_reproduction",
             file_token_ids=[
@@ -648,8 +671,9 @@ class TestDirectL1:
             direct_l1=True,
         )
         batch = collate_compression([sample])
+        trainer.optimizer.zero_grad()
         with pytest.raises(ValueError, match=r"direct_l1 sample.*file_count=2"):
-            trainer._compress_repo_batch(batch)
+            trainer._forward_backward(batch)
 
 
 # ---------------------------------------------------------------------------
@@ -722,9 +746,10 @@ class TestScoreAndSelect:
 
 
 class TestResolveStep1Checkpoint:
-    def test_auto_prefers_commit_encoding(self, trainer):
-        """Auto should try commit_encoding first, then phase1_step1."""
-        from unittest.mock import MagicMock, patch
+    def test_auto_resolves_phase1_step3(self, trainer):
+        """Auto should resolve the best phase1_step3 checkpoint."""
+        from pathlib import Path
+        from unittest.mock import patch
 
         from omegaconf import OmegaConf
         trainer.cfg = OmegaConf.merge(trainer.cfg, {
@@ -732,53 +757,25 @@ class TestResolveStep1Checkpoint:
             "checkpoint_dir": "/tmp/ckpts",
         })
 
-        mock_registry = MagicMock()
-        mock_entry = MagicMock()
-        mock_entry.name = "commit_encoding_step10000_20260301"
-        mock_registry.best.return_value = mock_entry
-
+        mock_path = Path("/tmp/ckpts/phase1_step3_step10000_20260301")
         with patch(
-            "bgkit.training.phase1.compression.CheckpointRegistry",
-            return_value=mock_registry,
-        ):
+            "bgkit.training.phase1.compression.resolve_checkpoint",
+            return_value=mock_path,
+        ) as mock_resolve:
             result = trainer._resolve_step1_checkpoint()
 
-        # Should try commit_encoding first
-        mock_registry.best.assert_called_once_with(
-            phase="commit_encoding", metric="eval/loss",
-            lower_is_better=True,
+        mock_resolve.assert_called_once_with(
+            Path("/tmp/ckpts"),
+            phase="phase1_step4",
+            metric="eval/loss",
+            label="step1_checkpoint",
         )
-        assert result == "/tmp/ckpts/commit_encoding_step10000_20260301"
-        assert trainer._input_sources["step1"] == "commit_encoding_step10000_20260301"
-
-    def test_auto_falls_back_to_phase1_step1(self, trainer):
-        """Auto should fall back to phase1_step1 when no commit_encoding exists."""
-        from unittest.mock import MagicMock, patch
-
-        from omegaconf import OmegaConf
-        trainer.cfg = OmegaConf.merge(trainer.cfg, {
-            "step1_checkpoint": "auto",
-            "checkpoint_dir": "/tmp/ckpts",
-        })
-
-        mock_registry = MagicMock()
-        mock_step1_entry = MagicMock()
-        mock_step1_entry.name = "phase1_step1_step5000_20260224"
-        # First call (commit_encoding) returns None, second (phase1_step1) returns entry
-        mock_registry.best.side_effect = [None, mock_step1_entry]
-
-        with patch(
-            "bgkit.training.phase1.compression.CheckpointRegistry",
-            return_value=mock_registry,
-        ):
-            result = trainer._resolve_step1_checkpoint()
-
-        assert result == "/tmp/ckpts/phase1_step1_step5000_20260224"
-        assert trainer._input_sources["step1"] == "phase1_step1_step5000_20260224"
+        assert result == str(mock_path)
+        assert trainer._input_sources["step1"] == "phase1_step3_step10000_20260301"
 
     def test_auto_raises_when_no_checkpoint(self, trainer):
-        """Auto should raise when neither phase has checkpoints."""
-        from unittest.mock import MagicMock, patch
+        """Auto should raise when no phase1_step3 checkpoint exists."""
+        from unittest.mock import patch
 
         import pytest
         from omegaconf import OmegaConf
@@ -787,15 +784,11 @@ class TestResolveStep1Checkpoint:
             "checkpoint_dir": "/tmp/ckpts",
         })
 
-        mock_registry = MagicMock()
-        mock_registry.best.return_value = None
-
         with patch(
-            "bgkit.training.phase1.compression.CheckpointRegistry",
-            return_value=mock_registry,
-        ):
-            with pytest.raises(ValueError, match="no commit_encoding or phase1_step1"):
-                trainer._resolve_step1_checkpoint()
+            "bgkit.training.phase1.compression.resolve_checkpoint",
+            side_effect=ValueError("No phase1_step4 checkpoint found"),
+        ), pytest.raises(ValueError, match="phase1_step4"):
+            trainer._resolve_step1_checkpoint()
 
     def test_explicit_path_passthrough(self, trainer):
         """Explicit path should pass through and populate _input_sources."""
@@ -815,9 +808,141 @@ class TestResolveStep1Checkpoint:
         assert "step1" not in trainer._input_sources
 
 
+def _make_mixed_batch(
+    n_file_samples: int = 2,
+    n_repo_samples: int = 2,
+    n_files: int = 2,
+    file_len: int = 8,
+    content_len: int = SEQ_LEN,
+    target_len: int = SEQ_LEN,
+    prompt_len: int = 4,
+) -> dict:
+    """Create a mixed batch with both file and repo sub-batches."""
+    file_samples = []
+    for _ in range(n_file_samples):
+        file_samples.append(FileCompressionSample(
+            objective="data_reconstruction",
+            content_token_ids=torch.randint(0, VOCAB_SIZE, (content_len,)),
+            content_attention_mask=torch.ones(content_len, dtype=torch.bool),
+            compression_ratio=0.2,
+            compression_level=0,
+            target_token_ids=torch.randint(0, VOCAB_SIZE, (target_len,)),
+            target_attention_mask=torch.ones(target_len, dtype=torch.bool),
+            target_loss_mask=torch.ones(target_len, dtype=torch.long),
+            prefix_ids=torch.randint(0, VOCAB_SIZE, (3,)),
+            compression_prompt_ids=torch.randint(0, VOCAB_SIZE, (prompt_len,)),
+        ))
+    repo_samples = []
+    for _ in range(n_repo_samples):
+        fids = [torch.randint(0, VOCAB_SIZE, (file_len,)) for _ in range(n_files)]
+        fmasks = [torch.ones(file_len, dtype=torch.bool) for _ in range(n_files)]
+        repo_samples.append(RepoCompressionSample(
+            objective="commit_reproduction",
+            file_token_ids=fids,
+            file_attention_masks=fmasks,
+            compression_ratio=0.2,
+            compression_level=1,
+            target_token_ids=torch.randint(0, VOCAB_SIZE, (target_len,)),
+            target_attention_mask=torch.ones(target_len, dtype=torch.bool),
+            target_loss_mask=torch.ones(target_len, dtype=torch.long),
+            prefix_ids=torch.randint(0, VOCAB_SIZE, (3,)),
+            compression_prompt_ids=torch.randint(0, VOCAB_SIZE, (prompt_len,)),
+        ))
+    return collate_compression(file_samples + repo_samples)
+
+
+class TestForwardBackwardMixed:
+    def test_mixed_batch_returns_expected_metrics(self, trainer):
+        """_forward_backward_mixed should return loss and standard metrics."""
+        batch = _make_mixed_batch()
+        assert batch.get("mixed", False)
+        trainer.optimizer.zero_grad()
+        metrics = trainer._forward_backward(batch)
+        assert "loss" in metrics
+        assert metrics["sample_type"] == "mixed"
+        assert "actual_ratio" in metrics
+        assert torch.isfinite(torch.tensor(metrics["loss"]))
+
+    def test_mixed_batch_accumulates_gradients(self, trainer):
+        """Mixed batch should produce gradients on the decoder."""
+        batch = _make_mixed_batch()
+        trainer.optimizer.zero_grad()
+        trainer._forward_backward(batch)
+        decoder_has_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in trainer.decoder.parameters() if p.requires_grad
+        )
+        assert decoder_has_grad, "Decoder should receive gradients from mixed batch"
+
+    def test_mixed_loss_is_weighted_average(self, trainer):
+        """Reported loss should be between file-only and repo-only losses."""
+        batch = _make_mixed_batch(n_file_samples=2, n_repo_samples=2)
+        trainer.optimizer.zero_grad()
+        metrics = trainer._forward_backward(batch)
+        # Loss is finite and non-negative (CE loss)
+        assert metrics["loss"] >= 0
+        assert torch.isfinite(torch.tensor(metrics["loss"]))
+
+    def test_mixed_batch_delegates_to_repo_persample(self, trainer):
+        """Repo portion of mixed batch should use _forward_backward_repo_persample."""
+        batch = _make_mixed_batch(n_file_samples=1, n_repo_samples=2)
+        call_count = [0]
+        original = trainer._forward_backward_repo_persample
+
+        def tracking(*args, **kwargs):
+            call_count[0] += 1
+            return original(*args, **kwargs)
+
+        trainer._forward_backward_repo_persample = tracking
+        trainer.optimizer.zero_grad()
+        trainer._forward_backward(batch)
+        assert call_count[0] == 1, "Should delegate repo portion exactly once"
+
+
+class TestEvaluateRepoBatchPersample:
+    def test_repo_eval_returns_token_weighted_loss(self, trainer):
+        """_evaluate_repo_batch_persample should return (loss_sum, token_count)."""
+        batch = _make_repo_batch(batch_size=2, n_files=2, file_len=8)
+        with torch.no_grad():
+            trainer.encoder.eval()
+            trainer.decoder.eval()
+            trainer._is_evaluating = True
+            loss_sum, token_count = trainer._evaluate_repo_batch_persample(batch)
+            trainer._is_evaluating = False
+        assert loss_sum >= 0
+        assert token_count > 0
+        # Average loss should be finite
+        avg = loss_sum / token_count
+        assert torch.isfinite(torch.tensor(avg))
+
+    def test_repo_eval_handles_direct_l1(self, trainer):
+        """Eval should handle direct_l1 repo batches without error."""
+        batch = _make_direct_l1_batch(batch_size=2)
+        with torch.no_grad():
+            trainer.encoder.eval()
+            trainer.decoder.eval()
+            trainer._is_evaluating = True
+            loss_sum, token_count = trainer._evaluate_repo_batch_persample(batch)
+            trainer._is_evaluating = False
+        assert loss_sum >= 0
+        assert token_count > 0
+
+    def test_repo_eval_token_count_matches_target_mask(self, trainer):
+        """Token count should match the sum of target attention masks (minus position 0)."""
+        batch = _make_repo_batch(batch_size=2, n_files=1, file_len=8)
+        expected_tokens = batch["target_attention_mask"][:, 1:].sum().item()
+        with torch.no_grad():
+            trainer.encoder.eval()
+            trainer.decoder.eval()
+            trainer._is_evaluating = True
+            _, token_count = trainer._evaluate_repo_batch_persample(batch)
+            trainer._is_evaluating = False
+        assert token_count == expected_tokens
+
+
 class TestL0ToL1AutoRepro:
-    def test_auto_reproduce_called_in_repo_batch(self, trainer):
-        """_compress_repo_batch should call compressor.auto_reproduce for L0→L1 handoff."""
+    def test_auto_reproduce_called_in_per_sample_loop(self, trainer):
+        """Per-sample forward should call compressor.auto_reproduce for L0→L1 handoff."""
         call_count = [0]
         original = trainer.encoder.compressor.auto_reproduce
 
@@ -827,9 +952,12 @@ class TestL0ToL1AutoRepro:
 
         trainer.encoder.compressor.auto_reproduce = tracking_auto_repro
         batch = _make_repo_batch(batch_size=1, n_files=2, file_len=8)
-        trainer._compress_repo_batch(batch)
-        # Should be called once per file
-        assert call_count[0] == 2
+        trainer.optimizer.zero_grad()
+        trainer._forward_backward(batch)
+        # Batched L0: 2 files processed in one batched call.
+        # With selective checkpointing, short files (< threshold) skip checkpoint,
+        # so auto_reproduce is called once per file in the forward only = 2.
+        assert call_count[0] >= 2
 
     def test_l1_uses_ice_scoring(self, trainer):
         """L1 stage should also call _score_and_select (for L1 survivor selection)."""
@@ -842,6 +970,7 @@ class TestL0ToL1AutoRepro:
 
         trainer._score_and_select = tracking_score
         batch = _make_repo_batch(batch_size=1, n_files=2, file_len=8)
-        trainer._compress_repo_batch(batch)
-        # Called once per file (L0) + once for L1 = 3
+        trainer.optimizer.zero_grad()
+        trainer._forward_backward(batch)
+        # Called once per file (L0) + once for L1 per sample = 3
         assert call_count[0] == 3

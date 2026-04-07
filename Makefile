@@ -7,7 +7,7 @@ export
 # reading the file itself for ${VAR} interpolation in the YAML).
 DC := docker compose --env-file .env -f docker/docker-compose.yaml
 
-.PHONY: install install-gpu test test-unit test-gpu test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-commit-encoding train-phase1-step2 ckpt-backfill extract-structural generate-descriptions extract-commits prepare-commit-encoding convert-tokens convert-structural convert-descriptions convert-commits convert-commit-encoding generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full prepare-data-all
+.PHONY: install install-gpu test test-unit test-gpu test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos ice-labels train-ice train-phase1-step1 train-phase1-step2 train-phase1-step3 train-phase1-step4 train-phase1-step5 ckpt-backfill extract-structural generate-descriptions extract-commits prepare-commit-encoding convert-tokens convert-structural convert-descriptions convert-commits convert-commit-encoding generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full prepare-data-all
 
 install:
 	uv sync --extra dev --extra data
@@ -68,11 +68,17 @@ train-ice:
 train-phase1-step1:
 	scripts/run-train.sh train-phase1-step1
 
-train-commit-encoding:
-	scripts/run-train.sh train-commit-encoding
-
 train-phase1-step2:
 	scripts/run-train.sh train-phase1-step2
+
+train-phase1-step3:
+	scripts/run-train.sh train-phase1-step3
+
+train-phase1-step4:
+	scripts/run-train.sh train-phase1-step4
+
+train-phase1-step5:
+	scripts/run-train.sh train-phase1-step5
 
 docker-build-deps:
 	$(DC) build train

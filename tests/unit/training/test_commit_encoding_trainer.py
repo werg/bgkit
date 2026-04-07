@@ -77,6 +77,11 @@ class _CausalLMOutput:
         self.logits = logits
 
 
+class _ModelOutput:
+    def __init__(self, last_hidden_state):
+        self.last_hidden_state = last_hidden_state
+
+
 class _MockQwen3Model(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int, num_layers: int = 2):
         super().__init__()
@@ -85,6 +90,16 @@ class _MockQwen3Model(nn.Module):
             [nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)]
         )
         self.norm = nn.LayerNorm(hidden_dim)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+        x = inputs_embeds
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        return _ModelOutput(last_hidden_state=x)
 
 
 class MockCausalLMBackbone(nn.Module):
@@ -164,7 +179,7 @@ def trainer():
 
     cfg = OmegaConf.create({
         "training": {
-            "phase": "commit_encoding",
+            "phase": "phase1_step4",
             "max_steps": 100,
             "lr": 1e-3,
             "warmup_steps": 10,
@@ -227,6 +242,7 @@ def trainer():
     t._pending_l0_scores = []
     t._pending_l1_scores = []
     t._is_evaluating = False
+    t._profile_enabled = False
 
     return t
 
@@ -289,12 +305,50 @@ class TestForwardBackward:
         assert decoder_has_grad, "Decoder should receive gradients"
 
     def test_multi_file_l0_compression(self, trainer):
-        """L0 should process each file independently."""
+        """L0 should process each file via batched _compress_l0_batched."""
         batch = _make_commit_batch(batch_size=1, n_files=4, file_len=8)
-        survivors, survivor_mask = trainer._compress_repo_batch(batch)
-        assert survivors.ndim == 3  # (batch, max_survivors, hidden_dim)
-        assert survivor_mask.ndim == 2  # (batch, max_survivors)
-        assert survivor_mask.any(), "Should have at least some survivors"
+        file_ids = batch["file_token_ids"]
+        file_masks = batch["file_attention_masks"]
+        prompt_ids = batch["compression_prompt_ids"]
+        prompt_mask = batch["compression_prompt_mask"]
+        bgkit_embed = trainer.encoder.compressor.backbone.get_input_embeddings()
+        prompt_emb = bgkit_embed(prompt_ids[0:1])
+
+        l0_surv = trainer._compress_l0_batched(
+            file_ids[0], file_masks[0], 4,
+            prompt_emb, prompt_mask[0:1], bgkit_embed,
+        )
+        assert l0_surv.ndim == 2  # (total_survivors, hidden_dim)
+        assert l0_surv.size(0) > 0, "Should have at least some survivors"
+
+    def test_calibrator_scores_not_doubled_by_checkpoint(self, trainer):
+        """Scores should be buffered exactly once per file, not doubled.
+
+        _score_and_select lives OUTSIDE the activation checkpoint boundary.
+        If it were inside, checkpoint recomputation would double-append
+        scores to _pending_l0_scores. This test catches that regression.
+        """
+        trainer._pending_l0_scores.clear()
+        n_files = 4
+        batch = _make_commit_batch(batch_size=1, n_files=n_files, file_len=8)
+        file_ids = batch["file_token_ids"]
+        file_masks = batch["file_attention_masks"]
+        prompt_ids = batch["compression_prompt_ids"]
+        prompt_mask = batch["compression_prompt_mask"]
+        bgkit_embed = trainer.encoder.compressor.backbone.get_input_embeddings()
+        prompt_emb = bgkit_embed(prompt_ids[0:1])
+
+        trainer._compress_l0_batched(
+            file_ids[0], file_masks[0], n_files,
+            prompt_emb, prompt_mask[0:1], bgkit_embed,
+        )
+
+        # L0 scores: one per file
+        n_l0_appends = len(trainer._pending_l0_scores)
+        assert n_l0_appends == n_files, (
+            f"Expected {n_files} L0 score appends (one per file), "
+            f"got {n_l0_appends} — checkpoint may be re-executing side effects"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +449,7 @@ class TestCheckpoint:
 
         # Load as CompressionTrainer would (separate encoder/decoder state dicts)
         metadata, state_dicts = load_checkpoint(ckpt_path)
-        assert metadata.phase == "commit_encoding"
+        assert metadata.phase == "phase1_step4"
         assert "encoder" in state_dicts
         assert "decoder" in state_dicts
 

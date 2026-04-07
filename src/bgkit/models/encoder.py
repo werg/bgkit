@@ -20,6 +20,7 @@ import torch.nn as nn
 from bgkit.models.bgkit_compressor import BgKITCompressor, CompressionOutput
 from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
 from bgkit.models.projection_block import ProjectionBlock
+from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
 
 
 def _resolve_layers(backbone: nn.Module) -> nn.ModuleList:
@@ -125,6 +126,15 @@ def _expand_survivor_mask(
     return full_mask
 
 
+def is_pruned_encoder_state_dict(state_dict: dict) -> bool:
+    """Detect whether an encoder state dict came from a pruned backbone.
+
+    Pruned backbones use ``compressor.backbone.blocks.*`` keys;
+    unpruned use ``compressor.backbone.layers.*``.
+    """
+    return any(k.startswith("compressor.backbone.blocks.") for k in state_dict)
+
+
 class BgKITEncoder(nn.Module):
     """Full BgKIT encoder: compressor + projection block.
 
@@ -220,9 +230,9 @@ class BgKITEncoder(nn.Module):
         return self.compressor.auto_reproduce(normed_embeddings)
 
     def step_bidi_warmup(self) -> None:
-        """Advance the bidirectional warmup counter on all BidirectionalQwen35 modules."""
+        """Advance the bidirectional warmup counter on all backbone modules."""
         for module in self.modules():
-            if isinstance(module, BidirectionalQwen35):
+            if isinstance(module, (BidirectionalQwen35, PrunedBidirectionalQwen35)):
                 module.step_bidi_warmup()
 
     @classmethod
@@ -235,11 +245,17 @@ class BgKITEncoder(nn.Module):
         revision: str | None = None,
         attn_implementation: str | None = None,
         bidi_warmup_steps: int = 0,
+        pruned: bool = False,
+        conv_kernel_size: int = 16,
     ) -> BgKITEncoder:
         """Construct a BgKITEncoder from a pretrained HF model.
 
         Splits the backbone into compressor (layers 0..N-2) and projection
         block (layer N-1), with separate norms for each.
+
+        Callers that load a checkpoint afterward should generally use
+        ``from_pretrained_with_state_dict()`` instead, which auto-detects
+        pruned vs. unpruned architecture from the state dict keys.
 
         Args:
             backbone_name_or_module: HF model name or pre-loaded model.
@@ -248,6 +264,8 @@ class BgKITEncoder(nn.Module):
             trust_remote_code: Trust remote code for HF loading.
             revision: Model revision for HF loading.
             attn_implementation: Attention implementation (e.g. "sdpa").
+            pruned: If True, construct with PrunedBidirectionalQwen35 backbone.
+            conv_kernel_size: Kernel size for ResidualConv1d (only when pruned).
 
         Returns:
             Constructed BgKITEncoder.
@@ -272,6 +290,12 @@ class BgKITEncoder(nn.Module):
         # embed_tokens, layers, norm, rotary_emb.
         raw_model = _extract_text_model(raw_model)
 
+        if pruned:
+            # Pruned path: skip BidirectionalQwen35, go directly to pruned model
+            return cls._from_pretrained_pruned(
+                raw_model, hidden_dim, torch_dtype, bidi_warmup_steps, conv_kernel_size,
+            )
+
         # Wrap Qwen3.5 text models in BidirectionalQwen35 (bidirectional
         # full attention layers, causal DeltaNet layers).
         if not isinstance(raw_model, BidirectionalQwen35) and _is_qwen35_model(raw_model):
@@ -289,14 +313,12 @@ class BgKITEncoder(nn.Module):
         # 3. Get rotary embedding (shared reference, not deepcopy)
         rotary_emb = _resolve_rotary_emb(backbone)
 
-        # 4. Deepcopy the final norm for the projection block
+        # 4. Deepcopy norms for compressor and projection block
         original_norm = _resolve_final_norm(backbone)
         projection_norm = deepcopy(original_norm)
+        compressor_norm = deepcopy(original_norm)
 
-        # 5. The original norm stays as the compressor norm
-        compressor_norm = original_norm
-
-        # 6. Replace backbone's norm with Identity (un-normed output)
+        # 5. Replace backbone's norm with Identity (un-normed output)
         _set_norm_to_identity(backbone)
 
         # 7. Construct compressor
@@ -312,4 +334,89 @@ class BgKITEncoder(nn.Module):
         # Cast all parameters (including newly-initialized ones like flag embeddings,
         # separator, auto_repro_head) to match the pretrained model dtype.
         encoder.to(dtype=torch_dtype)
+        return encoder
+
+    @classmethod
+    def _from_pretrained_pruned(
+        cls,
+        text_model: nn.Module,
+        hidden_dim: int,
+        torch_dtype: torch.dtype,
+        bidi_warmup_steps: int,
+        conv_kernel_size: int,
+    ) -> BgKITEncoder:
+        """Construct a pruned BgKITEncoder from raw HF text model layers.
+
+        Skips BidirectionalQwen35 entirely — no point patching DeltaNet conv1d
+        on layers that will be discarded.
+        """
+        # Pop last layer for projection block BEFORE pruning
+        layers = _resolve_layers(text_model)
+        projection_layer = layers[-1]
+        del layers[-1]
+
+        rotary_emb = _resolve_rotary_emb(text_model)
+        original_norm = _resolve_final_norm(text_model)
+        projection_norm = deepcopy(original_norm)
+        compressor_norm = deepcopy(original_norm)
+
+        # Build pruned backbone from remaining 23 layers.
+        # Pass Identity norm — the compressor owns the real norm separately.
+        pruned_backbone = PrunedBidirectionalQwen35.from_text_model(
+            text_model,
+            hidden_dim=hidden_dim,
+            conv_kernel_size=conv_kernel_size,
+            bidi_warmup_steps=bidi_warmup_steps,
+            norm_override=nn.Identity(),
+        )
+
+        compressor = BgKITCompressor(pruned_backbone, compressor_norm, hidden_dim=hidden_dim)
+        projection_block = ProjectionBlock(
+            projection_layer, projection_norm, rotary_emb, hidden_dim=hidden_dim,
+        )
+
+        encoder = cls(compressor, projection_block)
+        encoder.to(dtype=torch_dtype)
+        return encoder
+
+    @classmethod
+    def from_pretrained_with_state_dict(
+        cls,
+        backbone_name_or_module: str | nn.Module,
+        encoder_state_dict: dict,
+        hidden_dim: int = 1024,
+        torch_dtype: torch.dtype = torch.bfloat16,
+        trust_remote_code: bool = True,
+        revision: str | None = None,
+        attn_implementation: str | None = None,
+        bidi_warmup_steps: int = 0,
+        conv_kernel_size: int = 16,
+    ) -> BgKITEncoder:
+        """Construct a BgKITEncoder, auto-detecting pruned architecture from state dict.
+
+        Inspects the state dict keys to determine whether the checkpoint was
+        saved from a pruned or unpruned encoder. This removes the need for
+        metadata flags or config settings — the checkpoint is self-describing.
+
+        Args:
+            backbone_name_or_module: HF model name or pre-loaded model.
+            encoder_state_dict: The encoder state dict (from checkpoint).
+            **kwargs: Forwarded to ``from_pretrained()``.
+
+        Returns:
+            Constructed BgKITEncoder with state dict loaded.
+        """
+        pruned = is_pruned_encoder_state_dict(encoder_state_dict)
+        encoder = cls.from_pretrained(
+            backbone_name_or_module,
+            hidden_dim=hidden_dim,
+            torch_dtype=torch_dtype,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            attn_implementation=attn_implementation,
+            bidi_warmup_steps=bidi_warmup_steps,
+            pruned=pruned,
+            conv_kernel_size=conv_kernel_size,
+        )
+        encoder.load_state_dict(encoder_state_dict)
         return encoder

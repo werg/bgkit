@@ -124,7 +124,7 @@ def test_mark_pruned_nonexistent_noop(tmp_path):
 def test_list_all(tmp_path):
     reg = CheckpointRegistry(tmp_path)
     reg.register(_make_entry(name="a", step=2, phase="ice"))
-    reg.register(_make_entry(name="b", step=1, phase="phase1_step2"))
+    reg.register(_make_entry(name="b", step=1, phase="phase1_step5"))
     entries = reg.list_entries()
     assert len(entries) == 2
     # Sorted by step
@@ -135,7 +135,7 @@ def test_list_all(tmp_path):
 def test_list_filter_phase(tmp_path):
     reg = CheckpointRegistry(tmp_path)
     reg.register(_make_entry(name="a", phase="ice", step=1))
-    reg.register(_make_entry(name="b", phase="phase1_step2", step=2))
+    reg.register(_make_entry(name="b", phase="phase1_step5", step=2))
     assert len(reg.list_entries(phase="ice")) == 1
 
 
@@ -576,8 +576,8 @@ def test_parent_captured_before_save_not_self(tmp_path):
 def test_input_sources_in_registry_entry():
     """CompressionTrainer sets input_sources for cross-phase lineage."""
     entry = RegistryEntry(
-        name="phase1_step2_step5000_20260220_220522",
-        phase="phase1_step2",
+        name="phase1_step4_step5000_20260220_220522",
+        phase="phase1_step5",
         step=5000,
         epoch=0,
         timestamp="2026-02-20T22:05:22+00:00",

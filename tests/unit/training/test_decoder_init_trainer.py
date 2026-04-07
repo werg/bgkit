@@ -71,6 +71,11 @@ class _CausalLMOutput:
         self.logits = logits
 
 
+class _ModelOutput:
+    def __init__(self, last_hidden_state):
+        self.last_hidden_state = last_hidden_state
+
+
 class _MockQwen3Model(nn.Module):
     """Inner .model sub-module mirroring Qwen3ForCausalLM.model structure."""
 
@@ -81,6 +86,16 @@ class _MockQwen3Model(nn.Module):
             [nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)]
         )
         self.norm = nn.LayerNorm(hidden_dim)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+        x = inputs_embeds
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        return _ModelOutput(last_hidden_state=x)
 
 
 class MockCausalLMBackbone(nn.Module):
@@ -568,9 +583,7 @@ class TestResolveBgkitCheckpoint:
             label="bgkit_checkpoint",
         )
         assert result == "/tmp/ckpts/jbp_step500_20260224_120000"
-        assert trainer._input_sources["joint_block_pretrain"] == (
-            "jbp_step500_20260224_120000"
-        )
+        assert trainer._input_sources["bgkit"] == "jbp_step500_20260224_120000"
 
     def test_explicit_path_passthrough(self, trainer):
         """Explicit path should pass through and populate _input_sources."""
@@ -581,10 +594,10 @@ class TestResolveBgkitCheckpoint:
 
         result = trainer._resolve_bgkit_checkpoint()
         assert result == "/workspace/checkpoints/jbp_step300"
-        assert trainer._input_sources["joint_block_pretrain"] == "jbp_step300"
+        assert trainer._input_sources["bgkit"] == "jbp_step300"
 
     def test_none_returns_none(self, trainer):
         """No bgkit_checkpoint config should return None and empty _input_sources."""
         result = trainer._resolve_bgkit_checkpoint()
         assert result is None
-        assert "joint_block_pretrain" not in trainer._input_sources
+        assert "bgkit" not in trainer._input_sources

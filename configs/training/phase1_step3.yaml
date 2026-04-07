@@ -1,26 +1,69 @@
-# Phase 1 Step 3: Frozen-target projection alignment
+# Phase 1 Step 3: Pruned encoder reconstruction
+#
+# Retrains the decoder (via LoRA) and encoder (full) on the content
+# reproduction task using the pruned encoder from step 2. All curriculum
+# phases are skipped — encoder is unfrozen and compression is active
+# from step 0.
 phase: phase1_step3
+optimizer: muon
+max_steps: 15000
+lr: 2.0e-4               # base LR (encoder gets this)
+decoder_lr: 1.0e-5        # decoder LoRA LR (low — LoRA concentrates gradients)
+encoder_lr: 2.0e-4        # encoder LR (higher — pruned encoder needs to adapt)
+warmup_steps: 500
+max_batch_tokens: 16384
+gradient_accumulation_steps: 4
+max_eval_samples: 2000
+eval_every: 500
+save_every: 500
 
-# Step 3a: Text regurgitation (projection block only, warm-started from joint block pretraining)
-step3a:
-  max_steps: 50000
-  projection_lr: 3.0e-4
-  warmup_steps: 2000
-  freeze:
-    bgkit_compressor: true
-    projection_block: false
-    target_lm: true  # Frozen, 4-bit for forward passes only
+# Everything unfrozen from step 0 — no curriculum phases
+train_projection_block: true
+projection_only_steps: 0
+projection_lr: null
+encoder_unfreeze_step: 0
+bidi_warmup_steps: 0       # already bidirectional from step 2
 
-# Step 3b: Content tasks (unfreeze compressor at low LR)
-step3b:
-  max_steps: 50000
-  bgkit_lr: 1.0e-5  # Low LR for compressor
-  projection_lr: 1.0e-4
-  warmup_steps: 2000
-  freeze:
-    bgkit_compressor: false
-    projection_block: false
-    target_lm: true  # Still frozen
+# Compression active from step 0
+compression_introduction_step: 0
+ice:
+  checkpoint_path: auto
+  input_dim: 1024
+  hidden_dim: 192
+  num_layers: 3
+  kernel_size: 5
 
-eval_every: 2000
-save_every: 10000
+curriculum:
+  target_ratio_start: 0.10   # start at the ratio step 2 trained with
+  target_ratio_end: 0.10     # no ramp — fixed ratio
+  target_ratio_ramp_steps: 1
+  max_survivor_gap: 64
+  fallback_threshold: 3.0
+  calibrator_ema_decay: 0.99
+  calibrator_warmup_batches: 50
+
+# LoRA config for decoder — small adapter, fast adaptation
+decoder_lora:
+  enabled: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+# Do NOT freeze top layer — LoRA handles parameter efficiency
+freeze_top_layer: false
+lr_scale_bottom: 1.0
+
+reset_wandb: true
+
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+early_stopping:
+  enabled: false
+qa_ratio: 0.0
+eval:
+  generation_samples: 50
+  generation_eval_every: 4

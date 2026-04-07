@@ -96,13 +96,21 @@ services:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_step1"]
 
-  train-commit-encoding:
-    <<: *gpu-common
-    command: ["scripts/train.py", "+experiment=commit_encoding"]
-
   train-phase1-step2:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_step2"]
+
+  train-phase1-step3:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step3"]
+
+  train-phase1-step4:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step4"]
+
+  train-phase1-step5:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step5"]
 
   ice-labels:
     <<: *gpu-common

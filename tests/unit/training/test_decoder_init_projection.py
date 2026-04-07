@@ -70,6 +70,11 @@ class _CausalLMOutput:
         self.logits = logits
 
 
+class _ModelOutput:
+    def __init__(self, last_hidden_state):
+        self.last_hidden_state = last_hidden_state
+
+
 class _MockQwen3Model(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int, num_layers: int = 4):
         super().__init__()
@@ -78,6 +83,16 @@ class _MockQwen3Model(nn.Module):
             [nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)]
         )
         self.norm = nn.LayerNorm(hidden_dim)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+        x = inputs_embeds
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        return _ModelOutput(last_hidden_state=x)
 
 
 class MockCausalLMBackbone(nn.Module):

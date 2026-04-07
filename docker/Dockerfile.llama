@@ -1,6 +1,6 @@
 # Multi-stage build for llama-server optimized for Blackwell sm_121.
 # Builder: NGC CUDA devel (full toolkit for compilation)
-FROM nvcr.io/nvidia/cuda:13.1.1-devel-ubuntu24.04 AS builder
+FROM nvcr.io/nvidia/cuda:13.2.0-devel-ubuntu24.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake git curl ca-certificates \
@@ -28,7 +28,7 @@ RUN ln -sf /usr/local/cuda/targets/sbsa-linux/lib/stubs/libcuda.so \
     && cmake --build build -j$(nproc) --target llama-server
 
 # Runtime: NGC CUDA runtime (minimal, ~2 GB)
-FROM nvcr.io/nvidia/cuda:13.1.1-runtime-ubuntu24.04
+FROM nvcr.io/nvidia/cuda:13.2.0-runtime-ubuntu24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl libgomp1 \
     && rm -rf /var/lib/apt/lists/*
