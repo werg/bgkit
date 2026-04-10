@@ -1,4 +1,4 @@
-# Phase 2 Track C: User memory retrieval
+# Phase 2 Track C: User memory retrieval with L1
 phase: phase2
 step: user_memory
 optimizer: adamw
@@ -16,16 +16,25 @@ datasets:
   - chronicles
   - perltqa
   - laps
-# Phase 1 checkpoint for encoder + ICE
 phase1_checkpoint: auto
 use_precomputed_l0: false
+# L1: cross-session compression with memory query as prompt
+l1:
+  enabled: true
+  ratio_start: 0.60
+  ratio_end: 0.40
+  ratio_ramp_steps: 20000
+  fallback_threshold: 3.0
+  calibrator_warmup_batches: 50
+  calibrator_fast_batches: 200
+  calibrator_ema_decay: 0.99
 freeze:
   decoder: false
   l0_compressor: true
 curriculum:
-  target_ratio_start: 0.05
-  target_ratio_end: 0.02
-  target_ratio_ramp_steps: 30000
+  l0_ratio_start: 0.10
+  l0_ratio_end: 0.05
+  l0_ratio_ramp_steps: 20000
 topic_embeddings:
   enabled: true
   taxonomy_path: ${oc.env:DATA_DIR}/taxonomy/taxonomy.json

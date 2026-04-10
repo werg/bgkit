@@ -1,4 +1,5 @@
 # Phase 2 Step 5: Target LLM injection (Qwen3.5-35B QLoRA)
+# Two tool-call regions: bgkit_knowledge (L1 survivors) + bgkit_topic_context
 phase: phase2
 step: step5
 optimizer: adamw
@@ -16,21 +17,28 @@ datasets:
   - msc
   - share
   - chronicles
-# Multi-track data mixing weights
 data_mixing:
-  track_a: 0.40  # IR benchmarks (KILT)
-  track_b: 0.15  # Git history
-  track_c: 0.15  # User memory
-  reconstruction: 0.05  # Reconstruction regularizer
-  no_injection: 0.25  # Baseline preservation
-# Precomputed L0
+  track_a: 0.40
+  track_b: 0.15
+  track_c: 0.15
+  reconstruction: 0.05
+  no_injection: 0.25
 use_precomputed_l0: true
 l0_cache_dir: ${oc.env:DATA_DIR}/l0_cache
+l1:
+  enabled: true
+  ratio_start: 0.50
+  ratio_end: 0.30
+  ratio_ramp_steps: 30000
+  fallback_threshold: 3.0
+  calibrator_warmup_batches: 50
+  calibrator_fast_batches: 200
+  calibrator_ema_decay: 0.99
+phase1_checkpoint: auto
 freeze:
   decoder: false
   target_lm_base: false
   l0_compressor: true
-# Target LLM config
 target_lm:
   backbone_name: Qwen/Qwen3.5-35B
   quantization: 4bit
@@ -44,16 +52,14 @@ target_lm:
     - gate_proj
     - up_proj
     - down_proj
-# Projection extension: 1024 -> 2560
 projection_extension:
   source_dim: 1024
   target_dim: 2560
   init: block_diagonal
 curriculum:
-  target_ratio_start: 0.05
-  target_ratio_end: 0.01
-  target_ratio_ramp_steps: 50000
-# Decoder regularizer on subset
+  l0_ratio_start: 0.10
+  l0_ratio_end: 0.05
+  l0_ratio_ramp_steps: 30000
 decoder_regularizer:
   enabled: true
   weight: 0.1

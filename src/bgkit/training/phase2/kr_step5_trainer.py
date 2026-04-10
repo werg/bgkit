@@ -24,12 +24,12 @@ from __future__ import annotations
 
 import json
 import random
+from dataclasses import dataclass
 
 import structlog
 import torch
 import torch.nn as nn
 
-from bgkit.data.chat_template import CONTENT_SENTINEL
 from bgkit.models.target_lm import TargetLMWithInjection
 from bgkit.training.phase2.kr_trainer import KRTrainer, _Phase2Model
 
@@ -71,98 +71,148 @@ class _ProjectionExtension(nn.Module):
         return self.extension(x)
 
 
+_KNOWLEDGE_SENTINEL = "<<<BGKIT_KNOWLEDGE_7f3a2b>>>"
+_TOPIC_SENTINEL = "<<<BGKIT_TOPIC_9d4e1c>>>"
+
+_BGKIT_TOPIC_TOOL_CALL = {
+    "name": "bgkit_topic_context",
+    "arguments": {"source": "topic_embeddings"},
+}
+
+
+@dataclass
+class InjectionFrame:
+    """Positions for embedding injection in a tokenized chat sequence."""
+
+    token_ids: torch.Tensor       # (seq_len,) full tokenized sequence
+    knowledge_start: int          # start index of knowledge placeholder
+    knowledge_end: int            # end index (exclusive)
+    topic_start: int | None       # start of topic placeholder (None if no topics)
+    topic_end: int | None         # end of topic placeholder (None if no topics)
+
+
 def _build_injection_frame(
     tokenizer,
     question_text: str,
     num_survivors: int,
-) -> tuple[torch.Tensor, int, int]:
-    """Build chat-template token IDs with placeholder positions for injection.
+    num_topic_positions: int = 0,
+) -> InjectionFrame:
+    """Build chat-template token IDs with TWO tool-call regions.
 
-    Uses the sentinel-based boundary detection pattern from ChatReproDataset:
-    1. Build messages with a sentinel string as tool response content
-    2. Render via apply_chat_template (tokenize=False)
-    3. Split on sentinel to find prefix/suffix boundaries
-    4. Tokenize piecewise to get exact token positions
+    Region 1 (knowledge): BgKIT compressed L1 survivors
+    Region 2 (topics):    Topic embedding vectors (optional)
 
-    The sentinel occupies the exact span where BgKIT survivors will be injected.
-    We use num_survivors copies of a single-char placeholder so the tokenizer
-    produces a predictable number of tokens.
+    Uses sentinel-based boundary detection: place unique sentinels in the
+    template, render to string, split on sentinels, tokenize piecewise.
 
-    Args:
-        tokenizer: Target LLM tokenizer (Qwen3.5-35B).
-        question_text: User question / issue text.
-        num_survivors: Number of BgKIT survivors (K) to inject.
-
-    Returns:
-        (token_ids, inject_start, inject_end) where:
-        - token_ids: (seq_len,) full tokenized chat sequence with placeholder tokens
-        - inject_start: index where placeholder tokens begin
-        - inject_end: index where placeholder tokens end (inject_end - inject_start = K)
+    Message structure:
+        [system] You are a knowledgeable assistant...
+        [assistant] <tool_call>bgkit_knowledge</tool_call>
+        [tool] <<<KNOWLEDGE_SENTINEL>>>
+        [assistant] <tool_call>bgkit_topic_context</tool_call>  (if topics)
+        [tool] <<<TOPIC_SENTINEL>>>                             (if topics)
+        [user] {question}
     """
-    tool_call_json = json.dumps(_BGKIT_TOOL_CALL, ensure_ascii=False)
+    knowledge_call = json.dumps(_BGKIT_TOOL_CALL, ensure_ascii=False)
 
     messages = [
         {
             "role": "system",
             "content": (
-                "You are a knowledgeable assistant with access to retrieved context "
-                "from BgKIT compressed knowledge sources."
+                "You are a knowledgeable assistant with access to "
+                "retrieved context from BgKIT compressed knowledge."
             ),
         },
-        {"role": "user", "content": question_text},
         {
             "role": "assistant",
-            "content": f"<tool_call>\n{tool_call_json}\n</tool_call>",
+            "content": f"<tool_call>\n{knowledge_call}\n</tool_call>",
         },
-        {
-            "role": "tool",
-            "content": CONTENT_SENTINEL,
-        },
+        {"role": "tool", "content": _KNOWLEDGE_SENTINEL},
     ]
 
-    # Render template without tokenizing to get a string we can split
+    has_topics = num_topic_positions > 0
+    if has_topics:
+        topic_call = json.dumps(_BGKIT_TOPIC_TOOL_CALL, ensure_ascii=False)
+        messages.extend([
+            {
+                "role": "assistant",
+                "content": f"<tool_call>\n{topic_call}\n</tool_call>",
+            },
+            {"role": "tool", "content": _TOPIC_SENTINEL},
+        ])
+
+    messages.append({"role": "user", "content": question_text})
+
     try:
         full_text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
     except Exception:
-        # Fallback for tokenizers without apply_chat_template support
-        full_text = (
-            "<|im_start|>system\n"
-            "You are a knowledgeable assistant with access to retrieved context "
-            "from BgKIT compressed knowledge sources.<|im_end|>\n"
+        # ChatML fallback
+        parts = [
+            "<|im_start|>system\nYou are a knowledgeable assistant "
+            "with access to retrieved context from BgKIT compressed "
+            "knowledge.<|im_end|>\n",
+            "<|im_start|>assistant\n"
+            f"<tool_call>\n{knowledge_call}\n</tool_call><|im_end|>\n",
+            f"<|im_start|>tool\n{_KNOWLEDGE_SENTINEL}<|im_end|>\n",
+        ]
+        if has_topics:
+            topic_call = json.dumps(
+                _BGKIT_TOPIC_TOOL_CALL, ensure_ascii=False,
+            )
+            parts.extend([
+                "<|im_start|>assistant\n"
+                f"<tool_call>\n{topic_call}\n</tool_call><|im_end|>\n",
+                f"<|im_start|>tool\n{_TOPIC_SENTINEL}<|im_end|>\n",
+            ])
+        parts.append(
             f"<|im_start|>user\n{question_text}<|im_end|>\n"
-            "<|im_start|>assistant\n"
-            f"<tool_call>\n{tool_call_json}\n</tool_call><|im_end|>\n"
-            f"<|im_start|>tool\n{CONTENT_SENTINEL}<|im_end|>\n"
-            "<|im_start|>assistant\n"
+            "<|im_start|>assistant\n",
         )
+        full_text = "".join(parts)
 
-    # Validate sentinel uniqueness
-    sentinel_count = full_text.count(CONTENT_SENTINEL)
-    if sentinel_count != 1:
-        raise ValueError(
-            f"Expected exactly 1 sentinel in template, found {sentinel_count}."
-        )
-
-    # Split on sentinel to get prefix and suffix strings
-    prefix_str, suffix_str = full_text.split(CONTENT_SENTINEL, 1)
-
-    # Tokenize prefix and suffix separately
-    prefix_ids = tokenizer.encode(prefix_str, add_special_tokens=False)
-    suffix_ids = tokenizer.encode(suffix_str, add_special_tokens=False)
-
-    # The injection span starts right after prefix
-    inject_start = len(prefix_ids)
-    inject_end = inject_start + num_survivors
-
-    # Build full token IDs: prefix + placeholder tokens + suffix
-    # Use pad_token_id as placeholder (will be replaced with projected embeddings)
     pad_id = tokenizer.pad_token_id or 0
-    placeholder_ids = [pad_id] * num_survivors
-    full_ids = prefix_ids + placeholder_ids + suffix_ids
 
-    return torch.tensor(full_ids, dtype=torch.long), inject_start, inject_end
+    # --- Knowledge region ---
+    if full_text.count(_KNOWLEDGE_SENTINEL) != 1:
+        raise ValueError("Knowledge sentinel not found exactly once")
+    pre_k, post_k = full_text.split(_KNOWLEDGE_SENTINEL, 1)
+    pre_k_ids = tokenizer.encode(pre_k, add_special_tokens=False)
+    k_start = len(pre_k_ids)
+    k_end = k_start + num_survivors
+
+    # --- Topic region (optional) ---
+    if has_topics:
+        if post_k.count(_TOPIC_SENTINEL) != 1:
+            raise ValueError("Topic sentinel not found exactly once")
+        mid, post_t = post_k.split(_TOPIC_SENTINEL, 1)
+        mid_ids = tokenizer.encode(mid, add_special_tokens=False)
+        post_t_ids = tokenizer.encode(post_t, add_special_tokens=False)
+
+        t_start = k_end + len(mid_ids)
+        t_end = t_start + num_topic_positions
+
+        full_ids = (
+            pre_k_ids
+            + [pad_id] * num_survivors
+            + mid_ids
+            + [pad_id] * num_topic_positions
+            + post_t_ids
+        )
+    else:
+        post_k_ids = tokenizer.encode(post_k, add_special_tokens=False)
+        t_start = None
+        t_end = None
+        full_ids = pre_k_ids + [pad_id] * num_survivors + post_k_ids
+
+    return InjectionFrame(
+        token_ids=torch.tensor(full_ids, dtype=torch.long),
+        knowledge_start=k_start,
+        knowledge_end=k_end,
+        topic_start=t_start,
+        topic_end=t_end,
+    )
 
 
 class KRStep5Trainer(KRTrainer):
@@ -341,17 +391,64 @@ class KRStep5Trainer(KRTrainer):
 
         return groups
 
-    def _forward_backward(self, batch) -> dict[str, float]:
-        """Forward pass through target LLM with tool-call framed BgKIT injection.
+    def _get_l1_survivors_and_topics(
+        self, batch,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Get L1 survivors and topic embeddings as separate tensors.
 
-        When injecting:
-        1. Get compressed survivors from BgKIT pipeline
-        2. Project to target LLM dimension (1024 -> 2560)
-        3. Build chat-template sequence with placeholder tokens in <tool_response>
-        4. Replace placeholder embeddings with projected survivors
-        5. Append answer tokens and forward through target LLM
+        Unlike the parent's _compose_prompt (which concatenates them for the
+        0.8B decoder), Step 5 needs them separate for distinct tool-call regions.
+
+        Returns:
+            (survivors, surv_mask, topic_emb, topic_mask)
+            topic_emb/topic_mask are None if topic embeddings are disabled.
         """
-        # Decide whether to inject BgKIT context (vs no-injection baseline)
+        # Get L0 survivors
+        cached = self._cached_l0_survivors(batch)
+        if cached is not None:
+            l0_surv, l0_mask = cached
+        elif self._use_live_l0():
+            l0_surv, l0_mask = self._encode_live_l0(
+                batch["content_token_ids"].to(self.device),
+                batch["content_attention_mask"].to(self.device),
+            )
+        else:
+            l0_surv, l0_mask = self._subsample_embeddings(
+                batch["content_token_ids"].to(self.device),
+                batch["content_attention_mask"].to(self.device),
+            )
+
+        # L1 query-conditioned compression
+        if (
+            self._l1_enabled
+            and self.encoder is not None
+            and "question_token_ids" in batch
+        ):
+            survivors, surv_mask = self._compress_l1(
+                l0_surv, l0_mask,
+                batch["question_token_ids"],
+                batch["question_attention_mask"],
+            )
+        else:
+            survivors, surv_mask = l0_surv, l0_mask
+
+        # Topic embeddings (separate, not concatenated)
+        topic_emb = None
+        topic_mask = None
+        if self.topic_embeddings is not None:
+            topic_emb, topic_mask = self.topic_embeddings(batch["tags"])
+            if topic_emb.size(1) == 0:
+                topic_emb = None
+                topic_mask = None
+
+        return survivors, surv_mask, topic_emb, topic_mask
+
+    def _forward_backward(self, batch) -> dict[str, float]:
+        """Forward with two-region tool-call injection into target LLM.
+
+        Region 1: bgkit_knowledge — L1 compressed survivors
+        Region 2: bgkit_topic_context — topic embeddings (optional)
+        """
         inject = random.random() > self._no_injection_fraction
 
         target_ids = batch["target_token_ids"].to(self.device)
@@ -359,39 +456,43 @@ class KRStep5Trainer(KRTrainer):
         target_loss_mask = batch["target_loss_mask"].to(self.device)
 
         if inject and self._target_lm is not None:
-            # --- Step 1: Get compressed survivors ---
-            prompt, prompt_mask = self._compose_prompt(batch)
+            # Get L1 survivors and topic embeddings as separate tensors
+            survivors, surv_mask, topic_emb, topic_mask = (
+                self._get_l1_survivors_and_topics(batch)
+            )
 
-            # --- Step 2: Project to target LLM dimension ---
-            projected = self._projection_ext(prompt)  # (B, K, 2560)
+            # Project survivors to target LLM dimension
+            projected = self._projection_ext(survivors)  # (B, K, 2560)
             num_survivors = projected.size(1)
-            batch_size = target_ids.size(0)
 
-            # --- Step 3: Build tool-call framed sequences ---
+            # Project topic embeddings if present
+            projected_topics = None
+            num_topic_pos = 0
+            if topic_emb is not None:
+                projected_topics = self._projection_ext(topic_emb)
+                num_topic_pos = projected_topics.size(1)
+
+            batch_size = target_ids.size(0)
             tokenizer = self._target_tokenizer
             question_ids = batch["question_token_ids"]
             question_mask = batch["question_attention_mask"]
 
-            all_frame_ids = []
-            all_inject_starts = []
-            all_inject_ends = []
-
+            # Build two-region injection frames per sample
+            frames: list[InjectionFrame] = []
             for i in range(batch_size):
                 q_len = int(question_mask[i].sum().item())
                 q_text = tokenizer.decode(
                     question_ids[i, :q_len], skip_special_tokens=True,
                 )
-                frame_ids, inj_start, inj_end = _build_injection_frame(
-                    tokenizer, q_text, num_survivors,
+                frame = _build_injection_frame(
+                    tokenizer, q_text, num_survivors, num_topic_pos,
                 )
-                all_frame_ids.append(frame_ids)
-                all_inject_starts.append(inj_start)
-                all_inject_ends.append(inj_end)
+                frames.append(frame)
 
-            # Pad framed sequences to same length
-            max_frame_len = max(ids.size(0) for ids in all_frame_ids)
+            # Pad framed sequences
+            max_frame_len = max(f.token_ids.size(0) for f in frames)
             pad_id = tokenizer.pad_token_id or 0
-            padded_frame_ids = torch.full(
+            padded_ids = torch.full(
                 (batch_size, max_frame_len), pad_id,
                 dtype=torch.long, device=self.device,
             )
@@ -399,28 +500,30 @@ class KRStep5Trainer(KRTrainer):
                 batch_size, max_frame_len,
                 dtype=torch.long, device=self.device,
             )
-            for i, ids in enumerate(all_frame_ids):
-                padded_frame_ids[i, :ids.size(0)] = ids.to(self.device)
-                frame_mask[i, :ids.size(0)] = 1
+            for i, f in enumerate(frames):
+                n = f.token_ids.size(0)
+                padded_ids[i, :n] = f.token_ids.to(self.device)
+                frame_mask[i, :n] = 1
 
-            # --- Step 4: Get embeddings and inject survivors ---
+            # Get embeddings and inject at both regions
             embed_layer = self._target_lm.get_input_embeddings()
-            frame_embeds = embed_layer(padded_frame_ids)
+            frame_embeds = embed_layer(padded_ids)
 
-            # Build injection_positions tensor for TargetLMWithInjection
-            injection_positions = torch.zeros(
-                batch_size, num_survivors, dtype=torch.long, device=self.device,
-            )
-            for i in range(batch_size):
-                s = all_inject_starts[i]
-                injection_positions[i] = torch.arange(
-                    s, s + num_survivors, dtype=torch.long, device=self.device,
-                )
+            for i, f in enumerate(frames):
+                # Region 1: knowledge survivors
+                ks, ke = f.knowledge_start, f.knowledge_end
+                n_k = min(ke - ks, projected.size(1))
+                frame_embeds[i, ks:ks + n_k] = projected[i, :n_k]
 
-            # Use TargetLMWithInjection.inject_survivors for the replacement
-            frame_embeds = self._target_lm_wrapper.inject_survivors(
-                padded_frame_ids, frame_embeds, projected, injection_positions,
-            )
+                # Region 2: topic embeddings
+                if (
+                    projected_topics is not None
+                    and f.topic_start is not None
+                    and f.topic_end is not None
+                ):
+                    ts, te = f.topic_start, f.topic_end
+                    n_t = min(te - ts, projected_topics.size(1))
+                    frame_embeds[i, ts:ts + n_t] = projected_topics[i, :n_t]
 
             # --- Step 5: Append answer tokens and forward ---
             answer_embeds = embed_layer(target_ids)
@@ -444,7 +547,7 @@ class KRStep5Trainer(KRTrainer):
                 labels=labels,
             )
             target_lm_loss = outputs.loss
-            prompt_tok_val = float(prompt_mask.sum().item() / prompt_mask.size(0))
+            prompt_tok_val = float(num_survivors + num_topic_pos)
 
         elif self._target_lm is not None:
             # No-injection: straight target LM forward

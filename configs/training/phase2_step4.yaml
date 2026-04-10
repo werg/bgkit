@@ -1,4 +1,4 @@
-# Phase 2 Step 4: KILT + NarrativeQA multi-task knowledge retrieval
+# Phase 2 Step 4: KILT + NarrativeQA multi-task with precomputed L0, live L1
 phase: phase2
 step: step4
 optimizer: adamw
@@ -12,16 +12,25 @@ save_every: 10000
 datasets:
   - narrativeqa
   - kilt
-# Precomputed L0 for KILT Wikipedia articles
 use_precomputed_l0: true
 l0_cache_dir: ${oc.env:DATA_DIR}/l0_cache/kilt
+l1:
+  enabled: true
+  ratio_start: 0.50
+  ratio_end: 0.30
+  ratio_ramp_steps: 30000
+  fallback_threshold: 3.0
+  calibrator_warmup_batches: 50
+  calibrator_fast_batches: 200
+  calibrator_ema_decay: 0.99
+phase1_checkpoint: auto
 freeze:
   decoder: false
   l0_compressor: true
 curriculum:
-  target_ratio_start: 0.05
-  target_ratio_end: 0.01
-  target_ratio_ramp_steps: 50000
+  l0_ratio_start: 0.10
+  l0_ratio_end: 0.05
+  l0_ratio_ramp_steps: 30000
 topic_embeddings:
   enabled: true
   taxonomy_path: ${oc.env:DATA_DIR}/taxonomy/taxonomy.json

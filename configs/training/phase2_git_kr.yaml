@@ -1,4 +1,4 @@
-# Phase 2 Track B: Git history knowledge retrieval
+# Phase 2 Track B: Git history knowledge retrieval with L1
 phase: phase2
 step: git_kr
 optimizer: adamw
@@ -12,17 +12,26 @@ eval_every: 2000
 save_every: 10000
 datasets:
   - git_history
-# Phase 1 checkpoint for encoder + ICE
 phase1_checkpoint: auto
 use_precomputed_l0: true
 l0_cache_dir: ${oc.env:DATA_DIR}/l0_cache/repos
+# L1: cross-commit compression with query prompt
+l1:
+  enabled: true
+  ratio_start: 0.50
+  ratio_end: 0.30
+  ratio_ramp_steps: 20000
+  fallback_threshold: 3.0
+  calibrator_warmup_batches: 50
+  calibrator_fast_batches: 200
+  calibrator_ema_decay: 0.99
 freeze:
   decoder: false
   l0_compressor: true
 curriculum:
-  target_ratio_start: 0.05
-  target_ratio_end: 0.02
-  target_ratio_ramp_steps: 30000
+  l0_ratio_start: 0.10
+  l0_ratio_end: 0.05
+  l0_ratio_ramp_steps: 20000
 topic_embeddings:
   enabled: true
   taxonomy_path: ${oc.env:DATA_DIR}/taxonomy/taxonomy.json
