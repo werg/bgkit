@@ -877,8 +877,6 @@ class CommitEncodingTrainer(BaseTrainer):
         self.decoder.eval()
         self._is_evaluating = True
 
-        group_size = 4  # micro-batch size for L1+decoder (same as training)
-
         try:
             total_loss = 0.0
             total_tokens = 0.0
@@ -901,113 +899,61 @@ class CommitEncodingTrainer(BaseTrainer):
 
                 batch_size = file_ids.size(0)
                 bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
-                hidden_dim = self.encoder.compressor.hidden_dim
 
-                # --- Phase 1: L0 compression per sample ---
-                l0_data = []  # (l0_surv, prompt_emb, sample_idx)
+                # Per-sample eval — no grouping, minimal peak memory
                 for b in range(batch_size):
-                    with torch.autocast(
-                        "cuda", dtype=torch.bfloat16,
-                        enabled=self.device.type == "cuda",
-                    ):
-                        n_files = int(file_count[b].item())
-                        prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
+                  with torch.autocast(
+                    "cuda", dtype=torch.bfloat16,
+                    enabled=self.device.type == "cuda",
+                  ):
+                    n_files = int(file_count[b].item())
+                    prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
 
-                        l0_surv = self._compress_l0_batched(
-                            file_ids[b], file_masks[b], n_files,
-                            prompt_emb_b, prompt_mask[b:b + 1],
-                            bgkit_embed,
+                    l0_surv = self._compress_l0_batched(
+                        file_ids[b], file_masks[b], n_files,
+                        prompt_emb_b, prompt_mask[b:b + 1],
+                        bgkit_embed,
+                    )
+
+                    l1_input = l0_surv.unsqueeze(0)
+                    l1_mask = torch.ones(
+                        1, l0_surv.size(0), dtype=torch.bool, device=self.device,
+                    )
+                    l1_survivor_mask = self._score_and_select(
+                        l1_input, l1_mask, level="l1",
+                    )
+
+                    l1_out = self.encoder(
+                        input_embeddings=l1_input,
+                        survivor_mask=l1_survivor_mask,
+                        attention_mask=l1_mask,
+                        prompt_embeddings=prompt_emb_b,
+                        prompt_attention_mask=prompt_mask[b:b + 1],
+                    )
+
+                    sample_loss_mask = (
+                        loss_mask_batch[b:b + 1]
+                        if loss_mask_batch is not None else None
+                    )
+
+                    loss = self.decoder.forward_with_loss(
+                        survivor_embeddings=l1_out.survivor_embeddings,
+                        target_ids=target_ids[b:b + 1],
+                        target_attention_mask=target_mask[b:b + 1],
+                        survivor_attention_mask=l1_out.survivor_attention_mask,
+                        loss_mask=sample_loss_mask,
+                    )
+
+                    # Token-weighted accumulation for comparable perplexity
+                    eval_loss_mask = batch.get("target_loss_mask")
+                    if eval_loss_mask is not None:
+                        sample_tokens = eval_loss_mask[b, 1:].sum().item()
+                    else:
+                        sample_tokens = (
+                            batch["target_attention_mask"][b, 1:].sum().item()
                         )
-
-                    l0_data.append((l0_surv, prompt_emb_b, b))
-
-                # --- Phase 2: Group L1 + decoder (no backward) ---
-                # Sort by survivor count for efficient padding
-                l0_data.sort(key=lambda x: x[0].size(0))
-
-                for g_start in range(0, batch_size, group_size):
-                    g_end = min(g_start + group_size, batch_size)
-                    group = l0_data[g_start:g_end]
-                    g_size = len(group)
-
-                    with torch.autocast(
-                        "cuda", dtype=torch.bfloat16,
-                        enabled=self.device.type == "cuda",
-                    ):
-                        # Pad L0 survivors to max in group
-                        max_surv = max(s.size(0) for s, _, _ in group)
-                        l1_input = torch.zeros(
-                            g_size, max_surv, hidden_dim,
-                            device=self.device, dtype=torch.bfloat16,
-                        )
-                        l1_mask = torch.zeros(
-                            g_size, max_surv, dtype=torch.bool, device=self.device,
-                        )
-                        for j, (surv, _, _) in enumerate(group):
-                            sc = surv.size(0)
-                            l1_input[j, :sc] = surv
-                            l1_mask[j, :sc] = True
-
-                        # L1 scoring (per-sample — calibrator side effects)
-                        l1_survivor_mask = torch.zeros_like(l1_mask)
-                        for j in range(g_size):
-                            l1_survivor_mask[j:j + 1] = self._score_and_select(
-                                l1_input[j:j + 1], l1_mask[j:j + 1], level="l1",
-                            )
-
-                        # Batched L1 encoder forward
-                        prompt_embs = torch.cat([p for _, p, _ in group], dim=0)
-                        prompt_masks = torch.cat(
-                            [prompt_mask[b:b + 1] for _, _, b in group], dim=0,
-                        )
-
-                        l1_out = self.encoder(
-                            input_embeddings=l1_input,
-                            survivor_mask=l1_survivor_mask,
-                            attention_mask=l1_mask,
-                            prompt_embeddings=prompt_embs,
-                            prompt_attention_mask=prompt_masks,
-                        )
-
-                        # Batched decoder forward
-                        group_indices = [b for _, _, b in group]
-                        group_target_ids = target_ids[group_indices]
-                        group_target_mask = target_mask[group_indices]
-                        group_loss_mask = None
-                        if loss_mask_batch is not None:
-                            group_loss_mask = loss_mask_batch[group_indices]
-
-                        loss = self.decoder.forward_with_loss(
-                            survivor_embeddings=l1_out.survivor_embeddings,
-                            target_ids=group_target_ids,
-                            target_attention_mask=group_target_mask,
-                            survivor_attention_mask=l1_out.survivor_attention_mask,
-                            loss_mask=group_loss_mask,
-                        )
-
-                        # Token-weighted accumulation for comparable perplexity
-                        eval_loss_mask = batch.get("target_loss_mask")
-                        for _, _, b in group:
-                            if eval_loss_mask is not None:
-                                sample_tokens = eval_loss_mask[b, 1:].sum().item()
-                            else:
-                                sample_tokens = (
-                                    batch["target_attention_mask"][b, 1:].sum().item()
-                                )
-                            total_tokens += sample_tokens
-                        # Loss from forward_with_loss is token-averaged across group;
-                        # weight by total group tokens for proper aggregation
-                        if eval_loss_mask is not None:
-                            group_tokens = sum(
-                                eval_loss_mask[b, 1:].sum().item()
-                                for _, _, b in group
-                            )
-                        else:
-                            group_tokens = sum(
-                                batch["target_attention_mask"][b, 1:].sum().item()
-                                for _, _, b in group
-                            )
-                        total_loss += loss.item() * group_tokens
+                    total_loss += loss.item() * sample_tokens
+                    total_tokens += sample_tokens
 
             avg_loss = total_loss / max(total_tokens, 1)
             perplexity = torch.exp(torch.tensor(avg_loss)).item()
