@@ -37,47 +37,47 @@ During Phase 1, auxiliary multi-target losses can be trained simultaneously: eac
 
 **Cross-platform transfer test:** After v1, evaluate adaptation to a new LLM by training only a fresh (block-diagonally extended) projection block with the compressor frozen. If this works well, it validates the architecture's reusability.
 
-### 1.2 Phase 2a: Attention Priming
+### 1.2 Phase 2 Prep: Attention Priming for KR
 
-Two mechanisms to strengthen attention pathways to BgKIT positions early in Phase 2, before the model has learned to use them:
+Two mechanisms to strengthen attention pathways to BgKIT positions when transitioning from code to knowledge retrieval:
 
-**Mechanism 1 — Privileged encodings.** For a portion of examples, BgKIT compresses the post-commit state (modified files and direct dependents). BgKIT positions carry near-direct information about the correct output, creating an overwhelming advantage for attending to them. To mitigate the risk of harmful associations, limit this phase, compress the output more heavily, and present it as a different tool ("bgkit_oracle"), not the repo structure tool.
+**Mechanism 1 — Reconstruction bridge.** Before switching to QA objectives, train briefly on document reconstruction at extreme compression (0.01 retention) using the new KR datasets. This validates that the compression pipeline transfers from code to natural language before adding the QA objective.
 
-**Mechanism 2 — Description generation bridge task.** The LLM generates natural-language repository descriptions conditioned on BgKIT survivors. Validates end-to-end information survival with gentler signal than coding tasks.
+**Mechanism 2 — Easy QA warmup.** Start with PubMedQA's yes/no/maybe classification — a simpler signal than extractive or abstractive QA. Validates end-to-end information survival with a forgiving metric.
 
-**Proposed data mix if used:** ~20% privileged-encoding tasks, ~40% standard tasks with real encodings, ~25% description generation bridge, ~15% without injection. Higher learning rate for projection block (2–3× the Phase 2 base rate).
+### 1.3 Phase 2: Knowledge Retrieval (Primary Post-Phase-1 Strategy)
 
-**Risk:** Privileged encodings could teach the model a dependency on information that won't be present at inference. Should be short and carefully annealed.
+Pivot from code compression to knowledge-intensive retrieval tasks. Train BgKIT to compress document collections into dense embeddings from which a decoder can answer questions. Progressive curriculum from single-document to multi-million-document corpora:
 
-### 1.3 Phase 2: Distillation Training (Primary Post-Phase-1 Strategy)
+**Track A (IR benchmarks) — Steps 1-4:** PubMedQA/NewsQA (single-doc) → SearchQA (multi-doc L1) → MS MARCO (shared corpus, 8.8M passages) → NarrativeQA + KILT (62K-token stories + 5.9M Wikipedia articles).
 
-Before end-to-end injection with RL, validate the BgKIT hypothesis through progressive distillation using the Qwen3.5 model family ladder.
+**Track B (git history KR):** Compress a repo's commit chain (messages + diffs + file context). Train decoder to answer developer questions about past changes. Uses our 10K+ repo collection. Runs parallel to Track A Steps 2-4.
 
-**Phase 2a — Logprob distillation:** Distill larger Qwen3.5 models (2B → 4B → 9B) down to the 0.8B decoder using BgKIT context. Teacher logprobs are pre-computed on agentic coding prompts; the student trains on KL divergence. The key metric is how close the BgKIT-augmented 0.8B student gets to each teacher — matching a 4B teacher with 0.8B + BgKIT would be strong evidence that dense injection compensates for reduced model capacity.
+**Track C (user memory):** Compress multi-session conversations (MSC, SHARE, Conversation Chronicles, PerLTQA). Train decoder to recall persona, events, preferences, temporal facts from past sessions. Evaluated on LongMemEval, LoCoMo, BEAM. Runs parallel to Track A Steps 3-4.
 
-**Phase 2b — Trajectory distillation:** Run progressively stronger teachers (2B → 4B → 9B → 35B) in an agentic coding harness, recording full interaction trajectories (tool calls, file reads, reasoning, diffs). Same ladder principle as 2a — a student learns more effectively from a moderately stronger teacher than from a vastly stronger one. Filter trajectories where teacher reasoning references details unrecoverable from BgKIT vectors. Train the BgKIT-augmented 0.8B student to reproduce filtered trajectories via teacher forcing. Stop climbing the ladder when the with-BgKIT vs. without-BgKIT gap stops growing.
+**Step 5 — Target LLM injection:** Qwen3.5-35B with QLoRA, drawing from all three tracks. Projection block extended to 2560 dim. Evaluate on KILT leaderboard, MS MARCO MRR, LongMemEval, git history QA.
 
-**Phase 2c — End-to-end injection:** Once distillation validates the approach, train the full pipeline with Qwen3.5-35B as the target LLM (QLoRA, 4-bit quantization).
+See `docs/02_training_plan.md` for full details on each step and track.
 
-See `docs/02_training_plan.md` for full details on each sub-phase.
+### 1.4 Phase 3: Agentic Coding Distillation with BgKIT Context
 
-### 1.4 Phase 3: RLVR (Deferred)
+Distill large coding agent models (Qwen3-Coder-480B, Claude 3.7 Sonnet, swe-agent-llama-70b) into 0.8B and Qwen3.5-35B, using BgKIT-compressed filesystem state and git history to compensate for the parameter gap. ~200K+ trajectories from SWE-bench with `base_commit` metadata enable exact repo state reconstruction. The student receives BgKIT-compressed context upfront; the teacher had to discover the same information through exploration tool calls.
 
-Reinforcement learning with verifiable rewards for sharpening after distillation validates the approach. Reward = task completion weighted by retrieval efficiency (tool-call budget). Short and focused.
+**Prerequisite:** Phase 2 Tracks A+B must demonstrate that BgKIT compression preserves enough information for KR and git history retrieval.
 
-**Prerequisite:** Phase 2 distillation must show clear evidence that BgKIT injection adds value. RLVR is only worth pursuing if the model ladder gap metric confirms the hypothesis.
+### 1.5 Cross-Session Agentic Memory (folded into Phase 3)
 
-**Key risk:** RL may teach the model to succeed *without* BgKIT — the ablation infrastructure is the safeguard. If the survivors-present vs. survivors-zeroed gap shrinks during RLVR, stop.
+For repos with multiple SWE-bench trajectories, prior sessions (ordered by `base_commit` position in git history) are compressed via L0/L1 and provided as a third BgKIT context source alongside filesystem state and git history. The student learns to leverage what was previously tried on the same codebase. This is part of Phase 3 distillation training, not a separate phase.
 
 ---
 
 ## 2. Additional Knowledge Sources
 
-These use the same BgKIT architecture with different compression prompts and are framed as separate tool calls. All deferred until repository file contents are working.
+These use the same BgKIT architecture with different compression prompts and are framed as separate tool calls. Code repositories are the Phase 1 domain. Phase 2 covers three tracks: IR benchmarks (Track A), git commit history (Track B), and user memory from conversations (Track C). The sources below are extensions beyond Phase 2.
 
-### 2.1 Git Commit History (`bgkit_commit_history`)
+### 2.1 Git Commit History (`bgkit_commit_history`) — Phase 2 Track B
 
-Commit diffs and messages tokenized with commit hash, author, and timestamp prefixes. Level 0 per commit, level 1 in chronological order. Exercises temporal and change-pattern reasoning.
+Commit diffs and messages tokenized with commit hash, author, and timestamp prefixes. Level 0 per commit, level 1 in chronological order. Exercises temporal and change-pattern reasoning. Developer QA questions generated from commit metadata (messages, diffs, file context at `base_commit`). See Phase 2 Track B in `docs/02_training_plan.md` for details.
 
 ### 2.2 Library Documentation (`bgkit_library:<name>`)
 
@@ -91,9 +91,9 @@ Multiple web pages compressed in the context of a search query. Each page proces
 
 Prior agent interaction trajectories — user prompts, tool calls, file reads, commands, diffs — compressed at level 0 with conversation metadata as prefixes. Level 1 joins across conversations for cross-session pattern extraction.
 
-### 2.5 User Memories (`bgkit_user_memories`)
+### 2.5 User Memories (`bgkit_user_memories`) — Phase 2 Track C
 
-Accumulated facts about the user (preferences, biographical details, working context) compressed as a collection. Individual items are short enough to enter level 1 directly (like tiny files). Level 1 cross-item attention enables relational reasoning across memory items.
+Multi-session conversation histories compressed for persona, preference, event, and temporal fact retrieval. Trained on purpose-built memory datasets (MSC, SHARE, Conversation Chronicles, PerLTQA). Individual memory items are short enough to enter level 1 directly (like tiny files). Level 1 cross-session attention enables relational and temporal reasoning across sessions. See Phase 2 Track C in `docs/02_training_plan.md` for details.
 
 ### 2.6 Future
 
@@ -183,13 +183,13 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 ## 5. Risks and Mitigations
 
-### 5.1 Does Dense Injection Actually Beat Retrieval?
+### 5.1 Does Dense Compression Beat Standard Retrieval?
 
-**Risk:** Modern retrieval (vector DB + reranker) is very good, cheap, and simple. BgKIT involves a 600M compressor, a 600M decoder, projection heads, LoRA, and a multi-phase pipeline. The benefit over retrieval may be marginal or zero.
+**Risk:** Modern retrieval (DPR + reranker, ColBERT, BM25 + cross-encoder) is very good, cheap, and simple. BgKIT involves a ~1B compressor, an 800M decoder, projection heads, LoRA, and a multi-phase pipeline. The benefit over retrieval may be marginal or zero — especially since BgKIT compresses away information that standard retrieval preserves verbatim.
 
-**Mitigation:** The mandatory ablation (survivors present vs. zeroed vs. noise) after every training stage is the kill switch. If the gap is negligible at any point, stop and re-evaluate. The eval plan includes direct comparison against embedding retrieval with reranker as a required baseline.
+**Mitigation:** Phase 2 directly benchmarks against standard retrieval baselines on established leaderboards (KILT, MS MARCO). The mandatory ablation (survivors present vs. zeroed vs. noise) after every step is the kill switch. BgKIT's advantage, if any, will come from compressing far more context than retrieval can fit in a context window — if a DPR+reranker top-10 beats BgKIT over 128K compressed passages, the approach is not viable.
 
-**What would strengthen confidence:** A cheap pilot measuring how much of an agent's errors today are attributable to missing ambient structural knowledge vs. other bottlenecks (poor planning, hallucination, wrong tool use). If most errors aren't structural-knowledge errors, BgKIT is solving the wrong problem.
+**What would strengthen confidence:** BgKIT should show a favorable scaling curve — performance improving as more documents are compressed into L1, beyond what fits in a standard retrieval + reader context window. The value proposition is "compress the entire knowledge base" vs. "retrieve top-k passages."
 
 ### 5.2 Gradient Flow Through Recursive Application
 
@@ -203,18 +203,18 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 **Mitigation:** Options include: (a) run the full backbone forward pass before ICE scoring (correct input space, but 2× compute at L0 since the encoder must also process the sequence for compression), (b) restructure the encoder to score after the compressor backbone but before the projection block (backbone always processes the full sequence; compression happens in the projection block), (c) retrain ICE on raw embedding lookups to match the compression training input, (d) accept that ICE's scores are approximate and rely on the calibrator to adapt. The current implementation uses approach (d) — the `ThresholdCalibrator` tracks the EMA of observed ICE score quantiles and converts a target ratio to a threshold, so even if absolute ICE scores are miscalibrated, the relative ranking still drives survivor selection. Gap-filling (max 64 tokens) provides a safety net against degenerate selections. If compression quality is poor, approach (b) or (c) should be investigated.
 
-### 5.4 Level 1 Sequence Length
+### 5.4 Level 1 Sequence Length and Corpus Scale
 
-**Risk:** For a 2,000-file repo at ~6–7 positions per file, level 1 receives ~12,000–14,000 positions — approaching Qwen3-0.6B's 32K context limit. Repositories of 5,000–20,000+ files are common in industry.
+**Risk:** Phase 2 requires L1 to process far more positions than code repos. MS MARCO at 128K distractor passages = 128K L1 positions. KILT at 262K positions covers ~27K articles per pass, but the full 5.9M-article corpus requires ~225 shards. The model is only trained on individual shards — cross-shard knowledge interaction is lost.
 
 **Mitigation options:**
 
-- RoPE base frequency scaling to extend context (a standard technique, but quality may degrade at extreme lengths).
-- Batched level 1 with limited cross-batch attention — but this sacrifices the global interaction that's the whole point.
-- Pre-filtering to relevant modules before level 1 — but this reintroduces retrieval.
-- A third compression level (optional level 2) over level 1 outputs from multiple batches.
+- **Query-aware batching (adopted for Phase 2):** Ensure the relevant document(s) are always in the same L1 pass as the query. Distractors are randomly sampled. This works for training but limits inference to shard-local retrieval.
+- **Extended L1 context:** Qwen3.5-0.8B natively supports 262K context. DeltaNet layers are O(L), and SDPA makes the 6 full-attention layers O(L) in memory. Push L1 to 262K to cover more documents per pass.
+- **L2 cross-shard compression (deferred):** Pre-compute L1 shard outputs → L2 compresses across shards. Same architecture, third level. Needed only if query-aware batching proves insufficient.
+- **Hierarchical index:** For inference, use a lightweight retrieval step (BM25 or embedding similarity on L0 survivors) to select the relevant shard, then run L1 on that shard. Reintroduces retrieval but only at the shard selection level.
 
-**Recommendation:** Set an explicit v1 target (e.g., repos up to ~2,000–3,000 files within 32K level 1 positions). Acknowledge the scaling limitation up front. If v1 demonstrates value, the scaling problem justifies dedicated effort.
+**Recommendation:** Start with query-aware batching at 128K L1 context (Phase 2 Step 3). Scale to 262K for KILT (Step 4). Investigate L2 only if the shard boundary proves to be the bottleneck.
 
 ### 5.5 Training Pipeline Complexity
 
@@ -245,7 +245,7 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 **Risk:** The entire projection pipeline is trained against a specific target LLM's embedding space. If that model's architecture or embedding space changes in the next release, everything from the projection alignment step onward needs retraining.
 
-**Mitigation:** Using Qwen3.5-35B as the target — the same model family as our encoder and decoder — reduces architectural mismatch and simplifies the projection block's task. Multi-target projection (Section 1.1) helps the compressor's internal representations stay target-agnostic. But in v1, this risk is accepted. The key question is whether the compressor's output space is stable enough that adapting to a new target requires only a fresh projection block (cheap, with block-diagonal warm-start from the v1 block) rather than full Phase 2 retraining (expensive). The Qwen3.5 model ladder (0.8B/2B/4B/9B/35B) offers a natural progression for testing this.
+**Mitigation:** Using Qwen3.5-35B as the target — the same model family as our encoder and decoder — reduces architectural mismatch and simplifies the projection block's task. Multi-target projection (Section 1.1) helps the compressor's internal representations stay target-agnostic. But in v1, this risk is accepted. The key question is whether the compressor's output space is stable enough that adapting to a new target requires only a fresh projection block (cheap, with block-diagonal warm-start from the v1 block) rather than full Phase 2 Step 5 retraining (expensive).
 
 ### 5.9 Decoder Co-Adaptation
 
@@ -253,11 +253,13 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 **Mitigation:** Tracked in the training plan via survivor embedding diagnostics. If cosine similarity to nearest token embeddings collapses while reconstruction loss keeps improving, the decoder is compensating. Switch to constrained decoder (Section 4.1, option b) if observed.
 
-### 5.10 Distillation Data Quality
+### 5.10 Extreme Compression Information Loss
 
-**Risk:** Distillation trajectories from a stronger teacher model may contain reasoning that references fine-grained details unrecoverable from BgKIT vectors. Subtle data quality issues.
+**Risk:** At 0.01 retention, each survivor must consolidate ~100 tokens of context. The compressor may not learn to preserve the specific facts needed for QA — reconstruction training signal (Phase 1) optimizes for surface-level reproduction, not fact retention.
 
-**Mitigation:** Phase 2b (trajectory distillation) includes an automated filtering step: cross-reference every file read/tool call in the teacher's trajectory against BgKIT's survivor map. Reject trajectories where the teacher targets files with low survivor coverage. For Phase 2a (logprob distillation), the risk is lower — the student isn't reproducing reasoning traces, just matching output distributions. Spot-check extensively in both cases.
+**Mitigation:** Phase 2 adds explicit QA loss alongside reconstruction. The dual-objective training ensures survivors preserve retrievable facts, not just surface form. The progressive curriculum (0.10 → 0.01 retention) gives the model time to learn information consolidation at each ratio. Gap-filling relaxation at extreme ratios prevents the gap-filler from artificially inflating survivor counts.
+
+**Diagnostic:** Compare QA accuracy vs. reconstruction quality at matched compression ratios. If reconstruction is good but QA is bad, the compression is preserving form over content — increase QA loss weight.
 
 ---
 
@@ -293,23 +295,27 @@ BgKIT deployment requires the target LLM to accept projected vectors via the LLa
 
 Beyond the mandatory survivors-present vs. zeroed ablation:
 
-- (a) Compression ratio sweep — performance vs. survivor budget.
-- (b) Level 0 only vs. level 0 + level 1 — does cross-file interaction add value?
+- (a) Compression ratio sweep — retrieval quality vs. survivor budget at 0.50, 0.10, 0.05, 0.01 retention.
+- (b) Level 0 only vs. level 0 + level 1 — does cross-document interaction add value for KR?
 - (c) ICE threshold-based vs. random vs. uniform survivor selection.
-- (d) Per-file independent thresholding vs. cross-file proportional budget allocation.
+- (d) Per-document independent thresholding vs. cross-document proportional budget allocation.
 - (e) Shared weights vs. per-level LoRA adapters.
-- (f) Decoder adaptation: full fine-tuning vs. high-rank LoRA (if both trained in Phase 1).
-- (g) Individual knowledge source ablation (when additional sources are added).
-- (h) With vs. without compression prompt at level 1.
-- (i) BgKIT information utilization in gated attention vs. gated DeltaNet layers — does disabling LoRA on DeltaNet layers affect BgKIT-dependent performance?
-- (j) BgKIT tool-call frame placement: beginning-only vs. distributed across the input sequence (relevant to DeltaNet recurrent state retention, see Section 5.7).
-- (k) Model ladder distillation gap: 0.8B + BgKIT vs. 2B/4B/9B teachers — how much of the teacher's capability does BgKIT injection recover?
+- (f) Decoder adaptation: full fine-tuning vs. high-rank LoRA.
+- (g) QA loss only vs. QA + reconstruction dual objective — does reconstruction regularization help?
+- (h) Gap-filling on vs. off at extreme compression (0.01) — does positional coverage matter for QA?
+- (i) L1 context scaling curve: retrieval quality vs. number of distractor documents.
+- (j) Query-aware batching vs. random batching — how much does shard composition matter?
+- (k) BgKIT information utilization in gated attention vs. gated DeltaNet layers (Phase 2 Step 5).
+- (l) BgKIT tool-call frame placement: beginning-only vs. distributed (Phase 2 Step 5).
+- (m) Domain transfer: does Phase 1 (code) pre-training help Phase 2 (KR) vs. training from scratch?
 
 ---
 
 ## 8. Deferred Evaluation Dimensions
 
-- **Cross-platform transfer:** Adaptation to a new target LLM by training only a fresh projection block (block-diagonally extended from v1, frozen compressor). How much performance is retained?
-- **Coding style preservation:** Does BgKIT context help the model match repository-specific conventions?
-- **Temporal reasoning:** With commit history as a knowledge source, can the model reason about what changed recently and why?
-- **User personalization:** With user memories as a knowledge source, does the model adapt behavior to user preferences?
+- **Cross-platform transfer:** Adaptation to a new target LLM by training only a fresh projection block (block-diagonally extended, frozen compressor). How much performance is retained?
+- **Domain transfer:** Does Phase 1 (code) pre-training transfer to Phase 2 (natural language KR)? Compare Phase 2 performance with vs. without Phase 1 initialization.
+- **User personalization:** With user memories as a knowledge source (Phase 2 Track C), does the model adapt behavior to user preferences?
+- **Session continuity:** Can compressed conversation history enable coherent multi-session interactions (Phase 2 Track C)?
+- **Multi-hop reasoning:** On KILT HotpotQA, does L1 cross-document interaction enable multi-hop answers that L0-only cannot?
+- **Temporal reasoning:** With commit history or versioned documents, can the model reason about what changed and why?

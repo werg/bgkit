@@ -1,4 +1,4 @@
-# BgKIT: Ambient Awareness for Agentic LLMs
+# BgKIT: Dense Knowledge Compression for LLMs
 
 **Project Overview**
 
@@ -6,11 +6,11 @@
 
 ## Core Idea
 
-Agentic coding models rely on tokenized context — system prompts, AGENTS.md files, tool-retrieved snippets — to understand the context they operate in. We want to explore whether we can provide more holistic, subtle and compact forms of context injection inspired by the way image embeddings are injected. 
+LLMs are constrained by their context window. Whether the task is agentic coding, knowledge-intensive QA, or long-session user interaction, the model can only reason over what fits in its prompt. Retrieval (RAG) helps, but it operates at the document level and discards cross-document structure. We want to explore whether we can provide more holistic, subtle and compact forms of context injection inspired by the way image embeddings are injected — compressing entire knowledge bases into dense embeddings below the token level.
 
 ## Approach
 
-A Background Knowledge Interaction Transformer (BgKIT) hierarchically compresses repository-wide context into a compact set of dense embeddings, injected into the target LLM's forward pass below the token level — analogous to how images are embedded in vision-language models. The target LLM receives a compressed, variable-sized embedded representation of the entire codebase or other background knowledge.
+A Background Knowledge Interaction Transformer (BgKIT) hierarchically compresses large knowledge sources into a compact set of dense embeddings, injected into the target LLM's forward pass below the token level — analogous to how images are embedded in vision-language models. The target LLM receives a compressed, variable-sized embedded representation of an entire knowledge base (a codebase, a Wikipedia corpus, a document collection, or accumulated user memories).
 
 ## Architecture
 
@@ -39,28 +39,32 @@ Survivors are mapped via the learned projection block from BgKIT's hidden dimens
 
 This reuses the model's existing tool-call understanding, makes knowledge sources individually addressable, and allows selective omission for graceful degradation.
 
+**Learned topic knowledge embeddings:** In addition to compressed document context, BgKIT provides a second kind of dense knowledge: learned embeddings per topic tag in a hierarchical taxonomy (e.g., `global → coding → python → webdev → flask`). These are `nn.Parameter` blocks learned directly via backpropagation — no encoder needed. They capture domain-level prior knowledge that complements document-specific compressed context. Inserted as a `bgkit_topic_knowledge` tool-call response alongside compressed context. See `docs/02_training_plan.md` for details.
+
 ## Knowledge Sources
 
-We initially will focus on files, but there are a number of other potential sources that could be injected in this manner.
-These are just a few examples. Each knowledge domain is processed by the shared BgKIT network with appropriate compression prompts:
+BgKIT is designed to compress diverse knowledge sources through the same architecture with appropriate compression prompts:
 
-- **Repository file contents** — the primary and initial target
-- **Git commit history** — change patterns and project evolution
+- **Repository file contents** — the Phase 1 training domain; establishes compression fundamentals
+- **Knowledge retrieval corpora** — Phase 2 Track A; Wikipedia, MS MARCO, PubMedQA, NarrativeQA, and other standard IR benchmarks
+- **Git commit history** — Phase 2 Track B; compress a repo's commit chain (messages + diffs + file context), retrieve answers to developer questions about past changes
+- **User memories from conversations** — Phase 2 Track C; compress multi-session dialogues, recall facts, preferences, events, and relationships from past sessions. Trained on MSC, SHARE, Conversation Chronicles, PerLTQA
+- **Past agent conversations** — Phase 3; compress prior agentic sessions on the same repo, ordered by commit position, as additional context for distillation
 - **Library documentation** — API surfaces of declared dependencies
 - **Web search results** — query-guided compression of retrieved pages
-- **Past agent conversations** — interaction logs from prior sessions
-- **User memories** — accumulated facts about the user
 - **Structured format extraction** — HTML→Markdown stripping, JSON/YAML→schema, SQL→DDL summaries, log→salient events
 
-Repository file contents are the focus of v1. Other sources are extensions using the same architecture.
+Phase 1 trains on repository file contents (code). Phase 2 runs three parallel tracks: IR benchmarks (Track A), git history KR (Track B), and user memory from conversations (Track C), pushing compression to extreme ratios (down to 0.01 retention) and scaling to multi-million-document corpora.
 
 ## Training
 
 **Prerequisites — Joint block pretraining:** The compressor's penultimate block is trained to reproduce input embeddings (auto-reproduction) while the projection block is trained to produce decoder-compatible embeddings, jointly in a single forward pass. This simultaneously establishes the compressor's output space for recursive compression and warm-starts the projection block for decoder readability.
 
-**Phase 1 — BgKIT pre-training:** Train BgKIT's compression and the reconstruction decoder on code repositories. The decoder reconstructs original content from compressed survivors, providing gradient signal for consolidation quality. Multiple complementary objectives (data reconstruction, description generation, structural QA, commit reproduction) ensure survivors preserve diverse information types.
+**Phase 1 — BgKIT pre-training (code):** Train BgKIT's compression and the reconstruction decoder on code repositories. The decoder reconstructs original content from compressed survivors, providing gradient signal for consolidation quality. Multiple complementary objectives (data reconstruction, description generation, structural QA, commit reproduction) ensure survivors preserve diverse information types. Establishes the compression fundamentals: L0/L1 hierarchy, ICE scoring, drop-flag mechanism.
 
-**Phase 2 — Distillation and injection:** First validate the hypothesis via progressive distillation — distill larger Qwen3.5 models (2B/4B/9B) down to the 0.8B decoder using BgKIT context, measuring how much of the teacher's capability BgKIT injection recovers. Then distill agentic trajectories from Qwen3.5-35B running in an agentic harness. Finally, train the full pipeline (BgKIT compressor → projection block → Qwen3.5-35B with LoRA) end-to-end on agentic coding tasks.
+**Phase 2 — Knowledge retrieval:** Pivot from code to three parallel retrieval tracks. **Track A (IR benchmarks):** Progressive KR on standard benchmarks — single-document QA (PubMedQA, NewsQA) → multi-document L1 compression (SearchQA) → shared-corpus retrieval at scale (MS MARCO) → large-scale multi-task KR (KILT/Wikipedia). **Track B (git history KR):** Compress a repo's commit history, train decoder to answer developer questions about past changes — bridges the Phase 1 code domain with QA objectives. **Track C (user memory):** Compress multi-session conversations (MSC, SHARE, Conversation Chronicles, PerLTQA), train decoder to recall persona, events, preferences, and temporal facts from past sessions. All tracks push compression to extreme ratios (0.01 retention). Final step injects compressed knowledge from all tracks into Qwen3.5-35B via QLoRA.
+
+**Phase 3 — Agentic coding distillation:** Distill large coding agent models (Qwen3-Coder-480B, Claude 3.7 Sonnet, swe-agent-llama-70b) into our 0.8B model and Qwen3.5-35B. ~200K+ SWE-bench trajectories provide teacher demonstrations with `base_commit` metadata, enabling exact repo state reconstruction. BgKIT provides the student with compressed filesystem state (Phase 1) and git history (Phase 2 Track B) — the student starts with full repo context that the teacher had to discover through exploration. Evaluated on SWE-bench Verified.
 
 ## Deployment
 
@@ -70,4 +74,4 @@ Level 0 is re-run per changed file only. Level 1 requires full recomputation but
 
 ## Success Criteria
 
-BgKIT must outperform embedding-based retrieval with a reranker on end-to-end agentic coding benchmarks (SWE-bench or similar) to justify its complexity. Secondary metrics: retrieval guidance accuracy, structural QA from BgKIT context alone, tool-call efficiency, and graceful degradation under increasing compression.
+BgKIT must demonstrate competitive performance across three domains: standard IR benchmarks (KILT, MS MARCO, PubMedQA), git history QA, and conversational memory retrieval (LongMemEval, LoCoMo, BEAM). The key metric is whether a decoder conditioned on BgKIT-compressed knowledge can answer questions as well as or better than standard retrieval baselines, while handling far larger knowledge bases within a fixed context budget. Secondary metrics: compression ratio vs. retrieval quality curve, multi-document reasoning accuracy, cross-session memory recall, graceful degradation under extreme compression, and scaling behavior with corpus size.
