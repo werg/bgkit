@@ -18,6 +18,31 @@ class CompressionBatch:
     target_attention_mask: torch.Tensor  # (batch, max_target_len)
 
 
+@dataclass
+class QABatch:
+    """A collated batch for query-conditioned QA training."""
+
+    content_token_ids: torch.Tensor
+    content_attention_mask: torch.Tensor
+    question_token_ids: torch.Tensor
+    question_attention_mask: torch.Tensor
+    answer_token_ids: torch.Tensor
+    answer_attention_mask: torch.Tensor
+    target_token_ids: torch.Tensor
+    target_attention_mask: torch.Tensor
+    target_loss_mask: torch.Tensor
+    compression_prompt_ids: torch.Tensor
+    compression_prompt_mask: torch.Tensor
+    prefix_ids: torch.Tensor
+    prefix_attention_mask: torch.Tensor
+    objectives: list[str]
+    dataset_names: list[str | None]
+    sample_ids: list[str | None]
+    document_ids: list[str | None]
+    tags: list[list[str]]
+    metadata: list[dict[str, object]]
+
+
 def pad_and_collate(
     sequences: list[torch.Tensor],
     pad_value: int = 0,
@@ -222,4 +247,60 @@ def _collate_repo_samples(samples: list) -> dict:
         "compression_prompt_ids": prompt_ids,
         "compression_prompt_mask": prompt_mask,
         "direct_l1": torch.tensor([s.direct_l1 for s in samples], dtype=torch.bool),
+    }
+
+
+def collate_qa(batch: list) -> dict:
+    """Collate ``QASample`` objects into a padded Phase 2 batch."""
+    from bgkit.data.datasets.qa_sample import QASample
+
+    if not batch:
+        raise ValueError("collate_qa() received an empty batch")
+    if not all(isinstance(sample, QASample) for sample in batch):
+        types = sorted({type(sample).__name__ for sample in batch})
+        raise TypeError(f"collate_qa() expects QASample items, got {types}")
+
+    content_ids, content_mask = pad_and_collate(
+        [s.content_token_ids for s in batch],
+    )
+    question_ids, question_mask = pad_and_collate(
+        [s.question_token_ids for s in batch],
+    )
+    answer_ids, answer_mask = pad_and_collate(
+        [s.answer_token_ids for s in batch],
+    )
+    target_ids, target_mask = pad_and_collate(
+        [s.target_token_ids for s in batch],
+    )
+    loss_mask, _ = pad_and_collate(
+        [s.target_loss_mask for s in batch],
+    )
+    prompt_ids, prompt_mask = pad_and_collate(
+        [s.compression_prompt_ids for s in batch],
+    )
+    prefix_ids, prefix_mask = pad_and_collate(
+        [s.prefix_ids for s in batch],
+    )
+
+    return {
+        "sample_type": "qa",
+        "content_token_ids": content_ids,
+        "content_attention_mask": content_mask,
+        "question_token_ids": question_ids,
+        "question_attention_mask": question_mask,
+        "answer_token_ids": answer_ids,
+        "answer_attention_mask": answer_mask,
+        "target_token_ids": target_ids,
+        "target_attention_mask": target_mask,
+        "target_loss_mask": loss_mask,
+        "compression_prompt_ids": prompt_ids,
+        "compression_prompt_mask": prompt_mask,
+        "prefix_ids": prefix_ids,
+        "prefix_attention_mask": prefix_mask,
+        "objectives": [s.objective for s in batch],
+        "dataset_names": [s.dataset_name for s in batch],
+        "sample_ids": [s.sample_id for s in batch],
+        "document_ids": [s.document_id for s in batch],
+        "tags": [list(s.tags) for s in batch],
+        "metadata": [dict(s.metadata) for s in batch],
     }

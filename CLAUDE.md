@@ -161,3 +161,140 @@ Configure via `InferenceConfig.backend_type`: `"auto"` (default, probes `/versio
 - Ruff for linting and formatting (line-length 100)
 - pytest markers: `slow`, `gpu`, `integration`, `smoke`
 - Pre-commit hooks configured (ruff)
+
+## Execution Runbook — Remaining Pipeline Steps
+
+All code is implemented. The items below are **execution tasks** that require trained checkpoints, GPU time, network access, or running services. They form a dependency chain — each step's gate condition must be met before starting it.
+
+**When starting a new session**, check this list and execute the first unblocked item. Mark items done by changing `[ ]` to `[x]` with the date.
+
+### Phase 2 Data Preparation (gate: network + disk + CPU)
+
+- [ ] **Convert HF datasets to mmap** — Run for each dataset. CPU-only, no GPU needed. ~2-4 hours total.
+  ```bash
+  for ds in pubmedqa pubmedqa_artificial newsqa searchqa msmarco_passage narrativeqa; do
+    python scripts/convert_hf_to_mmap.py $ds --output-dir $DATA_DIR/mmap/phase2/$ds
+  done
+  # KILT Wikipedia (large — ~5.9M articles):
+  python scripts/convert_hf_to_mmap.py kilt_wikipedia --output-dir $DATA_DIR/mmap/phase2/kilt
+  # KILT tasks (11 tasks):
+  for task in kilt_nq kilt_hotpotqa kilt_fever kilt_zsre kilt_trex kilt_wow kilt_eli5 kilt_aidayago2 kilt_wned kilt_cweb kilt_triviaqa; do
+    python scripts/convert_hf_to_mmap.py $task --output-dir $DATA_DIR/mmap/phase2/$task
+  done
+  ```
+
+- [ ] **Convert memory datasets to mmap** — Requires HF access. CPU-only.
+  ```bash
+  for ds in msc share chronicles perltqa laps; do
+    python scripts/convert_memory_datasets.py $ds --output-dir $DATA_DIR/mmap/phase2/$ds
+  done
+  ```
+
+- [ ] **Extract dependency tags + build taxonomy** — CPU-only, scans local repos.
+  ```bash
+  python scripts/extract_dependency_tags.py repos --root-dir $DATA_DIR/repos --output-dir $DATA_DIR/taxonomy
+  # After KILT/PubMedQA conversion, add their tags:
+  python scripts/extract_dependency_tags.py kilt --metadata $DATA_DIR/mmap/phase2/kilt/metadata.parquet --output-dir $DATA_DIR/taxonomy
+  python scripts/extract_dependency_tags.py pubmedqa --metadata $DATA_DIR/mmap/phase2/pubmedqa/metadata.parquet --output-dir $DATA_DIR/taxonomy
+  ```
+
+### Phase 2 Git QA Generation (gate: vLLM server running + repos available)
+
+- [ ] **Generate git QA pairs** — Needs vLLM primary server on port 8090. Idempotent/resumable. GPU for inference, ~10-20 hours for 10K repos.
+  ```bash
+  make vllm-server  # start vLLM if not running
+  python scripts/generate_git_qa.py \
+    --repos-dir $DATA_DIR/repos \
+    --output-dir $DATA_DIR/mmap/phase2/git_qa \
+    --server-url http://localhost:8090/v1 \
+    --workers 8
+  ```
+
+### Phase 1 Evaluation (gate: Phase 1 Step 5 checkpoint exists)
+
+- [ ] **Run Eval 1 (post-Phase 1 baselines)** — GPU needed for encoder/decoder inference.
+  ```bash
+  python scripts/eval_phase1.py +eval.checkpoint=$CHECKPOINT_DIR/phase1_step5_best +eval.output_dir=$CHECKPOINT_DIR/eval_reports
+  ```
+
+### Phase 2 Training (gate: mmap datasets + Phase 1 checkpoint)
+
+Steps must run in order. Each produces a checkpoint consumed by the next.
+
+- [ ] **Phase 2 Step 1** — Live L0, PubMedQA + NewsQA. ~30K steps.
+  ```bash
+  scripts/run-train.sh --no-follow train-phase2-step1  # add compose service, or:
+  # docker compose run ... python scripts/train.py training=phase2_step1
+  ```
+- [ ] **Phase 2 Step 2** — Frozen L0, SearchQA. ~20K steps.
+- [ ] **L0 pre-computation** — Encode MS MARCO + KILT + repos with Step 2 checkpoint. ~55 GPU-hours.
+  ```bash
+  python scripts/precompute_l0.py --checkpoint $CHECKPOINT_DIR/phase2_step2_best \
+    --token-dir $DATA_DIR/mmap/phase2/msmarco_passage --output-dir $DATA_DIR/l0_cache/msmarco
+  python scripts/precompute_l0.py --checkpoint $CHECKPOINT_DIR/phase2_step2_best \
+    --token-dir $DATA_DIR/mmap/phase2/kilt --output-dir $DATA_DIR/l0_cache/kilt
+  ```
+- [ ] **Phase 2 Steps 3-4 + Tracks B/C** — Pre-computed L0, interleaved. Can run in parallel.
+- [ ] **Phase 2 Step 5** — Target LLM injection (Qwen3.5-35B QLoRA). Needs all tracks complete.
+
+### Phase 2 Evaluation (gate: Phase 2 checkpoints)
+
+- [ ] **Per-step eval** — Run after each step completes.
+  ```bash
+  python scripts/eval_phase2_step.py training=phase2_step1 +eval.checkpoint=...
+  ```
+- [ ] **Comprehensive eval (Eval 3)** — Run after Step 5. Go/no-go gate for Phase 3.
+  ```bash
+  python scripts/eval_phase2_comprehensive.py +eval.checkpoint=$CHECKPOINT_DIR/phase2_step5_best
+  ```
+- [ ] **Topic embedding ablation** — Run after Step 3+ (when topic embeddings are enabled).
+  ```bash
+  python scripts/eval_topic_embeddings.py +eval.checkpoint=...
+  ```
+- [ ] **Retention-ratio Pareto sweep** — Uses pre-computed L0 sub-selection at [0.50, 0.10, 0.05, 0.02, 0.01]. Part of comprehensive eval.
+
+### Phase 3 Data Preparation (gate: network + repos)
+
+- [ ] **Download SWE-bench trajectories**
+  ```bash
+  python scripts/download_swe_trajectories.py --datasets openhands --output-dir $DATA_DIR/trajectories
+  ```
+- [ ] **Filter trajectories** — CPU-only, fast.
+  ```bash
+  python scripts/filter_trajectories.py \
+    --input $DATA_DIR/trajectories/openhands_trajectories.jsonl \
+    --output $DATA_DIR/trajectories/openhands_filtered.jsonl
+  ```
+
+### Phase 3 Encoding (gate: Phase 2 best checkpoint + filtered trajectories + repos)
+
+- [ ] **Encode SWE-bench repos** — Pre-compute BgKIT embeddings with blob-SHA dedup. ~24 GPU-hours.
+  ```bash
+  python scripts/encode_swe_repos.py \
+    --checkpoint $CHECKPOINT_DIR/phase2_step5_best \
+    --trajectories $DATA_DIR/trajectories/openhands_filtered.jsonl \
+    --repos-dir $DATA_DIR/swe_repos --output-dir $DATA_DIR/swe_embeddings
+  ```
+
+### Phase 3 Training (gate: encoded repos + filtered trajectories)
+
+- [ ] **Phase 3 Step 2** — Distillation from Llama-70B teacher. ~100K steps.
+- [ ] **Phase 3 Step 3** — Distillation on Qwen3.5-35B target (QLoRA). ~50K steps.
+
+### Phase 3 Evaluation (gate: Phase 3 checkpoint + SWE-bench repos cloned)
+
+- [ ] **SWE-bench eval (Lite)** — Interactive agent loop, ~300 instances. Start here for fast iteration.
+  ```bash
+  python scripts/eval_swebench.py generate \
+    --checkpoint $CHECKPOINT_DIR/phase3_best \
+    --repos-dir $DATA_DIR/swe_repos --subset lite
+  python scripts/eval_swebench.py evaluate --predictions predictions.jsonl
+  ```
+- [ ] **SWE-bench eval (Verified)** — 500 instances, final numbers.
+- [ ] **Knowledge source ablation** — With/without BgKIT context.
+  ```bash
+  python scripts/eval_swebench.py ablation \
+    --checkpoint $CHECKPOINT_DIR/phase3_best \
+    --repos-dir $DATA_DIR/swe_repos --output-dir ablation_results
+  ```
+- [ ] **Exploration-dropout sweep** — Train 3 models with p=0.5, 0.8, 1.0, evaluate all 3.

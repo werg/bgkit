@@ -1,0 +1,7 @@
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2/narrativeqa
+max_document_len: 65536
+max_question_len: 256
+max_answer_len: 512
+# NarrativeQA: long-document comprehension (avg 62K tokens)
+# Abstractive QA - only 30% direct spans, tests deep comprehension
+# L0 compression to ~625 survivors at 0.01 retention

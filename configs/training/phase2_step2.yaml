@@ -1,0 +1,28 @@
+# Phase 2 Step 2: SearchQA with frozen L0 and L1 introduction
+phase: phase2
+step: step2
+optimizer: adamw
+max_steps: 20000
+warmup_steps: 1000
+lr: 1.0e-4
+encoder_lr: 5.0e-5
+decoder_lr: 5.0e-5
+max_batch_tokens: 16384
+eval_every: 1000
+save_every: 5000
+datasets:
+  - searchqa
+# Resume from Step 1 checkpoint
+phase1_checkpoint: auto
+use_precomputed_l0: false
+freeze:
+  decoder: false
+  l0_compressor: true  # L0 frozen for L1 stability
+  projection_block: false
+  encoder: false
+curriculum:
+  target_ratio_start: 0.05
+  target_ratio_end: 0.05
+  target_ratio_ramp_steps: 1
+topic_embeddings:
+  enabled: false

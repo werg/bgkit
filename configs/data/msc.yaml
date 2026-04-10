@@ -1,0 +1,7 @@
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2/msc
+max_document_len: 8192
+max_question_len: 256
+max_answer_len: 512
+# MSC: Multi-Session Chat - 5 sessions per conversation
+# ~237K examples, persona tracking across sessions
+# Memory type: persona

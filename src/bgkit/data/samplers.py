@@ -167,3 +167,110 @@ class LengthSortedBatchSampler(Sampler[list[int]]):
 
     def __len__(self) -> int:
         return len(self._batches)
+
+
+class QueryAwareBatchSampler(Sampler[list[int]]):
+    """Samples QA examples while preserving query-centric locality.
+
+    The dataset is expected to expose ``metadata`` with optional ``query_id``.
+    When ``query_id`` is absent the sampler falls back to plain shuffled indices.
+
+    Supports curriculum-based distractor sampling: the number of distractor
+    documents per query grows over training steps.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        *,
+        shuffle: bool = True,
+        seed: int = 42,
+        n_distractors_start: int = 0,
+        n_distractors_end: int = 0,
+        distractor_ramp_steps: int = 1,
+    ):
+        self._dataset = dataset
+        self._batch_size = batch_size
+        self._shuffle = shuffle
+        self._seed = seed
+        self._epoch = 0
+        self._step = 0
+        self._n_distractors_start = n_distractors_start
+        self._n_distractors_end = n_distractors_end
+        self._distractor_ramp_steps = max(distractor_ramp_steps, 1)
+        self._query_to_indices = self._build_query_groups()
+        self._all_indices = list(range(len(self._dataset)))
+
+    def _build_query_groups(self) -> dict[str, list[int]]:
+        groups: dict[str, list[int]] = {}
+        for idx in range(len(self._dataset)):
+            sample = self._dataset[idx]
+            query_id = str(sample.metadata.get("query_id", sample.sample_id))
+            groups.setdefault(query_id, []).append(idx)
+        return groups
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    def set_step(self, step: int) -> None:
+        """Update training step for curriculum distractor count."""
+        self._step = step
+
+    @property
+    def _n_distractors(self) -> int:
+        """Current number of distractors based on curriculum."""
+        if self._n_distractors_end <= 0:
+            return 0
+        progress = min(1.0, self._step / self._distractor_ramp_steps)
+        n = self._n_distractors_start + (
+            self._n_distractors_end - self._n_distractors_start
+        ) * progress
+        return int(n)
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self._seed + self._epoch)
+        query_ids = list(self._query_to_indices)
+        if self._shuffle:
+            rng.shuffle(query_ids)
+
+        n_dist = self._n_distractors
+
+        # Pre-build per-query distractor pools once per epoch (avoids O(N)
+        # list comprehension inside the hot loop).
+        distractor_pool: list[int] | None = None
+        if n_dist > 0:
+            distractor_pool = self._all_indices  # flat list, built at init
+
+        batch: list[int] = []
+        for query_id in query_ids:
+            indices = list(self._query_to_indices[query_id])
+            if self._shuffle:
+                rng.shuffle(indices)
+
+            if n_dist > 0 and distractor_pool:
+                # Sample distractors from the global pool.  A sampled index
+                # may belong to the same query — that's fine; the overlap is
+                # negligible for large datasets and avoids per-query filtering.
+                distractors = rng.sample(
+                    distractor_pool,
+                    min(n_dist, len(distractor_pool)),
+                )
+                indices.extend(distractors)
+                if self._shuffle:
+                    rng.shuffle(indices)
+
+            for idx in indices:
+                batch.append(idx)
+                if len(batch) == self._batch_size:
+                    yield batch
+                    batch = []
+        if batch:
+            yield batch
+
+    def __len__(self) -> int:
+        total = sum(len(indices) for indices in self._query_to_indices.values())
+        n_dist = self._n_distractors
+        if n_dist > 0:
+            total += len(self._query_to_indices) * n_dist
+        return (total + self._batch_size - 1) // self._batch_size

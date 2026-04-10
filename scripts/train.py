@@ -49,6 +49,19 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.compression import CompressionTrainer
 
         return CompressionTrainer(cfg)
+    elif phase == "phase2":
+        step = cfg.get("training", {}).get("step", None)
+        if step == "step5":
+            from bgkit.training.phase2.kr_step5_trainer import KRStep5Trainer
+
+            return KRStep5Trainer(cfg)
+        from bgkit.training.phase2.kr_trainer import KRTrainer
+
+        return KRTrainer(cfg)
+    elif phase == "phase3":
+        from bgkit.training.phase3.distillation_trainer import DistillationTrainer
+
+        return DistillationTrainer(cfg)
     else:
         raise NotImplementedError(f"Training phase '{phase}' not yet implemented")
 

@@ -17,26 +17,26 @@ import torch.nn as nn
 class TargetLMWithInjection(nn.Module):
     """Target LLM wrapper supporting BgKIT vector injection via tool-call frames.
 
-    Projected BgKIT survivors are injected as tool-call response embeddings:
-        <tool_call>bgkit_repo_contents</tool_call>
-        <tool_response>[projected survivor vectors]</tool_response>
+    Projected BgKIT survivors are injected as tool response embeddings within
+    Qwen3.5's native tool-call format:
+
+        [assistant] <tool_call>
+        {"name": "bgkit_retrieve_context", "arguments": {"source": "compressed_knowledge"}}
+        </tool_call>
+        [tool] [projected survivor vectors replace placeholder tokens here]
 
     This reuses the model's existing tool-call understanding and makes
     knowledge sources individually addressable.
 
-    Implementation note — chat template integration:
-        The injection_positions must correspond to the exact token span of the
-        <tool_response> content within a tokenizer.apply_chat_template() output.
-        Use the same sentinel-based boundary detection pattern as ChatReproDataset
-        (see src/bgkit/data/datasets/chat_repro_dataset.py) to locate the tool
-        response region:
-        1. Build messages with a sentinel string as the tool response content
-        2. Call tokenizer.apply_chat_template(messages, tokenize=False)
-        3. Split on sentinel to find prefix/suffix boundaries
-        4. Tokenize piecewise to get exact token positions
-        The tool_response_start/end_token_id constructor args are insufficient
-        for this — they identify the *markers* but not the content span between
-        them. Consider replacing with a template-aware position finder.
+    Position detection uses sentinel-based boundary detection (same pattern as
+    ChatReproDataset): build messages with CONTENT_SENTINEL as tool response
+    content, render via apply_chat_template(tokenize=False), split on sentinel
+    to find prefix/suffix boundaries, tokenize piecewise. See
+    ``_build_injection_frame()`` in ``kr_step5_trainer.py``.
+
+    The tool_response_start/end_token_id constructor args are retained for
+    reference (e.g., for detecting tool response boundaries in generation)
+    but position finding is done externally via the sentinel pattern.
     """
 
     def __init__(
@@ -81,7 +81,7 @@ class TargetLMWithInjection(nn.Module):
         projected_survivors: torch.Tensor | None = None,
         injection_positions: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ):
         """Forward pass with optional BgKIT injection.
 
         Args:
@@ -91,7 +91,18 @@ class TargetLMWithInjection(nn.Module):
             **kwargs: Passed to the underlying model.
 
         Returns:
-            Model output (logits).
+            Model output (CausalLMOutput with logits, loss, etc.).
         """
-        # TODO: Get embeddings from model, inject survivors, run forward pass
-        raise NotImplementedError
+        if projected_survivors is not None and injection_positions is not None:
+            # Get base embeddings from the model's embedding layer
+            embed_layer = self.model.get_input_embeddings()
+            input_embeds = embed_layer(input_ids)
+            # Inject BgKIT survivors at specified positions
+            input_embeds = self.inject_survivors(
+                input_ids, input_embeds, projected_survivors, injection_positions,
+            )
+            # Forward with embeddings instead of token ids
+            kwargs.pop("input_ids", None)
+            return self.model(inputs_embeds=input_embeds, **kwargs)
+
+        return self.model(input_ids=input_ids, **kwargs)

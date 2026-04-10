@@ -1,0 +1,6 @@
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2/pubmedqa
+max_document_len: 4096
+max_question_len: 256
+max_answer_len: 512
+# PubMedQA: biomedical QA with yes/no/maybe classification + long answers
+# Tags: MeSH terms extracted from metadata

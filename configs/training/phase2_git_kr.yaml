@@ -1,0 +1,29 @@
+# Phase 2 Track B: Git history knowledge retrieval
+phase: phase2
+step: git_kr
+optimizer: adamw
+max_steps: 50000
+warmup_steps: 2000
+lr: 5.0e-5
+encoder_lr: 2.0e-5
+decoder_lr: 2.0e-5
+max_batch_tokens: 16384
+eval_every: 2000
+save_every: 10000
+datasets:
+  - git_history
+# Phase 1 checkpoint for encoder + ICE
+phase1_checkpoint: auto
+use_precomputed_l0: true
+l0_cache_dir: ${oc.env:DATA_DIR}/l0_cache/repos
+freeze:
+  decoder: false
+  l0_compressor: true
+curriculum:
+  target_ratio_start: 0.05
+  target_ratio_end: 0.02
+  target_ratio_ramp_steps: 30000
+topic_embeddings:
+  enabled: true
+  taxonomy_path: ${oc.env:DATA_DIR}/taxonomy/taxonomy.json
+  positions_per_tag: 8

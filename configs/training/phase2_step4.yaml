@@ -1,0 +1,28 @@
+# Phase 2 Step 4: KILT + NarrativeQA multi-task knowledge retrieval
+phase: phase2
+step: step4
+optimizer: adamw
+max_steps: 100000
+warmup_steps: 5000
+lr: 3.0e-5
+decoder_lr: 1.0e-5
+max_batch_tokens: 16384
+eval_every: 2000
+save_every: 10000
+datasets:
+  - narrativeqa
+  - kilt
+# Precomputed L0 for KILT Wikipedia articles
+use_precomputed_l0: true
+l0_cache_dir: ${oc.env:DATA_DIR}/l0_cache/kilt
+freeze:
+  decoder: false
+  l0_compressor: true
+curriculum:
+  target_ratio_start: 0.05
+  target_ratio_end: 0.01
+  target_ratio_ramp_steps: 50000
+topic_embeddings:
+  enabled: true
+  taxonomy_path: ${oc.env:DATA_DIR}/taxonomy/taxonomy.json
+  positions_per_tag: 8

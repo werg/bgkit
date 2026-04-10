@@ -1,0 +1,64 @@
+# Phase 2 Step 5: Target LLM injection (Qwen3.5-35B QLoRA)
+phase: phase2
+step: step5
+optimizer: adamw
+max_steps: 100000
+warmup_steps: 5000
+lr: 1.0e-4
+decoder_lr: 2.0e-4
+encoder_lr: 1.0e-5
+max_batch_tokens: 12288
+eval_every: 2000
+save_every: 10000
+datasets:
+  - kilt
+  - git_history
+  - msc
+  - share
+  - chronicles
+# Multi-track data mixing weights
+data_mixing:
+  track_a: 0.40  # IR benchmarks (KILT)
+  track_b: 0.15  # Git history
+  track_c: 0.15  # User memory
+  reconstruction: 0.05  # Reconstruction regularizer
+  no_injection: 0.25  # Baseline preservation
+# Precomputed L0
+use_precomputed_l0: true
+l0_cache_dir: ${oc.env:DATA_DIR}/l0_cache
+freeze:
+  decoder: false
+  target_lm_base: false
+  l0_compressor: true
+# Target LLM config
+target_lm:
+  backbone_name: Qwen/Qwen3.5-35B
+  quantization: 4bit
+  lora_rank: 64
+  lora_alpha: 128
+  lora_target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+# Projection extension: 1024 -> 2560
+projection_extension:
+  source_dim: 1024
+  target_dim: 2560
+  init: block_diagonal
+curriculum:
+  target_ratio_start: 0.05
+  target_ratio_end: 0.01
+  target_ratio_ramp_steps: 50000
+# Decoder regularizer on subset
+decoder_regularizer:
+  enabled: true
+  weight: 0.1
+  fraction: 0.2
+topic_embeddings:
+  enabled: true
+  taxonomy_path: ${oc.env:DATA_DIR}/taxonomy/taxonomy.json
+  positions_per_tag: 8

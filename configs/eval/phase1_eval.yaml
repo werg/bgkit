@@ -1,0 +1,24 @@
+# Post-Phase 1 evaluation config
+# Usage: python scripts/eval_phase1.py +eval=phase1_eval +eval.checkpoint=<path>
+
+checkpoint: null  # Set via CLI
+output_dir: ${checkpoint_dir}/eval_reports
+
+# Evaluation parameters
+max_eval_samples: 500
+batch_size: 4
+
+# Compression curve ratios
+compression_ratios:
+  - 0.50
+  - 0.25
+  - 0.10
+  - 0.05
+  - 0.02
+
+# RAG baseline
+rag_embedding_model: all-MiniLM-L6-v2
+rag_reranker_model: null  # Set to cross-encoder model name to enable
+
+# WandB
+wandb: false

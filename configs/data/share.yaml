@@ -1,0 +1,6 @@
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2/share
+max_document_len: 8192
+max_question_len: 256
+max_answer_len: 512
+# SHARE: 4 memory annotation types
+# ~119K utterances: persona(80K) + personal_events(12K) + mutual_events(21K) + shared_memories(4K)
