@@ -22,6 +22,14 @@ x-gpu-common: &gpu-common
     # Without this, PyTorch pre-allocates huge contiguous blocks that push
     # other processes into swap on the DGX Spark's shared 128 GB pool.
     - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    # sm_121 stream-capture interaction: load_binary on a new kernel variant
+    # inside a captured stream throws CUDA error 800 ("operation not permitted
+    # when stream is capturing"). Disable inductor CUDA graphs to prevent
+    # captures from being active when fla compiles new kernel variants.
+    - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+    - TORCH_COMPILE_DISABLE=1
+    # TMA broken on sm_121 in fla; explicit disable as defensive measure
+    - FLA_USE_TMA=0
   volumes:
     - ${DATA_DIR}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
@@ -110,7 +118,7 @@ services:
 
   train-phase1-step5:
     <<: *gpu-common
-    command: ["scripts/train.py", "+experiment=phase1_step5"]
+    command: ["scripts/train.py", "+experiment=phase1_step5", "++training.reset_wandb=true"]
 
   ice-labels:
     <<: *gpu-common
