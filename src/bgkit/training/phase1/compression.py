@@ -187,6 +187,21 @@ class CompressionTrainer(BaseTrainer):
         # re-recording overhead. PeftModel isinstance fix landed in decoder.py
         # for when this becomes viable.
 
+        # Optional Liger Kernel fused kernels (RMSNorm / SwiGLU / RoPE +
+        # fused linear+CE). Gated on ``training.use_liger`` (default True);
+        # no-op when liger-kernel is not installed.
+        if tcfg.get("use_liger", True):
+            from bgkit.utils.liger_integration import apply_liger_to_qwen35
+
+            enc_patched = apply_liger_to_qwen35(self.encoder)
+            dec_patched = apply_liger_to_qwen35(self.decoder)
+            self.decoder.enable_liger_ce(True)
+            logger.info(
+                "liger_kernel_applied",
+                encoder_modules=enc_patched,
+                decoder_modules=dec_patched,
+            )
+
         # BaseTrainer uses self.model for logging
         self.model = self.decoder
 
@@ -1084,37 +1099,29 @@ class CompressionTrainer(BaseTrainer):
                     ev_l1_end = torch.cuda.Event(enable_timing=True)
                     ev_l1_start.record()
 
-                # Per-sample L1 (fast — handles both direct_l1 and regular)
+                # Per-sample L1 scoring + encoder forward. ALL samples go
+                # through L1 (including direct_l1 which only skipped L0).
                 group_survivors = []
                 group_surv_masks = []
                 for d in group:
-                    if d['direct_l1']:
-                        # direct_l1: survivors are already final
-                        surv = d['survivors'].unsqueeze(0)  # (1, n_surv, D)
-                        mask = torch.ones(
-                            1, surv.size(1), dtype=torch.bool, device=self.device,
-                        )
-                    else:
-                        # Regular: L1 scoring + encoder forward
-                        l0_surv = d['survivors']
-                        l1_input = l0_surv.unsqueeze(0)
-                        l1_mask = torch.ones(
-                            1, l0_surv.size(0), dtype=torch.bool, device=self.device,
-                        )
-                        l1_survivor_mask = self._score_and_select(
-                            l1_input, l1_mask, level="l1",
-                        )
-                        l1_out = self.encoder(
-                            input_embeddings=l1_input,
-                            survivor_mask=l1_survivor_mask,
-                            attention_mask=l1_mask,
-                            prompt_embeddings=d['prompt_emb'],
-                            prompt_attention_mask=prompt_mask[d['idx']:d['idx'] + 1],
-                        )
-                        surv = l1_out.survivor_embeddings  # (1, n_surv, D)
-                        mask = l1_out.survivor_attention_mask  # (1, n_surv)
-                    group_survivors.append(surv)
-                    group_surv_masks.append(mask)
+                    surv_input = d['survivors']
+                    l1_input = surv_input.unsqueeze(0)
+                    l1_mask = torch.ones(
+                        1, surv_input.size(0), dtype=torch.bool,
+                        device=self.device,
+                    )
+                    l1_survivor_mask = self._score_and_select(
+                        l1_input, l1_mask, level="l1",
+                    )
+                    l1_out = self.encoder(
+                        input_embeddings=l1_input,
+                        survivor_mask=l1_survivor_mask,
+                        attention_mask=l1_mask,
+                        prompt_embeddings=d['prompt_emb'],
+                        prompt_attention_mask=prompt_mask[d['idx']:d['idx'] + 1],
+                    )
+                    group_survivors.append(l1_out.survivor_embeddings)
+                    group_surv_masks.append(l1_out.survivor_attention_mask)
 
                 if self._profile_enabled:
                     ev_l1_end.record()
@@ -1468,44 +1475,43 @@ class CompressionTrainer(BaseTrainer):
             n_files = int(file_count[b].item())
             prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
 
+            # Compression: L0 (or direct_l1 skip) → L1 scoring → encoder
             if direct_l1_flags[b]:
                 if n_files != 1:
                     raise ValueError(
                         f"direct_l1 sample {b} has file_count={n_files}, expected 1"
                     )
-                sample_survivors = self._compress_single_direct_l1(
+                surv = self._compress_single_direct_l1(
                     file_ids[b, 0].unsqueeze(0),
                     file_masks[b, 0].unsqueeze(0),
                     prompt_emb_b,
                     prompt_mask[b:b + 1],
                     bgkit_embed,
-                ).unsqueeze(0)
-                sample_surv_mask = torch.ones(
-                    1, sample_survivors.size(1),
-                    dtype=torch.bool, device=self.device,
                 )
             else:
-                l0_surv = self._compress_l0_batched(
+                surv = self._compress_l0_batched(
                     file_ids[b], file_masks[b], n_files,
                     prompt_emb_b, prompt_mask[b:b + 1],
                     bgkit_embed,
                 )
-                l1_input = l0_surv.unsqueeze(0)
-                l1_mask = torch.ones(
-                    1, l0_surv.size(0), dtype=torch.bool, device=self.device,
-                )
-                l1_survivor_mask = self._score_and_select(
-                    l1_input, l1_mask, level="l1",
-                )
-                l1_out = self.encoder(
-                    input_embeddings=l1_input,
-                    survivor_mask=l1_survivor_mask,
-                    attention_mask=l1_mask,
-                    prompt_embeddings=prompt_emb_b,
-                    prompt_attention_mask=prompt_mask[b:b + 1],
-                )
-                sample_survivors = l1_out.survivor_embeddings
-                sample_surv_mask = l1_out.survivor_attention_mask
+
+            # L1 scoring + encoder (all samples, including direct_l1)
+            l1_input = surv.unsqueeze(0)
+            l1_mask = torch.ones(
+                1, surv.size(0), dtype=torch.bool, device=self.device,
+            )
+            l1_survivor_mask = self._score_and_select(
+                l1_input, l1_mask, level="l1",
+            )
+            l1_out = self.encoder(
+                input_embeddings=l1_input,
+                survivor_mask=l1_survivor_mask,
+                attention_mask=l1_mask,
+                prompt_embeddings=prompt_emb_b,
+                prompt_attention_mask=prompt_mask[b:b + 1],
+            )
+            sample_survivors = l1_out.survivor_embeddings
+            sample_surv_mask = l1_out.survivor_attention_mask
 
             sample_loss_mask = (
                 loss_mask_batch[b:b + 1] if loss_mask_batch is not None else None
