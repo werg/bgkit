@@ -1099,8 +1099,11 @@ class CompressionTrainer(BaseTrainer):
                     ev_l1_end = torch.cuda.Event(enable_timing=True)
                     ev_l1_start.record()
 
-                # Per-sample L1 scoring + encoder forward. ALL samples go
-                # through L1 (including direct_l1 which only skipped L0).
+                # Per-sample L1 scoring. ALL samples score through ICE at L1
+                # level (feeds the calibrator). direct_l1 samples then use
+                # their survivors directly (no extra encoder forward — too
+                # expensive on memory). Regular samples get the full L1
+                # encoder + projection.
                 group_survivors = []
                 group_surv_masks = []
                 for d in group:
@@ -1113,15 +1116,26 @@ class CompressionTrainer(BaseTrainer):
                     l1_survivor_mask = self._score_and_select(
                         l1_input, l1_mask, level="l1",
                     )
-                    l1_out = self.encoder(
-                        input_embeddings=l1_input,
-                        survivor_mask=l1_survivor_mask,
-                        attention_mask=l1_mask,
-                        prompt_embeddings=d['prompt_emb'],
-                        prompt_attention_mask=prompt_mask[d['idx']:d['idx'] + 1],
-                    )
-                    group_survivors.append(l1_out.survivor_embeddings)
-                    group_surv_masks.append(l1_out.survivor_attention_mask)
+                    if d['direct_l1']:
+                        # Apply L1 mask to get selected survivors directly
+                        selected = l1_input[0][l1_survivor_mask[0]]
+                        surv = selected.unsqueeze(0)
+                        mask = torch.ones(
+                            1, selected.size(0), dtype=torch.bool,
+                            device=self.device,
+                        )
+                    else:
+                        l1_out = self.encoder(
+                            input_embeddings=l1_input,
+                            survivor_mask=l1_survivor_mask,
+                            attention_mask=l1_mask,
+                            prompt_embeddings=d['prompt_emb'],
+                            prompt_attention_mask=prompt_mask[d['idx']:d['idx'] + 1],
+                        )
+                        surv = l1_out.survivor_embeddings
+                        mask = l1_out.survivor_attention_mask
+                    group_survivors.append(surv)
+                    group_surv_masks.append(mask)
 
                 if self._profile_enabled:
                     ev_l1_end.record()
@@ -1495,7 +1509,8 @@ class CompressionTrainer(BaseTrainer):
                     bgkit_embed,
                 )
 
-            # L1 scoring + encoder (all samples, including direct_l1)
+            # L1 scoring (all samples — feeds calibrator). direct_l1
+            # samples apply the mask directly; regular get full encoder.
             l1_input = surv.unsqueeze(0)
             l1_mask = torch.ones(
                 1, surv.size(0), dtype=torch.bool, device=self.device,
@@ -1503,15 +1518,23 @@ class CompressionTrainer(BaseTrainer):
             l1_survivor_mask = self._score_and_select(
                 l1_input, l1_mask, level="l1",
             )
-            l1_out = self.encoder(
-                input_embeddings=l1_input,
-                survivor_mask=l1_survivor_mask,
-                attention_mask=l1_mask,
-                prompt_embeddings=prompt_emb_b,
-                prompt_attention_mask=prompt_mask[b:b + 1],
-            )
-            sample_survivors = l1_out.survivor_embeddings
-            sample_surv_mask = l1_out.survivor_attention_mask
+            if direct_l1_flags[b]:
+                selected = l1_input[0][l1_survivor_mask[0]]
+                sample_survivors = selected.unsqueeze(0)
+                sample_surv_mask = torch.ones(
+                    1, selected.size(0), dtype=torch.bool,
+                    device=self.device,
+                )
+            else:
+                l1_out = self.encoder(
+                    input_embeddings=l1_input,
+                    survivor_mask=l1_survivor_mask,
+                    attention_mask=l1_mask,
+                    prompt_embeddings=prompt_emb_b,
+                    prompt_attention_mask=prompt_mask[b:b + 1],
+                )
+                sample_survivors = l1_out.survivor_embeddings
+                sample_surv_mask = l1_out.survivor_attention_mask
 
             sample_loss_mask = (
                 loss_mask_batch[b:b + 1] if loss_mask_batch is not None else None

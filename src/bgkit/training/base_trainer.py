@@ -745,9 +745,8 @@ class BaseTrainer(ABC):
         if control_file is None:
             control_file = checkpoint_dir / "control.json"
         control_path = Path(control_file)
-        if control_path.exists():
-            control_path.write_text("{}\n")
-        live_config = LiveConfig(control_path)
+        phase = getattr(tcfg, "phase", None)
+        live_config = LiveConfig(control_path, namespace=phase)
 
         # Checkpoint pruning
         prune_cfg = tcfg.get("checkpoint_pruning", {})

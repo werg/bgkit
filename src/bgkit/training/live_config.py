@@ -13,21 +13,28 @@ logger = structlog.get_logger()
 class LiveConfig:
     """Watches a JSON control file for mid-run hyperparameter changes.
 
-    The control file is optional; if it doesn't exist, ``poll()`` returns ``{}``.
+    The control file is shared across all training phases. Each phase reads
+    only its own section, keyed by ``namespace`` (typically the training
+    phase name like ``phase1_step5``). Unrelated phases' settings are ignored.
+
+    Control file format::
+
+        {
+            "phase1_step5": {"eval_every": 500, "save_every": 500, "lr": 5e-5},
+            "phase1_step4": {"lr": 3e-5}
+        }
+
     Only keys that changed since the last poll are returned.
-
-    Control file format (any subset of keys)::
-
-        {"lr": 5e-5, "w_repro": 0.8, "early_stopping_patience": 10}
     """
 
-    def __init__(self, path: Path | None) -> None:
+    def __init__(self, path: Path | None, namespace: str | None = None) -> None:
         self._path = Path(path) if path is not None else None
+        self._namespace = namespace
         self._last_mtime: float = 0.0
         self._last_values: dict = {}
 
     def poll(self) -> dict:
-        """Check the control file and return changed keys.
+        """Check the control file and return changed keys for this namespace.
 
         Returns:
             Dict of keys whose values changed since last poll.
@@ -46,23 +53,38 @@ class LiveConfig:
 
         try:
             raw = self._path.read_text()
-            values = json.loads(raw)
+            top = json.loads(raw)
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("live_config_parse_error", path=str(self._path), error=str(exc))
-            # Don't update _last_mtime so we re-read on next poll even if
-            # the file is corrected without an mtime change.
             return {}
 
-        if not isinstance(values, dict):
+        if not isinstance(top, dict):
             logger.warning("live_config_not_dict", path=str(self._path))
             return {}
 
         self._last_mtime = stat.st_mtime
 
+        # Extract this phase's section; ignore other phases
+        if self._namespace and self._namespace in top:
+            values = top[self._namespace]
+            if not isinstance(values, dict):
+                logger.warning(
+                    "live_config_namespace_not_dict",
+                    namespace=self._namespace,
+                    path=str(self._path),
+                )
+                return {}
+        elif self._namespace:
+            # Namespace specified but not present in file — nothing for us
+            values = {}
+        else:
+            # No namespace (legacy): use the top-level dict directly
+            values = top
+
         changed = {k: v for k, v in values.items() if self._last_values.get(k) != v}
         self._last_values = values
 
         if changed:
-            logger.info("live_config_changed", changes=changed)
+            logger.info("live_config_changed", namespace=self._namespace, changes=changed)
 
         return changed
