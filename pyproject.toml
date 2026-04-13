@@ -34,6 +34,7 @@ gpu = [
     "bitsandbytes",
     "einops",
     "flash-linear-attention",
+    "liger-kernel>=0.5",
 ]
 dev = [
     "pytest",
