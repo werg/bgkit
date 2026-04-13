@@ -4,7 +4,6 @@ defaults:
   - model/ice
   - model/decoder
   - model/projection
-  - model/target_lm
   - data/repos
   - data/commits
   - data/tasks

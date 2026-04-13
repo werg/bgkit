@@ -12,11 +12,12 @@ Phase 1 trains BgKIT's compression on code repositories, establishing the L0/L1 
 
 | Component | Base | Parameters | Role |
 |---|---|---|---|
-| BgKIT compressor | Qwen3.5-0.8B-Base layers 0–22 | ~1,040M (fwd + backward DeltaNet) | Compressor (shared weights, levels 0 and 1). Hidden dim 1024. |
-| Projection block | Qwen3.5-0.8B-Base layer 23 | ~35M | Context-aware projection from compressor output to target embedding space. Full transformer block: attends to all positions, outputs for survivors only. Extended via block-diagonal initialization for higher-dim targets. |
-| Reconstruction decoder | Qwen3.5-0.8B | ~800M | Co-trained decoder, provides primary training signal |
-| ICE | Custom 1D CNN | ~0.7M | Information content estimator for survivor selection |
-| Target LLM | Qwen3.5-35B | QLoRA only | 35B total / ~3B active MoE. 64-layer hybrid: 16 × (3 × gated DeltaNet-MoE + 1 × gated attention-MoE). 262K context. Hidden dim 2560. Loaded in 4-bit (~18 GB) due to memory constraints; LoRA adapters train in BF16. Same architecture family as encoder/decoder. |
+| BgKIT compressor | Qwen3.5-0.8B-Base layers 0–22 | ~770M | Compressor (shared base weights, levels 0 and 1, per-level LoRA in KB-scale). Hidden dim 1024. 18 DeltaNet + 5 full-attention layers. Bidirectionalized via unmasked full attention + bidirectional conv1d on DeltaNet layers — no parameter increase. |
+| Projection block | Qwen3.5-0.8B-Base layer 23 | ~35M | Context-aware projection from compressor output into the decoder's 1024-dim token-embedding space. Full transformer block: attends to all positions, outputs for survivors only. |
+| Decoder | Qwen3.5-0.8B | ~800M | The serving model. Co-trained from Phase 1 onward to reconstruct content and answer questions from BgKIT survivors. |
+| ICE | Custom 1D CNN | ~0.7M | Information content estimator for survivor selection. |
+
+Note: The decoder is Qwen3.5-0.8B throughout — there is no separate larger target LLM. Encoder and decoder share the tokenizer (`Qwen/Qwen3.5-0.8B-Base`) and hidden dimension, so the projection block stays at 1024 dim and never needs dimensional extension. LoRA on the decoder is available but optional and is primarily used in Phase 1 Step 3 and Phase 2 KB Stages B/C to keep decoder drift under control.
 
 ## Data
 
@@ -99,21 +100,15 @@ Introduce the drop-flag mechanism with all four core reconstruction objectives, 
 
 **Decoder adaptation strategy:** Begin with full fine-tuning. Monitor survivor embedding quality (cosine similarity to nearest token embeddings in BgKIT's vocabulary). If embeddings drift substantially from the token manifold, switch to high-rank LoRA with learning rate throttling on the decoder.
 
-### Frozen-Target Projection Alignment (Phase 2a prep)
-
-**Sub-step a — Text regurgitation.** Frozen Qwen3.5-35B receives projected BgKIT survivors and generates the original text. Only the projection block trains; the compressor is frozen. The projection block is warm-initialized from joint block pretraining (Prerequisite 2), giving it a strong starting point. High volume, simple data. Aligns the projection output to the target LLM's embedding space.
-
-**Sub-step b — Content tasks.** Unfreeze the compressor at a low learning rate. Train on description generation and structural QA in tool-call format through the frozen target LLM. The projection block trains at a higher rate.
-
 ### Phase 1 Quality Gate
 
 Before proceeding to Phase 2, verify:
 
 - Decoder reconstruction loss at target compression ratios (and functional equivalence — does reconstructed code parse?).
 - Decoder produces reasonable repository descriptions from compressed survivors.
-- Frozen Qwen3.5-35B reproduces original text from projection-block-projected survivors (3a alignment).
-- Frozen Qwen3.5-35B generates coherent descriptions from projection-block-projected survivors (3b).
 - Reconstruction and description quality across a range of compression ratios — where does it degrade gracefully vs. collapse?
+
+Because the decoder is co-trained alongside BgKIT throughout Phase 1 (rather than being a separate frozen target that the projection block must align to), there is no separate projection-alignment sub-phase. The projection block's job is entirely handled by joint block pretraining (Prerequisite 2) plus ongoing gradient signal from the decoder reconstruction loss.
 
 ### Eval 1: Post-Phase 1 Baseline Comparisons (`eval_phase1`)
 
@@ -149,18 +144,22 @@ Run immediately after Phase 1 Step 5 completes, before starting Phase 2. This is
 
 ## Phase 2: Knowledge Retrieval
 
-**Goal:** Pivot from code compression to knowledge-intensive retrieval across three domains: standard IR benchmarks, git history knowledge retrieval, and user memory from conversations. Train BgKIT to compress document collections into dense embeddings from which a decoder can answer questions, scaling from single short documents to multi-million-article corpora. Push compression to extreme ratios (0.01 retention).
+**Goal:** Pivot from code compression to knowledge-intensive retrieval. Train BgKIT to compress document collections into dense embeddings from which the 0.8B decoder can answer questions, scaling from single short documents to KB-scale navigable corpora. Push compression to extreme ratios (0.01 retention).
 
-**Three parallel tracks after initial steps:**
-- **Track A — IR benchmarks:** Standard knowledge retrieval (PubMedQA → SearchQA → MS MARCO → KILT). Validates compression at scale against established baselines.
+Phase 2 has two complementary strands that share the same encoder and decoder:
+
+- **Flat retrieval (Steps 1-4 + Tracks B/C).** The trainer hands the decoder a fixed list of documents per sample — this is the curriculum that validates BgKIT's compression-and-QA pipeline against established IR benchmarks (PubMedQA, NewsQA, SearchQA, MS MARCO, NarrativeQA, KILT) plus Track B (git history) and Track C (user memory). All four tracks push L0/L1 toward extreme compression ratios on single-document, multi-document, and shared-corpus settings.
+- **KB-scale training (Stages A/B/C).** The decoder learns to navigate hierarchical browse trees via `browse(id)` and `bgkit(ids, query)` tool calls, with every `bgkit` call triggering a live, query-conditioned L1 pass. This is the only part of Phase 2 that trains the decoder to *choose* what to retrieve, which is the capability needed for real knowledge bases. Detailed in its own section below.
+
+**Tracks (run in parallel with both strands):**
 - **Track B — Git history KR:** Compress a repo's commit history (messages + diffs + file context), train decoder to answer developer questions about past changes. Uses our existing 10K+ repo collection. Bridges Phase 1 (code domain) with Phase 2 (QA objective).
 - **Track C — User memory:** Compress multi-session conversations, train decoder to recall facts, preferences, events, and relationships from past sessions. Trained on purpose-built memory datasets (MSC, SHARE, Conversation Chronicles, PerLTQA). Evaluated on LongMemEval, LoCoMo, BEAM.
 
-**Key architectural insight:** The L0/L1 hierarchy maps naturally to all three tracks. L0 compresses individual documents/commits/sessions independently (parallelizable, cacheable). L1 jointly compresses L0 survivors from multiple items, enabling cross-document knowledge interaction. For large corpora, L0 is pre-computed and frozen; only L1 + decoder train during retrieval steps.
+**Key architectural insight:** The L0/L1 hierarchy maps naturally to every Phase 2 setting. L0 compresses individual documents/commits/sessions independently (parallelizable, cacheable). L1 jointly compresses L0 survivors from multiple items, enabling cross-document knowledge interaction. For large corpora, L0 is pre-computed and frozen (Steps 3-4 and KB Stages B/C); only L1 + decoder train.
 
 **Training objective shift:** Phase 1 trains on reconstruction ("reproduce the original text from compressed embeddings"). Phase 2 adds QA loss ("answer questions about compressed content"). Both objectives run jointly — reconstruction as a regularizer, QA as the primary signal. The existing multi-objective infrastructure from Phase 1 Step 5 supports this directly.
 
-**Question conditioning:** The decoder receives compressed L1 survivors as a prefix, then the question as normal token input, and generates the answer. This reuses the existing `ReconstructionDecoder` prefix-conditioning mechanism with no architectural changes.
+**Question conditioning:** In Steps 1-4, the decoder receives compressed L1 survivors as a prefix, then the question as normal token input, and generates the answer. This reuses the existing `ReconstructionDecoder` prefix-conditioning mechanism with no architectural changes. In KB Stages A/B/C, the decoder sees a multi-turn chat with `browse` and `bgkit` tool calls interleaved; survivors are spliced into the decoder's forward sequence in-place at each `bgkit` tool response. See the Phase 2 KB-scale section below for details.
 
 ### Step 1: Single-Document Extreme Compression (`phase2_step1`)
 
@@ -238,19 +237,20 @@ Two sub-tasks trained jointly:
 
 **Long-document comprehension (NarrativeQA):** 1,567 stories (books + movie scripts), averaging 62,500 tokens. At 0.01 L0 retention, each story compresses to ~625 survivors. Tests whether extreme compression preserves plot, character, and event details across very long documents. 46.7K QA pairs, mostly abstractive (only 30% are direct spans). L0 only — each story is a single document.
 
-**Large-scale multi-task KR (KILT):** The capstone benchmark. 5.9M Wikipedia articles, 11 tasks across 5 categories (fact checking, entity linking, slot filling, open-domain QA, dialogue). Shared knowledge source.
+**Large-scale multi-task KR (KILT):** The capstone flat benchmark. KILT itself spans 11 tasks across 5 categories (fact checking, entity linking, slot filling, open-domain QA, dialogue) against a Wikipedia knowledge source. We use the `orionweller/kilt_wikipedia_split` mirror (~184K unique articles, paragraph-split), which is the only conveniently-accessible HF version and covers the KILT tasks without the 5.9M-article full dump. See `docs/taxonomies.md` for details on the mirror.
 
 **KILT pre-computation (offline, one-time):**
-- Encode all 5.9M Wikipedia articles through L0 at 0.01 retention
-- ~9.5 survivors per article (avg ~950 tokens)
-- Storage: 5.9M × 9.5 × 1024 × 2 bytes = ~115 GB on disk
-- Time: 5.9M × 950 tokens × 0.5ms/token ≈ 780 GPU-hours (~32 days continuous, or faster with sub-batching)
+- Encode all ~184K orionweller Wikipedia articles through L0 at 0.05 retention (see Phase 2 KB config)
+- ~3.5 GB on disk in FP16
+- ~10-20 GPU-hours
 
-**KILT training strategy:** Query-aware sharding, same as Step 3 but at Wikipedia scale:
+**KILT flat training strategy (Step 4):** Query-aware batching, same as Step 3:
 - Each training query: relevant article(s) + distractor articles loaded into L1
-- L1 context: 128K → 262K positions (covering up to ~27K articles per pass at 9.5 survivors/article)
+- L1 context: 32K → 128K → 262K positions
 - Multi-task training across KILT tasks with task-proportional sampling
 - HotpotQA within KILT requires multi-hop reasoning (finding info across multiple articles) — a direct test of L1 cross-document interaction
+
+KB-scale training (Stages A/B/C) takes over from flat Step 4 once the single-L1-pass batching style runs out of headroom. See the Phase 2 KB-scale section below.
 
 **Configuration:**
 - Continues from Phase 2 Step 3 checkpoint
@@ -335,25 +335,9 @@ Runs in parallel with Track A Steps 3-4. Compress multi-session conversations an
 
 **Quality gate:** Competitive on LongMemEval (primary), LoCoMo, and BEAM. The with-L1 vs. without-L1 gap measures whether cross-session compression adds value over independent session embeddings.
 
-### Step 5: Target LLM Injection (`phase2_step5`)
+### KB-Scale Training (`phase2_kb` Stages A/B/C)
 
-End-to-end injection into Qwen3.5-35B, training the full pipeline on knowledge retrieval tasks from all three tracks.
-
-**Configuration:**
-- Qwen3.5-35B loaded in 4-bit quantization (QLoRA, ~18 GB)
-- LoRA adapters (rank 32-64, BF16) on gated attention layers (16 of 64 layers)
-- Projection block extended from 1024 → 2560 dim via block-diagonal initialization, warm-started from Phase 1
-- BgKIT compressor frozen (preferred) or unfrozen at very low LR (1e-5) — compare both
-- Training data: mix of best-performing tasks from all tracks — IR benchmarks (Track A), git history QA (Track B), user memory recall (Track C)
-- The reconstruction decoder continues as a regularizer on a subset of examples
-
-**DeltaNet interaction note:** Qwen3.5-35B has 48 DeltaNet layers + 16 gated attention layers. BgKIT vectors injected as tool-call response tokens must be useful to both layer types. DeltaNet layers compress context into a fixed-size recurrent state — injected vectors seen early may be overwritten. Monitor per-layer attention to BgKIT positions. If DeltaNet layers ignore injected vectors, consider repeated injection at multiple positions or targeting LoRA at the 16 attention layers only.
-
-**Evaluation (across all tracks):**
-- Track A: KILT leaderboard (R-Precision, accuracy per task), MS MARCO MRR@10, PubMedQA accuracy
-- Track B: Git history QA accuracy on held-out repos
-- Track C: LongMemEval, LoCoMo, BEAM memory benchmarks
-- Cross-track: BgKIT-compressed context vs. RAG (DPR + reranker) vs. full-text context (where it fits)
+Steps 1-4 plus Tracks B/C are "flat retrieval": the trainer hands the decoder a question, the bgkit encoder (possibly L1-fused) produces survivors, and the decoder answers. That works for a fixed document list per sample but doesn't scale to a real KB where the decoder has to decide *what* to retrieve. The KB-scale pipeline replaces the flat retriever with a hierarchical browse tree plus two decoder-visible tools, `browse(id)` and `bgkit(ids, query)`, and trains the decoder to navigate and retrieve over corpora up to the full Wikipedia scale. Fully replaces the pre-pivot plan's "target LLM injection" step — the decoder is already 0.8B, there is nothing to inject into. See the dedicated section **"Phase 2 KB-Scale Training"** below for architecture, stage curriculum, trajectory construction, and cross-references to the trainer and config files.
 
 ### Eval 2: Per-Step Evaluation During Phase 2 (`eval_phase2_steps`)
 
@@ -393,16 +377,16 @@ Each step and track has its own eval, run on held-out data at the end of each st
 
 ### Eval 3: Post-Phase 2 Comprehensive (`eval_phase2_final`)
 
-Run after Step 5 (target LLM injection) completes, before starting Phase 3. This is the comprehensive cross-track evaluation.
+Run after Phase 2 KB Stage C completes, before starting Phase 3. This is the comprehensive cross-track evaluation. Everything runs through the same Qwen3.5-0.8B decoder.
 
-**Cross-track comparison (all through Qwen3.5-35B):**
+**Cross-track comparison (all through the 0.8B decoder):**
 - (a) DPR + reranker (standard dense retrieval baseline)
 - (b) BM25 + reranker (sparse retrieval baseline)
 - (c) BgKIT L0 only (single-document compression, no L1)
-- (d) BgKIT L0 + L1 (full hierarchical compression, 0.8B decoder)
-- (e) BgKIT L0 + L1 injected into Qwen3.5-35B (Step 5)
+- (d) BgKIT L0 + L1 flat batching (Steps 1-4 style — fixed document list per query)
+- (e) BgKIT browse + bgkit tool calls over the full browse tree (KB-scale Stage C)
 
-BgKIT (d) must beat (a) on at least some KILT tasks to justify the approach over standard retrieval. BgKIT (e) tests whether the compressed representations transfer to the target LLM.
+BgKIT (d) must beat (a) on at least some KILT tasks to justify the dense-compression approach over standard retrieval. BgKIT (e) must beat (d) — if browse-tree navigation doesn't help, the extra tool-call machinery isn't earning its keep.
 
 **Domain transfer analysis:**
 - Does Phase 1 (code) pre-training help Phase 2 (KR) vs. training from scratch? Compare against a BgKIT initialized from raw Qwen3.5-0.8B without Phase 1.
@@ -418,9 +402,109 @@ BgKIT (d) must beat (a) on at least some KILT tasks to justify the approach over
 
 **Output:** Comprehensive eval report with all benchmarks, baselines, ablations, and compression curves. This report determines which tracks feed into Phase 3 and whether the approach justifies continued investment.
 
+## Phase 2 KB-Scale Training
+
+### Why KB-scale is a separate training regime
+
+Steps 1-4 and Tracks B/C give the encoder a fixed list of documents per training example. That's adequate for benchmarks like PubMedQA or SearchQA, where "which documents to consider" is pre-decided by the dataset, and for corpora whose L0 survivors fit in a single L1 pass. It does not work for a real knowledge base. Wikipedia-scale retrieval has two problems the flat pipeline cannot answer:
+
+1. **Scope selection.** With millions of articles, no single L1 pass can ingest the whole corpus. Some part of the model has to *choose* which articles to load before any dense retrieval happens. Naive nearest-neighbour on L0 vectors reintroduces exactly the retrieval step BgKIT was trying to replace.
+2. **Query-conditioned compression.** Phase 1 and Phase 2 Steps 1-4 run L1 with the question as a prefix prompt, but over a pre-selected document set. Letting the decoder itself direct compression — "summarise *these* articles with respect to *this* question" — is a capability the flat pipeline doesn't train.
+
+The KB-scale pipeline trains the decoder to navigate a hierarchical browse tree and to issue query-conditioned `bgkit` retrieval calls on its own. Two stages of navigation machinery (`browse`) plus one stage of compressed retrieval (`bgkit`) replace a monolithic dense-retrieval step.
+
+### Browse tree
+
+Built offline by `scripts/build_browse_tree.py` and the `BrowseTreeBuilder` in `src/bgkit/data/tagging.py`. Input is a flat list of `(article_id, tag_path)` pairs, where `tag_path` is a root-to-leaf sequence of tag names. Output is a parquet per dataset with the full hierarchy materialized:
+
+- `root → topic → sub-tag → … → leaf_tag → article`
+- Leaf tags are capped at `leaf_cap=100` articles each. Oversized leaves are sub-divided alphabetically (then by longer prefix, then by hash) until every leaf satisfies the cap.
+- Intermediate nodes are capped at `fanout_cap=100` children per `browse` response. Same bucketing fallback.
+- Every tag-path prefix becomes a navigable node. A synthetic `root` is always present.
+
+Two hierarchy sources are supported out of the box: flat `tag_list_json` from the Phase 2 mmap (produces a one-level tree) or JSONL files of the form `{"article_id": …, "tag_path": […]}`. For KILT Wikipedia and PubMedQA the hierarchy comes from `scripts/build_kilt_hierarchy.py` (DBpedia SKOS categories) and `scripts/build_mesh_hierarchy.py` (NLM MeSH tree). See `docs/taxonomies.md` for those builders.
+
+### Browse + bgkit tool semantics
+
+The decoder sees two tools at every training and inference step. Both are OpenAI-style tool definitions passed through `tokenizer.apply_chat_template(..., tools=...)`.
+
+- **`browse(id)`** — Returns the children of a tag node as text. Cheap: no encoder work, no LLM inference, just a lookup in the pre-built parquet. The decoder uses `browse` to narrow scope before calling `bgkit`. Browse responses list child tag IDs with their article counts so the decoder can decide where to drill.
+- **`bgkit(ids, query)`** — Runs the BgKIT L1 encoder fresh over the referenced leaf's L0 survivors, conditioned on the query, and splices the resulting survivor embeddings into the decoder's forward sequence at the call site. Each `bgkit` call also returns a text side-channel listing related article IDs / sub-tags the decoder can drill into with further calls. The tool schema and the splicing glue are in `src/bgkit/data/bgkit_tool_template.py`.
+
+System prompts come in two flavours. `SYSTEM_TOPIC_LIST` enumerates the visible top-level topics and tells the decoder to pick one before browsing (used for Wikipedia, PubMedQA, NarrativeQA). `SYSTEM_PRE_SCOPED` is for single-book / single-repo / single-user corpora where scope is already narrowed and the decoder is instructed to start at `browse(id="root")`.
+
+The decoder sees the full multi-turn conversation: system prompt, user question, its own `browse` and `bgkit` calls, and the text responses from each. At every `bgkit` tool response the raw text contains a unique sentinel string (`BGKIT_SENTINEL`), which the trainer replaces in embedding space at forward time with the live-computed L1 survivor run. Splicing happens below the tokenizer — the number of survivor positions varies per call, so the sentinel token is substituted out and the sequence length is shifted accordingly.
+
+### Query-conditioned L1 with pinned article IDs
+
+Every `bgkit` call produces a live L1 pass, not a cache lookup. The pipeline is:
+
+1. Look up the referenced tag IDs in the browse tree, gather the leaf article IDs.
+2. Load the L0 survivors for each article. In Stage A this runs the encoder live at L0 over the raw tokens from the Phase 2 mmap. In Stages B/C the L0 survivors come from the pre-computed `L0Cache`.
+3. Concatenate the L0 survivors with article-ID tokens pinned into the survivor set (so the L1 output can still be addressed back to individual articles by ID — important for drill-down calls).
+4. Run the L1 encoder pass with the query text as prefix, producing the final survivor vectors for this tool call. L1 is query-conditioned every time: the same leaf produces different survivors for different questions.
+5. Splice the survivor vectors into the decoder input at the sentinel position.
+
+ID pinning is the mechanism that lets a `bgkit(leaf_tag, query)` call hand back article IDs the decoder can then drill into with `bgkit([article_id], query)`. Without pinning, the decoder has no way to name a specific article out of the compressed survivor soup.
+
+### Per-level LoRA
+
+The encoder base weights are frozen (the Phase 1 Step 5 checkpoint) throughout Phase 2 KB. All adaptation happens through two small LoRA adapters:
+
+- **L0 LoRA** — trained in Stage A, then frozen. Shapes within-document salience on top of the code-trained Phase 1 encoder.
+- **L1 LoRA** — trained in all three stages. Shapes query-conditioned cross-document fusion.
+
+`LoRARouter` in `src/bgkit/models/lora_encoder.py` wraps the encoder's Linears and flips between adapters at Python call granularity: `"l0"` during L0 passes, `"l1"` during L1 passes. This is a lightweight in-tree implementation rather than a `peft` dependency so that the router can switch adapters on every call without the state-dict churn of `peft.set_adapter`. Rank defaults are 32 / 32 / alpha=64 (see `configs/training/phase2_kb_stage_{a,b,c}.yaml`).
+
+### Teacher trajectories
+
+Training is imitation learning on offline-generated teacher trajectories (`src/bgkit/data/teacher_trajectories.py`). Each QA sample with provenance `(question, gold_answer, gold_article_id)` produces one or two trajectories:
+
+- **Primary trajectory** (always emitted). Walks the browse tree from `root` to the leaf tag containing the gold article, emitting one `browse` turn per intermediate node, then a `bgkit([leaf_tag], question)` call, then — if the gold target is a specific article — a drill-down `bgkit([article_id], question)` call, then the assistant's final answer. All turns carry `loss=True`.
+- **Exploration trajectory** (~20% of samples, configurable via `exploration_fraction`). Before the primary leaf, the trajectory loads 1 *sibling* leaf tag by default (configurable via `exploration_siblings`, typically 1-2) via additional `bgkit` calls that return irrelevant content. Those sibling turns carry `loss=False`: the decoder is not trained to emit them, but the encoder's L1 pass for each sibling still runs, and gradient flows through the survivor embeddings they produce. This is training-time augmentation that stops L1 from only ever working on perfect targets — the decoder sees what "wrong leaf" survivors look like without learning to go there.
+
+Trajectories are stored as per-dataset parquet files under `$DATA_DIR/trajectories/{dataset}.parquet`.
+
+### Three-stage curriculum
+
+Both the compute budget and the L0-cache storage budget scale up through the stages. Configs are in `configs/training/phase2_kb_stage_{a,b,c}.yaml`.
+
+| Stage | L0 | L1 LoRA | Datasets | Scale | L0 cache |
+|---|---|---|---|---|---|
+| **A** | Live (L0 LoRA trainable) | Trainable | PubMedQA + NarrativeQA + git history + memory | ~6K articles | — |
+| **B** | Cached (L0 LoRA frozen) | Trainable | Stage A + ~10 Wikipedia top-tags + full PubMedQA + 100 git repos + full memory + full NarrativeQA + NewsQA | ~medium | ~140 GB |
+| **C** | Cached (L0 LoRA frozen) | Trainable | Full Wikipedia + everything from B | ~184K Wikipedia articles + full aux datasets | ~400 GB |
+
+- **Stage A** is the live-L0 bootstrap. The corpus is small enough (~6K articles) that live L0 at ~1 step/sec is affordable. Both L0 and L1 LoRA train. At the end of Stage A, L0 LoRA is frozen and used to pre-compute L0 survivors for B/C.
+- **Stage B** adds the middle Wikipedia slice — ~10 top-level topic buckets — using cached L0 survivors produced by the Stage A L0 LoRA. L1 LoRA plus the decoder continue training. This is where the browse-tree scale starts to matter: the decoder sees real Wikipedia navigation.
+- **Stage C** expands the L0 cache to cover all Wikipedia top-tags (~400 GB). Same trainer, same LoRA config, just more data.
+
+L0 retention ratios differ per dataset to match their information density: `kilt_wikipedia: 0.05`, `newsqa: 0.10`, `pubmedqa/narrativeqa/git_history: 0.20`, `memory: 0.40`. L1 retention is `0.50` throughout — the decoder is already gating what enters L1, so L1 itself is relatively light.
+
+### Integration with Steps 1-4 and Tracks B/C
+
+The flat-retrieval steps (Steps 1-4 plus Tracks B/C) still exist and still run before KB-scale — they establish the encoder's basic QA behaviour on curated document lists. KB-scale Stage A loads the best Phase 1 Step 5 checkpoint via `phase1_checkpoint: auto` (the same source the flat Steps 1-4 use). Stage A then re-uses the same Phase 2 mmaps (PubMedQA, NarrativeQA, memory, git-history QA) as its small-corpus bootstrap, so no data is wasted. Stages B/C add the Wikipedia scale that the flat pipeline cannot absorb in a single L1 pass.
+
+Pragmatically: Steps 1-4 and the KB-scale stages train the same model on overlapping objectives. If the quality gate at Eval 3 shows the KB-scale pipeline subsumes the flat one (cross-track comparison `(e) > (d)` on most benchmarks), Steps 1-4 can be dropped from future pipeline runs. Until then, both run.
+
+### Relevant code and configs
+
+- `src/bgkit/training/phase2/kr_kb_trainer.py` — `KRKBTrainer` (Stages A/B/C)
+- `src/bgkit/data/bgkit_tool_template.py` — tool schemas, system prompts, trajectory tokenization, sentinel splicing
+- `src/bgkit/data/browse_tree.py` — browse tree data structure
+- `src/bgkit/data/tagging.py` — `BrowseTreeBuilder` with leaf_cap / fanout_cap sub-division
+- `src/bgkit/data/teacher_trajectories.py` — primary + exploration trajectory generation
+- `src/bgkit/models/lora_encoder.py` — `LoRARouter`, per-level LoRA adapters
+- `scripts/build_browse_tree.py` — offline browse-tree builder
+- `scripts/build_kilt_hierarchy.py`, `scripts/build_mesh_hierarchy.py` — external hierarchy builders (see `docs/taxonomies.md`)
+- `scripts/reshard_narrativeqa.py` — NarrativeQA weak-gold heuristic reshard
+- `configs/training/phase2_kb_stage_a.yaml`, `phase2_kb_stage_b.yaml`, `phase2_kb_stage_c.yaml`
+
 ## Phase 3: Agentic Coding Distillation with BgKIT Context
 
-**Goal:** Distill large coding agent models (Qwen3-Coder-480B, Claude 3.7 Sonnet, swe-agent-llama-70b) into our 0.8B model or Qwen3.5-35B, using BgKIT-compressed repository state and git history to compensate for the massive parameter gap. The hypothesis: a small model with dense compressed knowledge of the entire codebase can match a large model that relies on tool calls to explore the repo.
+**Goal:** Distill large external coding agent trajectories (Qwen3-Coder-480B, Claude 3.7 Sonnet, swe-agent-llama-70b, GPT-OSS-20B) into the Qwen3.5-0.8B student, using BgKIT-compressed repository state, git history, and prior-session context to compensate for the massive parameter gap. The hypothesis: a small decoder with dense compressed knowledge of the entire codebase can match a large model that relies on tool calls to explore the repo.
+
+The student is the same 0.8B decoder as in Phase 1 and Phase 2 — there is no parallel distillation into a larger target. The teachers are whatever size happens to produce good SWE-bench trajectories.
 
 **Prerequisite:** Phase 2 must demonstrate that BgKIT compression preserves enough information for competitive retrieval. Specifically, Phase 2 Track B (git history KR) must work — the student's advantage over the teacher is having the full repo context pre-compressed, where the teacher had to discover it through exploration.
 
@@ -485,50 +569,32 @@ Key insight: many teacher tool calls are *information gathering*, not *problem s
 - Filter out trajectories where the repo can't be checked out (missing/corrupted repos)
 - Cross-reference teacher's file reads against BgKIT survivor map — reject trajectories where edited files have low survivor coverage
 
-### Step 2: Student Training on 0.8B Decoder (`phase3_step2`)
+### Step 2: Distillation Training (`phase3_step2`)
 
-Train the BgKIT-augmented 0.8B decoder to reproduce filtered teacher trajectories.
+Train the BgKIT-augmented 0.8B student to reproduce filtered teacher trajectories.
 
 **Configuration:**
-- Student: Qwen3.5-0.8B + BgKIT context (filesystem + git history embeddings as prefix)
+- Student: Qwen3.5-0.8B + BgKIT context (compressed filesystem + git history + prior-session embeddings as `bgkit` tool responses)
 - Loss: CE on teacher trajectory tokens (tool calls, file selections, code changes)
 - Teacher forcing on the trajectory sequence
 - ~30% of examples without BgKIT injection (baseline preservation)
-- Progressive teacher ladder: start with swe-agent-llama-70b (closest capability gap), then Qwen3-Coder-480B
+- Progressive teacher ladder: start with swe-agent-llama-70b (closest capability gap), then Qwen3-Coder-480B. Claude Sonnet and GPT-OSS-20B trajectories mixed in where available.
+
+The student is 0.8B — the same decoder from Phase 1 and Phase 2. The teachers are whatever size happens to produce good trajectories (70B, 480B, Sonnet). There is no parallel "large target" training; the whole project has exactly one decoder.
 
 **Key metric:** 0.8B + BgKIT vs. 0.8B without BgKIT on SWE-bench Verified. The gap is the value of compressed context. If the BgKIT-augmented student approaches the teacher's resolve rate, the hypothesis is validated.
 
-### Step 3: End-to-End with Qwen3.5-35B (`phase3_step3`)
-
-Once distillation validates the approach on 0.8B, train the full pipeline with Qwen3.5-35B as the target.
-
-**Configuration:**
-- Qwen3.5-35B loaded in 4-bit (QLoRA, ~18 GB)
-- BgKIT compressor frozen, projection block extended (1024 → 2560)
-- Training data: filtered trajectories from Step 1, with BgKIT filesystem + git history context
-- Compare against: (a) Qwen3.5-35B without BgKIT, (b) Qwen3.5-35B with RAG, (c) teacher model resolve rates
-
-**Evaluation:** SWE-bench Verified resolve rate. The bar: Qwen3.5-35B + BgKIT must beat Qwen3.5-35B + RAG to justify the compression approach.
-
 ### Eval 4: Phase 3 Evaluation (`eval_phase3`)
 
-**SWE-bench Verified** is the primary benchmark. Run after Step 2 (0.8B student) and Step 3 (35B target).
+**SWE-bench Verified** is the primary benchmark. Run after Step 2 distillation.
 
-**Step 2 eval (0.8B student):**
+**Student eval:**
 
 | Comparison | What it tests |
 |---|---|
 | 0.8B + BgKIT vs. 0.8B alone | Value of compressed context |
-| 0.8B + BgKIT vs. teacher (70B/480B) | How much of the gap BgKIT closes |
-| 0.8B + BgKIT vs. 0.8B + RAG | BgKIT vs. standard retrieval at 0.8B scale |
-
-**Step 3 eval (35B target):**
-
-| Comparison | What it tests |
-|---|---|
-| 35B + BgKIT vs. 35B alone | Value of compressed context at scale |
-| 35B + BgKIT vs. 35B + RAG | BgKIT vs. standard retrieval for agentic coding |
-| 35B + BgKIT vs. teacher | Whether we match/exceed the trajectory source |
+| 0.8B + BgKIT vs. teacher (70B / 480B / Sonnet) | How much of the parameter gap BgKIT closes |
+| 0.8B + BgKIT vs. 0.8B + RAG | BgKIT vs. standard retrieval at the same decoder scale |
 
 **Knowledge source ablation** (mandatory):
 - Test each of the three BgKIT context sources independently:
@@ -683,29 +749,29 @@ This dampens updates for tags that appear on every sample (e.g., `global`, `pyth
 
 ## Kernel Optimizations
 
-Both BgKIT (Qwen3.5-0.8B-Base) and the reconstruction decoder (Qwen3.5-0.8B) use RMSNorm and SwiGLU, which have well-known fused Triton kernel implementations. The target LLM's cross-entropy loss is the largest single memory consumer during training (materializing the full `[batch × seq_len, vocab_size]` logit tensor). Fused kernels address both.
+Both BgKIT (Qwen3.5-0.8B-Base) and the decoder (Qwen3.5-0.8B) use RMSNorm and SwiGLU, which have well-known fused Triton kernel implementations. The decoder's cross-entropy loss is the largest single memory consumer during training (materializing the full `[batch × seq_len, vocab_size]` logit tensor, where `vocab_size ≈ 248,320`). Fused kernels address both.
 
 **Liger Kernel** (`liger-kernel`, Apache 2.0, from LinkedIn) provides drop-in fused Triton kernels for:
 
-- **Fused cross-entropy loss** — computes loss without materializing the full logit tensor, using online softmax in a single streaming pass. Reduces logit memory from multiple GB to ~100 MB. Applies to: Phase 1 decoder reconstruction loss, Phase 2 target LLM next-token prediction loss.
-- **Fused RMSNorm** — forward + backward in a single kernel, eliminating intermediate tensors. Applies to: BgKIT, decoder, target LLM.
-- **Fused SwiGLU** — gate + element-wise multiply + up projection combined. Applies to: BgKIT, decoder.
-- **Fused RoPE** — Q and K rotary embeddings in a single kernel. Applies to: BgKIT, decoder, target LLM (gated attention layers).
+- **Fused cross-entropy loss** — computes loss without materializing the full logit tensor, using online softmax in a single streaming pass. Reduces logit memory from multiple GB to ~100 MB. Applies to Phase 1 decoder reconstruction loss, Phase 2 decoder QA loss, and Phase 3 distillation loss.
+- **Fused RMSNorm** — forward + backward in a single kernel, eliminating intermediate tensors. Applies to encoder and decoder alike.
+- **Fused SwiGLU** — gate + element-wise multiply + up projection combined.
+- **Fused RoPE** — Q and K rotary embeddings in a single kernel.
 
 These are **non-invasive** — they replace individual PyTorch modules without monkey-patching the full model or breaking autograd. This is critical because BgKIT's training requires gradient flow through the projection block and across compression levels, which is incompatible with more aggressive optimization frameworks (e.g., Unsloth) that use in-place backward operations that corrupt upstream gradient graphs.
 
-**CPU-offloaded gradient checkpointing** — during the forward pass, async-copy hidden states to CPU (`non_blocking=True`); during backward, async-copy back and recompute. Overlaps PCIe transfer with GPU compute (~1.9% overhead) for ~30% additional VRAM savings on top of standard gradient checkpointing. Implementation is ~20 lines of pure PyTorch (`torch.autograd.Function`). Particularly valuable for Phase 2c where the target LLM's activations dominate memory.
+**CPU-offloaded gradient checkpointing** — during the forward pass, async-copy hidden states to CPU (`non_blocking=True`); during backward, async-copy back and recompute. Overlaps PCIe transfer with GPU compute (~1.9% overhead) for ~30% additional VRAM savings on top of standard gradient checkpointing. Implementation is ~20 lines of pure PyTorch (`torch.autograd.Function`). Most useful for Phase 2 KB Stage C, where L0 cache I/O and the long browse-trajectory sequences dominate working set.
 
 ## Compute Estimates
 
-Estimates require validation via profiling on the DGX Spark (Blackwell GB10, 128 GB unified memory, 273 GB/s shared bandwidth).
+Estimates require validation via profiling on the DGX Spark (Blackwell GB10, 128 GB unified memory, 273 GB/s shared bandwidth). Working sets are comfortable throughout — the decoder is 0.8B (~1.6 GB bf16), which is small on 128 GB unified memory regardless of what Phase does.
 
 - **ICE:** Negligible one-time cost.
-- **Phase 1:** BgKIT compressor + projection block + decoder co-training (~1,040M + ~35M + ~800M). Dominant cost: compression-reconstruction examples + frozen target LLM forward passes for projection alignment. Frozen-target projection alignment requires loading Qwen3.5-35B in 4-bit for frozen forward passes (~18 GB), but no backward pass through the target LLM, so memory pressure is moderate. Fused cross-entropy on the decoder reduces peak memory substantially.
-- **Phase 2, Steps 1-2 (single-doc + SearchQA):** Same memory footprint as Phase 1 — encoder + decoder + optimizer ≈ 15 GB fixed. Lightweight because L1 context is small (50-100 positions).
-- **Phase 2, Step 3 (MS MARCO):** L0 pre-computation: ~90 GPU-minutes for 8.8M passages. Storage: ~18 GB. L1 training at 128K context: ~30-40 GB total (15 GB fixed + 8-15 GB L1 activations). Comfortable in 128 GB.
-- **Phase 2, Step 4 (KILT):** L0 pre-computation: ~780 GPU-hours for 5.9M Wikipedia articles (~32 days continuous, parallelizable via sub-batching). Storage: ~115 GB on disk. L1 training at 262K context: must be profiled — the 6 full-attention layers at 262K positions with SDPA are the bottleneck. Estimated ~50-70 GB for activations. Total working set may approach 85-100 GB.
-- **Phase 2, Step 5 (target LLM injection):** Approximate memory budget: target LLM 4-bit weights (~18 GB) + BgKIT compressor BF16 (~2.1 GB) + projection block BF16 (~0.1 GB extended to 2560) + decoder BF16 (~1.6 GB) + LoRA adapters (~0.3 GB) + optimizer states (~5 GB) ≈ 27 GB fixed, leaving ~101 GB for activations. With gradient checkpointing + fused cross-entropy, should support 8K-16K token sequences at microbatch 1 with gradient accumulation.
-- **Phase 3, Step 1 (BgKIT encoding):** Dominant cost is pre-computing BgKIT embeddings for ~200K repo states. At ~2K files × 500 tokens/file per repo, this is ~200B tokens through L0. Parallelizable, storage-intensive (~TB range for all embeddings). Can be done incrementally — start with the ~32K resolved trajectories.
-- **Phase 3, Steps 2-3 (distillation):** Same memory profile as Phase 2 Step 5 for the 35B target. For the 0.8B student, same as Phase 1 (~15 GB fixed). The bottleneck is BgKIT embedding loading — each training example requires loading pre-computed repo + git history embeddings from disk.
-- The DGX Spark's shared memory bandwidth (273 GB/s, ~12× lower than A100 HBM) will make Phase 2 Step 5 and Phase 3 Step 3 bandwidth-bound; expect significantly longer step times than equivalent HBM hardware.
+- **Phase 1:** BgKIT compressor + projection block + decoder co-training (~770M + ~35M + ~800M ≈ 1.6B trainable parameters). In bf16 plus optimizer states this is roughly 13 GB fixed. Fused cross-entropy on the decoder reduces peak activation memory substantially.
+- **Phase 2, Steps 1-2 (single-doc + SearchQA):** Same footprint as Phase 1 (~15 GB fixed). Lightweight because L1 context is small (50-100 positions).
+- **Phase 2, Step 3 (MS MARCO):** L0 pre-computation: ~90 GPU-minutes for 8.8M passages. Storage: ~18 GB. L1 training at 128K context: ~30-40 GB total (15 GB fixed + 8-15 GB L1 activations).
+- **Phase 2, Step 4 (KILT):** L0 pre-computation over the orionweller KILT split (~184K articles) is tractable: ~10-20 GPU-hours, ~3.5 GB on disk. (The historical 5.9M-article `facebook/kilt_wikipedia` would take ~32 days of L0 but we use the smaller mirror — see `docs/taxonomies.md`.) L1 training at 262K context: the 6 full-attention layers at 262K positions with SDPA are the bottleneck. Estimated ~50-70 GB for activations. Total working set may approach 85-100 GB.
+- **Phase 2 KB Stages A/B/C:** Same trainable parameter count as Phase 1 (encoder LoRA + decoder), so memory is dominated by browse-trajectory sequence length and L0 cache I/O, not weights. Stage A is live-L0 at ~1 step/sec on a small corpus. Stages B/C need ~140 GB and ~400 GB respectively for the cached L0 survivors on disk (outside the GPU budget). GPU working set is in the 30-60 GB range depending on trajectory length and number of bgkit tool calls per sample.
+- **Phase 3, Step 1 (BgKIT encoding):** Dominant cost is pre-computing BgKIT embeddings for ~200K repo states at `base_commit`. Blob-SHA dedup (see `scripts/encode_swe_repos.py`) collapses the actual encoder work to the unique-file count — much lower than the ~200B naive token count. Still storage-intensive (several hundred GB for all embeddings). Can be done incrementally — start with the ~32K resolved trajectories.
+- **Phase 3, Step 2 (distillation):** Same memory profile as Phase 1 (~15 GB fixed). The bottleneck is BgKIT embedding loading — each training example requires loading pre-computed repo + git history + prior-session embeddings from disk.
+- The DGX Spark's shared memory bandwidth (273 GB/s, ~12× lower than A100 HBM) is the main training bottleneck across all phases. Expect step times several times longer than equivalent HBM hardware. Memory capacity is rarely the constraint now that nothing in the pipeline needs a larger target model.

@@ -80,6 +80,12 @@ train-phase1-step4:
 train-phase1-step5:
 	scripts/run-train.sh train-phase1-step5
 
+train-phase2-kb-stage-a:
+	scripts/run-train.sh train-phase2-kb-stage-a
+
+train-phase2-kb-stage-b:
+	scripts/run-train.sh train-phase2-kb-stage-b
+
 docker-build-deps:
 	$(DC) build train
 

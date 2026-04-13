@@ -19,23 +19,15 @@
 
 ## 1. Deferred Training Extensions
 
-### 1.1 Multi-Target Projection
+### 1.1 Multi-Target Projection (future work)
 
-BgKIT can serve multiple target LLMs via separate projection blocks sharing the same compressor backbone:
+v1 is strictly single-target: encoder and decoder are both Qwen3.5-0.8B, so the projection block stays at 1024 dim and the compressor's output space is only ever read by one model. The original multi-target plan (separate projection blocks per target LLM, sharing the compressor) is retained here only as a forward-compatibility note. If we ever want to ship BgKIT against a larger target (Qwen3.5-4B, GLM, Llama, etc.), the mechanism would be:
 
-```
-                       ┌─ Projection block (Qwen3.5-35B, 2560-dim)  → Qwen3.5-35B
-BgKIT compressor ──────┤─ Projection block (GLM, 4096-dim)          → GLM-4.7-Flash
-                       └─ Projection block (Qwen3.5-4B, 2560-dim)   → Qwen3.5-4B
-```
+- **Block-diagonal extension.** Copy the v1 projection block (~35M params at 1024 dim) and extend it along the hidden-dim axis via block-diagonal initialization: existing weights occupy the original 1024-dim subspace, and new parameters are added for the extra dimensions (initialized near-zero). At init the block behaves like v1 with zero cross-interaction; fine-tuning learns the cross-terms. Strictly better than random init.
+- **Per-target warm-start.** Distillation-pretrain the extended projection block on token-embedding alignment (compressor output → target's token embeddings via MSE/cosine loss) before connecting to any downstream task.
+- **Cross-platform transfer test.** Evaluate adaptation to a new target by training only the fresh projection block with the compressor frozen. If it works, the architecture is reusable.
 
-The v1 projection block (~25M parameters at native 1024-dim) is extended for higher-dimensional targets via **block-diagonal parameter initialization**: existing pretrained weights occupy the original-dimension subspace, and new parameters are added for the extra dimensions, initialized near-zero. At initialization the block behaves like the pretrained version on the original dimensions with zero cross-interaction; fine-tuning then learns the cross-terms. This is strictly better than random initialization of a full target-dim block — the learned attention patterns and MLP transformations in the original subspace transfer directly.
-
-For each new target, the projection block can be distillation-pretrained on token embedding alignment (compressor output → target model's token embeddings via MSE/cosine loss) before connecting to the real end-to-end task. This provides a warm start regardless of how different the target's embedding space is.
-
-During Phase 1, auxiliary multi-target losses can be trained simultaneously: each frozen target LLM receives projected survivors and computes next-token prediction loss, with gradients flowing back through the projection blocks into the compressor. Auxiliary losses weighted 0.1–0.3× relative to the decoder's reconstruction loss. This would help the compressor develop target-agnostic representations.
-
-**Cross-platform transfer test:** After v1, evaluate adaptation to a new LLM by training only a fresh (block-diagonally extended) projection block with the compressor frozen. If this works well, it validates the architecture's reusability.
+None of this is on the v1 critical path. The current plan trains exactly one decoder; everything above lives behind a "do we want to ship a bigger model" gate.
 
 ### 1.2 Phase 2 Prep: Attention Priming for KR
 
@@ -47,23 +39,21 @@ Two mechanisms to strengthen attention pathways to BgKIT positions when transiti
 
 ### 1.3 Phase 2: Knowledge Retrieval (Primary Post-Phase-1 Strategy)
 
-Pivot from code compression to knowledge-intensive retrieval tasks. Train BgKIT to compress document collections into dense embeddings from which a decoder can answer questions. Progressive curriculum from single-document to multi-million-document corpora:
+Pivot from code compression to knowledge-intensive retrieval. Two complementary strands share the same encoder and 0.8B decoder:
 
-**Track A (IR benchmarks) — Steps 1-4:** PubMedQA/NewsQA (single-doc) → SearchQA (multi-doc L1) → MS MARCO (shared corpus, 8.8M passages) → NarrativeQA + KILT (62K-token stories + 5.9M Wikipedia articles).
+**Flat retrieval (Steps 1-4 + Tracks B/C):** Curriculum from single-document to multi-document to shared-corpus retrieval on standard IR benchmarks — PubMedQA/NewsQA (single-doc) → SearchQA (multi-doc L1) → MS MARCO (shared corpus, 8.8M passages) → NarrativeQA + KILT. Track B compresses git commit chains for developer QA. Track C compresses multi-session conversations (MSC, SHARE, Conversation Chronicles, PerLTQA) and is evaluated on LongMemEval, LoCoMo, BEAM.
 
-**Track B (git history KR):** Compress a repo's commit chain (messages + diffs + file context). Train decoder to answer developer questions about past changes. Uses our 10K+ repo collection. Runs parallel to Track A Steps 2-4.
+**KB-scale training (Stages A/B/C):** The decoder learns to navigate hierarchical browse trees via `browse(id)` and `bgkit(ids, query)` tool calls. Every `bgkit` call triggers a live, query-conditioned L1 pass whose survivors are spliced into the decoder sequence. Per-level LoRA (L0 / L1), offline teacher trajectories with ~20% exploration-sibling augmentation, three-stage curriculum (live L0 small-corpus bootstrap → cached L0 ~10 Wikipedia top-tags → cached L0 full Wikipedia). This is where BgKIT actually scales to a real KB.
 
-**Track C (user memory):** Compress multi-session conversations (MSC, SHARE, Conversation Chronicles, PerLTQA). Train decoder to recall persona, events, preferences, temporal facts from past sessions. Evaluated on LongMemEval, LoCoMo, BEAM. Runs parallel to Track A Steps 3-4.
-
-**Step 5 — Target LLM injection:** Qwen3.5-35B with QLoRA, drawing from all three tracks. Projection block extended to 2560 dim. Evaluate on KILT leaderboard, MS MARCO MRR, LongMemEval, git history QA.
-
-See `docs/02_training_plan.md` for full details on each step and track.
+The decoder is 0.8B throughout — no separate large target LLM, no QLoRA injection step. See `docs/02_training_plan.md` (Phase 2 and Phase 2 KB-Scale Training sections) for full details.
 
 ### 1.4 Phase 3: Agentic Coding Distillation with BgKIT Context
 
-Distill large coding agent models (Qwen3-Coder-480B, Claude 3.7 Sonnet, swe-agent-llama-70b) into 0.8B and Qwen3.5-35B, using BgKIT-compressed filesystem state and git history to compensate for the parameter gap. ~200K+ trajectories from SWE-bench with `base_commit` metadata enable exact repo state reconstruction. The student receives BgKIT-compressed context upfront; the teacher had to discover the same information through exploration tool calls.
+Distill external coding agent trajectories (Qwen3-Coder-480B, Claude 3.7 Sonnet, swe-agent-llama-70b, GPT-OSS-20B) into the 0.8B student. BgKIT provides compressed filesystem state, git history, and prior agentic sessions upfront — the student receives context the teacher had to discover through exploration tool calls. ~200K+ trajectories from SWE-bench with `base_commit` metadata enable exact repo state reconstruction.
 
-**Prerequisite:** Phase 2 Tracks A+B must demonstrate that BgKIT compression preserves enough information for KR and git history retrieval.
+The student is always 0.8B; teachers are whatever size happens to produce good trajectories. There is no end-to-end retrain of a larger target — the whole project has exactly one decoder.
+
+**Prerequisite:** Phase 2 must demonstrate that BgKIT compression preserves enough information for KR and git history retrieval. Specifically, Track B git history KR must work — the student's advantage over the teacher is having full repo context pre-compressed.
 
 ### 1.5 Cross-Session Agentic Memory (folded into Phase 3)
 
@@ -163,21 +153,18 @@ This tension needs resolution. Most likely the right answer is generic prompts f
 
 ### 4.4 BgKIT Freezing in Phase 2
 
-The core training plan lists this as an early experiment. Multiple configurations:
+The core training plan explores several freezing regimes. The KB-scale pipeline already commits to one (encoder base frozen, per-level L0/L1 LoRA trainable), but the flat Steps 1-4 leave the choice open. The candidates:
 
-- **Frozen compressor + frozen projection block:** Train only target LLM LoRA. Simplest, no risk of representational degradation. Analogous to frozen vision encoders in VLM training.
-- **Frozen compressor + unfrozen projection block:** Train projection block + target LLM LoRA. The projection block adapts to the target LLM while the compressor's representations stay stable.
-- **Unfrozen compressor + unfrozen projection block:** End-to-end gradients through the full pipeline. Compression may improve, but Phase 1's representations might degrade under target-LLM-driven gradients.
+- **Frozen compressor + frozen projection block:** Train only the decoder. Simplest, no risk of encoder representational degradation. Analogous to frozen vision encoders in VLM training.
+- **Frozen compressor + unfrozen projection block:** Train projection block + decoder. The projection block adapts to the decoder's evolving token-embedding distribution while the compressor's representations stay stable.
+- **Unfrozen compressor + unfrozen projection block:** End-to-end gradients through the full pipeline. Compression may improve, but Phase 1's representations might degrade under QA-driven gradients.
+- **Frozen compressor base + per-level LoRA (KB-scale default):** Encoder base frozen, two small LoRA adapters (L0, L1) carry all Phase 2 adaptation. Middle ground — keeps Phase 1 encoder stable while still allowing Phase 2 to reshape per-level behaviour.
 
-The compressor may not be "good enough" after Phase 1 the way a pretrained CLIP is — Phase 1 trains new capabilities (compression, consolidation) that may benefit from further refinement. But frozen compressor is safer and strongly preferred if performance is comparable. The projection block is more likely to benefit from continued training since it directly interfaces with the target LLM.
+The compressor may not be "good enough" after Phase 1 the way a pretrained CLIP is — Phase 1 trains new capabilities (compression, consolidation) that may benefit from further refinement. But a frozen encoder base is safer and is the default for KB-scale.
 
 ### 4.5 Knowledge Source Ablation During Training
 
 Randomly omit individual tool-call knowledge frames (independently, ~20% drop probability each) so the model learns to function with any subset. Randomly permute tool-call frame ordering across examples to prevent order dependence.
-
-### 4.6 Alternative BgKIT Source: Weight Merge
-
-SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), combining embedding quality with predictive modeling. Evaluated via joint block pretraining quality — both auto-reproduction (layer 26) and decoder projection (layer 27) metrics (the prerequisite step). Use the embedding model alone if no merge improves over it.
 
 ---
 
@@ -185,7 +172,7 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 ### 5.1 Does Dense Compression Beat Standard Retrieval?
 
-**Risk:** Modern retrieval (DPR + reranker, ColBERT, BM25 + cross-encoder) is very good, cheap, and simple. BgKIT involves a ~1B compressor, an 800M decoder, projection heads, LoRA, and a multi-phase pipeline. The benefit over retrieval may be marginal or zero — especially since BgKIT compresses away information that standard retrieval preserves verbatim.
+**Risk:** Modern retrieval (DPR + reranker, ColBERT, BM25 + cross-encoder) is very good, cheap, and simple. BgKIT involves a ~800M compressor, an 800M decoder, projection heads, LoRA, and a multi-phase pipeline. The benefit over retrieval may be marginal or zero — especially since BgKIT compresses away information that standard retrieval preserves verbatim.
 
 **Mitigation:** Phase 2 directly benchmarks against standard retrieval baselines on established leaderboards (KILT, MS MARCO). The mandatory ablation (survivors present vs. zeroed vs. noise) after every step is the kill switch. BgKIT's advantage, if any, will come from compressing far more context than retrieval can fit in a context window — if a DPR+reranker top-10 beats BgKIT over 128K compressed passages, the approach is not viable.
 
@@ -193,9 +180,9 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 ### 5.2 Gradient Flow Through Recursive Application
 
-**Risk:** End-to-end backpropagation from target LLM loss through the projection block, through level 1, through level 0 is a deep computation graph with shared weights. Vanishing or exploding gradients.
+**Risk:** End-to-end backpropagation from decoder loss through the projection block, through level 1, through level 0 is a deep computation graph with shared weights. Vanishing or exploding gradients.
 
-**Mitigation:** The compressor is one layer shorter (27 vs 28 layers) than the full base model, marginally helping gradient flow. More importantly: gradient checkpointing, separate learning rates for the projection block vs. compressor layers, and a curriculum of verifiable knowledge extraction at every level. Freezing the compressor during Phase 2 (Section 4.4) eliminates the deepest gradient path if viable.
+**Mitigation:** The compressor is one layer shorter (23 vs 24 layers) than the full base model, marginally helping gradient flow. More importantly: gradient checkpointing, separate learning rates for the projection block vs. compressor layers, and a curriculum of verifiable knowledge extraction at every level. Freezing the compressor during Phase 2 (Section 4.4) eliminates the deepest gradient path if viable.
 
 ### 5.3 ICE Input Space Mismatch
 
@@ -230,22 +217,33 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 ### 5.7 Hybrid DeltaNet Architecture and Dense Injection
 
-**Risk:** Qwen3.5-35B uses a hybrid architecture where 48 of 64 layers are gated DeltaNet (linear attention with a delta update rule) and only 16 are gated softmax attention. The BgKIT injection design assumes the target LLM can freely attend to injected tool-call positions, which is naturally true for softmax attention layers (any position can attend to any other). DeltaNet layers instead compress context into a fixed-size recurrent state via a delta rule — information from early positions (where BgKIT vectors are injected) may be progressively overwritten as later tokens are processed, degrading the model's ability to use BgKIT context in deeper DeltaNet layers.
+**Risk:** Qwen3.5-0.8B has 24 layers in a hybrid pattern: 18 DeltaNet linear-attention layers + 6 gated softmax attention layers (arranged as `[DeltaNet, DeltaNet, DeltaNet, FullAttention] × 6`). The BgKIT injection design assumes the decoder can freely attend to injected tool-call positions, which is natural for the 6 full-attention layers (any position can attend to any other). The 18 DeltaNet layers instead compress context into a fixed-size recurrent state via a delta rule — information from early positions (where BgKIT vectors are injected) may be progressively overwritten as later tokens are processed, degrading the model's ability to use BgKIT context in deeper DeltaNet layers.
+
+In the Phase 2 KB-scale setting this risk is somewhat lower than it would have been for a deeper target: `bgkit` tool responses are interleaved with browse turns and the final answer, so BgKIT vectors are not all at the start of the sequence, and the relatively shallow (24-layer) stack leaves less room for DeltaNet state decay.
 
 **Mitigation options:**
 
-- **Monitor per-layer attention to BgKIT positions.** In the 16 softmax attention layers, measure attention weight on BgKIT positions directly. In DeltaNet layers, probe whether BgKIT-derived information persists in the recurrent state by comparing outputs with vs. without BgKIT injection.
-- **Repeated injection.** Insert BgKIT tool-call frames at multiple positions in the input sequence (not just the beginning) so that DeltaNet layers encounter BgKIT vectors at various points and can refresh their recurrent state.
-- **Target LoRA at attention layers preferentially.** The 16 gated attention layers are the primary pathway for the model to "look up" BgKIT information. LoRA on these layers may matter more than on DeltaNet layers for injection quality.
-- **Evaluate DeltaNet-only vs. attention-only ablation.** If the model only uses BgKIT through the attention layers and DeltaNet layers ignore it, that's acceptable — it just means BgKIT's effective depth is 16 layers, not 64.
+- **Monitor attention to BgKIT positions in the 6 full-attention layers.** Direct measurement of whether the decoder routes through BgKIT vectors at all.
+- **Probe DeltaNet persistence.** Compare outputs with vs. without BgKIT injection to see whether DeltaNet layers even carry the information forward, or whether all of it flows through the 6 full-attention layers.
+- **Repeated injection naturally handled by KB-scale layout.** Because each `bgkit` tool call is a separate injection site, DeltaNet layers encounter BgKIT vectors at multiple points rather than only at the prompt prefix — the KB-scale trajectory format gives us repeated injection by construction.
+- **LoRA preferentially on attention layers.** If the decoder ignores BgKIT in DeltaNet layers, concentrate decoder LoRA on the 6 full-attention layers.
+- **Accept bounded effective depth.** If DeltaNet layers ignore BgKIT entirely, BgKIT's effective depth is 6 layers out of 24 — still nontrivial for a 0.8B decoder.
 
 **Severity:** Unknown until tested. This is the most architecturally novel risk in v1 — previous dense injection work (LLaVA, etc.) targeted pure-attention transformers.
 
-### 5.8 Target LLM Brittleness
+### 5.8 Phase 2 KB-Scale Specific Risks
 
-**Risk:** The entire projection pipeline is trained against a specific target LLM's embedding space. If that model's architecture or embedding space changes in the next release, everything from the projection alignment step onward needs retraining.
+The KB-scale pipeline introduces several risks that the flat Steps 1-4 don't have. None of these is a showstopper individually, but they stack and each needs explicit monitoring.
 
-**Mitigation:** Using Qwen3.5-35B as the target — the same model family as our encoder and decoder — reduces architectural mismatch and simplifies the projection block's task. Multi-target projection (Section 1.1) helps the compressor's internal representations stay target-agnostic. But in v1, this risk is accepted. The key question is whether the compressor's output space is stable enough that adapting to a new target requires only a fresh projection block (cheap, with block-diagonal warm-start from the v1 block) rather than full Phase 2 Step 5 retraining (expensive).
+**ID pinning preservation through 24 encoder layers.** The `bgkit(ids, query)` tool-call machinery pins article IDs into the L1 survivor set so the decoder can drill into a specific article from a leaf-tag response. Those ID tokens must survive 23 compressor layers + the projection block without being washed out by cross-attention with query-relevant content. If the encoder treats them as generic tokens and blends them into the survivor stew, drill-down calls will fail. The empirical check is whether, after Stage A, a drill-down `bgkit([article_id], query)` call actually references the right article. No mitigation beyond "watch the metric" — if it breaks, the ID tokens need stronger positional anchoring (reserved channels, learned type embeddings, or a separate pin-through path in L1).
+
+**L1 encoder memory budget at fan-out 100.** Leaf tags are pre-capped at `leaf_cap=100` articles. In Stage C, an L1 pass over 100 Wikipedia articles with paragraph-split L0 survivors at retention 0.05 runs ~5-15K positions per call. That's still within the 262K native context, but the full backward pass through 23 compressor layers at 15K positions, on a query-conditioned pass for every `bgkit` tool call in every trajectory in every batch, is the dominant compute cost of the stage. If Stage C trains too slowly, `leaf_cap` can drop to 50 and alphabetical bucketing takes over — the browse tree just gets one level deeper.
+
+**Tokenizer vocab alignment between encoder and decoder.** The whole KB-scale pipeline assumes the encoder and decoder share a tokenizer so that article-ID strings, query text, and chat-template scaffolding encode identically on both sides. This currently holds (Qwen3.5-0.8B-Base on both sides). If the decoder is ever swapped for a different tokenizer, every sentinel-splice calculation in `bgkit_tool_template.py` has to be re-verified — off-by-one errors in the sentinel substitution will corrupt every trajectory silently. Enforced in the trainer via a vocab-check at startup.
+
+**Weak gold-passage heuristics for NarrativeQA.** NarrativeQA provides full stories as context but no ground-truth "which passage answers this question" at the paragraph level. `scripts/reshard_narrativeqa.py` uses a weak heuristic (n-gram overlap between question/answer and each shard) to pick a gold shard for trajectory generation. Shard selection errors go directly into teacher trajectories — the decoder is trained to browse to a shard that may not actually contain the answer. Mitigation: keep exploration-sibling fraction high for NarrativeQA specifically (more siblings mean more cases where the decoder sees "none of these shards hit, fall back to a broader read"), and drop any shard whose n-gram overlap is below a minimum threshold rather than forcing a pick.
+
+**Flat taxonomy fallbacks when external hierarchy is missing.** `BrowseTreeBuilder` accepts flat tags from the Phase 2 mmap and produces a one-level tree. For datasets without an external hierarchy (NewsQA, git history, user memory), that's all there is — the browse tree is essentially `root → {single tag} → 100 articles`, and `browse(id="root")` has to list all distinct top-level tags. If any single top-level tag has more than `fanout_cap=100` leaf buckets, the alphabetical sub-division kicks in and the decoder sees synthetic `A`, `B`, ... navigation nodes. These are uninterpretable at the semantic level. The risk is that flat-taxonomy datasets get treated as purely navigational and the decoder never learns content-driven drill-down on them. Mitigation: for each dataset without a good hierarchy, either ship a custom tagger (like the MeSH/SKOS builders for PubMedQA/KILT) or accept that the dataset only exercises `bgkit` retrieval and not `browse` navigation.
 
 ### 5.9 Decoder Co-Adaptation
 
@@ -267,9 +265,9 @@ SLERP or linear merge between Qwen3-Embedding-0.6B and Qwen3-0.6B (decoder), com
 
 ### 6.1 Context Window Budgeting
 
-K_total is set at inference time. ICE allocates across files proportionally to information content. A 2,000-file repository at typical budget produces ~3,000–3,500 final positions (including metadata). With Qwen3.5-35B's 262K context window, a 25% reservation yields ~65K positions — sufficient for large repositories.
+K_total is set at inference time. ICE allocates across files proportionally to information content. A 2,000-file repository at typical budget produces ~3,000–3,500 final positions (including metadata). With Qwen3.5-0.8B's 262K native context window, a 25% reservation yields ~65K positions — sufficient for large repositories.
 
-BgKIT internally processes much longer sequences (full tokens at level 0, all survivors at level 1), but this cost is borne by the ~600M model, not the target LLM's context window.
+BgKIT internally processes much longer sequences (full tokens at level 0, all survivors at level 1), but that cost is borne by the ~800M encoder and does not eat into the decoder's context budget.
 
 ### 6.2 Incremental Updates
 
@@ -281,7 +279,7 @@ For repositories exceeding the level 1 context budget: increase compression rati
 
 ### 6.4 Deployment Inference on DGX Spark
 
-BgKIT deployment requires the target LLM to accept projected vectors via the LLaVA multimodal embedding pathway. Two inference runtimes support this:
+BgKIT deployment requires the decoder to accept projected vectors via the LLaVA multimodal embedding pathway. Two inference runtimes support this:
 
 **llama.cpp (recommended for DGX Spark).** Well-tested on ARM64 + Blackwell. GGUF quantized models load directly. The multimodal embedding pathway (used for LLaVA image patches) is the injection point for BgKIT vectors. Stable, no build patches required.
 
@@ -305,15 +303,15 @@ Beyond the mandatory survivors-present vs. zeroed ablation:
 - (h) Gap-filling on vs. off at extreme compression (0.01) — does positional coverage matter for QA?
 - (i) L1 context scaling curve: retrieval quality vs. number of distractor documents.
 - (j) Query-aware batching vs. random batching — how much does shard composition matter?
-- (k) BgKIT information utilization in gated attention vs. gated DeltaNet layers (Phase 2 Step 5).
-- (l) BgKIT tool-call frame placement: beginning-only vs. distributed (Phase 2 Step 5).
+- (k) BgKIT information utilization in gated attention vs. gated DeltaNet layers (where in the 24-layer decoder does BgKIT information actually flow?).
+- (l) BgKIT tool-call frame placement: single prefix frame (flat Steps 1-4) vs. distributed per-turn injection (KB-scale Stages A/B/C).
 - (m) Domain transfer: does Phase 1 (code) pre-training help Phase 2 (KR) vs. training from scratch?
 
 ---
 
 ## 8. Deferred Evaluation Dimensions
 
-- **Cross-platform transfer:** Adaptation to a new target LLM by training only a fresh projection block (block-diagonally extended, frozen compressor). How much performance is retained?
+- **Cross-platform transfer (future work):** Adaptation to a larger target decoder by training only a fresh projection block (block-diagonally extended, frozen compressor). See Section 1.1. Not on v1 critical path.
 - **Domain transfer:** Does Phase 1 (code) pre-training transfer to Phase 2 (natural language KR)? Compare Phase 2 performance with vs. without Phase 1 initialization.
 - **User personalization:** With user memories as a knowledge source (Phase 2 Track C), does the model adapt behavior to user preferences?
 - **Session continuity:** Can compressed conversation history enable coherent multi-session interactions (Phase 2 Track C)?

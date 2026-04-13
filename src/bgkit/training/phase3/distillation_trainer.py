@@ -6,7 +6,7 @@ Distills teacher agent trajectories (from 480B/70B/Sonnet) into the student
 2. Git history (commit chains)
 3. Prior agentic sessions (ordered by base_commit)
 
-Training input: [BgKIT context frames | issue description | filtered teacher trajectory]
+Training input: [issue description | bgkit tool-response slot | filtered teacher trajectory]
 Loss: CE on trajectory tokens (tool calls, code edits, reasoning)
 ~30% examples without BgKIT injection (baseline preservation)
 
@@ -35,6 +35,8 @@ from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.training.base_trainer import BaseTrainer
 
 logger = structlog.get_logger()
+
+_DISTILL_BGKIT_SENTINEL = "<<<BGKIT_DISTILL_CONTEXT_0d4e61f9>>>"
 
 
 def _load_manifest(parquet_path: Path) -> list[dict]:
@@ -89,8 +91,10 @@ class _ContextSourceCache:
 class DistillationTrainer(BaseTrainer):
     """Phase 3 distillation from SWE-bench teacher trajectories.
 
-    Steps 2-3: progressively larger teacher models.
-    Step 3 extends to Qwen3.5-35B target (like KRStep5Trainer).
+    The student/target is Qwen3.5-0.8B throughout — the same decoder used
+    by every other phase of bgkit. Teacher trajectories come from larger
+    external models (SWE-bench OpenHands, Llama-70B, etc.) but we never
+    train a larger target in-house.
     """
 
     _log_every = 5
@@ -122,6 +126,24 @@ class DistillationTrainer(BaseTrainer):
         self.decoder.train()
 
         self.tokenizer = AutoTokenizer.from_pretrained(decoder_name, trust_remote_code=True)
+        self._distill_bgkit_prefix_ids = torch.tensor(
+            self.tokenizer.encode(
+                "<tool_call>bgkit</tool_call>\n<tool_response>\n",
+                add_special_tokens=False,
+            ),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self._distill_bgkit_sentinel_ids = torch.tensor(
+            self.tokenizer.encode(_DISTILL_BGKIT_SENTINEL, add_special_tokens=False),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self._distill_bgkit_suffix_ids = torch.tensor(
+            self.tokenizer.encode("\n</tool_response>\n", add_special_tokens=False),
+            dtype=torch.long,
+            device=self.device,
+        )
 
         # Load BgKIT encoder from Phase 2 checkpoint (if configured)
         self.encoder = None
@@ -400,10 +422,68 @@ class DistillationTrainer(BaseTrainer):
 
         return padded.to(self.device), mask.to(self.device)
 
+    def _build_decoder_targets(
+        self,
+        trajectory_ids: torch.Tensor,
+        trajectory_mask: torch.Tensor,
+        issue_ids: torch.Tensor | None = None,
+        issue_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build a decoder target batch with a fixed BgKIT tool-response slot."""
+        batch_size = trajectory_ids.size(0)
+        target_rows: list[torch.Tensor] = []
+        loss_rows: list[torch.Tensor] = []
+        splice_starts: list[int] = []
+        splice_lens: list[int] = []
+
+        for b in range(batch_size):
+            issue = torch.empty(0, dtype=torch.long, device=self.device)
+            if issue_ids is not None and issue_mask is not None:
+                issue_len = int(issue_mask[b].sum().item())
+                issue = issue_ids[b, :issue_len]
+            traj_len = int(trajectory_mask[b].sum().item())
+            traj = trajectory_ids[b, :traj_len]
+
+            prefix = self._distill_bgkit_prefix_ids
+            sentinel = self._distill_bgkit_sentinel_ids
+            suffix = self._distill_bgkit_suffix_ids
+            seq = torch.cat([issue, prefix, sentinel, suffix, traj], dim=0)
+            loss = torch.cat([
+                torch.zeros(
+                    issue.size(0) + prefix.size(0) + sentinel.size(0) + suffix.size(0),
+                    dtype=torch.bool,
+                    device=self.device,
+                ),
+                torch.ones(traj.size(0), dtype=torch.bool, device=self.device),
+            ], dim=0)
+            target_rows.append(seq)
+            loss_rows.append(loss)
+            splice_starts.append(int(issue.size(0) + prefix.size(0)))
+            splice_lens.append(int(sentinel.size(0)))
+
+        max_len = max(int(row.size(0)) for row in target_rows)
+        target_ids = torch.zeros(batch_size, max_len, dtype=torch.long, device=self.device)
+        target_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=self.device)
+        loss_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=self.device)
+        for b, (seq, loss) in enumerate(zip(target_rows, loss_rows, strict=True)):
+            slen = int(seq.size(0))
+            target_ids[b, :slen] = seq
+            target_mask[b, :slen] = True
+            loss_mask[b, :slen] = loss
+
+        return (
+            target_ids,
+            target_mask,
+            loss_mask,
+            torch.tensor(splice_starts, dtype=torch.long, device=self.device),
+            torch.tensor(splice_lens, dtype=torch.long, device=self.device),
+        )
+
     def _forward_backward(self, batch) -> dict[str, float]:
         """Distillation forward pass with multi-source context and issue tokens.
 
-        Assembles decoder input as [BgKIT context | issue tokens | trajectory tokens].
+        Assembles decoder input as
+        [issue tokens | bgkit tool-response slot | trajectory tokens].
         Loss is computed only on the trajectory token portion.
         """
         inject = random.random() > self._no_injection_fraction
@@ -412,9 +492,7 @@ class DistillationTrainer(BaseTrainer):
         trajectory_mask = batch["trajectory_attention_mask"].to(self.device)
         batch_size = trajectory_ids.size(0)
 
-        # Get issue token embeddings
         has_issue = "issue_token_ids" in batch
-        embed_layer = self.decoder.backbone.get_input_embeddings()
 
         if has_issue:
             issue_ids = batch["issue_token_ids"].to(self.device)
@@ -426,40 +504,43 @@ class DistillationTrainer(BaseTrainer):
         # Determine BgKIT context
         bgkit_context = self._get_bgkit_context(batch) if inject else None
 
-        # Build target: [issue_tokens | trajectory_tokens]
-        # Loss mask: 0 on issue tokens, 1 on trajectory tokens
-        if has_issue:
-            target_ids = torch.cat([issue_ids, trajectory_ids], dim=1)
-            target_mask = torch.cat([issue_mask, trajectory_mask], dim=1)
-            # Loss only on trajectory portion
-            issue_loss_zeros = torch.zeros_like(issue_mask, dtype=torch.bool)
-            trajectory_loss_ones = trajectory_mask.bool()
-            loss_mask = torch.cat([issue_loss_zeros, trajectory_loss_ones], dim=1)
-        else:
-            target_ids = trajectory_ids
-            target_mask = trajectory_mask
-            loss_mask = trajectory_mask.bool()
+        target_ids, target_mask, loss_mask, splice_starts, splice_lens = (
+            self._build_decoder_targets(
+                trajectory_ids,
+                trajectory_mask,
+                issue_ids if has_issue else None,
+                issue_mask if has_issue else None,
+            )
+        )
 
         context_sources = 0
         if bgkit_context is not None:
             context_embeds, context_mask = bgkit_context
             context_sources = int(context_mask.any(dim=-1).sum().item())
-            loss = self.decoder.forward_with_loss(
-                context_embeds,
-                target_ids,
-                target_mask,
-                context_mask,
+            loss = self.decoder.forward_with_single_splice(
+                survivor_embeddings=context_embeds,
+                survivor_attention_mask=context_mask,
+                token_ids=target_ids,
+                token_attention_mask=target_mask,
+                splice_starts=splice_starts,
+                splice_lengths=splice_lens,
                 loss_mask=loss_mask,
             )
         else:
-            # No BgKIT context: use a single-token empty context
-            empty_context = embed_layer(trajectory_ids[:, :1])
+            # Preserve the same in-sequence geometry even when context is absent.
+            empty_context = torch.zeros(
+                batch_size, 1, self.decoder.hidden_dim,
+                dtype=self.decoder.backbone.get_input_embeddings().weight.dtype,
+                device=self.device,
+            )
             empty_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=self.device)
-            loss = self.decoder.forward_with_loss(
-                empty_context,
-                target_ids,
-                target_mask,
-                empty_mask,
+            loss = self.decoder.forward_with_single_splice(
+                survivor_embeddings=empty_context,
+                survivor_attention_mask=empty_mask,
+                token_ids=target_ids,
+                token_attention_mask=target_mask,
+                splice_starts=splice_starts,
+                splice_lengths=splice_lens,
                 loss_mask=loss_mask,
             )
 
@@ -479,8 +560,6 @@ class DistillationTrainer(BaseTrainer):
         batches_with_ctx = 0
         batches_no_ctx = 0
 
-        embed_layer = self.decoder.backbone.get_input_embeddings()
-
         for batch in self.eval_dataloader:
             trajectory_ids = batch["trajectory_token_ids"].to(self.device)
             trajectory_mask = batch["trajectory_attention_mask"].to(self.device)
@@ -490,34 +569,44 @@ class DistillationTrainer(BaseTrainer):
             if has_issue:
                 issue_ids = batch["issue_token_ids"].to(self.device)
                 issue_mask = batch["issue_attention_mask"].to(self.device)
-                target_ids = torch.cat([issue_ids, trajectory_ids], dim=1)
-                target_mask = torch.cat([issue_mask, trajectory_mask], dim=1)
-                issue_loss_zeros = torch.zeros_like(issue_mask, dtype=torch.bool)
-                trajectory_loss_ones = trajectory_mask.bool()
-                loss_mask = torch.cat([issue_loss_zeros, trajectory_loss_ones], dim=1)
             else:
-                target_ids = trajectory_ids
-                target_mask = trajectory_mask
-                loss_mask = trajectory_mask.bool()
+                issue_ids = None
+                issue_mask = None
+            target_ids, target_mask, loss_mask, splice_starts, splice_lens = (
+                self._build_decoder_targets(
+                    trajectory_ids, trajectory_mask, issue_ids, issue_mask,
+                )
+            )
 
             # Eval with context
             bgkit_context = self._get_bgkit_context(batch)
             if bgkit_context is not None:
                 context_embeds, context_mask = bgkit_context
-                loss_ctx = self.decoder.forward_with_loss(
-                    context_embeds, target_ids, target_mask, context_mask,
+                loss_ctx = self.decoder.forward_with_single_splice(
+                    survivor_embeddings=context_embeds,
+                    survivor_attention_mask=context_mask,
+                    token_ids=target_ids,
+                    token_attention_mask=target_mask,
+                    splice_starts=splice_starts,
+                    splice_lengths=splice_lens,
                     loss_mask=loss_mask,
                 )
                 total_loss_with_ctx += loss_ctx.item()
                 batches_with_ctx += 1
             else:
-                # Eval without context
-                empty_context = embed_layer(trajectory_ids[:, :1])
-                empty_mask = torch.ones(
-                    batch_size, 1, dtype=torch.bool, device=self.device,
+                empty_context = torch.zeros(
+                    batch_size, 1, self.decoder.hidden_dim,
+                    dtype=self.decoder.backbone.get_input_embeddings().weight.dtype,
+                    device=self.device,
                 )
-                loss_no = self.decoder.forward_with_loss(
-                    empty_context, target_ids, target_mask, empty_mask,
+                empty_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=self.device)
+                loss_no = self.decoder.forward_with_single_splice(
+                    survivor_embeddings=empty_context,
+                    survivor_attention_mask=empty_mask,
+                    token_ids=target_ids,
+                    token_attention_mask=target_mask,
+                    splice_starts=splice_starts,
+                    splice_lengths=splice_lens,
                     loss_mask=loss_mask,
                 )
                 total_loss_no_ctx += loss_no.item()

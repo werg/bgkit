@@ -107,7 +107,7 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 | Step 3 → Step 4 | `step1_checkpoint` | `phase1_step3` | `phase1_step4` | `eval/loss` |
 | Step 4 → Step 5 | `step1_checkpoint` | `phase1_step4` | `phase1_step5` | `eval/loss` |
 
-**Training phase pipeline**: ICE → Joint Block Pretrain → Phase 1 Steps 1-5 (compression pre-training on code) → Phase 2 Steps 1-2 (single-doc + multi-doc KR) → Steps 3-4 (MS MARCO + KILT) + Track B (git history KR) + Track C (user memory from MSC/SHARE/Chronicles) → Step 5 (target LLM injection, Qwen3.5-35B).
+**Training phase pipeline**: ICE → Joint Block Pretrain → Phase 1 Steps 1-5 (compression pre-training on code) → Phase 2 (single-doc KR Steps 1-4, KB-scale KR Stages A/B/C, Track B git history, Track C user memory) → Phase 3 (agentic distillation from SWE-bench trajectories). The decoder is **Qwen3.5-0.8B throughout** — bgkit does not train any larger in-house target LLM.
 
 | Task | Command |
 |---|---|
@@ -219,39 +219,172 @@ All code is implemented. The items below are **execution tasks** that require tr
 
 ### Phase 2 Training (gate: mmap datasets + Phase 1 checkpoint)
 
-Steps must run in order. Each produces a checkpoint consumed by the next.
+Phase 2 is unified around a single trainer (`KRKBTrainer`). The legacy
+`KRTrainer` and the per-step `phase2_step{1-4}.yaml` configs have been
+deleted — every Phase 2 dataset goes through the trajectory framework
+now. Flat datasets (NewsQA, MS MARCO, SearchQA, git history, memory)
+emit single-bgkit trajectories; hierarchical datasets (KILT via DBpedia
+categories, PubMedQA via MeSH, NarrativeQA per book) emit
+`browse → bgkit → answer` trajectories. Two stages:
 
-- [ ] **Phase 2 Step 1** — Live L0, PubMedQA + NewsQA. ~30K steps.
+- [ ] **Phase 2 Stage A** — live L0, L0 LoRA + L1 LoRA + decoder
+      trainable. One epoch over the bootstrap mix
+      (PubMedQA + NarrativeQA + git_history + memory). Produces the
+      Stage A checkpoint that bakes the L0 LoRA into the cache for
+      Stage B.
   ```bash
-  scripts/run-train.sh --no-follow train-phase2-step1  # add compose service, or:
-  # docker compose run ... python scripts/train.py training=phase2_step1
+  scripts/run-train.sh --no-follow train-phase2-kb-stage-a
   ```
-- [ ] **Phase 2 Step 2** — Frozen L0, SearchQA. ~20K steps.
-- [ ] **L0 pre-computation** — Encode MS MARCO + KILT + repos with Step 2 checkpoint. ~55 GPU-hours.
+- [ ] **Phase 2 Stage B** — cached L0 (built from the Stage A
+      checkpoint), L0 LoRA frozen, L1 LoRA + decoder train. Full-scale
+      corpus including Wikipedia, all KILT/PubMedQA, MS MARCO,
+      SearchQA, NewsQA, git history, memory.
   ```bash
-  python scripts/precompute_l0.py --checkpoint $CHECKPOINT_DIR/phase2_step2_best \
-    --token-dir $DATA_DIR/mmap/phase2/msmarco_passage --output-dir $DATA_DIR/l0_cache/msmarco
-  python scripts/precompute_l0.py --checkpoint $CHECKPOINT_DIR/phase2_step2_best \
-    --token-dir $DATA_DIR/mmap/phase2/kilt --output-dir $DATA_DIR/l0_cache/kilt
+  scripts/run-train.sh --no-follow train-phase2-kb-stage-b
   ```
-- [ ] **Phase 2 Steps 3-4 + Tracks B/C** — Pre-computed L0, interleaved. Can run in parallel.
-- [ ] **Phase 2 Step 5** — Target LLM injection (Qwen3.5-35B QLoRA). Needs all tracks complete.
 
 ### Phase 2 Evaluation (gate: Phase 2 checkpoints)
 
-- [ ] **Per-step eval** — Run after each step completes.
+- [ ] **Per-stage eval** — Run after each stage completes.
   ```bash
-  python scripts/eval_phase2_step.py training=phase2_step1 +eval.checkpoint=...
+  python scripts/eval_phase2_step.py training=phase2_kb_stage_a +eval.checkpoint=...
   ```
-- [ ] **Comprehensive eval (Eval 3)** — Run after Step 5. Go/no-go gate for Phase 3.
+- [ ] **Comprehensive eval (Eval 3)** — Run after Stage B. Go/no-go gate for Phase 3.
   ```bash
-  python scripts/eval_phase2_comprehensive.py +eval.checkpoint=$CHECKPOINT_DIR/phase2_step5_best
+  python scripts/eval_phase2_comprehensive.py +eval.checkpoint=$CHECKPOINT_DIR/phase2_kb_stage_b_best
   ```
-- [ ] **Topic embedding ablation** — Run after Step 3+ (when topic embeddings are enabled).
+- [ ] **Topic embedding ablation** — Run with topic embeddings enabled.
   ```bash
   python scripts/eval_topic_embeddings.py +eval.checkpoint=...
   ```
 - [ ] **Retention-ratio Pareto sweep** — Uses pre-computed L0 sub-selection at [0.50, 0.10, 0.05, 0.02, 0.01]. Part of comprehensive eval.
+
+### Phase 2 KB-Scale (gate: mmap datasets + Phase 1 checkpoint)
+
+`KRKBTrainer` trains over browse + bgkit trajectories on every Phase 2
+dataset (KILT Wikipedia, MS MARCO, PubMedQA, NewsQA, SearchQA,
+NarrativeQA, the memory corpora, and git history). Hierarchical
+datasets emit `browse → bgkit → answer` trajectories; flat datasets
+emit single-bgkit trajectories with no browse step. Two stages:
+**Stage A** (live L0, L0 LoRA trainable, one epoch over the bootstrap
+mix) → **Stage B** (cached L0 re-computed from Stage A weights, L0 LoRA
+frozen, L1 LoRA + decoder train, full corpus). Stage C from earlier
+plans has been merged into Stage B.
+
+End-to-end data-prep + trainer forward is covered by `tests/integration/test_phase2_kb_e2e.py`, which runs the pipeline on a toy 250-article corpus with stubbed encoder + decoder. Use it as a regression gate whenever any of the scripts below change:
+
+```bash
+make test-integration                       # runs all integration tests
+.venv/bin/pytest tests/integration/test_phase2_kb_e2e.py -v  # just the KB e2e test
+```
+
+#### Data prep (per dataset)
+
+Each dataset (`kilt_wikipedia`, `msmarco_passage`, `pubmedqa`, `newsqa`, `searchqa`, `narrativeqa`, `git_history`, `msc`, `share`, `chronicles`, `perltqa`, `laps`) runs the same five-step sequence. Substitute `$DS` for the dataset name below.
+
+- [ ] **Build browse tree** (gate: `$DATA_DIR/mmap/phase2/$DS/metadata.parquet` exists)
+  ```bash
+  python scripts/build_browse_tree.py \
+    --dataset $DS \
+    --phase2-dir $DATA_DIR/mmap/phase2/$DS \
+    --output-dir $DATA_DIR/browse_trees
+  # → writes $DATA_DIR/browse_trees/$DS.parquet
+  ```
+  For datasets with an external hierarchy (KILT category DAG, PubMedQA MeSH tree), pre-compute the hierarchical paths and pass `--input paths.jsonl` instead of `--phase2-dir`.
+
+- [ ] **Build per-dataset provenance JSONL** (gate: mmap exists with `provenance_json` or equivalent column)
+  ```bash
+  # KILT tasks (NQ, HotpotQA, FEVER, zsRE, T-REx, WoW, ELI5, etc.):
+  python scripts/build_provenance_kilt.py --mmap-dir $DATA_DIR/mmap/phase2/$DS --output $DATA_DIR/provenance/$DS.jsonl
+  # All other datasets have their own scripts:
+  #   scripts/build_provenance_kilt_wikipedia.py — KILT Wikipedia corpus
+  #   scripts/build_provenance_msmarco.py
+  #   scripts/build_provenance_newsqa.py
+  #   scripts/build_provenance_searchqa.py
+  #   scripts/build_provenance_pubmedqa.py
+  #   scripts/build_provenance_narrativeqa.py
+  #   scripts/build_provenance_git_history.py
+  #   scripts/build_provenance_memory.py
+  # Each reads $DATA_DIR/mmap/phase2/$DS/metadata.parquet and emits a JSONL
+  # with {question, gold_answer, gold_article_id, scope_template,
+  # scope_description} rows compatible with build_teacher_trajectories.py.
+  ```
+
+- [ ] **Generate teacher trajectories** (gate: browse tree parquet + provenance JSONL)
+  ```bash
+  python scripts/build_teacher_trajectories.py \
+    --input $DATA_DIR/provenance/$DS.jsonl \
+    --dataset $DS \
+    --browse-tree $DATA_DIR/browse_trees/$DS.parquet \
+    --output-dir $DATA_DIR/trajectories \
+    --exploration-fraction 0.20 --seed 17
+  # → writes $DATA_DIR/trajectories/$DS.parquet in the KBTrajectoryDataset schema
+  ```
+
+- [ ] **Enumerate trajectory article set** (gate: trajectory parquet)
+  ```bash
+  python scripts/build_trajectory_set.py \
+    --trajectory $DATA_DIR/trajectories/$DS.parquet \
+    --browse-tree $DATA_DIR/browse_trees/$DS.parquet \
+    --dataset $DS \
+    --output $DATA_DIR/trajectory_sets/$DS.jsonl
+  # → writes {dataset, article_id} rows for every article any trajectory touches
+  ```
+  Pass `--trajectory`/`--browse-tree`/`--dataset` multiple times to union several datasets into one article set for a combined pre-compute.
+
+- [ ] **Pre-compute L0 for the trajectory subset** (gate: trajectory set JSONL + Phase 1 checkpoint)
+  ```bash
+  python scripts/precompute_l0_subset.py \
+    --articles $DATA_DIR/trajectory_sets/$DS.jsonl \
+    --mmap-dir $DATA_DIR/mmap/phase2 \
+    --phase1-checkpoint $CHECKPOINT_DIR/phase1_step5_best \
+    --output-dir $DATA_DIR/l0_cache_kb \
+    --retention-json configs/phase2_kb/l0_retention.json \
+    --lora-rank 32
+  # → populates $DATA_DIR/l0_cache_kb/$DS/shard_NNNN/{survivors,offsets}.npy + index.parquet
+  ```
+  Omit `--stage-a-checkpoint` on the bootstrap pre-compute (before Stage A has trained); include it during the Stage A → B transition below.
+
+#### Stage A training (live L0, L0 LoRA trainable)
+
+- [ ] **Stage A** (gate: browse trees + trajectories for the Stage A subset + bootstrap L0 cache + Phase 1 checkpoint)
+  ```bash
+  scripts/run-train.sh --no-follow train-phase2-kb-stage-a
+  # or direct:
+  # docker compose -f docker/docker-compose.yaml run --rm train-phase2-kb-stage-a
+  ```
+  Stage A trains the L0 LoRA adapter in live mode (`live_l0: true`) on a KILT + PubMedQA subset. The L1 LoRA is also trainable. Produces a checkpoint at `$CHECKPOINT_DIR/phase2_kb_stage_a_best`.
+
+#### Stage A → B transition
+
+- [ ] **Re-build L0 cache using Stage A's LoRA weights** (gate: Stage A checkpoint)
+  ```bash
+  python scripts/precompute_l0_subset.py \
+    --articles $DATA_DIR/trajectory_sets/stage_b.jsonl \
+    --mmap-dir $DATA_DIR/mmap/phase2 \
+    --phase1-checkpoint $CHECKPOINT_DIR/phase1_step5_best \
+    --stage-a-checkpoint $CHECKPOINT_DIR/phase2_kb_stage_a_best \
+    --output-dir $DATA_DIR/l0_cache_kb \
+    --retention-json configs/phase2_kb/l0_retention.json \
+    --lora-rank 32
+  ```
+  Passing `--stage-a-checkpoint` installs the Stage A LoRA router and loads its trained L0 weights before encoding, so the cached survivors reflect Stage A's text-adapted behavior instead of bare Phase 1. Without this flag the Stage A training is effectively discarded. The script appends new shards to `$DATA_DIR/l0_cache_kb/$DS/` and updates `index.parquet` idempotently.
+
+#### Stage B training (cached L0, L0 LoRA frozen, L1 LoRA trainable)
+
+- [ ] **Stage B** (gate: Stage A checkpoint + rebuilt L0 cache)
+  ```bash
+  scripts/run-train.sh --no-follow train-phase2-kb-stage-b
+  ```
+  Stage B disables live L0 (`live_l0: false`), freezes the L0 LoRA, and trains only the L1 LoRA + decoder head on the cached L0 survivors. Same dataset subset as Stage A but with the large KILT corpus fully enumerated.
+
+#### Evaluation
+
+- [ ] **KB-scale eval** (gate: Stage A or B checkpoint) — `scripts/eval_phase2_kb.py` reuses `_eval_one_sample` + `_build_decoder_segments_with_trace` from `KRKBTrainer` to score answer EM/F1, browse tool-call ID accuracy, bgkit tool-call ID accuracy, and trajectory step accuracy.
+  ```bash
+  python scripts/eval_phase2_kb.py +eval.checkpoint=$CHECKPOINT_DIR/phase2_kb_stage_b_best
+  ```
+  Also runs the ablation matrix (`zeroed`, `noise`, `no_topics`, `topics_only`, `neither`) via `KRKBTrainer.set_ablation_mode()`.
 
 ### Phase 3 Data Preparation (gate: network + repos)
 
@@ -271,15 +404,14 @@ Steps must run in order. Each produces a checkpoint consumed by the next.
 - [ ] **Encode SWE-bench repos** — Pre-compute BgKIT embeddings with blob-SHA dedup. ~24 GPU-hours.
   ```bash
   python scripts/encode_swe_repos.py \
-    --checkpoint $CHECKPOINT_DIR/phase2_step5_best \
+    --checkpoint $CHECKPOINT_DIR/phase2_kb_stage_b_best \
     --trajectories $DATA_DIR/trajectories/openhands_filtered.jsonl \
     --repos-dir $DATA_DIR/swe_repos --output-dir $DATA_DIR/swe_embeddings
   ```
 
 ### Phase 3 Training (gate: encoded repos + filtered trajectories)
 
-- [ ] **Phase 3 Step 2** — Distillation from Llama-70B teacher. ~100K steps.
-- [ ] **Phase 3 Step 3** — Distillation on Qwen3.5-35B target (QLoRA). ~50K steps.
+- [ ] **Phase 3 distillation** — Distillation from external SWE-bench teacher trajectories (OpenHands / Llama-70B / Claude Sonnet, etc.) into the Qwen3.5-0.8B student + BgKIT context. ~100K steps.
 
 ### Phase 3 Evaluation (gate: Phase 3 checkpoint + SWE-bench repos cloned)
 

@@ -1,6 +1,10 @@
 # BgKIT: Next Steps
 
-First prototyping work beyond environment setup. Three parallel tracks.
+**Historical planning document** — describes the first prototyping
+work done after environment setup. All three tracks have since been
+implemented; this file is preserved for onboarding context. See
+`docs/02_training_plan.md` for the current training plan and the
+"Execution Runbook" section of `CLAUDE.md` for the active task list.
 
 ---
 
@@ -17,14 +21,14 @@ Build against the existing raw git repo dataset on the dev server.
 
 ICE is a hard dependency for all compression training. Also serves as the first end-to-end validation of the DGX Spark environment.
 
-1. **ICE label generation** — run Qwen3-0.6B in causal mode over a training corpus slice to produce per-token cross-entropy values. Pure inference job, good smoke test.
+1. **ICE label generation** — run Qwen3.5-0.8B in causal mode over a training corpus slice to produce per-token cross-entropy values. Pure inference job, good smoke test.
 2. **ICE training** — train the lightweight 1D CNN to regress cross-entropy from token embedding sequences, with uniformity regularizer. Output: frozen ICE model.
 
 ## Track 3: Architecture Prototyping
 
 Derisk the novel components before full training.
 
-1. **Auto-reproduction experiment** — retrain BgKIT's (Qwen3-Embedding-0.6B) last transformer block to reproduce per-position input embeddings (all other layers frozen). Optionally test SLERP/linear merges with Qwen3-0.6B. Select the best BgKIT base. Cheap experiment, one block trains.
+1. **Auto-reproduction experiment** — retrain BgKIT's (Qwen3.5-0.8B-Base) penultimate transformer block to reproduce per-position input embeddings, while the ultimate block learns to project toward the decoder's embedding space. All other layers frozen. Cheap experiment, two blocks train. (Implemented as the "joint block pretraining" prerequisite in `docs/02_training_plan.md`.)
 2. **Drop-flag mechanism prototype** — implement survive/doomed labeling and consolidation on single files with random survivor selection (no ICE dependency). Validate gradient flow and basic mechanics.
 
 ---
