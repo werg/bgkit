@@ -221,7 +221,6 @@ class CommitEncodingDataset(Dataset):
             target_loss_mask=result["loss_mask"],
             prefix_ids=result["prefix_ids"],
             compression_prompt_ids=compression_prompt_ids,
-            direct_l1=False,  # Always L0→L1, never skip L0
         )
 
     # --- Worker-safe pickling (mirrors MmapTokenDataset pattern) ---

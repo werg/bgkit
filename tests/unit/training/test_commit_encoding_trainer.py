@@ -166,7 +166,6 @@ def _make_commit_batch(
             target_loss_mask=torch.ones(target_len, dtype=torch.long),
             prefix_ids=torch.randint(0, VOCAB_SIZE, (3,)),
             compression_prompt_ids=torch.randint(0, VOCAB_SIZE, (prompt_len,)),
-            direct_l1=False,
         )
         samples.append(sample)
     return collate_compression(samples)

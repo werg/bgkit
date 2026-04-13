@@ -102,7 +102,6 @@ class RepoCompressionSample:
     target_loss_mask: torch.Tensor
     prefix_ids: torch.Tensor
     compression_prompt_ids: torch.Tensor
-    direct_l1: bool = False  # If True, skip L0 and compress raw tokens at L1
 
 
 def _gather_l1_files(
@@ -659,7 +658,6 @@ class CommitReproSubset(Dataset):
             target_loss_mask=result["loss_mask"],
             prefix_ids=result["prefix_ids"],
             compression_prompt_ids=result["compression_prompt_ids"],
-            direct_l1=True,
         )
 
 

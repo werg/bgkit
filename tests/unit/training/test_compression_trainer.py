@@ -370,32 +370,6 @@ class TestTrainStepFileSample:
 # ---------------------------------------------------------------------------
 
 
-def _make_direct_l1_batch(
-    batch_size: int = 2,
-    file_len: int = 12,
-    target_len: int = SEQ_LEN,
-    prompt_len: int = 4,
-) -> dict:
-    """Create a collated repo batch with direct_l1=True (single file per sample)."""
-    samples = []
-    for _ in range(batch_size):
-        sample = RepoCompressionSample(
-            objective="commit_reproduction",
-            file_token_ids=[torch.randint(0, VOCAB_SIZE, (file_len,))],
-            file_attention_masks=[torch.ones(file_len, dtype=torch.bool)],
-            compression_ratio=0.2,
-            compression_level=1,
-            target_token_ids=torch.randint(0, VOCAB_SIZE, (target_len,)),
-            target_attention_mask=torch.ones(target_len, dtype=torch.bool),
-            target_loss_mask=torch.ones(target_len, dtype=torch.long),
-            prefix_ids=torch.randint(0, VOCAB_SIZE, (3,)),
-            compression_prompt_ids=torch.randint(0, VOCAB_SIZE, (prompt_len,)),
-            direct_l1=True,
-        )
-        samples.append(sample)
-    return collate_compression(samples)
-
-
 class TestTrainStepRepoSample:
     def test_returns_expected_metrics(self, trainer):
         batch = _make_repo_batch()
@@ -558,125 +532,6 @@ class TestCheckpointRoundtrip:
             p.abs().sum() > 0 for p in trainer.decoder.parameters()
         )
         assert has_nonzero, "Decoder params should be restored"
-
-
-# ---------------------------------------------------------------------------
-# Direct L1 tests
-# ---------------------------------------------------------------------------
-
-
-class TestDirectL1:
-    def test_direct_l1_dispatches(self, trainer):
-        """Batch with all direct_l1=True should produce valid metrics."""
-        batch = _make_direct_l1_batch()
-        assert batch["direct_l1"].all()
-
-        metrics = trainer.train_step(batch)
-        assert "loss" in metrics
-        assert torch.isfinite(torch.tensor(metrics["loss"]))
-        assert metrics["sample_type"] == "repo"
-
-    def test_direct_l1_returns_valid_embeddings(self, trainer):
-        """direct_l1 single sample should return embeddings with correct shape."""
-        batch = _make_direct_l1_batch(batch_size=1, file_len=12)
-        bgkit_embed = trainer.encoder.compressor.backbone.get_input_embeddings()
-        prompt_emb = bgkit_embed(batch["compression_prompt_ids"][0:1])
-
-        survivors = trainer._compress_single_direct_l1(
-            batch["file_token_ids"][0, 0].unsqueeze(0),
-            batch["file_attention_masks"][0, 0].unsqueeze(0),
-            prompt_emb,
-            batch["compression_prompt_mask"][0:1],
-            bgkit_embed,
-        )
-        assert survivors.dim() == 2  # (num_survivors, D)
-        assert survivors.size(-1) == HIDDEN_DIM
-
-    def test_direct_l1_uses_single_direct_l1(self, trainer):
-        """direct_l1 samples should call _compress_single_direct_l1 in per-sample loop."""
-        batch = _make_direct_l1_batch()
-
-        original = trainer._compress_single_direct_l1
-        call_count = [0]
-
-        def tracking(*args, **kwargs):
-            call_count[0] += 1
-            return original(*args, **kwargs)
-
-        trainer._compress_single_direct_l1 = tracking
-        trainer.optimizer.zero_grad()
-        trainer._forward_backward(batch)
-        assert call_count[0] == batch["file_token_ids"].size(0)
-
-    def test_non_direct_l1_does_not_dispatch(self, trainer):
-        """Regular repo batch should NOT call _compress_single_direct_l1."""
-        batch = _make_repo_batch(n_files=2)
-        assert not batch["direct_l1"].any()
-
-        call_count = [0]
-        original = trainer._compress_single_direct_l1
-
-        def tracking(*args, **kwargs):
-            call_count[0] += 1
-            return original(*args, **kwargs)
-
-        trainer._compress_single_direct_l1 = tracking
-        trainer.optimizer.zero_grad()
-        trainer._forward_backward(batch)
-        assert call_count[0] == 0
-
-    def test_direct_l1_forward_backward_produces_loss(self, trainer):
-        """Per-sample repo forward+backward with direct_l1 should produce a valid loss."""
-        batch = _make_direct_l1_batch()
-        trainer.optimizer.zero_grad()
-        metrics = trainer._forward_backward(batch)
-        assert torch.isfinite(torch.tensor(metrics["loss"]))
-
-    def test_direct_l1_encoder_passes(self, trainer):
-        """direct_l1 samples: 1 direct_l1 pass + 1 L1 encoder pass per sample."""
-        batch = _make_direct_l1_batch(batch_size=2)
-
-        encoder_call_count = [0]
-        original_encoder = trainer.encoder.forward
-
-        def counting_encoder(*args, **kwargs):
-            encoder_call_count[0] += 1
-            return original_encoder(*args, **kwargs)
-
-        trainer.encoder.forward = counting_encoder
-        trainer.optimizer.zero_grad()
-        trainer._forward_backward(batch)
-        # Per sample: 1 direct_l1 encoder + 1 L1 encoder = 2 forward calls
-        # + checkpoint recompute on backward = 2 more = 4 total per sample
-        # With 2 samples = 8 total (but selective checkpointing may skip
-        # recompute for short sequences)
-        assert encoder_call_count[0] >= 4
-
-    def test_direct_l1_rejects_multi_file(self, trainer):
-        """direct_l1=True with file_count > 1 should raise ValueError."""
-        sample = RepoCompressionSample(
-            objective="commit_reproduction",
-            file_token_ids=[
-                torch.randint(0, VOCAB_SIZE, (12,)),
-                torch.randint(0, VOCAB_SIZE, (12,)),
-            ],
-            file_attention_masks=[
-                torch.ones(12, dtype=torch.bool),
-                torch.ones(12, dtype=torch.bool),
-            ],
-            compression_ratio=0.2,
-            compression_level=1,
-            target_token_ids=torch.randint(0, VOCAB_SIZE, (SEQ_LEN,)),
-            target_attention_mask=torch.ones(SEQ_LEN, dtype=torch.bool),
-            target_loss_mask=torch.ones(SEQ_LEN, dtype=torch.long),
-            prefix_ids=torch.randint(0, VOCAB_SIZE, (3,)),
-            compression_prompt_ids=torch.randint(0, VOCAB_SIZE, (4,)),
-            direct_l1=True,
-        )
-        batch = collate_compression([sample])
-        trainer.optimizer.zero_grad()
-        with pytest.raises(ValueError, match=r"direct_l1 sample.*file_count=2"):
-            trainer._forward_backward(batch)
 
 
 # ---------------------------------------------------------------------------
@@ -917,18 +772,6 @@ class TestEvaluateRepoBatchPersample:
         # Average loss should be finite
         avg = loss_sum / token_count
         assert torch.isfinite(torch.tensor(avg))
-
-    def test_repo_eval_handles_direct_l1(self, trainer):
-        """Eval should handle direct_l1 repo batches without error."""
-        batch = _make_direct_l1_batch(batch_size=2)
-        with torch.no_grad():
-            trainer.encoder.eval()
-            trainer.decoder.eval()
-            trainer._is_evaluating = True
-            loss_sum, token_count = trainer._evaluate_repo_batch_persample(batch)
-            trainer._is_evaluating = False
-        assert loss_sum >= 0
-        assert token_count > 0
 
     def test_repo_eval_token_count_matches_target_mask(self, trainer):
         """Token count should match the sum of target attention masks (minus position 0)."""

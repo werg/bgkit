@@ -156,7 +156,6 @@ class TestCommitEncodingDataset:
         sample = ds[0]
         assert isinstance(sample, RepoCompressionSample)
         assert sample.objective == "commit_encoding"
-        assert sample.direct_l1 is False
         assert len(sample.file_token_ids) >= 1
         assert sample.target_token_ids.ndim == 1
         assert sample.compression_prompt_ids.ndim == 1
