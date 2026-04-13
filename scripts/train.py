@@ -49,15 +49,17 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.compression import CompressionTrainer
 
         return CompressionTrainer(cfg)
-    elif phase == "phase2":
-        step = cfg.get("training", {}).get("step", None)
-        if step == "step5":
-            from bgkit.training.phase2.kr_step5_trainer import KRStep5Trainer
+    elif phase in ("phase2", "phase2_kb"):
+        # Phase 2 is unified: a single trainer handles every dataset via
+        # the trajectory framework. Flat datasets (NewsQA, MS MARCO,
+        # SearchQA, git history, memory) emit single-bgkit trajectories;
+        # hierarchical datasets (KILT, PubMedQA via MeSH, NarrativeQA
+        # per book) emit browse + bgkit trajectories. The legacy
+        # ``phase2`` route is kept as an alias so existing checkpoints
+        # / configs still resolve.
+        from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
 
-            return KRStep5Trainer(cfg)
-        from bgkit.training.phase2.kr_trainer import KRTrainer
-
-        return KRTrainer(cfg)
+        return KRKBTrainer(cfg)
     elif phase == "phase3":
         from bgkit.training.phase3.distillation_trainer import DistillationTrainer
 

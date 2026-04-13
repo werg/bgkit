@@ -39,10 +39,10 @@ _CONDITIONS = {
 
 
 def _load_trainer(cfg: DictConfig):
-    """Load a KRTrainer with checkpoint weights."""
-    from bgkit.training.phase2.kr_trainer import KRTrainer
+    """Load the unified Phase 2 trainer with checkpoint weights."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
 
-    trainer = KRTrainer(cfg)
+    trainer = KRKBTrainer(cfg)
     trainer.setup()
 
     eval_cfg = cfg.get("eval", {})

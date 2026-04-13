@@ -10,7 +10,7 @@ Runs all benchmarks, all baselines, all ablations:
 
 Usage:
     python scripts/eval_phase2_comprehensive.py \
-        +eval.checkpoint=checkpoints/phase2_step5_best \
+        +eval.checkpoint=checkpoints/phase2_best \
         +eval.output_dir=eval_reports/phase2
 """
 
@@ -32,10 +32,10 @@ logger = structlog.get_logger()
 
 
 def _load_trainer(cfg: DictConfig):
-    """Load and set up a KRTrainer from config + checkpoint."""
-    from bgkit.training.phase2.kr_trainer import KRTrainer
+    """Load and set up the unified Phase 2 trainer from config + checkpoint."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
 
-    trainer = KRTrainer(cfg)
+    trainer = KRKBTrainer(cfg)
     trainer.setup()
 
     eval_cfg = cfg.get("eval", {})
