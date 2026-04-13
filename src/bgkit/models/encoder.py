@@ -12,6 +12,7 @@ keeping DeltaNet layers causal for efficient O(L) processing.
 
 from __future__ import annotations
 
+import contextlib
 from copy import deepcopy
 
 import torch
@@ -21,6 +22,11 @@ from bgkit.models.bgkit_compressor import BgKITCompressor, CompressionOutput
 from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
+
+
+@contextlib.contextmanager
+def _null_ctx():
+    yield
 
 
 def _resolve_layers(backbone: nn.Module) -> nn.ModuleList:
@@ -160,6 +166,8 @@ class BgKITEncoder(nn.Module):
         attention_mask: torch.Tensor | None = None,
         prompt_embeddings: torch.Tensor | None = None,
         prompt_attention_mask: torch.Tensor | None = None,
+        pinned_positions: torch.Tensor | None = None,
+        lora_level: str | None = None,
     ) -> CompressionOutput:
         """Run the full encoder: compressor then projection block.
 
@@ -169,32 +177,51 @@ class BgKITEncoder(nn.Module):
             attention_mask: (B, L) optional padding mask for content.
             prompt_embeddings: (B, P, D) optional prompt embeddings.
             prompt_attention_mask: (B, P) optional mask for prompt positions.
+            pinned_positions: (B, L) bool mask of content positions that MUST survive,
+                regardless of ICE score. OR'd into ``survivor_mask`` before the
+                compressor runs, and propagated to the projection block so the
+                pinned outputs are extracted. Used by the KB-scale pipeline to
+                preserve article-ID tokens through L1 compression.
+            lora_level: Which LoRA adapter ("l0", "l1", or None) to activate on
+                the encoder backbone for this forward pass. Routed via
+                :class:`bgkit.models.lora_encoder.LoRARouter` when present.
 
         Returns:
             CompressionOutput with projected embeddings.
         """
-        # Run compressor (layers 0..N-2)
-        comp_out = self.compressor(
-            input_embeddings,
-            survivor_mask=survivor_mask,
-            attention_mask=attention_mask,
-            prompt_embeddings=prompt_embeddings,
-            prompt_attention_mask=prompt_attention_mask,
-        )
+        # Merge pinned positions into survivor_mask so compressor and projection
+        # block see the same effective mask. Requires survivor_mask to exist
+        # (pinning is a compression-only concept).
+        if pinned_positions is not None and survivor_mask is not None:
+            survivor_mask = survivor_mask | pinned_positions.to(survivor_mask.dtype)
 
-        # Projection block sees the full sequence (prompt context preserved)
-        full_raw = comp_out.raw_embeddings
-        full_mask = comp_out.attention_mask
+        # Activate LoRA adapter for this call, if any are installed.
+        from bgkit.models.lora_encoder import LoRARouter
 
-        # Expand survivor mask to full sequence if compression is active
-        if survivor_mask is not None:
-            full_survivor_mask = _expand_survivor_mask(
-                survivor_mask, comp_out.content_slice, full_raw.size(1),
+        router = LoRARouter.get()
+        lora_ctx = router.active(lora_level) if router is not None else _null_ctx()
+        with lora_ctx:
+            comp_out = self.compressor(
+                input_embeddings,
+                survivor_mask=survivor_mask,
+                attention_mask=attention_mask,
+                prompt_embeddings=prompt_embeddings,
+                prompt_attention_mask=prompt_attention_mask,
             )
-        else:
-            full_survivor_mask = None
 
-        proj_out = self.projection_block(full_raw, full_mask, full_survivor_mask)
+            # Projection block sees the full sequence (prompt context preserved)
+            full_raw = comp_out.raw_embeddings
+            full_mask = comp_out.attention_mask
+
+            # Expand survivor mask to full sequence if compression is active
+            if survivor_mask is not None:
+                full_survivor_mask = _expand_survivor_mask(
+                    survivor_mask, comp_out.content_slice, full_raw.size(1),
+                )
+            else:
+                full_survivor_mask = None
+
+            proj_out = self.projection_block(full_raw, full_mask, full_survivor_mask)
 
         # Package output
         if survivor_mask is None:

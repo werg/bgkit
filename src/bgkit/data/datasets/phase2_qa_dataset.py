@@ -235,6 +235,8 @@ class Phase2QADataset(Dataset):
             "loss_mask": loss_mask,
             "prefix_ids": question_ids.clone(),
             "compression_prompt_ids": question_ids.clone(),
+            "bgkit_splice_start": torch.tensor(question_ids.size(0), dtype=torch.long),
+            "bgkit_splice_len": torch.tensor(0, dtype=torch.long),
         }
 
     def __getitem__(self, idx: int) -> QASample:
@@ -281,6 +283,8 @@ class Phase2QADataset(Dataset):
             target_loss_mask=target["loss_mask"].to(dtype=torch.bool),
             prefix_ids=target["prefix_ids"],
             compression_prompt_ids=target["compression_prompt_ids"],
+            bgkit_splice_start=int(target["bgkit_splice_start"].item()),
+            bgkit_splice_len=int(target["bgkit_splice_len"].item()),
             question_token_ids=question_ids,
             answer_token_ids=answer_ids,
             sample_id=str(metadata.get("id", f"{self.dataset_name}:{orig_idx}")),

@@ -180,7 +180,8 @@ class TestChatReproDataset:
         sample = dataset[0]
         expected_keys = {
             "token_ids", "loss_mask", "content_token_ids",
-            "compression_prompt_ids", "prefix_ids", "language",
+            "compression_prompt_ids", "prefix_ids",
+            "bgkit_splice_start", "bgkit_splice_len", "language",
         }
         assert set(sample.keys()) == expected_keys
 
@@ -373,9 +374,16 @@ class TestCollateChatRepro:
             "content_token_ids", "content_attention_mask",
             "compression_prompt_ids", "compression_prompt_mask",
             "prefix_ids", "prefix_attention_mask",
+            "bgkit_splice_start", "bgkit_splice_len",
             "languages",
         }
         assert set(batch.keys()) == expected
+
+    def test_splice_metadata_collated(self, dataset):
+        samples = [dataset[0], dataset[1]]
+        batch = collate_chat_repro(samples)
+        assert batch["bgkit_splice_start"].shape == (2,)
+        assert batch["bgkit_splice_len"].shape == (2,)
 
     def test_content_token_ids_padded(self, dataset):
         """Content token IDs should be padded to max content length."""

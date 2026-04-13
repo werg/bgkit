@@ -87,6 +87,7 @@ class BgKITCompressor(nn.Module):
         attention_mask: torch.Tensor | None = None,
         prompt_embeddings: torch.Tensor | None = None,
         prompt_attention_mask: torch.Tensor | None = None,
+        pinned_positions: torch.Tensor | None = None,
         return_intermediates: bool = False,
     ) -> CompressorOutput:
         """Run the compressor (layers 0..N-2) and return dense output.
@@ -103,6 +104,12 @@ class BgKITCompressor(nn.Module):
                 candidates for survival -- only content positions get flag embeddings.
             prompt_attention_mask: (batch, prompt_len) optional mask for prompt positions.
                 Required when prompt_embeddings is provided and prompts have variable length.
+            pinned_positions: (batch, seq_len) bool mask of content positions that MUST
+                survive compression regardless of ICE score. Forced True in survivor_mask
+                before flag embeddings are applied. Used by the KB-scale trainer to
+                preserve article-ID tokens through L1 compression so the decoder can
+                read and re-emit them in subsequent tool calls. Ignored when
+                survivor_mask is None.
 
         Returns:
             CompressorOutput with dense embeddings for the full sequence (including prompt
@@ -110,8 +117,14 @@ class BgKITCompressor(nn.Module):
         """
         batch_size = input_embeddings.size(0)
 
-        # Add flag embeddings to content positions only (when compression is active)
+        # Add flag embeddings to content positions only (when compression is active).
+        # The caller (BgKITEncoder) is responsible for merging pinned_positions into
+        # survivor_mask before calling — we keep the parameter here so downstream
+        # code that calls the compressor directly can still pin, but by this point
+        # survivor_mask already reflects the merge.
         if survivor_mask is not None:
+            if pinned_positions is not None:
+                survivor_mask = survivor_mask | pinned_positions
             flag_emb = torch.where(
                 survivor_mask.unsqueeze(-1),
                 self.survive_embedding,

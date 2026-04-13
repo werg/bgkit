@@ -156,6 +156,21 @@ class CommitEncodingTrainer(BaseTrainer):
         # re-recording overhead. PeftModel isinstance fix landed in decoder.py
         # for when this becomes viable.
 
+        # Optional Liger Kernel fused kernels (RMSNorm / SwiGLU / RoPE +
+        # fused linear+CE). Gated on ``training.use_liger`` (default True);
+        # no-op when liger-kernel is not installed.
+        if tcfg.get("use_liger", True):
+            from bgkit.utils.liger_integration import apply_liger_to_qwen35
+
+            enc_patched = apply_liger_to_qwen35(self.encoder)
+            dec_patched = apply_liger_to_qwen35(self.decoder)
+            self.decoder.enable_liger_ce(True)
+            logger.info(
+                "liger_kernel_applied",
+                encoder_modules=enc_patched,
+                decoder_modules=dec_patched,
+            )
+
         # BaseTrainer uses self.model for logging
         self.model = self.decoder
 
@@ -654,6 +669,8 @@ class CommitEncodingTrainer(BaseTrainer):
         prompt_mask = batch["compression_prompt_mask"].to(self.device)
         target_ids = batch["target_token_ids"].to(self.device)
         target_mask = batch["target_attention_mask"].to(self.device)
+        splice_start_batch = batch["bgkit_splice_start"].to(self.device)
+        splice_len_batch = batch["bgkit_splice_len"].to(self.device)
         loss_mask_batch = batch.get("target_loss_mask")
         if loss_mask_batch is not None:
             loss_mask_batch = loss_mask_batch.to(self.device)
@@ -768,11 +785,13 @@ class CommitEncodingTrainer(BaseTrainer):
                     if loss_mask_batch is not None:
                         group_loss_mask = loss_mask_batch[group_indices]
 
-                    loss = self.decoder.forward_with_loss(
+                    loss = self.decoder.forward_with_single_splice(
                         survivor_embeddings=l1_out.survivor_embeddings,
-                        target_ids=group_target_ids,
-                        target_attention_mask=group_target_mask,
                         survivor_attention_mask=l1_out.survivor_attention_mask,
+                        token_ids=group_target_ids,
+                        token_attention_mask=group_target_mask,
+                        splice_starts=splice_start_batch[group_indices],
+                        splice_lengths=splice_len_batch[group_indices],
                         loss_mask=group_loss_mask,
                     )
                     group_scale = g_size / (batch_size * self._accum_steps)
@@ -809,11 +828,13 @@ class CommitEncodingTrainer(BaseTrainer):
                             loss_mask_batch[b_idx:b_idx + 1]
                             if loss_mask_batch is not None else None
                         )
-                        loss = self.decoder.forward_with_loss(
+                        loss = self.decoder.forward_with_single_splice(
                             survivor_embeddings=l1_o.survivor_embeddings,
-                            target_ids=target_ids[b_idx:b_idx + 1],
-                            target_attention_mask=target_mask[b_idx:b_idx + 1],
                             survivor_attention_mask=l1_o.survivor_attention_mask,
+                            token_ids=target_ids[b_idx:b_idx + 1],
+                            token_attention_mask=target_mask[b_idx:b_idx + 1],
+                            splice_starts=splice_start_batch[b_idx:b_idx + 1],
+                            splice_lengths=splice_len_batch[b_idx:b_idx + 1],
                             loss_mask=s_lm,
                         )
                         (loss * scale).backward()
@@ -893,6 +914,8 @@ class CommitEncodingTrainer(BaseTrainer):
                 prompt_mask = batch["compression_prompt_mask"].to(self.device)
                 target_ids = batch["target_token_ids"].to(self.device)
                 target_mask = batch["target_attention_mask"].to(self.device)
+                splice_start_batch = batch["bgkit_splice_start"].to(self.device)
+                splice_len_batch = batch["bgkit_splice_len"].to(self.device)
                 loss_mask_batch = batch.get("target_loss_mask")
                 if loss_mask_batch is not None:
                     loss_mask_batch = loss_mask_batch.to(self.device)
@@ -900,60 +923,59 @@ class CommitEncodingTrainer(BaseTrainer):
                 batch_size = file_ids.size(0)
                 bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
 
-                # Per-sample eval — no grouping, minimal peak memory
+                # Per-sample eval, no grouping, minimal peak memory.
                 for b in range(batch_size):
-                  with torch.autocast(
-                    "cuda", dtype=torch.bfloat16,
-                    enabled=self.device.type == "cuda",
-                  ):
-                    n_files = int(file_count[b].item())
-                    prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
+                    with torch.autocast(
+                        "cuda", dtype=torch.bfloat16,
+                        enabled=self.device.type == "cuda",
+                    ):
+                        n_files = int(file_count[b].item())
+                        prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
 
-                    l0_surv = self._compress_l0_batched(
-                        file_ids[b], file_masks[b], n_files,
-                        prompt_emb_b, prompt_mask[b:b + 1],
-                        bgkit_embed,
-                    )
-
-                    l1_input = l0_surv.unsqueeze(0)
-                    l1_mask = torch.ones(
-                        1, l0_surv.size(0), dtype=torch.bool, device=self.device,
-                    )
-                    l1_survivor_mask = self._score_and_select(
-                        l1_input, l1_mask, level="l1",
-                    )
-
-                    l1_out = self.encoder(
-                        input_embeddings=l1_input,
-                        survivor_mask=l1_survivor_mask,
-                        attention_mask=l1_mask,
-                        prompt_embeddings=prompt_emb_b,
-                        prompt_attention_mask=prompt_mask[b:b + 1],
-                    )
-
-                    sample_loss_mask = (
-                        loss_mask_batch[b:b + 1]
-                        if loss_mask_batch is not None else None
-                    )
-
-                    loss = self.decoder.forward_with_loss(
-                        survivor_embeddings=l1_out.survivor_embeddings,
-                        target_ids=target_ids[b:b + 1],
-                        target_attention_mask=target_mask[b:b + 1],
-                        survivor_attention_mask=l1_out.survivor_attention_mask,
-                        loss_mask=sample_loss_mask,
-                    )
-
-                    # Token-weighted accumulation for comparable perplexity
-                    eval_loss_mask = batch.get("target_loss_mask")
-                    if eval_loss_mask is not None:
-                        sample_tokens = eval_loss_mask[b, 1:].sum().item()
-                    else:
-                        sample_tokens = (
-                            batch["target_attention_mask"][b, 1:].sum().item()
+                        l0_surv = self._compress_l0_batched(
+                            file_ids[b], file_masks[b], n_files,
+                            prompt_emb_b, prompt_mask[b:b + 1],
+                            bgkit_embed,
                         )
-                    total_loss += loss.item() * sample_tokens
-                    total_tokens += sample_tokens
+
+                        l1_input = l0_surv.unsqueeze(0)
+                        l1_mask = torch.ones(
+                            1, l0_surv.size(0), dtype=torch.bool, device=self.device,
+                        )
+                        l1_survivor_mask = self._score_and_select(
+                            l1_input, l1_mask, level="l1",
+                        )
+
+                        l1_out = self.encoder(
+                            input_embeddings=l1_input,
+                            survivor_mask=l1_survivor_mask,
+                            attention_mask=l1_mask,
+                            prompt_embeddings=prompt_emb_b,
+                            prompt_attention_mask=prompt_mask[b:b + 1],
+                        )
+
+                        sample_loss_mask = (
+                            loss_mask_batch[b:b + 1]
+                            if loss_mask_batch is not None else None
+                        )
+
+                        loss = self.decoder.forward_with_single_splice(
+                            survivor_embeddings=l1_out.survivor_embeddings,
+                            survivor_attention_mask=l1_out.survivor_attention_mask,
+                            token_ids=target_ids[b:b + 1],
+                            token_attention_mask=target_mask[b:b + 1],
+                            splice_starts=splice_start_batch[b:b + 1],
+                            splice_lengths=splice_len_batch[b:b + 1],
+                            loss_mask=sample_loss_mask,
+                        )
+
+                        eval_loss_mask = batch.get("target_loss_mask")
+                        if eval_loss_mask is not None:
+                            sample_tokens = eval_loss_mask[b].sum().item()
+                        else:
+                            sample_tokens = batch["target_attention_mask"][b].sum().item()
+                        total_loss += loss.item() * sample_tokens
+                        total_tokens += sample_tokens
 
             avg_loss = total_loss / max(total_tokens, 1)
             perplexity = torch.exp(torch.tensor(avg_loss)).item()

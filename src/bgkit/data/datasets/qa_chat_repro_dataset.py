@@ -11,6 +11,7 @@ import torch
 from torch.utils.data import Dataset
 
 from bgkit.data.chat_template import (
+    BGKIT_TOOL_RESPONSE_SENTINEL,
     TOOL_CONFIGS,
     build_messages,
     build_tools,
@@ -84,7 +85,12 @@ class QAChatReproDataset(Dataset):
         # Compute overhead and cache lengths
         tools = build_tools(_FILE_READ_QUERY_CONFIG)
         messages = build_messages(
-            stub_variants[0], _FILE_READ_QUERY_CONFIG, "x.py", "python", "X",
+            stub_variants[0],
+            _FILE_READ_QUERY_CONFIG,
+            "x.py",
+            "python",
+            "X",
+            tool_response_content=BGKIT_TOOL_RESPONSE_SENTINEL,
         )
         overhead_str = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False, tools=tools,

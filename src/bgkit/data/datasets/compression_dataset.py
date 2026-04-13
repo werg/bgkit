@@ -17,6 +17,7 @@ import torch
 from torch.utils.data import Dataset
 
 from bgkit.data.chat_template import (
+    BGKIT_TOOL_RESPONSE_SENTINEL,
     TOOL_CONFIGS,
     ChatTemplateConfig,
     build_messages,
@@ -101,7 +102,14 @@ def _compute_max_overhead(
     tools = build_tools(config)
     for vi in probe_indices:
         variant = variants[vi]
-        messages = build_messages(variant, config, dummy_path, dummy_lang, "X")
+        messages = build_messages(
+            variant,
+            config,
+            dummy_path,
+            dummy_lang,
+            "X",
+            tool_response_content=BGKIT_TOOL_RESPONSE_SENTINEL,
+        )
         template_str = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False,
             tools=tools,
@@ -137,6 +145,8 @@ class FileCompressionSample:
     target_loss_mask: torch.Tensor
     prefix_ids: torch.Tensor
     compression_prompt_ids: torch.Tensor
+    bgkit_splice_start: int = -1
+    bgkit_splice_len: int = 0
 
 
 @dataclass
@@ -153,6 +163,8 @@ class RepoCompressionSample:
     target_loss_mask: torch.Tensor
     prefix_ids: torch.Tensor
     compression_prompt_ids: torch.Tensor
+    bgkit_splice_start: int = -1
+    bgkit_splice_len: int = 0
 
 
 def _gather_l1_files(
@@ -246,6 +258,8 @@ class DataReconstructionSubset(Dataset):
             target_loss_mask=result["loss_mask"],
             prefix_ids=result["prefix_ids"],
             compression_prompt_ids=result["compression_prompt_ids"],
+            bgkit_splice_start=int(result["bgkit_splice_start"].item()),
+            bgkit_splice_len=int(result["bgkit_splice_len"].item()),
         )
 
 
@@ -402,6 +416,8 @@ class DescriptionSubset(Dataset):
                 target_loss_mask=result["loss_mask"],
                 prefix_ids=result["prefix_ids"],
                 compression_prompt_ids=result["compression_prompt_ids"],
+                bgkit_splice_start=int(result["bgkit_splice_start"].item()),
+                bgkit_splice_len=int(result["bgkit_splice_len"].item()),
             )
 
         # L1: gather repo files grouped by (repo_path, commit_sha)
@@ -455,6 +471,8 @@ class DescriptionSubset(Dataset):
             target_loss_mask=result["loss_mask"],
             prefix_ids=result["prefix_ids"],
             compression_prompt_ids=result["compression_prompt_ids"],
+            bgkit_splice_start=int(result["bgkit_splice_start"].item()),
+            bgkit_splice_len=int(result["bgkit_splice_len"].item()),
         )
 
 
@@ -611,6 +629,8 @@ class StructuralSubset(Dataset):
                 target_loss_mask=result["loss_mask"],
                 prefix_ids=result["prefix_ids"],
                 compression_prompt_ids=result["compression_prompt_ids"],
+                bgkit_splice_start=int(result["bgkit_splice_start"].item()),
+                bgkit_splice_len=int(result["bgkit_splice_len"].item()),
             )
 
         # L1: gather repo files grouped by (repo_path, commit_sha)
@@ -643,6 +663,8 @@ class StructuralSubset(Dataset):
             target_loss_mask=result["loss_mask"],
             prefix_ids=result["prefix_ids"],
             compression_prompt_ids=result["compression_prompt_ids"],
+            bgkit_splice_start=int(result["bgkit_splice_start"].item()),
+            bgkit_splice_len=int(result["bgkit_splice_len"].item()),
         )
 
 
@@ -709,6 +731,8 @@ class CommitReproSubset(Dataset):
             target_loss_mask=result["loss_mask"],
             prefix_ids=result["prefix_ids"],
             compression_prompt_ids=result["compression_prompt_ids"],
+            bgkit_splice_start=int(result["bgkit_splice_start"].item()),
+            bgkit_splice_len=int(result["bgkit_splice_len"].item()),
         )
 
 

@@ -17,9 +17,40 @@ from torch.utils.data import DataLoader
 from bgkit.eval.metrics.reconstruction import parse_success_rate
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
-from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
 
 logger = structlog.get_logger()
+
+
+def _resolve_splice_metadata(
+    batch: dict,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(splice_starts, splice_lengths)`` for decoder injection.
+
+    Chat-formatted phase-1 data carries explicit splice metadata.
+    Simpler QA-style datasets do not, but their ``prefix_ids`` correspond to
+    the token prefix before the answer-bearing region, so a zero-width splice
+    at ``len(prefix_ids)`` preserves the intended geometry.
+    """
+    if "bgkit_splice_start" in batch and "bgkit_splice_len" in batch:
+        return (
+            batch["bgkit_splice_start"].to(device),
+            batch["bgkit_splice_len"].to(device),
+        )
+    prefix_mask = batch.get("prefix_attention_mask")
+    if prefix_mask is not None:
+        starts = prefix_mask.to(device).sum(dim=1, dtype=torch.long)
+        lengths = torch.zeros_like(starts)
+        return starts, lengths
+    prefix_ids = batch.get("prefix_ids")
+    if prefix_ids is not None:
+        starts = torch.full(
+            (prefix_ids.size(0),), prefix_ids.size(1),
+            dtype=torch.long, device=device,
+        )
+        lengths = torch.zeros_like(starts)
+        return starts, lengths
+    raise ValueError("Batch does not provide BgKIT splice metadata or prefix_ids")
 
 
 class AblationCondition(Enum):
@@ -134,17 +165,18 @@ def run_ablation_suite(
 
                 # Teacher-forced loss
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                    logits = decoder(
+                    splice_starts, splice_lengths = _resolve_splice_metadata(batch, device)
+                    loss = decoder.forward_with_single_splice(
                         survivor_embeddings=survivors,
-                        target_ids=token_ids,
-                        target_attention_mask=attention_mask,
                         survivor_attention_mask=content_attention_mask,
-                    )
-                    loss = data_reconstruction_loss(
-                        logits, token_ids, attention_mask, loss_mask=loss_mask,
+                        token_ids=token_ids,
+                        token_attention_mask=attention_mask,
+                        splice_starts=splice_starts,
+                        splice_lengths=splice_lengths,
+                        loss_mask=loss_mask,
                     )
 
-                batch_tokens = loss_mask[:, 1:].sum().item()
+                batch_tokens = loss_mask.sum().item()
                 total_loss += loss.item() * batch_tokens
                 total_tokens += batch_tokens
 
@@ -152,11 +184,14 @@ def run_ablation_suite(
                 if include_generation_metrics and suffix_ids is not None:
                     prefix_ids = batch["prefix_ids"].to(device)
                     prefix_attention_mask = batch["prefix_attention_mask"].to(device)
-                    gen_output = decoder.generate(
+                    splice_starts, splice_lengths = _resolve_splice_metadata(batch, device)
+                    gen_output = decoder.generate_with_single_splice(
                         survivor_embeddings=survivors,
                         survivor_attention_mask=content_attention_mask,
                         prefix_ids=prefix_ids,
                         prefix_attention_mask=prefix_attention_mask,
+                        splice_starts=splice_starts,
+                        splice_lengths=splice_lengths,
                         suffix_ids=suffix_ids.to(device),
                         tokenizer=tokenizer,
                         max_new_tokens=2048,

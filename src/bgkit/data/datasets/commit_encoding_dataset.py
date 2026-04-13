@@ -221,6 +221,8 @@ class CommitEncodingDataset(Dataset):
             target_loss_mask=result["loss_mask"],
             prefix_ids=result["prefix_ids"],
             compression_prompt_ids=compression_prompt_ids,
+            bgkit_splice_start=int(result["bgkit_splice_start"].item()),
+            bgkit_splice_len=int(result["bgkit_splice_len"].item()),
         )
 
     # --- Worker-safe pickling (mirrors MmapTokenDataset pattern) ---

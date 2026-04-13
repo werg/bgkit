@@ -1,4 +1,4 @@
-"""Tests for ReconstructionDecoder.generate() method."""
+"""Tests for ReconstructionDecoder.generate_with_single_splice()."""
 
 from __future__ import annotations
 
@@ -102,11 +102,13 @@ class TestGenerationOutput:
         batch_size, num_survivors, hidden_dim = 2, 4, 32
         prefix_len = 3
 
-        result = decoder.generate(
+        result = decoder.generate_with_single_splice(
             survivor_embeddings=torch.randn(batch_size, num_survivors, hidden_dim),
             survivor_attention_mask=torch.ones(batch_size, num_survivors, dtype=torch.bool),
             prefix_ids=torch.randint(0, 100, (batch_size, prefix_len)),
             prefix_attention_mask=torch.ones(batch_size, prefix_len, dtype=torch.bool),
+            splice_starts=torch.zeros(batch_size, dtype=torch.long),
+            splice_lengths=torch.zeros(batch_size, dtype=torch.long),
             suffix_ids=torch.tensor([5, 6], dtype=torch.long),
             tokenizer=tokenizer,
             max_new_tokens=10,
@@ -124,11 +126,13 @@ class TestGenerationOutput:
         # Model outputs [10, 20, 30, 5, 6, 2]. Suffix is [5, 6]. EOS is 2.
         # After stripping EOS: [10, 20, 30, 5, 6]
         # After stripping suffix [5, 6]: [10, 20, 30]
-        result = decoder.generate(
+        result = decoder.generate_with_single_splice(
             survivor_embeddings=torch.randn(batch_size, 3, 32),
             survivor_attention_mask=torch.ones(batch_size, 3, dtype=torch.bool),
             prefix_ids=torch.randint(0, 100, (batch_size, 2)),
             prefix_attention_mask=torch.ones(batch_size, 2, dtype=torch.bool),
+            splice_starts=torch.zeros(batch_size, dtype=torch.long),
+            splice_lengths=torch.zeros(batch_size, dtype=torch.long),
             suffix_ids=torch.tensor([5, 6], dtype=torch.long),
             tokenizer=tokenizer,
             max_new_tokens=10,
@@ -143,14 +147,16 @@ class TestGenerationOutput:
             "survivor_attention_mask": torch.ones(1, 3, dtype=torch.bool),
             "prefix_ids": torch.randint(0, 100, (1, 2)),
             "prefix_attention_mask": torch.ones(1, 2, dtype=torch.bool),
+            "splice_starts": torch.zeros(1, dtype=torch.long),
+            "splice_lengths": torch.zeros(1, dtype=torch.long),
             "suffix_ids": torch.tensor([5, 6], dtype=torch.long),
             "tokenizer": tokenizer,
             "max_new_tokens": 10,
             "temperature": 0.0,
         }
 
-        r1 = decoder.generate(**kwargs)
-        r2 = decoder.generate(**kwargs)
+        r1 = decoder.generate_with_single_splice(**kwargs)
+        r2 = decoder.generate_with_single_splice(**kwargs)
         assert r1.content_ids[0].tolist() == r2.content_ids[0].tolist()
 
     def test_fallback_when_no_suffix_match(self, tokenizer):
@@ -161,11 +167,13 @@ class TestGenerationOutput:
         )
         dec = ReconstructionDecoder(backbone, hidden_dim=32)
 
-        result = dec.generate(
+        result = dec.generate_with_single_splice(
             survivor_embeddings=torch.randn(1, 3, 32),
             survivor_attention_mask=torch.ones(1, 3, dtype=torch.bool),
             prefix_ids=torch.randint(0, 100, (1, 2)),
             prefix_attention_mask=torch.ones(1, 2, dtype=torch.bool),
+            splice_starts=torch.zeros(1, dtype=torch.long),
+            splice_lengths=torch.zeros(1, dtype=torch.long),
             suffix_ids=torch.tensor([99, 98], dtype=torch.long),
             tokenizer=tokenizer,
             max_new_tokens=10,
@@ -175,14 +183,30 @@ class TestGenerationOutput:
         assert result.content_ids[0].tolist() == [10, 20, 30, 40, 50]
 
     def test_content_text_is_nonempty(self, decoder, tokenizer):
-        result = decoder.generate(
+        result = decoder.generate_with_single_splice(
             survivor_embeddings=torch.randn(1, 3, 32),
             survivor_attention_mask=torch.ones(1, 3, dtype=torch.bool),
             prefix_ids=torch.randint(0, 100, (1, 2)),
             prefix_attention_mask=torch.ones(1, 2, dtype=torch.bool),
+            splice_starts=torch.zeros(1, dtype=torch.long),
+            splice_lengths=torch.zeros(1, dtype=torch.long),
             suffix_ids=torch.tensor([5, 6], dtype=torch.long),
             tokenizer=tokenizer,
             max_new_tokens=10,
         )
 
         assert len(result.content_text[0]) > 0
+
+    def test_generate_with_single_splice_strips_suffix(self, decoder, tokenizer):
+        result = decoder.generate_with_single_splice(
+            survivor_embeddings=torch.randn(1, 3, 32),
+            survivor_attention_mask=torch.ones(1, 3, dtype=torch.bool),
+            prefix_ids=torch.randint(0, 100, (1, 5)),
+            prefix_attention_mask=torch.ones(1, 5, dtype=torch.bool),
+            splice_starts=torch.tensor([2], dtype=torch.long),
+            splice_lengths=torch.tensor([0], dtype=torch.long),
+            suffix_ids=torch.tensor([5, 6], dtype=torch.long),
+            tokenizer=tokenizer,
+            max_new_tokens=10,
+        )
+        assert result.content_ids[0].tolist() == [10, 20, 30]

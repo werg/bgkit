@@ -180,8 +180,8 @@ class TestMergeLora:
 
         assert changed, "Merged weights should differ from base after LoRA training"
 
-    def test_roundtrip_forward_equivalence(self):
-        """forward() with LoRA decoder ≈ forward() with merged plain decoder."""
+    def test_roundtrip_single_splice_loss_equivalence(self):
+        """Single-splice loss matches before and after LoRA merge."""
         torch.manual_seed(42)
 
         backbone = MockCausalLMBackbone()
@@ -193,7 +193,7 @@ class TestMergeLora:
             if "lora_" in name and param.requires_grad:
                 param.data.normal_(0, 0.01)
 
-        # Forward through LoRA decoder
+        # Evaluate through the LoRA decoder
         survivors = torch.randn(1, 3, HIDDEN_DIM)
         target_ids = torch.randint(0, VOCAB_SIZE, (1, 8))
         target_mask = torch.ones(1, 8, dtype=torch.bool)
@@ -201,7 +201,14 @@ class TestMergeLora:
 
         decoder.eval()
         with torch.no_grad():
-            lora_logits = decoder(survivors, target_ids, target_mask, survivor_mask)
+            lora_loss = decoder.forward_with_single_splice(
+                survivor_embeddings=survivors,
+                survivor_attention_mask=survivor_mask,
+                token_ids=target_ids,
+                token_attention_mask=target_mask,
+                splice_starts=torch.zeros(1, dtype=torch.long),
+                splice_lengths=torch.zeros(1, dtype=torch.long),
+            )
 
         # Merge and load into plain decoder
         merged = decoder.merge_lora()
@@ -211,11 +218,16 @@ class TestMergeLora:
         fresh_decoder.eval()
 
         with torch.no_grad():
-            plain_logits = fresh_decoder(
-                survivors, target_ids, target_mask, survivor_mask,
+            plain_loss = fresh_decoder.forward_with_single_splice(
+                survivor_embeddings=survivors,
+                survivor_attention_mask=survivor_mask,
+                token_ids=target_ids,
+                token_attention_mask=target_mask,
+                splice_starts=torch.zeros(1, dtype=torch.long),
+                splice_lengths=torch.zeros(1, dtype=torch.long),
             )
 
-        torch.testing.assert_close(lora_logits, plain_logits, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(lora_loss, plain_loss, atol=1e-4, rtol=1e-4)
 
     def test_no_lora_returns_state_dict(self):
         """merge_lora() on a non-LoRA decoder just returns state_dict()."""

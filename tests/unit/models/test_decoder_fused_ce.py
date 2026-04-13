@@ -1,7 +1,7 @@
-"""Tests for ReconstructionDecoder.forward_with_loss() fused CE path.
+"""Tests for ReconstructionDecoder.forward_with_single_splice() fused CE path.
 
 Verifies:
-1. Numerical equivalence with forward() + manual CE loss
+1. Numerical equivalence with explicit interleaved CE loss
 2. Gradient flow through the fused path
 3. loss_mask support
 4. Single-chunk (no checkpoint) path
@@ -14,10 +14,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import torch.nn.functional as F
 from torch import nn
 
-from bgkit.models.decoder import ReconstructionDecoder
+from bgkit.models.decoder import EmbeddingSegment, ReconstructionDecoder, TokenSegment
 
 # ---------------------------------------------------------------------------
 # Mock backbone with HF CausalLM-style .model / .lm_head nesting
@@ -81,31 +80,13 @@ VOCAB_SIZE = 256
 HIDDEN_DIM = 32
 
 
-def _manual_ce_loss(logits, target_ids, attention_mask, loss_mask=None):
-    """Reference CE loss matching data_reconstruction_loss logic."""
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_targets = target_ids[:, 1:].contiguous()
-    shift_mask = attention_mask[:, 1:].float()
-    if loss_mask is not None:
-        shift_mask = shift_mask * loss_mask[:, 1:].float()
-
-    flat_logits = shift_logits.view(-1, shift_logits.size(-1))
-    flat_targets = shift_targets.view(-1)
-    flat_mask = shift_mask.view(-1)
-
-    per_token = F.cross_entropy(
-        flat_logits, flat_targets, ignore_index=-100, reduction="none",
-    )
-    return (per_token * flat_mask).sum() / flat_mask.sum().clamp(min=1)
-
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 
 class TestForwardWithLossNumericalEquivalence:
-    """forward_with_loss() should produce the same loss as forward() + manual CE."""
+    """forward_with_single_splice() should match explicit interleaved CE."""
 
     @pytest.fixture()
     def decoder(self):
@@ -120,16 +101,21 @@ class TestForwardWithLossNumericalEquivalence:
         return survivors, target_ids, target_mask, survivor_mask
 
     def test_matches_forward_plus_ce(self, decoder):
-        """Fused loss matches forward() + manual CE within float tolerance."""
+        """Single-splice loss matches explicit interleaved loss."""
         survivors, target_ids, target_mask, survivor_mask = self._make_inputs()
 
-        # Reference: forward() + manual CE
-        logits = decoder(survivors, target_ids, target_mask, survivor_mask)
-        ref_loss = _manual_ce_loss(logits, target_ids, target_mask)
+        ref_loss = decoder.forward_interleaved_with_loss([
+            EmbeddingSegment(embeddings=survivors),
+            TokenSegment(token_ids=target_ids, loss=True),
+        ])
 
-        # Fused: forward_with_loss()
-        fused_loss = decoder.forward_with_loss(
-            survivors, target_ids, target_mask, survivor_mask,
+        fused_loss = decoder.forward_with_single_splice(
+            survivor_embeddings=survivors,
+            survivor_attention_mask=survivor_mask,
+            token_ids=target_ids,
+            token_attention_mask=target_mask,
+            splice_starts=torch.zeros(target_ids.size(0), dtype=torch.long),
+            splice_lengths=torch.zeros(target_ids.size(0), dtype=torch.long),
         )
 
         torch.testing.assert_close(fused_loss, ref_loss, atol=1e-4, rtol=1e-4)
@@ -143,11 +129,18 @@ class TestForwardWithLossNumericalEquivalence:
         loss_mask = torch.zeros_like(target_mask, dtype=torch.bool)
         loss_mask[:, 10:25] = True
 
-        logits = decoder(survivors, target_ids, target_mask, survivor_mask)
-        ref_loss = _manual_ce_loss(logits, target_ids, target_mask, loss_mask)
+        ref_loss = decoder.forward_interleaved_with_loss([
+            EmbeddingSegment(embeddings=survivors),
+            TokenSegment(token_ids=target_ids, loss_mask=loss_mask),
+        ])
 
-        fused_loss = decoder.forward_with_loss(
-            survivors, target_ids, target_mask, survivor_mask,
+        fused_loss = decoder.forward_with_single_splice(
+            survivor_embeddings=survivors,
+            survivor_attention_mask=survivor_mask,
+            token_ids=target_ids,
+            token_attention_mask=target_mask,
+            splice_starts=torch.zeros(target_ids.size(0), dtype=torch.long),
+            splice_lengths=torch.zeros(target_ids.size(0), dtype=torch.long),
             loss_mask=loss_mask,
         )
 
@@ -159,12 +152,19 @@ class TestForwardWithLossNumericalEquivalence:
             target_len=40,
         )
 
-        logits = decoder(survivors, target_ids, target_mask, survivor_mask)
-        ref_loss = _manual_ce_loss(logits, target_ids, target_mask)
+        ref_loss = decoder.forward_interleaved_with_loss([
+            EmbeddingSegment(embeddings=survivors),
+            TokenSegment(token_ids=target_ids, loss=True),
+        ], chunk_size=8)
 
         # chunk_size=8 forces multiple chunks for 40-token sequence
-        fused_loss = decoder.forward_with_loss(
-            survivors, target_ids, target_mask, survivor_mask,
+        fused_loss = decoder.forward_with_single_splice(
+            survivor_embeddings=survivors,
+            survivor_attention_mask=survivor_mask,
+            token_ids=target_ids,
+            token_attention_mask=target_mask,
+            splice_starts=torch.zeros(target_ids.size(0), dtype=torch.long),
+            splice_lengths=torch.zeros(target_ids.size(0), dtype=torch.long),
             chunk_size=8,
         )
 
@@ -176,11 +176,18 @@ class TestForwardWithLossNumericalEquivalence:
             batch_size=1, target_len=12,
         )
 
-        logits = decoder(survivors, target_ids, target_mask, survivor_mask)
-        ref_loss = _manual_ce_loss(logits, target_ids, target_mask)
+        ref_loss = decoder.forward_interleaved_with_loss([
+            EmbeddingSegment(embeddings=survivors),
+            TokenSegment(token_ids=target_ids, loss=True),
+        ])
 
-        fused_loss = decoder.forward_with_loss(
-            survivors, target_ids, target_mask, survivor_mask,
+        fused_loss = decoder.forward_with_single_splice(
+            survivor_embeddings=survivors,
+            survivor_attention_mask=survivor_mask,
+            token_ids=target_ids,
+            token_attention_mask=target_mask,
+            splice_starts=torch.zeros(target_ids.size(0), dtype=torch.long),
+            splice_lengths=torch.zeros(target_ids.size(0), dtype=torch.long),
         )
 
         torch.testing.assert_close(fused_loss, ref_loss, atol=1e-4, rtol=1e-4)
@@ -199,8 +206,13 @@ class TestForwardWithLossGradients:
         target_mask = torch.ones(1, 10, dtype=torch.bool)
         survivor_mask = torch.ones(1, 3, dtype=torch.bool)
 
-        loss = decoder.forward_with_loss(
-            survivors, target_ids, target_mask, survivor_mask,
+        loss = decoder.forward_with_single_splice(
+            survivor_embeddings=survivors,
+            survivor_attention_mask=survivor_mask,
+            token_ids=target_ids,
+            token_attention_mask=target_mask,
+            splice_starts=torch.zeros(1, dtype=torch.long),
+            splice_lengths=torch.zeros(1, dtype=torch.long),
         )
         loss.backward()
 
@@ -218,8 +230,13 @@ class TestForwardWithLossGradients:
         target_mask = torch.ones(2, 15, dtype=torch.bool)
         survivor_mask = torch.ones(2, 4, dtype=torch.bool)
 
-        loss = decoder.forward_with_loss(
-            survivors, target_ids, target_mask, survivor_mask,
+        loss = decoder.forward_with_single_splice(
+            survivor_embeddings=survivors,
+            survivor_attention_mask=survivor_mask,
+            token_ids=target_ids,
+            token_attention_mask=target_mask,
+            splice_starts=torch.zeros(2, dtype=torch.long),
+            splice_lengths=torch.zeros(2, dtype=torch.long),
         )
         assert torch.isfinite(loss)
 
@@ -228,7 +245,7 @@ class TestIgnoreIndex:
     """Verify ignore_index=-100 tokens produce zero loss contribution.
 
     Note: target_ids are used for BOTH embedding lookup and CE targets in
-    forward_with_loss, so we can't set them to -100 directly (would crash
+    forward_with_single_splice, so we can't set them to -100 directly (would crash
     the embedding). Instead we verify that _chunk_ce_fn correctly passes
     ignore_index to F.cross_entropy by testing the low-level function.
     """

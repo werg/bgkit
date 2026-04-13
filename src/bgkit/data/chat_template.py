@@ -16,6 +16,10 @@ import torch
 # Long random suffix makes accidental collision near-impossible.
 CONTENT_SENTINEL = "<<<BGKIT_CONTENT_a7f3b2e1>>>"
 
+# Sentinel used to mark the tool-response span where BgKIT survivor
+# embeddings should be spliced into the decoder sequence.
+BGKIT_TOOL_RESPONSE_SENTINEL = "<<<BGKIT_TOOL_RESPONSE_4c91d7e5>>>"
+
 
 @dataclass
 class ChatTemplateConfig:
@@ -202,6 +206,8 @@ def build_messages(
     file_path: str,
     language: str,
     content_placeholder: str,
+    *,
+    tool_response_content: str = "File contents provided as BgKIT compressed context.",
 ) -> list[dict]:
     """Build chat messages in Qwen3.5's official tool-call format.
 
@@ -254,7 +260,7 @@ def build_messages(
         tool_call_msg,
         {
             "role": "tool",
-            "content": "File contents provided as BgKIT compressed context.",
+            "content": tool_response_content,
         },
         {"role": "assistant", "content": response_content},
     ]
@@ -388,7 +394,12 @@ def tokenize_with_sentinel(
     # Build template with sentinel for boundary detection
     tools = build_tools(config)
     messages_with_sentinel = build_messages(
-        variant, config, file_path, language, CONTENT_SENTINEL,
+        variant,
+        config,
+        file_path,
+        language,
+        CONTENT_SENTINEL,
+        tool_response_content=BGKIT_TOOL_RESPONSE_SENTINEL,
     )
     template_str = tokenizer.apply_chat_template(
         messages_with_sentinel, tokenize=False, add_generation_prompt=False,
@@ -402,13 +413,29 @@ def tokenize_with_sentinel(
             f"Expected exactly 1 sentinel in template, found {sentinel_count}. "
             f"Variant text may accidentally contain the sentinel string."
         )
+    tool_sentinel_count = template_str.count(BGKIT_TOOL_RESPONSE_SENTINEL)
+    if tool_sentinel_count != 1:
+        raise ValueError(
+            "Expected exactly 1 BgKIT tool-response sentinel in template, "
+            f"found {tool_sentinel_count}. Variant text may accidentally "
+            "contain the sentinel string."
+        )
 
     # Split on sentinel to get prefix and suffix strings
     prefix_str, suffix_str = template_str.split(CONTENT_SENTINEL)
+    prefix_before_bgkit, _prefix_after_bgkit = prefix_str.split(
+        BGKIT_TOOL_RESPONSE_SENTINEL,
+    )
 
     # Tokenize each piece separately (no special tokens per piece)
     prefix_ids = tokenizer.encode(prefix_str, add_special_tokens=False)
     suffix_ids = tokenizer.encode(suffix_str, add_special_tokens=False)
+    bgkit_splice_start = len(
+        tokenizer.encode(prefix_before_bgkit, add_special_tokens=False),
+    )
+    bgkit_splice_len = len(
+        tokenizer.encode(BGKIT_TOOL_RESPONSE_SENTINEL, add_special_tokens=False),
+    )
 
     # Content token IDs from the inner dataset (already tokenized)
     content_ids = content_token_ids.tolist()
@@ -433,4 +460,6 @@ def tokenize_with_sentinel(
         "content_token_ids": content_token_ids,
         "compression_prompt_ids": compression_prompt_ids,
         "prefix_ids": torch.tensor(prefix_ids, dtype=torch.long),
+        "bgkit_splice_start": torch.tensor(bgkit_splice_start, dtype=torch.long),
+        "bgkit_splice_len": torch.tensor(bgkit_splice_len, dtype=torch.long),
     }

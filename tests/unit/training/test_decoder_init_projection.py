@@ -151,6 +151,8 @@ def _make_batch(batch_size: int = 2, seq_len: int = 20, content_len: int = 10,
             "content_token_ids": token_ids[content_start:content_end],
             "compression_prompt_ids": torch.randint(0, 1000, (prompt_len,)),
             "prefix_ids": torch.randint(0, 1000, (content_start,)),
+            "bgkit_splice_start": content_start,
+            "bgkit_splice_len": 0,
             "language": "python",
         })
     return collate_chat_repro(samples)
@@ -716,6 +718,8 @@ class TestTrainStepWithProjection:
                 "content_token_ids": torch.randint(0, 1000, (5,)),
                 "compression_prompt_ids": torch.randint(0, 1000, (3,)),
                 "prefix_ids": torch.randint(0, 1000, (5,)),
+                "bgkit_splice_start": 5,
+                "bgkit_splice_len": 0,
                 "language": "python",
             },
         ]
@@ -744,6 +748,8 @@ class TestTrainStepWithProjection:
                 "content_token_ids": torch.randint(0, 1000, (5,)),
                 "compression_prompt_ids": torch.randint(0, 1000, (3,)),
                 "prefix_ids": torch.randint(0, 1000, (5,)),
+                "bgkit_splice_start": 5,
+                "bgkit_splice_len": 0,
                 "language": "python",
             },
         ]

@@ -165,6 +165,8 @@ def _make_file_batch(
             target_loss_mask=torch.ones(target_len, dtype=torch.long),
             prefix_ids=torch.randint(0, VOCAB_SIZE, (3,)),
             compression_prompt_ids=torch.randint(0, VOCAB_SIZE, (prompt_len,)),
+            bgkit_splice_start=3,
+            bgkit_splice_len=0,
         )
         samples.append(sample)
     return collate_compression(samples)
@@ -193,6 +195,8 @@ def _make_repo_batch(
             target_loss_mask=torch.ones(target_len, dtype=torch.long),
             prefix_ids=torch.randint(0, VOCAB_SIZE, (3,)),
             compression_prompt_ids=torch.randint(0, VOCAB_SIZE, (prompt_len,)),
+            bgkit_splice_start=3,
+            bgkit_splice_len=0,
         )
         samples.append(sample)
     return collate_compression(samples)
@@ -689,6 +693,8 @@ def _make_mixed_batch(
             target_loss_mask=torch.ones(target_len, dtype=torch.long),
             prefix_ids=torch.randint(0, VOCAB_SIZE, (3,)),
             compression_prompt_ids=torch.randint(0, VOCAB_SIZE, (prompt_len,)),
+            bgkit_splice_start=3,
+            bgkit_splice_len=0,
         ))
     repo_samples = []
     for _ in range(n_repo_samples):
@@ -705,6 +711,8 @@ def _make_mixed_batch(
             target_loss_mask=torch.ones(target_len, dtype=torch.long),
             prefix_ids=torch.randint(0, VOCAB_SIZE, (3,)),
             compression_prompt_ids=torch.randint(0, VOCAB_SIZE, (prompt_len,)),
+            bgkit_splice_start=3,
+            bgkit_splice_len=0,
         ))
     return collate_compression(file_samples + repo_samples)
 
@@ -774,9 +782,9 @@ class TestEvaluateRepoBatchPersample:
         assert torch.isfinite(torch.tensor(avg))
 
     def test_repo_eval_token_count_matches_target_mask(self, trainer):
-        """Token count should match the sum of target attention masks (minus position 0)."""
+        """Token count should match the sum of target attention masks."""
         batch = _make_repo_batch(batch_size=2, n_files=1, file_len=8)
-        expected_tokens = batch["target_attention_mask"][:, 1:].sum().item()
+        expected_tokens = batch["target_attention_mask"].sum().item()
         with torch.no_grad():
             trainer.encoder.eval()
             trainer.decoder.eval()

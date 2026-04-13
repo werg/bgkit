@@ -15,6 +15,7 @@ import torch
 from torch.utils.data import Dataset
 
 from bgkit.data.chat_template import (
+    BGKIT_TOOL_RESPONSE_SENTINEL,
     CONTENT_SENTINEL,
     TOOL_CONFIGS,
     build_messages,
@@ -86,7 +87,12 @@ class ChatReproDataset(Dataset):
         for variant in self._variants:
             for lang in test_languages:
                 messages = build_messages(
-                    variant, _FILE_READ_CONFIG, dummy_path, lang, "X",
+                    variant,
+                    _FILE_READ_CONFIG,
+                    dummy_path,
+                    lang,
+                    "X",
+                    tool_response_content=BGKIT_TOOL_RESPONSE_SENTINEL,
                 )
                 template_str = self._tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=False,

@@ -829,7 +829,7 @@ class CompressionTrainer(BaseTrainer):
     # Loss computation
     # ------------------------------------------------------------------
 
-    def _decoder_forward_with_loss(
+    def _decoder_forward_single_splice(
         self,
         survivors: torch.Tensor,
         survivor_mask: torch.Tensor,
@@ -842,15 +842,19 @@ class CompressionTrainer(BaseTrainer):
         """
         target_ids = batch["target_token_ids"].to(self.device)
         target_mask = batch["target_attention_mask"].to(self.device)
+        splice_start = batch["bgkit_splice_start"].to(self.device)
+        splice_len = batch["bgkit_splice_len"].to(self.device)
         loss_mask = batch.get("target_loss_mask")
         if loss_mask is not None:
             loss_mask = loss_mask.to(self.device)
 
-        return self.decoder.forward_with_loss(
+        return self.decoder.forward_with_single_splice(
             survivor_embeddings=survivors,
-            target_ids=target_ids,
-            target_attention_mask=target_mask,
             survivor_attention_mask=survivor_mask,
+            token_ids=target_ids,
+            token_attention_mask=target_mask,
+            splice_starts=splice_start,
+            splice_lengths=splice_len,
             loss_mask=loss_mask,
         )
 
@@ -885,7 +889,7 @@ class CompressionTrainer(BaseTrainer):
                 "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
             ):
                 survivors, survivor_mask = self._compress_file_batch(batch)
-                loss = self._decoder_forward_with_loss(survivors, survivor_mask, batch)
+                loss = self._decoder_forward_single_splice(survivors, survivor_mask, batch)
             self._flush_calibrator_scores()
             (loss / self._accum_steps).backward()
 
@@ -945,6 +949,8 @@ class CompressionTrainer(BaseTrainer):
         prompt_mask = batch["compression_prompt_mask"].to(self.device)
         target_ids = batch["target_token_ids"].to(self.device)
         target_mask = batch["target_attention_mask"].to(self.device)
+        splice_start_batch = batch["bgkit_splice_start"].to(self.device)
+        splice_len_batch = batch["bgkit_splice_len"].to(self.device)
         loss_mask_batch = batch.get("target_loss_mask")
         if loss_mask_batch is not None:
             loss_mask_batch = loss_mask_batch.to(self.device)
@@ -1076,11 +1082,13 @@ class CompressionTrainer(BaseTrainer):
                     if loss_mask_batch is not None:
                         group_loss_mask = loss_mask_batch[group_indices]
 
-                    loss = self.decoder.forward_with_loss(
+                    loss = self.decoder.forward_with_single_splice(
                         survivor_embeddings=dec_surv,
-                        target_ids=group_target_ids,
-                        target_attention_mask=group_target_mask,
                         survivor_attention_mask=dec_mask,
+                        token_ids=group_target_ids,
+                        token_attention_mask=group_target_mask,
+                        splice_starts=splice_start_batch[group_indices],
+                        splice_lengths=splice_len_batch[group_indices],
                         loss_mask=group_loss_mask,
                     )
 
@@ -1095,11 +1103,13 @@ class CompressionTrainer(BaseTrainer):
                             loss_mask_batch[d['idx']:d['idx'] + 1]
                             if loss_mask_batch is not None else None
                         )
-                        loss = self.decoder.forward_with_loss(
+                        loss = self.decoder.forward_with_single_splice(
                             survivor_embeddings=group_survivors[k],
-                            target_ids=target_ids[d['idx']:d['idx'] + 1],
-                            target_attention_mask=target_mask[d['idx']:d['idx'] + 1],
                             survivor_attention_mask=group_surv_masks[k],
+                            token_ids=target_ids[d['idx']:d['idx'] + 1],
+                            token_attention_mask=target_mask[d['idx']:d['idx'] + 1],
+                            splice_starts=splice_start_batch[d['idx']:d['idx'] + 1],
+                            splice_lengths=splice_len_batch[d['idx']:d['idx'] + 1],
                             loss_mask=s_loss_mask,
                         )
                         (loss * scale).backward()
@@ -1153,7 +1163,7 @@ class CompressionTrainer(BaseTrainer):
             "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
         ):
             file_survivors, file_mask = self._compress_file_batch(file_batch)
-            file_loss = self._decoder_forward_with_loss(
+            file_loss = self._decoder_forward_single_splice(
                 file_survivors, file_mask, file_batch,
             )
         file_scale = n_file_samples / (total_samples * self._accum_steps)
@@ -1363,16 +1373,14 @@ class CompressionTrainer(BaseTrainer):
                 enabled=self.device.type == "cuda",
             ):
                 surv, surv_mask = self._compress_file_batch(sub_batch)
-                loss = self._decoder_forward_with_loss(
+                loss = self._decoder_forward_single_splice(
                     surv, surv_mask, sub_batch,
                 )
             eval_loss_mask = sub_batch.get("target_loss_mask")
             if eval_loss_mask is not None:
-                sub_tokens = eval_loss_mask[:, 1:].sum().item()
+                sub_tokens = eval_loss_mask.sum().item()
             else:
-                sub_tokens = (
-                    sub_batch["target_attention_mask"][:, 1:].sum().item()
-                )
+                sub_tokens = sub_batch["target_attention_mask"].sum().item()
             file_loss_sum += loss.item() * sub_tokens
             file_tokens += sub_tokens
         return file_loss_sum, file_tokens
@@ -1396,6 +1404,8 @@ class CompressionTrainer(BaseTrainer):
         prompt_mask = batch["compression_prompt_mask"].to(self.device)
         target_ids = batch["target_token_ids"].to(self.device)
         target_mask = batch["target_attention_mask"].to(self.device)
+        splice_start_batch = batch["bgkit_splice_start"].to(self.device)
+        splice_len_batch = batch["bgkit_splice_len"].to(self.device)
         loss_mask_batch = batch.get("target_loss_mask")
         if loss_mask_batch is not None:
             loss_mask_batch = loss_mask_batch.to(self.device)
@@ -1442,19 +1452,21 @@ class CompressionTrainer(BaseTrainer):
                 loss_mask_batch[b:b + 1] if loss_mask_batch is not None else None
             )
 
-            loss = self.decoder.forward_with_loss(
+            loss = self.decoder.forward_with_single_splice(
                 survivor_embeddings=sample_survivors,
-                target_ids=target_ids[b:b + 1],
-                target_attention_mask=target_mask[b:b + 1],
                 survivor_attention_mask=sample_surv_mask,
+                token_ids=target_ids[b:b + 1],
+                token_attention_mask=target_mask[b:b + 1],
+                splice_starts=splice_start_batch[b:b + 1],
+                splice_lengths=splice_len_batch[b:b + 1],
                 loss_mask=sample_loss_mask,
             )
 
             eval_loss_mask = batch.get("target_loss_mask")
             if eval_loss_mask is not None:
-                sample_tokens = eval_loss_mask[b, 1:].sum().item()
+                sample_tokens = eval_loss_mask[b].sum().item()
             else:
-                sample_tokens = batch["target_attention_mask"][b, 1:].sum().item()
+                sample_tokens = batch["target_attention_mask"][b].sum().item()
             batch_loss_sum += loss.item() * sample_tokens
             batch_token_count += sample_tokens
 

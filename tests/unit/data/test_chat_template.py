@@ -9,6 +9,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from bgkit.data.chat_template import (
+    BGKIT_TOOL_RESPONSE_SENTINEL,
     CONTENT_SENTINEL,
     TOOL_CONFIGS,
     build_messages,
@@ -407,6 +408,7 @@ class TestTokenizeWithSentinel:
         expected_keys = {
             "token_ids", "loss_mask", "content_token_ids",
             "compression_prompt_ids", "prefix_ids",
+            "bgkit_splice_start", "bgkit_splice_len",
         }
         assert set(result.keys()) == expected_keys
 
@@ -472,6 +474,20 @@ class TestTokenizeWithSentinel:
             )
             assert result["loss_mask"].sum().item() == 3
             assert len(result["token_ids"]) > 3
+
+    def test_bgkit_splice_metadata_points_inside_prefix(self):
+        tokenizer = MockTokenizer()
+        config = TOOL_CONFIGS["file_read_repro"]
+        content_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+        result = tokenize_with_sentinel(
+            tokenizer, SEED_VARIANT, config, "test.py", "python", content_ids,
+        )
+        start = int(result["bgkit_splice_start"].item())
+        span_len = int(result["bgkit_splice_len"].item())
+        assert 0 <= start < len(result["prefix_ids"])
+        assert span_len == len(
+            tokenizer.encode(BGKIT_TOOL_RESPONSE_SENTINEL, add_special_tokens=False),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +585,8 @@ class TestChatReproDatasetIntegration:
         sample = dataset[0]
         expected_keys = {
             "token_ids", "loss_mask", "content_token_ids",
-            "compression_prompt_ids", "prefix_ids", "language",
+            "compression_prompt_ids", "prefix_ids",
+            "bgkit_splice_start", "bgkit_splice_len", "language",
         }
         assert set(sample.keys()) == expected_keys
 

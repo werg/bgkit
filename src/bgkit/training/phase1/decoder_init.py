@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import structlog
@@ -108,7 +109,7 @@ class _InterleavingIterator:
 class DecoderInitTrainer(BaseTrainer):
     """Step 1: Decoder init with encoder unfreeze + compression curriculum."""
 
-    LIVE_CONFIG_FIELDS = {
+    LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {
         "max_survivor_gap": "_max_gap",
         "target_ratio_ramp_steps": "_target_ratio_ramp_steps",
         "target_ratio_start": "_target_ratio_start",
@@ -212,6 +213,21 @@ class DecoderInitTrainer(BaseTrainer):
             self._decoder_lora = True
 
         enable_gradient_checkpointing(self.decoder.backbone)
+
+        # Optional Liger Kernel fused kernels (RMSNorm / SwiGLU / RoPE +
+        # fused linear+CE). Gated on ``training.use_liger`` (default True);
+        # no-op when liger-kernel is not installed.
+        if tcfg.get("use_liger", True):
+            from bgkit.utils.liger_integration import apply_liger_to_qwen35
+
+            enc_patched = apply_liger_to_qwen35(self.encoder)
+            dec_patched = apply_liger_to_qwen35(self.decoder)
+            self.decoder.enable_liger_ce(True)
+            logger.info(
+                "liger_kernel_applied",
+                encoder_modules=enc_patched,
+                decoder_modules=dec_patched,
+            )
 
         # BaseTrainer logging/device logic uses self.model
         self.model = self.decoder
@@ -998,6 +1014,8 @@ class DecoderInitTrainer(BaseTrainer):
         token_ids = batch["token_ids"].to(self.device)
         attention_mask = batch["attention_mask"].to(self.device)
         loss_mask = batch["loss_mask"].to(self.device)
+        splice_start = batch["bgkit_splice_start"].to(self.device)
+        splice_len = batch["bgkit_splice_len"].to(self.device)
 
         if self._encoder_frozen and not self._train_projection:
             with torch.no_grad():
@@ -1007,11 +1025,13 @@ class DecoderInitTrainer(BaseTrainer):
 
         # BF16 autocast for decoder forward + backward
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-            loss = self.decoder.forward_with_loss(
+            loss = self.decoder.forward_with_single_splice(
                 survivor_embeddings=survivors,
-                target_ids=token_ids,
-                target_attention_mask=attention_mask,
                 survivor_attention_mask=survivor_mask,
+                token_ids=token_ids,
+                token_attention_mask=attention_mask,
+                splice_starts=splice_start,
+                splice_lengths=splice_len,
                 loss_mask=loss_mask,
             )
 
@@ -1059,21 +1079,25 @@ class DecoderInitTrainer(BaseTrainer):
                 token_ids = batch["token_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 loss_mask = batch["loss_mask"].to(self.device)
+                splice_start = batch["bgkit_splice_start"].to(self.device)
+                splice_len = batch["bgkit_splice_len"].to(self.device)
 
                 survivors, survivor_mask = self._compute_survivors(batch)
 
                 with torch.autocast(
                     "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"
                 ):
-                    loss = self.decoder.forward_with_loss(
+                    loss = self.decoder.forward_with_single_splice(
                         survivor_embeddings=survivors,
-                        target_ids=token_ids,
-                        target_attention_mask=attention_mask,
                         survivor_attention_mask=survivor_mask,
+                        token_ids=token_ids,
+                        token_attention_mask=attention_mask,
+                        splice_starts=splice_start,
+                        splice_lengths=splice_len,
                         loss_mask=loss_mask,
                     )
 
-                batch_content_tokens = loss_mask[:, 1:].sum().item()
+                batch_content_tokens = loss_mask.sum().item()
                 total_loss += loss.item() * batch_content_tokens
                 total_content_tokens += batch_content_tokens
 
@@ -1102,19 +1126,23 @@ class DecoderInitTrainer(BaseTrainer):
                     token_ids = batch["token_ids"].to(self.device)
                     attention_mask = batch["attention_mask"].to(self.device)
                     loss_mask = batch["loss_mask"].to(self.device)
+                    splice_start = batch["bgkit_splice_start"].to(self.device)
+                    splice_len = batch["bgkit_splice_len"].to(self.device)
 
                     survivors, survivor_mask = self._compute_survivors(batch)
                     with torch.autocast(
                         "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"
                     ):
-                        loss = self.decoder.forward_with_loss(
+                        loss = self.decoder.forward_with_single_splice(
                             survivor_embeddings=survivors,
-                            target_ids=token_ids,
-                            target_attention_mask=attention_mask,
                             survivor_attention_mask=survivor_mask,
+                            token_ids=token_ids,
+                            token_attention_mask=attention_mask,
+                            splice_starts=splice_start,
+                            splice_lengths=splice_len,
                             loss_mask=loss_mask,
                         )
-                    bt = loss_mask[:, 1:].sum().item()
+                    bt = loss_mask.sum().item()
                     qa_loss += loss.item() * bt
                     qa_tokens += bt
 
@@ -1171,11 +1199,13 @@ class DecoderInitTrainer(BaseTrainer):
                 all_survivors.append(flat[:remaining])
 
             # Generate
-            gen_output = self.decoder.generate(
+            gen_output = self.decoder.generate_with_single_splice(
                 survivor_embeddings=survivors,
                 survivor_attention_mask=survivor_mask,
                 prefix_ids=prefix_ids,
                 prefix_attention_mask=prefix_attention_mask,
+                splice_starts=batch["bgkit_splice_start"].to(self.device),
+                splice_lengths=batch["bgkit_splice_len"].to(self.device),
                 suffix_ids=suffix_ids,
                 tokenizer=self.tokenizer,
                 max_new_tokens=2048,

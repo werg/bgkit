@@ -124,6 +124,12 @@ def collate_chat_repro(batch: list[dict]) -> dict:
         "compression_prompt_mask": compression_prompt_mask,
         "prefix_ids": prefix_ids,
         "prefix_attention_mask": prefix_attention_mask,
+        "bgkit_splice_start": torch.tensor(
+            [int(s.get("bgkit_splice_start", -1)) for s in batch], dtype=torch.long,
+        ),
+        "bgkit_splice_len": torch.tensor(
+            [int(s.get("bgkit_splice_len", 0)) for s in batch], dtype=torch.long,
+        ),
         "languages": [s["language"] for s in batch],
     }
 
@@ -191,6 +197,12 @@ def _collate_file_samples(samples: list) -> dict:
         "prefix_attention_mask": prefix_mask,
         "compression_prompt_ids": prompt_ids,
         "compression_prompt_mask": prompt_mask,
+        "bgkit_splice_start": torch.tensor(
+            [getattr(s, "bgkit_splice_start", -1) for s in samples], dtype=torch.long,
+        ),
+        "bgkit_splice_len": torch.tensor(
+            [getattr(s, "bgkit_splice_len", 0) for s in samples], dtype=torch.long,
+        ),
     }
 
 
@@ -246,6 +258,12 @@ def _collate_repo_samples(samples: list) -> dict:
         "prefix_attention_mask": prefix_mask,
         "compression_prompt_ids": prompt_ids,
         "compression_prompt_mask": prompt_mask,
+        "bgkit_splice_start": torch.tensor(
+            [getattr(s, "bgkit_splice_start", -1) for s in samples], dtype=torch.long,
+        ),
+        "bgkit_splice_len": torch.tensor(
+            [getattr(s, "bgkit_splice_len", 0) for s in samples], dtype=torch.long,
+        ),
     }
 
 
