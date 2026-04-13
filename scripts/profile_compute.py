@@ -18,23 +18,23 @@ import torch
 
 
 def profile_phase1() -> dict[str, float]:
-    """Profile Phase 1 memory: BgKIT + decoder (no target LLM)."""
+    """Profile Phase 1 memory: BgKIT encoder + 0.8B decoder."""
     print("=== Phase 1 Memory Profile ===")
     # TODO: Load BgKIT + decoder, run one step, measure memory
     raise NotImplementedError
 
 
 def profile_phase2() -> dict[str, float]:
-    """Profile Phase 2 memory: full pipeline with 4-bit target LLM.
+    """Profile Phase 2 memory: full KR pipeline with Qwen3.5-0.8B decoder.
 
-    Memory budget (Qwen3.5-35B target):
-    - Target LLM 4-bit: ~18 GB
-    - BgKIT BF16: ~2.1 GB
+    Memory budget (bgkit trains the 0.8B decoder throughout — there is no
+    larger in-house target LLM and no 4-bit quantization path):
+    - BgKIT encoder BF16: ~2.1 GB
     - Decoder BF16: ~1.6 GB
     - Projection block: ~70 MB
-    - LoRA adapters: ~0.3 GB
+    - LoRA adapters (optional): ~0.3 GB
     - Optimizer states: ~5 GB
-    - Activations: ~101 GB remaining
+    - Activations + L0/L1 caches: bulk of remaining budget
     """
     print("=== Phase 2 Memory Profile ===")
     # TODO: Load all models, run one fwd+bwd step, capture peak memory

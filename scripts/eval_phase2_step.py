@@ -8,7 +8,6 @@ Runs the appropriate benchmark evaluation for each Phase 2 step:
 - Step 4: KILT downstream metrics + NarrativeQA ROUGE-L
 - Track B: Git history QA per-type F1
 - Track C: Memory benchmarks (LongMemEval, LoCoMo)
-- Step 5: All benchmarks via target LLM
 
 Usage:
     python scripts/eval_phase2_step.py \
@@ -27,8 +26,7 @@ import torch
 from omegaconf import DictConfig
 from transformers import AutoTokenizer
 
-from bgkit.training.phase2.kr_step5_trainer import KRStep5Trainer
-from bgkit.training.phase2.kr_trainer import KRTrainer
+from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer as KRTrainer
 from bgkit.utils.logging import setup_logging
 
 logger = structlog.get_logger()
@@ -41,7 +39,6 @@ _STEP_BENCHMARKS = {
     "step4": ["kilt", "narrativeqa"],
     "git_kr": ["git_kr"],
     "user_memory": ["longmemeval", "locomo"],
-    "step5": ["kilt", "msmarco", "pubmedqa", "narrativeqa", "git_kr", "longmemeval", "locomo"],
 }
 
 
@@ -255,7 +252,7 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("eval_phase2_step.py expects a Phase 2 training config")
 
     step_name = str(cfg.training.get("step", "phase2"))
-    trainer = KRStep5Trainer(cfg) if step_name == "step5" else KRTrainer(cfg)
+    trainer = KRTrainer(cfg)
     trainer.setup()
 
     # Load checkpoint if specified

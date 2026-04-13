@@ -4,9 +4,8 @@ Replaces the ProjectionMLP with a full transformer block (the last layer
 extracted from the backbone). Attends to all positions bidirectionally
 but outputs only for survivors (when compression is active).
 
-For the v1 target (reconstruction decoder, 1024->1024) no dimension
-change is needed. extend_to_dim() will be implemented for Phase 1 Step 3
-(target LLM, 1024->2048).
+bgkit's decoder is Qwen3.5-0.8B throughout, so input and output hidden dims
+both stay at 1024 and no dimensional extension is needed.
 """
 
 from __future__ import annotations
@@ -114,12 +113,3 @@ class ProjectionBlock(nn.Module):
             projected = self.projection_head(self.output_norm(all_out))
             return ProjectionOutput(projected, None, None)
 
-    def extend_to_dim(self, target_dim: int, init_scale: float = 0.01) -> None:
-        """Extend output dimensionality for target LLM alignment.
-
-        Will be implemented for Phase 1 Step 3 (1024 -> 2560).
-        """
-        raise NotImplementedError(
-            f"extend_to_dim({target_dim}) not yet implemented. "
-            "Needed for Phase 1 Step 3 target LLM alignment."
-        )

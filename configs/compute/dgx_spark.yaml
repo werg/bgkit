@@ -3,7 +3,7 @@
 device: cuda
 # Mixed precision -- BF16 default (MXFP8/MXFP4 not supported on sm_121)
 mixed_precision: bf16
-# Gradient checkpointing across BgKIT levels and target LLM
+# Gradient checkpointing across BgKIT encoder levels and the 0.8B decoder
 gradient_checkpointing: true
 # Conservative defaults -- must be profiled on actual hardware
 max_seq_len: 8192

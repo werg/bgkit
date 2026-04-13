@@ -3,8 +3,8 @@
 Before proceeding from Phase 1 to Phase 2, verify:
 - Decoder reconstruction loss at target compression ratios
 - Reconstructed code parses successfully
-- Frozen target LLM (Qwen3.5-35B) reproduces text from projected survivors (3a)
-- Frozen target LLM (Qwen3.5-35B) generates coherent descriptions (3b)
+- Frozen decoder (Qwen3.5-0.8B) reproduces text from projected survivors (3a)
+- Frozen decoder (Qwen3.5-0.8B) generates coherent descriptions (3b)
 - Quality across compression ratio range
 """
 
@@ -55,7 +55,7 @@ def check_phase1_gates(
         step: Training step ("1", "2", "3a", "3b", "all").
         reconstruction_loss: Decoder reconstruction loss.
         parse_success_rate: Fraction of generated code that parses.
-        text_repro_loss: Target LLM text reproduction loss.
+        text_repro_loss: Decoder text reproduction loss.
         description_quality: Description generation quality score.
         max_reconstruction_loss: Threshold for reconstruction loss gate.
         min_parse_success_rate: Threshold for parse success rate gate.

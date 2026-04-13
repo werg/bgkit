@@ -161,18 +161,6 @@ class TestProjectionBlockForward:
         )
 
 
-class TestProjectionBlockExtendToDim:
-    def test_not_implemented(self):
-        """extend_to_dim should raise NotImplementedError."""
-        layer = MockTransformerLayer(64)
-        norm = nn.LayerNorm(64)
-        rotary = MockRotaryEmb(64)
-        block = ProjectionBlock(layer, norm, rotary, hidden_dim=64)
-
-        with pytest.raises(NotImplementedError):
-            block.extend_to_dim(2048)
-
-
 class TestProjectionBlockRotary:
     def test_rotary_not_in_state_dict(self):
         """_rotary_emb should NOT appear in state_dict (not a registered submodule)."""
