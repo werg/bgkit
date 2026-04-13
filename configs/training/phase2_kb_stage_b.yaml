@@ -1,0 +1,60 @@
+# Phase 2 KB-scale Stage B: full-corpus training (merged with the
+# old Stage C — we no longer ship a separate Stage C config).
+#
+# L0 LoRA frozen (the Stage A result); L1 LoRA + decoder train. L0
+# survivors come from a pre-computed cache built by
+# scripts/precompute_l0_subset.py with --stage-a-checkpoint pointing at
+# the trained Stage A checkpoint.
+phase: phase2_kb
+stage: B
+optimizer: adamw
+max_steps: 60000
+warmup_steps: 1000
+lr: 1.0e-4
+decoder_lr: 5.0e-5
+l1_lr: 2.0e-4
+eval_every: 1000
+save_every: 5000
+
+datasets:
+  - kilt_wikipedia
+  - pubmedqa
+  - narrativeqa
+  - git_history
+  - memory
+  - newsqa
+  - msmarco_passage
+  - searchqa
+
+# No top_tag_whitelist — Stage B is the full-scale stage. If you want
+# to run a smaller subset for debugging, add a whitelist here.
+
+live_l0: false
+l0_cache_dir: ${oc.env:DATA_DIR}/l0_cache_kb
+
+l0_retention:
+  kilt_wikipedia: 0.05
+  pubmedqa: 0.20
+  narrativeqa: 0.20
+  newsqa: 0.10
+  msmarco_passage: 0.40
+  searchqa: 0.40
+  git_history: 0.20
+  memory: 0.40
+
+# L1 retention drives how much *additional* compression L1 applies on
+# top of the per-article L0 survivors. Pinned article-ID tokens always
+# survive; this controls non-pinned positions. 0.10-0.20 keeps L1 doing
+# real compression. Tightened from 0.50 historical default.
+l1_retention: 0.15
+
+lora:
+  l0_rank: 32
+  l1_rank: 32
+  alpha: 64
+  dropout: 0.0
+
+phase1_checkpoint: auto
+# stage_a_checkpoint: auto  # uncomment once Stage A has produced a
+# best-checkpoint registry entry; the precompute script needs this to
+# bake Stage A's L0 LoRA into the cache.

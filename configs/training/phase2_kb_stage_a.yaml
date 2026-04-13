@@ -1,0 +1,65 @@
+# Phase 2 KB-scale Stage A: live-L0 bootstrap (1 epoch).
+#
+# Live L0 means the encoder runs forward + backward over raw tokens for
+# every bgkit call. Both L0 LoRA and L1 LoRA are trainable; the base
+# encoder is frozen (Phase 1 weights). Stage A's job is to shape L0 LoRA
+# to natural-language input distributions on a small mixed corpus, then
+# freeze L0 LoRA and pre-compute the L0 cache for Stage B.
+#
+# **One epoch only** — no data repetition. Stage A's data is small
+# enough that one pass shapes L0 sufficiently; Stage B picks up on the
+# much larger cached corpus afterwards.
+phase: phase2_kb
+stage: A
+optimizer: adamw
+warmup_steps: 500
+lr: 1.0e-4
+decoder_lr: 5.0e-5
+l0_lr: 2.0e-4
+l1_lr: 2.0e-4
+eval_every: 500
+save_every: 2000
+# max_steps is computed dynamically as ceil(len(train_dataset) / batch_size).
+# The trainer interprets ``max_steps: null`` as "one epoch over the train
+# split". Set explicitly to override.
+max_steps: null
+
+datasets:
+  - pubmedqa
+  - narrativeqa
+  - git_history
+  - memory
+
+# Stage A is the live-L0 bootstrap — keep the working set small so live
+# L0 is affordable. ~1500 samples per dataset × 4 datasets ≈ 6K samples
+# total, matching the stage budget described in docs/02_training_plan.md.
+max_samples_per_dataset_default: 1500
+
+live_l0: true
+# l0_cache_dir unused at Stage A since live_l0 = true
+# browse_tree_dir defaults to {DATA_DIR}/browse_trees
+# trajectory_dir defaults to {DATA_DIR}/trajectories
+# mmap_dir: {DATA_DIR}/mmap/phase2 (ArticleTokenStore root for live L0)
+
+l0_retention:
+  kilt_wikipedia: 0.05
+  pubmedqa: 0.20
+  narrativeqa: 0.20
+  newsqa: 0.10
+  git_history: 0.20
+  memory: 0.40
+
+# L1 retention drives how much *additional* compression L1 applies on
+# top of the per-article L0 survivors. The pinned article-ID tokens
+# always survive; this controls non-pinned positions. 0.10-0.20 keeps
+# L1 doing real compression — the plan's "extreme retention" target.
+# Was 0.50 historically; tightened to 0.15.
+l1_retention: 0.15
+
+lora:
+  l0_rank: 32
+  l1_rank: 32
+  alpha: 64
+  dropout: 0.0
+
+phase1_checkpoint: auto
