@@ -786,6 +786,40 @@ class TestEvaluateRepoBatchPersample:
         assert token_count == expected_tokens
 
 
+class TestEvaluateBreakdown:
+    def test_evaluate_reports_token_weighted_per_objective_metrics(self, trainer):
+        """evaluate() should emit per-objective loss and token shares."""
+        trainer.eval_dataloader = [
+            _make_file_batch(batch_size=2, target_len=12),
+            _make_repo_batch(batch_size=2, n_files=2, target_len=10),
+        ]
+
+        with torch.no_grad():
+            metrics = trainer.evaluate()
+
+        assert "data_reconstruction_loss" in metrics
+        assert "commit_reproduction_loss" in metrics
+        assert metrics["data_reconstruction_tokens"] > 0
+        assert metrics["commit_reproduction_tokens"] > 0
+        frac_sum = (
+            metrics["data_reconstruction_token_fraction"]
+            + metrics["commit_reproduction_token_fraction"]
+        )
+        assert 0.99 <= frac_sum <= 1.01
+
+    def test_evaluate_handles_mixed_batches_instead_of_skipping(self, trainer):
+        """Mixed batches should contribute to overall and per-objective eval metrics."""
+        trainer.eval_dataloader = [_make_mixed_batch(n_file_samples=1, n_repo_samples=1)]
+
+        with torch.no_grad():
+            metrics = trainer.evaluate()
+
+        assert metrics["mixed_batches"] == 1.0
+        assert "data_reconstruction_loss" in metrics
+        assert "commit_reproduction_loss" in metrics
+        assert metrics["loss"] >= 0
+
+
 class TestL0ToL1AutoRepro:
     def test_auto_reproduce_called_in_per_sample_loop(self, trainer):
         """Per-sample forward should call compressor.auto_reproduce for L0→L1 handoff."""

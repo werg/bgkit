@@ -34,6 +34,48 @@ _MAX_OVERHEAD_PROBE_VARIANTS = 8
 DEFAULT_MAX_FILES_PER_REPO = 32
 DEFAULT_MAX_TOKENS_PER_FILE = 8192
 
+_DEFAULT_VARIANT_BANKS: dict[str, list[dict[str, str]]] = {
+    "file_read_repro": [{
+        "system_prompt": (
+            "You are an AI coding assistant with access to the "
+            "bgkit_read_file tool for reading file contents."
+        ),
+        "user_prompt": "Read the file `{file_path}`",
+        "compression_prompt": "Return the file contents verbatim",
+        "response_prefix": "Here are the contents of `{file_path}`:",
+    }],
+    "description_gen": [{
+        "system_prompt": (
+            "You are an AI coding assistant with access to the "
+            "bgkit_describe tool for generating descriptions from "
+            "compressed code context."
+        ),
+        "user_prompt": "Describe `{file_path}`",
+        "compression_prompt": "Generate an accurate description of the target",
+        "response_prefix": "Here is a description of `{file_path}`:",
+    }],
+    "structural_repro": [{
+        "system_prompt": (
+            "You are an AI coding assistant with access to the "
+            "bgkit_extract_structure tool for extracting structure from "
+            "compressed code context."
+        ),
+        "user_prompt": "Extract the structure of `{file_path}`",
+        "compression_prompt": "Extract the structural information faithfully",
+        "response_prefix": "Here is the structure of `{file_path}`:",
+    }],
+    "commit_repro": [{
+        "system_prompt": (
+            "You are an AI coding assistant with access to the "
+            "bgkit_reproduce_commit tool for reconstructing commits from "
+            "compressed repository context."
+        ),
+        "user_prompt": "Reproduce the commit from repository {file_path}",
+        "compression_prompt": "Reproduce the complete commit from compressed context",
+        "response_prefix": "Here is the reconstructed commit:",
+    }],
+}
+
 
 def _compute_max_overhead(
     tokenizer,
@@ -70,6 +112,15 @@ def _compute_max_overhead(
         )
         max_overhead = max(max_overhead, overhead_tokens)
     return max_overhead
+
+
+def _load_variant_bank(path: Path) -> list[dict[str, str]] | None:
+    """Load a variant bank JSON file, returning None when absent or empty."""
+    if not path.exists():
+        return None
+    with open(path) as f:
+        bank = json.load(f)
+    return bank or None
 
 
 @dataclass
@@ -764,36 +815,27 @@ class CompressionDataset(Dataset):
         subsets: dict[str, Dataset] = {}
         weights = objective_weights or cls.DEFAULT_WEIGHTS
 
-        # Load variant banks (per-objective when available, shared fallback)
-        fallback_bank = [{
-            "system_prompt": "You are a helpful assistant.",
-            "user_prompt": "Read {file_path}",
-            "compression_prompt": "Reproduce the file contents exactly.",
-            "response_prefix": "Here is {file_path}:",
-        }]
-
         variant_banks: dict[str, list] = {}
         variant_dir = getattr(cfg, "prompt_variants_dir", None)
         if variant_dir and Path(variant_dir).is_dir():
             p = Path(variant_dir)
-            # Load shared fallback
-            shared_bank = None
-            if (p / "file_read_repro.json").exists():
-                with open(p / "file_read_repro.json") as f:
-                    shared_bank = json.load(f)
-            # Load per-objective banks, falling back to shared
-            for obj_key in [
-                "file_read_repro", "description_gen", "structural_repro", "commit_repro",
-            ]:
-                bank_path = p / f"{obj_key}.json"
-                if bank_path.exists():
-                    with open(bank_path) as f:
-                        bank = json.load(f)
-                    if bank:  # guard against empty JSON arrays
-                        variant_banks[obj_key] = bank
-                        continue
-                if shared_bank:
-                    variant_banks[obj_key] = shared_bank
+            bank_candidates = {
+                "file_read_repro": ["file_read_repro.json"],
+                "description_gen": ["description_gen.json"],
+                "structural_repro": ["structural_repro.json"],
+                # Step 4 stores commit prompts in commit_encoding.json; accept
+                # that file as an alias when the step-5-specific name is absent.
+                "commit_repro": ["commit_repro.json", "commit_encoding.json"],
+            }
+            for obj_key, candidates in bank_candidates.items():
+                bank = None
+                for candidate in candidates:
+                    bank = _load_variant_bank(p / candidate)
+                    if bank:
+                        break
+                if bank is None:
+                    bank = _DEFAULT_VARIANT_BANKS[obj_key]
+                variant_banks[obj_key] = bank
         elif variant_dir and Path(variant_dir).is_file():
             with open(variant_dir) as f:
                 shared = json.load(f)
@@ -846,7 +888,7 @@ class CompressionDataset(Dataset):
             config = TOOL_CONFIGS["file_read_repro"]
             subsets["data_reconstruction"] = DataReconstructionSubset(
                 token_ds, tokenizer,
-                variant_banks.get("file_read_repro", fallback_bank),
+                variant_banks.get("file_read_repro", _DEFAULT_VARIANT_BANKS["file_read_repro"]),
                 config, seed=seed,
             )
 
@@ -877,7 +919,7 @@ class CompressionDataset(Dataset):
                 config = TOOL_CONFIGS["description_gen"]
                 subsets["description_generation"] = DescriptionSubset(
                     token_ds, desc_ds, tokenizer,
-                    variant_banks.get("description_gen", fallback_bank),
+                    variant_banks.get("description_gen", _DEFAULT_VARIANT_BANKS["description_gen"]),
                     config, seed=seed,
                     repo_description_dataset=repo_desc_ds,
                 )
@@ -892,7 +934,10 @@ class CompressionDataset(Dataset):
                 config = TOOL_CONFIGS["structural_repro"]
                 subsets["structural_relational"] = StructuralSubset(
                     token_ds, struct_ds, tokenizer,
-                    variant_banks.get("structural_repro", fallback_bank),
+                    variant_banks.get(
+                        "structural_repro",
+                        _DEFAULT_VARIANT_BANKS["structural_repro"],
+                    ),
                     config, seed=seed,
                 )
             except (FileNotFoundError, ValueError) as e:
@@ -906,7 +951,7 @@ class CompressionDataset(Dataset):
                 config = TOOL_CONFIGS["commit_repro"]
                 subsets["commit_reproduction"] = CommitReproSubset(
                     commit_ds, tokenizer,
-                    variant_banks.get("commit_repro", fallback_bank),
+                    variant_banks.get("commit_repro", _DEFAULT_VARIANT_BANKS["commit_repro"]),
                     config, seed=seed,
                 )
             except (FileNotFoundError, ValueError) as e:

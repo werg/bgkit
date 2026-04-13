@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import random
 from pathlib import Path
+from typing import ClassVar
 
 import structlog
 import torch
@@ -59,7 +60,7 @@ class CompressionTrainer(BaseTrainer):
     fetching the next batch.
     """
 
-    LIVE_CONFIG_FIELDS = {
+    LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {
         "max_survivor_gap": "_max_gap",
         "target_ratio_ramp_steps": "_target_ratio_ramp_steps",
         "target_ratio_start": "_target_ratio_start",
@@ -778,7 +779,7 @@ class CompressionTrainer(BaseTrainer):
         all_s_mask = all_s_mask[sorted_indices]
 
         # 4. Sub-batch files to bound peak memory. Full attention layers have
-        #    O(n^2) memory in sequence length; batching 32 files × 4096 tokens
+        #    O(n^2) memory in sequence length; batching 32 files x 4096 tokens
         #    would exhaust unified memory. Process in groups of max_files_per_sub
         #    with checkpointing per sub-batch.
         max_files_per_sub = 8
@@ -1263,8 +1264,9 @@ class CompressionTrainer(BaseTrainer):
         try:
             total_loss = 0.0
             total_tokens = 0.0
-            per_objective_loss: dict[str, float] = {}
-            per_objective_count: dict[str, int] = {}
+            per_objective_loss_sum: dict[str, float] = {}
+            per_objective_tokens: dict[str, float] = {}
+            mixed_batches = 0
 
             num_batches = len(self.eval_dataloader)
             for batch_idx, batch in enumerate(self.eval_dataloader):
@@ -1272,67 +1274,38 @@ class CompressionTrainer(BaseTrainer):
                     logger.info("eval_progress", batch=batch_idx, total=num_batches)
 
                 if batch.get("mixed", False):
-                    continue
-
-                sample_type = batch["sample_type"]
-                if sample_type == "file":
-                    # Sub-batch file eval to bound peak memory. Full-batch
-                    # decoder forward on 20+ samples spikes activation memory
-                    # on unified memory systems.
-                    eval_sub = 4
-                    n_file = batch["content_token_ids"].size(0)
-                    file_loss_sum = 0.0
-                    file_tokens = 0.0
-                    for fs in range(0, n_file, eval_sub):
-                        fe = min(fs + eval_sub, n_file)
-                        sub_batch = {
-                            k: (v[fs:fe] if isinstance(v, torch.Tensor) else v)
-                            for k, v in batch.items()
-                        }
-                        with torch.autocast(
-                            "cuda", dtype=torch.bfloat16,
-                            enabled=self.device.type == "cuda",
-                        ):
-                            surv, surv_mask = self._compress_file_batch(sub_batch)
-                            loss = self._decoder_forward_with_loss(
-                                surv, surv_mask, sub_batch,
-                            )
-                        eval_loss_mask = sub_batch.get("target_loss_mask")
-                        if eval_loss_mask is not None:
-                            sub_tokens = eval_loss_mask[:, 1:].sum().item()
-                        else:
-                            sub_tokens = (
-                                sub_batch["target_attention_mask"][:, 1:].sum().item()
-                            )
-                        file_loss_sum += loss.item() * sub_tokens
-                        file_tokens += sub_tokens
-                    total_loss += file_loss_sum
-                    total_tokens += file_tokens
-
-                    objectives = batch.get("objectives", [])
-                    if objectives:
-                        obj = objectives[0]
-                        avg = file_loss_sum / max(file_tokens, 1)
-                        per_objective_loss[obj] = (
-                            per_objective_loss.get(obj, 0.0) + avg
-                        )
-                        per_objective_count[obj] = per_objective_count.get(obj, 0) + 1
+                    mixed_batches += 1
+                    batch_parts = [batch["file_batch"], batch["repo_batch"]]
                 else:
-                    # Repo batches: per-sample forward
-                    batch_loss_sum, batch_tokens = (
-                        self._evaluate_repo_batch_persample(batch)
-                    )
-                    total_loss += batch_loss_sum
-                    total_tokens += batch_tokens
+                    batch_parts = [batch]
 
-                    objectives = batch.get("objectives", [])
+                for part in batch_parts:
+                    objectives = part.get("objectives", [])
                     if objectives:
-                        obj = objectives[0]
-                        avg = batch_loss_sum / max(batch_tokens, 1)
-                        per_objective_loss[obj] = (
-                            per_objective_loss.get(obj, 0.0) + avg
+                        grouped_indices: dict[str, list[int]] = {}
+                        for idx, obj in enumerate(objectives):
+                            grouped_indices.setdefault(obj, []).append(idx)
+                    else:
+                        grouped_indices = {"unknown": list(range(self._batch_size(part)))}
+
+                    for obj, indices in grouped_indices.items():
+                        obj_batch = (
+                            part if len(indices) == self._batch_size(part)
+                            else self._slice_batch(part, indices)
                         )
-                        per_objective_count[obj] = per_objective_count.get(obj, 0) + 1
+                        if obj_batch["sample_type"] == "file":
+                            loss_sum, token_count = self._evaluate_file_batch(obj_batch)
+                        else:
+                            loss_sum, token_count = self._evaluate_repo_batch_persample(obj_batch)
+
+                        total_loss += loss_sum
+                        total_tokens += token_count
+                        per_objective_loss_sum[obj] = (
+                            per_objective_loss_sum.get(obj, 0.0) + loss_sum
+                        )
+                        per_objective_tokens[obj] = (
+                            per_objective_tokens.get(obj, 0.0) + token_count
+                        )
 
             avg_loss = total_loss / max(total_tokens, 1)
             perplexity = torch.exp(torch.tensor(avg_loss)).item()
@@ -1340,17 +1313,69 @@ class CompressionTrainer(BaseTrainer):
             metrics: dict[str, float] = {
                 "loss": avg_loss,
                 "perplexity": perplexity,
+                "mixed_batches": float(mixed_batches),
             }
 
-            for obj, total in per_objective_loss.items():
-                count = per_objective_count.get(obj, 1)
-                metrics[f"{obj}_loss"] = total / count
+            for obj, loss_sum in per_objective_loss_sum.items():
+                obj_tokens = per_objective_tokens.get(obj, 0.0)
+                metrics[f"{obj}_loss"] = loss_sum / max(obj_tokens, 1.0)
+                metrics[f"{obj}_tokens"] = obj_tokens
+                metrics[f"{obj}_token_fraction"] = obj_tokens / max(total_tokens, 1.0)
         finally:
             self._is_evaluating = False
             self.encoder.train()
             self.decoder.train()
 
         return metrics
+
+    def _batch_size(self, batch: dict) -> int:
+        """Return the number of samples represented by a collated batch."""
+        objectives = batch.get("objectives", [])
+        if objectives:
+            return len(objectives)
+        if batch["sample_type"] == "file":
+            return int(batch["content_token_ids"].size(0))
+        return int(batch["file_token_ids"].size(0))
+
+    def _slice_batch(self, batch: dict, indices: list[int]) -> dict:
+        """Slice a collated batch down to a subset of sample indices."""
+        sliced: dict = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                sliced[key] = value[indices]
+            elif isinstance(value, list):
+                sliced[key] = [value[i] for i in indices]
+            else:
+                sliced[key] = value
+        return sliced
+
+    def _evaluate_file_batch(self, batch: dict) -> tuple[float, float]:
+        """Token-weighted eval forward for a file batch."""
+        eval_sub = 4
+        n_file = batch["content_token_ids"].size(0)
+        file_loss_sum = 0.0
+        file_tokens = 0.0
+        for fs in range(0, n_file, eval_sub):
+            fe = min(fs + eval_sub, n_file)
+            sub_batch = self._slice_batch(batch, list(range(fs, fe)))
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16,
+                enabled=self.device.type == "cuda",
+            ):
+                surv, surv_mask = self._compress_file_batch(sub_batch)
+                loss = self._decoder_forward_with_loss(
+                    surv, surv_mask, sub_batch,
+                )
+            eval_loss_mask = sub_batch.get("target_loss_mask")
+            if eval_loss_mask is not None:
+                sub_tokens = eval_loss_mask[:, 1:].sum().item()
+            else:
+                sub_tokens = (
+                    sub_batch["target_attention_mask"][:, 1:].sum().item()
+                )
+            file_loss_sum += loss.item() * sub_tokens
+            file_tokens += sub_tokens
+        return file_loss_sum, file_tokens
 
     def _evaluate_repo_batch_persample(
         self,

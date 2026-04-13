@@ -1062,28 +1062,35 @@ class TestVariantBankLoading:
         assert ds._subsets["structural_relational"]._variants[0]["system_prompt"] == "sr"
         assert ds._subsets["commit_reproduction"]._variants[0]["system_prompt"] == "cr"
 
-    def test_missing_bank_falls_back_to_shared(self, tmp_path):
-        """Objectives without their own bank file fall back to file_read_repro."""
+    def test_missing_bank_uses_objective_specific_defaults(self, tmp_path):
+        """Missing per-objective files should not reuse file-read prompts."""
         variants_dir = tmp_path / "variants"
         variants_dir.mkdir()
 
         shared_variant = [{"system_prompt": "shared", "user_prompt": "Read {file_path}",
                            "compression_prompt": "Reproduce.", "response_prefix": "{file_path}:"}]
         (variants_dir / "file_read_repro.json").write_text(json.dumps(shared_variant))
-        # No per-objective files — all should fall back to shared
 
         cfg = self._make_full_config(tmp_path, variants_dir)
         tokenizer = _MockTokenizer()
         ds = CompressionDataset.from_config(cfg, tokenizer, seed=42)
 
-        for key in ["data_reconstruction", "description_generation",
-                     "structural_relational", "commit_reproduction"]:
-            assert ds._subsets[key]._variants[0]["system_prompt"] == "shared", (
-                f"{key} should fall back to shared bank"
-            )
+        assert ds._subsets["data_reconstruction"]._variants[0]["system_prompt"] == "shared"
+        assert (
+            "bgkit_describe"
+            in ds._subsets["description_generation"]._variants[0]["system_prompt"]
+        )
+        assert (
+            "bgkit_extract_structure"
+            in ds._subsets["structural_relational"]._variants[0]["system_prompt"]
+        )
+        assert (
+            "bgkit_reproduce_commit"
+            in ds._subsets["commit_reproduction"]._variants[0]["system_prompt"]
+        )
 
-    def test_empty_bank_falls_back_to_shared(self, tmp_path):
-        """Empty JSON array bank file should fall back to shared."""
+    def test_empty_bank_falls_back_to_objective_default(self, tmp_path):
+        """Empty per-objective files should use the matching built-in default."""
         variants_dir = tmp_path / "variants"
         variants_dir.mkdir()
 
@@ -1096,21 +1103,57 @@ class TestVariantBankLoading:
         tokenizer = _MockTokenizer()
         ds = CompressionDataset.from_config(cfg, tokenizer, seed=42)
 
-        # description_generation had empty bank → should fall back to shared
-        assert ds._subsets["description_generation"]._variants[0]["system_prompt"] == "shared"
-        # data_reconstruction uses file_read_repro directly
+        assert (
+            "bgkit_describe"
+            in ds._subsets["description_generation"]._variants[0]["system_prompt"]
+        )
         assert ds._subsets["data_reconstruction"]._variants[0]["system_prompt"] == "shared"
 
     def test_no_variants_dir_uses_fallback(self, tmp_path):
-        """Without variants dir, all objectives get the hardcoded fallback."""
+        """Without a variants dir, each objective gets a matching built-in prompt bank."""
         cfg = self._make_full_config(tmp_path, variants_dir=None)
         tokenizer = _MockTokenizer()
         ds = CompressionDataset.from_config(cfg, tokenizer, seed=42)
 
-        for key in ds._subsets:
-            assert ds._subsets[key]._variants[0]["user_prompt"] == "Read {file_path}", (
-                f"{key} should use hardcoded fallback"
-            )
+        assert (
+            ds._subsets["data_reconstruction"]._variants[0]["user_prompt"]
+            == "Read the file `{file_path}`"
+        )
+        assert (
+            ds._subsets["description_generation"]._variants[0]["user_prompt"]
+            == "Describe `{file_path}`"
+        )
+        assert (
+            ds._subsets["structural_relational"]._variants[0]["user_prompt"]
+            == "Extract the structure of `{file_path}`"
+        )
+        assert (
+            ds._subsets["commit_reproduction"]._variants[0]["user_prompt"]
+            == "Reproduce the commit from repository {file_path}"
+        )
+
+    def test_commit_repro_accepts_commit_encoding_alias(self, tmp_path):
+        """Step-4 prompt banks should be accepted for step-5 commit reproduction."""
+        variants_dir = tmp_path / "variants"
+        variants_dir.mkdir()
+        (variants_dir / "file_read_repro.json").write_text(json.dumps([{
+            "system_prompt": "shared",
+            "user_prompt": "Read {file_path}",
+            "compression_prompt": "Reproduce.",
+            "response_prefix": "{file_path}:",
+        }]))
+        (variants_dir / "commit_encoding.json").write_text(json.dumps([{
+            "system_prompt": "commit-alias",
+            "user_prompt": "Commit {file_path}",
+            "compression_prompt": "Commit alias.",
+            "response_prefix": "Commit:",
+        }]))
+
+        cfg = self._make_full_config(tmp_path, variants_dir)
+        tokenizer = _MockTokenizer()
+        ds = CompressionDataset.from_config(cfg, tokenizer, seed=42)
+
+        assert ds._subsets["commit_reproduction"]._variants[0]["system_prompt"] == "commit-alias"
 
     def test_single_file_variant_path(self, tmp_path):
         """A single JSON file as prompt_variants_dir loads for all objectives."""
