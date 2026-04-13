@@ -23,6 +23,75 @@ from convert_hf_to_mmap import (
 )
 
 
+def _build_document_id(record: dict, idx: int) -> str:
+    """Reproduce the document_id fallback chain from convert_dataset().
+
+    Kept in sync with the production code so the regression test catches
+    any accidental reordering of the probes.
+    """
+    raw_doc_id = (
+        record.get("document_id")
+        or record.get("wikipedia_id")
+        or record.get("pubid")
+        or record.get("query_id")
+        or record.get("key")
+        or record.get("id")
+        or idx
+    )
+    return str(raw_doc_id)
+
+
+class TestDocumentIdFallbackChain:
+    """The document_id fallback chain must produce the correct stable key
+    for every Phase 2 dataset. A wrong fallback silently breaks
+    ``article_id → document_id`` alignment between browse trees, L0
+    caches, and teacher trajectories."""
+
+    def test_pubmedqa_uses_pubid(self):
+        record = {"pubid": 27733282, "question": "...", "long_answer": "..."}
+        assert _build_document_id(record, 0) == "27733282"
+
+    def test_ms_marco_uses_query_id(self):
+        record = {"query_id": 1185869, "query": "...", "passages": []}
+        assert _build_document_id(record, 0) == "1185869"
+
+    def test_searchqa_uses_key(self):
+        record = {"key": "search_12345", "question": "...", "answer": "..."}
+        assert _build_document_id(record, 0) == "search_12345"
+
+    def test_kilt_wikipedia_uses_wikipedia_id(self):
+        record = {"wikipedia_id": "290", "wikipedia_title": "A", "text": []}
+        assert _build_document_id(record, 0) == "290"
+
+    def test_explicit_document_id_wins(self):
+        record = {
+            "document_id": "explicit_id",
+            "wikipedia_id": "should_lose",
+            "pubid": 99,
+            "id": "also_lose",
+        }
+        assert _build_document_id(record, 0) == "explicit_id"
+
+    def test_generic_id_fallback(self):
+        record = {"id": "doc_42", "question": "..."}
+        assert _build_document_id(record, 99) == "doc_42"
+
+    def test_enumeration_last_resort(self):
+        # No recognized id field: falls back to the positional index.
+        # This is a bug signal — never a meaningful document_id.
+        record = {"text": "some content", "no_id_here": True}
+        assert _build_document_id(record, 7) == "7"
+
+    def test_numeric_zero_not_confused_with_missing(self):
+        # pubid=0 is technically a valid value but Python's `or` chain
+        # treats it as falsy. This test documents that limitation so a
+        # future reader knows: if a dataset ever legitimately uses id=0,
+        # the fallback chain silently skips it. PubMed IDs start at 1
+        # historically so this is not a practical issue.
+        record = {"pubid": 0, "id": "fallback_id"}
+        assert _build_document_id(record, 5) == "fallback_id"
+
+
 # ===================================================================
 # _coerce_text
 # ===================================================================

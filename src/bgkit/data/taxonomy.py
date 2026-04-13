@@ -65,6 +65,41 @@ class TagTaxonomy:
         return cls.from_tag_counts(counter, min_frequency=min_frequency, separator=separator)
 
     @classmethod
+    def from_browse_tree(
+        cls,
+        tree: object,
+        *,
+        frequency_from_size: bool = True,
+    ) -> TagTaxonomy:
+        """Build a taxonomy from a :class:`bgkit.data.browse_tree.BrowseTree`.
+
+        Every non-article node in the tree becomes a tag. The parent
+        relationship is inherited from the browse tree's ``parent`` field.
+        When ``frequency_from_size`` is True (default) each tag's
+        ``frequency`` is set to the number of articles underneath it,
+        which gives ``TopicEmbeddingModule``'s LR scaler something to
+        work with even without real usage counts.
+
+        Tag IDs coming from a browse tree already use ``/`` as a
+        hierarchical separator (e.g. ``Physics/Quantum_mechanics``), so
+        we preserve that as the canonical separator.
+        """
+        nodes: dict[str, TagNode] = {}
+        for node_id in getattr(tree, "_nodes", {}):
+            node = tree.get(node_id)
+            if node.is_article:
+                continue
+            parent = node.parent if node.parent != "root" else None
+            freq = int(node.size) if frequency_from_size else 0
+            nodes[node_id] = TagNode(
+                name=node_id, parent=parent, frequency=max(freq, 0),
+            )
+        if "root" not in nodes:
+            # Ensure a root node exists for ancestors() to terminate cleanly.
+            nodes["root"] = TagNode(name="root", parent=None, frequency=0)
+        return cls(nodes, separator="/")
+
+    @classmethod
     def load(cls, path: str | Path) -> TagTaxonomy:
         payload = json.loads(Path(path).read_text())
         nodes = {
@@ -88,6 +123,28 @@ class TagTaxonomy:
 
     def __len__(self) -> int:
         return len(self._nodes)
+
+    def with_frequencies(
+        self,
+        counts: dict[str, int] | Counter[str],
+    ) -> TagTaxonomy:
+        """Return a new taxonomy with frequencies replaced from ``counts``.
+
+        Tags not present in ``counts`` get frequency 0. Parent/child
+        structure is preserved. Used by the KB-scale trainer to replace
+        the (misleading) tree-size-derived frequencies from
+        :meth:`from_browse_tree` with actual per-tag occurrence counts
+        computed over the loaded trajectory dataset — which is what the
+        optimizer's sqrt-frequency LR scaling really wants to see.
+        """
+        new_nodes: dict[str, TagNode] = {}
+        for name, node in self._nodes.items():
+            new_nodes[name] = TagNode(
+                name=node.name,
+                parent=node.parent,
+                frequency=int(counts.get(name, 0)),
+            )
+        return TagTaxonomy(new_nodes, separator=self.separator)
 
     @property
     def tags(self) -> list[str]:

@@ -36,9 +36,16 @@ from bgkit.data.mmap_writer import (
     write_mmap_artifacts,
 )
 
+# Metadata columns written to metadata.parquet.
+#
+# ``commit_ts`` (Unix seconds, int64) and ``question_type`` (str) are
+# optional-but-preserved columns used by the git_history dataset wrapper
+# and by build_browse_tree.py to construct the year-bucketed browse tree.
+# They default to 0 / "" when missing so non-git pipelines stay
+# backwards-compatible.
 META_COLUMNS = [
-    "repo_path", "file_path", "commit_sha",
-    "question", "category",
+    "repo_path", "file_path", "commit_sha", "commit_ts",
+    "question", "question_type", "category",
     "model_id", "generation_tier", "prompt_version",
 ]
 
@@ -100,7 +107,15 @@ def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: 
                 meta["repo_path"].append(record.get("repo_path", repo_path))
                 meta["file_path"].append(record.get("file_path", ""))
                 meta["commit_sha"].append(record.get("commit_sha", ""))
+                # Unix seconds; 0 means unknown (older records without this
+                # field, or non-git QA sources).
+                commit_ts = record.get("commit_ts", 0)
+                try:
+                    meta["commit_ts"].append(int(commit_ts) if commit_ts else 0)
+                except (TypeError, ValueError):
+                    meta["commit_ts"].append(0)
                 meta["question"].append(question[:500])  # Truncate for storage
+                meta["question_type"].append(record.get("question_type", ""))
                 meta["category"].append(record.get("category", ""))
                 meta["model_id"].append(record.get("model_id", ""))
                 meta["generation_tier"].append(record.get("generation_tier", ""))
@@ -136,6 +151,8 @@ def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: 
     for col in META_COLUMNS:
         if col == "prompt_version":
             meta_columns[col] = pa.array(meta[col], type=pa.int32())
+        elif col == "commit_ts":
+            meta_columns[col] = pa.array(meta[col], type=pa.int64())
         else:
             meta_columns[col] = pa.array(meta[col], type=pa.string())
 

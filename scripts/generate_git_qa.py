@@ -350,6 +350,11 @@ async def process_commit(
             "repo_path": repo_name,
             "commit_sha": commit.sha,
             "parent_sha": commit.parent_sha,
+            # Unix seconds from commit.commit_time (authoritative author/commit
+            # time). Used downstream by build_browse_tree.py to bucket the
+            # git history tree by year so the decoder can navigate a repo's
+            # commits chronologically.
+            "commit_ts": int(commit.timestamp),
             "commit_message": commit.message,
             "diff_paths": commit.diff_paths,
             "question": q["question"],

@@ -476,11 +476,30 @@ def convert_dataset(
                 elif value:
                     tag_list.append(str(value))
 
+        # ``document_id`` is the stable per-article key used by the browse
+        # tree and external taxonomy builders. Each HF dataset puts its
+        # canonical id under a different field, so we probe them in order
+        # of specificity:
+        #   - document_id / wikipedia_id: KILT Wikipedia
+        #   - pubid:                      PubMedQA (labeled + artificial)
+        #   - query_id:                   MS MARCO
+        #   - key:                        SearchQA
+        #   - id:                         generic fallback
+        #   - idx:                        last-resort enumeration (never
+        #                                 user-meaningful; signals a bug)
+        raw_doc_id = (
+            record.get("document_id")
+            or record.get("wikipedia_id")
+            or record.get("pubid")
+            or record.get("query_id")
+            or record.get("key")
+            or record.get("id")
+            or idx
+        )
+        raw_id = record.get("id") or record.get("wikipedia_id") or record.get("pubid") or idx
         row_meta = {
-            "id": str(record.get("id", record.get("wikipedia_id", idx))),
-            "document_id": str(
-                record.get("document_id", record.get("wikipedia_id", record.get("id", idx))),
-            ),
+            "id": str(raw_id),
+            "document_id": str(raw_doc_id),
             "dataset_name": dataset_name,
             "tag_list_json": json.dumps(tag_list),
         }
