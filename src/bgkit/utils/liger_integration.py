@@ -174,6 +174,11 @@ def _patch_rms_norm_modules(root: nn.Module) -> int:
             cls_name = type(child).__name__
             if "RMSNorm" not in cls_name or "Liger" in cls_name:
                 continue
+            # Skip gated RMSNorm variants (e.g. fla's FusedRMSNormGated used in
+            # DeltaNet, called as self.norm(x, z)). Plain LigerRMSNorm only
+            # accepts (x,) and the signature mismatch crashes at forward time.
+            if "Gated" in cls_name:
+                continue
             try:
                 hidden_size = int(child.weight.shape[-1])
                 new = liger_rms_cls(hidden_size=hidden_size, eps=float(eps))
