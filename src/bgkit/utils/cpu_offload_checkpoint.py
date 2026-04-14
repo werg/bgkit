@@ -140,7 +140,7 @@ class _CpuOffloadCheckpointFunction(torch.autograd.Function):
         else:
             out_list = [recomputed]  # type: ignore[list-item]
 
-        # Filter to tensor outputs + matching incoming grads for autograd.grad.
+        # Filter to tensor outputs + matching incoming grads for autograd.backward.
         grad_list = list(grad_outputs)
         tensor_outputs: list[torch.Tensor] = []
         tensor_grads: list[torch.Tensor] = []
@@ -149,30 +149,23 @@ class _CpuOffloadCheckpointFunction(torch.autograd.Function):
                 tensor_outputs.append(o)
                 tensor_grads.append(g)
 
-        # Tensors we want gradients w.r.t.
-        grad_inputs_targets = [
-            t for t, req in zip(restored, requires_grad, strict=True) if req
-        ]
-
-        if tensor_outputs and grad_inputs_targets:
-            grads_wrt_inputs = torch.autograd.grad(
-                outputs=tensor_outputs,
-                inputs=grad_inputs_targets,
-                grad_outputs=tensor_grads,
+        # Use autograd.backward (not autograd.grad): it accumulates .grad on
+        # every leaf tensor reachable from the outputs, including any nn.Module
+        # parameters captured in the fn closure. autograd.grad with explicit
+        # inputs= would skip those and leave mlp.param.grad as None.
+        if tensor_outputs:
+            torch.autograd.backward(
+                tensors=tensor_outputs,
+                grad_tensors=tensor_grads,
                 retain_graph=False,
                 create_graph=False,
-                allow_unused=True,
             )
-        else:
-            grads_wrt_inputs = tuple(None for _ in grad_inputs_targets)
 
-        # Reassemble the full grad tuple, inserting ``None`` for inputs that
-        # did not require grad so we return one entry per forward arg.
+        # Read input gradients back off the restored tensors for the return tuple.
         final_grads: list[torch.Tensor | None] = []
-        grad_iter = iter(grads_wrt_inputs)
-        for req in requires_grad:
+        for t, req in zip(restored, requires_grad, strict=True):
             if req:
-                final_grads.append(next(grad_iter))
+                final_grads.append(t.grad)
             else:
                 final_grads.append(None)
 
