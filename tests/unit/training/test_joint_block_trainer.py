@@ -36,10 +36,12 @@ class MockBackbone(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+    def forward(self, inputs_embeds=None, attention_mask=None, return_intermediates=False, layer_hooks=None, **kwargs):
         x = inputs_embeds
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             x = layer(x)
+            if layer_hooks and i in layer_hooks:
+                x = layer_hooks[i](x)
         x = self.norm(x)
         return _Output(last_hidden_state=x)
 
@@ -68,7 +70,7 @@ class MockRotaryEmb(nn.Module):
 def _make_encoder(hidden_dim: int = 64, num_layers: int = 3) -> BgKITEncoder:
     backbone = MockBackbone(hidden_dim=hidden_dim, num_layers=num_layers)
     compressor_norm = nn.LayerNorm(hidden_dim)
-    compressor = BgKITCompressor(backbone, compressor_norm, hidden_dim=hidden_dim)
+    compressor = BgKITCompressor(backbone, compressor_norm, hidden_dim=hidden_dim, survivorship_inner_dim=8)
 
     proj_layer = MockTransformerLayer(hidden_dim)
     proj_norm = nn.LayerNorm(hidden_dim)

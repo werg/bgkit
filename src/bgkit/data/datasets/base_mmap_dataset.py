@@ -2,7 +2,7 @@
 
 Provides shared init, getitem, pickle, and validation logic used by
 CommitReproDataset, MmapRepoDescriptionDataset, MmapDescriptionDataset,
-MmapStructuralDataset, and MmapICEDataset.
+and MmapStructuralDataset.
 
 Also exports standalone validation functions for use by MmapTokenDataset
 (which does not inherit due to its chunking logic).

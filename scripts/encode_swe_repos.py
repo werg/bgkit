@@ -39,10 +39,9 @@ import pyarrow.parquet as pq
 import torch
 
 
-def _load_encoder_and_ice(checkpoint_path: str, device: torch.device):
-    """Load BgKIT encoder and ICE from checkpoint."""
+def _load_encoder(checkpoint_path: str, device: torch.device):
+    """Load BgKIT encoder from checkpoint. Survivorship head is inside the encoder."""
     from bgkit.models.encoder import BgKITEncoder
-    from bgkit.models.ice import ICE
     from bgkit.training.checkpointing import load_checkpoint
 
     _metadata, state_dicts = load_checkpoint(Path(checkpoint_path))
@@ -58,17 +57,7 @@ def _load_encoder_and_ice(checkpoint_path: str, device: torch.device):
     encoder.to(device).eval()
     encoder.requires_grad_(False)
 
-    ice_state = {
-        k.replace("ice.", "", 1): v
-        for k, v in model_state.items() if k.startswith("ice.")
-    }
-    ice = ICE(input_dim=1024, hidden_dim=128, num_layers=3)
-    if ice_state:
-        ice.load_state_dict(ice_state, strict=False)
-    ice.to(device).eval()
-    ice.requires_grad_(False)
-
-    return encoder, ice
+    return encoder
 
 
 def _get_blob_sha(content: bytes) -> str:
@@ -139,7 +128,7 @@ def encode_swe_repos(
 
     # Load model
     print(f"Loading checkpoint from {checkpoint_path}")
-    encoder, ice = _load_encoder_and_ice(checkpoint_path, device)
+    encoder = _load_encoder(checkpoint_path, device)
 
     from transformers import AutoTokenizer
 
@@ -229,27 +218,19 @@ def encode_swe_repos(
                         mask_tensor = torch.from_numpy(masks).to(device)
                         embed_tokens = encoder.compressor.backbone.get_input_embeddings()
                         embeddings = embed_tokens(token_tensor)
-                        ice_scores = ice(embeddings)
 
                         for i, sha in enumerate(valid_shas):
-                            length = int(masks[i].sum())
-                            keep = max(1, math.ceil(length * retention_ratio))
-                            scores_i = ice_scores[i, :length]
-                            _, topk = torch.topk(scores_i, min(keep, length))
-                            topk, _ = topk.sort()
-
-                            survivor_mask = torch.zeros(
-                                1, token_tensor.size(1), dtype=torch.bool, device=device,
-                            )
-                            survivor_mask[0, topk] = True
-
                             output = encoder(
                                 input_embeddings=embeddings[i : i + 1],
-                                survivor_mask=survivor_mask,
                                 attention_mask=mask_tensor[i : i + 1],
+                                target_ratio=retention_ratio,
+                                level="l0",
                             )
+                            # Drop padding from survivors
+                            surv_mask = output.survivor_attention_mask[0]
                             survivors = (
-                                output.survivor_embeddings[0].cpu().to(torch.float16).numpy()
+                                output.survivor_embeddings[0][surv_mask]
+                                .cpu().to(torch.float16).numpy()
                             )
                             blob_cache[sha] = survivors
                             total_blobs_encoded += 1

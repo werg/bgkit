@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from collections import defaultdict
 from pathlib import Path
 
@@ -50,17 +49,16 @@ def _load_encoder_and_lora(
     lora_rank: int,
     lora_alpha: float | None,
 ) -> tuple[torch.nn.Module, torch.nn.Module, LoRARouter | None]:
-    """Load Phase 1 encoder + ICE, optionally install and load a Stage A LoRA.
+    """Load Phase 1 encoder, optionally install and load a Stage A LoRA.
 
     When ``stage_a_checkpoint`` is provided we install the same LoRA router
     configuration that ``KRKBTrainer._install_lora`` uses, then load the
     Stage A model state dict into the encoder so the LoRA adapters receive
-    their trained weights. Without this the ``lora_level="l0"`` hint at
+    their trained weights. Without this the ``level="l0"`` hint at
     encoder forward time is a no-op — the router returns None and the
     bare Phase 1 weights run, silently discarding Stage A's training.
     """
     from bgkit.models.encoder import BgKITEncoder
-    from bgkit.models.ice import ICE
     from bgkit.training.checkpointing import load_checkpoint
 
     _meta, state = load_checkpoint(phase1_checkpoint)
@@ -70,17 +68,9 @@ def _load_encoder_and_lora(
         for k, v in model_state.items()
         if k.startswith("encoder.")
     }
-    ice_state = {
-        k.replace("ice.", "", 1): v
-        for k, v in model_state.items()
-        if k.startswith("ice.")
-    }
     encoder = BgKITEncoder.from_pretrained_with_state_dict(
         "Qwen/Qwen3.5-0.8B-Base", encoder_state, hidden_dim=1024,
     )
-    ice = ICE(input_dim=1024, hidden_dim=128, num_layers=3)
-    if ice_state:
-        ice.load_state_dict(ice_state, strict=False)
 
     router: LoRARouter | None = None
     if stage_a_checkpoint is not None:
@@ -123,7 +113,7 @@ def _load_encoder_and_lora(
                 "Was this checkpoint saved by KRKBTrainer?"
             )
 
-    return encoder, ice, router
+    return encoder, router
 
 
 def alpha_or_default(alpha: float | None, rank: int) -> float:
@@ -136,7 +126,6 @@ def _encode_and_write_batch(
     dataset: str,
     token_store: ArticleTokenStore,
     encoder: torch.nn.Module,
-    ice: torch.nn.Module,
     embed_tokens: torch.nn.Module,
     device: torch.device,
     retention_ratio: float,
@@ -145,9 +134,6 @@ def _encode_and_write_batch(
 ) -> int:
     """Encode + write a batch. Returns the number of articles actually
     written to the shard (excludes missing articles and zero-survivor rows).
-    Callers use this to advance the per-shard counter — counting against
-    the requested batch size instead would close shards early when many
-    articles are absent from the token store.
     """
     if not pending_ids:
         return 0
@@ -159,18 +145,11 @@ def _encode_and_write_batch(
     mask = mask.to(device)
     with torch.no_grad():
         input_embeds = embed_tokens(tokens)
-        scores = ice(input_embeds)
-        survivor_mask = torch.zeros_like(mask, dtype=torch.bool)
-        for i in range(tokens.size(0)):
-            length = int(mask[i].sum())
-            keep = max(1, math.ceil(length * retention_ratio))
-            _, topk = torch.topk(scores[i, :length], min(keep, length))
-            survivor_mask[i, topk] = True
         out = encoder(
             input_embeddings=input_embeds,
-            survivor_mask=survivor_mask,
             attention_mask=mask,
-            lora_level="l0",
+            target_ratio=retention_ratio,
+            level="l0",
         )
         survivors = out.survivor_embeddings.cpu().float().numpy()
         survivor_mask_cpu = out.survivor_attention_mask.cpu().numpy()
@@ -244,14 +223,13 @@ def main() -> None:
             by_dataset[str(row["dataset"])].append(str(row["article_id"]))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    encoder, ice, router = _load_encoder_and_lora(
+    encoder, router = _load_encoder_and_lora(
         args.phase1_checkpoint,
         args.stage_a_checkpoint,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
     )
     encoder.to(device).eval()
-    ice.to(device).eval()
     if router is not None:
         router.to(device)
     embed_tokens = encoder.compressor.backbone.get_input_embeddings()
@@ -273,7 +251,7 @@ def main() -> None:
                     dataset=dataset,
                     token_store=token_store,
                     encoder=encoder,
-                    ice=ice,
+
                     embed_tokens=embed_tokens,
                     device=device,
                     retention_ratio=ratio,

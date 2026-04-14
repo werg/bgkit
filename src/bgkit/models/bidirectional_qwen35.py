@@ -33,6 +33,8 @@ Architecture notes (from model inspection):
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -176,6 +178,7 @@ class BidirectionalQwen35(nn.Module):
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         return_intermediates: bool = False,
+        layer_hooks: dict[int, Callable[[torch.Tensor], torch.Tensor]] | None = None,
     ) -> BaseModelOutputWithPast:
         """Run forward pass with bidirectional full attention.
 
@@ -190,6 +193,11 @@ class BidirectionalQwen35(nn.Module):
             return_intermediates: If True, collect hidden states after each
                 FullAttn layer (indices 3,7,11,15,19) and after the final
                 layer (index 22). Returned in hidden_states field.
+            layer_hooks: Optional dict mapping layer indices to callables.
+                After layer ``i`` completes, if ``i`` is in the dict, the
+                hook ``layer_hooks[i](hidden) -> hidden`` is called. Used
+                by the compressor for ratio-embedding injection (after
+                layer 3) and survivorship-head evaluation (after layer 7).
 
         Returns:
             BaseModelOutputWithPast with last_hidden_state (and hidden_states
@@ -257,6 +265,10 @@ class BidirectionalQwen35(nn.Module):
             else:
                 # Full attention: blended causal→bidirectional mask
                 hidden = _run_layer(layer, hidden, full_attn_mask, position_embeddings)
+
+            # Fire layer hook after this layer completes
+            if layer_hooks and i in layer_hooks:
+                hidden = layer_hooks[i](hidden)
 
             if return_intermediates and (
                 not self._is_deltanet_layer(layer) or i == num_layers - 1

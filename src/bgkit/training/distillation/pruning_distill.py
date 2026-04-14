@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import structlog
@@ -23,12 +24,9 @@ from bgkit.data.collators import collate_chat_repro
 from bgkit.data.datasets.chat_repro_dataset import ChatReproDataset
 from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
 from bgkit.data.samplers import TokenBudgetBatchSampler
-from bgkit.data.survivor_selection import fill_survivor_gaps, select_survivors_by_threshold
-from bgkit.data.threshold_calibrator import ThresholdCalibrator
 from bgkit.models.encoder import BgKITEncoder, _expand_survivor_mask
 from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
 from bgkit.training.base_trainer import BaseTrainer
-from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import enable_gradient_checkpointing
 
@@ -38,12 +36,11 @@ logger = structlog.get_logger()
 class PruningDistillTrainer(BaseTrainer):
     """Step 1a: DeltaNet pruning distillation with staged unfreezing."""
 
-    LIVE_CONFIG_FIELDS: dict[str, str] = {
+    LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {
         # Compression
         "target_ratio_min": "_target_ratio_min",
         "target_ratio_max": "_target_ratio_max",
         "eval_ratio": "_eval_ratio",
-        "max_survivor_gap": "_max_gap",
         # Loss weights
         "w_boundary": "_w_boundary",
         "w_repro": "_w_repro",
@@ -57,7 +54,7 @@ class PruningDistillTrainer(BaseTrainer):
     _use_device_prefetcher: bool = True
 
     def setup(self) -> None:
-        """Load teacher/student encoders, ICE model, configure staged curriculum."""
+        """Load teacher/student encoders, configure staged curriculum."""
         tcfg = self.cfg.training
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
@@ -133,21 +130,11 @@ class PruningDistillTrainer(BaseTrainer):
         # BaseTrainer uses self.model for parameter counting
         self.model = self.student_encoder
 
-        # --- ICE model (frozen) ---
-        self._load_ice_model(tcfg)
-
         # --- Compression config ---
         compression_cfg = tcfg.get("compression", {})
         self._target_ratio_min = compression_cfg.get("target_ratio_min", 0.10)
         self._target_ratio_max = compression_cfg.get("target_ratio_max", 1.0)
         self._eval_ratio = compression_cfg.get("eval_ratio", 0.10)
-        self._max_gap = compression_cfg.get("max_survivor_gap", 64)
-        self._calibrator = ThresholdCalibrator(
-            ema_decay=compression_cfg.get("calibrator_ema_decay", 0.99),
-            warmup_batches=compression_cfg.get("calibrator_warmup_batches", 50),
-            fallback_threshold=compression_cfg.get("fallback_threshold", 3.0),
-        )
-        self._pending_scores: list[torch.Tensor] = []
         self._is_evaluating = False
 
         # --- Stage thresholds ---
@@ -270,94 +257,14 @@ class PruningDistillTrainer(BaseTrainer):
         return step1_checkpoint
 
     # ------------------------------------------------------------------
-    # ICE model
+    # Target ratio
     # ------------------------------------------------------------------
 
-    def _load_ice_model(self, tcfg) -> None:
-        """Load frozen ICE model for compression scoring."""
-        from bgkit.models.ice import ICE
-
-        ice_cfg = tcfg.get("ice", {})
-        if not ice_cfg.get("checkpoint_path"):
-            raise ValueError(
-                "training.ice.checkpoint_path is required for pruning distillation."
-            )
-
-        if ice_cfg.checkpoint_path == "auto":
-            checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
-            ice_ckpt_path = resolve_checkpoint(
-                checkpoint_dir, phase="ice", metric="eval/mse",
-                label="training.ice.checkpoint_path",
-            )
-            self._input_sources["ice"] = ice_ckpt_path.name
-        else:
-            ice_ckpt_path = Path(ice_cfg.checkpoint_path)
-            self._input_sources["ice"] = ice_ckpt_path.name
-
-        self.ice_model = ICE(
-            input_dim=ice_cfg.get("input_dim", 1024),
-            hidden_dim=ice_cfg.get("hidden_dim", 128),
-            num_layers=ice_cfg.get("num_layers", 2),
-            kernel_size=ice_cfg.get("kernel_size", 5),
-        )
-        _, ice_state = load_checkpoint(ice_ckpt_path)
-        self.ice_model.load_state_dict(ice_state["model"])
-        self.ice_model.to(self.device)
-        self.ice_model.eval()
-        self.ice_model.requires_grad_(False)
-
-    # ------------------------------------------------------------------
-    # ICE scoring
-    # ------------------------------------------------------------------
-
-    def _score_and_select(
-        self,
-        embeddings: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Score with ICE, select survivors. Random ratio per sample in training."""
-        batch_size, seq_len, _ = embeddings.shape
-
-        with torch.no_grad():
-            ice_scores = self.ice_model(embeddings.float())
-        ice_scores = ice_scores.masked_fill(~attention_mask, float("-inf"))
-        if seq_len > 0:
-            ice_scores[:, 0] = float("-inf")
-
-        if not self._is_evaluating:
-            stats_mask = attention_mask.clone()
-            if seq_len > 0:
-                stats_mask[:, 0] = False
-            valid = ice_scores[stats_mask].detach()
-            self._pending_scores.append(valid)
-
-        survivor_mask = torch.zeros(
-            batch_size, seq_len, dtype=torch.bool, device=embeddings.device,
-        )
-        for b in range(batch_size):
-            valid_len = int(attention_mask[b].sum().item())
-            if valid_len == 0:
-                continue
-
-            if self._is_evaluating:
-                ratio = self._eval_ratio
-            else:
-                ratio = random.uniform(self._target_ratio_min, self._target_ratio_max)
-
-            threshold = self._calibrator.get_threshold(ratio)
-            valid_scores = ice_scores[b, :valid_len]
-            indices = select_survivors_by_threshold(valid_scores, threshold)
-            indices = fill_survivor_gaps(indices, valid_scores, self._max_gap, valid_len)
-            survivor_mask[b, indices] = True
-
-        return survivor_mask
-
-    def _flush_calibrator_scores(self) -> None:
-        if self._pending_scores:
-            non_empty = [s for s in self._pending_scores if s.numel() > 0]
-            if non_empty:
-                self._calibrator.update_from_flat(torch.cat(non_empty))
-            self._pending_scores.clear()
+    def _current_target_ratio(self) -> float:
+        """Return current target compression ratio for training or eval."""
+        if self._is_evaluating:
+            return self._eval_ratio
+        return random.uniform(self._target_ratio_min, self._target_ratio_max)
 
     # ------------------------------------------------------------------
     # Staged unfreezing
@@ -505,22 +412,22 @@ class PruningDistillTrainer(BaseTrainer):
         compression_prompt_ids = batch["compression_prompt_ids"].to(self.device)
         compression_prompt_mask = batch["compression_prompt_mask"].to(self.device)
 
+        target_ratio = self._current_target_ratio()
+
         # --- Teacher forward (fully frozen) ---
         with torch.no_grad():
             teacher_embed = self.teacher_encoder.compressor.backbone.get_input_embeddings()
             content_emb = teacher_embed(content_token_ids)
             prompt_emb = teacher_embed(compression_prompt_ids)
 
-            # ICE scoring on teacher embeddings (deterministic targets)
-            survivor_mask = self._score_and_select(content_emb, content_attention_mask)
-
-            # Teacher compressor with intermediates
+            # Teacher compressor with intermediates (survivorship head produces mask)
             teacher_comp = self.teacher_encoder.compressor(
                 content_emb,
-                survivor_mask=survivor_mask,
                 attention_mask=content_attention_mask,
                 prompt_embeddings=prompt_emb,
                 prompt_attention_mask=compression_prompt_mask,
+                target_ratio=target_ratio,
+                level="l0",
                 return_intermediates=True,
             )
 
@@ -534,9 +441,13 @@ class PruningDistillTrainer(BaseTrainer):
             # Teacher projection
             full_raw = teacher_comp.raw_embeddings
             full_mask = teacher_comp.attention_mask
-            full_survivor_mask = _expand_survivor_mask(
-                survivor_mask, content_slice, full_raw.size(1),
-            )
+            survivor_mask = teacher_comp.survivor_mask
+            if survivor_mask is not None:
+                full_survivor_mask = _expand_survivor_mask(
+                    survivor_mask, content_slice, full_raw.size(1),
+                )
+            else:
+                full_survivor_mask = None
             teacher_proj_out = self.teacher_encoder.projection_block(
                 full_raw, full_mask, survivor_mask=full_survivor_mask,
             )
@@ -546,14 +457,16 @@ class PruningDistillTrainer(BaseTrainer):
         student_content_emb = student_embed(content_token_ids)
         student_prompt_emb = student_embed(compression_prompt_ids)
 
-        # Student compressor with intermediates (uses same survivor mask from teacher)
+        # Student compressor with intermediates (uses same target_ratio; its own
+        # survivorship head produces a mask independently)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
             student_comp = self.student_encoder.compressor(
                 student_content_emb,
-                survivor_mask=survivor_mask,
                 attention_mask=content_attention_mask,
                 prompt_embeddings=student_prompt_emb,
                 prompt_attention_mask=compression_prompt_mask,
+                target_ratio=target_ratio,
+                level="l0",
                 return_intermediates=True,
             )
 
@@ -566,9 +479,16 @@ class PruningDistillTrainer(BaseTrainer):
             # Student projection
             student_full_raw = student_comp.raw_embeddings
             student_full_mask = student_comp.attention_mask
+            student_survivor_mask = student_comp.survivor_mask
+            if student_survivor_mask is not None:
+                student_full_survivor_mask = _expand_survivor_mask(
+                    student_survivor_mask, content_slice, student_full_raw.size(1),
+                )
+            else:
+                student_full_survivor_mask = None
             student_proj_out = self.student_encoder.projection_block(
                 student_full_raw, student_full_mask,
-                survivor_mask=full_survivor_mask,
+                survivor_mask=student_full_survivor_mask,
             )
 
             # Compute distillation loss
@@ -585,10 +505,8 @@ class PruningDistillTrainer(BaseTrainer):
 
         (loss / self._accum_steps).backward()
 
-        self._flush_calibrator_scores()
-
         # Track compression stats
-        n_survivors = int(survivor_mask.sum().item())
+        n_survivors = int(survivor_mask.sum().item()) if survivor_mask is not None else 0
         n_valid = int(content_attention_mask.sum().item())
         metrics["actual_ratio"] = n_survivors / max(n_valid, 1)
         metrics["stage"] = self._current_stage
@@ -608,7 +526,6 @@ class PruningDistillTrainer(BaseTrainer):
     def _add_step_metrics(self, metrics: dict[str, float]) -> None:
         metrics["bidi_alpha"] = self.student_encoder.compressor.backbone.bidi_alpha
         metrics["stage"] = self._current_stage
-        metrics["calibrated_threshold"] = self._calibrator.get_threshold(self._eval_ratio)
         metrics["trainable_params"] = sum(
             p.numel() for p in self.student_encoder.parameters() if p.requires_grad
         )
@@ -625,7 +542,6 @@ class PruningDistillTrainer(BaseTrainer):
         state["w_repro"] = self._w_repro
         state["w_proj"] = self._w_proj
         state["w_cosine"] = self._w_cosine
-        state["max_gap"] = self._max_gap
         return state
 
     def apply_live_config(self, changes: dict) -> None:
@@ -667,6 +583,8 @@ class PruningDistillTrainer(BaseTrainer):
         try:
             total_metrics: dict[str, float] = {}
             count = 0
+            target_ratio = self._current_target_ratio()
+
             for batch in self.eval_dataloader:
                 content_token_ids = batch["content_token_ids"].to(self.device)
                 content_attention_mask = batch["content_attention_mask"].to(self.device)
@@ -677,24 +595,30 @@ class PruningDistillTrainer(BaseTrainer):
                 teacher_embed = self.teacher_encoder.compressor.backbone.get_input_embeddings()
                 content_emb = teacher_embed(content_token_ids)
                 prompt_emb = teacher_embed(compression_prompt_ids)
-                survivor_mask = self._score_and_select(content_emb, content_attention_mask)
 
                 teacher_comp = self.teacher_encoder.compressor(
-                    content_emb, survivor_mask=survivor_mask,
+                    content_emb,
                     attention_mask=content_attention_mask,
                     prompt_embeddings=prompt_emb,
                     prompt_attention_mask=compression_prompt_mask,
+                    target_ratio=target_ratio,
+                    level="l0",
                     return_intermediates=True,
                 )
                 content_slice = teacher_comp.content_slice
                 teacher_normed = teacher_comp.normed_embeddings[:, content_slice, :]
                 teacher_repro = self.teacher_encoder.compressor.auto_reproduce(teacher_normed)
-                full_survivor_mask = _expand_survivor_mask(
-                    survivor_mask, content_slice, teacher_comp.raw_embeddings.size(1),
-                )
+                teacher_survivor_mask = teacher_comp.survivor_mask
+                if teacher_survivor_mask is not None:
+                    teacher_full_survivor_mask = _expand_survivor_mask(
+                        teacher_survivor_mask, content_slice,
+                        teacher_comp.raw_embeddings.size(1),
+                    )
+                else:
+                    teacher_full_survivor_mask = None
                 teacher_proj = self.teacher_encoder.projection_block(
                     teacher_comp.raw_embeddings, teacher_comp.attention_mask,
-                    survivor_mask=full_survivor_mask,
+                    survivor_mask=teacher_full_survivor_mask,
                 )
 
                 # Student forward
@@ -702,17 +626,27 @@ class PruningDistillTrainer(BaseTrainer):
                 s_content = student_embed(content_token_ids)
                 s_prompt = student_embed(compression_prompt_ids)
                 student_comp = self.student_encoder.compressor(
-                    s_content, survivor_mask=survivor_mask,
+                    s_content,
                     attention_mask=content_attention_mask,
                     prompt_embeddings=s_prompt,
                     prompt_attention_mask=compression_prompt_mask,
+                    target_ratio=target_ratio,
+                    level="l0",
                     return_intermediates=True,
                 )
                 student_normed = student_comp.normed_embeddings[:, content_slice, :]
                 student_repro = self.student_encoder.compressor.auto_reproduce(student_normed)
+                student_survivor_mask = student_comp.survivor_mask
+                if student_survivor_mask is not None:
+                    student_full_survivor_mask = _expand_survivor_mask(
+                        student_survivor_mask, content_slice,
+                        student_comp.raw_embeddings.size(1),
+                    )
+                else:
+                    student_full_survivor_mask = None
                 student_proj = self.student_encoder.projection_block(
                     student_comp.raw_embeddings, student_comp.attention_mask,
-                    survivor_mask=full_survivor_mask,
+                    survivor_mask=student_full_survivor_mask,
                 )
 
                 _, batch_metrics = self._compute_distillation_loss(
@@ -766,8 +700,6 @@ class PruningDistillTrainer(BaseTrainer):
         # Pass through decoder from original step1 checkpoint (unchanged)
         if self._decoder_state_dict is not None:
             save_kwargs["decoder"] = self._decoder_state_dict
-        # Save calibrator
-        save_kwargs["l0_calibrator"] = self._calibrator.state_dict()
 
         ckpt_path = save_checkpoint(checkpoint_dir, metadata, **save_kwargs)
         self._last_checkpoint_path = str(ckpt_path)
@@ -804,14 +736,9 @@ class PruningDistillTrainer(BaseTrainer):
                 ("_w_repro", "w_repro"),
                 ("_w_proj", "w_proj"),
                 ("_w_cosine", "w_cosine"),
-                ("_max_gap", "max_gap"),
             ]:
                 if key in ts:
                     setattr(self, attr, ts[key])
-
-        # Restore calibrator
-        if "l0_calibrator" in state_dicts:
-            self._calibrator.load_state_dict(state_dicts["l0_calibrator"])
 
         # Reapply freeze state from restored stage
         self._advance_to_current_stage()

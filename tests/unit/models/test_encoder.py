@@ -38,10 +38,19 @@ class MockBackbone(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+    def forward(
+        self,
+        inputs_embeds=None,
+        attention_mask=None,
+        return_intermediates=False,
+        layer_hooks=None,
+        **kwargs,
+    ):
         x = inputs_embeds
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             x = layer(x)
+            if layer_hooks and i in layer_hooks:
+                x = layer_hooks[i](x)
         x = self.norm(x)
         return _Output(last_hidden_state=x)
 
@@ -71,7 +80,9 @@ def _make_encoder(hidden_dim: int = 64) -> BgKITEncoder:
     """Create a BgKITEncoder with mock components."""
     backbone = MockBackbone(hidden_dim=hidden_dim, num_layers=2)
     compressor_norm = nn.LayerNorm(hidden_dim)
-    compressor = BgKITCompressor(backbone, compressor_norm, hidden_dim=hidden_dim)
+    compressor = BgKITCompressor(
+        backbone, compressor_norm, hidden_dim=hidden_dim, survivorship_inner_dim=16,
+    )
 
     proj_layer = MockTransformerLayer(hidden_dim)
     proj_norm = nn.LayerNorm(hidden_dim)
@@ -94,13 +105,13 @@ class TestBgKITEncoderForward:
     def test_output_type(self, encoder):
         """forward() should return CompressionOutput."""
         x = torch.randn(2, 10, 64)
-        out = encoder(x, survivor_mask=None)
+        out = encoder(x, target_ratio=None)
         assert isinstance(out, CompressionOutput)
 
     def test_no_compression_shape(self, encoder):
-        """Without survivor_mask, output should have full content."""
+        """Without target_ratio, output should have full content."""
         x = torch.randn(2, 10, 64)
-        out = encoder(x, survivor_mask=None)
+        out = encoder(x, target_ratio=None)
 
         assert out.survivor_embeddings.shape == (2, 10, 64)
         assert out.all_embeddings.shape == (2, 10, 64)
@@ -108,20 +119,8 @@ class TestBgKITEncoderForward:
         assert out.survivor_counts is None
         assert out.survivor_attention_mask.shape == (2, 10)
         assert out.survivor_attention_mask.all()
-
-    def test_with_compression(self, encoder):
-        """With survivor_mask, output should have extracted survivors."""
-        x = torch.randn(2, 8, 64)
-        mask = torch.tensor([
-            [True, True, False, True, False, False, True, True],
-            [True, False, True, False, True, False, False, False],
-        ])
-        out = encoder(x, survivor_mask=mask)
-
-        assert out.survivor_counts.tolist() == [5, 3]
-        assert out.survivor_embeddings.shape == (2, 5, 64)
-        assert out.survivor_attention_mask.shape == (2, 5)
-        assert out.all_embeddings.shape == (2, 8, 64)
+        assert out.head_logits is None
+        assert out.survive_probs is None
 
     def test_with_prompt_no_compression(self, encoder):
         """With prompt and no compression, output should be content-only."""
@@ -132,36 +131,17 @@ class TestBgKITEncoderForward:
 
         out = encoder(
             content_emb,
-            survivor_mask=None,
+            target_ratio=None,
             prompt_embeddings=prompt_emb,
         )
 
-        # Output should be content-only, not full sequence
         assert out.survivor_embeddings.shape == (batch_size, content_len, 64)
         assert out.all_embeddings.shape == (batch_size, content_len, 64)
-
-    def test_with_prompt_and_compression(self, encoder):
-        """With prompt and compression, survivors come from content only."""
-        batch_size = 1
-        content_len, prompt_len = 6, 3
-        content_emb = torch.randn(batch_size, content_len, 64)
-        prompt_emb = torch.randn(batch_size, prompt_len, 64)
-        # 3 survivors out of 6 content positions
-        mask = torch.tensor([[True, True, False, True, False, False]])
-
-        out = encoder(
-            content_emb,
-            survivor_mask=mask,
-            prompt_embeddings=prompt_emb,
-        )
-
-        assert out.survivor_counts.tolist() == [3]
-        assert out.survivor_embeddings.shape == (1, 3, 64)
 
     def test_gradient_flows(self, encoder):
         """Gradients should flow through the full encoder."""
         x = torch.randn(1, 5, 64, requires_grad=True)
-        out = encoder(x, survivor_mask=None)
+        out = encoder(x, target_ratio=None)
         out.survivor_embeddings.sum().backward()
         assert x.grad is not None
 
@@ -171,6 +151,15 @@ class TestBgKITEncoderForward:
         repro = encoder.auto_reproduce(x)
         expected = encoder.compressor.auto_reproduce(x)
         assert torch.allclose(repro, expected)
+
+    def test_new_fields_propagated(self, encoder):
+        """CompressionOutput should have head_logits, survive_probs, layer7_embeddings."""
+        x = torch.randn(2, 10, 64)
+        out = encoder(x, target_ratio=None)
+        # Without compression, fields are None
+        assert out.head_logits is None
+        assert out.survive_probs is None
+        assert out.layer7_embeddings is None
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +243,7 @@ class TestBgKITEncoderFactory:
 
         # from_pretrained casts to bfloat16; input must match
         x = torch.randn(2, 10, 64, dtype=torch.bfloat16)
-        out = encoder(x, survivor_mask=None)
+        out = encoder(x, target_ratio=None)
         assert isinstance(out, CompressionOutput)
         assert out.survivor_embeddings.shape == (2, 10, 64)
 

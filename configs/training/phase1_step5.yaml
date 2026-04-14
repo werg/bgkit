@@ -22,25 +22,19 @@ objectives:
   commit_reproduction: 0.20
   query_conditioned: 0.18
 
-ice:
-  checkpoint_path: auto
-  input_dim: 1024
-  hidden_dim: 192
-  num_layers: 3
-  kernel_size: 5
+# Ratio scheduling
+target_ratio_start: 0.10
+target_ratio_end: 0.10
+target_ratio_ramp_steps: 1
 
-curriculum:
-  l1_introduction_step: 0         # L0 already established in steps 1-4
-  # Random per-sample ratio drawn between min_target_ratio and 1.0.
-  # Step 1 trained across 0.10-1.0; step 2 holds the same range.
-  target_ratio_start: 0.10
-  target_ratio_end: 0.10
-  target_ratio_ramp_steps: 1       # no ramp — fixed at 0.10 from the start
-  max_survivor_gap: 64
-  fallback_threshold: 3.0       # used before calibrator warms up
-  calibrator_ema_decay: 0.99
-  calibrator_warmup_batches: 50
-  l1_calibrator_fast_batches: 200
+l1_introduction_step: 0         # L0 already established in steps 1-4
+
+# Survivorship head auxiliary losses
+survivorship:
+  ratio_loss_weight: 0.1
+  decisiveness_loss_weight: 0.05
+  soft_attn_loss_weight: 0.05
+  soft_attn_every_n_steps: 4
 
 decoder_lora:
   enabled: true

@@ -52,25 +52,6 @@ def _write_token_shards(
         pq.write_table(pa.table(cols), data_dir / f"shard_{i:04d}.parquet")
 
 
-def _write_ice_shards(
-    data_dir: Path,
-    shards: list[dict],
-) -> None:
-    """Write shard_*.parquet for ICE label data.
-
-    Each shard dict has keys: token_ids, ce_values, file_path, language, repo_path.
-    """
-    for i, shard in enumerate(shards):
-        table = pa.table({
-            "token_ids": pa.array(shard["token_ids"], type=pa.list_(pa.int32())),
-            "ce_values": pa.array(shard["ce_values"], type=pa.list_(pa.float32())),
-            "file_path": pa.array(shard["file_path"], type=pa.string()),
-            "language": pa.array(shard["language"], type=pa.string()),
-            "repo_path": pa.array(shard["repo_path"], type=pa.string()),
-        })
-        pq.write_table(table, data_dir / f"shard_{i:04d}.parquet")
-
-
 # ---------------------------------------------------------------------------
 # Commit converter tests
 # ---------------------------------------------------------------------------
@@ -197,72 +178,6 @@ class TestConvertTokens:
         assert manifest["row_count"] == 2
         assert manifest["total_tokens"] == 5
         assert manifest["source_shard_count"] == 2
-
-        verify(tmp_path)
-
-
-# ---------------------------------------------------------------------------
-# ICE converter tests
-# ---------------------------------------------------------------------------
-
-
-class TestConvertICE:
-    def test_convert_and_verify(self, tmp_path: Path):
-        from scripts.convert_ice_to_npy import convert, verify
-
-        _write_ice_shards(tmp_path, [{
-            "token_ids": [[1, 2, 3], [10, 20]],
-            "ce_values": [[0.1, 0.2], [0.3]],
-            "file_path": ["a.py", "b.py"],
-            "language": ["python", "python"],
-            "repo_path": ["owner/repo", "owner/repo"],
-        }])
-
-        manifest = convert(tmp_path)
-
-        assert manifest["schema_version"] == 1
-        assert manifest["row_count"] == 2
-        assert manifest["total_tokens"] == 5
-        assert manifest["total_ce_values"] == 3
-        assert manifest["source_shard_count"] == 1
-
-        # ICE-specific files exist
-        assert (tmp_path / "ce_values.npy").exists()
-        assert (tmp_path / "ce_offsets.npy").exists()
-        assert (tmp_path / "metadata.parquet").exists()
-
-        # Verify the CSR arrays are correct
-        offsets = np.load(tmp_path / "offsets.npy")
-        np.testing.assert_array_equal(offsets, [0, 3, 5])
-
-        ce_offsets = np.load(tmp_path / "ce_offsets.npy")
-        np.testing.assert_array_equal(ce_offsets, [0, 2, 3])
-
-        verify(tmp_path)
-
-    def test_multi_shard(self, tmp_path: Path):
-        from scripts.convert_ice_to_npy import convert, verify
-
-        _write_ice_shards(tmp_path, [
-            {
-                "token_ids": [[1, 2, 3]],
-                "ce_values": [[0.1, 0.2]],
-                "file_path": ["a.py"],
-                "language": ["python"],
-                "repo_path": ["owner/r1"],
-            },
-            {
-                "token_ids": [[10, 20]],
-                "ce_values": [[0.3]],
-                "file_path": ["b.py"],
-                "language": ["python"],
-                "repo_path": ["owner/r2"],
-            },
-        ])
-
-        manifest = convert(tmp_path)
-        assert manifest["row_count"] == 2
-        assert manifest["total_ce_values"] == 3
 
         verify(tmp_path)
 

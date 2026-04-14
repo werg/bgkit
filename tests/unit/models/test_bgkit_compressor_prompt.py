@@ -16,8 +16,9 @@ from bgkit.models.bgkit_compressor import BgKITCompressor, CompressorOutput
 
 
 class _Output:
-    def __init__(self, last_hidden_state):
+    def __init__(self, last_hidden_state, hidden_states=None):
         self.last_hidden_state = last_hidden_state
+        self.hidden_states = hidden_states
 
 
 class MockBackbone(nn.Module):
@@ -30,8 +31,17 @@ class MockBackbone(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+    def forward(
+        self,
+        inputs_embeds=None,
+        attention_mask=None,
+        return_intermediates=False,
+        layer_hooks=None,
+        **kwargs,
+    ):
         x = self.layers[0](inputs_embeds)
+        if layer_hooks and 0 in layer_hooks:
+            x = layer_hooks[0](x)
         x = self.norm(x)
         return _Output(last_hidden_state=x)
 
@@ -47,7 +57,7 @@ class TestBgKITCompressorPrompt:
         hidden_dim = 64
         backbone = MockBackbone(hidden_dim=hidden_dim)
         norm = nn.LayerNorm(hidden_dim)
-        return BgKITCompressor(backbone, norm, hidden_dim=hidden_dim)
+        return BgKITCompressor(backbone, norm, hidden_dim=hidden_dim, survivorship_inner_dim=16)
 
     def test_prompt_separator_exists(self, compressor):
         """Compressor should have a prompt_separator_embedding parameter."""
@@ -61,7 +71,7 @@ class TestBgKITCompressorPrompt:
     def test_forward_without_prompt_unchanged(self, compressor):
         """Forward without prompt should work as expected."""
         x = torch.randn(2, 8, 64)
-        out = compressor(x, survivor_mask=None)
+        out = compressor(x, target_ratio=None)
         assert isinstance(out, CompressorOutput)
         assert out.raw_embeddings.shape == (2, 8, 64)
 
@@ -73,7 +83,7 @@ class TestBgKITCompressorPrompt:
 
         out = compressor(
             content_emb,
-            survivor_mask=None,
+            target_ratio=None,
             prompt_embeddings=prompt_emb,
         )
 
@@ -81,7 +91,6 @@ class TestBgKITCompressorPrompt:
         expected_full_len = prompt_len + 1 + content_len
         assert out.raw_embeddings.shape == (batch_size, expected_full_len, 64)
         assert out.normed_embeddings.shape == (batch_size, expected_full_len, 64)
-        # Content slice starts at prompt_len + 1 (separator)
         assert out.content_slice == slice(prompt_len + 1, None)
 
     def test_content_slice_extracts_content(self, compressor):
@@ -92,7 +101,7 @@ class TestBgKITCompressorPrompt:
 
         out = compressor(
             content_emb,
-            survivor_mask=None,
+            target_ratio=None,
             prompt_embeddings=prompt_emb,
         )
 
@@ -105,20 +114,19 @@ class TestBgKITCompressorPrompt:
         content_emb = torch.randn(batch_size, content_len, 64)
         prompt_emb = torch.randn(batch_size, prompt_len, 64)
         content_mask = torch.ones(batch_size, content_len, dtype=torch.bool)
-        content_mask[0, 4:] = False  # padding in content
+        content_mask[0, 4:] = False
         prompt_mask = torch.ones(batch_size, prompt_len, dtype=torch.bool)
-        prompt_mask[1, 2:] = False  # padding in prompt
+        prompt_mask[1, 2:] = False
 
         out = compressor(
             content_emb,
-            survivor_mask=None,
+            target_ratio=None,
             attention_mask=content_mask,
             prompt_embeddings=prompt_emb,
             prompt_attention_mask=prompt_mask,
         )
 
         assert isinstance(out, CompressorOutput)
-        # Combined mask should have length prompt+sep+content = 3+1+6=10
         assert out.attention_mask.shape == (batch_size, prompt_len + 1 + content_len)
 
     def test_gradient_flows_through_prompt(self, compressor):
@@ -128,7 +136,7 @@ class TestBgKITCompressorPrompt:
 
         out = compressor(
             content_emb,
-            survivor_mask=None,
+            target_ratio=None,
             prompt_embeddings=prompt_emb,
         )
         out.raw_embeddings.sum().backward()
@@ -143,7 +151,7 @@ class TestBgKITCompressorPrompt:
 
         out = compressor(
             content_emb,
-            survivor_mask=None,
+            target_ratio=None,
             prompt_embeddings=prompt_emb,
         )
         out.raw_embeddings.sum().backward()
@@ -156,6 +164,6 @@ class TestBgKITCompressorPrompt:
         attn_mask = torch.ones(2, 10, dtype=torch.bool)
         attn_mask[0, 7:] = False
 
-        out = compressor(x, survivor_mask=None, attention_mask=attn_mask)
+        out = compressor(x, target_ratio=None, attention_mask=attn_mask)
         assert out.raw_embeddings.shape == (2, 10, 64)
         assert out.content_slice == slice(0, None)

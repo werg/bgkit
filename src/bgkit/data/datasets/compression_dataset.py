@@ -201,7 +201,7 @@ def _gather_l1_files(
 class DataReconstructionSubset(Dataset):
     """Sub-dataset for Objective 1: data reconstruction.
 
-    Wraps MmapTokenDataset + optional MmapICEDataset + chat template.
+    Wraps MmapTokenDataset + chat template.
     Always returns FileCompressionSample (L0 only).
     """
 

@@ -1,4 +1,4 @@
-"""Tests for the encoder's pinned_positions + lora_level plumbing."""
+"""Tests for the encoder's pinned_positions + level plumbing."""
 
 from __future__ import annotations
 
@@ -23,9 +23,22 @@ class _PassThroughBackbone(nn.Module):
     def get_input_embeddings(self):
         return self.embed_tokens
 
-    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+    def forward(
+        self,
+        inputs_embeds=None,
+        attention_mask=None,
+        return_intermediates=False,
+        layer_hooks=None,
+        **kwargs,
+    ):
+        hidden = inputs_embeds
+        if layer_hooks:
+            for idx in sorted(layer_hooks):
+                hidden = layer_hooks[idx](hidden)
+
         class Out:
-            last_hidden_state = inputs_embeds
+            last_hidden_state = hidden
+            hidden_states = None
         return Out()
 
 
@@ -52,39 +65,52 @@ class _TrivialProjection(ProjectionBlock):
 
 def _make_encoder(hidden_dim: int = 16) -> BgKITEncoder:
     backbone = _PassThroughBackbone(hidden_dim)
-    compressor = BgKITCompressor(backbone, norm=nn.Identity(), hidden_dim=hidden_dim)
+    compressor = BgKITCompressor(
+        backbone, norm=nn.Identity(), hidden_dim=hidden_dim, survivorship_inner_dim=8,
+    )
     projection = _TrivialProjection(hidden_dim)
     return BgKITEncoder(compressor, projection)
 
 
 def test_pinned_positions_force_survival():
+    """Pinned positions must survive even when the head says drop them."""
     encoder = _make_encoder()
     b, seq, d = 1, 6, 16
     embeddings = torch.randn(b, seq, d)
-    # Nobody selected by the ICE-style mask — but positions 0 and 3 are pinned.
-    survivor_mask = torch.zeros(b, seq, dtype=torch.bool)
     pinned = torch.zeros(b, seq, dtype=torch.bool)
     pinned[0, 0] = True
     pinned[0, 3] = True
+
+    # Force survivorship head to output very negative logits (all doomed)
+    # so only pinned positions survive.
+    with torch.no_grad():
+        head = encoder.compressor.survivorship_head_l0
+        # Set the final linear bias to a large negative value
+        head.head[2].bias.fill_(-10.0)
+        head.head[2].weight.fill_(0.0)
+        head.head[0].weight.fill_(0.0)
+        head.head[0].bias.fill_(-10.0)
+
     out = encoder(
         input_embeddings=embeddings,
-        survivor_mask=survivor_mask,
         attention_mask=torch.ones(b, seq, dtype=torch.bool),
         pinned_positions=pinned,
+        target_ratio=0.1,
+        level="l0",
     )
-    # After pinning merge, both positions must have survived.
+    # After pinning override, both positions must have survived.
     assert int(out.survivor_counts[0].item()) == 2
     assert out.survivor_embeddings.size(1) == 2
 
 
-def test_lora_level_runs_without_adapters_installed():
+def test_level_runs_without_adapters_installed():
+    """With no LoRARouter bound, level should be ignored silently."""
     encoder = _make_encoder()
     b, seq, d = 2, 4, 16
     embeddings = torch.randn(b, seq, d)
-    # With no LoRARouter bound, lora_level should be ignored silently.
     out = encoder(
         input_embeddings=embeddings,
         attention_mask=torch.ones(b, seq, dtype=torch.bool),
-        lora_level="l1",
+        level="l1",
     )
     assert out.survivor_embeddings.shape == (b, seq, d)

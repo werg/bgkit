@@ -315,7 +315,7 @@ class JointBlockTrainer(BaseTrainer):
             prompt_emb = prompt_emb.expand(input_embeddings.size(0), -1, -1)
 
         comp_out = self.encoder.compressor(
-            input_embeddings, survivor_mask=None, attention_mask=attention_mask,
+            input_embeddings, attention_mask=attention_mask,
             prompt_embeddings=prompt_emb,
         )
 

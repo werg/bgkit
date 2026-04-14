@@ -15,11 +15,9 @@ from bgkit.data.datasets.compression_dataset import (
     FileCompressionSample,
     RepoCompressionSample,
 )
-from bgkit.data.threshold_calibrator import ThresholdCalibrator
 from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
-from bgkit.models.ice import ICE
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.training.phase1.compression import CompressionTrainer
 
@@ -47,8 +45,16 @@ class MockEncoderBackbone(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+    def forward(
+        self, inputs_embeds=None, attention_mask=None,
+        return_intermediates=False, layer_hooks=None, **kwargs,
+    ):
         x = self.layers[0](inputs_embeds)
+        # Fire any registered hooks (compressor uses these for ratio injection
+        # and survivorship head evaluation)
+        if layer_hooks:
+            for idx in sorted(layer_hooks):
+                x = layer_hooks[idx](x)
         x = self.norm(x)
         return _Output(last_hidden_state=x)
 
@@ -220,11 +226,6 @@ def trainer():
                 "target_ratio_start": 0.30,
                 "target_ratio_end": 0.15,
                 "target_ratio_ramp_steps": 100,
-                "max_survivor_gap": 64,
-                "fallback_threshold": 3.0,
-                "calibrator_ema_decay": 0.99,
-                "calibrator_warmup_batches": 50,
-                "l1_calibrator_fast_batches": 200,
             },
         },
         "compute": {"num_workers": 0, "pin_memory": False},
@@ -244,11 +245,6 @@ def trainer():
     t.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=HIDDEN_DIM)
     t.model = t.decoder
 
-    # Frozen ICE model
-    t.ice_model = ICE(input_dim=HIDDEN_DIM, hidden_dim=16, num_layers=2, kernel_size=3)
-    t.ice_model.eval()
-    t.ice_model.requires_grad_(False)
-
     # Optimizer
     params = list(t.encoder.parameters()) + list(t.decoder.parameters())
     t.optimizer = torch.optim.AdamW(params, lr=1e-3)
@@ -259,27 +255,19 @@ def trainer():
     t._target_ratio_end = 0.15
     t._target_ratio_ramp_steps = 100
     t._target_ratio_override = None
-    t._max_gap = 64
-
-    # Calibrators
-    t._l0_calibrator = ThresholdCalibrator(
-        ema_decay=0.99, warmup_batches=50, fallback_threshold=3.0,
-    )
-    t._l1_calibrator = ThresholdCalibrator(
-        ema_decay=0.95, warmup_batches=50, fallback_threshold=3.0,
-    )
-    t._l1_calibrator_fast_batches = 200
-    t._l1_calibrator_slow_decay = 0.99
-    t._l1_batches_seen = 0
-    t._pending_l0_scores = []
-    t._pending_l1_scores = []
-    t._is_evaluating = False
 
     t._l1_enabled = False
     t._l1_transitioned = False
     t._l1_rebuild_pending = False
+    t._is_evaluating = False
     t._eval_count = 0
     t._profile_enabled = False
+
+    # Survivorship head aux loss weights (normally set in setup())
+    t._ratio_loss_weight = 0.1
+    t._decisiveness_loss_weight = 0.05
+    t._soft_attn_loss_weight = 0.05
+    t._soft_attn_every_n_steps = 4
 
     return t
 
@@ -309,11 +297,6 @@ class TestSetupCreatesComponents:
         has_trainable = any(p.requires_grad for p in trainer.decoder.parameters())
         assert has_trainable, "Decoder should be trainable"
 
-    def test_ice_model_exists_and_frozen(self, trainer):
-        assert trainer.ice_model is not None
-        assert isinstance(trainer.ice_model, ICE)
-        assert not any(p.requires_grad for p in trainer.ice_model.parameters())
-
 
 # ---------------------------------------------------------------------------
 # Train step tests (file samples)
@@ -327,7 +310,6 @@ class TestTrainStepFileSample:
         assert "loss" in metrics
         assert "grad_norm" in metrics
         assert "min_target_ratio" in metrics
-        assert "calibrated_threshold_l0" in metrics
         assert metrics["sample_type"] == "file"
 
     def test_loss_is_finite(self, trainer):
@@ -473,7 +455,6 @@ class TestCheckpointRoundtrip:
         trainer.epoch = 2
         trainer._l1_enabled = True
         trainer._l1_transitioned = True
-        trainer._l1_batches_seen = 5
         trainer._target_ratio_override = 0.20
 
         # Save
@@ -483,14 +464,11 @@ class TestCheckpointRoundtrip:
         assert (Path(ckpt_path) / "encoder.pt").exists()
         assert (Path(ckpt_path) / "decoder.pt").exists()
         assert (Path(ckpt_path) / "optimizer.pt").exists()
-        assert (Path(ckpt_path) / "l0_calibrator.pt").exists()
-        assert (Path(ckpt_path) / "l1_calibrator.pt").exists()
 
         # Mutate state
         trainer.global_step = 0
         trainer.epoch = 0
         trainer._l1_enabled = False
-        trainer._l1_batches_seen = 0
         trainer._target_ratio_override = None
 
         # Load
@@ -499,7 +477,6 @@ class TestCheckpointRoundtrip:
         assert trainer.epoch == 2
         assert trainer._l1_enabled is True
         assert trainer._l1_transitioned is True
-        assert trainer._l1_batches_seen == 5
         assert trainer._target_ratio_override == 0.20
 
     def test_encoder_weights_restored(self, trainer, tmp_path):
@@ -536,70 +513,6 @@ class TestCheckpointRoundtrip:
             p.abs().sum() > 0 for p in trainer.decoder.parameters()
         )
         assert has_nonzero, "Decoder params should be restored"
-
-
-# ---------------------------------------------------------------------------
-# ICE scoring and threshold selection tests
-# ---------------------------------------------------------------------------
-
-
-class TestScoreAndSelect:
-    def test_returns_bool_mask(self, trainer):
-        """_score_and_select should return a boolean mask."""
-        embeddings = torch.randn(2, SEQ_LEN, HIDDEN_DIM)
-        mask = torch.ones(2, SEQ_LEN, dtype=torch.bool)
-        result = trainer._score_and_select(embeddings, mask)
-        assert result.dtype == torch.bool
-        assert result.shape == (2, SEQ_LEN)
-
-    def test_handles_partial_mask(self, trainer):
-        """Padding positions should not be selected."""
-        embeddings = torch.randn(1, 20, HIDDEN_DIM)
-        mask = torch.zeros(1, 20, dtype=torch.bool)
-        mask[0, :10] = True  # only first 10 are valid
-        result = trainer._score_and_select(embeddings, mask)
-        # No padding positions should be selected
-        assert result[0, 10:].sum() == 0
-
-    def test_ice_model_called(self, trainer):
-        """ICE model should be called during scoring."""
-        call_count = [0]
-        original_forward = trainer.ice_model.forward
-
-        def tracking_forward(*args, **kwargs):
-            call_count[0] += 1
-            return original_forward(*args, **kwargs)
-
-        trainer.ice_model.forward = tracking_forward
-        embeddings = torch.randn(1, SEQ_LEN, HIDDEN_DIM)
-        mask = torch.ones(1, SEQ_LEN, dtype=torch.bool)
-        trainer._score_and_select(embeddings, mask)
-        assert call_count[0] == 1
-
-    def test_buffers_scores_during_training(self, trainer):
-        """Should buffer L0 scores for deferred calibrator update."""
-        trainer._is_evaluating = False
-        embeddings = torch.randn(1, SEQ_LEN, HIDDEN_DIM)
-        mask = torch.ones(1, SEQ_LEN, dtype=torch.bool)
-        trainer._score_and_select(embeddings, mask, level="l0")
-        assert len(trainer._pending_l0_scores) == 1
-
-    def test_does_not_buffer_during_eval(self, trainer):
-        """Should NOT buffer scores when evaluating."""
-        trainer._is_evaluating = True
-        embeddings = torch.randn(1, SEQ_LEN, HIDDEN_DIM)
-        mask = torch.ones(1, SEQ_LEN, dtype=torch.bool)
-        trainer._score_and_select(embeddings, mask, level="l0")
-        assert len(trainer._pending_l0_scores) == 0
-
-    def test_level_l1_buffers_to_l1(self, trainer):
-        """level='l1' should buffer to L1 pending scores."""
-        trainer._is_evaluating = False
-        embeddings = torch.randn(1, SEQ_LEN, HIDDEN_DIM)
-        mask = torch.ones(1, SEQ_LEN, dtype=torch.bool)
-        trainer._score_and_select(embeddings, mask, level="l1")
-        assert len(trainer._pending_l1_scores) == 1
-        assert len(trainer._pending_l0_scores) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -847,18 +760,3 @@ class TestL0ToL1AutoRepro:
         # so auto_reproduce is called once per file in the forward only = 2.
         assert call_count[0] >= 2
 
-    def test_l1_uses_ice_scoring(self, trainer):
-        """L1 stage should also call _score_and_select (for L1 survivor selection)."""
-        call_count = [0]
-        original = trainer._score_and_select
-
-        def tracking_score(emb, mask, level="l0"):
-            call_count[0] += 1
-            return original(emb, mask, level=level)
-
-        trainer._score_and_select = tracking_score
-        batch = _make_repo_batch(batch_size=1, n_files=2, file_len=8)
-        trainer.optimizer.zero_grad()
-        trainer._forward_backward(batch)
-        # Called once per file (L0) + once for L1 per sample = 3
-        assert call_count[0] == 3

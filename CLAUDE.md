@@ -100,20 +100,27 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 
 | Dependency | Config Key | Source Phase | Target Phase | Metric |
 |---|---|---|---|---|
-| ICE → Step 5 | `training.ice.checkpoint_path` | `ice` | `phase1_step5` | `eval/mse` |
 | Joint Block → Step 1 | `bgkit_checkpoint` | `joint_block_pretrain` | `phase1_step1` | `eval/mse_repro` |
 | Step 1 → Step 2 | `step1_checkpoint` | `phase1_step1` | `phase1_step2` | `eval/loss` |
 | Step 2 → Step 3 | `bgkit_checkpoint` | `phase1_step2` | `phase1_step3` | `eval/loss` |
 | Step 3 → Step 4 | `step1_checkpoint` | `phase1_step3` | `phase1_step4` | `eval/loss` |
 | Step 4 → Step 5 | `step1_checkpoint` | `phase1_step4` | `phase1_step5` | `eval/loss` |
 
-**Training phase pipeline**: ICE → Joint Block Pretrain → Phase 1 Steps 1-5 (compression pre-training on code) → Phase 2 (single-doc KR Steps 1-4, KB-scale KR Stages A/B/C, Track B git history, Track C user memory) → Phase 3 (agentic distillation from SWE-bench trajectories). The decoder is **Qwen3.5-0.8B throughout** — bgkit does not train any larger in-house target LLM.
+**Training phase pipeline**: Joint Block Pretrain → Phase 1 Steps 1-5 (compression pre-training on code) → Phase 2 (single-doc KR Steps 1-4, KB-scale KR Stages A/B/C, Track B git history, Track C user memory) → Phase 3 (agentic distillation from SWE-bench trajectories). The decoder is **Qwen3.5-0.8B throughout** — bgkit does not train any larger in-house target LLM.
+
+**Survivorship head**: Phase 1 Step 3+ and Phase 2 use a learned survivorship head inside the encoder (at layer 7 / pruned block 1) to select per-position survivors. Replaces the earlier frozen ICE model + ThresholdCalibrator + `fill_survivor_gaps` pipeline. Separate head instances for L0 and L1. Target compression ratio is injected via a learned embedding at layer 3. Hard flag embeddings (survive/doomed) propagate the decision to layers 8-22 for consolidation. See `configs/model/survivorship_head.yaml` and the `survivorship:` section in each training config.
+
+**Survivorship training signals** (all stages):
+- **Aggregate ratio loss**: `(mean(survive_probs) - target_ratio)^2` — drives mean survival toward the configured ratio in aggregate across the batch.
+- **Decisiveness loss**: `mean(4 * p * (1-p))` — penalizes probabilities near 0.5, pushing the head toward bimodal output (near 0 or near 1) so the `p > 0.5` hard mask produces clean selections.
+- **Soft attention (interleaved)**: every Nth step runs a second decoder forward with prob-gated layer-7 embeddings in place of hard survivors. Gradient flows from decoder CE loss back to the head through `survive_probs`, bypassing layers 8-22.
+- **Relevance loss** (Phase 2 only): per-group aggregate-ratio targets. Gold-article positions (IDs + content) target `gold_boost × target_ratio` (default 1.5× — upsample), distractor positions target `distractor_damp × target_ratio` (default 0.5× — mildly downsample). Distractors aren't suppressed to zero since their IDs may legitimately be referenced in subsequent bgkit calls; they're just biased toward lower survival than gold.
 
 | Task | Command |
 |---|---|
 | Backfill registry | `make ckpt-backfill` or `.venv/bin/bgkit-ckpt backfill` |
-| List checkpoints | `.venv/bin/bgkit-ckpt list --phase ice` |
-| Best checkpoint | `.venv/bin/bgkit-ckpt best --phase ice --metric eval/mse` |
+| List checkpoints | `.venv/bin/bgkit-ckpt list --phase phase1_step3` |
+| Best checkpoint | `.venv/bin/bgkit-ckpt best --phase phase1_step5 --metric eval/loss` |
 
 ## Inference Server
 

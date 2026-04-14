@@ -92,10 +92,6 @@ services:
     <<: *gpu-common
     command: ["scripts/train.py"]
 
-  train-ice:
-    <<: *gpu-common
-    command: ["scripts/train.py", "+experiment=ice_train"]
-
   train-joint-block:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=joint_block_pretrain"]
@@ -127,10 +123,6 @@ services:
   train-phase2-kb-stage-b:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase2_kb_stage_b"]
-
-  ice-labels:
-    <<: *gpu-common
-    command: ["scripts/generate_ice_labels.py"]
 
   preprocess:
     build:

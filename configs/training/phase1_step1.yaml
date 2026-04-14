@@ -35,21 +35,18 @@ bidi_warmup_steps: 2000         # duration of bidi warmup after encoder unfreeze
 
 # --- Compression curriculum ---
 compression_introduction_step: 800   # aligned with checkpoint step so ramp starts at 0.75
-ice:
-  checkpoint_path: auto
-  input_dim: 1024
-  hidden_dim: 192
-  num_layers: 3
-  kernel_size: 5
 
-curriculum:
-  target_ratio_start: 0.75       # min ratio starts here (actual ratio drawn randomly per sample)
-  target_ratio_end: 0.10         # ramp min ratio down to 10% retention
-  target_ratio_ramp_steps: 3000  # ramp over 3k steps from compression intro (runtime controllable)
-  max_survivor_gap: 64           # max positions without survivors (gap-filling)
-  fallback_threshold: 3.0        # ICE score threshold until calibrator warms up
-  calibrator_ema_decay: 0.99
-  calibrator_warmup_batches: 50
+# Ratio scheduling
+target_ratio_start: 0.75       # min ratio starts here (actual ratio drawn randomly per sample)
+target_ratio_end: 0.10         # ramp min ratio down to 10% retention
+target_ratio_ramp_steps: 3000  # ramp over 3k steps from compression intro (runtime controllable)
+
+# Survivorship head auxiliary losses
+survivorship:
+  ratio_loss_weight: 0.1
+  decisiveness_loss_weight: 0.05
+  soft_attn_loss_weight: 0.05
+  soft_attn_every_n_steps: 4
 
 # Fresh wandb run for new training regime
 reset_wandb: true

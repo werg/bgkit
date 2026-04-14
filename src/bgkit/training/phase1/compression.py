@@ -16,7 +16,6 @@ where BgKIT was frozen). ICE model remains frozen.
 from __future__ import annotations
 
 import os
-import random
 from pathlib import Path
 from typing import ClassVar
 
@@ -27,8 +26,6 @@ from torch.utils.data import DataLoader, random_split
 from bgkit.data.collators import collate_compression
 from bgkit.data.datasets.compression_dataset import CompressionDataset
 from bgkit.data.samplers import LengthSortedBatchSampler
-from bgkit.data.survivor_selection import fill_survivor_gaps, select_survivors_by_threshold
-from bgkit.data.threshold_calibrator import ThresholdCalibrator
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
@@ -61,16 +58,14 @@ class CompressionTrainer(BaseTrainer):
     """
 
     LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {
-        "max_survivor_gap": "_max_gap",
         "target_ratio_ramp_steps": "_target_ratio_ramp_steps",
         "target_ratio_start": "_target_ratio_start",
         "target_ratio_end": "_target_ratio_end",
         "l1_introduction_step": "_l1_introduction_step",
-        "l1_calibrator_fast_batches": "_l1_calibrator_fast_batches",
     }
 
     def setup(self) -> None:
-        """Load trainable encoder/decoder, frozen ICE, create dataset and optimizer."""
+        """Load trainable encoder/decoder, create dataset and optimizer."""
         import gc
 
         tcfg = self.cfg.training
@@ -215,48 +210,12 @@ class CompressionTrainer(BaseTrainer):
             revision=tokenizer_revision,
         )
 
-        # --- Frozen ICE model ---
-        from bgkit.models.ice import ICE
-
-        ice_cfg = tcfg.ice
-        if not ice_cfg.get("checkpoint_path"):
-            raise ValueError(
-                "training.ice.checkpoint_path must be set to a trained ICE checkpoint "
-                "or 'auto' for automatic resolution"
-            )
-
-        # Auto-resolution: find best ICE checkpoint from registry
-        if ice_cfg.checkpoint_path == "auto":
-            checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
-            ice_ckpt_path = resolve_checkpoint(
-                checkpoint_dir,
-                phase="ice",
-                metric="eval/mse",
-                label="training.ice.checkpoint_path",
-            )
-            self._input_sources["ice"] = ice_ckpt_path.name
-            logger.info("ice_auto_resolved", checkpoint=ice_ckpt_path.name)
-        else:
-            ice_ckpt_path = Path(ice_cfg.checkpoint_path)
-            self._input_sources["ice"] = ice_ckpt_path.name
-
-        if not ice_ckpt_path.exists():
-            raise FileNotFoundError(
-                f"ICE checkpoint not found: {ice_ckpt_path}\n"
-                "Set training.ice.checkpoint_path to a valid ICE checkpoint."
-            )
-        self.ice_model = ICE(
-            input_dim=ice_cfg.get("input_dim", 1024),
-            hidden_dim=ice_cfg.get("hidden_dim", 128),
-            num_layers=ice_cfg.get("num_layers", 2),
-            kernel_size=ice_cfg.get("kernel_size", 5),
-        )
-        _, ice_state_dicts = load_checkpoint(ice_ckpt_path)
-        self.ice_model.load_state_dict(ice_state_dicts["model"])
-        self.ice_model.to(device)
-        self.ice_model.eval()
-        self.ice_model.requires_grad_(False)
-        logger.info("loaded_ice_model", path=str(ice_ckpt_path))
+        # --- Survivorship head config ---
+        surv_cfg = tcfg.get("survivorship", {})
+        self._ratio_loss_weight = surv_cfg.get("ratio_loss_weight", 0.1)
+        self._decisiveness_loss_weight = surv_cfg.get("decisiveness_loss_weight", 0.05)
+        self._soft_attn_loss_weight = surv_cfg.get("soft_attn_loss_weight", 0.05)
+        self._soft_attn_every_n_steps = surv_cfg.get("soft_attn_every_n_steps", 4)
 
         # --- Dataset ---
         # Training YAML's `data:` section lives under cfg.training.data
@@ -335,35 +294,13 @@ class CompressionTrainer(BaseTrainer):
         self._setup_optimizer()
 
         # --- Curriculum state ---
-        curriculum = tcfg.get("curriculum", {})
-        self._l1_introduction_step = curriculum.get("l1_introduction_step", 20000)
+        self._l1_introduction_step = tcfg.get("l1_introduction_step", 20000)
 
-        # Ratio targeting curriculum (replaces threshold ramp + min/max clamps)
-        self._target_ratio_start = curriculum.get("target_ratio_start", 0.30)
-        self._target_ratio_end = curriculum.get("target_ratio_end", 0.15)
-        self._target_ratio_ramp_steps = curriculum.get("target_ratio_ramp_steps", 100000)
+        # Ratio targeting — top-level config keys
+        self._target_ratio_start = tcfg.get("target_ratio_start", 0.30)
+        self._target_ratio_end = tcfg.get("target_ratio_end", 0.15)
+        self._target_ratio_ramp_steps = tcfg.get("target_ratio_ramp_steps", 100000)
         self._target_ratio_override: float | None = None
-        self._max_gap = curriculum.get("max_survivor_gap", 64)
-
-        # Calibrators
-        fallback = curriculum.get("fallback_threshold", 3.0)
-        self._l0_calibrator = ThresholdCalibrator(
-            ema_decay=curriculum.get("calibrator_ema_decay", 0.99),
-            warmup_batches=curriculum.get("calibrator_warmup_batches", 50),
-            fallback_threshold=fallback,
-        )
-        self._l1_calibrator = ThresholdCalibrator(
-            ema_decay=0.95,  # starts fast
-            warmup_batches=curriculum.get("calibrator_warmup_batches", 50),
-            fallback_threshold=fallback,
-        )
-        self._l1_calibrator_fast_batches = curriculum.get("l1_calibrator_fast_batches", 200)
-        self._l1_calibrator_slow_decay = curriculum.get("calibrator_ema_decay", 0.99)
-        self._l1_batches_seen = 0
-
-        # Score buffers for deferred calibrator update (once per train_step)
-        self._pending_l0_scores: list[torch.Tensor] = []
-        self._pending_l1_scores: list[torch.Tensor] = []
 
         # Live curriculum values
         self._l1_enabled = False
@@ -513,25 +450,6 @@ class CompressionTrainer(BaseTrainer):
         t = step / max(self._target_ratio_ramp_steps, 1)
         return self._target_ratio_start + t * (self._target_ratio_end - self._target_ratio_start)
 
-    def _flush_calibrator_scores(self) -> None:
-        """Flush buffered ICE scores into calibrators. Called once per train_step."""
-        if self._pending_l0_scores:
-            non_empty = [s for s in self._pending_l0_scores if s.numel() > 0]
-            if non_empty:
-                combined = torch.cat(non_empty)
-                self._l0_calibrator.update_from_flat(combined)
-            self._pending_l0_scores.clear()
-        if self._pending_l1_scores:
-            non_empty = [s for s in self._pending_l1_scores if s.numel() > 0]
-            if non_empty:
-                combined = torch.cat(non_empty)
-                self._l1_calibrator.update_from_flat(combined)
-                # Adaptive L1 decay — only count steps with actual score data
-                self._l1_batches_seen += 1
-                if self._l1_batches_seen >= self._l1_calibrator_fast_batches:
-                    self._l1_calibrator.set_decay(self._l1_calibrator_slow_decay)
-            self._pending_l1_scores.clear()
-
     def _perform_l1_rebuild(self) -> None:
         """Rebuild dataset and dataloader for L1 phase."""
         import numpy as np
@@ -585,92 +503,83 @@ class CompressionTrainer(BaseTrainer):
         logger.info("l1_rebuild_complete", step=self.global_step)
 
     # ------------------------------------------------------------------
-    # ICE scoring
+    # Survivorship losses
     # ------------------------------------------------------------------
 
-    def _score_and_select(
+    def _compute_survivorship_losses(
         self,
-        embeddings: torch.Tensor,
-        attention_mask: torch.Tensor,
-        level: str = "l0",
+        enc_out,
+        target_ratio: float,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute auxiliary survivorship head losses."""
+        probs = enc_out.survive_probs
+        if probs is None:
+            return torch.tensor(0.0, device=self.device), {}
+
+        metrics: dict[str, float] = {}
+
+        # Aggregate ratio loss
+        mean_prob = probs.mean()
+        ratio_loss = (mean_prob - target_ratio) ** 2
+        metrics["ratio_loss"] = ratio_loss.item()
+        metrics["mean_survive_prob"] = mean_prob.item()
+
+        # Decisiveness loss
+        decisiveness_loss = (4 * probs * (1 - probs)).mean()
+        metrics["decisiveness_loss"] = decisiveness_loss.item()
+
+        total = (
+            self._ratio_loss_weight * ratio_loss
+            + self._decisiveness_loss_weight * decisiveness_loss
+        )
+        return total, metrics
+
+    def _soft_attention_forward(
+        self,
+        enc_out,
+        batch: dict,
     ) -> torch.Tensor:
-        """Score embeddings with ICE and select survivors via calibrated threshold.
+        """Second decoder forward on prob-gated layer-7 embeddings.
 
-        Uses the appropriate calibrator (L0 or L1) to convert the current
-        target compression ratio into a threshold. Applies gap-filling to
-        prevent long stretches without survivors.
-
-        Args:
-            embeddings: (B, L, D) embeddings to score.
-            attention_mask: (B, L) bool mask for valid positions.
-            level: ``"l0"`` or ``"l1"`` — selects which calibrator to use.
-
-        Returns:
-            (B, L) bool survivor mask.
+        Provides a differentiable gradient path from the decoder loss to the
+        survivorship head via survive_probs. Runs the full encoder pipeline
+        with soft (probability-weighted) values instead of hard-selected
+        survivors, bypassing layers 8-22's consolidation.
         """
-        batch_size, seq_len, _ = embeddings.shape
+        # Prob-gate the layer-7 embeddings (full content length)
+        gated = enc_out.survive_probs.unsqueeze(-1) * enc_out.layer7_embeddings
 
-        with torch.no_grad():
-            ice_scores = self.ice_model(embeddings.float())  # (B, L)
-        ice_scores = ice_scores.masked_fill(~attention_mask, float("-inf"))
-        if seq_len > 0:
-            ice_scores[:, 0] = float("-inf")  # position 0 unsupervised during ICE training
+        # Pass the real content attention mask so padded positions don't
+        # contribute noise to the soft signal.
+        content_attn_mask = batch["content_attention_mask"].to(self.device)
 
-        calibrator = self._l0_calibrator if level == "l0" else self._l1_calibrator
+        # Run the projection block on the gated embeddings with the real
+        # padding mask. survivor_mask=None means no hard extraction — we
+        # keep the full-length sequence so gradients flow back through
+        # every content position.
+        proj_out = self.encoder.projection_block(
+            gated, content_attn_mask, survivor_mask=None,
+        )
+        soft_survivors = proj_out.projected_embeddings
+        soft_mask = content_attn_mask.clone()
 
-        # Buffer scores for deferred calibrator update (training only)
-        if not self._is_evaluating:
-            stats_mask = attention_mask.clone()
-            if seq_len > 0:
-                stats_mask[:, 0] = False
-            valid_scores_flat = ice_scores[stats_mask].detach()
-            if level == "l0":
-                self._pending_l0_scores.append(valid_scores_flat)
-            else:
-                self._pending_l1_scores.append(valid_scores_flat)
+        target_ids = batch["target_token_ids"].to(self.device)
+        target_mask = batch["target_attention_mask"].to(self.device)
+        splice_start = batch["bgkit_splice_start"].to(self.device)
+        splice_len = batch["bgkit_splice_len"].to(self.device)
+        loss_mask = batch.get("target_loss_mask")
+        if loss_mask is not None:
+            loss_mask = loss_mask.to(self.device)
 
-        min_target_ratio = self._current_target_ratio()
-
-        survivor_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=embeddings.device)
-        for b in range(batch_size):
-            valid_len = int(attention_mask[b].sum().item())
-            if valid_len == 0:
-                continue
-
-            # Random ratio per sample during training; fixed min during eval
-            if self._is_evaluating:
-                ratio = min_target_ratio
-            else:
-                ratio = random.uniform(min_target_ratio, 1.0)
-
-            threshold = calibrator.get_threshold(ratio)
-            valid_scores = ice_scores[b, :valid_len]
-            indices = select_survivors_by_threshold(valid_scores, threshold)
-            indices = fill_survivor_gaps(indices, valid_scores, self._max_gap, valid_len)
-            survivor_mask[b, indices] = True
-
-        # ICE distribution monitoring (exclude position 0 which is forced to -inf)
-        eval_every = self.cfg.training.get("eval_every", 0)
-        if eval_every > 0 and self.global_step % eval_every == 0:
-            stats_mask = attention_mask.clone()
-            if seq_len > 0:
-                stats_mask[:, 0] = False
-            valid_scores = ice_scores[stats_mask]
-            selected_scores = ice_scores[survivor_mask]
-            if valid_scores.numel() > 1 and selected_scores.numel() > 1:
-                logger.info(
-                    "ice_survivor_stats",
-                    step=self.global_step,
-                    level=level,
-                    pre_mean=valid_scores.mean().item(),
-                    pre_std=valid_scores.std().item(),
-                    post_mean=selected_scores.mean().item(),
-                    post_std=selected_scores.std().item(),
-                    post_min=selected_scores.min().item(),
-                    post_max=selected_scores.max().item(),
-                )
-
-        return survivor_mask
+        return self.decoder.forward_with_single_splice(
+            survivor_embeddings=soft_survivors,
+            survivor_attention_mask=soft_mask,
+            token_ids=target_ids,
+            token_attention_mask=target_mask,
+            splice_starts=splice_start,
+            splice_lengths=splice_len,
+            loss_mask=loss_mask,
+        )
 
     # ------------------------------------------------------------------
     # Compression pipeline
@@ -678,44 +587,41 @@ class CompressionTrainer(BaseTrainer):
 
     def _compress_file_batch(
         self, batch: dict,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ):
         """Run L0 compression on a batch of FileCompressionSamples.
 
         Returns:
-            (survivor_embeddings, survivor_attention_mask)
+            CompressionOutput from the encoder.
         """
         content_ids = batch["content_token_ids"].to(self.device)
         content_mask = batch["content_attention_mask"].to(self.device)
         prompt_ids = batch["compression_prompt_ids"].to(self.device)
         prompt_mask = batch["compression_prompt_mask"].to(self.device)
 
-        # Get input embeddings
         bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
         content_emb = bgkit_embed(content_ids)
         prompt_emb = bgkit_embed(prompt_ids)
 
-        # Live ICE scoring for survivor selection
-        survivor_mask = self._score_and_select(content_emb, content_mask)
-
-        # Run encoder forward with compression
+        target_ratio = self._current_target_ratio()
         enc_out = self.encoder(
             input_embeddings=content_emb,
-            survivor_mask=survivor_mask,
             attention_mask=content_mask,
             prompt_embeddings=prompt_emb,
             prompt_attention_mask=prompt_mask,
+            target_ratio=target_ratio,
+            level="l0",
         )
 
-        return enc_out.survivor_embeddings, enc_out.survivor_attention_mask
+        return enc_out
 
     @staticmethod
     def _compress_files_batched_pure(
         compressor: torch.nn.Module,
         all_f_emb: torch.Tensor,      # (n_files, max_seq, D)
-        all_s_mask: torch.Tensor,      # (n_files, max_seq) bool
         all_f_mask: torch.Tensor,      # (n_files, max_seq) bool
         prompt_emb: torch.Tensor,      # (n_files, prompt_len, D)
         prompt_mask: torch.Tensor,     # (n_files, prompt_len) bool
+        target_ratio: float,
     ) -> torch.Tensor:
         """Batched L0 compression for checkpointing.
 
@@ -723,17 +629,19 @@ class CompressionTrainer(BaseTrainer):
         """
         comp_out = compressor(
             all_f_emb,
-            survivor_mask=all_s_mask,
             attention_mask=all_f_mask,
             prompt_embeddings=prompt_emb,
             prompt_attention_mask=prompt_mask,
+            target_ratio=target_ratio,
+            level="l0",
         )
         content_normed = comp_out.normed_embeddings[:, comp_out.content_slice, :]
-        # Extract per-file survivors and auto_reproduce each (variable survivor count)
+        survivor_mask = comp_out.survivor_mask
         all_survivors = []
-        for f in range(all_f_emb.shape[0]):
-            surv = content_normed[f][all_s_mask[f]]
-            all_survivors.append(compressor.auto_reproduce(surv.unsqueeze(0))[0])
+        if survivor_mask is not None:
+            for f in range(all_f_emb.shape[0]):
+                surv = content_normed[f][survivor_mask[f]]
+                all_survivors.append(compressor.auto_reproduce(surv.unsqueeze(0))[0])
         if all_survivors:
             return torch.cat(all_survivors, dim=0)
         return torch.zeros(
@@ -751,37 +659,26 @@ class CompressionTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """Batched L0 per-file compression for one sample -> (total_surv, D).
 
-        Embeds all files at once, scores each individually (ICE has side
-        effects), then runs a single batched compressor forward with selective
-        activation checkpointing based on total token count.
+        Embeds all files at once, then runs a single batched compressor
+        forward with the survivorship head producing masks internally.
+        Uses selective activation checkpointing based on total token count.
         """
         from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
         compressor = self.encoder.compressor
+        target_ratio = self._current_target_ratio()
 
         # 1. Embed all files at once
         all_f_emb = bgkit_embed(file_ids[:n_files])          # (n_files, max_seq, D)
         all_f_mask = file_masks[:n_files]                     # (n_files, max_seq)
 
-        # 2. Score each file individually (ICE scoring has side effects —
-        #    calibrator score buffering, stochastic ratio sampling — must stay per-file)
-        all_s_mask = torch.zeros_like(all_f_mask, dtype=torch.bool)
-        for f in range(n_files):
-            all_s_mask[f:f + 1] = self._score_and_select(
-                all_f_emb[f:f + 1], all_f_mask[f:f + 1],
-            )
-
-        # 3. Sort files by token count (descending) to reduce padding waste in attention
-        token_counts = all_f_mask.sum(dim=1)  # (n_files,)
+        # 2. Sort files by token count (descending) to reduce padding waste
+        token_counts = all_f_mask.sum(dim=1)
         sorted_indices = token_counts.argsort(descending=True)
         all_f_emb = all_f_emb[sorted_indices]
         all_f_mask = all_f_mask[sorted_indices]
-        all_s_mask = all_s_mask[sorted_indices]
 
-        # 4. Sub-batch files to bound peak memory. Full attention layers have
-        #    O(n^2) memory in sequence length; batching 32 files x 4096 tokens
-        #    would exhaust unified memory. Process in groups of max_files_per_sub
-        #    with checkpointing per sub-batch.
+        # 3. Sub-batch files to bound peak memory
         max_files_per_sub = 8
         checkpoint_threshold = 4096
         all_survivors = []
@@ -790,7 +687,6 @@ class CompressionTrainer(BaseTrainer):
             end = min(start + max_files_per_sub, n_files)
             sub_emb = all_f_emb[start:end]
             sub_f_mask = all_f_mask[start:end]
-            sub_s_mask = all_s_mask[start:end]
             sub_size = end - start
             sub_prompt_emb = prompt_emb.expand(sub_size, -1, -1)
             sub_prompt_mask = prompt_mask.expand(sub_size, -1)
@@ -799,14 +695,14 @@ class CompressionTrainer(BaseTrainer):
             if sub_tokens > checkpoint_threshold:
                 sub_surv = torch_checkpoint(
                     self._compress_files_batched_pure,
-                    compressor, sub_emb, sub_s_mask, sub_f_mask,
-                    sub_prompt_emb, sub_prompt_mask,
+                    compressor, sub_emb, sub_f_mask,
+                    sub_prompt_emb, sub_prompt_mask, target_ratio,
                     use_reentrant=False,
                 )
             else:
                 sub_surv = self._compress_files_batched_pure(
-                    compressor, sub_emb, sub_s_mask, sub_f_mask,
-                    sub_prompt_emb, sub_prompt_mask,
+                    compressor, sub_emb, sub_f_mask,
+                    sub_prompt_emb, sub_prompt_mask, target_ratio,
                 )
             all_survivors.append(sub_surv)
 
@@ -874,7 +770,7 @@ class CompressionTrainer(BaseTrainer):
         self.encoder.train()
         self.decoder.train()
 
-        # Check L1 introduction + flush calibrator scores
+        # Check L1 introduction
         self._check_l1_introduction()
 
         # Handle mixed batches
@@ -888,17 +784,47 @@ class CompressionTrainer(BaseTrainer):
             with torch.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
             ):
-                survivors, survivor_mask = self._compress_file_batch(batch)
+                enc_out = self._compress_file_batch(batch)
+                survivors = enc_out.survivor_embeddings
+                survivor_mask = enc_out.survivor_attention_mask
                 loss = self._decoder_forward_single_splice(survivors, survivor_mask, batch)
-            self._flush_calibrator_scores()
-            (loss / self._accum_steps).backward()
 
-            n_survivors = int(survivor_mask.sum().item())
+            total_loss_t = loss
+
+            # Survivorship auxiliary losses
+            surv_metrics: dict[str, float] = {}
+            if enc_out.survive_probs is not None:
+                surv_loss, surv_metrics = self._compute_survivorship_losses(
+                    enc_out, self._current_target_ratio(),
+                )
+                total_loss_t = total_loss_t + surv_loss
+
+                # Soft attention branch (every Nth step)
+                if (
+                    self._soft_attn_loss_weight > 0
+                    and self.global_step % self._soft_attn_every_n_steps == 0
+                    and enc_out.layer7_embeddings is not None
+                ):
+                    with torch.autocast(
+                        "cuda", dtype=torch.bfloat16,
+                        enabled=self.device.type == "cuda",
+                    ):
+                        soft_loss = self._soft_attention_forward(enc_out, batch)
+                    total_loss_t = total_loss_t + self._soft_attn_loss_weight * soft_loss
+                    surv_metrics["soft_attn_loss"] = soft_loss.item()
+
+            (total_loss_t / self._accum_steps).backward()
+
+            n_survivors = (
+                int(enc_out.survivor_mask.sum().item())
+                if enc_out.survivor_mask is not None else 0
+            )
             n_valid = int(batch["content_attention_mask"].sum().item())
             total_loss = loss.item()
         else:
             # Repo batches: per-sample accumulation
             total_loss, n_survivors, n_valid = self._forward_backward_repo_persample(batch)
+            surv_metrics = {}
 
         target_ratio = self._current_target_ratio()
         actual_ratio = n_survivors / max(n_valid, 1)
@@ -907,11 +833,9 @@ class CompressionTrainer(BaseTrainer):
             "sample_type": sample_type,
             "min_target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
-            "calibrated_threshold_l0": self._l0_calibrator.get_threshold(target_ratio),
             "l1_enabled": float(self._l1_enabled),
         }
-        if self._l1_enabled:
-            metrics["calibrated_threshold_l1"] = self._l1_calibrator.get_threshold(target_ratio)
+        metrics.update(surv_metrics)
         return metrics
 
     def _forward_backward_repo_persample(
@@ -1021,9 +945,10 @@ class CompressionTrainer(BaseTrainer):
                     ev_l1_end = torch.cuda.Event(enable_timing=True)
                     ev_l1_start.record()
 
-                # Per-sample L1 scoring + full encoder pass.
+                # Per-sample L1 scoring via survivorship head + full encoder pass.
                 group_survivors = []
                 group_surv_masks = []
+                target_ratio = self._current_target_ratio()
                 for d in group:
                     surv_input = d['survivors']
                     l1_input = surv_input.unsqueeze(0)
@@ -1031,15 +956,13 @@ class CompressionTrainer(BaseTrainer):
                         1, surv_input.size(0), dtype=torch.bool,
                         device=self.device,
                     )
-                    l1_survivor_mask = self._score_and_select(
-                        l1_input, l1_mask, level="l1",
-                    )
                     l1_out = self.encoder(
                         input_embeddings=l1_input,
-                        survivor_mask=l1_survivor_mask,
                         attention_mask=l1_mask,
                         prompt_embeddings=d['prompt_emb'],
                         prompt_attention_mask=prompt_mask[d['idx']:d['idx'] + 1],
+                        target_ratio=target_ratio,
+                        level="l1",
                     )
                     group_survivors.append(l1_out.survivor_embeddings)
                     group_surv_masks.append(l1_out.survivor_attention_mask)
@@ -1123,8 +1046,7 @@ class CompressionTrainer(BaseTrainer):
                     # decoder+backward combined (interleaved in grouped path)
                     prof_dec += ev_dec_start.elapsed_time(ev_dec_end)
 
-        if flush_calibrator:
-            self._flush_calibrator_scores()
+        # (flush_calibrator parameter retained for API compat but no-op)
 
         if self._profile_enabled:
             prof_total = prof_l0 + prof_l1 + prof_dec
@@ -1162,7 +1084,9 @@ class CompressionTrainer(BaseTrainer):
         with torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
         ):
-            file_survivors, file_mask = self._compress_file_batch(file_batch)
+            file_enc_out = self._compress_file_batch(file_batch)
+            file_survivors = file_enc_out.survivor_embeddings
+            file_mask = file_enc_out.survivor_attention_mask
             file_loss = self._decoder_forward_single_splice(
                 file_survivors, file_mask, file_batch,
             )
@@ -1179,16 +1103,15 @@ class CompressionTrainer(BaseTrainer):
             )
         )
 
-        self._flush_calibrator_scores()
-
-        # Combined sample-weighted loss: file_loss is token-weighted over the
-        # file sub-batch, avg_repo_loss is sample-weighted over repo samples.
-        # Weight each portion by its sample count for a consistent metric.
         combined_loss = (
             file_loss.item() * n_file_samples
             + avg_repo_loss * n_repo_samples
         ) / total_samples
-        total_survivors = int(file_mask.sum().item()) + repo_survivors
+        file_surv_count = (
+            int(file_enc_out.survivor_mask.sum().item())
+            if file_enc_out.survivor_mask is not None else 0
+        )
+        total_survivors = file_surv_count + repo_survivors
         n_valid_file = int(file_batch["content_attention_mask"].sum().item())
         actual_ratio = total_survivors / max(n_valid_file + n_valid_repo, 1)
 
@@ -1198,11 +1121,8 @@ class CompressionTrainer(BaseTrainer):
             "sample_type": "mixed",
             "min_target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
-            "calibrated_threshold_l0": self._l0_calibrator.get_threshold(target_ratio),
             "l1_enabled": float(self._l1_enabled),
         }
-        if self._l1_enabled:
-            metrics["calibrated_threshold_l1"] = self._l1_calibrator.get_threshold(target_ratio)
         return metrics
 
     # ------------------------------------------------------------------
@@ -1249,7 +1169,6 @@ class CompressionTrainer(BaseTrainer):
             "l1_enabled": self._l1_enabled,
             "l1_transitioned": self._l1_transitioned,
             "l1_rebuild_pending": self._l1_rebuild_pending,
-            "l1_batches_seen": self._l1_batches_seen,
             "target_ratio_override": self._target_ratio_override,
         })
         return state
@@ -1372,9 +1291,10 @@ class CompressionTrainer(BaseTrainer):
                 "cuda", dtype=torch.bfloat16,
                 enabled=self.device.type == "cuda",
             ):
-                surv, surv_mask = self._compress_file_batch(sub_batch)
+                enc_out = self._compress_file_batch(sub_batch)
                 loss = self._decoder_forward_single_splice(
-                    surv, surv_mask, sub_batch,
+                    enc_out.survivor_embeddings, enc_out.survivor_attention_mask,
+                    sub_batch,
                 )
             eval_loss_mask = sub_batch.get("target_loss_mask")
             if eval_loss_mask is not None:
@@ -1430,20 +1350,19 @@ class CompressionTrainer(BaseTrainer):
                 bgkit_embed,
             )
 
-            # L1 scoring + full encoder
+            # L1 compression via survivorship head + full encoder
             l1_input = surv.unsqueeze(0)
             l1_mask = torch.ones(
                 1, surv.size(0), dtype=torch.bool, device=self.device,
             )
-            l1_survivor_mask = self._score_and_select(
-                l1_input, l1_mask, level="l1",
-            )
+            target_ratio = self._current_target_ratio()
             l1_out = self.encoder(
                 input_embeddings=l1_input,
-                survivor_mask=l1_survivor_mask,
                 attention_mask=l1_mask,
                 prompt_embeddings=prompt_emb_b,
                 prompt_attention_mask=prompt_mask[b:b + 1],
+                target_ratio=target_ratio,
+                level="l1",
             )
             sample_survivors = l1_out.survivor_embeddings
             sample_surv_mask = l1_out.survivor_attention_mask
@@ -1488,7 +1407,6 @@ class CompressionTrainer(BaseTrainer):
             "l1_enabled": self._l1_enabled,
             "l1_transitioned": self._l1_transitioned,
             "l1_rebuild_pending": self._l1_rebuild_pending,
-            "l1_batches_seen": self._l1_batches_seen,
             "target_ratio_override": self._target_ratio_override,
         })
 
@@ -1506,8 +1424,6 @@ class CompressionTrainer(BaseTrainer):
             encoder=self.encoder.state_dict(),
             decoder=self.decoder.state_dict(),
             optimizer=self.optimizer.state_dict(),
-            l0_calibrator=self._l0_calibrator.state_dict(),
-            l1_calibrator=self._l1_calibrator.state_dict(),
         )
         if getattr(self, "_decoder_lora", False):
             save_kwargs["decoder_merged"] = self.decoder.merge_lora()
@@ -1536,14 +1452,17 @@ class CompressionTrainer(BaseTrainer):
             self._l1_enabled = ts.get("l1_enabled", False)
             self._l1_transitioned = ts.get("l1_transitioned", False)
             self._l1_rebuild_pending = ts.get("l1_rebuild_pending", False)
-            self._l1_batches_seen = ts.get("l1_batches_seen", 0)
-            if self._l1_batches_seen >= self._l1_calibrator_fast_batches:
-                self._l1_calibrator.set_decay(self._l1_calibrator_slow_decay)
             self._target_ratio_override = ts.get("target_ratio_override")
 
         # Restore model weights
         if "encoder" in state_dicts:
-            self.encoder.load_state_dict(state_dicts["encoder"])
+            result = self.encoder.load_state_dict(state_dicts["encoder"], strict=False)
+            if result.missing_keys:
+                logger.info(
+                    "encoder_missing_keys",
+                    keys=result.missing_keys,
+                    hint="Expected for new survivorship head components",
+                )
         if "decoder" in state_dicts:
             self.decoder.load_state_dict(state_dicts["decoder"])
 
@@ -1557,12 +1476,6 @@ class CompressionTrainer(BaseTrainer):
                     error=str(e),
                     hint="config topology may have changed; fresh optimizer moments",
                 )
-
-        # Restore calibrators (saved as .pt sidecar files)
-        if "l0_calibrator" in state_dicts:
-            self._l0_calibrator.load_state_dict(state_dicts["l0_calibrator"])
-        if "l1_calibrator" in state_dicts:
-            self._l1_calibrator.load_state_dict(state_dicts["l1_calibrator"])
 
         logger.info("restored_from_checkpoint", step=self.global_step)
 

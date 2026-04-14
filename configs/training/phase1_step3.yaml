@@ -26,21 +26,18 @@ bidi_warmup_steps: 0       # already bidirectional from step 2
 
 # Compression active from step 0
 compression_introduction_step: 0
-ice:
-  checkpoint_path: auto
-  input_dim: 1024
-  hidden_dim: 192
-  num_layers: 3
-  kernel_size: 5
 
-curriculum:
-  target_ratio_start: 0.10   # start at the ratio step 2 trained with
-  target_ratio_end: 0.10     # no ramp — fixed ratio
-  target_ratio_ramp_steps: 1
-  max_survivor_gap: 64
-  fallback_threshold: 3.0
-  calibrator_ema_decay: 0.99
-  calibrator_warmup_batches: 50
+# Ratio scheduling — fixed ratio, no ramp
+target_ratio_start: 0.10
+target_ratio_end: 0.10
+target_ratio_ramp_steps: 1
+
+# Survivorship head auxiliary losses
+survivorship:
+  ratio_loss_weight: 0.1
+  decisiveness_loss_weight: 0.05
+  soft_attn_loss_weight: 0.05
+  soft_attn_every_n_steps: 4
 
 # LoRA config for decoder — small adapter, fast adaptation
 decoder_lora:

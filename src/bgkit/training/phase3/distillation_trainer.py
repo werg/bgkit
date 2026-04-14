@@ -147,7 +147,6 @@ class DistillationTrainer(BaseTrainer):
 
         # Load BgKIT encoder from Phase 2 checkpoint (if configured)
         self.encoder = None
-        self.ice = None
         phase2_ckpt = self.cfg.training.get("phase2_checkpoint")
         if phase2_ckpt:
             self._load_encoder(str(phase2_ckpt))
@@ -237,7 +236,6 @@ class DistillationTrainer(BaseTrainer):
     def _load_encoder(self, checkpoint_path: str) -> None:
         """Load BgKIT encoder from Phase 2 checkpoint."""
         from bgkit.models.encoder import BgKITEncoder
-        from bgkit.models.ice import ICE
         from bgkit.training.checkpointing import load_checkpoint
 
         logger.info("phase3_loading_encoder", checkpoint=checkpoint_path)
@@ -258,16 +256,6 @@ class DistillationTrainer(BaseTrainer):
             )
             self.encoder.to(self.device).eval()
             self.encoder.requires_grad_(False)
-
-        ice_state = {
-            k.replace("ice.", "", 1): v
-            for k, v in model_state.items() if k.startswith("ice.")
-        }
-        if ice_state:
-            self.ice = ICE(input_dim=1024, hidden_dim=128, num_layers=3)
-            self.ice.load_state_dict(ice_state, strict=False)
-            self.ice.to(self.device).eval()
-            self.ice.requires_grad_(False)
 
     def _collate(self, batch: list[dict]) -> dict:
         """Collate trajectory samples."""

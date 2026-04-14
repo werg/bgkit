@@ -177,10 +177,7 @@ def trainer():
     t._compression_active = False
     t._compression_introduction_step = None
     t._is_evaluating = False
-    t._pending_scores = []
-    t._calibrator = None
     t._target_ratio_override = None
-    t.ice_model = None
     t.optimizer = torch.optim.AdamW(t.decoder.parameters(), lr=1e-3)
     t._eval_count = 0
 
@@ -436,10 +433,7 @@ def _make_frozen_trainer(num_layers: int = 4, lr: float = 1e-3,
     t._compression_active = False
     t._compression_introduction_step = None
     t._is_evaluating = False
-    t._pending_scores = []
-    t._calibrator = None
     t._target_ratio_override = None
-    t.ice_model = None
     t._apply_freeze()
     t._setup_optimizer()
     t._eval_count = 0

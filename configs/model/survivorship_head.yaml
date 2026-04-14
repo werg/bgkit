@@ -1,0 +1,4 @@
+survivorship_head:
+  inner_dim: 256               # head MLP hidden dim
+  tap_layer: 7                 # layer index for head tap (pruned: block 1)
+  ratio_inject_layer: 3        # inject ratio embedding after this layer

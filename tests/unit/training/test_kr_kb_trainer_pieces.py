@@ -291,7 +291,7 @@ def test_kb_model_lora_state_dict_roundtrip():
                     torch.randn_like(w.adapters[level].lora_B)
                 )
     model1 = _KBModel(
-        encoder=enc1, decoder=dec1, ice=ice1, lora_router=router1,
+        encoder=enc1, decoder=dec1, lora_router=router1,
     )
     saved_state = model1.state_dict()
 
@@ -305,7 +305,7 @@ def test_kb_model_lora_state_dict_roundtrip():
         levels={"l0": 4, "l1": 4},
     )
     model2 = _KBModel(
-        encoder=enc2, decoder=dec2, ice=ice2, lora_router=router2,
+        encoder=enc2, decoder=dec2, lora_router=router2,
     )
     missing, unexpected = model2.load_state_dict(saved_state, strict=True)
     assert missing == []
@@ -363,7 +363,6 @@ def test_load_checkpoint_remap_pre_lora_keys_defensive():
     model = _KBModel(
         encoder=post_encoder,
         decoder=torch.nn.Linear(8, 8),
-        ice=torch.nn.Linear(8, 1),
         lora_router=router,
     )
 
@@ -738,10 +737,17 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
             ).sum(dim=1) / prompt_mask.sum(dim=1, keepdim=True).clamp(min=1)
             # Survivors = content + prompt_mean broadcast.
             out_content = content + prompt_mean.unsqueeze(1)
-            mask = kwargs["survivor_mask"]
+            # Derive attention mask from content attention_mask (all True
+            # for non-padded positions). target_ratio/level are accepted
+            # but not used by this stub.
+            attn_mask = kwargs.get("attention_mask")
+            if attn_mask is None:
+                attn_mask = torch.ones(
+                    content.size(0), content.size(1), dtype=torch.bool,
+                )
             return types.SimpleNamespace(
                 survivor_embeddings=out_content,
-                survivor_attention_mask=mask,
+                survivor_attention_mask=attn_mask,
             )
 
     trainer = KRKBTrainer.__new__(KRKBTrainer)

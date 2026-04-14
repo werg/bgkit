@@ -13,11 +13,9 @@ from torch import nn
 
 from bgkit.data.collators import collate_compression
 from bgkit.data.datasets.compression_dataset import RepoCompressionSample
-from bgkit.data.threshold_calibrator import ThresholdCalibrator
 from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
-from bgkit.models.ice import ICE
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.training.phase1.commit_encoding import CommitEncodingTrainer
 
@@ -190,11 +188,6 @@ def trainer():
                 "target_ratio_start": 0.50,
                 "target_ratio_end": 0.20,
                 "target_ratio_ramp_steps": 30000,
-                "max_survivor_gap": 64,
-                "fallback_threshold": 3.0,
-                "calibrator_ema_decay": 0.99,
-                "calibrator_warmup_batches": 50,
-                "l1_calibrator_fast_batches": 200,
             },
         },
         "compute": {"num_workers": 0, "pin_memory": False},
@@ -214,11 +207,6 @@ def trainer():
     t.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=HIDDEN_DIM)
     t.model = t.decoder
 
-    # Frozen ICE model
-    t.ice_model = ICE(input_dim=HIDDEN_DIM, hidden_dim=16, num_layers=2, kernel_size=3)
-    t.ice_model.eval()
-    t.ice_model.requires_grad_(False)
-
     # Optimizer
     params = list(t.encoder.parameters()) + list(t.decoder.parameters())
     t.optimizer = torch.optim.AdamW(params, lr=1e-3)
@@ -228,21 +216,7 @@ def trainer():
     t._target_ratio_end = 0.20
     t._target_ratio_ramp_steps = 30000
     t._target_ratio_override = None
-    t._max_gap = 64
 
-    # Calibrators (both active from step 0)
-    t._l0_calibrator = ThresholdCalibrator(
-        ema_decay=0.99, warmup_batches=50, fallback_threshold=3.0,
-    )
-    t._l1_calibrator = ThresholdCalibrator(
-        ema_decay=0.95, warmup_batches=50, fallback_threshold=3.0,
-    )
-    t._l1_calibrator_fast_batches = 200
-    t._l1_calibrator_slow_decay = 0.99
-    t._l1_batches_seen = 0
-    t._pending_l0_scores = []
-    t._pending_l1_scores = []
-    t._is_evaluating = False
     t._profile_enabled = False
 
     return t
@@ -262,14 +236,6 @@ class TestSetup:
         assert isinstance(trainer.decoder, ReconstructionDecoder)
         assert any(p.requires_grad for p in trainer.decoder.parameters())
 
-    def test_ice_frozen(self, trainer):
-        assert isinstance(trainer.ice_model, ICE)
-        assert not any(p.requires_grad for p in trainer.ice_model.parameters())
-
-    def test_both_calibrators_exist(self, trainer):
-        assert isinstance(trainer._l0_calibrator, ThresholdCalibrator)
-        assert isinstance(trainer._l1_calibrator, ThresholdCalibrator)
-
 
 # ---------------------------------------------------------------------------
 # Forward/backward tests
@@ -283,8 +249,6 @@ class TestForwardBackward:
         assert "loss" in metrics
         assert "target_ratio" in metrics
         assert "actual_ratio" in metrics
-        assert "calibrated_threshold_l0" in metrics
-        assert "calibrated_threshold_l1" in metrics
         assert metrics["loss"] > 0
 
     def test_loss_is_finite(self, trainer):
@@ -322,35 +286,6 @@ class TestForwardBackward:
         assert l0_surv.ndim == 2  # (total_survivors, hidden_dim)
         assert l0_surv.size(0) > 0, "Should have at least some survivors"
 
-    def test_calibrator_scores_not_doubled_by_checkpoint(self, trainer):
-        """Scores should be buffered exactly once per file, not doubled.
-
-        _score_and_select lives OUTSIDE the activation checkpoint boundary.
-        If it were inside, checkpoint recomputation would double-append
-        scores to _pending_l0_scores. This test catches that regression.
-        """
-        trainer._pending_l0_scores.clear()
-        n_files = 4
-        batch = _make_commit_batch(batch_size=1, n_files=n_files, file_len=8)
-        file_ids = batch["file_token_ids"]
-        file_masks = batch["file_attention_masks"]
-        prompt_ids = batch["compression_prompt_ids"]
-        prompt_mask = batch["compression_prompt_mask"]
-        bgkit_embed = trainer.encoder.compressor.backbone.get_input_embeddings()
-        prompt_emb = bgkit_embed(prompt_ids[0:1])
-
-        trainer._compress_l0_batched(
-            file_ids[0], file_masks[0], n_files,
-            prompt_emb, prompt_mask[0:1], bgkit_embed,
-        )
-
-        # L0 scores: one per file
-        n_l0_appends = len(trainer._pending_l0_scores)
-        assert n_l0_appends == n_files, (
-            f"Expected {n_files} L0 score appends (one per file), "
-            f"got {n_l0_appends} — checkpoint may be re-executing side effects"
-        )
-
 
 # ---------------------------------------------------------------------------
 # Curriculum tests
@@ -370,15 +305,6 @@ class TestCurriculum:
         trainer._target_ratio_override = 0.35
         trainer.global_step = 15000
         assert trainer._current_target_ratio() == 0.35
-
-    def test_calibrator_flush(self, trainer):
-        """Flushing pending scores should update calibrators."""
-        trainer._pending_l0_scores = [torch.randn(100)]
-        trainer._pending_l1_scores = [torch.randn(50)]
-        trainer._flush_calibrator_scores()
-        assert len(trainer._pending_l0_scores) == 0
-        assert len(trainer._pending_l1_scores) == 0
-        assert trainer._l1_batches_seen == 1
 
 
 # ---------------------------------------------------------------------------
@@ -405,8 +331,6 @@ class TestCheckpoint:
         assert (ckpt_path / "encoder.pt").exists()
         assert (ckpt_path / "decoder.pt").exists()
         assert (ckpt_path / "optimizer.pt").exists()
-        assert (ckpt_path / "l0_calibrator.pt").exists()
-        assert (ckpt_path / "l1_calibrator.pt").exists()
         assert (ckpt_path / "metadata.json").exists()
 
     def test_checkpoint_roundtrip(self, trainer, tmp_path):
@@ -419,19 +343,16 @@ class TestCheckpoint:
         trainer._last_checkpoint_path = None
         trainer._schedule_params = None
         trainer._optimizer_type = "adamw"
-        trainer._l1_batches_seen = 42
 
         ckpt_path = trainer.save_checkpoint(ckpt_dir, metrics={"loss": 2.0})
 
         # Reset state
         trainer.global_step = 0
         trainer.epoch = 0
-        trainer._l1_batches_seen = 0
 
         trainer.load_checkpoint(ckpt_path)
         assert trainer.global_step == 100
         assert trainer.epoch == 3
-        assert trainer._l1_batches_seen == 42
 
     def test_checkpoint_loadable_by_compression_trainer(self, trainer, tmp_path):
         """Commit encoding checkpoints must be consumable by CompressionTrainer (Step 2)."""
@@ -497,10 +418,6 @@ class TestLiveConfig:
         trainer._target_ratio_override = 0.4
         trainer.apply_live_config({"target_ratio": None})
         assert trainer._target_ratio_override is None
-
-    def test_max_survivor_gap(self, trainer):
-        trainer.apply_live_config({"max_survivor_gap": 32})
-        assert trainer._max_gap == 32
 
 
 # ---------------------------------------------------------------------------

@@ -23,23 +23,11 @@ bidi_warmup_steps: 0
 # Local warmup steps for newly added param groups at stage transitions
 local_warmup_steps: 500
 
-# ICE model for compression scoring
-ice:
-  checkpoint_path: auto
-  input_dim: 1024
-  hidden_dim: 192
-  num_layers: 3
-  kernel_size: 5
-
 # Compression ratio distribution (must match teacher's training)
 compression:
   target_ratio_min: 0.10    # live-tunable via control.json
   target_ratio_max: 1.0     # live-tunable via control.json
   eval_ratio: 0.10          # live-tunable via control.json
-  max_survivor_gap: 64      # live-tunable via control.json
-  fallback_threshold: 3.0
-  calibrator_ema_decay: 0.99
-  calibrator_warmup_batches: 50
 
 # Staged unfreezing thresholds (step numbers, live-tunable via control.json)
 stages:

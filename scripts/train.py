@@ -21,11 +21,7 @@ def _create_trainer(cfg: DictConfig):
     if phase is None:
         raise ValueError("No training phase specified. Use a training config override.")
 
-    if phase == "ice":
-        from bgkit.training.ice_trainer import ICETrainer
-
-        return ICETrainer(cfg)
-    elif phase == "joint_block_pretrain":
+    if phase == "joint_block_pretrain":
         from bgkit.training.joint_block_trainer import JointBlockTrainer
 
         return JointBlockTrainer(cfg)

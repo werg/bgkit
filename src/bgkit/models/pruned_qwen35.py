@@ -15,6 +15,8 @@ Two construction paths:
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn as nn
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -151,7 +153,20 @@ class PrunedBidirectionalQwen35(nn.Module):
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         return_intermediates: bool = False,
+        layer_hooks: dict[int, Callable[[torch.Tensor], torch.Tensor]] | None = None,
     ) -> BaseModelOutputWithPast:
+        """Run forward pass through pruned blocks.
+
+        Args:
+            inputs_embeds: (B, L, D) input embeddings.
+            attention_mask: (B, L) padding mask.
+            return_intermediates: Collect hidden states after each block.
+            layer_hooks: Optional dict mapping block indices to callables.
+                After block ``idx`` completes, if ``idx`` is in the dict,
+                ``layer_hooks[idx](hidden) -> hidden`` is called. Block 0
+                corresponds to original layers 0-3, block 1 to layers 4-7,
+                etc.
+        """
         hidden = inputs_embeds
         seq_len = hidden.shape[1]
         position_ids = torch.arange(seq_len, device=hidden.device).unsqueeze(0)
@@ -185,8 +200,13 @@ class PrunedBidirectionalQwen35(nn.Module):
 
         intermediates = [] if return_intermediates else None
 
-        for block in self.blocks:
+        for idx, block in enumerate(self.blocks):
             hidden = block(hidden, full_attn_mask, position_embeddings, use_ckpt)
+
+            # Fire block hook after this block completes
+            if layer_hooks and idx in layer_hooks:
+                hidden = layer_hooks[idx](hidden)
+
             if return_intermediates:
                 intermediates.append(hidden)
 

@@ -7,19 +7,7 @@ bgkit:
   hidden_dim: 1024
   # Total survivor budget across all files for a single repo
   total_survivor_budget: 3500
-  # Level 0: within-file compression
-  level0:
-    # Static fallback ICE threshold (used before calibration)
-    ice_threshold: 3.0
-    # After calibration export, add:
-    # target_ratio: 0.15
-    # calibration_snapshot: { ... }
   # Level 1: cross-file compression
   level1:
     # Max positions for L1 input (Qwen3.5-0.8B supports 262K context)
     max_positions: 32768
-    # Static fallback ICE threshold (used before calibration)
-    ice_threshold: 3.0
-    # After calibration export, add:
-    # target_ratio: 0.15
-    # calibration_snapshot: { ... }

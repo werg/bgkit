@@ -38,8 +38,11 @@ class MockEncoderBackbone(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+    def forward(self, inputs_embeds=None, attention_mask=None, return_intermediates=False, layer_hooks=None, **kwargs):
         x = self.layers[0](inputs_embeds)
+        if layer_hooks:
+            for idx in sorted(layer_hooks):
+                x = layer_hooks[idx](x)
         x = self.norm(x)
         return _Output(last_hidden_state=x)
 
@@ -123,7 +126,7 @@ HIDDEN_DIM = 64
 def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
     backbone = MockEncoderBackbone(hidden_dim=hidden_dim)
     compressor_norm = nn.LayerNorm(hidden_dim)
-    compressor = BgKITCompressor(backbone, compressor_norm, hidden_dim=hidden_dim)
+    compressor = BgKITCompressor(backbone, compressor_norm, hidden_dim=hidden_dim, survivorship_inner_dim=8)
 
     proj_layer = MockTransformerLayer(hidden_dim)
     proj_norm = nn.LayerNorm(hidden_dim)
@@ -206,10 +209,12 @@ def _make_trainer(
     t._compression_active = False
     t._compression_introduction_step = None
     t._is_evaluating = False
-    t._pending_scores = []
-    t._calibrator = None
     t._target_ratio_override = None
-    t.ice_model = None
+    # Survivorship head aux loss weights
+    t._ratio_loss_weight = 0.1
+    t._decisiveness_loss_weight = 0.05
+    t._soft_attn_loss_weight = 0.05
+    t._soft_attn_every_n_steps = 4
 
     # Decoder
     decoder_backbone = MockCausalLMBackbone(hidden_dim=HIDDEN_DIM, num_layers=num_layers)
@@ -667,8 +672,8 @@ class TestTrainStepWithProjection:
         """
         t = _make_trainer(train_projection_block=True)
         batch = _make_batch()
-        survivors, _mask = t._compute_survivors(batch)
-        loss = survivors.sum()
+        enc_out = t._compute_survivors(batch)
+        loss = enc_out.survivor_embeddings.sum()
         loss.backward()
 
         has_grad = any(

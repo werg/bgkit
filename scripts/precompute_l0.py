@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Offline L0 pre-computation: encode documents through BgKIT encoder + ICE.
+"""Offline L0 pre-computation: encode documents through BgKIT encoder.
 
-Produces sharded mmap survivors for fast training at Steps 3-4.
-Uses the Phase 2 Step 2 checkpoint (where L0 is already frozen).
+The encoder's internal survivorship head produces the survivor mask from the
+target retention ratio. Produces sharded mmap survivors for fast training.
 
 Output format per shard:
-  survivors.npy   - bfloat16 mmap, shape (total_survivors_in_shard, hidden_dim)
-  offsets.npy     - int64 CSR offsets, shape (docs_in_shard + 1,)
-  ice_scores.npy  - float32 mmap, shape (total_survivors_in_shard,)
+  survivors.npy     - bfloat16 mmap, shape (total_survivors_in_shard, hidden_dim)
+  offsets.npy       - int64 CSR offsets, shape (docs_in_shard + 1,)
+  survive_probs.npy - float32 mmap, shape (total_survivors_in_shard,)
 
 Global index:
   index.parquet   - (document_id, shard_id, row_index) mapping
@@ -32,16 +32,17 @@ import pyarrow.parquet as pq
 import torch
 
 
-def _load_encoder_and_ice(checkpoint_path: str, device: torch.device):
-    """Load BgKIT encoder and ICE from a Phase 2 checkpoint."""
+def _load_encoder(checkpoint_path: str, device: torch.device):
+    """Load BgKIT encoder from a Phase 2 checkpoint.
+
+    The survivorship head is inside the encoder — no separate ICE model.
+    """
     from bgkit.models.encoder import BgKITEncoder
-    from bgkit.models.ice import ICE
     from bgkit.training.checkpointing import load_checkpoint
 
     _metadata, state_dicts = load_checkpoint(Path(checkpoint_path))
     model_state = state_dicts.get("model", {})
 
-    # Extract encoder state
     encoder_state = {
         k.replace("encoder.", "", 1): v
         for k, v in model_state.items() if k.startswith("encoder.")
@@ -54,36 +55,20 @@ def _load_encoder_and_ice(checkpoint_path: str, device: torch.device):
     encoder.to(device).eval()
     encoder.requires_grad_(False)
 
-    # Extract ICE state
-    ice_state = {
-        k.replace("ice.", "", 1): v
-        for k, v in model_state.items() if k.startswith("ice.")
-    }
-    ice = ICE(input_dim=1024, hidden_dim=128, num_layers=3)
-    if ice_state:
-        ice.load_state_dict(ice_state, strict=False)
-    ice.to(device).eval()
-    ice.requires_grad_(False)
-
-    return encoder, ice
+    return encoder
 
 
 def _encode_batch(
     encoder,
-    ice,
     token_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     retention_ratio: float,
     device: torch.device,
 ) -> list[dict]:
-    """Encode a batch and return per-document survivors + scores."""
+    """Encode a batch and return per-document survivors + survive probabilities."""
     embed_tokens = encoder.compressor.backbone.get_input_embeddings()
     input_embeddings = embed_tokens(token_ids)
 
-    # ICE scoring
-    ice_scores = ice(input_embeddings)  # (B, L)
-
-    # Select survivors per document
     results = []
     batch_size = token_ids.size(0)
     for i in range(batch_size):
@@ -91,29 +76,30 @@ def _encode_batch(
         if length == 0:
             results.append({
                 "survivors": np.zeros((0, 1024), dtype=np.float16),
-                "scores": np.array([], dtype=np.float32),
+                "probs": np.array([], dtype=np.float32),
             })
             continue
 
-        keep = max(1, math.ceil(length * retention_ratio))
-        scores_i = ice_scores[i, :length]
-        _, topk_indices = torch.topk(scores_i, min(keep, length))
-        topk_indices, _ = topk_indices.sort()
-
-        # Build survivor mask
-        survivor_mask = torch.zeros(1, token_ids.size(1), dtype=torch.bool, device=device)
-        survivor_mask[0, topk_indices] = True
-
-        # Run encoder with survivor mask
+        # Survivorship head produces the mask internally from target_ratio
         output = encoder(
             input_embeddings=input_embeddings[i : i + 1],
-            survivor_mask=survivor_mask,
             attention_mask=attention_mask[i : i + 1],
+            target_ratio=retention_ratio,
+            level="l0",
         )
-
-        survivors = output.survivor_embeddings[0].cpu().to(torch.float16).numpy()
-        selected_scores = scores_i[topk_indices].cpu().numpy().astype(np.float32)
-        results.append({"survivors": survivors, "scores": selected_scores})
+        # Drop padding from survivors
+        surv_mask_attn = output.survivor_attention_mask[0]
+        survivors = (
+            output.survivor_embeddings[0][surv_mask_attn]
+            .cpu().to(torch.float16).numpy()
+        )
+        # Gather probabilities at surviving positions
+        if output.survivor_mask is not None and output.survive_probs is not None:
+            probs = output.survive_probs[0][output.survivor_mask[0]]
+            probs_np = probs.cpu().float().numpy().astype(np.float32)
+        else:
+            probs_np = np.zeros(len(survivors), dtype=np.float32)
+        results.append({"survivors": survivors, "probs": probs_np})
 
     return results
 
@@ -133,7 +119,7 @@ def precompute_l0(
     output_path.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading checkpoint from {checkpoint_path}")
-    encoder, ice = _load_encoder_and_ice(checkpoint_path, device)
+    encoder = _load_encoder(checkpoint_path, device)
 
     # Load token dataset
     tokens = np.load(Path(token_dir) / "tokens.npy", mmap_mode="r")
@@ -158,12 +144,12 @@ def precompute_l0(
     index_rows = []
     shard_id = 0
     shard_survivors: list[np.ndarray] = []
-    shard_scores: list[np.ndarray] = []
+    shard_probs: list[np.ndarray] = []
     shard_lengths: list[int] = []
     shard_doc_count = 0
 
     def _flush_shard():
-        nonlocal shard_id, shard_survivors, shard_scores, shard_lengths, shard_doc_count
+        nonlocal shard_id, shard_survivors, shard_probs, shard_lengths, shard_doc_count
         if not shard_survivors:
             return
 
@@ -172,18 +158,18 @@ def precompute_l0(
         shard_dir.mkdir(parents=True, exist_ok=True)
 
         all_survivors = np.concatenate(shard_survivors, axis=0)
-        all_scores = np.concatenate(shard_scores, axis=0)
+        all_probs = np.concatenate(shard_probs, axis=0)
         shard_offsets = np.zeros(len(shard_lengths) + 1, dtype=np.int64)
         np.cumsum(shard_lengths, out=shard_offsets[1:])
 
         np.save(shard_dir / "survivors.npy", all_survivors)
         np.save(shard_dir / "offsets.npy", shard_offsets)
-        np.save(shard_dir / "ice_scores.npy", all_scores)
+        np.save(shard_dir / "survive_probs.npy", all_probs)
 
         print(f"  Shard {shard_name}: {shard_doc_count} docs, {len(all_survivors)} survivors")
         shard_id += 1
         shard_survivors = []
-        shard_scores = []
+        shard_probs = []
         shard_lengths = []
         shard_doc_count = 0
 
@@ -220,14 +206,14 @@ def precompute_l0(
 
         with torch.no_grad():
             results = _encode_batch(
-                encoder, ice, token_tensor, mask_tensor, retention_ratio, device,
+                encoder, token_tensor, mask_tensor, retention_ratio, device,
             )
 
         for i, (doc_idx, result) in enumerate(
             zip(batch_doc_indices, results, strict=False),
         ):
             survivors = result["survivors"]
-            scores = result["scores"]
+            probs = result["probs"]
 
             index_rows.append({
                 "document_id": str(doc_ids[doc_idx]),
@@ -236,7 +222,7 @@ def precompute_l0(
             })
 
             shard_survivors.append(survivors)
-            shard_scores.append(scores)
+            shard_probs.append(probs)
             shard_lengths.append(len(survivors))
             shard_doc_count += 1
 

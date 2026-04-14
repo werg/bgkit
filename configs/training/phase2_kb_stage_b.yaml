@@ -54,6 +54,17 @@ lora:
   alpha: 64
   dropout: 0.0
 
+# Survivorship head auxiliary losses
+survivorship:
+  relevance_loss_weight: 0.05
+  relevance_gold_boost: 1.5
+  relevance_distractor_damp: 0.5
+  n_distractors: 3
+  ratio_loss_weight: 0.1
+  decisiveness_loss_weight: 0.05
+  soft_attn_loss_weight: 0.05
+  soft_attn_every_n_steps: 4
+
 phase1_checkpoint: auto
 # stage_a_checkpoint: auto  # uncomment once Stage A has produced a
 # best-checkpoint registry entry; the precompute script needs this to

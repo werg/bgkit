@@ -8,6 +8,10 @@ layer) performs context-aware projection into the decoder's embedding space.
 For Qwen3.5-0.8B backbones, the model is wrapped in BidirectionalQwen35
 which makes full attention layers bidirectional (causal mask removed) while
 keeping DeltaNet layers causal for efficient O(L) processing.
+
+The survivorship head inside the compressor replaces the old ICE model +
+ThresholdCalibrator pipeline. It reads layer-7 hidden states and outputs
+per-position survive probabilities, producing the survivor mask internally.
 """
 
 from __future__ import annotations
@@ -70,11 +74,7 @@ def _resolve_rotary_emb(backbone: nn.Module) -> nn.Module:
 
 
 def _is_qwen35_model(model: nn.Module) -> bool:
-    """Check if a model is a Qwen3.5 variant (by config model_type).
-
-    Handles both the multimodal wrapper (model_type='qwen3_5') and
-    the text model (model_type='qwen3_5_text').
-    """
+    """Check if a model is a Qwen3.5 variant (by config model_type)."""
     config = getattr(model, "config", None)
     if config is None:
         return False
@@ -83,14 +83,7 @@ def _is_qwen35_model(model: nn.Module) -> bool:
 
 
 def _extract_text_model(model: nn.Module) -> nn.Module:
-    """Extract the text model from a multimodal Qwen3.5 model.
-
-    Qwen3.5 models are multimodal (Qwen3_5ForConditionalGeneration or
-    Qwen3_5Model) with vision + language_model. The text model (language_model)
-    has the standard HF structure: embed_tokens, layers, norm, rotary_emb.
-
-    Returns the text model if found, otherwise returns the model unchanged.
-    """
+    """Extract the text model from a multimodal Qwen3.5 model."""
     language_model = getattr(model, "language_model", None)
     if language_model is not None and hasattr(language_model, "layers"):
         return language_model
@@ -117,14 +110,6 @@ def _expand_survivor_mask(
 
     Prompt+sep positions are marked as doomed (False). Only content positions
     carry the original survive/doomed labels.
-
-    Args:
-        content_mask: (B, L_content) bool mask for content positions.
-        content_slice: slice indicating where content starts in the full sequence.
-        full_len: Total length of the full sequence.
-
-    Returns:
-        (B, full_len) bool mask where prompt/sep positions are False.
     """
     batch_size = content_mask.size(0)
     full_mask = torch.zeros(batch_size, full_len, dtype=torch.bool, device=content_mask.device)
@@ -133,11 +118,7 @@ def _expand_survivor_mask(
 
 
 def is_pruned_encoder_state_dict(state_dict: dict) -> bool:
-    """Detect whether an encoder state dict came from a pruned backbone.
-
-    Pruned backbones use ``compressor.backbone.blocks.*`` keys;
-    unpruned use ``compressor.backbone.layers.*``.
-    """
+    """Detect whether an encoder state dict came from a pruned backbone."""
     return any(k.startswith("compressor.backbone.blocks.") for k in state_dict)
 
 
@@ -145,9 +126,10 @@ class BgKITEncoder(nn.Module):
     """Full BgKIT encoder: compressor + projection block.
 
     The compressor runs layers 0..N-2 of the backbone to produce dense
-    hidden states. The projection block (layer N-1) performs context-aware
-    projection into the decoder's embedding space, optionally extracting
-    only survivor positions.
+    hidden states and internally generates the survivor mask via the
+    survivorship head. The projection block (layer N-1) performs
+    context-aware projection into the decoder's embedding space,
+    extracting only survivor positions when compression is active.
     """
 
     def __init__(
@@ -162,56 +144,51 @@ class BgKITEncoder(nn.Module):
     def forward(
         self,
         input_embeddings: torch.Tensor,
-        survivor_mask: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         prompt_embeddings: torch.Tensor | None = None,
         prompt_attention_mask: torch.Tensor | None = None,
         pinned_positions: torch.Tensor | None = None,
-        lora_level: str | None = None,
+        target_ratio: float | None = None,
+        level: str | None = None,
     ) -> CompressionOutput:
         """Run the full encoder: compressor then projection block.
 
         Args:
             input_embeddings: (B, L, D) input token embeddings (content).
-            survivor_mask: (B, L) bool mask for survivor positions. None = no compression.
             attention_mask: (B, L) optional padding mask for content.
             prompt_embeddings: (B, P, D) optional prompt embeddings.
             prompt_attention_mask: (B, P) optional mask for prompt positions.
-            pinned_positions: (B, L) bool mask of content positions that MUST survive,
-                regardless of ICE score. OR'd into ``survivor_mask`` before the
-                compressor runs, and propagated to the projection block so the
-                pinned outputs are extracted. Used by the KB-scale pipeline to
-                preserve article-ID tokens through L1 compression.
-            lora_level: Which LoRA adapter ("l0", "l1", or None) to activate on
-                the encoder backbone for this forward pass. Routed via
-                :class:`bgkit.models.lora_encoder.LoRARouter` when present.
+            pinned_positions: (B, L) bool mask of content positions that MUST
+                survive, regardless of head output. OR'd into the hard mask.
+            target_ratio: Target compression ratio (e.g. 0.10). None means
+                no compression (no survivorship head, no flag embeddings).
+            level: Which survivorship head / LoRA adapter to use ("l0",
+                "l1", or None). When None and target_ratio is set, defaults
+                to "l0".
 
         Returns:
-            CompressionOutput with projected embeddings.
+            CompressionOutput with projected embeddings and head outputs.
         """
-        # Merge pinned positions into survivor_mask so compressor and projection
-        # block see the same effective mask. Requires survivor_mask to exist
-        # (pinning is a compression-only concept).
-        if pinned_positions is not None and survivor_mask is not None:
-            survivor_mask = survivor_mask | pinned_positions.to(survivor_mask.dtype)
-
         # Activate LoRA adapter for this call, if any are installed.
         from bgkit.models.lora_encoder import LoRARouter
 
         router = LoRARouter.get()
-        lora_ctx = router.active(lora_level) if router is not None else _null_ctx()
+        lora_ctx = router.active(level) if router is not None else _null_ctx()
         with lora_ctx:
             comp_out = self.compressor(
                 input_embeddings,
-                survivor_mask=survivor_mask,
                 attention_mask=attention_mask,
                 prompt_embeddings=prompt_embeddings,
                 prompt_attention_mask=prompt_attention_mask,
+                pinned_positions=pinned_positions,
+                target_ratio=target_ratio,
+                level=level or "l0",
             )
 
             # Projection block sees the full sequence (prompt context preserved)
             full_raw = comp_out.raw_embeddings
             full_mask = comp_out.attention_mask
+            survivor_mask = comp_out.survivor_mask
 
             # Expand survivor mask to full sequence if compression is active
             if survivor_mask is not None:
@@ -247,13 +224,13 @@ class BgKITEncoder(nn.Module):
             survivor_attention_mask=content_mask,
             survivor_mask=survivor_mask,
             survivor_counts=proj_out.survivor_counts,
+            head_logits=comp_out.head_logits,
+            survive_probs=comp_out.survive_probs,
+            layer7_embeddings=comp_out.layer7_embeddings,
         )
 
     def auto_reproduce(self, normed_embeddings: torch.Tensor) -> torch.Tensor:
-        """Map normed embeddings back to input embedding space.
-
-        Delegates to the compressor's auto-reproduction head.
-        """
+        """Map normed embeddings back to input embedding space."""
         return self.compressor.auto_reproduce(normed_embeddings)
 
     def step_bidi_warmup(self) -> None:
@@ -274,15 +251,12 @@ class BgKITEncoder(nn.Module):
         bidi_warmup_steps: int = 0,
         pruned: bool = False,
         conv_kernel_size: int = 16,
+        survivorship_inner_dim: int = 256,
     ) -> BgKITEncoder:
         """Construct a BgKITEncoder from a pretrained HF model.
 
         Splits the backbone into compressor (layers 0..N-2) and projection
         block (layer N-1), with separate norms for each.
-
-        Callers that load a checkpoint afterward should generally use
-        ``from_pretrained_with_state_dict()`` instead, which auto-detects
-        pruned vs. unpruned architecture from the state dict keys.
 
         Args:
             backbone_name_or_module: HF model name or pre-loaded model.
@@ -293,6 +267,7 @@ class BgKITEncoder(nn.Module):
             attn_implementation: Attention implementation (e.g. "sdpa").
             pruned: If True, construct with PrunedBidirectionalQwen35 backbone.
             conv_kernel_size: Kernel size for ResidualConv1d (only when pruned).
+            survivorship_inner_dim: Inner dim for survivorship heads.
 
         Returns:
             Constructed BgKITEncoder.
@@ -312,54 +287,40 @@ class BgKITEncoder(nn.Module):
         else:
             raw_model = backbone_name_or_module
 
-        # Qwen3.5 models are multimodal (visual + language_model). Extract the
-        # text model (language_model) which has the standard HF structure:
-        # embed_tokens, layers, norm, rotary_emb.
         raw_model = _extract_text_model(raw_model)
 
         if pruned:
-            # Pruned path: skip BidirectionalQwen35, go directly to pruned model
             return cls._from_pretrained_pruned(
-                raw_model, hidden_dim, torch_dtype, bidi_warmup_steps, conv_kernel_size,
+                raw_model, hidden_dim, torch_dtype, bidi_warmup_steps,
+                conv_kernel_size, survivorship_inner_dim,
             )
 
-        # Wrap Qwen3.5 text models in BidirectionalQwen35 (bidirectional
-        # full attention layers, causal DeltaNet layers).
         if not isinstance(raw_model, BidirectionalQwen35) and _is_qwen35_model(raw_model):
             backbone = BidirectionalQwen35(raw_model, bidi_warmup_steps=bidi_warmup_steps)
         else:
             backbone = raw_model
 
-        # 1. Get the layers list
         layers = _resolve_layers(backbone)
-
-        # 2. Pop the last layer -> projection layer
         projection_layer = layers[-1]
         del layers[-1]
 
-        # 3. Get rotary embedding (shared reference, not deepcopy)
         rotary_emb = _resolve_rotary_emb(backbone)
-
-        # 4. Deepcopy norms for compressor and projection block
         original_norm = _resolve_final_norm(backbone)
         projection_norm = deepcopy(original_norm)
         compressor_norm = deepcopy(original_norm)
 
-        # 5. Replace backbone's norm with Identity (un-normed output)
         _set_norm_to_identity(backbone)
 
-        # 7. Construct compressor
-        compressor = BgKITCompressor(backbone, compressor_norm, hidden_dim=hidden_dim)
+        compressor = BgKITCompressor(
+            backbone, compressor_norm, hidden_dim=hidden_dim,
+            survivorship_inner_dim=survivorship_inner_dim,
+        )
 
-        # 8. Construct projection block
         projection_block = ProjectionBlock(
             projection_layer, projection_norm, rotary_emb, hidden_dim=hidden_dim,
         )
 
         encoder = cls(compressor, projection_block)
-
-        # Cast all parameters (including newly-initialized ones like flag embeddings,
-        # separator, auto_repro_head) to match the pretrained model dtype.
         encoder.to(dtype=torch_dtype)
         return encoder
 
@@ -371,13 +332,9 @@ class BgKITEncoder(nn.Module):
         torch_dtype: torch.dtype,
         bidi_warmup_steps: int,
         conv_kernel_size: int,
+        survivorship_inner_dim: int = 256,
     ) -> BgKITEncoder:
-        """Construct a pruned BgKITEncoder from raw HF text model layers.
-
-        Skips BidirectionalQwen35 entirely — no point patching DeltaNet conv1d
-        on layers that will be discarded.
-        """
-        # Pop last layer for projection block BEFORE pruning
+        """Construct a pruned BgKITEncoder from raw HF text model layers."""
         layers = _resolve_layers(text_model)
         projection_layer = layers[-1]
         del layers[-1]
@@ -387,8 +344,6 @@ class BgKITEncoder(nn.Module):
         projection_norm = deepcopy(original_norm)
         compressor_norm = deepcopy(original_norm)
 
-        # Build pruned backbone from remaining 23 layers.
-        # Pass Identity norm — the compressor owns the real norm separately.
         pruned_backbone = PrunedBidirectionalQwen35.from_text_model(
             text_model,
             hidden_dim=hidden_dim,
@@ -397,7 +352,10 @@ class BgKITEncoder(nn.Module):
             norm_override=nn.Identity(),
         )
 
-        compressor = BgKITCompressor(pruned_backbone, compressor_norm, hidden_dim=hidden_dim)
+        compressor = BgKITCompressor(
+            pruned_backbone, compressor_norm, hidden_dim=hidden_dim,
+            survivorship_inner_dim=survivorship_inner_dim,
+        )
         projection_block = ProjectionBlock(
             projection_layer, projection_norm, rotary_emb, hidden_dim=hidden_dim,
         )
@@ -418,20 +376,13 @@ class BgKITEncoder(nn.Module):
         attn_implementation: str | None = None,
         bidi_warmup_steps: int = 0,
         conv_kernel_size: int = 16,
+        survivorship_inner_dim: int = 256,
     ) -> BgKITEncoder:
         """Construct a BgKITEncoder, auto-detecting pruned architecture from state dict.
 
-        Inspects the state dict keys to determine whether the checkpoint was
-        saved from a pruned or unpruned encoder. This removes the need for
-        metadata flags or config settings — the checkpoint is self-describing.
-
-        Args:
-            backbone_name_or_module: HF model name or pre-loaded model.
-            encoder_state_dict: The encoder state dict (from checkpoint).
-            **kwargs: Forwarded to ``from_pretrained()``.
-
-        Returns:
-            Constructed BgKITEncoder with state dict loaded.
+        Uses ``strict=False`` when loading to tolerate missing survivorship
+        head / ratio_embedding keys in old checkpoints (randomly initialized)
+        and unexpected ICE-related keys.
         """
         pruned = is_pruned_encoder_state_dict(encoder_state_dict)
         encoder = cls.from_pretrained(
@@ -444,6 +395,15 @@ class BgKITEncoder(nn.Module):
             bidi_warmup_steps=bidi_warmup_steps,
             pruned=pruned,
             conv_kernel_size=conv_kernel_size,
+            survivorship_inner_dim=survivorship_inner_dim,
         )
-        encoder.load_state_dict(encoder_state_dict)
+        result = encoder.load_state_dict(encoder_state_dict, strict=False)
+        if result.missing_keys:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(
+                "Missing keys when loading encoder state dict (expected for "
+                "new survivorship head components): %s",
+                result.missing_keys,
+            )
         return encoder
