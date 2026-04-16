@@ -181,7 +181,32 @@ def _patch_rms_norm_modules(root: nn.Module) -> int:
                 continue
             try:
                 hidden_size = int(child.weight.shape[-1])
-                new = liger_rms_cls(hidden_size=hidden_size, eps=float(eps))
+                # in_place=False is critical: LigerRMSNorm's default
+                # in_place=True scribbles on the dY buffer during backward,
+                # silently corrupting gradients flowing through post-norm
+                # residual consumers. Qwen3.5's hybrid Gated-DeltaNet +
+                # Attention architecture has exactly that residual pattern,
+                # so in_place=True produces biased (non-NaN) gradients that
+                # quickly pull training off the Step 2 manifold —
+                # decoder-CE goes from ~1.6 at step 0 to ~13 (LM prior) by
+                # step 10 at near-zero LR. See Liger issues #272, #1119,
+                # and the LigerRMSNormForQwen3Next variant which also
+                # overrides in_place=False. Do not remove without reading
+                # those.
+                try:
+                    new = liger_rms_cls(
+                        hidden_size=hidden_size,
+                        eps=float(eps),
+                        in_place=False,
+                    )
+                except TypeError:
+                    # Older liger-kernel versions (<0.5.x?) don't accept
+                    # in_place kwarg. Fall through to the default signature
+                    # — those versions predated the in_place default change
+                    # and are believed safe.
+                    new = liger_rms_cls(
+                        hidden_size=hidden_size, eps=float(eps),
+                    )
                 new.weight = child.weight
                 new.to(device=child.weight.device, dtype=child.weight.dtype)
                 setattr(parent, child_name, new)
@@ -257,7 +282,12 @@ def _patch_rope(root: nn.Module) -> int:
         return 0
 
 
-def apply_liger_to_qwen35(model: nn.Module | None) -> int:
+def apply_liger_to_qwen35(
+    model: nn.Module | None,
+    patch_rmsnorm: bool = True,
+    patch_swiglu: bool = True,
+    patch_rope: bool = True,
+) -> int:
     """Install Liger's fused kernels on a Qwen3.5 encoder *or* decoder.
 
     Walks ``model`` to the underlying text backbone and swaps RMSNorm /
@@ -265,6 +295,12 @@ def apply_liger_to_qwen35(model: nn.Module | None) -> int:
     Returns the total number of modules patched (0 when Liger is not
     installed — callers should log this so missing-kernel regressions
     are visible in training logs).
+
+    Component toggles allow bisecting which fused kernel introduces a
+    regression (e.g., a liger-kernel version bump may silently break
+    backward-pass numerics on one module type). Call with
+    ``patch_rmsnorm=False`` or ``patch_swiglu=False`` to skip that
+    kernel specifically while keeping the others active.
 
     Safe to call on encoders and decoders alike, on top of LoRA wrappers,
     before or after ``enable_gradient_checkpointing``, and multiple times
@@ -284,9 +320,12 @@ def apply_liger_to_qwen35(model: nn.Module | None) -> int:
 
     root = _iter_text_backbone(model)
     total = 0
-    total += _patch_rms_norm_modules(root)
-    total += _patch_swiglu_mlp_modules(root)
-    total += _patch_rope(root)
+    if patch_rmsnorm:
+        total += _patch_rms_norm_modules(root)
+    if patch_swiglu:
+        total += _patch_swiglu_mlp_modules(root)
+    if patch_rope:
+        total += _patch_rope(root)
 
     with contextlib.suppress(Exception):
         model._liger_patched = True  # type: ignore[attr-defined]

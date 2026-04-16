@@ -68,13 +68,11 @@ def test_filter_on_empty_dict_is_identity():
 
 
 def test_filter_preserves_new_head_names():
-    """New two-head keys (head_base_l0, head_adapter_l0) must NOT match
-    the legacy survivorship_head_l0 filter — they are different names."""
+    """New single-head keys (head_base_l0) must NOT match the legacy
+    survivorship_head_l0 filter — they are different names."""
     state_dict = {
         "compressor.head_base_l0.head.0.weight": torch.zeros(8, 16),
-        "compressor.head_adapter_l0.head.0.weight": torch.zeros(8, 16),
         "compressor.threshold_l0.theta_param": torch.tensor(-1.4),
-        "compressor.adapter_mean_ema_l0.mu_param": torch.tensor(0.0),
     }
     legacy_prefixes = (
         "compressor.ratio_embedding.",

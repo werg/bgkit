@@ -237,19 +237,14 @@ class BgKITEncoder(nn.Module):
             full_attention_mask=comp_out.attention_mask,
             content_slice=comp_out.content_slice,
             base_raw=comp_out.base_raw,
-            adapter_raw=comp_out.adapter_raw,
-            adapter_zm=comp_out.adapter_zm,
             logits_for_op=comp_out.logits_for_op,
-            logits_for_softattn=comp_out.logits_for_softattn,
             survive_probs_metrics=comp_out.survive_probs_metrics,
-            adapter_sum=comp_out.adapter_sum,
             valid_count=comp_out.valid_count,
             organic_count=comp_out.organic_count,
             controllable_count=comp_out.controllable_count,
             floor_trigger_rate=comp_out.floor_trigger_rate,
             num_pinned=comp_out.num_pinned,
             theta_tensor=comp_out.theta_tensor,
-            adapter_mu_tensor=comp_out.adapter_mu_tensor,
         )
 
     def auto_reproduce(self, normed_embeddings: torch.Tensor) -> torch.Tensor:
@@ -276,7 +271,6 @@ class BgKITEncoder(nn.Module):
         conv_kernel_size: int = 16,
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
-        adapter_mean_ema_cfg: dict | None = None,
     ) -> BgKITEncoder:
         """Construct a BgKITEncoder from a pretrained HF model.
 
@@ -318,7 +312,7 @@ class BgKITEncoder(nn.Module):
             return cls._from_pretrained_pruned(
                 raw_model, hidden_dim, torch_dtype, bidi_warmup_steps,
                 conv_kernel_size, survivorship_inner_dim,
-                threshold_controller_cfg, adapter_mean_ema_cfg,
+                threshold_controller_cfg,
             )
 
         if not isinstance(raw_model, BidirectionalQwen35) and _is_qwen35_model(raw_model):
@@ -341,7 +335,6 @@ class BgKITEncoder(nn.Module):
             backbone, compressor_norm, hidden_dim=hidden_dim,
             survivorship_inner_dim=survivorship_inner_dim,
             threshold_controller_cfg=threshold_controller_cfg,
-            adapter_mean_ema_cfg=adapter_mean_ema_cfg,
         )
 
         projection_block = ProjectionBlock(
@@ -362,7 +355,6 @@ class BgKITEncoder(nn.Module):
         conv_kernel_size: int,
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
-        adapter_mean_ema_cfg: dict | None = None,
     ) -> BgKITEncoder:
         """Construct a pruned BgKITEncoder from raw HF text model layers."""
         layers = _resolve_layers(text_model)
@@ -386,7 +378,6 @@ class BgKITEncoder(nn.Module):
             pruned_backbone, compressor_norm, hidden_dim=hidden_dim,
             survivorship_inner_dim=survivorship_inner_dim,
             threshold_controller_cfg=threshold_controller_cfg,
-            adapter_mean_ema_cfg=adapter_mean_ema_cfg,
         )
         projection_block = ProjectionBlock(
             projection_layer, projection_norm, rotary_emb, hidden_dim=hidden_dim,
@@ -410,7 +401,6 @@ class BgKITEncoder(nn.Module):
         conv_kernel_size: int = 16,
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
-        adapter_mean_ema_cfg: dict | None = None,
     ) -> BgKITEncoder:
         """Construct a BgKITEncoder, auto-detecting pruned architecture from state dict.
 
@@ -431,7 +421,6 @@ class BgKITEncoder(nn.Module):
             conv_kernel_size=conv_kernel_size,
             survivorship_inner_dim=survivorship_inner_dim,
             threshold_controller_cfg=threshold_controller_cfg,
-            adapter_mean_ema_cfg=adapter_mean_ema_cfg,
         )
 
         # Filter legacy keys removed in the survivorship-head refactor.

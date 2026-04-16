@@ -182,14 +182,18 @@ class TestBgKITCompressorForward:
         assert out.survivor_mask is None
 
     def test_survivorship_head_modules_exist(self, compressor):
-        """Compressor should have both heads (base + adapter) per level + controllers."""
+        """Compressor has one head per level + threshold controllers.
+
+        Adapter architecture removed 2026-04-16; tanh saturation is
+        the sole inflation guard.
+        """
         assert hasattr(compressor, "head_base_l0")
-        assert hasattr(compressor, "head_adapter_l0")
         assert hasattr(compressor, "head_base_l1")
-        assert hasattr(compressor, "head_adapter_l1")
         assert hasattr(compressor, "threshold_l0")
         assert hasattr(compressor, "threshold_l1")
-        assert hasattr(compressor, "adapter_mean_ema_l0")
-        assert hasattr(compressor, "adapter_mean_ema_l1")
-        # Ratio embedding is intentionally removed; see plan / design doc.
+        # Removed: adapter heads, adapter_mean_ema, ratio_embedding.
+        assert not hasattr(compressor, "head_adapter_l0")
+        assert not hasattr(compressor, "head_adapter_l1")
+        assert not hasattr(compressor, "adapter_mean_ema_l0")
+        assert not hasattr(compressor, "adapter_mean_ema_l1")
         assert not hasattr(compressor, "ratio_embedding")

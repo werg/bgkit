@@ -8,14 +8,19 @@ survivorship_head:
   # §Phase 2 KB regression).
 
 threshold_controller:
-  init_theta: -1.4            # σ(0 − (−1.4)) ≈ 0.80 expected keep rate at step 0
-  lr: 0.1                     # logit-units per gap-unit per optimizer step
+  # θ operates on tanh-bounded head output (in (-1, 1)). For a roughly
+  # symmetric head distribution, θ = 1 - 2·target_ratio yields
+  # target_ratio initial keep-rate. The trainer computes this from
+  # target_ratio_start at setup and overrides the value below.
+  init_theta: -0.9            # default for target_ratio_start=0.95
+  lr: 0.02                    # tanh-space lr (was 0.1 in unbounded logit space)
   momentum: 0.0               # tune up if θ sawtooths
-  clamp: 20.0                 # ±clamp on θ for numerical sanity
+  clamp: 0.99                 # ±clamp within tanh's domain
   min_per_sample_during_warmup: 1   # floor active during BCE warmup only
   min_per_sample_post_warmup: 0     # disabled; accept zero-survivor samples as
                                     # legitimate signal at full compression.
 
-adapter_mean_ema:
-  init_mu: 0.0                # adapter zero-init → first batch_mean is 0
-  momentum: 0.99              # EMA tracks slowly; soft-attn must do real work
+# Adapter + μ EMA architecture was removed 2026-04-16. Soft-attn now
+# feeds gradient directly to the single head; tanh saturation at ±1
+# is the sole structural guard against inflation. See bgkit_compressor.py
+# module docstring and git log for the simplification rationale.

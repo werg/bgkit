@@ -3,7 +3,7 @@
 Exercises the hot paths without needing a real Qwen backbone:
 - Forward produces all new CompressionOutput fields.
 - Operator short-circuit (target_ratio >= 0.999) returns no mask/fields.
-- logits_for_op == base_raw + adapter_zm numerically.
+- logits_for_op == tanh(base_raw / T) numerically.
 - full_after_head captures the post-head hidden at full L_full length.
 - Soft-attn replay via forward_from_block(2) with spliced prompt context
   produces a usable gradient path into the adapter.
@@ -95,16 +95,17 @@ def test_forward_populates_all_new_fields():
         prompt_attention_mask=torch.ones(2, 3, dtype=torch.bool),
         target_ratio=0.5, level="l0",
     )
-    # All the new fields should be present.
+    # Single-head fields populated.
     for field in (
-        "base_raw", "adapter_raw", "adapter_zm",
-        "logits_for_op", "logits_for_softattn",
-        "survive_probs_metrics", "layer7_embeddings",
+        "base_raw",
+        "logits_for_op",
+        "survive_probs_metrics",
+        "layer7_embeddings",
         "full_after_head",
     ):
         assert getattr(out, field) is not None, f"{field} should be populated"
     # Metrics aggregation primitives.
-    for field in ("adapter_sum", "valid_count", "organic_count", "controllable_count"):
+    for field in ("valid_count", "organic_count", "controllable_count"):
         assert getattr(out, field) is not None, f"{field} should be populated"
 
 
@@ -123,14 +124,11 @@ def test_compression_off_short_circuit():
 def test_logits_composition_numerical():
     torch.manual_seed(0)
     comp = _make_compressor()
-    # Prime adapter with non-trivial weights + non-zero μ.
-    with torch.no_grad():
-        for p in comp.head_adapter_l0.parameters():
-            p.normal_(0.0, 0.1)
-        comp.adapter_mean_ema_l0.mu_param.fill_(0.25)
     content = torch.randn(1, 5, HIDDEN_DIM)
     out = comp(content, target_ratio=0.5, level="l0")
-    expected = out.base_raw + (out.adapter_raw - comp.adapter_mean_ema_l0.value)
+    # logits_for_op = tanh(base_raw / T) under single-head composition.
+    T = comp.head_tanh_temperature
+    expected = torch.tanh(out.base_raw / T)
     assert torch.allclose(out.logits_for_op, expected, atol=1e-5)
 
 
@@ -162,13 +160,14 @@ def test_head_logits_alias_is_base_raw():
     assert torch.equal(out.head_logits, out.base_raw)
 
 
-def test_softattn_replay_gradients_reach_adapter():
+def test_softattn_replay_gradients_reach_head():
+    """Single-head architecture: soft-attn replay gradient flows to the
+    head (no adapter separation). Used to check the ``adapter`` received
+    gradient while the ``base`` did not; now there's just one head and
+    the only check is that SOME gradient reaches it (i.e. the full-encoder
+    replay path is wired up)."""
     torch.manual_seed(0)
     comp = _make_compressor()
-    with torch.no_grad():
-        for p in comp.head_adapter_l0.parameters():
-            p.normal_(0.0, 0.1)
-
     content = torch.randn(1, 4, HIDDEN_DIM)
     prompt = torch.randn(1, 3, HIDDEN_DIM)
     out = comp(
@@ -179,7 +178,9 @@ def test_softattn_replay_gradients_reach_adapter():
     )
     # Simulate soft-attn replay: splice gated content into full_after_head.
     theta = comp.threshold_l0.theta
-    softattn_probs = torch.sigmoid(out.logits_for_softattn.float() - theta.float()).to(content.dtype)
+    softattn_probs = torch.sigmoid(
+        out.logits_for_op.float() - theta.float(),
+    ).to(content.dtype)
     p = softattn_probs.unsqueeze(-1)
     gated = out.layer7_embeddings + p * comp.survive_embedding + (1 - p) * comp.doomed_embedding
     full = out.full_after_head.clone()
@@ -190,15 +191,8 @@ def test_softattn_replay_gradients_reach_adapter():
     ).last_hidden_state
     loss = resumed.pow(2).mean()
     loss.backward()
-    # Adapter should have gradient, base should NOT (logits_for_softattn
-    # detaches base).
-    adapter_grad = sum(
-        (p.grad.abs().sum() if p.grad is not None else 0)
-        for p in comp.head_adapter_l0.parameters()
-    )
-    base_grad = sum(
+    head_grad = sum(
         (p.grad.abs().sum() if p.grad is not None else 0)
         for p in comp.head_base_l0.parameters()
     )
-    assert adapter_grad > 0
-    assert base_grad == 0
+    assert head_grad > 0

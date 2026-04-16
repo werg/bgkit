@@ -45,8 +45,6 @@ class MicrobatchAggState:
 
     organic_count_sum: "int | torch.Tensor" = 0
     controllable_count_sum: "int | torch.Tensor" = 0
-    adapter_sum: "float | torch.Tensor" = 0.0
-    valid_count_sum: "int | torch.Tensor" = 0
     controllable_empty_count: "int | torch.Tensor" = 0
 
 
@@ -70,20 +68,15 @@ def accumulate(state: MicrobatchAggState, enc_out) -> None:
         return
 
     cc = enc_out.controllable_count  # zero-dim int tensor
-    vc = enc_out.valid_count  # zero-dim int tensor
-    adapter_sum = enc_out.adapter_sum  # zero-dim float tensor or None
     organic_count = enc_out.organic_count  # zero-dim int tensor
 
-    # Upgrade Python int/float accumulators to zero-dim tensors on the
-    # first real accumulation (after init_state()).
+    # Upgrade Python int accumulators to zero-dim tensors on the first real
+    # accumulation (after init_state()).
     if not _is_tensor(state.organic_count_sum):
         device = cc.device
         state.organic_count_sum = torch.zeros((), dtype=torch.long, device=device)
         state.controllable_count_sum = torch.zeros((), dtype=torch.long, device=device)
-        state.valid_count_sum = torch.zeros((), dtype=torch.long, device=device)
         state.controllable_empty_count = torch.zeros((), dtype=torch.long, device=device)
-        ad_dtype = adapter_sum.dtype if adapter_sum is not None else torch.float32
-        state.adapter_sum = torch.zeros((), dtype=ad_dtype, device=device)
 
     # All ops below are device-side tensor ops (no sync). We encode
     # "was this microbatch's controllable_count == 0?" as a 0/1 mask.
@@ -97,24 +90,13 @@ def accumulate(state: MicrobatchAggState, enc_out) -> None:
         state.controllable_count_sum + cc.to(torch.long) * non_empty_mask
     )
 
-    valid_nonzero = (vc > 0).to(torch.long)
-    state.valid_count_sum = (
-        state.valid_count_sum + vc.to(torch.long) * valid_nonzero
-    )
-    if adapter_sum is not None:
-        state.adapter_sum = (
-            state.adapter_sum
-            + adapter_sum.to(state.adapter_sum.dtype)
-            * valid_nonzero.to(state.adapter_sum.dtype)
-        )
-
 
 def _ddp_all_reduce_sums(state: MicrobatchAggState) -> MicrobatchAggState:
-    """All-reduce microbatch sums across DDP ranks before θ/μ update.
+    """All-reduce microbatch sums across DDP ranks before θ update.
 
     Single-GPU: no-op (early return on uninitialized process group).
-    DDP: sums organic/controllable/adapter_sum/valid_count across ranks so
-    the θ and μ updates see the true global mean per optimizer step.
+    DDP: sums organic/controllable across ranks so the θ update sees
+    the true global mean per optimizer step.
 
     Called automatically by ``apply_post_step_updates``; callers don't
     need to invoke it directly.
@@ -133,17 +115,13 @@ def _ddp_all_reduce_sums(state: MicrobatchAggState) -> MicrobatchAggState:
     tensor = torch.stack([
         state.organic_count_sum.to(torch.float64),
         state.controllable_count_sum.to(torch.float64),
-        state.adapter_sum.to(torch.float64),
-        state.valid_count_sum.to(torch.float64),
         state.controllable_empty_count.to(torch.float64),
     ]).to(device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return MicrobatchAggState(
         organic_count_sum=tensor[0].to(torch.long),
         controllable_count_sum=tensor[1].to(torch.long),
-        adapter_sum=tensor[2].to(torch.float32),
-        valid_count_sum=tensor[3].to(torch.long),
-        controllable_empty_count=tensor[4].to(torch.long),
+        controllable_empty_count=tensor[2].to(torch.long),
     )
 
 
@@ -369,26 +347,23 @@ def apply_post_step_updates(
     level: str,
     *,
     skip_threshold_step: bool = False,
-    skip_ema_update: bool = False,
 ) -> dict[str, float]:
-    """Run θ-step + μ-update for the given level using true-mean aggregation.
+    """Run θ-step for the given level using true-mean aggregation.
 
     Wraps in no_grad. Returns a logging dict.
 
     Skips θ-step if total controllable_count == 0 across the optimizer step.
-    Use ``skip_threshold_step`` / ``skip_ema_update`` for frozen-level paths
-    (e.g. Phase 2 Stage B with cached L0).
+    Use ``skip_threshold_step`` for frozen-level paths (e.g. Phase 2 Stage
+    B with cached L0).
     """
     if level == "l0":
         controller = compressor.threshold_l0
-        ema = compressor.adapter_mean_ema_l0
     elif level == "l1":
         controller = compressor.threshold_l1
-        ema = compressor.adapter_mean_ema_l1
     else:
         raise ValueError(f"Unknown level: {level!r}")
 
-    # Reduce across DDP ranks so θ and μ see the true global mean.
+    # Reduce across DDP ranks so θ sees the true global mean.
     # No-op on single-GPU (detects uninitialized process group).
     state = _ddp_all_reduce_sums(state)
 
@@ -401,8 +376,6 @@ def apply_post_step_updates(
     empty_count = float(_to_python(state.controllable_empty_count))
     controllable_sum = int(_to_python(state.controllable_count_sum))
     organic_sum = int(_to_python(state.organic_count_sum))
-    valid_sum = int(_to_python(state.valid_count_sum))
-    adapter_sum = float(_to_python(state.adapter_sum))
 
     metrics: dict[str, float] = {
         "controllable_empty_microbatches": empty_count,
@@ -413,12 +386,6 @@ def apply_post_step_updates(
         controller.step(current_rate=mean_rate, target_rate=target_ratio)
         metrics["mean_rate"] = float(mean_rate)
     metrics[f"theta_{level}"] = float(controller.theta.item())
-
-    if not skip_ema_update and valid_sum > 0:
-        mean_adapter = adapter_sum / valid_sum
-        ema.update(mean_adapter)
-        metrics["mean_adapter"] = float(mean_adapter)
-    metrics[f"adapter_mu_{level}"] = float(ema.value.item())
 
     return metrics
 

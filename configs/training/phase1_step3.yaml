@@ -40,7 +40,7 @@ diagnostic_metrics_every_n_steps: 10
 # Optional sidecar with pre-distilled head_base_l0 weights. Produced by
 # scripts/pretrain_survivorship_head.py. When set, online BCE warmup is
 # NOT needed (set ice_distillation.l0.enabled: false below).
-survivorship_head_sidecar: /workspace/checkpoints/survivorship_head_base_l0/head_base_l0.pt
+survivorship_head_sidecar: /workspace/checkpoints/survivorship_head_base_l0_20260416_132842/head_base_l0.pt
 
 # Everything unfrozen from step 0 — no curriculum phases
 train_projection_block: true
@@ -52,13 +52,22 @@ bidi_warmup_steps: 0       # already bidirectional from step 2
 # Compression active from step 0
 compression_introduction_step: 0
 
-# Cold-start curriculum: ratio anneals 0.95 → 0.10 over 1k steps. The
-# ramp runs in parallel with Stage A (decoder is learning on progressively
-# more compressed contexts, against the pre-distilled head). By the time
-# soft-attn kicks in, the target ratio has reached its final value.
+# Cold-start curriculum: ratio anneals 0.95 → 0.10 over 1k steps.
 target_ratio_start: 0.95
 target_ratio_end: 0.10
 target_ratio_ramp_steps: 1000
+
+# Liger kernels: SwiGLU + RoPE + fused linear-CE are enabled. LigerRMSNorm
+# is pinned OFF due to a silent backward-pass corruption on Qwen3.5 in
+# liger-kernel 0.7.x. Symptom: loss ~1.6 at step 0 → ~13 (LM prior) by
+# step 10 at near-zero LR, grad_norm ~500, no NaN. Neither the
+# in_place=False fix to LigerRMSNorm nor disabling LigerCE resolves it.
+# LigerRMSNorm's casting_mode="llama" default doesn't match Qwen3.5's
+# RMSNorm math. Re-enable only after upstream ships an
+# `apply_liger_kernel_to_qwen3_5` with Qwen-specific RMSNorm handling
+# (Liger issue #1119) or after a targeted version-downgrade test.
+use_liger: true
+use_liger_rmsnorm: false
 
 # Survivorship head losses, per level.
 survivorship:
@@ -70,16 +79,22 @@ survivorship:
   soft_attn_every_n_steps: 2
 
   # L0: base is pre-distilled offline; Stage A runs no ranking loss. Stage
-  # B adds soft-attn through the adapter. Moment-match runs throughout.
+  # B adds soft-attn through the adapter.
+  #
+  # Moment-match is re-enabled at low weight with a delay: the fresh
+  # sidecar's raw-logit distribution has been auto-calibrated to std ~1
+  # in tanh space via head_tanh_temperature, but moment-match provides
+  # a permanent corpus-wide shape anchor on base_raw so the head can't
+  # drift into degenerate distribution shapes during soft-attn training
+  # (Stage B). The start_step=500 gives BCE warmup time to stabilize
+  # base_raw's distribution before moment-match applies pressure;
+  # weight 0.05 keeps the gradient subordinate to decoder CE.
   l0:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
     soft_attn_loss_weight: 0.2
-    moment_match_weight: 0.1
-    # Moment-match can run from step 0 because base_raw now has the
-    # ICE-distilled distribution at init (not the fresh-head std≈0.04
-    # that blew up standardization before).
-    moment_match_start_step: 0
+    moment_match_weight: 0.05
+    moment_match_start_step: 500
 
   # L1: no ICE anchor; soft-attn drives, decisiveness breaks symmetry.
   # (Step 3 doesn't activate L1 — included for forward compatibility.)

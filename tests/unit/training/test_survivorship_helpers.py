@@ -225,13 +225,9 @@ def test_compute_losses_bce_warmup_cuts_off():
 
 class _FakeCompressor:
     def __init__(self):
-        from bgkit.models.components.selection import (
-            AdapterMeanEMA, DualThresholdController,
-        )
+        from bgkit.models.components.selection import DualThresholdController
         self.threshold_l0 = DualThresholdController(init_theta=-1.4, lr=0.1)
         self.threshold_l1 = DualThresholdController(init_theta=-1.4, lr=0.1)
-        self.adapter_mean_ema_l0 = AdapterMeanEMA(init_mu=0.0, momentum=0.9)
-        self.adapter_mean_ema_l1 = AdapterMeanEMA(init_mu=0.0, momentum=0.9)
 
 
 def test_apply_post_step_updates_uses_true_mean():
@@ -240,18 +236,13 @@ def test_apply_post_step_updates_uses_true_mean():
     state = init_state()
     state.organic_count_sum = 30
     state.controllable_count_sum = 100
-    state.adapter_sum = 5.0
-    state.valid_count_sum = 50
 
     metrics = apply_post_step_updates(
         compressor, state, target_ratio=0.10, level="l0",
     )
     assert metrics["mean_rate"] == pytest.approx(0.30)
-    assert metrics["mean_adapter"] == pytest.approx(0.10)
     # θ moved up (gap = 0.30 - 0.10 = +0.20, lr=0.1 → +0.02)
     assert metrics["theta_l0"] == pytest.approx(-1.4 + 0.02, abs=1e-5)
-    # μ moved up by (1 - momentum) · batch_mean = 0.1 · 0.10 = 0.01.
-    assert metrics["adapter_mu_l0"] == pytest.approx(0.01, abs=1e-5)
 
 
 def test_apply_post_step_updates_skips_threshold_when_no_controllable():
@@ -259,16 +250,12 @@ def test_apply_post_step_updates_skips_threshold_when_no_controllable():
     state = init_state()
     state.organic_count_sum = 0
     state.controllable_count_sum = 0
-    state.adapter_sum = 1.0
-    state.valid_count_sum = 10
     initial_theta = float(compressor.threshold_l0.theta.item())
     metrics = apply_post_step_updates(
         compressor, state, target_ratio=0.10, level="l0",
     )
     assert "mean_rate" not in metrics
     assert metrics["theta_l0"] == pytest.approx(initial_theta)
-    # μ still updated.
-    assert "mean_adapter" in metrics
 
 
 def test_apply_post_step_updates_skip_flags_for_frozen_level():
@@ -276,16 +263,12 @@ def test_apply_post_step_updates_skip_flags_for_frozen_level():
     state = init_state()
     state.organic_count_sum = 30
     state.controllable_count_sum = 100
-    state.adapter_sum = 5.0
-    state.valid_count_sum = 50
     initial_theta = float(compressor.threshold_l0.theta.item())
-    initial_mu = float(compressor.adapter_mean_ema_l0.value.item())
     metrics = apply_post_step_updates(
         compressor, state, target_ratio=0.10, level="l0",
-        skip_threshold_step=True, skip_ema_update=True,
+        skip_threshold_step=True,
     )
     assert metrics["theta_l0"] == pytest.approx(initial_theta)
-    assert metrics["adapter_mu_l0"] == pytest.approx(initial_mu)
 
 
 # ----------------------------------------------------------------------

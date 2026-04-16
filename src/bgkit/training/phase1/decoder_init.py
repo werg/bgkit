@@ -142,6 +142,24 @@ class DecoderInitTrainer(BaseTrainer):
         self._train_projection = tcfg.get("train_projection_block", True)
         self._projection_only_steps = tcfg.get("projection_only_steps", 0)
 
+        # Threshold-controller config. Derive init_theta from target_ratio_start
+        # under the tanh-bounded-logit convention: θ = 1 − 2·target_ratio so a
+        # symmetric base distribution produces ~target_ratio initial keep-rate.
+        # Config init_theta wins if set explicitly (e.g., to tune the warmup
+        # bias); otherwise it's computed.
+        model_cfg = self.cfg.model
+        ctrl_src = model_cfg.get("threshold_controller", {}) if hasattr(
+            model_cfg, "get",
+        ) else {}
+        target_ratio_start = float(tcfg.get("target_ratio_start", 0.10))
+        threshold_controller_cfg = {
+            "init_theta": float(
+                ctrl_src.get("init_theta", 1.0 - 2.0 * target_ratio_start),
+            ),
+            "lr": float(ctrl_src.get("lr", 0.02)),
+            "momentum": float(ctrl_src.get("momentum", 0.0)),
+            "clamp": float(ctrl_src.get("clamp", 0.99)),
+        }
         # Load BgKIT from checkpoint if available (auto-detects pruned architecture)
         bgkit_checkpoint = self._resolve_bgkit_checkpoint()
         if bgkit_checkpoint is not None:
@@ -161,6 +179,7 @@ class DecoderInitTrainer(BaseTrainer):
                 revision=backbone_revision,
                 attn_implementation="sdpa",
                 bidi_warmup_steps=bidi_warmup,
+                threshold_controller_cfg=threshold_controller_cfg,
             )
             # Also load decoder weights if present (step 2 checkpoints include it)
             self._bgkit_decoder_state = bgkit_state_dicts.get("decoder", None)
@@ -173,12 +192,15 @@ class DecoderInitTrainer(BaseTrainer):
                 sidecar = torch.load(sidecar_path, map_location="cpu", weights_only=True)
                 res = self.encoder.load_state_dict(sidecar, strict=False)
                 n_loaded = len(sidecar) - len(res.unexpected_keys)
+                self._sidecar_loaded = True
                 logger.info(
                     "loaded_survivorship_sidecar",
                     path=sidecar_path,
                     loaded_keys=n_loaded,
                     unexpected=len(res.unexpected_keys),
                 )
+            else:
+                self._sidecar_loaded = False
         else:
             logger.info("loading_bgkit_encoder", model=backbone_name, revision=backbone_revision)
             self.encoder = BgKITEncoder.from_pretrained(
@@ -189,8 +211,10 @@ class DecoderInitTrainer(BaseTrainer):
                 revision=backbone_revision,
                 attn_implementation="sdpa",
                 bidi_warmup_steps=bidi_warmup,
+                threshold_controller_cfg=threshold_controller_cfg,
             )
             self._bgkit_decoder_state = None
+            self._sidecar_loaded = False
         self.encoder.to(device)
         self.encoder.requires_grad_(False)
         self.encoder.eval()
@@ -231,13 +255,35 @@ class DecoderInitTrainer(BaseTrainer):
         if tcfg.get("use_liger", True):
             from bgkit.utils.liger_integration import apply_liger_to_qwen35
 
-            enc_patched = apply_liger_to_qwen35(self.encoder)
-            dec_patched = apply_liger_to_qwen35(self.decoder)
-            self.decoder.enable_liger_ce(True)
+            # Per-kernel toggles for bisecting which Liger component
+            # regressed (2026-04-16 observation: v0.5→0.7 upgrade
+            # corrupts backward). Defaults match full-Liger behavior.
+            patch_rmsnorm = bool(tcfg.get("use_liger_rmsnorm", True))
+            patch_swiglu = bool(tcfg.get("use_liger_swiglu", True))
+            patch_rope = bool(tcfg.get("use_liger_rope", True))
+            use_liger_ce = bool(tcfg.get("use_liger_ce", True))
+            enc_patched = apply_liger_to_qwen35(
+                self.encoder,
+                patch_rmsnorm=patch_rmsnorm,
+                patch_swiglu=patch_swiglu,
+                patch_rope=patch_rope,
+            )
+            dec_patched = apply_liger_to_qwen35(
+                self.decoder,
+                patch_rmsnorm=patch_rmsnorm,
+                patch_swiglu=patch_swiglu,
+                patch_rope=patch_rope,
+            )
+            if use_liger_ce:
+                self.decoder.enable_liger_ce(True)
             logger.info(
                 "liger_kernel_applied",
                 encoder_modules=enc_patched,
                 decoder_modules=dec_patched,
+                patch_rmsnorm=patch_rmsnorm,
+                patch_swiglu=patch_swiglu,
+                patch_rope=patch_rope,
+                use_liger_ce=use_liger_ce,
             )
 
         # BaseTrainer logging/device logic uses self.model
@@ -472,6 +518,16 @@ class DecoderInitTrainer(BaseTrainer):
         # --- Optimizer (with projection-aware freeze/unfreeze) ---
         self._configure_trainable_state()
 
+        # Auto-calibrate the operator-facing tanh temperature from the
+        # sidecar-loaded head's output distribution. We want base_raw/T to
+        # have std ~1 so tanh operates in its linear region and ranking
+        # info survives. BCE-with-logits distillation naturally produces
+        # confident (large-magnitude) logits; hardcoding T=5 works for the
+        # current sidecar but is brittle to hyperparameter changes in the
+        # distillation pipeline. Probing once at startup makes T track
+        # whatever the sidecar actually produced.
+        self._calibrate_head_tanh_temperature()
+
         logger.info(
             "decoder_init_trainer_setup",
             train_samples=train_size,
@@ -481,6 +537,69 @@ class DecoderInitTrainer(BaseTrainer):
             encoder_unfreeze_step=self._encoder_unfreeze_step,
             compression_introduction_step=self._compression_introduction_step,
             bidi_warmup_steps=bidi_warmup,
+        )
+
+    # ------------------------------------------------------------------
+    # Tanh temperature calibration
+    # ------------------------------------------------------------------
+
+    def _calibrate_head_tanh_temperature(self, n_probe_batches: int = 4) -> None:
+        """Probe base_raw's std and set ``head_tanh_temperature`` to match.
+
+        The operator applies ``tanh(base_raw / T)``. When T
+        matches the raw-logit std, most positions land in tanh's linear
+        region and ranking is preserved. A hardcoded T is brittle to
+        changes in the sidecar's training pipeline (BCE schedule, data,
+        teacher ratio); probing makes T adapt automatically.
+
+        Skips when no sidecar was loaded (fresh head has std near zero
+        anyway, any T works), or when compression is disabled.
+        """
+        if not getattr(self, "_sidecar_loaded", False):
+            return
+        compressor = self.encoder.compressor
+        if not hasattr(compressor, "head_tanh_temperature"):
+            return
+
+        head = compressor.head_base_l0
+        backbone = compressor.backbone
+        stds: list[float] = []
+        self.encoder.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(self.train_dataloader):
+                if i >= n_probe_batches:
+                    break
+                content_token_ids = batch["content_token_ids"].to(self.device)
+                content_mask = batch["content_attention_mask"].to(self.device).bool()
+                embed_tokens = backbone.get_input_embeddings()
+                inputs_embeds = embed_tokens(content_token_ids)
+                # Run backbone up to head-tap (pruned block 1 / layer 7).
+                # Use return_intermediates so we don't need the head hook.
+                backbone_out = backbone(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=content_mask,
+                    return_intermediates=True,
+                )
+                intermediates = backbone_out.hidden_states
+                if intermediates is None or len(intermediates) < 2:
+                    return  # nothing to probe; leave T at its default
+                layer7 = intermediates[1]
+                base_raw = head(layer7.to(dtype=head.head[0].weight.dtype))
+                valid_f = content_mask.float()
+                mean = (base_raw.float() * valid_f).sum() / valid_f.sum().clamp(min=1)
+                var = (
+                    ((base_raw.float() - mean) ** 2) * valid_f
+                ).sum() / valid_f.sum().clamp(min=1)
+                stds.append(float(var.clamp(min=1e-8).sqrt().item()))
+        if not stds:
+            return
+        calibrated_T = max(sum(stds) / len(stds), 0.5)  # floor to avoid tiny T
+        compressor.head_tanh_temperature.fill_(calibrated_T)
+        logger.info(
+            "head_tanh_temperature_calibrated",
+            T=calibrated_T,
+            probe_batches=len(stds),
+            probe_stds=[round(s, 3) for s in stds],
         )
 
     # ------------------------------------------------------------------
@@ -1056,9 +1175,9 @@ class DecoderInitTrainer(BaseTrainer):
                     n_survivors = int(enc_out.survivor_mask.sum().item())
                     n_valid = int(content_mask.sum().item())
                     metrics["actual_ratio"] = n_survivors / max(n_valid, 1)
-                # floor_trigger_rate / theta / adapter_mu are zero-dim
-                # tensors on device; .item() at log time (still gated on
-                # emit_diag to keep off hot path).
+                # floor_trigger_rate / theta are zero-dim tensors on
+                # device; .item() at log time (still gated on emit_diag
+                # to keep off hot path).
                 if emit_diag:
                     if enc_out.floor_trigger_rate is not None:
                         metrics["floor_trigger_rate"] = float(
@@ -1066,25 +1185,12 @@ class DecoderInitTrainer(BaseTrainer):
                         )
                     if enc_out.theta_tensor is not None:
                         metrics["theta_l0_step"] = float(enc_out.theta_tensor.item())
-                    if enc_out.adapter_mu_tensor is not None:
-                        metrics["adapter_mu_l0_step"] = float(
-                            enc_out.adapter_mu_tensor.item(),
-                        )
-                    # Adapter health
-                    if (
-                        enc_out.adapter_zm is not None
-                        and enc_out.base_raw is not None
-                    ):
+                    # Head health
+                    if enc_out.base_raw is not None:
                         base = enc_out.base_raw.detach()
-                        adp = enc_out.adapter_zm.detach()
                         n_v = max(int(content_mask.sum().item()), 1)
                         base_norm = float(base.norm().item()) / max(n_v ** 0.5, 1.0)
-                        adapter_norm = float(adp.norm().item()) / max(n_v ** 0.5, 1.0)
                         metrics["base_norm"] = base_norm
-                        metrics["adapter_norm"] = adapter_norm
-                        metrics["adapter_to_base_ratio"] = (
-                            adapter_norm / base_norm if base_norm > 0 else 0.0
-                        )
                     if enc_out.logits_for_op is not None:
                         logits = enc_out.logits_for_op.detach()
                         metrics["head_logit_std"] = float(logits.std().item())
@@ -1092,9 +1198,10 @@ class DecoderInitTrainer(BaseTrainer):
                         metrics["head_logit_max"] = float(logits.max().item())
 
             # Soft attention branch (every Nth step). Cadence defaults to 1
-            # (every step). Soft-attn provides the only deliberate
-            # head-gradient path from the decoder; gradient flows to the
-            # ADAPTER only (base is detached in logits_for_softattn).
+            # (every step). Soft-attn provides one of three head-gradient
+            # paths (alongside BCE warmup and moment-match); all flow to
+            # the single head. Tanh saturation at ±1 is the structural
+            # guard against soft-attn inflating the aggregate logit mass.
             from bgkit.training.survivorship_helpers import LevelLossCfg
             surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
             soft_attn_every = getattr(self, "_soft_attn_every_n_steps", 1)
@@ -1126,9 +1233,9 @@ class DecoderInitTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """Second decoder forward on prob-gated layer-7 embeddings.
 
-        Routes the decoder's CE-loss gradient back to the head adapter (NOT
-        base — see ``logits_for_softattn``) through the FULL remaining
-        encoder (blocks 2..end + final norm + projection_block + decoder).
+        Routes the decoder's CE-loss gradient back to the head (single head
+        post-simplification) through the FULL remaining encoder (blocks
+        2..end + final norm + projection_block + decoder).
 
         The previous implementation skipped blocks 2..end and went straight
         from gated layer-7 directly to the projection block, which made
@@ -1139,18 +1246,17 @@ class DecoderInitTrainer(BaseTrainer):
         forward (``hidden = layer7 + flag_emb``) at p∈{0,1}. Multiplying
         layer7 by p would be a different computation, not a relaxation.
         """
-        # Read the adapter-routed logits (gradient flows through adapter only;
-        # base is detached). Recompute softattn_probs here so gradient flows
-        # through the adapter-only graph — DO NOT use survive_probs_metrics
-        # (which is detached and no-grad).
         compressor = self.encoder.compressor
         # θ is a per-level fp32 scalar; level here is l0 (Step 3 trains L0).
         theta = compressor.threshold_l0.theta.to(self.device)
-        logits_softattn = enc_out.logits_for_softattn
+        # logits_for_op = tanh(base_raw / T); carries head-gradient
+        # directly. Soft-attn now flows gradient to the single head via
+        # this path (adapter architecture removed).
+        logits_for_op = enc_out.logits_for_op
         layer7 = enc_out.layer7_embeddings
         base_dtype = layer7.dtype
         softattn_probs = torch.sigmoid(
-            logits_softattn.float() - theta.float()
+            logits_for_op.float() - theta.float()
         ).to(base_dtype)
 
         # Soft-blend flag embeddings while preserving layer7 content.

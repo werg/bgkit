@@ -115,9 +115,9 @@ services:
     <<: *gpu-common
     command: [
       "scripts/pretrain_survivorship_head.py",
-      "--step2-checkpoint", "/workspace/checkpoints/phase1_step2_step19999_20260323_132922",
+      "--step2-checkpoint", "/workspace/checkpoints/phase1_step2_step19500_20260323_113116",
       "--ice-checkpoint", "/workspace/checkpoints/ice_step89999_20260306_213825",
-      "--data-dir", "/workspace/data/processed/tokens",
+      "--data-dir", "/workspace/data/mmap/structural",
       "--output-dir", "/workspace/checkpoints",
       "--teacher-ratio", "0.10",
       "--max-steps", "3000",

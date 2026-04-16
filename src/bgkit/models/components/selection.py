@@ -179,10 +179,10 @@ class DualThresholdController(nn.Module):
 
     def __init__(
         self,
-        init_theta: float = -1.4,
-        lr: float = 0.1,
+        init_theta: float = 0.0,
+        lr: float = 0.02,
         momentum: float = 0.0,
-        clamp: float = 20.0,
+        clamp: float = 0.99,
     ):
         super().__init__()
         self.lr = float(lr)
@@ -246,60 +246,6 @@ class DualThresholdController(nn.Module):
     def theta(self) -> Tensor:
         """fp32 view of the current threshold."""
         return self.theta_param.float()
-
-
-class AdapterMeanEMA(nn.Module):
-    """EMA of the adapter's raw mean over valid positions.
-
-        μ ← momentum · μ + (1 - momentum) · batch_mean
-
-    μ is a buffer, NOT a free parameter. A free parameter would break the
-    zero-sum budget — soft-attn could raise adapter_raw and μ in lockstep
-    with no net constraint. The EMA tracks batch-mean, making μ a mechanical
-    consequence of adapter_raw's history.
-
-    Same fp32 preservation as ``DualThresholdController``: stored as fp32,
-    always read via ``.float()`` at call sites. Same one-update-per-optimizer-
-    step cadence (caller accumulates batch_mean across microbatches and
-    passes the true global mean).
-
-    Init: μ = 0.0. With adapter zero-init, first batch_mean is 0 too, so μ
-    stays at 0 until adapter_raw starts producing non-zero output.
-
-    DDP TODO: caller must all_reduce batch_mean across ranks before update.
-    """
-
-    def __init__(self, init_mu: float = 0.0, momentum: float = 0.99):
-        super().__init__()
-        self.momentum = float(momentum)
-        self.register_buffer(
-            "mu_param", torch.tensor(float(init_mu), dtype=torch.float32),
-        )
-
-    def _apply(self, fn, recurse: bool = True):
-        """Preserve fp32 on μ under encoder.to(bf16). See DualThresholdController._apply."""
-        old_mu = self.mu_param
-        result = super()._apply(fn, recurse)
-        if self.mu_param.dtype != torch.float32:
-            self.mu_param = old_mu.to(
-                device=self.mu_param.device, dtype=torch.float32,
-            )
-        return result
-
-    @torch.no_grad()
-    def update(self, batch_mean: float) -> None:
-        if batch_mean != batch_mean:  # NaN guard
-            return
-        new_mu = (
-            self.momentum * float(self.mu_param.item())
-            + (1.0 - self.momentum) * float(batch_mean)
-        )
-        self.mu_param.fill_(new_mu)
-
-    @property
-    def value(self) -> Tensor:
-        """fp32 view of the current EMA value."""
-        return self.mu_param.float()
 
 
 def moment_match_loss(

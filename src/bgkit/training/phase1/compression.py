@@ -620,7 +620,9 @@ class CompressionTrainer(BaseTrainer):
         compressor = self.encoder.compressor
         controller = compressor.threshold_l0 if level == "l0" else compressor.threshold_l1
         theta = controller.theta.to(self.device)
-        logits_softattn = enc_out.logits_for_softattn
+        # logits_for_op = tanh(base_raw / T); carries head-gradient directly
+        # (single-head architecture post-2026-04-16 simplification).
+        logits_softattn = enc_out.logits_for_op
         layer7 = enc_out.layer7_embeddings
         if logits_softattn is None or layer7 is None:
             # No compression this batch (short-circuit). Return zero.

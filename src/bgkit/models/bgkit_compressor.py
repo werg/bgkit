@@ -13,22 +13,26 @@ via BidirectionalQwen35. Applied recursively at two compression levels:
   pass with shared weights for cross-file interaction and further compression.
 
 Shared backbone weights across levels, but separate survivorship head
-instances for L0 and L1 (different input distributions). Each level has a
-two-head split:
+instances for L0 and L1 (different input distributions). Each level has
+one head (``head_base_l{0,1}``; name retained for sidecar compatibility)
+trained by BCE warmup + moment-match + soft-attn.
 
-- ``head_base``: BCE/moment-match anchor (ICE-aligned at L0).
-- ``head_adapter``: zero-init no-op at step 0; trained ONLY by soft-attn
-  loss to redistribute mass based on actual decoder usage.
-
-The composed logit is ``base_raw + (adapter_raw - μ)`` where μ is an
-EMA-tracked buffer of ``mean(adapter_raw)`` over valid positions. μ is a
-buffer (not a free parameter) so soft-attn cannot use it as a budget knob.
+The operator-facing logit is ``tanh(base_raw / T)`` where T is a
+per-compressor buffer (``head_tanh_temperature``) calibrated from the
+head's raw-logit std at sidecar load. Tanh bounds the output to (-1, 1)
+so θ lives in a head-agnostic coordinate system and saturation is the
+structural guard against soft-attn inflating the aggregate logit mass.
 
 Selection is ``logit > θ`` against a single global threshold θ owned by
 ``DualThresholdController`` and updated externally by dual ascent against
-the curriculum's target compression ratio. There is NO straight-through
-estimator on the hard mask — head gradient flows only via BCE +
-moment-match (→ base) and soft-attn (→ adapter).
+the curriculum's target compression ratio. No straight-through estimator
+on the hard mask — all gradient to the head flows via BCE, moment-match
+(both directly on ``base_raw``), and soft-attn (through the tanh).
+
+Historical note: an adapter-head + μ EMA architecture was used 2026-04-15
+to 2026-04-16 to structurally prevent soft-attn inflation via zero-sum
+redistribution. It was removed in favor of tanh saturation once bounded
+operator output was in place (see git log for 2026-04-16 simplification).
 
 Auto-reproduction output head maps outputs back to input embedding space.
 """
@@ -41,7 +45,6 @@ import torch
 import torch.nn as nn
 
 from bgkit.models.components.selection import (
-    AdapterMeanEMA,
     DualThresholdController,
     adaptive_threshold_select,
 )
@@ -59,22 +62,17 @@ class CompressorOutput:
     content_slice: slice  # slice(prefix_len, None) -- where content starts in L_full
     # Selection + survivorship head fields. All None when target_ratio is None
     # (compression disabled), otherwise:
-    head_logits: torch.Tensor | None = None  # alias of base_raw (pre-θ raw head output)
+    head_logits: torch.Tensor | None = None  # alias of base_raw (pre-tanh raw head output)
     survive_probs: torch.Tensor | None = None  # alias of survive_probs_metrics
     survivor_mask: torch.Tensor | None = None  # (B, L_content) bool — operator's final selection
     layer7_embeddings: torch.Tensor | None = None  # (B, L_content, D) for soft attention branch
     full_after_head: torch.Tensor | None = None  # (B, L_full, D) post-head hidden (incl. prompt+sep) for soft-attn replay
     full_attention_mask: torch.Tensor | None = None  # alias of attention_mask (full-seq mask)
     intermediates: list[torch.Tensor] | None = None  # block boundary hidden states
-    # Two-head adapter fields (gradient-routed):
-    base_raw: torch.Tensor | None = None  # (B, L_content) — head_base output, no detach
-    adapter_raw: torch.Tensor | None = None  # (B, L_content) — head_adapter output, no detach
-    adapter_zm: torch.Tensor | None = None  # (B, L_content) — adapter_raw - μ
-    logits_for_op: torch.Tensor | None = None  # base_raw + adapter_zm (no detach)
-    logits_for_softattn: torch.Tensor | None = None  # base_raw.detach() + adapter_zm
-    # Detached metrics surfaced for the trainer's true-mean aggregation:
+    # Single-head fields (adapter architecture removed 2026-04-16):
+    base_raw: torch.Tensor | None = None  # (B, L_content) — raw head output (pre-tanh)
+    logits_for_op: torch.Tensor | None = None  # tanh(base_raw / T)
     survive_probs_metrics: torch.Tensor | None = None  # sigmoid(logits_for_op - θ), detached
-    adapter_sum: torch.Tensor | None = None  # scalar, sum(adapter_raw * valid_mask), detached
     valid_count: torch.Tensor | None = None  # scalar int, sum(valid_mask), detached
     organic_count: torch.Tensor | None = None  # scalar int, |organic ∩ controllable|, detached
     controllable_count: torch.Tensor | None = None  # scalar int, |controllable|, detached
@@ -82,11 +80,10 @@ class CompressorOutput:
     # Trainers .item() these only when actually emitting a log line.
     floor_trigger_rate: torch.Tensor | None = None  # frac samples needing floor
     num_pinned: torch.Tensor | None = None  # # pinned positions (logging)
-    # θ / μ are tensors (no per-microbatch .item() sync). Trainers read the
-    # float value once per optimizer-step for logging, either via .item()
-    # at that boundary or directly from compressor.threshold_l{0,1}.theta.
+    # θ tensor (no per-microbatch .item() sync). Trainers read the float
+    # value once per optimizer-step for logging, either via .item() at that
+    # boundary or directly from compressor.threshold_l{0,1}.theta.
     theta_tensor: torch.Tensor | None = None
-    adapter_mu_tensor: torch.Tensor | None = None
 
 
 @dataclass
@@ -104,22 +101,16 @@ class CompressionOutput:
     full_after_head: torch.Tensor | None = None  # (B, L_full, D) detached post-head hidden
     full_attention_mask: torch.Tensor | None = None  # (B, L_full) full-sequence mask
     content_slice: slice | None = None  # where content starts in L_full (for splicing)
-    # Two-head adapter fields (propagated for trainer access):
+    # Single-head fields:
     base_raw: torch.Tensor | None = None
-    adapter_raw: torch.Tensor | None = None
-    adapter_zm: torch.Tensor | None = None
     logits_for_op: torch.Tensor | None = None
-    logits_for_softattn: torch.Tensor | None = None
     survive_probs_metrics: torch.Tensor | None = None
-    adapter_sum: torch.Tensor | None = None
     valid_count: torch.Tensor | None = None
     organic_count: torch.Tensor | None = None
     controllable_count: torch.Tensor | None = None
     floor_trigger_rate: torch.Tensor | None = None
     num_pinned: torch.Tensor | None = None
-    # θ / μ are tensors (no per-microbatch .item() sync). See CompressorOutput.
     theta_tensor: torch.Tensor | None = None
-    adapter_mu_tensor: torch.Tensor | None = None
 
 
 class BgKITCompressor(nn.Module):
@@ -154,12 +145,25 @@ class BgKITCompressor(nn.Module):
         hidden_dim: int = 1024,
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
-        adapter_mean_ema_cfg: dict | None = None,
+        head_tanh_temperature: float = 5.0,
     ):
         super().__init__()
         self.backbone = backbone
         self.norm = norm
         self.hidden_dim = hidden_dim
+        # Temperature for the operator-facing tanh: logit_op = tanh(raw / T).
+        # BCE-with-logits distillation naturally produces raw logits with
+        # std roughly equal to the "confidence gap" between classes — in
+        # practice ~5 for 10% positive targets. Tanh saturates at ±3+, so
+        # applying it directly to std~5 logits collapses most positions
+        # to ±1 and destroys ranking. T matches the raw std so base_raw/T
+        # has std ~1, keeping most positions in tanh's linear region.
+        # Save as a buffer so it serializes with the state_dict and can
+        # be auto-calibrated at sidecar load if needed.
+        self.register_buffer(
+            "head_tanh_temperature",
+            torch.tensor(float(head_tanh_temperature), dtype=torch.float32),
+        )
 
         # Learned flag embeddings added to input representations
         self.survive_embedding = nn.Parameter(torch.randn(hidden_dim) * 0.02)
@@ -171,52 +175,31 @@ class BgKITCompressor(nn.Module):
         # Auto-reproduction head: maps output back to input embedding space
         self.auto_repro_head = nn.Linear(hidden_dim, hidden_dim)
 
-        # Per-level head_base + head_adapter (adapter zero-init).
+        # Per-level single head. Historical name "head_base_l{0,1}" retained
+        # to keep sidecar checkpoint keys stable (the old adapter head was
+        # removed 2026-04-16 in favor of tanh-saturation as the sole
+        # inflation guard on soft-attn).
         self.head_base_l0 = SurvivorshipHead(hidden_dim, survivorship_inner_dim)
-        self.head_adapter_l0 = SurvivorshipHead(
-            hidden_dim, survivorship_inner_dim, init_to_zero=True,
-        )
         self.head_base_l1 = SurvivorshipHead(hidden_dim, survivorship_inner_dim)
-        self.head_adapter_l1 = SurvivorshipHead(
-            hidden_dim, survivorship_inner_dim, init_to_zero=True,
-        )
 
-        # Per-level DualThresholdController + AdapterMeanEMA. fp32 buffers;
-        # always read via .float() at call sites. Do not cast to bf16 — these
-        # accumulate small deltas per step and lose precision in lower formats.
+        # Per-level DualThresholdController. fp32 buffer; always read via
+        # .float() at call sites. Do not cast to bf16 — accumulates small
+        # dual-ascent deltas per step and would lose precision.
         ctrl_cfg = threshold_controller_cfg or {}
-        ema_cfg = adapter_mean_ema_cfg or {}
-        # Filter cfg keys that aren't constructor params (e.g. floor knobs
-        # that are read by the trainer, not the controller itself).
         ctrl_kwargs = {
             k: v for k, v in ctrl_cfg.items()
             if k in {"init_theta", "lr", "momentum", "clamp"}
         }
-        ema_kwargs = {
-            k: v for k, v in ema_cfg.items() if k in {"init_mu", "momentum"}
-        }
         self.threshold_l0 = DualThresholdController(**ctrl_kwargs)
         self.threshold_l1 = DualThresholdController(**ctrl_kwargs)
-        self.adapter_mean_ema_l0 = AdapterMeanEMA(**ema_kwargs)
-        self.adapter_mean_ema_l1 = AdapterMeanEMA(**ema_kwargs)
 
     def _heads_for_level(
         self, level: str,
-    ) -> tuple[SurvivorshipHead, SurvivorshipHead, DualThresholdController, AdapterMeanEMA]:
+    ) -> tuple[SurvivorshipHead, DualThresholdController]:
         if level == "l0":
-            return (
-                self.head_base_l0,
-                self.head_adapter_l0,
-                self.threshold_l0,
-                self.adapter_mean_ema_l0,
-            )
+            return (self.head_base_l0, self.threshold_l0)
         if level == "l1":
-            return (
-                self.head_base_l1,
-                self.head_adapter_l1,
-                self.threshold_l1,
-                self.adapter_mean_ema_l1,
-            )
+            return (self.head_base_l1, self.threshold_l1)
         raise ValueError(f"Unknown level: {level!r}")
 
     def forward(
@@ -313,21 +296,21 @@ class BgKITCompressor(nn.Module):
             """Run two-head survivorship + adaptive-threshold selection.
 
             Composes ``logits_for_op = base_raw + adapter_zm`` and
-            ``logits_for_softattn = base_raw.detach() + adapter_zm``. The
-            two tensors produce numerically identical values; only the
-            autograd graph differs. Bool mask detached to prevent an
-            uncontrolled head-gradient path through every position's flag
-            contribution. Soft-attn provides the only deliberate
-            head-gradient path from the decoder.
+            Single-head composition: ``logits_for_op = tanh(base_raw / T)``.
+            Bool mask detached to prevent an uncontrolled head-gradient path
+            through every position's flag contribution. All three loss
+            paths (BCE warmup, moment-match, soft-attn) flow back to the
+            same head; tanh saturation at ±1 is the sole structural guard
+            against soft-attn inflating the aggregate logit mass.
             """
             if compression_off:
                 return hidden
 
-            base_head, adapter_head, controller, ema = self._heads_for_level(level)
+            head, controller = self._heads_for_level(level)
 
             content_hidden = hidden[:, content_slice, :]
             # Detach layer7 before stashing for soft-attn: soft-attn is
-            # intended to train the adapter + survive/doomed embeddings +
+            # intended to train the head + survive/doomed embeddings +
             # blocks 2..end (via forward_from_block) + projection_block +
             # decoder. It must NOT also provide a second gradient path back
             # through backbone blocks 0-1 (that would duplicate the hard
@@ -336,13 +319,18 @@ class BgKITCompressor(nn.Module):
             # through blocks 2..end downstream.
             hook_state["layer7_embeddings"] = content_hidden.detach().clone()
 
-            base_raw = base_head(content_hidden)  # (B, L_content)
-            adapter_raw = adapter_head(content_hidden)  # (B, L_content)
-            mu = ema.value.to(adapter_raw.dtype)
-            adapter_zm = adapter_raw - mu
+            base_raw = head(content_hidden)  # (B, L_content)
 
-            logits_for_op = base_raw + adapter_zm
-            logits_for_softattn = base_raw.detach() + adapter_zm
+            # Tanh-bound the operator-facing logits so θ lives in (-1, 1),
+            # decoupled from whatever absolute scale the head happens to
+            # produce. Temperature scales the pre-tanh input into tanh's
+            # linear region so ranking is preserved across positions (not
+            # collapsed by saturation). Ranking preserved (tanh is
+            # monotonic). Pre-tanh raw values are still exposed on
+            # hook_state for BCE-with-logits losses, which need unbounded
+            # input to be numerically stable.
+            T = self.head_tanh_temperature.to(base_raw.dtype)
+            logits_for_op = torch.tanh(base_raw / T)
 
             # Build the valid mask in content-space.
             if attention_mask is not None:
@@ -393,12 +381,10 @@ class BgKITCompressor(nn.Module):
             # tensor, not through this stash.
             hook_state["full_after_head"] = hidden.detach()
 
-            # Aggregation primitives for the trainer's true-mean update of θ
-            # and μ. Stash sums + counts (detached) — never pre-divide here,
-            # because variable microbatch sizes need true global means.
+            # Aggregation primitives for the trainer's true-mean update of θ.
+            # Stash sums + counts (detached) — never pre-divide here, because
+            # variable microbatch sizes need true global means.
             with torch.no_grad():
-                valid_f = valid.to(base_raw.dtype)
-                adapter_sum = (adapter_raw.detach() * valid_f).sum()
                 valid_count = valid.sum()
                 # organic ∩ controllable count from the selection routine.
                 # Reconstruct: organic = (logits > θ) & valid, controllable =
@@ -417,26 +403,18 @@ class BgKITCompressor(nn.Module):
                 controllable_count = controllable.sum()
 
             hook_state["base_raw"] = base_raw
-            hook_state["adapter_raw"] = adapter_raw
-            hook_state["adapter_zm"] = adapter_zm
             hook_state["logits_for_op"] = logits_for_op
-            hook_state["logits_for_softattn"] = logits_for_softattn
             hook_state["survive_probs"] = survive_probs
             hook_state["survive_probs_metrics"] = survive_probs_metrics
             hook_state["survivor_mask"] = mask
-            hook_state["adapter_sum"] = adapter_sum
             hook_state["valid_count"] = valid_count
             hook_state["organic_count"] = organic_count
             hook_state["controllable_count"] = controllable_count
             hook_state["floor_trigger_rate"] = sel.floor_trigger_rate
             hook_state["num_pinned"] = sel.num_pinned
-            # Keep theta/mu as tensors; trainer .item()s them once per
-            # optimizer step at log time instead of per microbatch. The
-            # CompressorOutput fields are populated only with the tensor
-            # handles — callers that need floats should read from the
-            # controller / ema directly.
+            # Keep theta as a tensor; trainer .item()s once per optimizer step
+            # at log time instead of per microbatch.
             hook_state["theta_tensor"] = theta.detach()
-            hook_state["adapter_mu_tensor"] = ema.value.detach()
             return hidden
 
         # Map hook indices based on backbone type. Block indices in the
@@ -477,19 +455,14 @@ class BgKITCompressor(nn.Module):
             full_attention_mask=combined_mask,
             intermediates=intermediates,
             base_raw=hook_state.get("base_raw"),
-            adapter_raw=hook_state.get("adapter_raw"),
-            adapter_zm=hook_state.get("adapter_zm"),
             logits_for_op=hook_state.get("logits_for_op"),
-            logits_for_softattn=hook_state.get("logits_for_softattn"),
             survive_probs_metrics=hook_state.get("survive_probs_metrics"),
-            adapter_sum=hook_state.get("adapter_sum"),
             valid_count=hook_state.get("valid_count"),
             organic_count=hook_state.get("organic_count"),
             controllable_count=hook_state.get("controllable_count"),
             floor_trigger_rate=hook_state.get("floor_trigger_rate"),
             num_pinned=hook_state.get("num_pinned"),
             theta_tensor=hook_state.get("theta_tensor"),
-            adapter_mu_tensor=hook_state.get("adapter_mu_tensor"),
         )
 
     def auto_reproduce(self, embeddings: torch.Tensor) -> torch.Tensor:

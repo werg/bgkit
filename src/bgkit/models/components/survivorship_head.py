@@ -30,7 +30,6 @@ class SurvivorshipHead(nn.Module):
         self,
         hidden_dim: int = 1024,
         inner_dim: int = 256,
-        init_to_zero: bool = False,
     ):
         super().__init__()
         self.head = nn.Sequential(
@@ -38,24 +37,26 @@ class SurvivorshipHead(nn.Module):
             nn.GELU(),
             nn.Linear(inner_dim, 1),
         )
-        # Bias must be a known constant — the cold-start expected keep rate
-        # σ(0 − θ_init) depends on it. Do not randomize without updating
-        # the θ_init convention.
+        # Bias zero-init is a cold-start invariant: at step 0 the sidecar
+        # hasn't been loaded yet, so the random-init head's bias determines
+        # the initial logit distribution's center. With bias=0 and the
+        # tanh+temperature operator, θ_init = 1 - 2·target_ratio gives the
+        # right starting keep-rate.
         nn.init.zeros_(self.head[-1].bias)
-        if init_to_zero:
-            # Used to construct head_adapter as a no-op at step 0 so it does
-            # not perturb the BCE-anchored base ranking. Adapter learns from
-            # zero via soft-attn gradient (upstream ∂L/∂logit ≠ 0 still
-            # produces a non-zero gradient on the zero-weight final layer).
-            nn.init.zeros_(self.head[-1].weight)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Predict per-position survive logits.
+        """Predict per-position raw survive logits (pre-tanh).
+
+        Callers compose multiple heads (``base_raw + adapter_zm``) in
+        unbounded space, then apply tanh at the composition level so the
+        operator-facing logit is bounded to (-1, 1) — see
+        :class:`BgKITCompressor` hook. BCE-with-logits distillation / warmup
+        consumes this raw output directly.
 
         Args:
             hidden_states: (B, L, D) contextualized hidden states.
 
         Returns:
-            (B, L) raw logits — positive means likely survivor.
+            (B, L) raw logits.
         """
         return self.head(hidden_states).squeeze(-1)

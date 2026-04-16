@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-"""Offline distillation: ICE → head_base_l0.
+"""Offline distillation: ICE → head_base_l0 (tanh-bounded operator regime).
 
-Runs a dedicated BCE pass against ICE top-k targets to initialize
-``compressor.head_base_l0`` before Phase 1 Step 3 starts. Frees Step 3 from
-doing this work while simultaneously trying to teach the decoder to use
-BgKIT output — two hard training objectives that were competing with each
-other in the same optimizer.
+Runs a dedicated BCE-with-logits pass against ICE top-k teacher targets to
+initialize ``compressor.head_base_l0`` before Phase 1 Step 3 starts. Frees
+Step 3 from doing this work while simultaneously trying to teach the
+decoder to use BgKIT output.
 
 What's trained:
     Only ``compressor.head_base_l0.*``. Everything else (pruned backbone,
-    projection block, adapter head, flag embeddings, etc.) is frozen. This
-    isolates the distillation from any decoder-side concerns and uses a
-    much larger total-sample count than the 1000-step online BCE warmup.
+    projection block, adapter head, flag embeddings, etc.) is frozen. The
+    script taps the pruned backbone at block 1 (≡ layer 7 of the unpruned
+    Qwen3.5-0.8B) via ``return_intermediates=True`` and feeds that hidden
+    state into ``head_base_l0`` for BCE against ICE's top-k mask.
+
+Architecture note: ``SurvivorshipHead.forward`` returns raw (pre-tanh)
+logits. Tanh is applied at composition inside the compressor hook so the
+operator-facing logit is bounded. During distillation we train on raw
+logits so BCE-with-logits is numerically stable. At runtime the trained
+head outputs a raw distribution that tanh bounds naturally — if BCE
+targets drive raw logits into ~±3, tanh saturates lightly at ±0.99, which
+is the sweet spot for the θ ∈ (-0.99, 0.99) operator.
 
 What's saved:
     A standalone sidecar checkpoint at ``$CHECKPOINT_DIR/survivorship_head_base_l0_YYYYMMDD_HHMMSS/``

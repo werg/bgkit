@@ -1,4 +1,4 @@
-"""Tests for selection.py: adaptive_threshold_select, controllers, EMA, moment match."""
+"""Tests for selection.py: adaptive_threshold_select, controller, moment match."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from bgkit.models.components.selection import (  # noqa: E402
-    AdapterMeanEMA,
     DualThresholdController,
     SelectionOut,
     adaptive_threshold_select,
@@ -175,41 +174,6 @@ def test_threshold_momentum_damps_initial_response():
         no_mom.step(current_rate=0.6, target_rate=0.5)
     # Both clamped at 20.0 default, but they should agree to within a few epochs.
     assert abs(float(ctrl.theta.item()) - float(no_mom.theta.item())) < 1.0
-
-
-# ----------------------------------------------------------------------
-# AdapterMeanEMA
-# ----------------------------------------------------------------------
-
-
-def test_ema_starts_at_init_mu():
-    ema = AdapterMeanEMA(init_mu=0.0, momentum=0.99)
-    assert float(ema.value.item()) == 0.0
-
-
-def test_ema_converges_to_constant_input():
-    ema = AdapterMeanEMA(init_mu=0.0, momentum=0.99)
-    for _ in range(500):
-        ema.update(0.7)
-    assert float(ema.value.item()) == pytest.approx(0.7, abs=0.01)
-
-
-def test_ema_skips_nan_update():
-    ema = AdapterMeanEMA(init_mu=0.5)
-    ema.update(float("nan"))
-    assert float(ema.value.item()) == pytest.approx(0.5)
-
-
-def test_ema_value_preserves_fp32_storage_under_bf16_cast():
-    ema = AdapterMeanEMA(init_mu=0.3)
-    ema.to(dtype=torch.bfloat16)
-    # Storage must remain fp32 so small EMA deltas don't truncate.
-    assert ema.mu_param.dtype == torch.float32
-    assert ema.value.dtype == torch.float32
-    ema.update(0.3001)
-    # Small-delta update must be preserved (0.99 * 0.3 + 0.01 * 0.3001).
-    expected = 0.99 * 0.3 + 0.01 * 0.3001
-    assert abs(float(ema.value.item()) - expected) < 1e-6
 
 
 # ----------------------------------------------------------------------
