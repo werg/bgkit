@@ -49,7 +49,7 @@ class MockDeltaNetLayer(nn.Module):
         super().__init__()
         self.linear_attn = MockLinearAttn(hidden_dim)
 
-    def forward(self, hidden_states, position_embeddings=None, attention_mask=None):
+    def forward(self, hidden_states, position_embeddings=None, attention_mask=None, **kwargs):
         x = self.linear_attn.proj(hidden_states)
         x = torch.cumsum(x, dim=1)
         return x
@@ -66,7 +66,7 @@ class MockFullAttentionLayer(nn.Module):
         super().__init__()
         self.self_attn = nn.Linear(hidden_dim, hidden_dim)  # detection marker + transform
 
-    def forward(self, hidden_states, position_embeddings=None, attention_mask=None):
+    def forward(self, hidden_states, position_embeddings=None, attention_mask=None, **kwargs):
         x = self.self_attn(hidden_states)
         if attention_mask is not None:
             # attention_mask may be (B, 1, 1, L) or (B, 1, L, L) depending on

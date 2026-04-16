@@ -98,6 +98,7 @@ class ProjectionBlock(nn.Module):
             hidden_states,
             attention_mask=attn_mask_4d,
             position_embeddings=position_embeddings,
+            is_causal=False,
         )
         # HF decoder layers return (hidden_states, ...) tuples; unwrap.
         all_out = layer_out[0] if isinstance(layer_out, tuple) else layer_out
@@ -112,4 +113,3 @@ class ProjectionBlock(nn.Module):
         else:
             projected = self.projection_head(self.output_norm(all_out))
             return ProjectionOutput(projected, None, None)
-

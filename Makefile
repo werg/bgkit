@@ -7,13 +7,21 @@ export
 # reading the file itself for ${VAR} interpolation in the YAML).
 DC := docker compose --env-file .env -f docker/docker-compose.yaml
 
-.PHONY: install install-gpu test test-unit test-gpu test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos train-phase1-step1 train-phase1-step2 train-phase1-step3 train-phase1-step4 train-phase1-step5 ckpt-backfill extract-structural generate-descriptions extract-commits prepare-commit-encoding convert-tokens convert-structural convert-descriptions convert-commits convert-commit-encoding generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full prepare-data-all
+.PHONY: install install-gpu install-fa4-local install-gpu-local-fa4 test test-unit test-gpu test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos train-phase1-step1 train-phase1-step2 train-phase1-step3 train-phase1-step4 train-phase1-step5 ckpt-backfill extract-structural generate-descriptions extract-commits prepare-commit-encoding convert-tokens convert-structural convert-descriptions convert-commits convert-commit-encoding generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full prepare-data-all
+
+FLASH_ATTN_DIR ?= ../flash-attention
 
 install:
 	uv sync --extra dev --extra data
 
 install-gpu:
 	uv sync --group torch --extra gpu --extra dev --extra eval
+
+install-fa4-local:
+	@test -f "$(FLASH_ATTN_DIR)/flash_attn/cute/pyproject.toml" || { echo "ERROR: FLASH_ATTN_DIR=$(FLASH_ATTN_DIR) does not point to a flash-attention checkout"; exit 1; }
+	uv pip install --python .venv/bin/python -e "$(FLASH_ATTN_DIR)/flash_attn/cute[cu13]"
+
+install-gpu-local-fa4: install-gpu install-fa4-local
 
 test: test-unit
 

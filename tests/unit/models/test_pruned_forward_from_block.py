@@ -43,7 +43,7 @@ class MockFullAttentionLayer(nn.Module):
         self.post_attention_layernorm = nn.LayerNorm(dim)
         self.mlp = MockMLP(dim)
 
-    def forward(self, hidden_states, position_embeddings=None, attention_mask=None):
+    def forward(self, hidden_states, position_embeddings=None, attention_mask=None, **kwargs):
         return self.self_attn(hidden_states) + hidden_states
 
 

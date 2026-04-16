@@ -114,6 +114,7 @@ def main() -> int:
     from bgkit.models.encoder import BgKITEncoder
     from bgkit.models.ice_teacher import ICETeacher
     from bgkit.training.checkpointing import load_checkpoint
+    from bgkit.utils.attention_backend import resolve_attention_implementation
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -134,7 +135,7 @@ def main() -> int:
         hidden_dim=args.hidden_dim,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="sdpa",
+        attn_implementation=resolve_attention_implementation(),
     ).to(device)
 
     # Freeze everything; only head_base_l0 gets grad.

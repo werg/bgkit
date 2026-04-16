@@ -76,10 +76,10 @@ def _run_attn_layer(
     """Run a full attention layer with optional gradient checkpointing."""
     if use_ckpt:
         def _fwd(h):
-            out = layer(h, position_embeddings, attention_mask=mask)
+            out = layer(h, position_embeddings, attention_mask=mask, is_causal=False)
             return out[0] if isinstance(out, tuple) else out
         return torch.utils.checkpoint.checkpoint(_fwd, hidden_states, use_reentrant=False)
-    out = layer(hidden_states, position_embeddings, attention_mask=mask)
+    out = layer(hidden_states, position_embeddings, attention_mask=mask, is_causal=False)
     return out[0] if isinstance(out, tuple) else out
 
 

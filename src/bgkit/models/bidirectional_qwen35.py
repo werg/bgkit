@@ -249,10 +249,10 @@ class BidirectionalQwen35(nn.Module):
             """
             if use_ckpt:
                 def _fwd(hidden_states):
-                    out = layer(hidden_states, pos_emb, attention_mask=mask)
+                    out = layer(hidden_states, pos_emb, attention_mask=mask, is_causal=False)
                     return out[0] if isinstance(out, tuple) else out
                 return torch.utils.checkpoint.checkpoint(_fwd, h, use_reentrant=False)
-            out = layer(h, pos_emb, attention_mask=mask)
+            out = layer(h, pos_emb, attention_mask=mask, is_causal=False)
             return out[0] if isinstance(out, tuple) else out
 
         intermediates = [] if return_intermediates else None

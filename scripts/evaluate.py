@@ -32,6 +32,7 @@ from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.checkpointing import load_checkpoint
 from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
+from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.logging import setup_logging
 
 logger = structlog.get_logger()
@@ -49,6 +50,9 @@ def main(cfg: DictConfig) -> None:
         sys.exit(1)
 
     generation_samples = eval_cfg.get("generation_samples", 200)
+    attention_impl = resolve_attention_implementation(
+        cfg.compute.get("attention_implementation", "auto")
+    )
 
     # Load models
     bgkit_cfg = cfg.model.bgkit
@@ -69,7 +73,7 @@ def main(cfg: DictConfig) -> None:
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         revision=bgkit_cfg.get("backbone_revision"),
-        attn_implementation="sdpa",
+        attn_implementation=attention_impl,
     )
     encoder.to(device)
     encoder.requires_grad_(False)
@@ -81,7 +85,7 @@ def main(cfg: DictConfig) -> None:
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
         revision=decoder_cfg.get("backbone_revision"),
-        attn_implementation="sdpa",
+        attn_implementation=attention_impl,
     )
     decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
     decoder.to(device)

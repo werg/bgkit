@@ -32,6 +32,7 @@ from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import enable_gradient_checkpointing
+from bgkit.utils.attention_backend import resolve_attention_implementation
 
 logger = structlog.get_logger()
 
@@ -56,6 +57,9 @@ class CommitEncodingTrainer(BaseTrainer):
         tcfg = self.cfg.training
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
+        attention_impl = resolve_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto")
+        )
 
         # --- BgKIT encoder (trainable) ---
         bgkit_cfg = self.cfg.model.bgkit
@@ -84,7 +88,7 @@ class CommitEncodingTrainer(BaseTrainer):
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
                 revision=backbone_revision,
-                attn_implementation="sdpa",
+                attn_implementation=attention_impl,
                 bidi_warmup_steps=bidi_warmup,
             )
         else:
@@ -94,7 +98,7 @@ class CommitEncodingTrainer(BaseTrainer):
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
                 revision=backbone_revision,
-                attn_implementation="sdpa",
+                attn_implementation=attention_impl,
                 bidi_warmup_steps=bidi_warmup,
             )
         self.encoder.to(device)
@@ -117,7 +121,7 @@ class CommitEncodingTrainer(BaseTrainer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=decoder_revision,
-            attn_implementation="sdpa",
+            attn_implementation=attention_impl,
             device_map=device,  # load directly to CUDA, avoid CPU staging copy
         )
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)

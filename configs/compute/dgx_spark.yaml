@@ -10,16 +10,23 @@ max_seq_len: 8192
 microbatch_size: 1
 gradient_accumulation_steps: 8
 # Effective batch size = microbatch * gradient_accumulation = 8
-# Optimizer: 8-bit AdamW to reduce memory
-optimizer: adamw_bnb_8bit
+# Optimizer: default to plain AdamW. Individual experiments override to
+# `muon` (phase 1) or keep `adamw` (phase 2/3). `adamw8bit` requires
+# bitsandbytes with a matching CUDA binary (cuda132.so is not shipped in
+# bnb 0.49.2 — use `adamw`/`muon` until bnb 0.50+).
+optimizer: adamw
 optimizer_kwargs:
   lr: 1.0e-4
   weight_decay: 0.01
   betas: [0.9, 0.999]
 # Gradient clipping
 max_grad_norm: 1.0
-# Attention: use PyTorch SDPA (flash-attn not supported on sm_121)
-attention_implementation: sdpa
+# Attention: `auto` resolves to BgKIT's FA4-aware backend when FA4 is
+# importable (bgkit.utils.attention_backend). MHA head_dim up to 256 works
+# via our flash-attention fork's sm_120 tile/atom fixes. GQA is handled by
+# repeat-interleaving K/V heads (native FA4 sm_120 GQA still produces wrong
+# gradients). See docs/memory for the full story.
+attention_implementation: auto
 # Dataloader
 num_workers: 0  # fork workers cause CoW memory exhaustion on unified memory
 pin_memory: false  # unified memory, pinning not applicable

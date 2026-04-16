@@ -245,6 +245,7 @@ def live_verify(
     from bgkit.models.decoder import ReconstructionDecoder
     from bgkit.models.encoder import BgKITEncoder
     from bgkit.models.lora_encoder import DEFAULT_LORA_TARGETS, LoRARouter
+    from bgkit.utils.attention_backend import resolve_attention_implementation
 
     if not torch.cuda.is_available():
         print("\n[live] CUDA unavailable — skipping live verification.")
@@ -266,7 +267,10 @@ def live_verify(
         trust_remote_code=True,
     ).to(device)
     decoder_backbone = AutoModelForCausalLM.from_pretrained(
-        decoder_name, trust_remote_code=True, torch_dtype=torch.bfloat16,
+        decoder_name,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        attn_implementation=resolve_attention_implementation(),
     ).to(device)
     decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=1024)
     decoder.train()

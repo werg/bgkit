@@ -37,6 +37,7 @@ from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import enable_gradient_checkpointing
 from bgkit.training.scheduling import cosine_with_warmup
+from bgkit.utils.attention_backend import resolve_attention_implementation
 
 logger = structlog.get_logger()
 
@@ -112,6 +113,10 @@ class DecoderInitTrainer(BaseTrainer):
         "target_ratio_end": "_target_ratio_end",
         "compression_introduction_step": "_compression_introduction_step",
         "encoder_unfreeze_step": "_encoder_unfreeze_step",
+        # Flow-control scalars (all cheap to change mid-run):
+        "soft_attn_every_n_steps": "_soft_attn_every_n_steps",
+        "soft_attn_start_step": "_soft_attn_start_step",
+        "diagnostic_metrics_every_n_steps": "_diagnostic_metrics_every_n_steps",
     }
 
     def setup(self) -> None:
@@ -126,6 +131,9 @@ class DecoderInitTrainer(BaseTrainer):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
+        attention_impl = resolve_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto")
+        )
 
         # --- Curriculum config ---
         self._encoder_unfreeze_step = tcfg.get("encoder_unfreeze_step", None)
@@ -177,7 +185,7 @@ class DecoderInitTrainer(BaseTrainer):
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
                 revision=backbone_revision,
-                attn_implementation="sdpa",
+                attn_implementation=attention_impl,
                 bidi_warmup_steps=bidi_warmup,
                 threshold_controller_cfg=threshold_controller_cfg,
             )
@@ -209,7 +217,7 @@ class DecoderInitTrainer(BaseTrainer):
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
                 revision=backbone_revision,
-                attn_implementation="sdpa",
+                attn_implementation=attention_impl,
                 bidi_warmup_steps=bidi_warmup,
                 threshold_controller_cfg=threshold_controller_cfg,
             )
@@ -229,7 +237,7 @@ class DecoderInitTrainer(BaseTrainer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=decoder_revision,
-            attn_implementation="sdpa",
+            attn_implementation=attention_impl,
             device_map=device,  # load directly to CUDA, avoid CPU staging copy
         )
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
@@ -318,6 +326,12 @@ class DecoderInitTrainer(BaseTrainer):
         # is skipped entirely (saves ~1.8× FLOPs). After, it fires at the
         # configured cadence. Defaults to 0 = active from step 0 (legacy).
         self._soft_attn_start_step = int(surv_cfg.get("soft_attn_start_step", 0))
+
+        # Diagnostic metrics gating — cached here so it's live-tunable via
+        # control.json alongside the soft-attn knobs (see LIVE_CONFIG_FIELDS).
+        self._diagnostic_metrics_every_n_steps = int(
+            tcfg.get("diagnostic_metrics_every_n_steps", 10),
+        )
 
         # Floor knobs for the operator (passed to encoder.forward).
         ctrl_cfg = self.cfg.model.get("threshold_controller", {}) if hasattr(
@@ -1162,9 +1176,7 @@ class DecoderInitTrainer(BaseTrainer):
             # Logging metrics (all detached to avoid retaining autograd graph).
             # Heavy diagnostic metrics require .item() syncs; gate them on
             # a modest interval to keep them off the hot path.
-            diag_interval = int(
-                self.cfg.training.get("diagnostic_metrics_every_n_steps", 10),
-            )
+            diag_interval = int(self._diagnostic_metrics_every_n_steps)
             emit_diag = (
                 diag_interval <= 1 or self.global_step % diag_interval == 0
             )

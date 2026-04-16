@@ -26,6 +26,7 @@ from bgkit.models.bgkit_compressor import BgKITCompressor, CompressionOutput
 from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
+from bgkit.utils.attention_backend import resolve_attention_implementation
 
 
 @contextlib.contextmanager
@@ -300,8 +301,9 @@ class BgKITEncoder(nn.Module):
             }
             if revision is not None:
                 load_kwargs["revision"] = revision
-            if attn_implementation is not None:
-                load_kwargs["attn_implementation"] = attn_implementation
+            load_kwargs["attn_implementation"] = resolve_attention_implementation(
+                attn_implementation
+            )
             raw_model = AutoModel.from_pretrained(backbone_name_or_module, **load_kwargs)
         else:
             raw_model = backbone_name_or_module

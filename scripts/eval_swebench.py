@@ -259,9 +259,9 @@ def _load_bgkit_context(
         return None, None
 
     try:
-        from bgkit.data.datasets.precomputed_l0_cache import PrecomputedL0Cache
-
         import torch
+
+        from bgkit.data.datasets.precomputed_l0_cache import PrecomputedL0Cache
 
         cache = PrecomputedL0Cache(str(cache_path))
         survivors = cache.get_survivors(instance_id)
@@ -355,7 +355,7 @@ def generate_prediction(
         conversation: list[dict] = []
         stats = {"turns": 0, "reads": 0, "edits": 0}
 
-        for turn in range(max_turns):
+        for _turn in range(max_turns):
             prompt_text = _build_prompt(issue_text, conversation)
             input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(device)
 
@@ -444,6 +444,8 @@ def cmd_generate(args) -> None:
     from datasets import load_dataset
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    from bgkit.utils.attention_backend import resolve_attention_implementation
+
     dataset_name = {
         "lite": "SWE-bench/SWE-bench_Lite",
         "verified": "SWE-bench/SWE-bench_Verified",
@@ -475,6 +477,7 @@ def cmd_generate(args) -> None:
         model = AutoModelForCausalLM.from_pretrained(
             model_name, trust_remote_code=True,
             torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+            attn_implementation=resolve_attention_implementation(),
         )
         if decoder_state:
             model.load_state_dict(decoder_state, strict=False)
@@ -483,6 +486,7 @@ def cmd_generate(args) -> None:
         model = AutoModelForCausalLM.from_pretrained(
             str(checkpoint_path), trust_remote_code=True,
             torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+            attn_implementation=resolve_attention_implementation(),
         )
     model.to(device).eval()
 
@@ -559,7 +563,7 @@ def cmd_evaluate(args) -> None:
     if args.namespace:
         eval_args.extend(["--namespace", args.namespace])
 
-    sys.argv = ["swebench_eval"] + eval_args
+    sys.argv = ["swebench_eval", *eval_args]
     swebench_main()
 
 

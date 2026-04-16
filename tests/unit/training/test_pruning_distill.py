@@ -32,7 +32,7 @@ class MockFullAttnLayer(nn.Module):
         super().__init__()
         self.self_attn = nn.Linear(dim, dim)
 
-    def forward(self, hidden_states, position_embeddings=None, attention_mask=None):
+    def forward(self, hidden_states, position_embeddings=None, attention_mask=None, **kwargs):
         return self.self_attn(hidden_states) + hidden_states
 
 

@@ -29,6 +29,7 @@ from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import enable_gradient_checkpointing
+from bgkit.utils.attention_backend import resolve_attention_implementation
 
 logger = structlog.get_logger()
 
@@ -58,6 +59,9 @@ class PruningDistillTrainer(BaseTrainer):
         tcfg = self.cfg.training
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
+        attention_impl = resolve_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto")
+        )
 
         bgkit_cfg = self.cfg.model.bgkit
         backbone_name = bgkit_cfg.backbone_name
@@ -79,7 +83,7 @@ class PruningDistillTrainer(BaseTrainer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=bgkit_cfg.get("backbone_revision", None),
-            attn_implementation="sdpa",
+            attn_implementation=attention_impl,
             bidi_warmup_steps=0,  # teacher is already bidirectional
         )
         _, teacher_state = load_checkpoint(Path(step1_checkpoint))
@@ -96,7 +100,7 @@ class PruningDistillTrainer(BaseTrainer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=bgkit_cfg.get("backbone_revision", None),
-            attn_implementation="sdpa",
+            attn_implementation=attention_impl,
             bidi_warmup_steps=tcfg.get("bidi_warmup_steps", 0),
         )
         _, student_state = load_checkpoint(Path(step1_checkpoint))

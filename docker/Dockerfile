@@ -19,6 +19,17 @@ COPY docs/01_overview.md docs/
 RUN mkdir -p src/bgkit && \
     echo '__version__ = "0.1.0"' > src/bgkit/__init__.py && \
     pip install --no-cache-dir ".[gpu]" && \
+    # nvidia-cutlass-dsl ships two overlapping wheels: libs-base and libs-cu13 BOTH
+    # install Python shims for `_nvvm_ops_gen.py`, `_cute_ops_gen.py` etc. at the same
+    # path, with DIFFERENT content (libs-cu13 uses a newer MLIR op API that drops
+    # `res=` kwargs and changes coord layout semantics). FA4 was written against
+    # libs-base's shim — if libs-cu13's shim wins the install-order race, FA4 breaks
+    # at runtime (atomicrmw `res=` TypeError, then `crd2idx` operation creation errors).
+    # Force libs-base to be the LAST writer so its shims win. The host venv ends up in
+    # the same state naturally via uv's resolver. Separate pip calls guarantee order;
+    # a single pip call with both packages reorders arbitrarily.
+    pip install --no-cache-dir --force-reinstall "nvidia-cutlass-dsl-libs-cu13==4.4.2" && \
+    pip install --no-cache-dir --force-reinstall "nvidia-cutlass-dsl-libs-base==4.4.2" && \
     pip uninstall -y bgkit && \
     rm -rf src/
 
@@ -34,14 +45,18 @@ RUN mkdir -p src/bgkit && \
 RUN pip install --no-cache-dir \
     "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu13torch26.02cxx11abiTRUE-cp312-cp312-linux_aarch64.whl"
 
-# Verify key deps are importable
+# Verify key deps are importable and that the cutlass-dsl install-order fight
+# left libs-base's `_nvvm_ops_gen.py` shim on disk (FA4 atomic_add_fp32 also
+# handles the libs-cu13 shim via try/except, so this is a fail-loud guardrail,
+# not a hard requirement).
 RUN python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')" && \
     python -c "import accelerate; print(f'accelerate {accelerate.__version__}')" && \
-    python -c "from causal_conv1d import causal_conv1d_fn; print('causal_conv1d OK')"
+    python -c "from causal_conv1d import causal_conv1d_fn; print('causal_conv1d OK')" && \
+    python -c "from cutlass._mlir.dialects import nvvm; import inspect; params = list(inspect.signature(nvvm.atomicrmw).parameters); print(f'cutlass-dsl atomicrmw first param: {params[0]!r}'); assert params[0] in ('res', 'op'), f'unrecognized atomicrmw signature: {params}'"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/workspace/bgkit/src \
+    PYTHONPATH=/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages \
     DATA_DIR=/workspace/data \
     HF_HOME=/workspace/hf_cache \
     CHECKPOINT_DIR=/workspace/checkpoints

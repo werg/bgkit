@@ -39,6 +39,8 @@ x-gpu-common: &gpu-common
     - ../src:/workspace/bgkit/src:ro
     - ../configs:/workspace/bgkit/configs:ro
     - ../scripts:/workspace/bgkit/scripts:ro
+    # Local FlashAttention checkout: mounted read-only and preferred via PYTHONPATH.
+    - ../../flash-attention:/workspace/flash-attention:ro
     # Wandb authenticates via netrc (machine api.wandb.ai).
     - ~/.netrc:/workspace/.netrc:ro
     # Persist torch.compile (inductor) and Triton kernel caches across restarts

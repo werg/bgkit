@@ -36,6 +36,7 @@ from bgkit.training.objectives.commit_reproduction import commit_reproduction_lo
 from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
 from bgkit.training.objectives.description_generation import description_generation_loss
 from bgkit.training.objectives.structural_relational import structural_relational_loss
+from bgkit.utils.attention_backend import resolve_attention_implementation
 
 logger = structlog.get_logger()
 
@@ -71,6 +72,9 @@ class CompressionTrainer(BaseTrainer):
         tcfg = self.cfg.training
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
+        attention_impl = resolve_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto")
+        )
 
         # --- BgKIT encoder (trainable in Step 2) ---
         bgkit_cfg = self.cfg.model.bgkit
@@ -106,7 +110,7 @@ class CompressionTrainer(BaseTrainer):
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
                 revision=backbone_revision,
-                attn_implementation="sdpa",
+                attn_implementation=attention_impl,
                 bidi_warmup_steps=bidi_warmup,
             )
         else:
@@ -120,7 +124,7 @@ class CompressionTrainer(BaseTrainer):
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
                 revision=backbone_revision,
-                attn_implementation="sdpa",
+                attn_implementation=attention_impl,
                 bidi_warmup_steps=bidi_warmup,
             )
         self.encoder.to(device)
@@ -145,7 +149,7 @@ class CompressionTrainer(BaseTrainer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=decoder_revision,
-            attn_implementation="sdpa",
+            attn_implementation=attention_impl,
             device_map=device,
         )
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)

@@ -57,6 +57,7 @@ from bgkit.models.lora_encoder import (
 )
 from bgkit.models.topic_embeddings import TopicEmbeddingModule
 from bgkit.training.base_trainer import BaseTrainer
+from bgkit.utils.attention_backend import resolve_attention_implementation
 
 logger = structlog.get_logger()
 
@@ -232,12 +233,18 @@ class KRKBTrainer(BaseTrainer):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._live_l0 = bool(self.step_cfg.get("live_l0", self._stage() == "A"))
+        attention_impl = resolve_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto")
+        )
 
         # --- Decoder ---
         decoder_name = self.cfg.model.decoder.backbone_name
         decoder_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         decoder_backbone = AutoModelForCausalLM.from_pretrained(
-            decoder_name, trust_remote_code=True, torch_dtype=decoder_dtype,
+            decoder_name,
+            trust_remote_code=True,
+            torch_dtype=decoder_dtype,
+            attn_implementation=attention_impl,
         ).to(self.device)
         hidden = decoder_backbone.get_input_embeddings().weight.shape[1]
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden)

@@ -44,7 +44,7 @@ class _MockAttn(nn.Module):
         self.post_attention_layernorm = nn.LayerNorm(d)
         self.mlp = _MockMLP(d)
 
-    def forward(self, h, pos_embeddings=None, attention_mask=None):
+    def forward(self, h, pos_embeddings=None, attention_mask=None, **kwargs):
         return self.self_attn(h) + h
 
 

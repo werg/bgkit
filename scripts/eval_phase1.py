@@ -35,6 +35,7 @@ from bgkit.eval.metrics.reconstruction import parse_success_rate
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.checkpointing import load_checkpoint
+from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.logging import setup_logging
 
 logger = structlog.get_logger()
@@ -47,6 +48,9 @@ def _load_models(cfg: DictConfig, device: torch.device):
 
     bgkit_cfg = cfg.model.bgkit
     hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
+    attention_impl = resolve_attention_implementation(
+        cfg.compute.get("attention_implementation", "auto")
+    )
 
     _metadata, state_dicts = load_checkpoint(Path(str(checkpoint_path)))
 
@@ -59,7 +63,7 @@ def _load_models(cfg: DictConfig, device: torch.device):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=bgkit_cfg.get("backbone_revision"),
-            attn_implementation="sdpa",
+            attn_implementation=attention_impl,
         )
     elif "model" in state_dicts:
         model_state = state_dicts["model"]
@@ -75,7 +79,7 @@ def _load_models(cfg: DictConfig, device: torch.device):
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
                 revision=bgkit_cfg.get("backbone_revision"),
-                attn_implementation="sdpa",
+                attn_implementation=attention_impl,
             )
         else:
             encoder = BgKITEncoder.from_pretrained(
@@ -84,7 +88,7 @@ def _load_models(cfg: DictConfig, device: torch.device):
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
                 revision=bgkit_cfg.get("backbone_revision"),
-                attn_implementation="sdpa",
+                attn_implementation=attention_impl,
             )
     else:
         raise ValueError(
@@ -101,7 +105,7 @@ def _load_models(cfg: DictConfig, device: torch.device):
         trust_remote_code=True,
         torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
         revision=decoder_cfg.get("backbone_revision"),
-        attn_implementation="sdpa",
+        attn_implementation=attention_impl,
     )
     decoder = ReconstructionDecoder(
         decoder_backbone,

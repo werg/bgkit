@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader
 from bgkit.data.datasets.swe_trajectory_dataset import SWETrajectoryDataset
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.training.base_trainer import BaseTrainer
+from bgkit.utils.attention_backend import resolve_attention_implementation
 
 logger = structlog.get_logger()
 
@@ -110,6 +111,9 @@ class DistillationTrainer(BaseTrainer):
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        attention_impl = resolve_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto")
+        )
 
         # Load decoder (student model)
         decoder_name = self.cfg.model.decoder.backbone_name
@@ -117,6 +121,7 @@ class DistillationTrainer(BaseTrainer):
             decoder_name,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16 if self.device.type == "cuda" else torch.float32,
+            attn_implementation=attention_impl,
         )
         decoder_backbone.to(self.device)
         self.decoder = ReconstructionDecoder(

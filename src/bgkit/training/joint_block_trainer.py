@@ -32,6 +32,7 @@ from bgkit.models.encoder import BgKITEncoder, _resolve_layers
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import enable_gradient_checkpointing
+from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.model_utils import count_parameters, slerp_merge
 
 logger = structlog.get_logger()
@@ -68,6 +69,9 @@ class JointBlockTrainer(BaseTrainer):
         tcfg = self.cfg.training
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
+        attention_impl = resolve_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto")
+        )
 
         # Load backbone
         backbone_name = self.cfg.model.bgkit.backbone_name
@@ -80,6 +84,7 @@ class JointBlockTrainer(BaseTrainer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=backbone_revision,
+            attn_implementation=attention_impl,
         )
 
         # Optional SLERP merge with decoder backbone
@@ -93,6 +98,7 @@ class JointBlockTrainer(BaseTrainer):
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
                 revision=decoder_revision,
+                attn_implementation=attention_impl,
             )
 
             sd_a = backbone.state_dict()
@@ -132,6 +138,7 @@ class JointBlockTrainer(BaseTrainer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=decoder_revision,
+            attn_implementation=attention_impl,
         )
         self.decoder_embed = decoder_model.get_input_embeddings()
         self.decoder_embed.requires_grad_(False)
