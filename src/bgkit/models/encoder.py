@@ -150,6 +150,7 @@ class BgKITEncoder(nn.Module):
         pinned_positions: torch.Tensor | None = None,
         target_ratio: float | None = None,
         level: str | None = None,
+        min_per_sample: int = 0,
     ) -> CompressionOutput:
         """Run the full encoder: compressor then projection block.
 
@@ -160,8 +161,12 @@ class BgKITEncoder(nn.Module):
             prompt_attention_mask: (B, P) optional mask for prompt positions.
             pinned_positions: (B, L) bool mask of content positions that MUST
                 survive, regardless of head output. OR'd into the hard mask.
-            target_ratio: Target compression ratio (e.g. 0.10). None means
-                no compression (no survivorship head, no flag embeddings).
+            target_ratio: Drives the dual-ascent target for θ and serves
+                as the sentinel for whether compression is active. The
+                operator compares logits against θ (owned by the
+                compressor's DualThresholdController), not against this
+                value directly. When None, the head/operator are skipped
+                entirely (no flag embeddings, no survivor mask).
             level: Which survivorship head / LoRA adapter to use ("l0",
                 "l1", or None). When None and target_ratio is set, defaults
                 to "l0".
@@ -183,6 +188,7 @@ class BgKITEncoder(nn.Module):
                 pinned_positions=pinned_positions,
                 target_ratio=target_ratio,
                 level=level or "l0",
+                min_per_sample=min_per_sample,
             )
 
             # Projection block sees the full sequence (prompt context preserved)
@@ -227,6 +233,23 @@ class BgKITEncoder(nn.Module):
             head_logits=comp_out.head_logits,
             survive_probs=comp_out.survive_probs,
             layer7_embeddings=comp_out.layer7_embeddings,
+            full_after_head=comp_out.full_after_head,
+            full_attention_mask=comp_out.attention_mask,
+            content_slice=comp_out.content_slice,
+            base_raw=comp_out.base_raw,
+            adapter_raw=comp_out.adapter_raw,
+            adapter_zm=comp_out.adapter_zm,
+            logits_for_op=comp_out.logits_for_op,
+            logits_for_softattn=comp_out.logits_for_softattn,
+            survive_probs_metrics=comp_out.survive_probs_metrics,
+            adapter_sum=comp_out.adapter_sum,
+            valid_count=comp_out.valid_count,
+            organic_count=comp_out.organic_count,
+            controllable_count=comp_out.controllable_count,
+            floor_trigger_rate=comp_out.floor_trigger_rate,
+            num_pinned=comp_out.num_pinned,
+            theta_tensor=comp_out.theta_tensor,
+            adapter_mu_tensor=comp_out.adapter_mu_tensor,
         )
 
     def auto_reproduce(self, normed_embeddings: torch.Tensor) -> torch.Tensor:
@@ -252,6 +275,8 @@ class BgKITEncoder(nn.Module):
         pruned: bool = False,
         conv_kernel_size: int = 16,
         survivorship_inner_dim: int = 256,
+        threshold_controller_cfg: dict | None = None,
+        adapter_mean_ema_cfg: dict | None = None,
     ) -> BgKITEncoder:
         """Construct a BgKITEncoder from a pretrained HF model.
 
@@ -293,6 +318,7 @@ class BgKITEncoder(nn.Module):
             return cls._from_pretrained_pruned(
                 raw_model, hidden_dim, torch_dtype, bidi_warmup_steps,
                 conv_kernel_size, survivorship_inner_dim,
+                threshold_controller_cfg, adapter_mean_ema_cfg,
             )
 
         if not isinstance(raw_model, BidirectionalQwen35) and _is_qwen35_model(raw_model):
@@ -314,6 +340,8 @@ class BgKITEncoder(nn.Module):
         compressor = BgKITCompressor(
             backbone, compressor_norm, hidden_dim=hidden_dim,
             survivorship_inner_dim=survivorship_inner_dim,
+            threshold_controller_cfg=threshold_controller_cfg,
+            adapter_mean_ema_cfg=adapter_mean_ema_cfg,
         )
 
         projection_block = ProjectionBlock(
@@ -333,6 +361,8 @@ class BgKITEncoder(nn.Module):
         bidi_warmup_steps: int,
         conv_kernel_size: int,
         survivorship_inner_dim: int = 256,
+        threshold_controller_cfg: dict | None = None,
+        adapter_mean_ema_cfg: dict | None = None,
     ) -> BgKITEncoder:
         """Construct a pruned BgKITEncoder from raw HF text model layers."""
         layers = _resolve_layers(text_model)
@@ -355,6 +385,8 @@ class BgKITEncoder(nn.Module):
         compressor = BgKITCompressor(
             pruned_backbone, compressor_norm, hidden_dim=hidden_dim,
             survivorship_inner_dim=survivorship_inner_dim,
+            threshold_controller_cfg=threshold_controller_cfg,
+            adapter_mean_ema_cfg=adapter_mean_ema_cfg,
         )
         projection_block = ProjectionBlock(
             projection_layer, projection_norm, rotary_emb, hidden_dim=hidden_dim,
@@ -377,6 +409,8 @@ class BgKITEncoder(nn.Module):
         bidi_warmup_steps: int = 0,
         conv_kernel_size: int = 16,
         survivorship_inner_dim: int = 256,
+        threshold_controller_cfg: dict | None = None,
+        adapter_mean_ema_cfg: dict | None = None,
     ) -> BgKITEncoder:
         """Construct a BgKITEncoder, auto-detecting pruned architecture from state dict.
 
@@ -396,14 +430,44 @@ class BgKITEncoder(nn.Module):
             pruned=pruned,
             conv_kernel_size=conv_kernel_size,
             survivorship_inner_dim=survivorship_inner_dim,
+            threshold_controller_cfg=threshold_controller_cfg,
+            adapter_mean_ema_cfg=adapter_mean_ema_cfg,
         )
-        result = encoder.load_state_dict(encoder_state_dict, strict=False)
+
+        # Filter legacy keys removed in the survivorship-head refactor.
+        # Pre-2026-04 Step 2 checkpoints carry compressor.ratio_embedding.*
+        # weights; the encoder no longer has that submodule. Also filter
+        # the old single-head names (compressor.survivorship_head_l{0,1}.*)
+        # that were replaced by the two-head split
+        # (head_base_l{0,1}, head_adapter_l{0,1}). Filtering avoids noisy
+        # "unexpected keys" entries and prevents accidentally loading an
+        # old unpruned head into the new base head (distribution mismatch).
+        # The encoder receives a sub-state-dict rooted at compressor.*
+        # (NOT encoder.compressor.*), so prefixes are plain compressor.*.
+        legacy_prefixes = (
+            "compressor.ratio_embedding.",
+            "compressor.survivorship_head_l0.",
+            "compressor.survivorship_head_l1.",
+        )
+        filtered_state_dict = {
+            k: v for k, v in encoder_state_dict.items()
+            if not any(k.startswith(p) for p in legacy_prefixes)
+        }
+        n_filtered = len(encoder_state_dict) - len(filtered_state_dict)
+        import logging
+        logger = logging.getLogger(__name__)
+        if n_filtered > 0:
+            logger.info(
+                "filtered %d legacy ratio_embedding key(s) from encoder state dict",
+                n_filtered,
+            )
+
+        result = encoder.load_state_dict(filtered_state_dict, strict=False)
         if result.missing_keys:
-            import logging
-            logger = logging.getLogger(__name__)
             logger.info(
                 "Missing keys when loading encoder state dict (expected for "
-                "new survivorship head components): %s",
+                "new survivorship head / threshold controller / adapter EMA "
+                "components, which initialize from config defaults): %s",
                 result.missing_keys,
             )
         return encoder

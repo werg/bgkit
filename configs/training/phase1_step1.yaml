@@ -41,12 +41,44 @@ target_ratio_start: 0.75       # min ratio starts here (actual ratio drawn rando
 target_ratio_end: 0.10         # ramp min ratio down to 10% retention
 target_ratio_ramp_steps: 3000  # ramp over 3k steps from compression intro (runtime controllable)
 
-# Survivorship head auxiliary losses
+# Survivorship head auxiliary losses, per level. Step 1 only consumes l0;
+# l1 included for forward compatibility with later steps.
+#
+# Step 1 is the COLDEST start in the entire pipeline. BCE warmup is long
+# (4000 steps to match the original encoder-unfreeze + bidi-warmup window)
+# so the head has plenty of signal before it must operate alone.
 survivorship:
-  ratio_loss_weight: 0.1
-  decisiveness_loss_weight: 0.05
-  soft_attn_loss_weight: 0.05
-  soft_attn_every_n_steps: 4
+  soft_attn_every_n_steps: 1
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    soft_attn_loss_weight: 0.2
+    moment_match_weight: 0.1
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    soft_attn_loss_weight: 0.3
+    moment_match_weight: 0.0
+
+ice_distillation:
+  checkpoint_path: /workspace/checkpoints/ice_step89999_20260306_213825
+  input_dim: 1024
+  hidden_dim: 192
+  num_layers: 3
+  kernel_size: 5
+  l0:
+    enabled: true
+    bce_warmup_weight: 0.5
+    bce_warmup_steps: 4000          # long warmup — coldest start in pipeline
+    teacher_ratio: 0.10
+  l1:
+    enabled: false
+
+moment_match_reference:
+  l0:
+    path: ${oc.env:DATA_DIR}/diagnostics/ice_reference_moments.json
+  l1:
+    path: null
 
 # Fresh wandb run for new training regime
 reset_wandb: true

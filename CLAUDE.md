@@ -108,13 +108,32 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 
 **Training phase pipeline**: Joint Block Pretrain → Phase 1 Steps 1-5 (compression pre-training on code) → Phase 2 (single-doc KR Steps 1-4, KB-scale KR Stages A/B/C, Track B git history, Track C user memory) → Phase 3 (agentic distillation from SWE-bench trajectories). The decoder is **Qwen3.5-0.8B throughout** — bgkit does not train any larger in-house target LLM.
 
-**Survivorship head**: Phase 1 Step 3+ and Phase 2 use a learned survivorship head inside the encoder (at layer 7 / pruned block 1) to select per-position survivors. Replaces the earlier frozen ICE model + ThresholdCalibrator + `fill_survivor_gaps` pipeline. Separate head instances for L0 and L1. Target compression ratio is injected via a learned embedding at layer 3. Hard flag embeddings (survive/doomed) propagate the decision to layers 8-22 for consolidation. See `configs/model/survivorship_head.yaml` and the `survivorship:` section in each training config.
+**Survivorship head (2026-04-15 pivot)**: Phase 1 Step 3+ and Phase 2 use a **two-head split** inside the encoder (at layer 7 / pruned block 1):
+
+- `head_base_l{0,1}`: BCE/moment-match anchor (ICE-aligned at L0).
+- `head_adapter_l{0,1}`: zero-init no-op at step 0; trained ONLY by soft-attn loss to redistribute mass based on actual decoder usage.
+- Composed logit: `final = base + (adapter_raw − μ)` where μ is an **EMA-tracked buffer** of `mean(adapter_raw)` (NOT a free parameter — see `docs/survivorship_design.md`).
+
+Selection is `logit > θ` against a single global threshold θ owned by `DualThresholdController` and updated externally by **dual ascent** on the aggregate keep-rate against the curriculum's target compression ratio. There is **no straight-through estimator** on the hard mask — head gradient flows only via BCE + moment-match (→ base) and soft-attn (→ adapter).
+
+The earlier ratio-embedding-at-layer-3 was **removed**. `target_ratio` is consumed by the operator (DualThresholdController), not by a learned embedding. See "Known limitations" below for the Phase 2 KB regression this introduces.
+
+Hard flag embeddings (survive/doomed) propagate the decision to subsequent layers for consolidation. See `configs/model/survivorship_head.yaml` and the per-level `survivorship.l{0,1}` blocks in each training config.
 
 **Survivorship training signals** (all stages):
-- **Aggregate ratio loss**: `(mean(survive_probs) - target_ratio)^2` — drives mean survival toward the configured ratio in aggregate across the batch.
-- **Decisiveness loss**: `mean(4 * p * (1-p))` — penalizes probabilities near 0.5, pushing the head toward bimodal output (near 0 or near 1) so the `p > 0.5` hard mask produces clean selections.
-- **Soft attention (interleaved)**: every Nth step runs a second decoder forward with prob-gated layer-7 embeddings in place of hard survivors. Gradient flows from decoder CE loss back to the head through `survive_probs`, bypassing layers 8-22.
-- **Relevance loss** (Phase 2 only): per-group aggregate-ratio targets. Gold-article positions (IDs + content) target `gold_boost × target_ratio` (default 1.5× — upsample), distractor positions target `distractor_damp × target_ratio` (default 0.5× — mildly downsample). Distractors aren't suppressed to zero since their IDs may legitimately be referenced in subsequent bgkit calls; they're just biased toward lower survival than gold.
+- **BCE warmup** (L0, steps 0-`bce_warmup_steps`): direct ICE-teacher supervision on `base_raw` at a fixed `teacher_ratio` (0.10 by default). Cuts off hard at the warmup boundary; ICE is then unloadable via `ICETeacher.unload()` — no runtime ICE dependency post-warmup.
+- **Moment match** (L0, permanent): MSE between standardized 3rd+4th moments of `base_raw` and *fixed* reference moments pre-computed offline by `scripts/probe_ice_distribution.py` (saved as two floats in `$DATA_DIR/diagnostics/ice_reference_moments.json`).
+- **Decisiveness loss** (L1 primary, L0 off by default): `mean(4·p·(1-p))` penalizes probabilities near 0.5. At L1 it provides the symmetry-break signal that BCE provides at L0.
+- **Soft attention** (every step, weight 0.2 at L0, 0.3 at L1): runs a second decoder forward via `PrunedBidirectionalQwen35.forward_from_block(start_block=2)` on prob-gated layer-7 embeddings (boundary-matched to the hard forward). Gradient flows from decoder CE loss through `softattn_probs` back to the head **adapter** (base is detached in `logits_for_softattn`).
+- **Aggregate ratio loss** (default weight 0.0 — defer to dual-ascent θ): when used, `(mean(σ(logits − θ)) − target)²`.
+- **Relevance loss** (Phase 2 only): per-group aggregate-ratio targets. Gold-article positions (IDs + content) target `gold_boost × target_ratio` (default 1.5× — upsample), distractor positions target `distractor_damp × target_ratio` (default 0.5× — mildly downsample).
+
+**Dual-ascent θ + EMA μ under gradient accumulation**: token-budget batching gives microbatches with variable valid/controllable counts. The trainer aggregates `(sum, count)` tuples per microbatch (via `accumulate(state, enc_out)` from `bgkit.training.survivorship_helpers`) and updates θ and μ ONCE per optimizer step using the **true global mean** (NOT mean-of-means).
+
+**Checkpoint registry note (Step 2 ratio_embedding key filter)**: as of 2026-04-15, the `compressor.ratio_embedding.*` submodule was removed. `BgKITEncoder.from_pretrained_with_state_dict` filters those keys from old Step 2 checkpoints before loading (one-time safety filter logged at INFO). Remove this filter once Step 2 is re-run under the new architecture.
+
+**Known limitations**:
+- **Phase 2 KB ratio-conditioning regression** (pending separate design pass): removing the ratio embedding means the encoder backbone no longer adapts representation per ratio. For Phase 2 KB with per-query ratios in the Pareto sweep at [0.5, 0.1, 0.05, 0.02, 0.01], this likely hurts ablation numbers at extreme ratios. See `docs/survivorship_design.md §Phase 2 KB regression` for the constraint and possible mitigations.
 
 | Task | Command |
 |---|---|

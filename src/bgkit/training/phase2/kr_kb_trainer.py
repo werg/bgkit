@@ -334,6 +334,18 @@ class KRKBTrainer(BaseTrainer):
         self._l1_retention = float(self.step_cfg.get("l1_retention", 0.15))
 
         # --- Survivorship head aux losses ---
+        # Phase 2 layers per-level config on top of the legacy trainer-scope
+        # ratio/decisiveness/relevance knobs. The per-level blocks drive
+        # BCE warmup + moment match + soft-attn weight; the legacy knobs
+        # remain for L0/L1 aggregate-ratio + relevance (which has no
+        # Phase 1 analogue).
+        from bgkit.training.survivorship_helpers import (
+            init_state,
+            load_reference_moments,
+            resolve_level_ice_cfg,
+            resolve_level_loss_cfg,
+        )
+
         surv_cfg = self.step_cfg.get("survivorship", {}) or {}
         self._ratio_loss_weight = float(surv_cfg.get("ratio_loss_weight", 0.1))
         self._decisiveness_loss_weight = float(
@@ -342,6 +354,61 @@ class KRKBTrainer(BaseTrainer):
         self._soft_attn_loss_weight = float(surv_cfg.get("soft_attn_loss_weight", 0.05))
         self._soft_attn_every_n_steps = int(surv_cfg.get("soft_attn_every_n_steps", 4))
         self._relevance_loss_weight = float(surv_cfg.get("relevance_loss_weight", 0.05))
+
+        self._surv_l0 = resolve_level_loss_cfg(surv_cfg.get("l0", {}))
+        self._surv_l1 = resolve_level_loss_cfg(surv_cfg.get("l1", {}))
+
+        ice_cfg = self.step_cfg.get("ice_distillation", {}) or {}
+        self._ice_l0 = resolve_level_ice_cfg(ice_cfg.get("l0", {}))
+        self._ice_l1 = resolve_level_ice_cfg(ice_cfg.get("l1", {}))
+        self._max_warmup_step = max(
+            self._ice_l0.bce_warmup_steps if self._ice_l0.enabled else 0,
+            self._ice_l1.bce_warmup_steps if self._ice_l1.enabled else 0,
+        )
+        self._ice_teacher = None
+        if (
+            (self._ice_l0.enabled and self._ice_l0.bce_warmup_weight > 0)
+            or (self._ice_l1.enabled and self._ice_l1.bce_warmup_weight > 0)
+        ):
+            from bgkit.models.ice_teacher import ICETeacher
+            ice_path = ice_cfg["checkpoint_path"]
+            embed_tokens = self.encoder.compressor.backbone.embed_tokens
+            self._ice_teacher = ICETeacher(
+                ice_path, embed_tokens,
+                input_dim=int(ice_cfg.get("input_dim", 1024)),
+                hidden_dim=int(ice_cfg.get("hidden_dim", 192)),
+                num_layers=int(ice_cfg.get("num_layers", 3)),
+                kernel_size=int(ice_cfg.get("kernel_size", 5)),
+            ).to(self.device)
+
+        mm_ref = self.step_cfg.get("moment_match_reference", {}) or {}
+        self._ref_moments_l0 = None
+        self._ref_moments_l1 = None
+        # OmegaConf's DictConfig is not a dict subclass; use duck-typed access.
+        _l0_block = mm_ref.get("l0", None) if hasattr(mm_ref, "get") else None
+        l0_path = _l0_block.get("path", None) if _l0_block is not None and hasattr(_l0_block, "get") else None
+        if self._surv_l0.moment_match_weight > 0 and l0_path:
+            self._ref_moments_l0 = load_reference_moments(l0_path)
+        _l1_block = mm_ref.get("l1", None) if hasattr(mm_ref, "get") else None
+        l1_path = _l1_block.get("path", None) if _l1_block is not None and hasattr(_l1_block, "get") else None
+        if self._surv_l1.moment_match_weight > 0 and l1_path:
+            self._ref_moments_l1 = load_reference_moments(l1_path)
+
+        # Stage B flag: when True, L0 is cached + L0 LoRA frozen, so we
+        # skip L0 θ/μ updates in post-step. Must be set explicitly —
+        # defaulting silently would cause wrong θ/μ behavior at Stage B
+        # if the key is ever omitted.
+        if "live_l0" not in self.step_cfg:
+            raise ValueError(
+                "Phase 2 KR/KB config missing required key 'live_l0'. "
+                "Set `live_l0: true` for Stage A (live-L0 training) or "
+                "`live_l0: false` for Stage B (cached L0, L0 LoRA frozen)."
+            )
+        self._live_l0 = bool(self.step_cfg.get("live_l0"))
+
+        self._surv_state_l0 = init_state()
+        self._surv_state_l1 = init_state()
+        self._last_post_step_metrics: dict[str, float] = {}
         # Per-position target ratio multipliers applied atop the global
         # target. Gold-article positions get upsampled (retain more);
         # distractor positions get downsampled (retain less). A value of
@@ -2180,14 +2247,36 @@ class KRKBTrainer(BaseTrainer):
         metrics: dict[str, float] = {}
         total = torch.zeros((), device=self.device, dtype=torch.float32)
 
-        # --- L0 aux losses (ratio + decisiveness) ---
+        # Ratio / decisiveness / relevance are operator-side shape losses;
+        # they pull the BASE head, not the adapter. To honor the
+        # "soft-attn trains adapter only" invariant, we recompute probs
+        # from `base_raw + adapter_zm.detach()` — attached on base,
+        # detached on adapter. This mirrors the design in
+        # compute_survivorship_losses but uses the attached base path
+        # (rather than base_raw directly) so that θ's role in the prob
+        # computation still matters. The probs go to the BASE subgraph.
         l0_ratio_losses: list[torch.Tensor] = []
         l0_decisive_losses: list[torch.Tensor] = []
         for entry in self._pending_l0_outputs:
             enc_out = entry["enc_out"]
-            probs = enc_out.survive_probs
-            if probs is None:
+            base_raw = enc_out.base_raw
+            adapter_zm = enc_out.adapter_zm
+            if base_raw is None:
                 continue
+            # base_attached + adapter_detached — gradient to head_base only.
+            logits_base_only = base_raw + (
+                adapter_zm.detach() if adapter_zm is not None else 0.0
+            )
+            theta_t = getattr(enc_out, "theta_tensor", None)
+            if theta_t is None:
+                legacy = getattr(enc_out, "theta_value", 0.0)
+                theta_t = torch.tensor(
+                    float(legacy), dtype=torch.float32,
+                    device=base_raw.device,
+                )
+            probs = torch.sigmoid(
+                logits_base_only.float() - theta_t.to(base_raw.device).float()
+            ).to(base_raw.dtype)
             target_ratio = entry["ratio"]
             mean_prob = probs.float().mean()
             l0_ratio_losses.append((mean_prob - target_ratio) ** 2)
@@ -2205,14 +2294,31 @@ class KRKBTrainer(BaseTrainer):
             metrics["l0_decisiveness_loss"] = l0_decisive_loss.item()
 
         # --- L1 aux losses (ratio + decisiveness + relevance) ---
+        # Same recomposition as L0: base attached, adapter detached — so
+        # these losses train head_base_l1 only, not head_adapter_l1. The
+        # adapter receives its gradient exclusively via soft-attn.
         l1_ratio_losses: list[torch.Tensor] = []
         l1_decisive_losses: list[torch.Tensor] = []
         l1_relevance_losses: list[torch.Tensor] = []
         for entry in self._pending_l1_outputs:
             enc_out = entry["enc_out"]
-            probs = enc_out.survive_probs
-            if probs is None:
+            base_raw = enc_out.base_raw
+            adapter_zm = enc_out.adapter_zm
+            if base_raw is None:
                 continue
+            logits_base_only = base_raw + (
+                adapter_zm.detach() if adapter_zm is not None else 0.0
+            )
+            theta_t = getattr(enc_out, "theta_tensor", None)
+            if theta_t is None:
+                legacy = getattr(enc_out, "theta_value", 0.0)
+                theta_t = torch.tensor(
+                    float(legacy), dtype=torch.float32,
+                    device=base_raw.device,
+                )
+            probs = torch.sigmoid(
+                logits_base_only.float() - theta_t.to(base_raw.device).float()
+            ).to(base_raw.dtype)
             target_ratio = entry["ratio"]
             content_mask = entry["content_mask"]
             pinned = entry["pinned"]
@@ -2316,23 +2422,90 @@ class KRKBTrainer(BaseTrainer):
             if not any(s == sample_idx for s, _ in addrs):
                 continue
             enc_out = entry["enc_out"]
-            if enc_out.survive_probs is None or enc_out.layer7_embeddings is None:
+            if (
+                enc_out.logits_for_softattn is None
+                or enc_out.layer7_embeddings is None
+            ):
                 continue
-            # Prob-gate content positions only
+            # Prob-gate content positions via the adapter-only gradient
+            # path. Recompute softattn_probs here so gradient flows through
+            # `adapter_zm` only (base is detached in logits_for_softattn).
+            # Pick the level-appropriate controller: entries from L0 use
+            # threshold_l0, L1 entries use threshold_l1. _pending_l1_outputs
+            # is named for the outer pipeline stage but a given entry may
+            # have been produced at either level — check the marker.
             content_mask = entry["content_mask"]
-            probs = enc_out.survive_probs
-            l7 = enc_out.layer7_embeddings
-            # layer7_embeddings are content-only (no prompt prefix).
-            gated = probs.unsqueeze(-1) * l7  # (B, L_content, D)
-
-            # Run projection block on the gated full sequence. The block
-            # expects a full-sequence tensor; passing survivor_mask=None
-            # extracts all positions (no hard extraction). But we also
-            # need attention_mask to know which positions are padding.
-            proj_out = self.encoder.projection_block(
-                gated, content_mask.to(gated.dtype), survivor_mask=None,
+            compressor = self.encoder.compressor
+            level = entry.get("level", "l1")
+            controller = (
+                compressor.threshold_l0 if level == "l0"
+                else compressor.threshold_l1
             )
-            proj_full = proj_out.projected_embeddings  # (B, L_content, D)
+            theta = controller.theta.to(self.device)
+            logits_softattn = enc_out.logits_for_softattn
+            l7 = enc_out.layer7_embeddings
+            base_dtype = l7.dtype
+            softattn_probs = torch.sigmoid(
+                logits_softattn.float() - theta.float()
+            ).to(base_dtype)
+
+            # Soft-blend flag embeddings while preserving layer7 content.
+            # Matches the hard forward at p∈{0,1} (see design doc).
+            survive_emb = compressor.survive_embedding.to(base_dtype)
+            doomed_emb = compressor.doomed_embedding.to(base_dtype)
+            p = softattn_probs.unsqueeze(-1)
+            gated_content = l7 + p * survive_emb + (1.0 - p) * doomed_emb
+
+            # Splice gated content into the detached post-block-1 full
+            # hidden so blocks 2..end attend over prompt + content as in
+            # the hard forward. `enc_out.full_after_head` carries the
+            # post-head hidden for [prompt, sep, content-with-flags];
+            # content_slice identifies where to splice.
+            full_after_head = enc_out.full_after_head
+            full_attn_mask = enc_out.full_attention_mask
+            content_slice_full = enc_out.content_slice
+
+            try:
+                if full_after_head is not None and content_slice_full is not None:
+                    full_hidden = full_after_head.clone().to(base_dtype)
+                    full_hidden[:, content_slice_full, :] = gated_content
+                    # Head hook fires after backbone block 1; blocks 2..end
+                    # remain. Block indices are positions in the backbone,
+                    # NOT indices into the hooks dict — `start_block=2`
+                    # is stable regardless of hook dict sparsity.
+                    full_layer22 = compressor.backbone.forward_from_block(
+                        hidden=full_hidden,
+                        start_block=2,
+                        attention_mask=full_attn_mask,
+                        apply_final_norm=True,
+                    ).last_hidden_state
+                    # Projection block on FULL sequence so rotary positional
+                    # encodings match the hard forward; slice content out.
+                    proj_out = self.encoder.projection_block(
+                        full_layer22, full_attn_mask, survivor_mask=None,
+                    )
+                    proj_full = proj_out.projected_embeddings[:, content_slice_full, :]
+                else:
+                    full_layer22 = compressor.backbone.forward_from_block(
+                        hidden=gated_content,
+                        start_block=2,
+                        attention_mask=content_mask.bool(),
+                        apply_final_norm=True,
+                    ).last_hidden_state
+                    proj_out = self.encoder.projection_block(
+                        full_layer22, content_mask.to(gated_content.dtype),
+                        survivor_mask=None,
+                    )
+                    proj_full = proj_out.projected_embeddings
+            except (AttributeError, ValueError):
+                # Non-pruned backbone has no forward_from_block; fall back
+                # to the projection block alone (truncated signal).
+                full_layer22 = gated_content
+                proj_out = self.encoder.projection_block(
+                    full_layer22, content_mask.to(gated_content.dtype),
+                    survivor_mask=None,
+                )
+                proj_full = proj_out.projected_embeddings  # (B, L_content, D)
 
             # For each turn in this bucket that belongs to our sample,
             # slice out its non-padding soft survivors.
@@ -2546,6 +2719,95 @@ class KRKBTrainer(BaseTrainer):
         if self._ablation_mode == self.ABLATION_NOISE:
             return torch.randn_like(survivors) * 0.02
         return survivors
+
+    # ------------------------------------------------------------------
+    # Post-optimizer-step hooks
+    # ------------------------------------------------------------------
+
+    def _post_optimizer_step(self, step: int) -> None:
+        """Run dual-ascent θ + EMA μ updates per level using true-mean aggregation.
+
+        Stage A: live L0 → update both L0 and L1.
+        Stage B: cached L0 with L0 LoRA frozen → skip L0 updates.
+        """
+        # Accumulate pending L0/L1 outputs into per-level state, then apply.
+        from bgkit.training.survivorship_helpers import (
+            accumulate,
+            apply_post_step_updates,
+            init_state,
+            maybe_unload_ice,
+        )
+
+        # L0 target: per-microbatch ratios differ by dataset. Weight each
+        # microbatch by its controllable_count so θ targets the true
+        # batch-weighted mean ratio — matches the aggregation semantics of
+        # the sum/count accumulator.
+        l0_target_num = 0.0
+        l0_target_den = 0.0
+        for entry in getattr(self, "_pending_l0_outputs", []):
+            enc_out = entry.get("enc_out")
+            if enc_out is None:
+                continue
+            accumulate(self._surv_state_l0, enc_out)
+            if enc_out.controllable_count is not None:
+                cc = int(enc_out.controllable_count.item())
+                l0_target_num += float(entry.get("ratio", self._l1_retention)) * cc
+                l0_target_den += cc
+        for entry in getattr(self, "_pending_l1_outputs", []):
+            enc_out = entry.get("enc_out")
+            if enc_out is not None:
+                accumulate(self._surv_state_l1, enc_out)
+
+        if l0_target_den > 0:
+            target_l0 = l0_target_num / l0_target_den
+        elif isinstance(self._l0_retention, (int, float)):
+            target_l0 = float(self._l0_retention)
+        else:
+            # No per-dataset weighting available; fall back to the mean
+            # across configured datasets.
+            vals = [float(v) for v in self._l0_retention.values()] if self._l0_retention else []
+            target_l0 = sum(vals) / len(vals) if vals else 0.10
+        target_l1 = float(self._l1_retention)
+
+        merged: dict[str, float] = {}
+        # L0 update: skip if Stage B (cached L0, L0 LoRA frozen).
+        l0_metrics = apply_post_step_updates(
+            self.encoder.compressor,
+            self._surv_state_l0,
+            target_ratio=target_l0,
+            level="l0",
+            skip_threshold_step=not self._live_l0,
+            skip_ema_update=not self._live_l0,
+        )
+        merged.update(l0_metrics)
+        self._surv_state_l0 = init_state()
+
+        # L1 always updates.
+        l1_metrics = apply_post_step_updates(
+            self.encoder.compressor,
+            self._surv_state_l1,
+            target_ratio=target_l1,
+            level="l1",
+        )
+        merged.update(l1_metrics)
+        self._surv_state_l1 = init_state()
+
+        self._last_post_step_metrics = merged
+
+        unloaded = maybe_unload_ice(
+            getattr(self, "_ice_teacher", None),
+            step,
+            getattr(self, "_max_warmup_step", 0),
+        )
+        if unloaded:
+            logger.info("ice_teacher_unloaded", step=step)
+
+    def _add_step_metrics(self, metrics: dict[str, float]) -> None:
+        """Attach post-step θ/μ updates (without clobbering base keys)."""
+        post = getattr(self, "_last_post_step_metrics", None)
+        if post:
+            for k, v in post.items():
+                metrics.setdefault(k, v)
 
     # ------------------------------------------------------------------
     # Evaluation

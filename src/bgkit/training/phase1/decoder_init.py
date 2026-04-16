@@ -164,6 +164,21 @@ class DecoderInitTrainer(BaseTrainer):
             )
             # Also load decoder weights if present (step 2 checkpoints include it)
             self._bgkit_decoder_state = bgkit_state_dicts.get("decoder", None)
+            # Optional: load a pre-distilled head_base_l0 sidecar as a warm
+            # start. Produced by scripts/pretrain_survivorship_head.py.
+            sidecar_path = self.cfg.training.get(
+                "survivorship_head_sidecar", None,
+            )
+            if sidecar_path:
+                sidecar = torch.load(sidecar_path, map_location="cpu", weights_only=True)
+                res = self.encoder.load_state_dict(sidecar, strict=False)
+                n_loaded = len(sidecar) - len(res.unexpected_keys)
+                logger.info(
+                    "loaded_survivorship_sidecar",
+                    path=sidecar_path,
+                    loaded_keys=n_loaded,
+                    unexpected=len(res.unexpected_keys),
+                )
         else:
             logger.info("loading_bgkit_encoder", model=backbone_name, revision=backbone_revision)
             self.encoder = BgKITEncoder.from_pretrained(
@@ -240,12 +255,89 @@ class DecoderInitTrainer(BaseTrainer):
         # --- Compression curriculum state ---
         self._init_curriculum_state(tcfg)
 
-        # --- Survivorship head config ---
+        # --- Survivorship head config (per-level) ---
+        from bgkit.training.survivorship_helpers import (
+            init_state,
+            load_reference_moments,
+            resolve_level_ice_cfg,
+            resolve_level_loss_cfg,
+        )
+
         surv_cfg = tcfg.get("survivorship", {})
-        self._ratio_loss_weight = surv_cfg.get("ratio_loss_weight", 0.1)
-        self._decisiveness_loss_weight = surv_cfg.get("decisiveness_loss_weight", 0.05)
-        self._soft_attn_loss_weight = surv_cfg.get("soft_attn_loss_weight", 0.05)
-        self._soft_attn_every_n_steps = surv_cfg.get("soft_attn_every_n_steps", 4)
+        # Step 3 only consumes l0; l1 may be absent.
+        self._surv_l0 = resolve_level_loss_cfg(surv_cfg.get("l0", {}))
+        self._surv_l1 = resolve_level_loss_cfg(surv_cfg.get("l1", {}))
+        self._soft_attn_every_n_steps = int(surv_cfg.get("soft_attn_every_n_steps", 1))
+        # Soft-attn activation step: before this step, the soft-attn forward
+        # is skipped entirely (saves ~1.8× FLOPs). After, it fires at the
+        # configured cadence. Defaults to 0 = active from step 0 (legacy).
+        self._soft_attn_start_step = int(surv_cfg.get("soft_attn_start_step", 0))
+
+        # Floor knobs for the operator (passed to encoder.forward).
+        ctrl_cfg = self.cfg.model.get("threshold_controller", {}) if hasattr(
+            self.cfg.model, "get",
+        ) else {}
+        self._floor_warmup = int(ctrl_cfg.get("min_per_sample_during_warmup", 1))
+        self._floor_post_warmup = int(ctrl_cfg.get("min_per_sample_post_warmup", 0))
+
+        # --- ICE distillation teacher (per-level) ---
+        ice_cfg = tcfg.get("ice_distillation", {})
+        self._ice_l0 = resolve_level_ice_cfg(ice_cfg.get("l0", {}))
+        self._ice_l1 = resolve_level_ice_cfg(ice_cfg.get("l1", {}))
+        self._max_warmup_step = max(
+            self._ice_l0.bce_warmup_steps if self._ice_l0.enabled else 0,
+            self._ice_l1.bce_warmup_steps if self._ice_l1.enabled else 0,
+        )
+        self._ice_teacher = None
+        if (
+            (self._ice_l0.enabled and self._ice_l0.bce_warmup_weight > 0)
+            or (self._ice_l1.enabled and self._ice_l1.bce_warmup_weight > 0)
+        ):
+            from bgkit.models.ice_teacher import ICETeacher
+
+            ice_path = ice_cfg["checkpoint_path"]
+            embed_tokens = self.encoder.compressor.backbone.embed_tokens
+            self._ice_teacher = ICETeacher(
+                ice_path,
+                embed_tokens,
+                input_dim=int(ice_cfg.get("input_dim", 1024)),
+                hidden_dim=int(ice_cfg.get("hidden_dim", 192)),
+                num_layers=int(ice_cfg.get("num_layers", 3)),
+                kernel_size=int(ice_cfg.get("kernel_size", 5)),
+            ).to(device)
+            logger.info(
+                "ice_teacher_loaded",
+                path=ice_path,
+                bce_warmup_steps_l0=self._ice_l0.bce_warmup_steps,
+                bce_warmup_steps_l1=self._ice_l1.bce_warmup_steps,
+            )
+
+        # --- Moment-match reference moments (per-level) ---
+        # OmegaConf's DictConfig is not a dict subclass; use duck-typed access.
+        mm_ref = tcfg.get("moment_match_reference", {}) or {}
+        self._ref_moments_l0 = None
+        self._ref_moments_l1 = None
+        _l0_block = mm_ref.get("l0", None) if hasattr(mm_ref, "get") else None
+        l0_path = _l0_block.get("path", None) if _l0_block is not None and hasattr(_l0_block, "get") else None
+        if self._surv_l0.moment_match_weight > 0 and l0_path:
+            self._ref_moments_l0 = load_reference_moments(l0_path)
+            logger.info("moment_match_ref_l0_loaded", path=l0_path,
+                        skew=self._ref_moments_l0[0], kurt=self._ref_moments_l0[1])
+        elif self._surv_l0.moment_match_weight > 0:
+            raise ValueError(
+                "survivorship.l0.moment_match_weight > 0 requires "
+                "moment_match_reference.l0.path. Run "
+                "scripts/probe_ice_distribution.py to generate the file."
+            )
+        _l1_block = mm_ref.get("l1", None) if hasattr(mm_ref, "get") else None
+        l1_path = _l1_block.get("path", None) if _l1_block is not None and hasattr(_l1_block, "get") else None
+        if self._surv_l1.moment_match_weight > 0 and l1_path:
+            self._ref_moments_l1 = load_reference_moments(l1_path)
+
+        # Per-optimizer-step microbatch aggregation state (re-init at each
+        # optimizer step boundary).
+        self._surv_state_l0 = init_state()
+        self._surv_state_l1 = init_state()
 
         # --- Dataset ---
         data_dir = self.cfg.data.tokens.input_dir
@@ -777,34 +869,45 @@ class DecoderInitTrainer(BaseTrainer):
         self,
         enc_out,
         target_ratio: float,
+        content_token_ids: torch.Tensor | None = None,
+        content_attention_mask: torch.Tensor | None = None,
+        level: str = "l0",
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute auxiliary survivorship head losses.
+        """Delegate to ``compute_survivorship_losses`` from the shared helpers.
 
-        Returns:
-            (total_aux_loss, metrics_dict) where total_aux_loss is ready to add
-            to the main loss and metrics_dict has per-loss scalars.
+        Step 3 only consumes l0; level kwarg is forward-compatible for Step 4+.
+        BCE/moment-match consume base_raw directly (NOT logits_for_op) — base
+        is independently anchored to ICE; adapter is free to deviate.
         """
-        probs = enc_out.survive_probs  # (B, L_content)
-        if probs is None:
-            return torch.tensor(0.0, device=self.device), {}
-
-        metrics: dict[str, float] = {}
-
-        # Aggregate ratio loss: (mean(probs) - target)^2
-        mean_prob = probs.mean()
-        ratio_loss = (mean_prob - target_ratio) ** 2
-        metrics["ratio_loss"] = ratio_loss.item()
-        metrics["mean_survive_prob"] = mean_prob.item()
-
-        # Decisiveness loss: mean(4 * p * (1-p)) — penalizes probs near 0.5
-        decisiveness_loss = (4 * probs * (1 - probs)).mean()
-        metrics["decisiveness_loss"] = decisiveness_loss.item()
-
-        total = (
-            self._ratio_loss_weight * ratio_loss
-            + self._decisiveness_loss_weight * decisiveness_loss
+        from bgkit.training.survivorship_helpers import (
+            LevelICECfg,
+            LevelLossCfg,
+            compute_survivorship_losses,
         )
-        return total, metrics
+
+        if level == "l0":
+            weights = getattr(self, "_surv_l0", LevelLossCfg())
+            ice_cfg = getattr(self, "_ice_l0", LevelICECfg())
+            ref_moments = getattr(self, "_ref_moments_l0", None)
+        elif level == "l1":
+            weights = getattr(self, "_surv_l1", LevelLossCfg())
+            ice_cfg = getattr(self, "_ice_l1", LevelICECfg())
+            ref_moments = getattr(self, "_ref_moments_l1", None)
+        else:
+            raise ValueError(f"Unknown level: {level!r}")
+
+        return compute_survivorship_losses(
+            enc_out=enc_out,
+            level=level,
+            weights=weights,
+            ice_cfg=ice_cfg,
+            ref_moments=ref_moments,
+            ice_teacher=getattr(self, "_ice_teacher", None),
+            global_step=self.global_step,
+            content_token_ids=content_token_ids,
+            content_attn_mask=content_attention_mask,
+            target_ratio=target_ratio,
+        )
 
     # ------------------------------------------------------------------
     # Forward / backward
@@ -828,6 +931,22 @@ class DecoderInitTrainer(BaseTrainer):
 
         target_ratio = self._current_target_ratio() if self._compression_active else None
 
+        # Per-sample floor: active during BCE warmup (so the head doesn't
+        # starve the decoder while it learns), disabled afterward so
+        # zero-survivor samples are accepted as legitimate signal at full
+        # compression. Pin to the L0 schedule (Step 3 trains L0 only).
+        ice_teacher = getattr(self, "_ice_teacher", None)
+        ice_l0 = getattr(self, "_ice_l0", None)
+        if (
+            ice_teacher is not None
+            and ice_l0 is not None
+            and ice_l0.enabled
+            and self.global_step < ice_l0.bce_warmup_steps
+        ):
+            min_per_sample = getattr(self, "_floor_warmup", 1)
+        else:
+            min_per_sample = getattr(self, "_floor_post_warmup", 0)
+
         # When the compressor is frozen AND the projection block is NOT
         # trainable, wrap in no_grad to save memory. Otherwise we must run
         # with autograd enabled so gradients can flow through the trainable
@@ -846,6 +965,7 @@ class DecoderInitTrainer(BaseTrainer):
                     prompt_attention_mask=compression_prompt_mask,
                     target_ratio=target_ratio,
                     level="l0",
+                    min_per_sample=min_per_sample,
                 )
         else:
             enc_out = self.encoder(
@@ -855,6 +975,7 @@ class DecoderInitTrainer(BaseTrainer):
                 prompt_attention_mask=compression_prompt_mask,
                 target_ratio=target_ratio,
                 level="l0",
+                min_per_sample=min_per_sample,
             )
 
         return enc_out
@@ -897,25 +1018,91 @@ class DecoderInitTrainer(BaseTrainer):
 
         metrics: dict[str, float] = {"loss": loss.item()}
 
-        # Survivorship head auxiliary losses (when compression is active)
-        if self._compression_active and enc_out.survive_probs is not None:
+        # Survivorship head auxiliary losses (when compression is active).
+        # Note: survive_probs_metrics is the canonical "probability that this
+        # position survives" exposed for metrics; survive_probs is its alias
+        # on CompressorOutput for backwards compatibility.
+        if self._compression_active and enc_out.logits_for_op is not None:
+            from bgkit.training.survivorship_helpers import accumulate
+
             target_ratio = self._current_target_ratio()
-            surv_loss, surv_metrics = self._compute_survivorship_losses(enc_out, target_ratio)
+            surv_loss, surv_metrics = self._compute_survivorship_losses(
+                enc_out,
+                target_ratio,
+                content_token_ids=batch["content_token_ids"].to(self.device),
+                content_attention_mask=batch["content_attention_mask"].to(self.device),
+                level="l0",
+            )
             total_loss = total_loss + surv_loss
             metrics.update(surv_metrics)
 
-            # Track actual compression ratio
+            # Aggregate per-microbatch (sum, count) for true-mean θ/μ updates
+            # at the optimizer-step boundary.
+            accumulate(self._surv_state_l0, enc_out)
+
+            # Logging metrics (all detached to avoid retaining autograd graph).
+            # Heavy diagnostic metrics require .item() syncs; gate them on
+            # a modest interval to keep them off the hot path.
+            diag_interval = int(
+                self.cfg.training.get("diagnostic_metrics_every_n_steps", 10),
+            )
+            emit_diag = (
+                diag_interval <= 1 or self.global_step % diag_interval == 0
+            )
             if enc_out.survivor_mask is not None:
                 content_mask = batch["content_attention_mask"].to(self.device)
-                n_survivors = int(enc_out.survivor_mask.sum().item())
-                n_valid = int(content_mask.sum().item())
                 metrics["min_target_ratio"] = target_ratio
-                metrics["actual_ratio"] = n_survivors / max(n_valid, 1)
+                if emit_diag:
+                    n_survivors = int(enc_out.survivor_mask.sum().item())
+                    n_valid = int(content_mask.sum().item())
+                    metrics["actual_ratio"] = n_survivors / max(n_valid, 1)
+                # floor_trigger_rate / theta / adapter_mu are zero-dim
+                # tensors on device; .item() at log time (still gated on
+                # emit_diag to keep off hot path).
+                if emit_diag:
+                    if enc_out.floor_trigger_rate is not None:
+                        metrics["floor_trigger_rate"] = float(
+                            enc_out.floor_trigger_rate.item(),
+                        )
+                    if enc_out.theta_tensor is not None:
+                        metrics["theta_l0_step"] = float(enc_out.theta_tensor.item())
+                    if enc_out.adapter_mu_tensor is not None:
+                        metrics["adapter_mu_l0_step"] = float(
+                            enc_out.adapter_mu_tensor.item(),
+                        )
+                    # Adapter health
+                    if (
+                        enc_out.adapter_zm is not None
+                        and enc_out.base_raw is not None
+                    ):
+                        base = enc_out.base_raw.detach()
+                        adp = enc_out.adapter_zm.detach()
+                        n_v = max(int(content_mask.sum().item()), 1)
+                        base_norm = float(base.norm().item()) / max(n_v ** 0.5, 1.0)
+                        adapter_norm = float(adp.norm().item()) / max(n_v ** 0.5, 1.0)
+                        metrics["base_norm"] = base_norm
+                        metrics["adapter_norm"] = adapter_norm
+                        metrics["adapter_to_base_ratio"] = (
+                            adapter_norm / base_norm if base_norm > 0 else 0.0
+                        )
+                    if enc_out.logits_for_op is not None:
+                        logits = enc_out.logits_for_op.detach()
+                        metrics["head_logit_std"] = float(logits.std().item())
+                        metrics["head_logit_min"] = float(logits.min().item())
+                        metrics["head_logit_max"] = float(logits.max().item())
 
-            # Soft attention branch (every Nth step)
+            # Soft attention branch (every Nth step). Cadence defaults to 1
+            # (every step). Soft-attn provides the only deliberate
+            # head-gradient path from the decoder; gradient flows to the
+            # ADAPTER only (base is detached in logits_for_softattn).
+            from bgkit.training.survivorship_helpers import LevelLossCfg
+            surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
+            soft_attn_every = getattr(self, "_soft_attn_every_n_steps", 1)
+            soft_attn_start = getattr(self, "_soft_attn_start_step", 0)
             if (
-                self._soft_attn_loss_weight > 0
-                and self.global_step % self._soft_attn_every_n_steps == 0
+                surv_l0.soft_attn_loss_weight > 0
+                and self.global_step >= soft_attn_start
+                and self.global_step % soft_attn_every == 0
                 and enc_out.layer7_embeddings is not None
                 and not self._encoder_frozen
             ):
@@ -923,7 +1110,9 @@ class DecoderInitTrainer(BaseTrainer):
                     enc_out, batch, token_ids, attention_mask, loss_mask,
                     splice_start, splice_len,
                 )
-                total_loss = total_loss + self._soft_attn_loss_weight * soft_loss
+                total_loss = (
+                    total_loss + surv_l0.soft_attn_loss_weight * soft_loss
+                )
                 metrics["soft_attn_loss"] = soft_loss.item()
 
         # Scaled backward (for gradient accumulation)
@@ -937,24 +1126,96 @@ class DecoderInitTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """Second decoder forward on prob-gated layer-7 embeddings.
 
-        Provides a differentiable gradient path from the decoder loss to
-        the survivorship head via survive_probs.
+        Routes the decoder's CE-loss gradient back to the head adapter (NOT
+        base — see ``logits_for_softattn``) through the FULL remaining
+        encoder (blocks 2..end + final norm + projection_block + decoder).
+
+        The previous implementation skipped blocks 2..end and went straight
+        from gated layer-7 directly to the projection block, which made
+        soft-attn a *truncated-encoder* signal. That severely undercut the
+        learning signal.
+
+        layer7 kept at full magnitude; flags blended by p. Matches hard
+        forward (``hidden = layer7 + flag_emb``) at p∈{0,1}. Multiplying
+        layer7 by p would be a different computation, not a relaxation.
         """
-        # Prob-gate the layer-7 embeddings
-        gated = enc_out.survive_probs.unsqueeze(-1) * enc_out.layer7_embeddings
+        # Read the adapter-routed logits (gradient flows through adapter only;
+        # base is detached). Recompute softattn_probs here so gradient flows
+        # through the adapter-only graph — DO NOT use survive_probs_metrics
+        # (which is detached and no-grad).
+        compressor = self.encoder.compressor
+        # θ is a per-level fp32 scalar; level here is l0 (Step 3 trains L0).
+        theta = compressor.threshold_l0.theta.to(self.device)
+        logits_softattn = enc_out.logits_for_softattn
+        layer7 = enc_out.layer7_embeddings
+        base_dtype = layer7.dtype
+        softattn_probs = torch.sigmoid(
+            logits_softattn.float() - theta.float()
+        ).to(base_dtype)
 
-        # Use the real content attention mask so padded positions do not
-        # contribute noise to the soft attention signal. The projection
-        # block treats it as a padding mask; the returned soft_mask then
-        # reflects which positions are real content.
+        # Soft-blend flag embeddings while preserving layer7 content.
+        # layer7 kept at full magnitude — see design doc.
+        #
+        # Preserve prompt context by splicing the gated content into the
+        # detached post-block-1 full hidden state stashed by the hard
+        # forward (`enc_out.full_after_head`). This reconstructs the full
+        # [prompt, sep, content-with-flags] tensor where content-with-flags
+        # is the differentiable `gated` path. Blocks 2..end then attend
+        # over prompt + content as in the hard forward.
+        survive_emb = compressor.survive_embedding.to(base_dtype)
+        doomed_emb = compressor.doomed_embedding.to(base_dtype)
+        p = softattn_probs.unsqueeze(-1)
+        gated_content = layer7 + p * survive_emb + (1.0 - p) * doomed_emb
+
         content_attn_mask = batch["content_attention_mask"].to(self.device)
+        full_after_head = enc_out.full_after_head
+        full_attn_mask = enc_out.full_attention_mask
+        content_slice = enc_out.content_slice
 
-        # Use projection block to get into decoder space
-        proj_out = self.encoder.projection_block(
-            gated, content_attn_mask, survivor_mask=None,
-        )
-        soft_survivors = proj_out.projected_embeddings
-        soft_mask = content_attn_mask.clone()
+        if full_after_head is not None and content_slice is not None:
+            # Splice: [prompt, sep, gated_content]. full_after_head is
+            # detached (from the hard forward); gated_content carries the
+            # adapter gradient. Scatter-assign the content slice into a
+            # clone of full_after_head.
+            full_hidden = full_after_head.clone().to(base_dtype)
+            full_hidden[:, content_slice, :] = gated_content
+            mask_for_fwd = (
+                full_attn_mask if full_attn_mask is not None else None
+            )
+            # Head hook fires after backbone block 1; blocks 2..end remain.
+            # Block indices are positions in the backbone, NOT indices into
+            # the hooks dict — removing the ratio hook did not re-number
+            # blocks. So `start_block=2` is stable regardless of hook dict
+            # sparsity.
+            full_layer22 = compressor.backbone.forward_from_block(
+                hidden=full_hidden,
+                start_block=2,
+                attention_mask=mask_for_fwd,
+                apply_final_norm=True,
+            ).last_hidden_state
+            # Run projection_block on the FULL sequence (not content-only)
+            # so its rotary positional encodings match the hard forward
+            # (where content positions start at prefix_len, not 0). Then
+            # slice out content positions for the decoder splice.
+            proj_out = self.encoder.projection_block(
+                full_layer22, mask_for_fwd, survivor_mask=None,
+            )
+            soft_survivors = proj_out.projected_embeddings[:, content_slice, :]
+            soft_mask = content_attn_mask.clone()
+        else:
+            # Fallback: content-only (no prompt context). Used when the
+            # hard forward didn't stash (e.g. non-pruned backbone path).
+            full_layer22 = compressor.backbone.forward_from_block(
+                hidden=gated_content,
+                start_block=2,
+                attention_mask=content_attn_mask,
+                apply_final_norm=True,
+            ).last_hidden_state
+            proj_out = self.encoder.projection_block(
+                full_layer22, content_attn_mask, survivor_mask=None,
+            )
+            soft_survivors = proj_out.projected_embeddings
+            soft_mask = content_attn_mask.clone()
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
             soft_loss = self.decoder.forward_with_single_splice(
@@ -1164,9 +1425,45 @@ class DecoderInitTrainer(BaseTrainer):
         self._maybe_introduce_compression()
 
     def _post_optimizer_step(self, step: int) -> None:
-        """Advance bidirectional warmup after each optimizer step (only when unfrozen)."""
+        """Advance bidi warmup; run dual-ascent θ + EMA μ updates per optimizer step.
+
+        Token-budget batching gives microbatches with variable valid/controllable
+        counts, so θ and μ MUST be updated using the true global mean across
+        all microbatches in this optimizer step (NOT mean of per-microbatch
+        means). State was accumulated by ``accumulate(self._surv_state_l0,
+        enc_out)`` in ``_forward_backward``.
+        """
         if not self._encoder_frozen:
             self.encoder.step_bidi_warmup()
+
+        if self._compression_active and not self._encoder_frozen:
+            from bgkit.training.survivorship_helpers import (
+                apply_post_step_updates,
+                init_state,
+                maybe_unload_ice,
+            )
+
+            target_ratio = self._current_target_ratio()
+            state_l0 = getattr(self, "_surv_state_l0", None)
+            if state_l0 is not None:
+                update_metrics = apply_post_step_updates(
+                    self.encoder.compressor,
+                    state_l0,
+                    target_ratio=target_ratio,
+                    level="l0",
+                )
+                self._last_post_step_metrics = update_metrics
+                # Reset the L0 state for the next optimizer step.
+                self._surv_state_l0 = init_state()
+
+            # Unload ICE once warmup ends across all levels (idempotent).
+            unloaded = maybe_unload_ice(
+                getattr(self, "_ice_teacher", None),
+                step,
+                getattr(self, "_max_warmup_step", 0),
+            )
+            if unloaded:
+                logger.info("ice_teacher_unloaded", step=step)
 
     def _add_step_metrics(self, metrics: dict[str, float]) -> None:
         """Add curriculum-specific metrics to step logging."""
@@ -1176,6 +1473,11 @@ class DecoderInitTrainer(BaseTrainer):
             metrics["bidi_alpha"] = self._get_bidi_alpha()
         if self._compression_active:
             metrics["target_ratio"] = self._current_target_ratio()
+        post = getattr(self, "_last_post_step_metrics", None)
+        if post is not None:
+            # Merge without clobbering base metrics (grad_norm, loss, etc).
+            for k, v in post.items():
+                metrics.setdefault(k, v)
 
     def _get_bidi_alpha(self) -> float:
         """Get the current bidirectional warmup alpha from the encoder."""

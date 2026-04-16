@@ -82,10 +82,10 @@ def test_pinned_positions_force_survival():
     pinned[0, 3] = True
 
     # Force survivorship head to output very negative logits (all doomed)
-    # so only pinned positions survive.
+    # so only pinned positions survive. Adapter is zero-init so it does not
+    # contribute; we only need to push base_raw negative.
     with torch.no_grad():
-        head = encoder.compressor.survivorship_head_l0
-        # Set the final linear bias to a large negative value
+        head = encoder.compressor.head_base_l0
         head.head[2].bias.fill_(-10.0)
         head.head[2].weight.fill_(0.0)
         head.head[0].weight.fill_(0.0)

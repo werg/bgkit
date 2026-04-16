@@ -1,4 +1,21 @@
 survivorship_head:
   inner_dim: 256               # head MLP hidden dim
   tap_layer: 7                 # layer index for head tap (pruned: block 1)
-  ratio_inject_layer: 3        # inject ratio embedding after this layer
+  # ratio_inject_layer REMOVED — ratio embedding intentionally deleted in
+  # the survivorship-head pivot. target_ratio is consumed by the operator
+  # (DualThresholdController), not by a learned embedding. Phase 2 KB with
+  # per-query ratios needs separate design (see docs/survivorship_design.md
+  # §Phase 2 KB regression).
+
+threshold_controller:
+  init_theta: -1.4            # σ(0 − (−1.4)) ≈ 0.80 expected keep rate at step 0
+  lr: 0.1                     # logit-units per gap-unit per optimizer step
+  momentum: 0.0               # tune up if θ sawtooths
+  clamp: 20.0                 # ±clamp on θ for numerical sanity
+  min_per_sample_during_warmup: 1   # floor active during BCE warmup only
+  min_per_sample_post_warmup: 0     # disabled; accept zero-survivor samples as
+                                    # legitimate signal at full compression.
+
+adapter_mean_ema:
+  init_mu: 0.0                # adapter zero-init → first batch_mean is 0
+  momentum: 0.99              # EMA tracks slowly; soft-attn must do real work

@@ -148,32 +148,20 @@ class PrunedBidirectionalQwen35(nn.Module):
         self._rotary_emb._apply(fn)
         return self
 
-    def forward(
+    def _build_position_and_mask(
         self,
-        inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        return_intermediates: bool = False,
-        layer_hooks: dict[int, Callable[[torch.Tensor], torch.Tensor]] | None = None,
-    ) -> BaseModelOutputWithPast:
-        """Run forward pass through pruned blocks.
+        hidden: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> tuple[tuple, torch.Tensor | None]:
+        """Build (position_embeddings, full_attn_mask) for a forward pass.
 
-        Args:
-            inputs_embeds: (B, L, D) input embeddings.
-            attention_mask: (B, L) padding mask.
-            return_intermediates: Collect hidden states after each block.
-            layer_hooks: Optional dict mapping block indices to callables.
-                After block ``idx`` completes, if ``idx`` is in the dict,
-                ``layer_hooks[idx](hidden) -> hidden`` is called. Block 0
-                corresponds to original layers 0-3, block 1 to layers 4-7,
-                etc.
+        Shared helper used by ``forward()`` and ``forward_from_block()`` to
+        guarantee identical position/mask construction across both paths.
         """
-        hidden = inputs_embeds
         seq_len = hidden.shape[1]
         position_ids = torch.arange(seq_len, device=hidden.device).unsqueeze(0)
         position_embeddings = self._rotary_emb(hidden, position_ids)
-        use_ckpt = getattr(self, "_gradient_checkpointing", False) and self.training
 
-        # Build blended 4D mask for full attention layers
         alpha = self.bidi_alpha
         neg_inf = torch.finfo(hidden.dtype).min
 
@@ -198,9 +186,70 @@ class PrunedBidirectionalQwen35(nn.Module):
         else:
             full_attn_mask = pad_mask_4d
 
+        return position_embeddings, full_attn_mask
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        return_intermediates: bool = False,
+        layer_hooks: dict[int, Callable[[torch.Tensor], torch.Tensor]] | None = None,
+    ) -> BaseModelOutputWithPast:
+        """Run forward pass through pruned blocks.
+
+        Args:
+            inputs_embeds: (B, L, D) input embeddings.
+            attention_mask: (B, L) padding mask.
+            return_intermediates: Collect hidden states after each block.
+            layer_hooks: Optional dict mapping block indices to callables.
+                After block ``idx`` completes, if ``idx`` is in the dict,
+                ``layer_hooks[idx](hidden) -> hidden`` is called. Block 0
+                corresponds to original layers 0-3, block 1 to layers 4-7,
+                etc.
+        """
+        return self.forward_from_block(
+            hidden=inputs_embeds,
+            start_block=0,
+            attention_mask=attention_mask,
+            layer_hooks=layer_hooks,
+            apply_final_norm=True,
+            return_intermediates=return_intermediates,
+        )
+
+    def forward_from_block(
+        self,
+        hidden: torch.Tensor,
+        start_block: int,
+        attention_mask: torch.Tensor | None = None,
+        layer_hooks: dict[int, Callable[[torch.Tensor], torch.Tensor]] | None = None,
+        apply_final_norm: bool = True,
+        return_intermediates: bool = False,
+    ) -> BaseModelOutputWithPast:
+        """Resume forward from ``start_block`` using ``hidden`` as input.
+
+        Recomputes position embeddings + attention mask exactly as
+        ``forward()`` does. Iterates ``blocks[start_block:]``. Applies the
+        final norm if requested.
+
+        Used by the soft-attn forward to traverse blocks 2..end on
+        prob-gated layer-7 embeddings, so the head's gradient signal flows
+        through the FULL remaining encoder rather than skipping straight to
+        the projection block.
+        """
+        if start_block < 0 or start_block > len(self.blocks):
+            raise ValueError(
+                f"start_block must be in [0, {len(self.blocks)}], got {start_block}"
+            )
+
+        position_embeddings, full_attn_mask = self._build_position_and_mask(
+            hidden, attention_mask,
+        )
+        use_ckpt = getattr(self, "_gradient_checkpointing", False) and self.training
+
         intermediates = [] if return_intermediates else None
 
-        for idx, block in enumerate(self.blocks):
+        for offset, block in enumerate(self.blocks[start_block:]):
+            idx = start_block + offset
             hidden = block(hidden, full_attn_mask, position_embeddings, use_ckpt)
 
             # Fire block hook after this block completes
@@ -210,7 +259,8 @@ class PrunedBidirectionalQwen35(nn.Module):
             if return_intermediates:
                 intermediates.append(hidden)
 
-        hidden = self.norm(hidden)
+        if apply_final_norm:
+            hidden = self.norm(hidden)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden,
             hidden_states=intermediates,

@@ -26,13 +26,28 @@ class SurvivorshipHead(nn.Module):
     Output: (B, L) raw logits (caller applies sigmoid for probabilities).
     """
 
-    def __init__(self, hidden_dim: int = 1024, inner_dim: int = 256):
+    def __init__(
+        self,
+        hidden_dim: int = 1024,
+        inner_dim: int = 256,
+        init_to_zero: bool = False,
+    ):
         super().__init__()
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, inner_dim),
             nn.GELU(),
             nn.Linear(inner_dim, 1),
         )
+        # Bias must be a known constant — the cold-start expected keep rate
+        # σ(0 − θ_init) depends on it. Do not randomize without updating
+        # the θ_init convention.
+        nn.init.zeros_(self.head[-1].bias)
+        if init_to_zero:
+            # Used to construct head_adapter as a no-op at step 0 so it does
+            # not perturb the BCE-anchored base ranking. Adapter learns from
+            # zero via soft-attn gradient (upstream ∂L/∂logit ≠ 0 still
+            # produces a non-zero gradient on the zero-weight final layer).
+            nn.init.zeros_(self.head[-1].weight)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Predict per-position survive logits.

@@ -2,8 +2,24 @@
 #
 # Retrains the decoder (via LoRA) and encoder (full) on the content
 # reproduction task using the pruned encoder from step 2. All curriculum
-# phases are skipped — encoder is unfrozen and compression is active
-# from step 0.
+# phases are skipped — encoder is unfrozen from step 0.
+#
+# Two-stage cold start (2026-04-15 refactor):
+#   Stage A (steps 0 .. soft_attn_start_step):
+#     - head_base_l0 is pre-distilled offline against ICE (sidecar path
+#       below) so the ranking signal is installed BEFORE Step 3 starts.
+#     - No online BCE (ICE is not loaded).
+#     - Soft-attn is DISABLED. The decoder learns to *use* BgKIT output
+#       at the head's distilled ranking, without the second forward-pass
+#       cost and without the adapter trying to move the selection.
+#     - Moment-match holds base's distribution shape.
+#     - Head adapter is zero-init → the composed logit equals base_raw
+#       until Stage B flips soft-attn on.
+#   Stage B (soft_attn_start_step ..):
+#     - Soft-attn activates and begins training the adapter via decoder CE.
+#     - By this point the decoder has a working reconstruction behaviour,
+#       so the adapter's gradient carries real "which positions matter to
+#       the decoder" information.
 phase: phase1_step3
 optimizer: muon
 max_steps: 15000
@@ -16,6 +32,15 @@ gradient_accumulation_steps: 4
 max_eval_samples: 2000
 eval_every: 500
 save_every: 500
+# Per-microbatch diagnostic metrics (base_norm, adapter_norm, head_logit_std,
+# floor_trigger_rate, theta, adapter_mu) each force a GPU→CPU sync. Gate
+# them on every 10th step — cheap loss/target metrics still emit every step.
+diagnostic_metrics_every_n_steps: 10
+
+# Optional sidecar with pre-distilled head_base_l0 weights. Produced by
+# scripts/pretrain_survivorship_head.py. When set, online BCE warmup is
+# NOT needed (set ice_distillation.l0.enabled: false below).
+survivorship_head_sidecar: /workspace/checkpoints/survivorship_head_base_l0/head_base_l0.pt
 
 # Everything unfrozen from step 0 — no curriculum phases
 train_projection_block: true
@@ -27,17 +52,67 @@ bidi_warmup_steps: 0       # already bidirectional from step 2
 # Compression active from step 0
 compression_introduction_step: 0
 
-# Ratio scheduling — fixed ratio, no ramp
-target_ratio_start: 0.10
+# Cold-start curriculum: ratio anneals 0.95 → 0.10 over 1k steps. The
+# ramp runs in parallel with Stage A (decoder is learning on progressively
+# more compressed contexts, against the pre-distilled head). By the time
+# soft-attn kicks in, the target ratio has reached its final value.
+target_ratio_start: 0.95
 target_ratio_end: 0.10
-target_ratio_ramp_steps: 1
+target_ratio_ramp_steps: 1000
 
-# Survivorship head auxiliary losses
+# Survivorship head losses, per level.
 survivorship:
-  ratio_loss_weight: 0.1
-  decisiveness_loss_weight: 0.05
-  soft_attn_loss_weight: 0.05
-  soft_attn_every_n_steps: 4
+  # Soft-attn activation step. Before this step, soft_attn_loss_weight is
+  # force-zero and the second decoder forward is skipped entirely — saves
+  # ~1.8× FLOPs during Stage A. After this step, the configured weight
+  # takes effect and the adapter receives decoder-CE gradient.
+  soft_attn_start_step: 2000
+  soft_attn_every_n_steps: 2
+
+  # L0: base is pre-distilled offline; Stage A runs no ranking loss. Stage
+  # B adds soft-attn through the adapter. Moment-match runs throughout.
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    soft_attn_loss_weight: 0.2
+    moment_match_weight: 0.1
+    # Moment-match can run from step 0 because base_raw now has the
+    # ICE-distilled distribution at init (not the fresh-head std≈0.04
+    # that blew up standardization before).
+    moment_match_start_step: 0
+
+  # L1: no ICE anchor; soft-attn drives, decisiveness breaks symmetry.
+  # (Step 3 doesn't activate L1 — included for forward compatibility.)
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    soft_attn_loss_weight: 0.3
+    moment_match_weight: 0.0
+
+# ICE distillation: disabled at runtime because head_base_l0 is pre-
+# distilled via the sidecar. The only remaining runtime link to ICE is
+# the reference moments (loaded as two floats — no ICE model on device).
+ice_distillation:
+  checkpoint_path: /workspace/checkpoints/ice_step89999_20260306_213825
+  input_dim: 1024
+  hidden_dim: 192
+  num_layers: 3
+  kernel_size: 5
+  l0:
+    enabled: false                   # sidecar replaces online BCE
+    bce_warmup_weight: 0.0
+    bce_warmup_steps: 0
+    teacher_ratio: 0.10
+  l1:
+    enabled: false
+
+# Pre-computed reference moments for the moment_match loss. The probe
+# script writes a JSON with {skew, excess_kurt, n_positions}.
+moment_match_reference:
+  l0:
+    path: ${oc.env:DATA_DIR}/diagnostics/ice_reference_moments.json
+  l1:
+    path: null                       # unused at L1
 
 # LoRA config for decoder — small adapter, fast adaptation
 decoder_lora:

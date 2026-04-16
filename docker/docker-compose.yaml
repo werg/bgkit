@@ -108,6 +108,24 @@ services:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_step3"]
 
+  # Offline ICE → head_base_l0 distillation. Writes a sidecar checkpoint
+  # to $CHECKPOINT_DIR/survivorship_head_base_l0_<ts>/head_base_l0.pt
+  # which phase1_step3.yaml references via survivorship_head_sidecar.
+  pretrain-survivorship-head:
+    <<: *gpu-common
+    command: [
+      "scripts/pretrain_survivorship_head.py",
+      "--step2-checkpoint", "/workspace/checkpoints/phase1_step2_step19999_20260323_132922",
+      "--ice-checkpoint", "/workspace/checkpoints/ice_step89999_20260306_213825",
+      "--data-dir", "/workspace/data/processed/tokens",
+      "--output-dir", "/workspace/checkpoints",
+      "--teacher-ratio", "0.10",
+      "--max-steps", "3000",
+      "--max-batch-tokens", "16384",
+      "--lr", "1e-3",
+      "--num-workers", "2",
+    ]
+
   train-phase1-step4:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_step4"]

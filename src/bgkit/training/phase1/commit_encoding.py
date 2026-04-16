@@ -264,10 +264,71 @@ class CommitEncodingTrainer(BaseTrainer):
 
         # --- Curriculum state ---
         curriculum = tcfg.get("curriculum", {})
-        self._target_ratio_start = curriculum.get("target_ratio_start", 0.50)
-        self._target_ratio_end = curriculum.get("target_ratio_end", 0.20)
-        self._target_ratio_ramp_steps = curriculum.get("target_ratio_ramp_steps", 30000)
+        self._target_ratio_start = curriculum.get(
+            "target_ratio_start", tcfg.get("target_ratio_start", 0.50),
+        )
+        self._target_ratio_end = curriculum.get(
+            "target_ratio_end", tcfg.get("target_ratio_end", 0.20),
+        )
+        self._target_ratio_ramp_steps = curriculum.get(
+            "target_ratio_ramp_steps", tcfg.get("target_ratio_ramp_steps", 30000),
+        )
         self._target_ratio_override: float | None = None
+
+        # --- Survivorship head config (per-level) ---
+        # Step 4 is where L1 first activates — L0 head is trained from Step 3
+        # and just continues; L1 cold-starts via decisiveness + soft-attn.
+        from bgkit.training.survivorship_helpers import (
+            init_state,
+            load_reference_moments,
+            resolve_level_ice_cfg,
+            resolve_level_loss_cfg,
+        )
+
+        surv_cfg = tcfg.get("survivorship", {})
+        self._surv_l0 = resolve_level_loss_cfg(surv_cfg.get("l0", {}))
+        self._surv_l1 = resolve_level_loss_cfg(surv_cfg.get("l1", {}))
+        self._soft_attn_every_n_steps = int(surv_cfg.get("soft_attn_every_n_steps", 1))
+
+        ice_cfg = tcfg.get("ice_distillation", {})
+        self._ice_l0 = resolve_level_ice_cfg(ice_cfg.get("l0", {}))
+        self._ice_l1 = resolve_level_ice_cfg(ice_cfg.get("l1", {}))
+        self._max_warmup_step = max(
+            self._ice_l0.bce_warmup_steps if self._ice_l0.enabled else 0,
+            self._ice_l1.bce_warmup_steps if self._ice_l1.enabled else 0,
+        )
+        self._ice_teacher = None
+        if (
+            (self._ice_l0.enabled and self._ice_l0.bce_warmup_weight > 0)
+            or (self._ice_l1.enabled and self._ice_l1.bce_warmup_weight > 0)
+        ):
+            from bgkit.models.ice_teacher import ICETeacher
+            ice_path = ice_cfg["checkpoint_path"]
+            embed_tokens = self.encoder.compressor.backbone.embed_tokens
+            self._ice_teacher = ICETeacher(
+                ice_path, embed_tokens,
+                input_dim=int(ice_cfg.get("input_dim", 1024)),
+                hidden_dim=int(ice_cfg.get("hidden_dim", 192)),
+                num_layers=int(ice_cfg.get("num_layers", 3)),
+                kernel_size=int(ice_cfg.get("kernel_size", 5)),
+            ).to(device)
+
+        mm_ref = tcfg.get("moment_match_reference", {})
+        self._ref_moments_l0 = None
+        self._ref_moments_l1 = None
+        # OmegaConf's DictConfig is not a dict subclass; use duck-typed access.
+        _l0_block = mm_ref.get("l0", None) if hasattr(mm_ref, "get") else None
+        l0_path = _l0_block.get("path", None) if _l0_block is not None and hasattr(_l0_block, "get") else None
+        if self._surv_l0.moment_match_weight > 0 and l0_path:
+            self._ref_moments_l0 = load_reference_moments(l0_path)
+        _l1_block = mm_ref.get("l1", None) if hasattr(mm_ref, "get") else None
+        l1_path = _l1_block.get("path", None) if _l1_block is not None and hasattr(_l1_block, "get") else None
+        if self._surv_l1.moment_match_weight > 0 and l1_path:
+            self._ref_moments_l1 = load_reference_moments(l1_path)
+
+        self._surv_state_l0 = init_state()
+        self._surv_state_l1 = init_state()
+        self._last_post_step_metrics: dict[str, float] = {}
 
         # --- Profiling ---
         self._profile_enabled = os.environ.get("BGKIT_PROFILE", "") == "1"
@@ -408,7 +469,10 @@ class CommitEncodingTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """Batched L0 compression for checkpointing.
 
-        Returns concatenated survivors as (total_surv, D).
+        Returns concatenated survivors as (total_surv, D). Used by the
+        activation-checkpointing wrapper, where the CompressorOutput can't
+        cross the checkpoint boundary — losses/state accumulation happen
+        in the non-checkpointed path only.
         """
         comp_out = compressor(
             all_f_emb,
@@ -432,6 +496,108 @@ class CommitEncodingTrainer(BaseTrainer):
             1, compressor.hidden_dim, device=all_f_emb.device, dtype=all_f_emb.dtype,
         )
 
+    def _l0_loss_args(self) -> dict:
+        """Bundle per-level loss config for the checkpointed loss wrapper."""
+        return {
+            "weights": self._surv_l0,
+            "ice_cfg": self._ice_l0,
+            "ref_moments": self._ref_moments_l0,
+            "ice_teacher": self._ice_teacher,
+            "global_step": self.global_step,
+            "target_ratio": self._current_target_ratio(),
+        }
+
+    @staticmethod
+    def _compress_files_batched_with_loss(
+        compressor: torch.nn.Module,
+        all_f_emb: torch.Tensor,
+        all_f_mask: torch.Tensor,
+        prompt_emb: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        target_ratio: float,
+        sub_file_ids: torch.Tensor,
+        loss_args: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Checkpointable: L0 compress + L0 survivorship loss in one region.
+
+        Returns (survivors, l0_loss). Loss is a scalar; CompressorOutput
+        stays inside the checkpoint region so its activations can be
+        recomputed on backward.
+        """
+        from bgkit.training.survivorship_helpers import compute_survivorship_losses
+
+        comp_out = compressor(
+            all_f_emb,
+            attention_mask=all_f_mask,
+            prompt_embeddings=prompt_emb,
+            prompt_attention_mask=prompt_mask,
+            target_ratio=target_ratio,
+            level="l0",
+        )
+        content_normed = comp_out.normed_embeddings[:, comp_out.content_slice, :]
+        survivor_mask = comp_out.survivor_mask
+        all_survivors = []
+        if survivor_mask is not None:
+            for f in range(all_f_emb.shape[0]):
+                surv = content_normed[f][survivor_mask[f]]
+                all_survivors.append(compressor.auto_reproduce(surv.unsqueeze(0))[0])
+        if all_survivors:
+            survivors = torch.cat(all_survivors, dim=0)
+        else:
+            survivors = torch.zeros(
+                1, compressor.hidden_dim,
+                device=all_f_emb.device, dtype=all_f_emb.dtype,
+            )
+
+        l0_loss, _ = compute_survivorship_losses(
+            enc_out=comp_out,
+            level="l0",
+            weights=loss_args["weights"],
+            ice_cfg=loss_args["ice_cfg"],
+            ref_moments=loss_args["ref_moments"],
+            ice_teacher=loss_args["ice_teacher"],
+            global_step=loss_args["global_step"],
+            content_token_ids=sub_file_ids,
+            content_attn_mask=all_f_mask,
+            target_ratio=loss_args["target_ratio"],
+        )
+        return survivors, l0_loss
+
+    @staticmethod
+    def _compress_files_batched_full(
+        compressor: torch.nn.Module,
+        all_f_emb: torch.Tensor,
+        all_f_mask: torch.Tensor,
+        prompt_emb: torch.Tensor,
+        prompt_mask: torch.Tensor,
+        target_ratio: float,
+    ) -> tuple[torch.Tensor, object]:
+        """Same as _compress_files_batched_pure but also returns CompressorOutput."""
+        comp_out = compressor(
+            all_f_emb,
+            attention_mask=all_f_mask,
+            prompt_embeddings=prompt_emb,
+            prompt_attention_mask=prompt_mask,
+            target_ratio=target_ratio,
+            level="l0",
+        )
+        content_normed = comp_out.normed_embeddings[:, comp_out.content_slice, :]
+        survivor_mask = comp_out.survivor_mask
+        all_survivors = []
+        if survivor_mask is not None:
+            for f in range(all_f_emb.shape[0]):
+                surv = content_normed[f][survivor_mask[f]]
+                all_survivors.append(compressor.auto_reproduce(surv.unsqueeze(0))[0])
+        if all_survivors:
+            return torch.cat(all_survivors, dim=0), comp_out
+        return (
+            torch.zeros(
+                1, compressor.hidden_dim,
+                device=all_f_emb.device, dtype=all_f_emb.dtype,
+            ),
+            comp_out,
+        )
+
     def _compress_l0_batched(
         self,
         file_ids: torch.Tensor,
@@ -440,6 +606,8 @@ class CommitEncodingTrainer(BaseTrainer):
         prompt_emb: torch.Tensor,
         prompt_mask: torch.Tensor,
         bgkit_embed: torch.nn.Module,
+        surv_loss_accum: list | None = None,
+        file_token_ids_l0: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Batched L0 per-file compression for one sample -> (total_surv, D).
 
@@ -476,18 +644,53 @@ class CommitEncodingTrainer(BaseTrainer):
             sub_prompt_mask = prompt_mask.expand(sub_size, -1)
 
             sub_tokens = sub_f_mask.sum().item()
+            sub_file_ids = (
+                file_token_ids_l0[start:end]
+                if file_token_ids_l0 is not None else None
+            )
             if sub_tokens > checkpoint_threshold:
-                sub_surv = torch_checkpoint(
-                    self._compress_files_batched_pure,
-                    compressor, sub_emb, sub_f_mask,
-                    sub_prompt_emb, sub_prompt_mask, target_ratio,
-                    use_reentrant=False,
-                )
+                if surv_loss_accum is not None and sub_file_ids is not None:
+                    # Checkpointed path with L0 loss: run a wrapper that
+                    # computes the loss INSIDE the checkpoint region (so
+                    # activations are recomputed on backward). The loss
+                    # scalar crosses the checkpoint boundary; the
+                    # CompressorOutput does NOT need to.
+                    sub_surv, sub_loss = torch_checkpoint(
+                        self._compress_files_batched_with_loss,
+                        compressor, sub_emb, sub_f_mask,
+                        sub_prompt_emb, sub_prompt_mask, target_ratio,
+                        sub_file_ids, self._l0_loss_args(),
+                        use_reentrant=False,
+                    )
+                    # Also stash a metrics sentinel so the post-step
+                    # aggregation sees this sub-batch (microbatch state
+                    # accumulation happens in _apply_surv_losses). We
+                    # rebuild state from the loss-computing call inside
+                    # the checkpoint — so instead of going through
+                    # _apply_surv_losses, append the (already-scalar) loss
+                    # with a stage-B-style marker.
+                    surv_loss_accum.append(("ckpt_loss", sub_loss))
+                else:
+                    sub_surv = torch_checkpoint(
+                        self._compress_files_batched_pure,
+                        compressor, sub_emb, sub_f_mask,
+                        sub_prompt_emb, sub_prompt_mask, target_ratio,
+                        use_reentrant=False,
+                    )
             else:
-                sub_surv = self._compress_files_batched_pure(
-                    compressor, sub_emb, sub_f_mask,
-                    sub_prompt_emb, sub_prompt_mask, target_ratio,
-                )
+                if surv_loss_accum is not None and sub_file_ids is not None:
+                    sub_surv, sub_out = self._compress_files_batched_full(
+                        compressor, sub_emb, sub_f_mask,
+                        sub_prompt_emb, sub_prompt_mask, target_ratio,
+                    )
+                    surv_loss_accum.append(
+                        ("full", sub_out, sub_file_ids, sub_f_mask)
+                    )
+                else:
+                    sub_surv = self._compress_files_batched_pure(
+                        compressor, sub_emb, sub_f_mask,
+                        sub_prompt_emb, sub_prompt_mask, target_ratio,
+                    )
             all_survivors.append(sub_surv)
 
         if all_survivors:
@@ -543,6 +746,11 @@ class CommitEncodingTrainer(BaseTrainer):
         total_loss = 0.0
         total_survivors = 0
         total_valid = 0
+        # Accumulators for per-level survivorship losses across all microbatches
+        # in this optimizer step. L0 losses are deferred until after backward
+        # through the decoder so the autograd graph is intact.
+        l0_surv_accum: list = []
+        aux_metrics: dict[str, float] = {}
 
         # Profiling accumulators
         if self._profile_enabled:
@@ -562,12 +770,45 @@ class CommitEncodingTrainer(BaseTrainer):
                     ev_l0_end = torch.cuda.Event(enable_timing=True)
                     ev_l0_start.record()
 
-                # L0 per-file (batched with selective checkpointing)
+                # L0 per-file (batched with selective checkpointing). Pass
+                # per-sample accumulator so non-checkpointed sub-batches
+                # stash their CompressorOutput; L0 survivorship loss is
+                # backwarded immediately per sub-batch (no retain_graph)
+                # to free the encoder graph — each sub-batch has its own
+                # independent autograd graph since nothing downstream
+                # (decoder, L1) consumes the L0 sub-batch's compressor
+                # activations (only the auto-reproduce output flows
+                # forward, and its .grad path is already captured above).
+                per_sample_l0: list = []
                 l0_surv = self._compress_l0_batched(
                     file_ids[b], file_masks[b], n_files,
                     prompt_emb_b, prompt_mask[b:b + 1],
                     bgkit_embed,
+                    surv_loss_accum=per_sample_l0,
+                    file_token_ids_l0=file_ids[b][:n_files],
                 )
+                scale = 1.0 / (batch_size * self._accum_steps)
+                for entry in per_sample_l0:
+                    if entry[0] == "ckpt_loss":
+                        # Checkpointed path: loss already computed inside
+                        # the checkpoint region. Just scale + backward.
+                        _, sub_loss = entry
+                        if isinstance(sub_loss, torch.Tensor) and sub_loss.requires_grad:
+                            (sub_loss * scale).backward()
+                    else:
+                        # Non-checkpointed path: compute loss + accumulate
+                        # state from the live CompressorOutput.
+                        _, sub_out, sub_ids, sub_mask = entry
+                        l0_loss, l0_metrics = self._apply_surv_losses(
+                            sub_out, level="l0",
+                            content_token_ids=sub_ids,
+                            content_attn_mask=sub_mask,
+                        )
+                        if l0_metrics:
+                            aux_metrics.update(l0_metrics)
+                        if isinstance(l0_loss, torch.Tensor) and l0_loss.requires_grad:
+                            (l0_loss * scale).backward()
+                per_sample_l0.clear()
 
                 if self._profile_enabled:
                     ev_l0_end.record()
@@ -628,6 +869,18 @@ class CommitEncodingTrainer(BaseTrainer):
                         level="l1",
                     )
 
+                    # L1 survivorship loss + state accumulation. Content
+                    # token_ids aren't meaningful at L1 (inputs are
+                    # compressed embeddings, not tokens), so BCE is
+                    # effectively disabled — plan sets L1 BCE off.
+                    l1_surv_loss, l1_metrics = self._apply_surv_losses(
+                        l1_out, level="l1",
+                        content_token_ids=None,
+                        content_attn_mask=l1_mask,
+                    )
+                    if l1_metrics:
+                        aux_metrics.update(l1_metrics)
+
                     if self._profile_enabled:
                         ev_l1_end.record()
                         ev_dec_start = torch.cuda.Event(enable_timing=True)
@@ -651,7 +904,37 @@ class CommitEncodingTrainer(BaseTrainer):
                         loss_mask=group_loss_mask,
                     )
                     group_scale = g_size / (batch_size * self._accum_steps)
-                    (loss * group_scale).backward()
+                    total = loss * group_scale
+                    if isinstance(l1_surv_loss, torch.Tensor) and l1_surv_loss.requires_grad:
+                        total = total + l1_surv_loss * group_scale
+
+                    # L1 soft-attn: primary discrimination signal at L1
+                    # (no BCE / moment-match). Gradient flows to adapter
+                    # only via logits_for_softattn.
+                    from bgkit.training.survivorship_helpers import LevelLossCfg
+                    surv_l1 = getattr(self, "_surv_l1", LevelLossCfg())
+                    soft_every = getattr(self, "_soft_attn_every_n_steps", 1)
+                    if (
+                        surv_l1.soft_attn_loss_weight > 0
+                        and self.global_step % soft_every == 0
+                        and l1_out.layer7_embeddings is not None
+                    ):
+                        soft_loss = self._soft_attention_forward(
+                            l1_out,
+                            target_ids=group_target_ids,
+                            target_mask=group_target_mask,
+                            splice_start=splice_start_batch[group_indices],
+                            splice_len=splice_len_batch[group_indices],
+                            loss_mask=group_loss_mask,
+                            level="l1",
+                        )
+                        if isinstance(soft_loss, torch.Tensor) and soft_loss.requires_grad:
+                            total = total + (
+                                surv_l1.soft_attn_loss_weight
+                                * soft_loss * group_scale
+                            )
+                            aux_metrics["l1_soft_attn_loss"] = soft_loss.item()
+                    total.backward()
 
                     total_loss += loss.item() * g_size
                     total_survivors += int(
@@ -680,6 +963,13 @@ class CommitEncodingTrainer(BaseTrainer):
                             target_ratio=target_ratio,
                             level="l1",
                         )
+                        l1_surv_loss, l1_metrics = self._apply_surv_losses(
+                            l1_o, level="l1",
+                            content_token_ids=None,
+                            content_attn_mask=l1_m,
+                        )
+                        if l1_metrics:
+                            aux_metrics.update(l1_metrics)
                         s_lm = (
                             loss_mask_batch[b_idx:b_idx + 1]
                             if loss_mask_batch is not None else None
@@ -693,7 +983,37 @@ class CommitEncodingTrainer(BaseTrainer):
                             splice_lengths=splice_len_batch[b_idx:b_idx + 1],
                             loss_mask=s_lm,
                         )
-                        (loss * scale).backward()
+                        total = loss * scale
+                        if isinstance(l1_surv_loss, torch.Tensor) and l1_surv_loss.requires_grad:
+                            total = total + l1_surv_loss * scale
+
+                        # L1 soft-attn (primary L1 signal) — per-sample path.
+                        from bgkit.training.survivorship_helpers import LevelLossCfg
+                        surv_l1 = getattr(self, "_surv_l1", LevelLossCfg())
+                        soft_every = getattr(self, "_soft_attn_every_n_steps", 1)
+                        if (
+                            surv_l1.soft_attn_loss_weight > 0
+                            and self.global_step % soft_every == 0
+                            and l1_o.layer7_embeddings is not None
+                        ):
+                            sample_target_ids = target_ids[b_idx:b_idx + 1]
+                            sample_target_mask = target_mask[b_idx:b_idx + 1]
+                            soft_loss = self._soft_attention_forward(
+                                l1_o,
+                                target_ids=sample_target_ids,
+                                target_mask=sample_target_mask,
+                                splice_start=splice_start_batch[b_idx:b_idx + 1],
+                                splice_len=splice_len_batch[b_idx:b_idx + 1],
+                                loss_mask=s_lm,
+                                level="l1",
+                            )
+                            if isinstance(soft_loss, torch.Tensor) and soft_loss.requires_grad:
+                                total = total + (
+                                    surv_l1.soft_attn_loss_weight
+                                    * soft_loss * scale
+                                )
+                                aux_metrics["l1_soft_attn_loss"] = soft_loss.item()
+                        total.backward()
                         total_loss += loss.item()
                         total_survivors += int(
                             l1_o.survivor_attention_mask.sum().item()
@@ -720,15 +1040,209 @@ class CommitEncodingTrainer(BaseTrainer):
         target_ratio = self._current_target_ratio()
         actual_ratio = total_survivors / max(total_valid, 1)
 
-        return {
+        result = {
             "loss": total_loss / batch_size,
             "target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
         }
+        result.update(aux_metrics)
+        return result
+
+    def _soft_attention_forward(
+        self,
+        enc_out,
+        target_ids: torch.Tensor,
+        target_mask: torch.Tensor,
+        splice_start: torch.Tensor,
+        splice_len: torch.Tensor,
+        loss_mask: torch.Tensor | None,
+        level: str = "l1",
+    ) -> torch.Tensor:
+        """Second decoder forward on prob-gated layer-7 embeddings.
+
+        Routes the decoder's CE-loss gradient back to the head adapter
+        (NOT base — ``logits_for_softattn`` detaches base) through the
+        FULL remaining encoder via ``forward_from_block(start_block=2)``,
+        then projection_block, then decoder.
+
+        Head hook fires after backbone block 1; blocks 2..end remain.
+        Block indices are positions in the backbone, NOT indices into the
+        hooks dict — removing the ratio hook did not re-number blocks.
+
+        layer7 kept at full magnitude; flags blended by p. Matches hard
+        forward (``hidden = layer7 + flag_emb``) at p∈{0,1}. Multiplying
+        layer7 by p would be a different computation, not a relaxation.
+
+        Critical for Step 4's L1 cold-start: L1 has no BCE and no
+        moment-match, so soft-attn is the primary discrimination signal
+        flowing into head_adapter_l1.
+        """
+        compressor = self.encoder.compressor
+        controller = (
+            compressor.threshold_l0 if level == "l0"
+            else compressor.threshold_l1
+        )
+        theta = controller.theta.to(self.device)
+        logits_softattn = enc_out.logits_for_softattn
+        layer7 = enc_out.layer7_embeddings
+        if logits_softattn is None or layer7 is None:
+            return torch.tensor(0.0, device=self.device)
+        base_dtype = layer7.dtype
+        softattn_probs = torch.sigmoid(
+            logits_softattn.float() - theta.float()
+        ).to(base_dtype)
+
+        survive_emb = compressor.survive_embedding.to(base_dtype)
+        doomed_emb = compressor.doomed_embedding.to(base_dtype)
+        p = softattn_probs.unsqueeze(-1)
+        gated_content = layer7 + p * survive_emb + (1.0 - p) * doomed_emb
+
+        full_after_head = enc_out.full_after_head
+        full_attn_mask = enc_out.full_attention_mask
+        content_slice = enc_out.content_slice
+
+        # Reconstruct full [prompt, sep, content-with-flags] by splicing
+        # the differentiable gated content into the detached full hidden
+        # so blocks 2..end attend over prompt context as in the hard
+        # forward (Fix 9 — soft-attn prompt context preservation).
+        if full_after_head is not None and content_slice is not None:
+            full_hidden = full_after_head.clone().to(base_dtype)
+            full_hidden[:, content_slice, :] = gated_content
+            full_layer22 = compressor.backbone.forward_from_block(
+                hidden=full_hidden,
+                start_block=2,
+                attention_mask=full_attn_mask,
+                apply_final_norm=True,
+            ).last_hidden_state
+            # Run projection_block on the FULL sequence so its rotary
+            # positional encodings match the hard forward; slice content
+            # out afterwards for the decoder splice.
+            proj_out = self.encoder.projection_block(
+                full_layer22, full_attn_mask, survivor_mask=None,
+            )
+            soft_survivors = proj_out.projected_embeddings[:, content_slice, :]
+            if content_slice is not None and full_attn_mask is not None:
+                soft_mask = full_attn_mask[:, content_slice].clone()
+            else:
+                soft_mask = torch.ones(
+                    soft_survivors.shape[:2],
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+        else:
+            # Fallback: content-only replay (no prompt context).
+            content_attn_mask = (
+                torch.ones(layer7.shape[:2], dtype=torch.bool, device=self.device)
+            )
+            full_layer22 = compressor.backbone.forward_from_block(
+                hidden=gated_content,
+                start_block=2,
+                attention_mask=content_attn_mask,
+                apply_final_norm=True,
+            ).last_hidden_state
+            proj_out = self.encoder.projection_block(
+                full_layer22, content_attn_mask, survivor_mask=None,
+            )
+            soft_survivors = proj_out.projected_embeddings
+            soft_mask = content_attn_mask.clone()
+
+        with torch.autocast(
+            "cuda", dtype=torch.bfloat16,
+            enabled=self.device.type == "cuda",
+        ):
+            soft_loss = self.decoder.forward_with_single_splice(
+                survivor_embeddings=soft_survivors,
+                survivor_attention_mask=soft_mask,
+                token_ids=target_ids,
+                token_attention_mask=target_mask,
+                splice_starts=splice_start,
+                splice_lengths=splice_len,
+                loss_mask=loss_mask,
+            )
+        return soft_loss
+
+    def _apply_surv_losses(
+        self,
+        enc_out,
+        level: str,
+        content_token_ids: torch.Tensor | None = None,
+        content_attn_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Compute per-level survivorship loss + accumulate microbatch state."""
+        from bgkit.training.survivorship_helpers import (
+            LevelICECfg,
+            LevelLossCfg,
+            accumulate,
+            compute_survivorship_losses,
+            init_state,
+        )
+
+        if level == "l0":
+            weights = getattr(self, "_surv_l0", LevelLossCfg())
+            ice_cfg = getattr(self, "_ice_l0", LevelICECfg())
+            ref_moments = getattr(self, "_ref_moments_l0", None)
+            state = getattr(self, "_surv_state_l0", None)
+            if state is None:
+                state = init_state()
+                self._surv_state_l0 = state
+        else:
+            weights = getattr(self, "_surv_l1", LevelLossCfg())
+            ice_cfg = getattr(self, "_ice_l1", LevelICECfg())
+            ref_moments = getattr(self, "_ref_moments_l1", None)
+            state = getattr(self, "_surv_state_l1", None)
+            if state is None:
+                state = init_state()
+                self._surv_state_l1 = state
+
+        target_ratio = self._current_target_ratio()
+        loss, metrics = compute_survivorship_losses(
+            enc_out=enc_out,
+            level=level,
+            weights=weights,
+            ice_cfg=ice_cfg,
+            ref_moments=ref_moments,
+            ice_teacher=getattr(self, "_ice_teacher", None),
+            global_step=self.global_step,
+            content_token_ids=content_token_ids,
+            content_attn_mask=content_attn_mask,
+            target_ratio=target_ratio,
+        )
+        accumulate(state, enc_out)
+        return loss, {f"{level}_{k}": v for k, v in metrics.items()}
 
     def _post_step(self, step: int) -> None:
-        """Advance bidirectional warmup after each optimizer step."""
+        """Advance bidirectional warmup and run dual-ascent θ + EMA μ updates."""
         self.encoder.step_bidi_warmup()
+
+        from bgkit.training.survivorship_helpers import (
+            apply_post_step_updates,
+            init_state,
+            maybe_unload_ice,
+        )
+
+        target_ratio = self._current_target_ratio()
+        merged: dict[str, float] = {}
+        for level, state_attr in (("l0", "_surv_state_l0"), ("l1", "_surv_state_l1")):
+            state = getattr(self, state_attr, None)
+            if state is None:
+                continue
+            update_metrics = apply_post_step_updates(
+                self.encoder.compressor,
+                state,
+                target_ratio=target_ratio,
+                level=level,
+            )
+            merged.update(update_metrics)
+            setattr(self, state_attr, init_state())
+
+        self._last_post_step_metrics = merged
+        unloaded = maybe_unload_ice(
+            getattr(self, "_ice_teacher", None),
+            step,
+            getattr(self, "_max_warmup_step", 0),
+        )
+        if unloaded:
+            logger.info("ice_teacher_unloaded", step=step)
 
     def _get_bidi_alpha(self) -> float:
         from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
@@ -738,6 +1252,13 @@ class CommitEncodingTrainer(BaseTrainer):
             if isinstance(module, (BidirectionalQwen35, PrunedBidirectionalQwen35)):
                 return module.bidi_alpha
         return 1.0
+
+    def _add_step_metrics(self, metrics: dict[str, float]) -> None:
+        """Attach post-step θ/μ updates (without clobbering base metrics)."""
+        post = getattr(self, "_last_post_step_metrics", None)
+        if post:
+            for k, v in post.items():
+                metrics.setdefault(k, v)
 
     # ------------------------------------------------------------------
     # Evaluation

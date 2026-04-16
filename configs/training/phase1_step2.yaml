@@ -23,11 +23,19 @@ bidi_warmup_steps: 0
 # Local warmup steps for newly added param groups at stage transitions
 local_warmup_steps: 500
 
-# Compression ratio distribution (must match teacher's training)
+# Compression ratio distribution. Post-survivorship-pivot (2026-04-15) the
+# survivorship head is part of the encoder but Step 2 does not train it
+# (no BCE/moment-match/soft-attn losses applied). Pinning target_ratio to
+# 1.0 short-circuits the operator (`compression_off` in BgKITCompressor),
+# so teacher and student both bypass the head and produce identical-shape
+# tensors for the distillation losses (boundary, repro, projection,
+# cosine). Without this pin, teacher and student would each run their
+# (different, randomly-initialized) heads, producing mismatched survivor
+# masks that break the distillation.
 compression:
-  target_ratio_min: 0.10    # live-tunable via control.json
-  target_ratio_max: 1.0     # live-tunable via control.json
-  eval_ratio: 0.10          # live-tunable via control.json
+  target_ratio_min: 1.0     # pinned 1.0 — see comment above
+  target_ratio_max: 1.0     # pinned 1.0 — see comment above
+  eval_ratio: 1.0           # pinned 1.0 — see comment above
 
 # Staged unfreezing thresholds (step numbers, live-tunable via control.json)
 stages:

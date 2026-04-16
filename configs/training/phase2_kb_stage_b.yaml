@@ -54,7 +54,9 @@ lora:
   alpha: 64
   dropout: 0.0
 
-# Survivorship head auxiliary losses
+# Survivorship head auxiliary losses. Stage B: L0 is cached + L0 LoRA
+# frozen, so L0 survivorship losses are zeroed and the trainer skips L0
+# θ/μ updates in post-step. L1 continues from Stage A's cold-start.
 survivorship:
   relevance_loss_weight: 0.05
   relevance_gold_boost: 1.5
@@ -63,7 +65,31 @@ survivorship:
   ratio_loss_weight: 0.1
   decisiveness_loss_weight: 0.05
   soft_attn_loss_weight: 0.05
-  soft_attn_every_n_steps: 4
+  soft_attn_every_n_steps: 1
+
+  # L0 frozen — all weights zero; trainer skips L0 θ/μ updates.
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    soft_attn_loss_weight: 0.0
+    moment_match_weight: 0.0
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    soft_attn_loss_weight: 0.3
+    moment_match_weight: 0.0
+
+ice_distillation:
+  l0:
+    enabled: false            # L0 frozen (Stage A baked LoRA into cache)
+  l1:
+    enabled: false
+
+moment_match_reference:
+  l0:
+    path: null
+  l1:
+    path: null
 
 phase1_checkpoint: auto
 # stage_a_checkpoint: auto  # uncomment once Stage A has produced a
