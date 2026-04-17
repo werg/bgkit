@@ -125,7 +125,7 @@ class TestBgKITCompressorForward:
         assert out.head_logits is None
         assert out.survive_probs is None
         assert out.survivor_mask is None
-        assert out.layer7_embeddings is None
+        assert out.post_head_content_values is None
 
     def test_with_attention_mask(self, compressor):
         """Should work with an attention mask passed through."""

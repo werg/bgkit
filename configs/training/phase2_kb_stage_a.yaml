@@ -63,8 +63,8 @@ lora:
   dropout: 0.0
 
 # Survivorship head auxiliary losses. Per-level blocks drive BCE warmup +
-# moment match + soft-attn (new) on top of Phase 2's legacy ratio +
-# decisiveness + relevance (unchanged).
+# moment match + utility-gradient BCE distillation (new) on top of Phase
+# 2's legacy ratio + decisiveness + relevance (unchanged).
 survivorship:
   relevance_loss_weight: 0.05
   relevance_gold_boost: 1.5        # gold positions target ~1.5 * target_ratio
@@ -72,21 +72,27 @@ survivorship:
   n_distractors: 3
   ratio_loss_weight: 0.1
   decisiveness_loss_weight: 0.05
-  soft_attn_loss_weight: 0.05
-  soft_attn_every_n_steps: 1
 
   # Stage A: short L0 BCE re-anchor (200 steps) since the L0 LoRA shifts
   # representations vs the Phase 1 weights. ICE unloads after step 200.
   l0:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
-    soft_attn_loss_weight: 0.2
+    utility_grad_loss_weight: 0.3
     moment_match_weight: 0.05
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
   l1:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.05
-    soft_attn_loss_weight: 0.3
+    utility_grad_loss_weight: 0.3
     moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
 
 ice_distillation:
   checkpoint_path: /workspace/checkpoints/ice_step89999_20260306_213825

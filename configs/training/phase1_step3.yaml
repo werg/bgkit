@@ -4,22 +4,15 @@
 # reproduction task using the pruned encoder from step 2. All curriculum
 # phases are skipped — encoder is unfrozen from step 0.
 #
-# Two-stage cold start (2026-04-15 refactor):
-#   Stage A (steps 0 .. soft_attn_start_step):
-#     - head_base_l0 is pre-distilled offline against ICE (sidecar path
-#       below) so the ranking signal is installed BEFORE Step 3 starts.
-#     - No online BCE (ICE is not loaded).
-#     - Soft-attn is DISABLED. The decoder learns to *use* BgKIT output
-#       at the head's distilled ranking, without the second forward-pass
-#       cost and without the adapter trying to move the selection.
-#     - Moment-match holds base's distribution shape.
-#     - Head adapter is zero-init → the composed logit equals base_raw
-#       until Stage B flips soft-attn on.
-#   Stage B (soft_attn_start_step ..):
-#     - Soft-attn activates and begins training the adapter via decoder CE.
-#     - By this point the decoder has a working reconstruction behaviour,
-#       so the adapter's gradient carries real "which positions matter to
-#       the decoder" information.
+# Cold start:
+#   - head_base_l0 is pre-distilled offline against ICE (sidecar path
+#     below) so the ranking signal is installed BEFORE Step 3 starts.
+#   - No online BCE (ICE is not loaded).
+#   - Moment-match holds base's distribution shape.
+#   - Utility-gradient BCE distillation trains the head from the decoder
+#     CE gradient captured at content_hidden via a backward hook, then
+#     a top-k teacher is built from ``-(grad · value)``. Replaced the
+#     soft-attention second-forward path (2026-04-17).
 phase: phase1_step3
 optimizer: muon
 max_steps: 15000
@@ -71,42 +64,40 @@ use_liger_rmsnorm: false
 
 # Survivorship head losses, per level.
 survivorship:
-  # Soft-attn activation step. Before this step, soft_attn_loss_weight is
-  # force-zero and the second decoder forward is skipped entirely — saves
-  # ~1.8× FLOPs during Stage A. After this step, the configured weight
-  # takes effect and the adapter receives decoder-CE gradient.
-  soft_attn_start_step: 2000
-  # Cadence 4 (was 2): adapter removal means no zero-init head needing
-  # frequent gradient to "come alive"; the full-encoder soft-attn replay
-  # (blocks 2-5 on all content positions) dominates wall-clock during
-  # Stage B, so halving its frequency saves ~1× step duration.
-  soft_attn_every_n_steps: 4
-
-  # L0: base is pre-distilled offline; Stage A runs no ranking loss. Stage
-  # B adds soft-attn through the adapter.
+  # L0: base is pre-distilled offline; utility-gradient BCE trains it
+  # online from the decoder-CE gradient captured at content_hidden.
   #
-  # Moment-match is re-enabled at low weight with a delay: the fresh
-  # sidecar's raw-logit distribution has been auto-calibrated to std ~1
-  # in tanh space via head_tanh_temperature, but moment-match provides
-  # a permanent corpus-wide shape anchor on base_raw so the head can't
-  # drift into degenerate distribution shapes during soft-attn training
-  # (Stage B). The start_step=500 gives BCE warmup time to stabilize
-  # base_raw's distribution before moment-match applies pressure;
+  # Moment-match provides a permanent corpus-wide shape anchor on
+  # base_raw so the head can't drift into degenerate distribution
+  # shapes during utility-grad training. The start_step=500 gives the
+  # encoder time to warm up before moment-match applies pressure;
   # weight 0.05 keeps the gradient subordinate to decoder CE.
   l0:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
-    soft_attn_loss_weight: 0.2
+    utility_grad_loss_weight: 0.3
     moment_match_weight: 0.05
     moment_match_start_step: 500
+    # Minimum-survivors floor loss: relative squared hinge on soft
+    # survivor count, using a larger-tau sigmoid so gradient flows
+    # through tanh saturation. Push the head off "confidently silent"
+    # for samples that currently get zero survivors.
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
 
-  # L1: no ICE anchor; soft-attn drives, decisiveness breaks symmetry.
+  # L1: no ICE anchor; utility-grad BCE drives, decisiveness breaks symmetry.
   # (Step 3 doesn't activate L1 — included for forward compatibility.)
   l1:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.05
-    soft_attn_loss_weight: 0.3
+    utility_grad_loss_weight: 0.3
     moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
 
 # ICE distillation: disabled at runtime because head_base_l0 is pre-
 # distilled via the sidecar. The only remaining runtime link to ICE is

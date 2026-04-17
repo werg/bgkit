@@ -48,17 +48,27 @@ target_ratio_ramp_steps: 3000  # ramp over 3k steps from compression intro (runt
 # (4000 steps to match the original encoder-unfreeze + bidi-warmup window)
 # so the head has plenty of signal before it must operate alone.
 survivorship:
-  soft_attn_every_n_steps: 1
   l0:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
-    soft_attn_loss_weight: 0.2
+    utility_grad_loss_weight: 0.3
     moment_match_weight: 0.1
+    # Relative squared hinge pushing soft survivor count above a per-sample
+    # floor; prevents the head from ranking "nothing important" on short
+    # boilerplate / license-header files.
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
   l1:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.05
-    soft_attn_loss_weight: 0.3
+    utility_grad_loss_weight: 0.3
     moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
 
 ice_distillation:
   checkpoint_path: /workspace/checkpoints/ice_step89999_20260306_213825

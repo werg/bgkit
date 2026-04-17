@@ -153,13 +153,13 @@ class TestBgKITEncoderForward:
         assert torch.allclose(repro, expected)
 
     def test_new_fields_propagated(self, encoder):
-        """CompressionOutput should have head_logits, survive_probs, layer7_embeddings."""
+        """CompressionOutput should have head_logits, survive_probs, post_head_content_values."""
         x = torch.randn(2, 10, 64)
         out = encoder(x, target_ratio=None)
         # Without compression, fields are None
         assert out.head_logits is None
         assert out.survive_probs is None
-        assert out.layer7_embeddings is None
+        assert out.post_head_content_values is None
 
 
 # ---------------------------------------------------------------------------

@@ -223,8 +223,13 @@ def test_compute_losses_bce_warmup_cuts_off():
 class _FakeCompressor:
     def __init__(self):
         from bgkit.models.components.selection import DualThresholdController
-        self.threshold_l0 = DualThresholdController(init_theta=-1.4, lr=0.1)
-        self.threshold_l1 = DualThresholdController(init_theta=-1.4, lr=0.1)
+        # Use init_theta well inside the controller's clamp range
+        # (default ±0.99) so the linear update is observable in tests
+        # that check the post-step value. An out-of-range init silently
+        # clamps on first step and masks the mean-rate logic we want to
+        # exercise here.
+        self.threshold_l0 = DualThresholdController(init_theta=-0.5, lr=0.1)
+        self.threshold_l1 = DualThresholdController(init_theta=-0.5, lr=0.1)
 
 
 def test_apply_post_step_updates_uses_true_mean():
@@ -239,7 +244,7 @@ def test_apply_post_step_updates_uses_true_mean():
     )
     assert metrics["mean_rate"] == pytest.approx(0.30)
     # θ moved up (gap = 0.30 - 0.10 = +0.20, lr=0.1 → +0.02)
-    assert metrics["theta_l0"] == pytest.approx(-1.4 + 0.02, abs=1e-5)
+    assert metrics["theta_l0"] == pytest.approx(-0.5 + 0.02, abs=1e-5)
 
 
 def test_apply_post_step_updates_skips_threshold_when_no_controllable():
@@ -331,9 +336,11 @@ def test_resolve_level_loss_cfg_defaults():
 
 
 def test_resolve_level_loss_cfg_partial():
-    cfg = resolve_level_loss_cfg({"moment_match_weight": 0.1, "soft_attn_loss_weight": 0.2})
+    cfg = resolve_level_loss_cfg(
+        {"moment_match_weight": 0.1, "utility_grad_loss_weight": 0.2},
+    )
     assert cfg.moment_match_weight == 0.1
-    assert cfg.soft_attn_loss_weight == 0.2
+    assert cfg.utility_grad_loss_weight == 0.2
     assert cfg.ratio_loss_weight == 0.0
 
 
@@ -480,3 +487,202 @@ def test_survivorship_diagnostics_missing_tensors_are_skipped():
     assert "l0_organic_rate_std" in metrics
     assert "l0_undecided_fraction" not in metrics
     assert "l0_floor_trigger_rate" not in metrics
+
+
+# ----------------------------------------------------------------------
+# Minimum-survivors loss
+# ----------------------------------------------------------------------
+
+
+class _FakeEncOutMinSurv:
+    """Fixture for the min-survivors loss with a configurable theta."""
+
+    def __init__(self, logits, theta, base_raw=None):
+        self.base_raw = base_raw if base_raw is not None else logits
+        self.logits_for_op = logits
+        # Pretend operator metrics
+        self.survive_probs_metrics = torch.sigmoid(logits.detach())
+        self.organic_count = torch.tensor(int(logits.numel()))
+        self.controllable_count = torch.tensor(int(logits.numel()))
+        self.valid_count = torch.tensor(int(logits.numel()))
+        self.theta_tensor = torch.tensor(float(theta))
+
+
+def test_min_survivors_loss_zero_when_count_above_floor():
+    """If every sample already has soft_count ≥ N_min, the deficit is zero."""
+    # Wildly above-threshold logits → soft_count ≈ L for every sample
+    B, L = 4, 100
+    logits = torch.full((B, L), 5.0, requires_grad=True)  # far above theta
+    enc = _FakeEncOutMinSurv(logits, theta=0.0)
+    weights = LevelLossCfg(
+        min_survivors_loss_weight=1.0,
+        min_survivors_floor_ratio=0.02,
+        min_survivors_absolute_min=1,
+        min_survivors_tau=0.3,
+    )
+    total, metrics = compute_survivorship_losses(
+        enc, "l0", weights, LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=0,
+        content_token_ids=None, content_attn_mask=None, target_ratio=0.1,
+    )
+    assert "min_survivors_loss" in metrics
+    assert metrics["min_survivors_loss"] == pytest.approx(0.0, abs=1e-6)
+    # Soft count should be ~L for each sample.
+    assert metrics["min_survivors_soft_count_mean"] == pytest.approx(float(L), abs=0.5)
+
+
+def test_min_survivors_loss_positive_when_all_below_theta():
+    """Zero-survivor samples (all logits far below theta) produce deficit ≈ 1
+    and loss ≈ 1 per affected sample."""
+    B, L = 4, 20
+    logits = torch.full((B, L), -5.0, requires_grad=True)  # far below theta
+    enc = _FakeEncOutMinSurv(logits, theta=0.2)
+    weights = LevelLossCfg(
+        min_survivors_loss_weight=1.0,
+        min_survivors_floor_ratio=0.02,
+        min_survivors_absolute_min=1,
+        min_survivors_tau=0.3,
+    )
+    total, metrics = compute_survivorship_losses(
+        enc, "l0", weights, LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=0,
+        content_token_ids=None, content_attn_mask=None, target_ratio=0.1,
+    )
+    # With soft_count ≈ 0 and N_min=1 (absolute), deficit = 1 for each sample,
+    # loss = mean(deficit²) ≈ 1.
+    assert metrics["min_survivors_loss"] == pytest.approx(1.0, abs=1e-3)
+    assert metrics["min_survivors_target_mean"] == pytest.approx(1.0, abs=1e-3)
+    assert metrics["min_survivors_soft_count_mean"] == pytest.approx(0.0, abs=1e-2)
+
+
+def test_min_survivors_loss_flows_gradient_to_logits():
+    """The loss must produce non-zero gradient on logits_for_op — this is
+    the whole point of replacing the post-hoc min_per_sample floor."""
+    B, L = 3, 30
+    logits = torch.full((B, L), -2.0, requires_grad=True)
+    enc = _FakeEncOutMinSurv(logits, theta=0.2)
+    weights = LevelLossCfg(
+        min_survivors_loss_weight=1.0,
+        min_survivors_floor_ratio=0.02,
+        min_survivors_absolute_min=1,
+        min_survivors_tau=0.3,
+    )
+    total, _ = compute_survivorship_losses(
+        enc, "l0", weights, LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=0,
+        content_token_ids=None, content_attn_mask=None, target_ratio=0.1,
+    )
+    total.backward()
+    assert logits.grad is not None
+    # Gradient should push logits UP (to raise soft_count above N_min).
+    # Sign convention: dloss/dlogits < 0, so .grad < 0 and logits will step up
+    # under gradient descent.
+    assert float(logits.grad.sum().item()) < 0.0
+
+
+def test_min_survivors_loss_target_scales_with_content_length():
+    """N_min = max(absolute_min, ceil(floor_ratio * content_len)).
+    For 500-token sample at 0.02 floor_ratio → N_min = 10 (not 1)."""
+    B, L = 1, 500
+    logits = torch.full((B, L), 0.0, requires_grad=True)
+    # theta=0.0 and logits=0.0 → sigmoid((0-0)/tau) = 0.5 → soft_count ≈ 250.
+    # But N_min scales to 10 (0.02 × 500), so no deficit.
+    enc = _FakeEncOutMinSurv(logits, theta=0.0)
+    weights = LevelLossCfg(
+        min_survivors_loss_weight=1.0,
+        min_survivors_floor_ratio=0.02,
+        min_survivors_absolute_min=1,
+        min_survivors_tau=0.3,
+    )
+    _, metrics = compute_survivorship_losses(
+        enc, "l0", weights, LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=0,
+        content_token_ids=None, content_attn_mask=None, target_ratio=0.1,
+    )
+    # 0.02 × 500 = 10
+    assert metrics["min_survivors_target_mean"] == pytest.approx(10.0)
+
+
+def test_min_survivors_loss_respects_attention_mask():
+    """Padded positions (attn_mask=False) must not contribute to soft_count
+    OR to content_len used in the target computation."""
+    B = 1
+    L = 100
+    valid_len = 50
+    logits = torch.full((B, L), 5.0, requires_grad=True)  # all above theta
+    attn = torch.zeros(B, L, dtype=torch.bool)
+    attn[:, :valid_len] = True
+    enc = _FakeEncOutMinSurv(logits, theta=0.0)
+    weights = LevelLossCfg(
+        min_survivors_loss_weight=1.0,
+        min_survivors_floor_ratio=0.02,
+        min_survivors_absolute_min=1,
+        min_survivors_tau=0.3,
+    )
+    _, metrics = compute_survivorship_losses(
+        enc, "l0", weights, LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=0,
+        content_token_ids=None, content_attn_mask=attn, target_ratio=0.1,
+    )
+    # Soft count must reflect only the 50 valid positions, not 100.
+    assert metrics["min_survivors_soft_count_mean"] == pytest.approx(
+        float(valid_len), abs=0.5,
+    )
+    # N_min = max(1, ceil(0.02 × 50)) = max(1, 1) = 1.
+    assert metrics["min_survivors_target_mean"] == pytest.approx(1.0)
+
+
+def test_min_survivors_loss_disabled_when_weight_zero():
+    """Config default weight=0 must produce no metric and no contribution."""
+    B, L = 2, 10
+    logits = torch.full((B, L), -5.0, requires_grad=True)
+    enc = _FakeEncOutMinSurv(logits, theta=0.0)
+    weights = LevelLossCfg()  # all zeros
+    total, metrics = compute_survivorship_losses(
+        enc, "l0", weights, LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=0,
+        content_token_ids=None, content_attn_mask=None, target_ratio=0.1,
+    )
+    assert "min_survivors_loss" not in metrics
+    assert float(total.item()) == 0.0
+
+
+def test_resolve_level_loss_cfg_reads_min_survivors_fields():
+    cfg = resolve_level_loss_cfg({
+        "min_survivors_loss_weight": 0.05,
+        "min_survivors_floor_ratio": 0.03,
+        "min_survivors_absolute_min": 2,
+        "min_survivors_tau": 0.4,
+    })
+    assert cfg.min_survivors_loss_weight == pytest.approx(0.05)
+    assert cfg.min_survivors_floor_ratio == pytest.approx(0.03)
+    assert cfg.min_survivors_absolute_min == 2
+    assert cfg.min_survivors_tau == pytest.approx(0.4)
+
+
+def test_survivor_count_diagnostics_emitted_from_survivor_mask():
+    """zero_survivor_rate, low_survivor_rate_lt5, median_survivors should
+    come out of survivorship_diagnostics when survivor_mask is present."""
+    # 4 samples: first has 0 survivors; second has 3; third has 20; fourth has 50.
+    B, L = 4, 60
+    surv = torch.zeros(B, L, dtype=torch.bool)
+    surv[1, :3] = True
+    surv[2, :20] = True
+    surv[3, :50] = True
+
+    class _E:
+        organic_rate_std = torch.tensor(0.1)
+        undecided_fraction = None
+        floor_trigger_rate = None
+        num_pinned = None
+        theta_tensor = None
+        survivor_mask = surv
+
+    metrics = survivorship_diagnostics(_E(), "l0", global_step=0, every_n_steps=1)
+    # 1/4 zero-survivor = 0.25
+    assert metrics["l0_zero_survivor_rate"] == pytest.approx(0.25)
+    # samples with <5 survivors: 2/4 (the 0- and 3-survivor ones) = 0.5
+    assert metrics["l0_low_survivor_rate_lt5"] == pytest.approx(0.5)
+    # PyTorch's .median() on an even-length 1-D tensor returns the lower
+    # of the two middle elements — for [0, 3, 20, 50] that is 3.
+    assert metrics["l0_median_survivors"] == pytest.approx(3.0)

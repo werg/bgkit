@@ -118,6 +118,27 @@ EXTENSION_LANGUAGES: dict[str, str] = {
 # Maximum file size to read (256 KB) — larger files are typically data, not code
 MAX_FILE_SIZE: int = 256 * 1024
 
+# Content-based minification heuristics. Minified / bundled / generated code
+# is out-of-distribution for human-written source — compresses poorly and
+# drags reconstruction loss disproportionately (see Phase 1 Step 3 per-token
+# loss analysis 2026-04-17: minified JS pulled JavaScript bucket mean to
+# 1.48 vs ~0.9 for hand-written languages). Thresholds tuned to be
+# conservative — prefer false-negatives over false-positives.
+_MINIFIED_MAX_LINE_LEN = 2000  # any line this long ⇒ minified/generated
+_MINIFIED_MEAN_LINE_LEN = 200  # mean over all lines ⇒ dense bundle
+_MINIFIED_SHORT_FILE_MAX_LEN = 500  # 1-2 line files with any line > this
+_MINIFIED_MIN_BYTES = 200  # below this, heuristics are noise (tiny valid files)
+
+# Compound-suffix filename patterns for common bundle / generated outputs
+# that slip past the simple extension blacklist.
+_MINIFIED_FILENAME_SUFFIXES: tuple[str, ...] = (
+    ".bundle.js", ".chunk.js",
+    ".bundle.mjs", ".chunk.mjs",
+    ".bundle.css", ".chunk.css",
+    ".js.map", ".css.map", ".mjs.map", ".cjs.map",
+    ".d.ts.map",
+)
+
 # Per-extension size limits (bytes) for types that are often data/generated when large
 EXTENSION_SIZE_CAPS: dict[str, int] = {
     ".html": 20 * 1024,
@@ -157,6 +178,7 @@ class RepoSnapshot:
     skipped_binary: int = 0
     skipped_large: int = 0
     skipped_pattern: int = 0
+    skipped_minified: int = 0
 
     @property
     def total_files(self) -> int:
@@ -222,8 +244,75 @@ def _should_skip_path(path: str) -> bool:
     if "swagger_doc_generated" in name:
         return True
 
+    # Skip compound-suffix bundle / source-map filenames that slip past
+    # the simple extension blacklist.
+    if name.endswith(_MINIFIED_FILENAME_SUFFIXES):
+        return True
+
     # In public/ dirs, only keep actual code files (not static assets like HTML/CSS)
     return "public" in parts[:-1] and suffix not in _PUBLIC_KEEP_EXTS
+
+
+def looks_minified(content: str, *, content_type: str = "code") -> bool:
+    """Content-based minification / pathology heuristic.
+
+    ``content_type="code"`` (default) — strict heuristic tuned for source
+    files. Catches bundled JS, minified CSS, embedded data-as-code,
+    machine-generated blobs. Flags on:
+      - max line length > ``_MINIFIED_MAX_LINE_LEN`` (2000 chars), OR
+      - 1-2 line files with any line > ``_MINIFIED_SHORT_FILE_MAX_LEN``
+        (500 chars; the classic minified one-liner), OR
+      - mean line length > ``_MINIFIED_MEAN_LINE_LEN`` (200 chars).
+
+    ``content_type="prose"`` — relaxed heuristic for natural-language
+    corpora where single-paragraph documents (Wikipedia articles,
+    PubMedQA abstracts) legitimately lack line breaks and have high
+    per-line lengths. Only the ``_MINIFIED_MAX_LINE_LEN`` rule applies:
+    a single line over 2000 chars suggests pathological content
+    (CSV-as-prose, HTML-in-field, base64 blobs) rather than natural
+    text.
+
+    False on short files (< ``_MINIFIED_MIN_BYTES``) because tiny files
+    legitimately have no structure to analyse.
+    """
+    if content_type not in ("code", "prose"):
+        raise ValueError(
+            f"content_type must be 'code' or 'prose', got {content_type!r}",
+        )
+    if len(content) < _MINIFIED_MIN_BYTES:
+        return False
+
+    lines = content.splitlines()
+    n_lines = len(lines)
+    if n_lines == 0:
+        return False
+
+    max_len = 0
+    total_len = 0
+    for line in lines:
+        n = len(line)
+        total_len += n
+        if n > max_len:
+            max_len = n
+
+    # Shared rule: any single line over the hard cap is suspect
+    # regardless of content type. Applies to both code and prose.
+    if max_len > _MINIFIED_MAX_LINE_LEN:
+        return True
+
+    if content_type == "prose":
+        # Prose: single-paragraph articles are normal. Don't flag on
+        # short_file or mean_line length rules — those match legitimate
+        # abstracts and short Wikipedia stubs.
+        return False
+
+    # 1-2 line files with any long line: minified one-liner.
+    if n_lines <= 2 and max_len > _MINIFIED_SHORT_FILE_MAX_LEN:
+        return True
+
+    # Mean line length over the threshold: dense machine-generated content.
+    mean_len = total_len / n_lines
+    return mean_len > _MINIFIED_MEAN_LINE_LEN
 
 
 def _walk_tree(
@@ -328,6 +417,13 @@ def extract_repo_snapshot(
             content = blob.data.decode("utf-8")
         except UnicodeDecodeError:
             snapshot.skipped_binary += 1
+            continue
+
+        # Reject minified / bundled / generated content that slipped past
+        # the extension / path filters. These have pathological line-length
+        # distributions and hurt compression / reconstruction quality.
+        if looks_minified(content):
+            snapshot.skipped_minified += 1
             continue
 
         snapshot.files.append(FileRecord(

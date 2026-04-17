@@ -329,6 +329,15 @@ async def process_commit(
     model_id: str,
 ) -> list[dict]:
     """Generate QA pairs for a single commit."""
+    # Skip commits whose formatted diff looks minified / bundled. A big
+    # diff touching a generated file produces near-garbage prompts — the
+    # LLM follows suit and the generated QA pair has no training signal.
+    # Filtering here avoids both wasted tokens and downstream noise.
+    from bgkit.data.repo_processing import looks_minified
+
+    if looks_minified(_format_diff(commit)):
+        return []
+
     # Generate questions
     questions = await generate_questions_for_commit(client, commit, num_questions)
     if not questions:

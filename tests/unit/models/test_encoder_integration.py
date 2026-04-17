@@ -1,12 +1,12 @@
-"""Integration smoke: full encoder forward with two-head + adapter + operator.
+"""Integration smoke: full encoder forward with single-head operator.
 
 Exercises the hot paths without needing a real Qwen backbone:
-- Forward produces all new CompressionOutput fields.
+- Forward produces all CompressionOutput fields.
 - Operator short-circuit (target_ratio >= 0.999) returns no mask/fields.
 - logits_for_op == tanh(base_raw / T) numerically.
-- full_after_head captures the post-head hidden at full L_full length.
-- Soft-attn replay via forward_from_block(2) with spliced prompt context
-  produces a usable gradient path into the adapter.
+- Utility-gradient plumbing populates ``post_head_content_values`` and
+  the backward hook captures ``post_head_content_grad`` when the
+  compressor is called with ``utility_grad_active=True``.
 """
 
 from __future__ import annotations
@@ -94,16 +94,20 @@ def test_forward_populates_all_new_fields():
         prompt_embeddings=prompt,
         prompt_attention_mask=torch.ones(2, 3, dtype=torch.bool),
         target_ratio=0.5, level="l0",
+        utility_grad_active=True,
     )
     # Single-head fields populated.
     for field in (
         "base_raw",
         "logits_for_op",
         "survive_probs_metrics",
-        "layer7_embeddings",
-        "full_after_head",
+        "base_raw_for_util",
+        "post_head_content_values",
     ):
         assert getattr(out, field) is not None, f"{field} should be populated"
+    # Legacy soft-attn fields removed.
+    assert not hasattr(out, "layer7_embeddings") or out.__dict__.get("layer7_embeddings") is None
+    assert not hasattr(out, "full_after_head") or out.__dict__.get("full_after_head") is None
     # Metrics aggregation primitives.
     for field in ("valid_count", "organic_count", "controllable_count"):
         assert getattr(out, field) is not None, f"{field} should be populated"
@@ -118,7 +122,8 @@ def test_compression_off_short_circuit():
     assert out.survivor_mask is None
     assert out.base_raw is None
     assert out.logits_for_op is None
-    assert out.full_after_head is None
+    assert out.base_raw_for_util is None
+    assert out.post_head_content_values is None
 
 
 def test_logits_composition_numerical():
@@ -134,24 +139,6 @@ def test_logits_composition_numerical():
     assert torch.allclose(out.logits_for_op, expected, atol=1e-5)
 
 
-def test_full_after_head_shape_and_splice():
-    torch.manual_seed(0)
-    comp = _make_compressor()
-    content = torch.randn(2, 4, HIDDEN_DIM)
-    prompt = torch.randn(2, 3, HIDDEN_DIM)
-    out = comp(
-        content, prompt_embeddings=prompt,
-        attention_mask=torch.ones(2, 4, dtype=torch.bool),
-        prompt_attention_mask=torch.ones(2, 3, dtype=torch.bool),
-        target_ratio=0.5, level="l0",
-    )
-    # L_full = prompt(3) + sep(1) + content(4) = 8
-    assert out.full_after_head.shape == (2, 8, HIDDEN_DIM)
-    assert out.content_slice == slice(4, None)
-    # full_after_head must be detached (no grad on it)
-    assert not out.full_after_head.requires_grad
-
-
 def test_head_logits_alias_is_base_raw():
     torch.manual_seed(0)
     comp = _make_compressor()
@@ -162,39 +149,25 @@ def test_head_logits_alias_is_base_raw():
     assert torch.equal(out.head_logits, out.base_raw)
 
 
-def test_softattn_replay_gradients_reach_head():
-    """Single-head architecture: soft-attn replay gradient flows to the
-    head (no adapter separation). Used to check the ``adapter`` received
-    gradient while the ``base`` did not; now there's just one head and
-    the only check is that SOME gradient reaches it (i.e. the full-encoder
-    replay path is wired up)."""
+def test_utility_grad_backward_hook_populates_content_grad():
+    """With ``utility_grad_active=True``, the compressor registers a
+    backward hook that captures ``post_head_content_grad`` during the
+    main backward. Verify it populates with the correct shape after a
+    dummy ``base_raw.sum().backward()``.
+    """
     torch.manual_seed(0)
     comp = _make_compressor()
-    content = torch.randn(1, 4, HIDDEN_DIM)
-    prompt = torch.randn(1, 3, HIDDEN_DIM)
+    content = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
     out = comp(
-        content, prompt_embeddings=prompt,
-        attention_mask=torch.ones(1, 4, dtype=torch.bool),
-        prompt_attention_mask=torch.ones(1, 3, dtype=torch.bool),
+        content,
+        attention_mask=torch.ones(2, 4, dtype=torch.bool),
         target_ratio=0.5, level="l0",
+        utility_grad_active=True,
     )
-    # Simulate soft-attn replay: splice gated content into full_after_head.
-    theta = comp.threshold_l0.theta
-    softattn_probs = torch.sigmoid(
-        out.logits_for_op.float() - theta.float(),
-    ).to(content.dtype)
-    p = softattn_probs.unsqueeze(-1)
-    gated = out.layer7_embeddings + p * comp.survive_embedding + (1 - p) * comp.doomed_embedding
-    full = out.full_after_head.clone()
-    full[:, out.content_slice, :] = gated
-    resumed = comp.backbone.forward_from_block(
-        hidden=full, start_block=2,
-        attention_mask=out.full_attention_mask,
-    ).last_hidden_state
-    loss = resumed.pow(2).mean()
-    loss.backward()
-    head_grad = sum(
-        (p.grad.abs().sum() if p.grad is not None else 0)
-        for p in comp.head_base_l0.parameters()
-    )
-    assert head_grad > 0
+    assert out.post_head_content_values is not None
+    assert out.post_head_content_values.shape == (2, 4, HIDDEN_DIM)
+    assert out.get_content_grad() is None  # backward hasn't fired yet
+    out.base_raw.sum().backward()
+    grad = out.get_content_grad()
+    assert grad is not None
+    assert grad.shape == (2, 4, HIDDEN_DIM)

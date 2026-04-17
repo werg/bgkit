@@ -136,6 +136,65 @@ services:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_step5", "++training.reset_wandb=true"]
 
+  # Per-token loss analyzer for a Phase 1 Step 3 checkpoint.
+  # Shares the GPU with an ongoing training container; expect a ~20–30%
+  # slowdown while it runs. Pinned to the already-built
+  # docker-train-phase1-step3 image so it never triggers a rebuild while
+  # training is live. Invoke via:
+  #   docker compose --env-file .env -f docker/docker-compose.yaml run --rm analyze-phase1-step3-loss
+  # Override checkpoint / output / max_samples via +analyze.* args.
+  analyze-phase1-step3-loss:
+    <<: *gpu-common
+    image: docker-train-phase1-step3:latest
+    build: !reset null
+    command: [
+      "scripts/analyze_step3_loss.py",
+      "+experiment=phase1_step3",
+      "+analyze.checkpoint=/workspace/checkpoints/phase1_step3_step1500_20260417_042208",
+      "+analyze.output_dir=/workspace/data/diagnostics/analyze_step3_step1500_20260417_042208",
+      "+analyze.max_samples=500",
+      # Use SDPA attention — avoids FA4's CUDA-error concurrency
+      # fragility when training is also using FA4 on the same GPU.
+      "++compute.attention_implementation=sdpa",
+      # Halve per-microbatch tokens so we don't trip the unified-memory
+      # allocator while training is live.
+      "++training.max_batch_tokens=8192",
+    ]
+
+  # Survivor counterfactual + logit-distribution analyzer for Phase 1
+  # Step 3. Runs eval twice (min_per_sample=0 vs =1) on the same samples
+  # and dumps per-sample logit stats + content for zero-survivor samples.
+  analyze-phase1-step3-survivors:
+    <<: *gpu-common
+    image: docker-train-phase1-step3:latest
+    build: !reset null
+    command: [
+      "scripts/analyze_step3_survivors.py",
+      "+experiment=phase1_step3",
+      "+analyze.checkpoint=/workspace/checkpoints/phase1_step3_step1500_20260417_042208",
+      "+analyze.output_dir=/workspace/data/diagnostics/survivors_step3_step1500",
+      "+analyze.max_samples=500",
+      "++compute.attention_implementation=sdpa",
+      "++training.max_batch_tokens=8192",
+    ]
+
+  # With-vs-without-survivors ablation: same samples, two decoder passes
+  # (real survivors vs zeroed). Per-position Δ tells us whether the
+  # decoder is using survivor info at depth or just autoregressing.
+  analyze-phase1-step3-survivor-ablation:
+    <<: *gpu-common
+    image: docker-train-phase1-step3:latest
+    build: !reset null
+    command: [
+      "scripts/analyze_step3_survivor_ablation.py",
+      "+experiment=phase1_step3",
+      "+analyze.checkpoint=/workspace/checkpoints/phase1_step3_step1500_20260417_042208",
+      "+analyze.output_dir=/workspace/data/diagnostics/ablation_step3_step1500",
+      "+analyze.max_samples=500",
+      "++compute.attention_implementation=sdpa",
+      "++training.max_batch_tokens=8192",
+    ]
+
   train-phase2-kb-stage-a:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase2_kb_stage_a"]

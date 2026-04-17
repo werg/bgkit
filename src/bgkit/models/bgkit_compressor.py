@@ -15,27 +15,29 @@ via BidirectionalQwen35. Applied recursively at two compression levels:
 Shared backbone weights across levels, but separate survivorship head
 instances for L0 and L1 (different input distributions). Each level has
 one head (``head_base_l{0,1}``; name retained for sidecar compatibility)
-trained by BCE warmup + moment-match + soft-attn.
+trained by BCE warmup + moment-match + utility-gradient BCE distillation.
 
 The operator-facing logit is ``tanh(base_raw / T)`` where T is a
 per-level buffer (``head_tanh_temperature_l{0,1}``) calibrated from the
 head's raw-logit std at sidecar load (L0) or at trainer startup (L1).
 Tanh bounds the output to (-1, 1) so θ lives in a head-agnostic
-coordinate system and saturation is the structural guard against
-soft-attn inflating the aggregate logit mass. L0 and L1 see different
-input distributions (L1's input is L0's survivors, with a narrower
-IC range), so each level needs its own T.
+coordinate system. L0 and L1 see different input distributions (L1's
+input is L0's survivors, with a narrower IC range), so each level needs
+its own T.
 
 Selection is ``logit > θ`` against a single global threshold θ owned by
 ``DualThresholdController`` and updated externally by dual ascent against
 the curriculum's target compression ratio. No straight-through estimator
-on the hard mask — all gradient to the head flows via BCE, moment-match
-(both directly on ``base_raw``), and soft-attn (through the tanh).
+on the hard mask — head gradient flows via BCE warmup, moment-match
+(both directly on ``base_raw``), and utility-gradient BCE (via the
+detached-input fork ``base_raw_for_util``, distilling a top-k teacher
+derived from the backward-hook-captured gradient on ``content_hidden``).
 
 Historical note: an adapter-head + μ EMA architecture was used 2026-04-15
-to 2026-04-16 to structurally prevent soft-attn inflation via zero-sum
-redistribution. It was removed in favor of tanh saturation once bounded
-operator output was in place (see git log for 2026-04-16 simplification).
+to 2026-04-16. Soft-attention distillation was used until 2026-04-17; it
+was replaced by utility-gradient BCE which gets the same ranking signal
+without the 3× second-forward cost (see git log for the 2026-04-17
+soft-attn removal).
 
 Auto-reproduction output head maps outputs back to input embedding space.
 """
@@ -68,14 +70,28 @@ class CompressorOutput:
     head_logits: torch.Tensor | None = None  # alias of base_raw (pre-tanh raw head output)
     survive_probs: torch.Tensor | None = None  # alias of survive_probs_metrics
     survivor_mask: torch.Tensor | None = None  # (B, L_content) bool — operator's final selection
-    layer7_embeddings: torch.Tensor | None = None  # (B, L_content, D) for soft attention branch
-    full_after_head: torch.Tensor | None = None  # (B, L_full, D) post-head hidden (incl. prompt+sep) for soft-attn replay
-    full_attention_mask: torch.Tensor | None = None  # alias of attention_mask (full-seq mask)
     intermediates: list[torch.Tensor] | None = None  # block boundary hidden states
     # Single-head fields (adapter architecture removed 2026-04-16):
     base_raw: torch.Tensor | None = None  # (B, L_content) — raw head output (pre-tanh)
     logits_for_op: torch.Tensor | None = None  # tanh(base_raw / T)
     survive_probs_metrics: torch.Tensor | None = None  # sigmoid(logits_for_op - θ), detached
+    # Utility-gradient distillation fields. Populated only when the owning
+    # trainer has asked for utility-grad BCE at the active level (via the
+    # compressor's forward ``utility_grad_active`` kwarg). Otherwise None.
+    # - ``base_raw_for_util``: ``head(content_hidden.detach())`` — BCE
+    #   logits whose backward terminates cleanly at the head weights.
+    #   Computed inside the encoder's LoRA context so any active adapter
+    #   is applied (Phase 2 Stage A trains the L0 LoRA).
+    # - ``post_head_content_values``: forward-time detached clone of
+    #   ``content_hidden`` at the head layer, paired with
+    #   ``post_head_content_grad`` to form the utility-teacher ranking
+    #   ``util_i = -(grad · value)_i``.
+    # - ``post_head_content_grad``: populated by a backward hook on
+    #   ``content_hidden`` when ``total_loss.backward()`` runs; remains
+    #   None until backward fires. Access via :meth:`get_content_grad`.
+    base_raw_for_util: torch.Tensor | None = None
+    post_head_content_values: torch.Tensor | None = None
+    post_head_content_grad: torch.Tensor | None = None
     valid_count: torch.Tensor | None = None  # scalar int, sum(valid_mask), detached
     organic_count: torch.Tensor | None = None  # scalar int, |organic ∩ controllable|, detached
     controllable_count: torch.Tensor | None = None  # scalar int, |controllable|, detached
@@ -96,6 +112,19 @@ class CompressorOutput:
     # boundary or directly from compressor.threshold_l{0,1}.theta.
     theta_tensor: torch.Tensor | None = None
 
+    def get_content_grad(self) -> torch.Tensor | None:
+        """Return ``post_head_content_grad`` populated by the backward hook.
+
+        Reads from the internal ``_utility_grad_state`` dict (set when
+        ``utility_grad_active=True`` and no explicit ``utility_grad_capture``
+        dict was supplied). Returns None when utility-grad was inactive or
+        backward hasn't run yet.
+        """
+        state = getattr(self, "_utility_grad_state", None)
+        if state is not None:
+            return state.get("post_head_content_grad")
+        return self.post_head_content_grad
+
 
 @dataclass
 class CompressionOutput:
@@ -108,14 +137,15 @@ class CompressionOutput:
     survivor_counts: torch.Tensor | None = None  # (B,) int, None if no compression
     head_logits: torch.Tensor | None = None  # (B, L_content) raw logits (alias for base_raw)
     survive_probs: torch.Tensor | None = None  # detached metrics view
-    layer7_embeddings: torch.Tensor | None = None  # (B, L_content, D) pre-layer-8 embeddings
-    full_after_head: torch.Tensor | None = None  # (B, L_full, D) detached post-head hidden
-    full_attention_mask: torch.Tensor | None = None  # (B, L_full) full-sequence mask
     content_slice: slice | None = None  # where content starts in L_full (for splicing)
     # Single-head fields:
     base_raw: torch.Tensor | None = None
     logits_for_op: torch.Tensor | None = None
     survive_probs_metrics: torch.Tensor | None = None
+    # Utility-gradient distillation fields (see CompressorOutput docstring).
+    base_raw_for_util: torch.Tensor | None = None
+    post_head_content_values: torch.Tensor | None = None
+    post_head_content_grad: torch.Tensor | None = None
     valid_count: torch.Tensor | None = None
     organic_count: torch.Tensor | None = None
     controllable_count: torch.Tensor | None = None
@@ -124,6 +154,13 @@ class CompressionOutput:
     organic_rate_std: torch.Tensor | None = None
     undecided_fraction: torch.Tensor | None = None
     theta_tensor: torch.Tensor | None = None
+
+    def get_content_grad(self) -> torch.Tensor | None:
+        """Proxy for ``CompressorOutput.get_content_grad()``."""
+        state = getattr(self, "_utility_grad_state", None)
+        if state is not None:
+            return state.get("post_head_content_grad")
+        return self.post_head_content_grad
 
 
 class BgKITCompressor(nn.Module):
@@ -134,7 +171,7 @@ class BgKITCompressor(nn.Module):
     - Single survivorship head per level, composed as
       ``logits_for_op = tanh(base_raw / T)``
     - Per-level ``DualThresholdController`` (owns θ scalar, dual ascent)
-    - Learned binary embeddings for survive/doomed flags
+    - Learned ``survive_embedding`` added at surviving content positions
     - Auto-reproduction output head
 
     Intentionally removed: the ``ratio_embedding`` injected at layer 3.
@@ -146,9 +183,13 @@ class BgKITCompressor(nn.Module):
     norm layer for normalizing the output before auto-reproduction.
 
     Hook-based forward: a single hook fires after layer 7 / block 1 to run
-    both heads, compose the operator logit, run ``adaptive_threshold_select``,
-    and add flag embeddings to all content positions (survive_emb at survivor
-    positions, doomed_emb elsewhere).
+    the head, compose the operator logit, run ``adaptive_threshold_select``,
+    and add ``survive_embedding`` at surviving content positions. When
+    utility-grad BCE distillation is active (see ``forward``
+    ``utility_grad_active`` arg), the hook also runs a detached-input
+    head fork (producing ``base_raw_for_util``) and registers a backward
+    hook on ``content_hidden`` to capture the gradient used as the
+    utility-teacher signal.
     """
 
     def __init__(
@@ -190,9 +231,11 @@ class BgKITCompressor(nn.Module):
             torch.tensor(float(head_tanh_temperature), dtype=torch.float32),
         )
 
-        # Learned flag embeddings added to input representations
+        # Learned flag embedding added to surviving content positions. The
+        # prior ``doomed_embedding`` (added to non-survivors) was removed
+        # alongside soft-attn: without soft-attn's ``p · doomed_emb`` gate
+        # it had no clean gradient path and drifted on weak diffuse gradient.
         self.survive_embedding = nn.Parameter(torch.randn(hidden_dim) * 0.02)
-        self.doomed_embedding = nn.Parameter(torch.randn(hidden_dim) * 0.02)
 
         # Learned separator between prompt and content embeddings.
         self.prompt_separator_embedding = nn.Parameter(torch.zeros(hidden_dim))
@@ -245,6 +288,8 @@ class BgKITCompressor(nn.Module):
         level: str = "l0",
         return_intermediates: bool = False,
         min_per_sample: int = 0,
+        utility_grad_active: bool = False,
+        utility_grad_capture: dict | None = None,
     ) -> CompressorOutput:
         """Run the compressor with two-head survivorship operator.
 
@@ -330,10 +375,10 @@ class BgKITCompressor(nn.Module):
             Composes ``logits_for_op = tanh(base_raw / T)`` then runs
             ``adaptive_threshold_select`` against θ. Bool mask detached to
             prevent an uncontrolled head-gradient path through every
-            position's flag contribution. All three loss paths (BCE warmup,
-            moment-match, soft-attn) flow back to the same head; tanh
-            saturation at ±1 is the sole structural guard against soft-attn
-            inflating the aggregate logit mass.
+            position's flag contribution. The head receives gradient via
+            BCE warmup, moment-match, and (when enabled) utility-gradient
+            BCE distillation. Tanh saturation at ±1 bounds the aggregate
+            logit mass.
             """
             if compression_off:
                 return hidden
@@ -341,17 +386,61 @@ class BgKITCompressor(nn.Module):
             head, controller = self._heads_for_level(level)
 
             content_hidden = hidden[:, content_slice, :]
-            # Detach layer7 before stashing for soft-attn: soft-attn is
-            # intended to train the head + survive/doomed embeddings +
-            # blocks 2..end (via forward_from_block) + projection_block +
-            # decoder. It must NOT also provide a second gradient path back
-            # through backbone blocks 0-1 (that would duplicate the hard
-            # forward's backbone gradient through the same blocks). Detach
-            # kills the 0-1 duplicate path while preserving gradient flow
-            # through blocks 2..end downstream.
-            hook_state["layer7_embeddings"] = content_hidden.detach().clone()
 
             base_raw = head(content_hidden)  # (B, L_content)
+            # Utility-grad plumbing (executed inside the encoder's LoRA
+            # context, so ``head`` forwards see any active LoRA adapter
+            # — crucial for Phase 2 Stage A where the L0 LoRA is what we
+            # actually want to train):
+            #
+            # 1. ``base_raw_for_util = head(content_hidden.detach())``
+            #    is a second head forward with a detached input. The
+            #    backward subgraph ``util_loss → base_raw_for_util →
+            #    head.weights`` is fully disjoint from the main
+            #    ``total_loss → base_raw → content_hidden → backbone``
+            #    subgraph. Because they share no nodes,
+            #    ``total_loss.backward()`` doesn't free
+            #    ``base_raw_for_util``'s activations, and a subsequent
+            #    ``util_loss.backward()`` traverses a clean, intact
+            #    subgraph — no retain_graph needed.
+            #
+            # 2. A backward hook on ``content_hidden`` captures its
+            #    gradient during the main backward so trainers can
+            #    compute the utility-teacher ranking
+            #    ``util_i = -(grad · value)_i``.
+            #
+            # 3. ``post_head_content_values`` is a detached forward-time
+            #    stash of ``content_hidden``; paired with the captured
+            #    gradient it gives ``-(grad · value)``.
+            #
+            # Gated on ``content_hidden.requires_grad`` so eval / inference
+            # paths (``@torch.no_grad()``, frozen-encoder ``with no_grad():``
+            # blocks) don't try to register a hook on a non-autograd tensor —
+            # ``Tensor.register_hook`` raises ``RuntimeError`` otherwise.
+            # No-op in those modes is correct: there is no backward to
+            # capture, and util-grad BCE wouldn't fire anyway.
+            if utility_grad_active and content_hidden.requires_grad:
+                base_raw_for_util = head(content_hidden.detach())
+                hook_state["base_raw_for_util"] = base_raw_for_util
+                hook_state["post_head_content_values"] = (
+                    content_hidden.detach().clone()
+                )
+
+                # Backward hook writes to ``utility_grad_capture`` dict
+                # when provided (required by the checkpointed L0 path
+                # where CompressorOutput doesn't cross the checkpoint
+                # boundary). Otherwise writes into ``hook_state`` which
+                # is held by CompressorOutput.
+                target_state = (
+                    utility_grad_capture
+                    if utility_grad_capture is not None
+                    else hook_state
+                )
+
+                def _save_content_grad(grad, _state=target_state):
+                    _state["post_head_content_grad"] = grad.detach()
+
+                content_hidden.register_hook(_save_content_grad)
 
             # Tanh-bound the operator-facing logits so θ lives in (-1, 1),
             # decoupled from whatever absolute scale the head happens to
@@ -396,22 +485,17 @@ class BgKITCompressor(nn.Module):
             with torch.no_grad():
                 survive_probs_metrics = survive_probs.detach()
 
-            # Bool mask detached to prevent an uncontrolled head-gradient path
-            # through every position's flag contribution. Soft-attn provides
-            # the only deliberate head-gradient path from the decoder.
-            flag_emb = torch.where(
-                mask.detach().unsqueeze(-1),
-                self.survive_embedding,
-                self.doomed_embedding,
-            )
+            # Add survive_embedding only at surviving positions. Bool mask
+            # detached so the head-gradient path is shaped only by the
+            # selection decision, not by every position's flag
+            # contribution. (The former ``doomed_embedding`` counterpart
+            # was removed alongside soft-attn — see class docstring.)
             hidden = hidden.clone()
-            hidden[:, content_slice, :] = hidden[:, content_slice, :] + flag_emb
-            # Stash the full post-head hidden (prompt+sep+content with flags)
-            # so the soft-attn replay can splice in gated content while
-            # preserving prompt context for blocks 2..end. Detached — the
-            # soft-attn gradient flows through its own fresh `gated`
-            # tensor, not through this stash.
-            hook_state["full_after_head"] = hidden.detach()
+            hard_mask = mask.detach()
+            content_with_flags = hidden[:, content_slice, :]
+            flag_emb = torch.zeros_like(content_with_flags)
+            flag_emb[hard_mask] = self.survive_embedding.to(flag_emb.dtype)
+            hidden[:, content_slice, :] = content_with_flags + flag_emb
 
             # Aggregation primitives for the trainer's true-mean update of θ.
             # Stash sums + counts (detached) — never pre-divide here, because
@@ -491,7 +575,7 @@ class BgKITCompressor(nn.Module):
 
         intermediates = backbone_out.hidden_states if return_intermediates else None
 
-        return CompressorOutput(
+        out = CompressorOutput(
             raw_embeddings=raw_out,
             normed_embeddings=normed_out,
             attention_mask=combined_mask,
@@ -499,9 +583,6 @@ class BgKITCompressor(nn.Module):
             head_logits=hook_state.get("base_raw"),
             survive_probs=hook_state.get("survive_probs"),
             survivor_mask=hook_state.get("survivor_mask"),
-            layer7_embeddings=hook_state.get("layer7_embeddings"),
-            full_after_head=hook_state.get("full_after_head"),
-            full_attention_mask=combined_mask,
             intermediates=intermediates,
             base_raw=hook_state.get("base_raw"),
             logits_for_op=hook_state.get("logits_for_op"),
@@ -514,7 +595,19 @@ class BgKITCompressor(nn.Module):
             organic_rate_std=hook_state.get("organic_rate_std"),
             undecided_fraction=hook_state.get("undecided_fraction"),
             theta_tensor=hook_state.get("theta_tensor"),
+            base_raw_for_util=hook_state.get("base_raw_for_util"),
+            post_head_content_values=hook_state.get("post_head_content_values"),
         )
+        # ``post_head_content_grad`` is populated by the backward hook
+        # registered in ``_hook_after_head_layer`` during the main backward
+        # pass. It writes into ``utility_grad_capture`` when provided
+        # (required by the checkpointed L0 path where CompressorOutput
+        # doesn't cross the checkpoint boundary). Otherwise it writes into
+        # ``hook_state``; we stash a reference to that dict on the output
+        # so trainers can read the populated grad after backward.
+        if utility_grad_active and utility_grad_capture is None:
+            out._utility_grad_state = hook_state  # type: ignore[attr-defined]
+        return out
 
     def auto_reproduce(self, embeddings: torch.Tensor) -> torch.Tensor:
         """Map output embeddings back to input embedding space."""

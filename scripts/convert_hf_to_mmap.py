@@ -19,6 +19,7 @@ import pyarrow as pa
 from datasets import load_dataset
 
 from bgkit.data.mmap_writer import build_csr_offsets, write_mmap_artifacts
+from bgkit.data.repo_processing import looks_minified
 
 
 @dataclass(frozen=True)
@@ -384,6 +385,7 @@ def convert_dataset(
     question_lengths: list[int] = []
     answer_lengths: list[int] = []
     metadata_rows: list[dict[str, object]] = []
+    skipped_minified = 0
 
     is_corpus_only = not spec.question_fields and not spec.answer_fields
     is_msmarco = dataset_name == "msmarco_passage"
@@ -418,6 +420,19 @@ def convert_dataset(
             if not document_text:
                 continue
         elif (not document_text and not is_kilt_task) or not question_text or not answer_text:
+            continue
+
+        # Quality filter in prose mode: catches the pathological cases
+        # (CSV / HTML / base64 stuffed into a text field) without
+        # flagging legitimate single-paragraph Wikipedia articles or
+        # PubMedQA abstracts. KILT tasks have empty document_text by
+        # design; skip the check there.
+        if (
+            document_text
+            and not is_kilt_task
+            and looks_minified(document_text, content_type="prose")
+        ):
+            skipped_minified += 1
             continue
 
         doc_ids = (
@@ -552,6 +567,7 @@ def convert_dataset(
             "tokenizer": tokenizer_name,
             "total_question_tokens": int(sum(question_lengths)),
             "total_answer_tokens": int(sum(answer_lengths)),
+            "skipped_minified": skipped_minified,
         },
         metadata_table=metadata_table,
         extra_arrays={

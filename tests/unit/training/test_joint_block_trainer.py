@@ -217,9 +217,8 @@ class TestJointBlockFreeze:
         for p in trainer.encoder.projection_block.parameters():
             assert p.requires_grad, "Projection block should be trainable"
 
-        # Survive/doomed embeddings should be frozen
+        # Survive embedding should be frozen (doomed_embedding removed 2026-04-17)
         assert not trainer.encoder.compressor.survive_embedding.requires_grad
-        assert not trainer.encoder.compressor.doomed_embedding.requires_grad
 
 
 # ---------------------------------------------------------------------------

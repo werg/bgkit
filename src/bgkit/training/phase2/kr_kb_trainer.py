@@ -358,8 +358,6 @@ class KRKBTrainer(BaseTrainer):
         self._decisiveness_loss_weight = float(
             surv_cfg.get("decisiveness_loss_weight", 0.05),
         )
-        self._soft_attn_loss_weight = float(surv_cfg.get("soft_attn_loss_weight", 0.05))
-        self._soft_attn_every_n_steps = int(surv_cfg.get("soft_attn_every_n_steps", 4))
         self._relevance_loss_weight = float(surv_cfg.get("relevance_loss_weight", 0.05))
 
         self._surv_l0 = resolve_level_loss_cfg(surv_cfg.get("l0", {}))
@@ -1172,6 +1170,8 @@ class KRKBTrainer(BaseTrainer):
         "pinned_positions",
         "target_ratio",
         "level",
+        "utility_grad_active",
+        "utility_grad_capture",
     )
 
     def _checkpointed_encoder(self, **kwargs):
@@ -1267,9 +1267,13 @@ class KRKBTrainer(BaseTrainer):
         The survivorship head inside the encoder produces the survivor mask
         internally based on the target retention ratio.
 
-        Returns the full CompressionOutput (including survive_probs and
-        layer7_embeddings) so the caller can apply survivorship auxiliary
-        losses and soft attention.
+        Returns ``(out, content_mask)`` where ``out`` is the full
+        CompressionOutput (carrying ``base_raw_for_util`` /
+        ``post_head_content_values`` / ``_utility_grad_state``) and
+        ``content_mask`` is the pre-compression token attention mask
+        required by utility-grad BCE's ``valid_mask`` (which must match
+        the shape of ``post_head_content_values``, not the post-
+        selection ``survivor_attention_mask``).
         """
         if self._token_store is None:
             raise RuntimeError(
@@ -1284,14 +1288,23 @@ class KRKBTrainer(BaseTrainer):
         input_embeddings = embed_tokens(tokens_batch)
 
         ratio = self._l0_retention_for(dataset)
+        from bgkit.training.survivorship_helpers import LevelLossCfg as _LLC
+        util_active = getattr(
+            self, "_surv_l0", _LLC(),
+        ).utility_grad_loss_weight > 0.0
+        grad_capture: dict | None = {} if util_active else None
 
         out = self._checkpointed_encoder(
             input_embeddings=input_embeddings,
             attention_mask=mask_batch,
             target_ratio=ratio,
             level="l0",
+            utility_grad_active=util_active,
+            utility_grad_capture=grad_capture,
         )
-        return out
+        if grad_capture is not None:
+            out._l0_grad_capture = grad_capture  # type: ignore[attr-defined]
+        return out, mask_batch
 
     def _l0_for_articles(
         self, dataset: str, article_ids: list[str],
@@ -1307,17 +1320,24 @@ class KRKBTrainer(BaseTrainer):
         auxiliary losses and soft attention after the main forward.
         """
         if self._live_l0:
-            out = self._live_l0_encode(dataset, article_ids)
+            out, content_mask = self._live_l0_encode(dataset, article_ids)
             survivors = out.survivor_embeddings
             # Use the real survivor attention mask from the encoder so
             # padded positions (from variable-length batch) are not treated
             # as valid L0 survivors downstream at L1.
             mask = out.survivor_attention_mask
-            # Stash output for aux loss computation (if training)
+            # Stash output for aux loss computation (if training). The
+            # ``content_mask`` is the pre-compression token attention
+            # mask — utility-grad BCE's ``valid_mask`` must match the
+            # shape of ``post_head_content_values``, not the post-
+            # selection ``survivor_attention_mask``.
             if self.encoder.training and hasattr(self, "_pending_l0_outputs"):
-                self._pending_l0_outputs.append(
-                    {"dataset": dataset, "enc_out": out, "ratio": self._l0_retention_for(dataset)}
-                )
+                self._pending_l0_outputs.append({
+                    "dataset": dataset,
+                    "enc_out": out,
+                    "ratio": self._l0_retention_for(dataset),
+                    "content_mask": content_mask,
+                })
             return survivors, mask
         if self._l0_cache is None:
             raise RuntimeError("L0 cache is None but live_l0 is False")
@@ -1733,6 +1753,11 @@ class KRKBTrainer(BaseTrainer):
             padded_query[i, :n_query] = query_emb
             query_mask[i, :n_query] = True
 
+        from bgkit.training.survivorship_helpers import LevelLossCfg as _LLC
+        util_active_l1 = getattr(
+            self, "_surv_l1", _LLC(),
+        ).utility_grad_loss_weight > 0.0
+        l1_grad_capture: dict | None = {} if util_active_l1 else None
         out = self._checkpointed_encoder(
             input_embeddings=padded_content,
             attention_mask=content_mask,
@@ -1741,7 +1766,11 @@ class KRKBTrainer(BaseTrainer):
             pinned_positions=padded_pinned,
             target_ratio=self._l1_retention,
             level="l1",
+            utility_grad_active=util_active_l1,
+            utility_grad_capture=l1_grad_capture,
         )
+        if l1_grad_capture is not None:
+            out._l1_grad_capture = l1_grad_capture  # type: ignore[attr-defined]
 
         # Stash encoder output for aux loss computation (when training).
         # Carry through content_mask and relevance/pinned info so the
@@ -2361,6 +2390,45 @@ class KRKBTrainer(BaseTrainer):
             metrics["l0_ratio_loss"] = l0_ratio_loss.item()
             metrics["l0_decisiveness_loss"] = l0_decisive_loss.item()
 
+        # --- L0 min-survivors loss ---
+        # Mirrors the helper in survivorship_helpers.compute_survivorship_losses
+        # but runs over Phase 2's per-article enc_outs. Uses the larger
+        # min_survivors_tau so gradient flows through tanh saturation.
+        if self._surv_l0.min_survivors_loss_weight > 0.0 and self._pending_l0_outputs:
+            l0_min_surv_losses: list[torch.Tensor] = []
+            for entry in self._pending_l0_outputs:
+                enc_out = entry["enc_out"]
+                logits_for_op = enc_out.logits_for_op
+                if logits_for_op is None:
+                    continue
+                theta_t = getattr(enc_out, "theta_tensor", None)
+                if theta_t is None:
+                    legacy = getattr(enc_out, "theta_value", 0.0)
+                    theta_t = torch.tensor(
+                        float(legacy), dtype=torch.float32,
+                        device=logits_for_op.device,
+                    )
+                tau = max(1e-3, self._surv_l0.min_survivors_tau)
+                soft_gates = torch.sigmoid(
+                    (logits_for_op.float() - theta_t.to(logits_for_op.device).float()) / tau,
+                )
+                # (B, L_content); Phase 2 L0 is per-article, no padding ->
+                # all positions valid. sum over L to get per-article count.
+                soft_count = soft_gates.sum(dim=-1)  # (B,)
+                content_len = torch.full_like(
+                    soft_count, float(logits_for_op.shape[-1]),
+                )
+                target_min = torch.clamp(
+                    torch.ceil(content_len * self._surv_l0.min_survivors_floor_ratio),
+                    min=float(self._surv_l0.min_survivors_absolute_min),
+                )
+                deficit = (1.0 - soft_count / target_min.clamp(min=1.0)).clamp(min=0.0)
+                l0_min_surv_losses.append((deficit ** 2).mean())
+            if l0_min_surv_losses:
+                l0_min_surv_loss = torch.stack(l0_min_surv_losses).mean()
+                total = total + self._surv_l0.min_survivors_loss_weight * l0_min_surv_loss
+                metrics["l0_min_survivors_loss"] = l0_min_surv_loss.item()
+
         # --- L1 aux losses (ratio + decisiveness + relevance) ---
         # Same single-head pattern as L0: attached ``logits_for_op`` + θ
         # drives probs; gradient flows into the L1 head directly.
@@ -2429,6 +2497,45 @@ class KRKBTrainer(BaseTrainer):
             metrics["l1_ratio_loss"] = l1_ratio_loss.item()
             metrics["l1_decisiveness_loss"] = l1_decisive_loss.item()
 
+        # --- L1 min-survivors loss ---
+        # Same logic as L0 min-survivors, masked to valid positions via
+        # content_mask since L1 enc_out has padding across multiple
+        # gathered articles.
+        if self._surv_l1.min_survivors_loss_weight > 0.0 and self._pending_l1_outputs:
+            l1_min_surv_losses: list[torch.Tensor] = []
+            for entry in self._pending_l1_outputs:
+                enc_out = entry["enc_out"]
+                logits_for_op = enc_out.logits_for_op
+                if logits_for_op is None:
+                    continue
+                content_mask = entry["content_mask"]
+                if content_mask.sum() == 0:
+                    continue
+                theta_t = getattr(enc_out, "theta_tensor", None)
+                if theta_t is None:
+                    legacy = getattr(enc_out, "theta_value", 0.0)
+                    theta_t = torch.tensor(
+                        float(legacy), dtype=torch.float32,
+                        device=logits_for_op.device,
+                    )
+                tau = max(1e-3, self._surv_l1.min_survivors_tau)
+                soft_gates = torch.sigmoid(
+                    (logits_for_op.float() - theta_t.to(logits_for_op.device).float()) / tau,
+                )
+                valid_f = content_mask.to(soft_gates.dtype)
+                soft_count = (soft_gates * valid_f).sum(dim=-1)  # (B,)
+                content_len = valid_f.sum(dim=-1)  # (B,)
+                target_min = torch.clamp(
+                    torch.ceil(content_len * self._surv_l1.min_survivors_floor_ratio),
+                    min=float(self._surv_l1.min_survivors_absolute_min),
+                )
+                deficit = (1.0 - soft_count / target_min.clamp(min=1.0)).clamp(min=0.0)
+                l1_min_surv_losses.append((deficit ** 2).mean())
+            if l1_min_surv_losses:
+                l1_min_surv_loss = torch.stack(l1_min_surv_losses).mean()
+                total = total + self._surv_l1.min_survivors_loss_weight * l1_min_surv_loss
+                metrics["l1_min_survivors_loss"] = l1_min_surv_loss.item()
+
         if l1_relevance_losses:
             l1_relevance_loss = torch.stack(l1_relevance_losses).mean()
             total = total + self._relevance_loss_weight * l1_relevance_loss
@@ -2436,163 +2543,97 @@ class KRKBTrainer(BaseTrainer):
 
         return total, metrics
 
-    def _soft_attention_forward_phase2(
-        self, batch, preps,
-    ) -> torch.Tensor | None:
-        """Run a single soft-attention decoder forward on one sample.
+    def _apply_utility_grad_bce_phase2(self) -> dict[str, float]:
+        """Run post-backward utility-gradient BCE distillation for Phase 2.
 
-        Picks a sample deterministically (rotating by global_step) and
-        recomputes its per-turn survivors from the accumulated L1 outputs
-        by prob-gating the layer-7 embeddings (instead of hard extraction),
-        running the projection block, then re-assembling decoder segments
-        and computing CE loss. The gradient flows from decoder loss back
-        to survive_probs → head, bypassing layers 8-22.
-
-        Returns a scalar loss tensor, or None if no usable sample is
-        available.
+        Walks ``_pending_l0_outputs`` and ``_pending_l1_outputs``; for
+        each entry whose enc_out captured a non-None content-grad in
+        its backward hook, builds a top-k teacher over controllable
+        positions (pinned positions excluded for L1 via the entry's
+        pinned mask) and runs a small head-local backward through
+        ``base_raw_for_util → head.weights``. Because
+        ``base_raw_for_util`` was computed inside the encoder's LoRA
+        context during the main forward, any active LoRA adapter (e.g.
+        L0 LoRA in Stage A) receives the BCE gradient directly — no
+        need to re-enter the router here. Clears large per-entry
+        stashes before return to bound peak memory.
         """
-        if not batch or not self._pending_l1_outputs:
-            return None
-
-        # Pick sample index deterministically
-        sample_idx = self.global_step % len(batch)
-        sample = batch[sample_idx]
-        prep = preps[sample_idx]
-        n_turns = len(prep["prepared_turns"])
-        if n_turns == 0:
-            return None
-
-        # Find the bucket entries that correspond to this sample's turns.
-        # Each entry in _pending_l1_outputs corresponds to ONE bucket's
-        # forward. Its ``non_null_preps`` list is in bucket order.
-        bucket_addr_map = getattr(self, "_bucket_addr_by_l1_idx", {}) or {}
-
-        # For each turn of the chosen sample, find its soft-projected
-        # survivors by re-running the projection block on prob-gated
-        # layer-7 embeddings.
-        hidden_dim = self.encoder.compressor.hidden_dim
-        zero_fallback = torch.zeros(
-            (1, hidden_dim), device=self.device, dtype=torch.bfloat16,
+        from bgkit.training.survivorship_helpers import (
+            LevelLossCfg as _LLC,
+            utility_grad_bce_loss,
         )
-        soft_survivors_per_turn: list[torch.Tensor] = [
-            zero_fallback for _ in range(n_turns)
-        ]
 
-        # Iterate over accumulated L1 outputs, project soft-gated values,
-        # and slot them into the chosen sample's positions.
-        for bucket_l1_idx, entry in enumerate(self._pending_l1_outputs):
-            addrs = bucket_addr_map.get(bucket_l1_idx, [])
-            if not any(s == sample_idx for s, _ in addrs):
-                continue
-            enc_out = entry["enc_out"]
-            if (
-                enc_out.logits_for_op is None
-                or enc_out.layer7_embeddings is None
-            ):
-                continue
-            # Prob-gate content positions. ``logits_for_op = tanh(base_raw / T)``
-            # carries head gradient directly (single-head architecture
-            # post-2026-04-16 simplification). Pick the level-appropriate
-            # controller: entries from L0 use threshold_l0, L1 entries use
-            # threshold_l1. _pending_l1_outputs is named for the outer
-            # pipeline stage but a given entry may have been produced at
-            # either level — check the marker.
-            content_mask = entry["content_mask"]
-            compressor = self.encoder.compressor
-            level = entry.get("level", "l1")
-            controller = (
-                compressor.threshold_l0 if level == "l0"
-                else compressor.threshold_l1
-            )
-            theta = controller.theta.to(self.device)
-            logits_softattn = enc_out.logits_for_op
-            l7 = enc_out.layer7_embeddings
-            base_dtype = l7.dtype
-            softattn_probs = torch.sigmoid(
-                logits_softattn.float() - theta.float()
-            ).to(base_dtype)
+        metrics: dict[str, float] = {}
+        w_l0 = getattr(self, "_surv_l0", _LLC()).utility_grad_loss_weight
+        w_l1 = getattr(self, "_surv_l1", _LLC()).utility_grad_loss_weight
 
-            # Soft-blend flag embeddings while preserving layer7 content.
-            # Matches the hard forward at p∈{0,1} (see design doc).
-            survive_emb = compressor.survive_embedding.to(base_dtype)
-            doomed_emb = compressor.doomed_embedding.to(base_dtype)
-            p = softattn_probs.unsqueeze(-1)
-            gated_content = l7 + p * survive_emb + (1.0 - p) * doomed_emb
-
-            # Splice gated content into the detached post-block-1 full
-            # hidden so blocks 2..end attend over prompt + content as in
-            # the hard forward. `enc_out.full_after_head` carries the
-            # post-head hidden for [prompt, sep, content-with-flags];
-            # content_slice identifies where to splice.
-            full_after_head = enc_out.full_after_head
-            full_attn_mask = enc_out.full_attention_mask
-            content_slice_full = enc_out.content_slice
-
-            try:
-                if full_after_head is not None and content_slice_full is not None:
-                    full_hidden = full_after_head.clone().to(base_dtype)
-                    full_hidden[:, content_slice_full, :] = gated_content
-                    # Head hook fires after backbone block 1; blocks 2..end
-                    # remain. Block indices are positions in the backbone,
-                    # NOT indices into the hooks dict — `start_block=2`
-                    # is stable regardless of hook dict sparsity.
-                    full_layer22 = compressor.backbone.forward_from_block(
-                        hidden=full_hidden,
-                        start_block=2,
-                        attention_mask=full_attn_mask,
-                        apply_final_norm=True,
-                    ).last_hidden_state
-                    # Projection block on FULL sequence so rotary positional
-                    # encodings match the hard forward; slice content out.
-                    proj_out = self.encoder.projection_block(
-                        full_layer22, full_attn_mask, survivor_mask=None,
-                    )
-                    proj_full = proj_out.projected_embeddings[:, content_slice_full, :]
-                else:
-                    full_layer22 = compressor.backbone.forward_from_block(
-                        hidden=gated_content,
-                        start_block=2,
-                        attention_mask=content_mask.bool(),
-                        apply_final_norm=True,
-                    ).last_hidden_state
-                    proj_out = self.encoder.projection_block(
-                        full_layer22, content_mask.to(gated_content.dtype),
-                        survivor_mask=None,
-                    )
-                    proj_full = proj_out.projected_embeddings
-            except (AttributeError, ValueError):
-                # Non-pruned backbone has no forward_from_block; fall back
-                # to the projection block alone (truncated signal).
-                full_layer22 = gated_content
-                proj_out = self.encoder.projection_block(
-                    full_layer22, content_mask.to(gated_content.dtype),
-                    survivor_mask=None,
+        if w_l0 > 0.0 and self._pending_l0_outputs:
+            grad_norms: list[float] = []
+            for entry in self._pending_l0_outputs:
+                enc_out = entry.get("enc_out")
+                if enc_out is None:
+                    continue
+                grad_capture = getattr(enc_out, "_l0_grad_capture", None)
+                content_grad = (
+                    grad_capture.get("post_head_content_grad")
+                    if grad_capture is not None
+                    else enc_out.get_content_grad()
                 )
-                proj_full = proj_out.projected_embeddings  # (B, L_content, D)
-
-            # For each turn in this bucket that belongs to our sample,
-            # slice out its non-padding soft survivors.
-            for item_idx, (s_idx, t_idx) in enumerate(addrs):
-                if s_idx != sample_idx:
+                content_values = enc_out.post_head_content_values
+                content_mask = entry.get("content_mask")
+                if (
+                    content_grad is None
+                    or content_values is None
+                    or content_mask is None
+                ):
                     continue
-                n_valid = int(content_mask[item_idx].sum().item())
-                if n_valid == 0:
+                util_loss, _ = utility_grad_bce_loss(
+                    base_raw_for_util=enc_out.base_raw_for_util,
+                    content_grad=content_grad,
+                    content_values=content_values,
+                    valid_mask=content_mask.bool(),
+                    pinned_mask=None,
+                    target_ratio=float(entry.get("ratio", self._l1_retention)),
+                )
+                if util_loss.requires_grad:
+                    (util_loss * w_l0 / self._accum_steps).backward()
+                grad_norms.append(float(content_grad.norm().item()))
+                # Release references to free memory.
+                entry["enc_out"] = None
+            if grad_norms:
+                metrics["l0_content_grad_norm"] = sum(grad_norms) / len(grad_norms)
+
+        if w_l1 > 0.0 and self._pending_l1_outputs:
+            grad_norms = []
+            for entry in self._pending_l1_outputs:
+                enc_out = entry.get("enc_out")
+                if enc_out is None:
                     continue
-                soft_survivors_per_turn[t_idx] = proj_full[item_idx, :n_valid]
+                grad_capture = getattr(enc_out, "_l1_grad_capture", None)
+                content_grad = (
+                    grad_capture.get("post_head_content_grad")
+                    if grad_capture is not None
+                    else enc_out.get_content_grad()
+                )
+                content_values = enc_out.post_head_content_values
+                if content_grad is None or content_values is None:
+                    continue
+                util_loss, _ = utility_grad_bce_loss(
+                    base_raw_for_util=enc_out.base_raw_for_util,
+                    content_grad=content_grad,
+                    content_values=content_values,
+                    valid_mask=entry["content_mask"].bool(),
+                    pinned_mask=entry.get("pinned"),
+                    target_ratio=float(entry.get("ratio", self._l1_retention)),
+                )
+                if util_loss.requires_grad:
+                    (util_loss * w_l1 / self._accum_steps).backward()
+                grad_norms.append(float(content_grad.norm().item()))
+                entry["enc_out"] = None
+            if grad_norms:
+                metrics["l1_content_grad_norm"] = sum(grad_norms) / len(grad_norms)
 
-        # Assemble segments with soft survivors
-        segments, _trace = self._assemble_sample_segments(
-            prep, soft_survivors_per_turn,
-        )
-        if not segments:
-            return None
-
-        try:
-            soft_loss = self.decoder.forward_interleaved_with_loss(segments)
-        except Exception as exc:
-            logger.warning("soft_attention_forward_failed", error=str(exc))
-            return None
-        return soft_loss
+        return metrics
 
     def _forward_backward(self, batch) -> dict[str, float]:
         """Cross-sample batched forward + backward.
@@ -2653,27 +2694,13 @@ class KRKBTrainer(BaseTrainer):
         # Run one encoder forward per bucket. _run_l1_batch takes a list
         # that may include None entries; we pre-filter because all
         # entries in a bucket are non-None by construction.
-        #
-        # Track which (s_idx, t_idx) each bucket entry belongs to so the
-        # soft attention branch can recompute the soft-gated survivors
-        # for a specific sample's turns.
-        bucket_addr_by_l1_idx: dict[int, list[tuple[int, int]]] = {}
         for _bucket_key, items in buckets.items():
             bucket_preps = [p for _, _, p in items]
-            l1_idx_before = len(self._pending_l1_outputs)
             bucket_out = self._run_l1_batch(bucket_preps)
-            if len(self._pending_l1_outputs) > l1_idx_before:
-                # The new entry is from this bucket's forward. Record its
-                # per-item (s_idx, t_idx) addresses.
-                bucket_addr_by_l1_idx[l1_idx_before] = [
-                    (s_idx, t_idx) for s_idx, t_idx, _ in items
-                ]
             for (s_idx, t_idx, _prep), surv in zip(
                 items, bucket_out, strict=True,
             ):
                 survivors_by_address[(s_idx, t_idx)] = surv
-
-        self._bucket_addr_by_l1_idx = bucket_addr_by_l1_idx
 
         # Fill in zero-fallbacks for None turns
         for s_idx, t_idx, prep in flat:
@@ -2716,21 +2743,14 @@ class KRKBTrainer(BaseTrainer):
         if aux_loss.requires_grad or aux_loss.item() != 0.0:
             total_weighted = total_weighted + aux_loss
 
-        # Soft attention (interleaved, every Nth step) over the L1 path.
-        # We pick a subset of accumulated L1 outputs — limit to one per step
-        # to keep the extra decoder forward cheap.
-        soft_attn_metric = 0.0
-        if (
-            self._soft_attn_loss_weight > 0
-            and self.global_step % self._soft_attn_every_n_steps == 0
-            and self._pending_l1_outputs
-        ):
-            soft_loss = self._soft_attention_forward_phase2(batch, preps)
-            if soft_loss is not None:
-                total_weighted = total_weighted + self._soft_attn_loss_weight * soft_loss
-                soft_attn_metric = soft_loss.item()
-
         (total_weighted / self._accum_steps).backward()
+
+        # --- Utility-gradient BCE distillation (post-backward) ---
+        # The main backward populated each enc_out's captured
+        # ``post_head_content_grad`` via the compressor's backward hook.
+        # Rebuild the top-k teacher from ``-(grad · value)`` and run a
+        # small head-local backward per level.
+        util_metrics = self._apply_utility_grad_bce_phase2()
 
         # Average shared-tag gradients across the batch (see
         # TopicEmbeddingModule.apply_gradient_averaging). Only touches
@@ -2745,9 +2765,9 @@ class KRKBTrainer(BaseTrainer):
             "live_l0": 1.0 if self._live_l0 else 0.0,
             "l1_turns_per_sample": float(n_turns_total / n_samples),
             "l1_buckets_per_step": float(len(buckets)),
-            "soft_attn_loss": soft_attn_metric,
         }
         metrics_out.update(aux_metrics)
+        metrics_out.update(util_metrics)
 
         # Head-health diagnostics (organic-rate std, undecided fraction,
         # floor/pinned/θ) per level. Sampled from the last accumulated

@@ -64,20 +64,26 @@ survivorship:
   n_distractors: 3
   ratio_loss_weight: 0.1
   decisiveness_loss_weight: 0.05
-  soft_attn_loss_weight: 0.05
-  soft_attn_every_n_steps: 1
 
   # L0 frozen — all weights zero; trainer skips L0 θ/μ updates.
   l0:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
-    soft_attn_loss_weight: 0.0
+    utility_grad_loss_weight: 0.0
     moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.0          # L0 frozen — no gradient to push
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
   l1:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.05
-    soft_attn_loss_weight: 0.3
+    utility_grad_loss_weight: 0.3
     moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
 
 ice_distillation:
   l0:

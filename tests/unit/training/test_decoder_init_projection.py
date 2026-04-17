@@ -213,8 +213,6 @@ def _make_trainer(
     # Survivorship head aux loss weights
     t._ratio_loss_weight = 0.1
     t._decisiveness_loss_weight = 0.05
-    t._soft_attn_loss_weight = 0.05
-    t._soft_attn_every_n_steps = 4
 
     # Decoder
     decoder_backbone = MockCausalLMBackbone(hidden_dim=HIDDEN_DIM, num_layers=num_layers)

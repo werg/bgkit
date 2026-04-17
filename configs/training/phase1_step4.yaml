@@ -15,29 +15,36 @@ target_ratio_ramp_steps: 1
 
 # Survivorship head losses, per level. Step 4 is where L1 first activates.
 # L0 head is trained from Step 3 (no BCE re-warmup); L1 cold-starts here
-# via decisiveness + soft-attn.
+# via decisiveness + utility-gradient BCE distillation.
 survivorship:
-  soft_attn_every_n_steps: 1
   l0:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
-    soft_attn_loss_weight: 0.2
+    utility_grad_loss_weight: 0.3
     moment_match_weight: 0.05        # halved from Step 3; lighter anchor
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
   l1:
     ratio_loss_weight: 0.0
     # L1 cold-start: hold a 4× stronger decisiveness signal for the first
-    # 2k steps (the window in which soft-attn is weakest — decoder needs
-    # meaningful L1 output to produce useful gradients, but L1 needs
+    # 2k steps (the window in which utility-grad BCE is weakest — decoder
+    # needs meaningful L1 output to produce useful gradients, but L1 needs
     # decoder gradient to know what's useful; a strong bimodal push here
     # breaks the chicken-and-egg tie). Linearly anneals down to the
-    # steady-state weight so it doesn't fight soft-attn once that's
+    # steady-state weight so it doesn't fight utility-grad BCE once that's
     # doing the work. See docs/survivorship_design.md for the collapse
     # mode this defends against.
     decisiveness_loss_weight: 0.05   # symmetry-break — no BCE at L1
     decisiveness_warmup_weight: 0.20
     decisiveness_warmup_steps: 2000
-    soft_attn_loss_weight: 0.3       # primary signal at L1
+    utility_grad_loss_weight: 0.3    # primary signal at L1
     moment_match_weight: 0.0         # ICE shape doesn't apply at L1
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
 
 ice_distillation:
   l0:

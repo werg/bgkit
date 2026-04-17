@@ -114,8 +114,6 @@ class DecoderInitTrainer(BaseTrainer):
         "compression_introduction_step": "_compression_introduction_step",
         "encoder_unfreeze_step": "_encoder_unfreeze_step",
         # Flow-control scalars (all cheap to change mid-run):
-        "soft_attn_every_n_steps": "_soft_attn_every_n_steps",
-        "soft_attn_start_step": "_soft_attn_start_step",
         "diagnostic_metrics_every_n_steps": "_diagnostic_metrics_every_n_steps",
     }
 
@@ -324,14 +322,8 @@ class DecoderInitTrainer(BaseTrainer):
         # Step 3 only consumes l0; l1 may be absent.
         self._surv_l0 = resolve_level_loss_cfg(surv_cfg.get("l0", {}))
         self._surv_l1 = resolve_level_loss_cfg(surv_cfg.get("l1", {}))
-        self._soft_attn_every_n_steps = int(surv_cfg.get("soft_attn_every_n_steps", 1))
-        # Soft-attn activation step: before this step, the soft-attn forward
-        # is skipped entirely (saves ~1.8× FLOPs). After, it fires at the
-        # configured cadence. Defaults to 0 = active from step 0 (legacy).
-        self._soft_attn_start_step = int(surv_cfg.get("soft_attn_start_step", 0))
 
-        # Diagnostic metrics gating — cached here so it's live-tunable via
-        # control.json alongside the soft-attn knobs (see LIVE_CONFIG_FIELDS).
+        # Diagnostic metrics gating — live-tunable via control.json.
         self._diagnostic_metrics_every_n_steps = int(
             tcfg.get("diagnostic_metrics_every_n_steps", 10),
         )
@@ -1028,8 +1020,9 @@ class DecoderInitTrainer(BaseTrainer):
         Returns:
             CompressionOutput from the encoder. Callers use
             ``enc_out.survivor_embeddings`` and ``enc_out.survivor_attention_mask``
-            for the decoder, plus ``enc_out.survive_probs`` and
-            ``enc_out.layer7_embeddings`` for auxiliary losses.
+            for the decoder, plus ``enc_out.base_raw`` / ``enc_out.base_raw_for_util``
+            / ``enc_out.get_content_grad()`` for the survivorship head's
+            auxiliary losses.
         """
         content_token_ids = batch["content_token_ids"].to(self.device)
         content_attention_mask = batch["content_attention_mask"].to(self.device)
@@ -1037,6 +1030,11 @@ class DecoderInitTrainer(BaseTrainer):
         compression_prompt_mask = batch["compression_prompt_mask"].to(self.device)
 
         target_ratio = self._current_target_ratio() if self._compression_active else None
+        util_active = (
+            self._compression_active
+            and not self._encoder_frozen
+            and self._surv_l0.utility_grad_loss_weight > 0.0
+        )
 
         # Per-sample floor: active during BCE warmup (so the head doesn't
         # starve the decoder while it learns), disabled afterward so
@@ -1083,6 +1081,7 @@ class DecoderInitTrainer(BaseTrainer):
                 target_ratio=target_ratio,
                 level="l0",
                 min_per_sample=min_per_sample,
+                utility_grad_active=util_active,
             )
 
         return enc_out
@@ -1193,143 +1192,43 @@ class DecoderInitTrainer(BaseTrainer):
                             enc_out.undecided_fraction.item(),
                         )
 
-            # Soft attention branch (every Nth step). Cadence defaults to 1
-            # (every step). Soft-attn provides one of three head-gradient
-            # paths (alongside BCE warmup and moment-match); all flow to
-            # the single head. Tanh saturation at ±1 is the structural
-            # guard against soft-attn inflating the aggregate logit mass.
-            from bgkit.training.survivorship_helpers import LevelLossCfg
-            surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
-            soft_attn_every = getattr(self, "_soft_attn_every_n_steps", 1)
-            soft_attn_start = getattr(self, "_soft_attn_start_step", 0)
-            if (
-                surv_l0.soft_attn_loss_weight > 0
-                and self.global_step >= soft_attn_start
-                and self.global_step % soft_attn_every == 0
-                and enc_out.layer7_embeddings is not None
-                and not self._encoder_frozen
-            ):
-                soft_loss = self._soft_attention_forward(
-                    enc_out, batch, token_ids, attention_mask, loss_mask,
-                    splice_start, splice_len,
-                )
-                total_loss = (
-                    total_loss + surv_l0.soft_attn_loss_weight * soft_loss
-                )
-                metrics["soft_attn_loss"] = soft_loss.item()
-
-        # Scaled backward (for gradient accumulation)
+        # Main scaled backward (for gradient accumulation). This populates
+        # ``enc_out.post_head_content_grad`` via the compressor's backward
+        # hook, which we consume below for utility-gradient BCE.
         (total_loss / self._accum_steps).backward()
 
+        # Utility-gradient BCE distillation (post-backward). Replaces the
+        # old soft-attn replay: the main backward already routed the
+        # decoder-CE gradient to ``content_hidden``; we use that captured
+        # gradient to build a binary top-k teacher for a second small
+        # backward that cleanly terminates at head weights.
+        from bgkit.training.survivorship_helpers import utility_grad_bce_loss
+
+        if (
+            self._compression_active
+            and not self._encoder_frozen
+            and self._surv_l0.utility_grad_loss_weight > 0.0
+            and enc_out.post_head_content_values is not None
+        ):
+            content_mask = batch["content_attention_mask"].to(self.device)
+            content_grad = enc_out.get_content_grad()
+            util_loss, util_metrics = utility_grad_bce_loss(
+                base_raw_for_util=enc_out.base_raw_for_util,
+                content_grad=content_grad,
+                content_values=enc_out.post_head_content_values,
+                valid_mask=content_mask,
+                pinned_mask=None,
+                target_ratio=self._current_target_ratio(),
+            )
+            if util_loss.requires_grad:
+                w = self._surv_l0.utility_grad_loss_weight
+                (util_loss * w / self._accum_steps).backward()
+            for k, v in util_metrics.items():
+                metrics[f"l0_{k}"] = v
+            if content_grad is not None:
+                metrics["l0_content_grad_norm"] = float(content_grad.norm().item())
+
         return metrics
-
-    def _soft_attention_forward(
-        self, enc_out, batch, token_ids, attention_mask, loss_mask,
-        splice_start, splice_len,
-    ) -> torch.Tensor:
-        """Second decoder forward on prob-gated layer-7 embeddings.
-
-        Routes the decoder's CE-loss gradient back to the head (single head
-        post-simplification) through the FULL remaining encoder (blocks
-        2..end + final norm + projection_block + decoder).
-
-        The previous implementation skipped blocks 2..end and went straight
-        from gated layer-7 directly to the projection block, which made
-        soft-attn a *truncated-encoder* signal. That severely undercut the
-        learning signal.
-
-        layer7 kept at full magnitude; flags blended by p. Matches hard
-        forward (``hidden = layer7 + flag_emb``) at p∈{0,1}. Multiplying
-        layer7 by p would be a different computation, not a relaxation.
-        """
-        compressor = self.encoder.compressor
-        # θ is a per-level fp32 scalar; level here is l0 (Step 3 trains L0).
-        theta = compressor.threshold_l0.theta.to(self.device)
-        # logits_for_op = tanh(base_raw / T); carries head-gradient
-        # directly. Soft-attn now flows gradient to the single head via
-        # this path (adapter architecture removed).
-        logits_for_op = enc_out.logits_for_op
-        layer7 = enc_out.layer7_embeddings
-        base_dtype = layer7.dtype
-        softattn_probs = torch.sigmoid(
-            logits_for_op.float() - theta.float()
-        ).to(base_dtype)
-
-        # Soft-blend flag embeddings while preserving layer7 content.
-        # layer7 kept at full magnitude — see design doc.
-        #
-        # Preserve prompt context by splicing the gated content into the
-        # detached post-block-1 full hidden state stashed by the hard
-        # forward (`enc_out.full_after_head`). This reconstructs the full
-        # [prompt, sep, content-with-flags] tensor where content-with-flags
-        # is the differentiable `gated` path. Blocks 2..end then attend
-        # over prompt + content as in the hard forward.
-        survive_emb = compressor.survive_embedding.to(base_dtype)
-        doomed_emb = compressor.doomed_embedding.to(base_dtype)
-        p = softattn_probs.unsqueeze(-1)
-        gated_content = layer7 + p * survive_emb + (1.0 - p) * doomed_emb
-
-        content_attn_mask = batch["content_attention_mask"].to(self.device)
-        full_after_head = enc_out.full_after_head
-        full_attn_mask = enc_out.full_attention_mask
-        content_slice = enc_out.content_slice
-
-        if full_after_head is not None and content_slice is not None:
-            # Splice: [prompt, sep, gated_content]. full_after_head is
-            # detached (from the hard forward); gated_content carries the
-            # adapter gradient. Scatter-assign the content slice into a
-            # clone of full_after_head.
-            full_hidden = full_after_head.clone().to(base_dtype)
-            full_hidden[:, content_slice, :] = gated_content
-            mask_for_fwd = (
-                full_attn_mask if full_attn_mask is not None else None
-            )
-            # Head hook fires after backbone block 1; blocks 2..end remain.
-            # Block indices are positions in the backbone, NOT indices into
-            # the hooks dict — removing the ratio hook did not re-number
-            # blocks. So `start_block=2` is stable regardless of hook dict
-            # sparsity.
-            full_layer22 = compressor.backbone.forward_from_block(
-                hidden=full_hidden,
-                start_block=2,
-                attention_mask=mask_for_fwd,
-                apply_final_norm=True,
-            ).last_hidden_state
-            # Run projection_block on the FULL sequence (not content-only)
-            # so its rotary positional encodings match the hard forward
-            # (where content positions start at prefix_len, not 0). Then
-            # slice out content positions for the decoder splice.
-            proj_out = self.encoder.projection_block(
-                full_layer22, mask_for_fwd, survivor_mask=None,
-            )
-            soft_survivors = proj_out.projected_embeddings[:, content_slice, :]
-            soft_mask = content_attn_mask.clone()
-        else:
-            # Fallback: content-only (no prompt context). Used when the
-            # hard forward didn't stash (e.g. non-pruned backbone path).
-            full_layer22 = compressor.backbone.forward_from_block(
-                hidden=gated_content,
-                start_block=2,
-                attention_mask=content_attn_mask,
-                apply_final_norm=True,
-            ).last_hidden_state
-            proj_out = self.encoder.projection_block(
-                full_layer22, content_attn_mask, survivor_mask=None,
-            )
-            soft_survivors = proj_out.projected_embeddings
-            soft_mask = content_attn_mask.clone()
-
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-            soft_loss = self.decoder.forward_with_single_splice(
-                survivor_embeddings=soft_survivors,
-                survivor_attention_mask=soft_mask,
-                token_ids=token_ids,
-                token_attention_mask=attention_mask,
-                splice_starts=splice_start,
-                splice_lengths=splice_len,
-                loss_mask=loss_mask,
-            )
-        return soft_loss
 
     # ------------------------------------------------------------------
     # Evaluation

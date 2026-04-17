@@ -9,6 +9,7 @@ import pytest
 from bgkit.data.repo_processing import (
     FileRecord,
     RepoSnapshot,
+    looks_minified,
     _should_skip_path,
     detect_language,
     extract_repo_snapshot,
@@ -87,6 +88,136 @@ class TestShouldSkipPath:
 
     def test_keep_github_dir(self):
         assert _should_skip_path(".github/workflows/ci.yml") is False
+
+    def test_skip_bundle_js(self):
+        assert _should_skip_path("src/main.bundle.js") is True
+
+    def test_skip_chunk_js(self):
+        assert _should_skip_path("static/0.chunk.js") is True
+
+    def test_skip_source_map(self):
+        assert _should_skip_path("dist/app.js.map") is True
+
+    def test_skip_ts_declaration_map(self):
+        assert _should_skip_path("out/index.d.ts.map") is True
+
+
+class TestLooksMinified:
+    def test_normal_python_is_not_minified(self):
+        code = (
+            "import os\n"
+            "\n"
+            "def greet(name):\n"
+            "    print(f'Hello, {name}!')\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    greet('world')\n"
+        ) * 10  # pad so file is >200 bytes
+        assert looks_minified(code) is False
+
+    def test_normal_typescript_is_not_minified(self):
+        code = (
+            "import { Component } from 'react';\n"
+            "\n"
+            "export class App extends Component {\n"
+            "    render() {\n"
+            "        return <div>hello</div>;\n"
+            "    }\n"
+            "}\n"
+        ) * 10
+        assert looks_minified(code) is False
+
+    def test_very_short_file_not_flagged(self):
+        # Below _MINIFIED_MIN_BYTES — we don't have enough signal.
+        assert looks_minified("x=1\n") is False
+        assert looks_minified("export default 42;\n") is False
+
+    def test_single_long_line_is_minified(self):
+        code = "var a=1;" * 2000  # one very long line
+        assert looks_minified(code) is True
+
+    def test_few_lines_with_long_line_is_minified(self):
+        # Two-line file where one line is 1000 chars of minified JS.
+        code = "var x=1;\n" + ("var y=2;" * 200) + "\n"
+        assert looks_minified(code) is True
+
+    def test_dense_multi_line_is_minified(self):
+        # 20 lines averaging ~300 chars each — mean > 200.
+        long_line = "a(); b(); c(); " * 25
+        code = "\n".join([long_line] * 20)
+        assert looks_minified(code) is True
+
+    def test_code_with_one_long_url_comment_not_flagged(self):
+        # Valid code with a single long URL comment shouldn't be flagged.
+        # The URL line is long but the overall mean stays low.
+        url_line = "// " + ("https://example.com/" + "x" * 180)
+        normal = "def foo():\n    return 1\n" * 10
+        code = url_line + "\n" + normal
+        # max_len is 200ish, well under 2000; mean is dominated by normal lines
+        assert looks_minified(code) is False
+
+    def test_empty_file_not_flagged(self):
+        assert looks_minified("") is False
+
+    def test_whitespace_only_file_not_flagged(self):
+        assert looks_minified("\n\n\n") is False
+
+    def test_invalid_content_type_raises(self):
+        import pytest
+        with pytest.raises(ValueError, match="content_type"):
+            looks_minified("some text", content_type="bogus")
+
+    def test_prose_mode_allows_single_paragraph_abstract(self):
+        """A 1200-char single-line abstract (PubMedQA-style) is legitimate
+        prose. In prose mode the short-file + mean-line rules are relaxed,
+        so it must not be flagged."""
+        abstract = "BACKGROUND: " + "word " * 150 + "CONCLUSION: " + "word " * 80
+        assert len(abstract) > 1000
+        assert looks_minified(abstract, content_type="code") is True
+        assert looks_minified(abstract, content_type="prose") is False
+
+    def test_prose_mode_allows_wikipedia_paragraph(self):
+        """Single-paragraph Wikipedia-style text must not be flagged in prose mode."""
+        wiki = (
+            "The Battle of Waterloo was fought on Sunday 18 June 1815 near "
+            "Waterloo, at the time in the United Kingdom of the Netherlands, "
+            "now in Belgium. A French army under the command of Napoleon was "
+            "defeated by two of the armies of the Seventh Coalition. One of "
+            "these was a British-led coalition consisting of units from the "
+            "United Kingdom, the Netherlands, Hanover, Brunswick and Nassau, "
+            "under the command of the Duke of Wellington."
+        )
+        assert looks_minified(wiki, content_type="prose") is False
+
+    def test_prose_mode_still_flags_pathological_long_line(self):
+        """Long single lines (> _MINIFIED_MAX_LINE_LEN=2000) stay flagged
+        even in prose mode — a 5000-char unbroken blob suggests base64 /
+        CSV-in-text / HTML-in-field content, not natural writing."""
+        blob = "a" * 5000
+        assert looks_minified(blob, content_type="prose") is True
+
+    def test_prose_mode_flags_html_stuffed_in_text(self):
+        htmlish = "<html><body>" + "<div>x</div>" * 200 + "</body></html>"
+        assert looks_minified(htmlish, content_type="prose") is True
+
+    def test_minified_js_flagged_in_both_modes(self):
+        """A classic minified JS file (long single line) is caught in both
+        modes because max_line > 2000 is an unconditional rule."""
+        minjs = "var a=1;" * 300 + ";" * 100
+        assert looks_minified(minjs, content_type="code") is True
+        assert looks_minified(minjs, content_type="prose") is True
+
+    def test_conversational_dialogue_not_flagged_in_prose_mode(self):
+        """Short human dialogue turns (used by memory datasets) must pass
+        through — they have short lines and would never match any rule."""
+        dialog = (
+            "A: How was your day?\n"
+            "B: Pretty good, thanks. I went hiking with Sarah and we saw "
+            "a waterfall about two hours into the trail. You?\n"
+            "A: Oh nice. I stayed home and read most of the day.\n"
+        )
+        assert looks_minified(dialog, content_type="prose") is False
+        assert looks_minified(dialog, content_type="code") is False
 
 
 # --- Tests against real repos ---

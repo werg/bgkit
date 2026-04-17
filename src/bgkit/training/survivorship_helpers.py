@@ -3,7 +3,9 @@
 Five trainers (Step 1, Step 3 via decoder_init.py; Step 2 via pruning_distill.py;
 Step 4 via commit_encoding.py; Step 5 via compression.py; Phase 2 via
 kr_kb_trainer.py) share the same dual-ascent θ pattern and the same loss
-composition (BCE warmup + moment match + ratio + decisiveness).
+composition (BCE warmup + moment match + ratio + decisiveness), plus the
+post-backward utility-gradient BCE distillation in
+:func:`utility_grad_bce_loss`.
 
 Each trainer imports and calls the helpers; per-trainer specialization happens
 via per-level config (``cfg.survivorship[level]``, ``cfg.ice_distillation[level]``,
@@ -22,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from bgkit.models.components.selection import moment_match_loss
@@ -158,16 +161,34 @@ class LevelLossCfg:
     # Decisiveness warmup: hold a higher weight at step 0 and linearly
     # anneal down to ``decisiveness_loss_weight`` over
     # ``decisiveness_warmup_steps``. Used at L1 cold-start (Step 4+,
-    # Phase 2) to force an early bimodal split before soft-attn takes
-    # over — without it, L1 can bootstrap into a near-uniform collapse
-    # that soft-attn alone is too weak to break. Disabled when
+    # Phase 2) to force an early bimodal split before utility-grad BCE
+    # takes over — without it, L1 can bootstrap into a near-uniform collapse
+    # that utility-grad BCE alone is too weak to break. Disabled when
     # ``decisiveness_warmup_weight <= 0`` or
     # ``decisiveness_warmup_steps <= 0``.
     decisiveness_warmup_weight: float = 0.0
     decisiveness_warmup_steps: int = 0
     moment_match_weight: float = 0.0
     moment_match_start_step: int = 0
-    soft_attn_loss_weight: float = 0.0
+    # Utility-gradient BCE distillation weight. Gates the compressor's
+    # head-fork + backward-hook capture path (compressor skips both when
+    # this is zero) and the trainer-level post-backward loss. Replaces the
+    # old ``soft_attn_loss_weight`` — see 2026-04-17 commit.
+    utility_grad_loss_weight: float = 0.0
+    # Minimum-survivors loss. Penalises samples where the head's soft
+    # survivor count falls below a per-sample floor
+    # ``N_min = max(absolute_min, ceil(floor_ratio * content_len))``.
+    # Uses a relative squared hinge on ``1 - soft_count / N_min`` so the
+    # loss is bounded in [0, 1] regardless of content length.
+    # Soft count is ``sum_i sigmoid((logits_for_op - theta) / tau)`` with
+    # a deliberately larger ``tau`` than the operator's implicit sharpness
+    # so gradient flows through tanh-saturated inputs (see 2026-04-17
+    # survivor analyzer: zero-survivor samples have max_logit ~0.75 below
+    # theta and often at tanh floor).
+    min_survivors_loss_weight: float = 0.0
+    min_survivors_floor_ratio: float = 0.02
+    min_survivors_absolute_min: int = 1
+    min_survivors_tau: float = 0.3
 
 
 def survivorship_diagnostics(
@@ -189,7 +210,7 @@ def survivorship_diagnostics(
     - ``{level}_undecided_fraction``: fraction of ``survive_probs`` in
       [0.2, 0.8] (the "uncommitted middle"). Low = head is committing to
       binary decisions (healthy); high = head is refusing to decide
-      (soft-attn not yet providing signal, or decisiveness curriculum
+      (utility-grad BCE not yet providing signal, or decisiveness curriculum
       needs more weight).
     - ``{level}_floor_trigger_rate``, ``{level}_num_pinned``,
       ``{level}_theta``: existing per-level operator diagnostics pulled
@@ -223,6 +244,23 @@ def survivorship_diagnostics(
     theta_t = getattr(enc_out, "theta_tensor", None)
     if theta_t is not None:
         metrics[f"{prefix}_theta"] = float(theta_t.item())
+
+    # Per-sample survivor-count diagnostics. A non-zero zero-survivor
+    # rate and/or a long low-survivor tail pulls eval loss up
+    # disproportionately (see 2026-04-17 analyzer). Emit on the gated
+    # cadence so we can track the min_survivors_loss's effect over time.
+    surv_mask = getattr(enc_out, "survivor_mask", None)
+    if surv_mask is not None:
+        hard_counts = surv_mask.sum(dim=1).float()
+        metrics[f"{prefix}_zero_survivor_rate"] = float(
+            (hard_counts == 0).float().mean().item(),
+        )
+        metrics[f"{prefix}_low_survivor_rate_lt5"] = float(
+            (hard_counts < 5).float().mean().item(),
+        )
+        metrics[f"{prefix}_median_survivors"] = float(
+            hard_counts.median().item(),
+        )
     return metrics
 
 
@@ -283,9 +321,10 @@ def compute_survivorship_losses(
       dual-ascent θ and decisiveness is usually the L1 cold-start signal
       only. A warning fires if ratio_loss_weight > 0.
 
-    - **Soft-attn** loss is NOT in this composition. It runs a separate
-      decoder forward via ``forward_from_block`` and is added to
-      ``total_loss`` separately in the trainer's main step.
+    - **Utility-gradient BCE** is NOT in this composition. It requires
+      a post-main-backward step (the compressor's backward hook captures
+      ``grad · value``) and is therefore added directly in the trainer's
+      step method via :func:`utility_grad_bce_loss`.
 
     ICE is NOT called online after BCE warmup. Reference moments are
     pre-computed offline by scripts/probe_ice_distribution.py and loaded
@@ -369,8 +408,9 @@ def compute_survivorship_losses(
     # With warmup configured, hold ``decisiveness_warmup_weight`` at step 0
     # and linearly anneal down to the steady-state ``decisiveness_loss_weight``
     # over ``decisiveness_warmup_steps``. Used at L1 cold-start — a strong
-    # early bimodal push breaks symmetry before soft-attn is strong enough
-    # to do so on its own; annealing out avoids fighting soft-attn once it
+    # early bimodal push breaks symmetry before utility-grad BCE is strong
+    # enough to do so on its own; annealing out avoids fighting utility-grad
+    # BCE once it
     # has taken over.
     effective_decisiveness_weight = _effective_decisiveness_weight(weights, global_step)
     if effective_decisiveness_weight > 0.0 and probs_op is not None:
@@ -379,6 +419,43 @@ def compute_survivorship_losses(
         metrics["decisiveness_loss"] = float(decisive.item())
         metrics["decisiveness_weight"] = effective_decisiveness_weight
         total = total + effective_decisiveness_weight * decisive
+
+    # Minimum-survivors loss (operator-side). Relative squared hinge on
+    # a per-sample soft survivor count, with larger-tau sigmoid to get
+    # gradient through tanh saturation (the head's zero-survivor mode).
+    # N_min_per_sample = max(absolute_min, ceil(floor_ratio * content_len))
+    # deficit = max(0, 1 - soft_count / N_min); loss = mean(deficit^2)
+    # Loss is bounded in [0, 1] and scale-invariant in content length.
+    if (
+        weights.min_survivors_loss_weight > 0.0
+        and logits_for_op is not None
+        and valid_count > 0
+    ):
+        theta_t_ms = getattr(enc_out, "theta_tensor", None)
+        if theta_t_ms is None:
+            theta_t_ms = torch.tensor(0.0, device=logits_for_op.device)
+        tau = max(1e-3, weights.min_survivors_tau)
+        # Soft gate per position, NaN-safe with larger tau to survive
+        # tanh saturation: sigmoid'(x) is non-negligible where the
+        # operator's own sigmoid gradient vanishes.
+        soft_gates = torch.sigmoid(
+            (logits_for_op.float() - theta_t_ms.to(logits_for_op.device).float()) / tau,
+        )
+        valid_f_ms = valid.to(soft_gates.dtype)
+        soft_count_per_sample = (soft_gates * valid_f_ms).sum(dim=1)  # (B,)
+        content_len_per_sample = valid_f_ms.sum(dim=1)  # (B,)
+        target_min = torch.clamp(
+            torch.ceil(content_len_per_sample * weights.min_survivors_floor_ratio),
+            min=float(weights.min_survivors_absolute_min),
+        )
+        # Relative deficit in [0, 1]. Guard against zero-length samples.
+        denom = target_min.clamp(min=1.0)
+        deficit = (1.0 - soft_count_per_sample / denom).clamp(min=0.0)
+        min_surv_loss = (deficit ** 2).mean()
+        metrics["min_survivors_loss"] = float(min_surv_loss.item())
+        metrics["min_survivors_target_mean"] = float(target_min.float().mean().item())
+        metrics["min_survivors_soft_count_mean"] = float(soft_count_per_sample.mean().item())
+        total = total + weights.min_survivors_loss_weight * min_surv_loss.to(total.dtype)
 
     # Moment match (base-side): standardized 3rd+4th moments of base_raw
     # vs fixed reference. Anchors base distribution shape to ICE.
@@ -625,8 +702,125 @@ def resolve_level_loss_cfg(cfg_block: dict | None) -> LevelLossCfg:
         decisiveness_warmup_steps=int(cfg.get("decisiveness_warmup_steps", 0)),
         moment_match_weight=float(cfg.get("moment_match_weight", 0.0)),
         moment_match_start_step=int(cfg.get("moment_match_start_step", 0)),
-        soft_attn_loss_weight=float(cfg.get("soft_attn_loss_weight", 0.0)),
+        utility_grad_loss_weight=float(cfg.get("utility_grad_loss_weight", 0.0)),
+        min_survivors_loss_weight=float(cfg.get("min_survivors_loss_weight", 0.0)),
+        min_survivors_floor_ratio=float(cfg.get("min_survivors_floor_ratio", 0.02)),
+        min_survivors_absolute_min=int(cfg.get("min_survivors_absolute_min", 1)),
+        min_survivors_tau=float(cfg.get("min_survivors_tau", 0.3)),
     )
+
+
+def utility_grad_bce_loss(
+    base_raw_for_util: Tensor | None,
+    content_grad: Tensor | None,
+    content_values: Tensor,
+    valid_mask: Tensor,
+    pinned_mask: Tensor | None,
+    target_ratio: float,
+) -> tuple[Tensor, dict[str, float]]:
+    """Utility-gradient BCE distillation loss on the survivorship head.
+
+    Builds a binary top-k teacher over controllable positions by ranking
+    ``util_i = -(grad · value)_i`` (higher utility = position whose
+    value contributes more to *reducing* total loss), then BCE-with-logits
+    against the compressor-stashed ``base_raw_for_util`` (which was
+    computed as ``head(content_hidden.detach())`` inside the encoder's
+    LoRA context — so any active LoRA adapter is applied and receives
+    the utility-grad BCE backward).
+
+    The ``base_raw_for_util`` subgraph is fully disjoint from the main
+    backward path because its input is detached at the head boundary;
+    ``total_loss.backward()`` does not free its activations, so
+    ``util_loss.backward()`` traverses a clean, intact subgraph with no
+    retain_graph needed.
+
+    Args:
+        base_raw_for_util: ``(B, L_content)`` head output from the
+            detached-input fork computed during the compressor forward.
+            When None (util-grad inactive on this forward), returns a
+            zero-loss scalar.
+        content_grad: ``(B, L_content, D)`` gradient on ``content_hidden``
+            captured by the compressor's backward hook during the main
+            backward. When None (backward hook didn't fire), returns a
+            zero-loss scalar.
+        content_values: ``(B, L_content, D)`` forward-time detached
+            stash of ``content_hidden``.
+        valid_mask: ``(B, L_content)`` bool mask of valid (non-padding)
+            content positions.
+        pinned_mask: optional ``(B, L_content)`` bool mask of positions
+            that are always-kept by the operator (excluded from teacher
+            and loss so they don't waste teacher capacity).
+        target_ratio: fraction of controllable positions that should
+            survive — drives the per-sample top-k count.
+
+    Returns ``(loss, metrics)``.
+    """
+    device = content_values.device
+    if content_grad is None or base_raw_for_util is None:
+        return (
+            torch.zeros((), device=device, dtype=torch.float32),
+            {},
+        )
+
+    if pinned_mask is None:
+        controllable = valid_mask
+    else:
+        controllable = valid_mask & ~pinned_mask
+
+    if not controllable.any():
+        return (
+            torch.zeros((), device=device, dtype=base_raw_for_util.dtype),
+            {},
+        )
+
+    # util_i = -(grad · value)_i. Computed in fp32 for numerical
+    # headroom — grad magnitudes can be small under bf16.
+    util = -(content_grad.float() * content_values.float()).sum(dim=-1)
+    # Mask out non-controllable positions with -inf so topk picks
+    # only from the controllable set.
+    util_masked = util.masked_fill(~controllable, float("-inf"))
+
+    # Per-sample top-k count = ceil(controllable_count * target_ratio),
+    # at least 1 so a fully controllable sample always produces a teacher
+    # positive.
+    ctrl_counts = controllable.sum(dim=-1)  # (B,)
+    ks = torch.clamp(
+        torch.ceil(ctrl_counts.float() * target_ratio).long(),
+        min=1,
+    )
+    max_k = int(ks.max().item())
+
+    # torch.topk with a per-sample k isn't a native op — emulate via a
+    # single topk at max_k and then mask with a per-sample length.
+    _, top_indices = torch.topk(util_masked, k=max_k, dim=-1)
+    teacher = torch.zeros_like(base_raw_for_util, dtype=torch.bool)
+    # Build a (B, max_k) mask: column j is "j < k[sample]".
+    col = torch.arange(max_k, device=device).unsqueeze(0)  # (1, max_k)
+    within_k = col < ks.unsqueeze(-1)  # (B, max_k)
+    # Scatter True into teacher at top positions gated by within_k.
+    teacher.scatter_(
+        dim=-1, index=top_indices,
+        src=within_k,
+    )
+    # Also ensure no teacher positive landed on a non-controllable slot
+    # (defensive — the -inf fill should prevent this already, except when
+    # controllable_count < max_k and topk falls back to -inf positions).
+    teacher = teacher & controllable
+
+    ctrl_f = controllable.to(base_raw_for_util.dtype)
+    bce_per_pos = F.binary_cross_entropy_with_logits(
+        base_raw_for_util.float(),
+        teacher.to(base_raw_for_util.dtype).float(),
+        reduction="none",
+    )
+    loss = (bce_per_pos * ctrl_f.float()).sum() / ctrl_f.float().sum().clamp(min=1.0)
+    loss = loss.to(base_raw_for_util.dtype)
+
+    metrics = {
+        "utility_grad_bce": float(loss.item()),
+        "utility_grad_teacher_rate": float(teacher.float().mean().item()),
+    }
+    return loss, metrics
 
 
 def resolve_level_ice_cfg(cfg_block: dict | None) -> LevelICECfg:

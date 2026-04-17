@@ -611,6 +611,7 @@ def process_single_repo(
             skipped_binary=snapshot.skipped_binary,
             skipped_large=snapshot.skipped_large,
             skipped_pattern=snapshot.skipped_pattern,
+            skipped_minified=snapshot.skipped_minified,
         )
 
         if not snapshot.files:

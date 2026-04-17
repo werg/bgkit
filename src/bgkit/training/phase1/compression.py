@@ -225,7 +225,6 @@ class CompressionTrainer(BaseTrainer):
         surv_cfg = tcfg.get("survivorship", {})
         self._surv_l0 = resolve_level_loss_cfg(surv_cfg.get("l0", {}))
         self._surv_l1 = resolve_level_loss_cfg(surv_cfg.get("l1", {}))
-        self._soft_attn_every_n_steps = int(surv_cfg.get("soft_attn_every_n_steps", 1))
 
         ice_cfg = tcfg.get("ice_distillation", {})
         self._ice_l0 = resolve_level_ice_cfg(ice_cfg.get("l0", {}))
@@ -646,101 +645,6 @@ class CompressionTrainer(BaseTrainer):
         )
         return loss, out_metrics
 
-    def _soft_attention_forward(
-        self,
-        enc_out,
-        batch: dict,
-        level: str = "l0",
-    ) -> torch.Tensor:
-        """Second decoder forward on prob-gated layer-7 embeddings.
-
-        Routes the decoder's CE-loss gradient back to the level's head
-        via ``logits_for_op`` through the FULL remaining encoder (blocks
-        2..end + final norm + projection + decoder) via
-        forward_from_block(2).
-
-        layer7 kept at full magnitude; flags blended by p. Matches hard
-        forward (``hidden = layer7 + flag_emb``) at p∈{0,1}. Multiplying
-        layer7 by p would be a different computation, not a relaxation.
-        """
-        compressor = self.encoder.compressor
-        controller = compressor.threshold_l0 if level == "l0" else compressor.threshold_l1
-        theta = controller.theta.to(self.device)
-        # logits_for_op = tanh(base_raw / T); carries head-gradient directly
-        # (single-head architecture post-2026-04-16 simplification).
-        logits_softattn = enc_out.logits_for_op
-        layer7 = enc_out.layer7_embeddings
-        if logits_softattn is None or layer7 is None:
-            # No compression this batch (short-circuit). Return zero.
-            return torch.tensor(0.0, device=self.device)
-        base_dtype = layer7.dtype
-        softattn_probs = torch.sigmoid(
-            logits_softattn.float() - theta.float()
-        ).to(base_dtype)
-
-        survive_emb = compressor.survive_embedding.to(base_dtype)
-        doomed_emb = compressor.doomed_embedding.to(base_dtype)
-        p = softattn_probs.unsqueeze(-1)
-        gated_content = layer7 + p * survive_emb + (1.0 - p) * doomed_emb
-
-        content_attn_mask = batch["content_attention_mask"].to(self.device)
-        full_after_head = enc_out.full_after_head
-        full_attn_mask = enc_out.full_attention_mask
-        content_slice = enc_out.content_slice
-
-        if full_after_head is not None and content_slice is not None:
-            full_hidden = full_after_head.clone().to(base_dtype)
-            full_hidden[:, content_slice, :] = gated_content
-            # Head hook fires after backbone block 1; blocks 2..end remain.
-            # Block indices are positions in the backbone, NOT indices into
-            # the hooks dict — removing the ratio hook did not re-number
-            # blocks. So `start_block=2` is the correct resume point
-            # regardless of the hooks dict's sparsity.
-            full_layer22 = compressor.backbone.forward_from_block(
-                hidden=full_hidden,
-                start_block=2,
-                attention_mask=full_attn_mask,
-                apply_final_norm=True,
-            ).last_hidden_state
-            # Run projection_block on the FULL sequence so its rotary
-            # positional encodings match the hard forward; slice content
-            # out afterwards for the decoder splice.
-            proj_out = self.encoder.projection_block(
-                full_layer22, full_attn_mask, survivor_mask=None,
-            )
-            soft_survivors = proj_out.projected_embeddings[:, content_slice, :]
-            soft_mask = content_attn_mask.clone()
-        else:
-            full_layer22 = compressor.backbone.forward_from_block(
-                hidden=gated_content,
-                start_block=2,
-                attention_mask=content_attn_mask,
-                apply_final_norm=True,
-            ).last_hidden_state
-            proj_out = self.encoder.projection_block(
-                full_layer22, content_attn_mask, survivor_mask=None,
-            )
-            soft_survivors = proj_out.projected_embeddings
-            soft_mask = content_attn_mask.clone()
-
-        target_ids = batch["target_token_ids"].to(self.device)
-        target_mask = batch["target_attention_mask"].to(self.device)
-        splice_start = batch["bgkit_splice_start"].to(self.device)
-        splice_len = batch["bgkit_splice_len"].to(self.device)
-        loss_mask = batch.get("target_loss_mask")
-        if loss_mask is not None:
-            loss_mask = loss_mask.to(self.device)
-
-        return self.decoder.forward_with_single_splice(
-            survivor_embeddings=soft_survivors,
-            survivor_attention_mask=soft_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=splice_start,
-            splice_lengths=splice_len,
-            loss_mask=loss_mask,
-        )
-
     # ------------------------------------------------------------------
     # Compression pipeline
     # ------------------------------------------------------------------
@@ -763,6 +667,10 @@ class CompressionTrainer(BaseTrainer):
         prompt_emb = bgkit_embed(prompt_ids)
 
         target_ratio = self._current_target_ratio()
+        from bgkit.training.survivorship_helpers import LevelLossCfg
+        util_active = getattr(
+            self, "_surv_l0", LevelLossCfg(),
+        ).utility_grad_loss_weight > 0.0
         enc_out = self.encoder(
             input_embeddings=content_emb,
             attention_mask=content_mask,
@@ -770,6 +678,7 @@ class CompressionTrainer(BaseTrainer):
             prompt_attention_mask=prompt_mask,
             target_ratio=target_ratio,
             level="l0",
+            utility_grad_active=util_active,
         )
 
         return enc_out
@@ -962,26 +871,34 @@ class CompressionTrainer(BaseTrainer):
                 )
                 total_loss_t = total_loss_t + surv_loss
 
-                # Soft attention branch via adapter-only gradient path.
-                from bgkit.training.survivorship_helpers import LevelLossCfg
-                surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
-                soft_every = getattr(self, "_soft_attn_every_n_steps", 1)
-                if (
-                    surv_l0.soft_attn_loss_weight > 0
-                    and self.global_step % soft_every == 0
-                    and enc_out.layer7_embeddings is not None
-                ):
-                    with torch.autocast(
-                        "cuda", dtype=torch.bfloat16,
-                        enabled=self.device.type == "cuda",
-                    ):
-                        soft_loss = self._soft_attention_forward(
-                            enc_out, batch, level="l0",
-                        )
-                    total_loss_t = total_loss_t + surv_l0.soft_attn_loss_weight * soft_loss
-                    surv_metrics["soft_attn_loss"] = soft_loss.item()
-
             (total_loss_t / self._accum_steps).backward()
+
+            # Utility-gradient BCE distillation (post-backward). Replaces
+            # soft-attn: the main backward already routed the decoder-CE
+            # gradient back to ``content_hidden`` where the compressor's
+            # backward hook captured it.
+            from bgkit.training.survivorship_helpers import LevelLossCfg
+            _surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
+            if (
+                _surv_l0.utility_grad_loss_weight > 0.0
+                and enc_out.post_head_content_values is not None
+            ):
+                from bgkit.training.survivorship_helpers import utility_grad_bce_loss
+
+                content_mask = batch["content_attention_mask"].to(self.device)
+                util_loss, util_metrics = utility_grad_bce_loss(
+                    base_raw_for_util=enc_out.base_raw_for_util,
+                    content_grad=enc_out.get_content_grad(),
+                    content_values=enc_out.post_head_content_values,
+                    valid_mask=content_mask,
+                    pinned_mask=None,
+                    target_ratio=self._current_target_ratio(),
+                )
+                if util_loss.requires_grad:
+                    w = _surv_l0.utility_grad_loss_weight
+                    (util_loss * w / self._accum_steps).backward()
+                for k, v in util_metrics.items():
+                    surv_metrics[f"l0_{k}"] = v
 
             n_survivors = (
                 int(enc_out.survivor_mask.sum().item())
@@ -1116,6 +1033,11 @@ class CompressionTrainer(BaseTrainer):
                 # Per-sample L1 scoring via survivorship head + full encoder pass.
                 group_survivors = []
                 group_surv_masks = []
+                l1_util_bundles: list[dict] = []
+                from bgkit.training.survivorship_helpers import LevelLossCfg
+                util_w_l1 = getattr(
+                    self, "_surv_l1", LevelLossCfg(),
+                ).utility_grad_loss_weight
                 target_ratio = self._current_target_ratio()
                 for d in group:
                     surv_input = d['survivors']
@@ -1131,9 +1053,19 @@ class CompressionTrainer(BaseTrainer):
                         prompt_attention_mask=prompt_mask[d['idx']:d['idx'] + 1],
                         target_ratio=target_ratio,
                         level="l1",
+                        utility_grad_active=util_w_l1 > 0.0,
                     )
                     group_survivors.append(l1_out.survivor_embeddings)
                     group_surv_masks.append(l1_out.survivor_attention_mask)
+                    if (
+                        util_w_l1 > 0.0
+                        and l1_out.post_head_content_values is not None
+                    ):
+                        l1_util_bundles.append({
+                            "enc_out": l1_out,
+                            "content_values": l1_out.post_head_content_values,
+                            "content_mask": l1_mask,
+                        })
 
                 if self._profile_enabled:
                     ev_l1_end.record()
@@ -1213,6 +1145,26 @@ class CompressionTrainer(BaseTrainer):
                     prof_l1 += ev_l1_start.elapsed_time(ev_l1_end)
                     # decoder+backward combined (interleaved in grouped path)
                     prof_dec += ev_dec_start.elapsed_time(ev_dec_end)
+
+            # --- L1 utility-gradient BCE distillation (post-group-backward) ---
+            if util_w_l1 > 0.0 and l1_util_bundles:
+                from bgkit.training.survivorship_helpers import utility_grad_bce_loss
+
+                for bundle in l1_util_bundles:
+                    enc_out = bundle["enc_out"]
+                    content_grad = enc_out.get_content_grad()
+                    if content_grad is None:
+                        continue
+                    util_loss, _ = utility_grad_bce_loss(
+                        base_raw_for_util=enc_out.base_raw_for_util,
+                        content_grad=content_grad,
+                        content_values=bundle["content_values"],
+                        valid_mask=bundle["content_mask"],
+                        pinned_mask=None,
+                        target_ratio=target_ratio,
+                    )
+                    if util_loss.requires_grad:
+                        (util_loss * util_w_l1 * scale).backward()
 
         # (flush_calibrator parameter retained for API compat but no-op)
 

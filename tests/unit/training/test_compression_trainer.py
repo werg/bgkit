@@ -266,8 +266,6 @@ def trainer():
     # Survivorship head aux loss weights (normally set in setup())
     t._ratio_loss_weight = 0.1
     t._decisiveness_loss_weight = 0.05
-    t._soft_attn_loss_weight = 0.05
-    t._soft_attn_every_n_steps = 4
 
     return t
 

@@ -38,6 +38,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
+from bgkit.data.repo_processing import looks_minified
+
 
 def _load_encoder(checkpoint_path: str, device: torch.device):
     """Load BgKIT encoder from checkpoint. Survivorship head is inside the encoder."""
@@ -196,6 +198,10 @@ def encode_swe_repos(
                         try:
                             text = content.decode("utf-8", errors="replace")
                         except Exception:
+                            continue
+                        # Reject minified / bundled files from the Phase 3
+                        # context cache. Same heuristic as Phase 1 data-prep.
+                        if looks_minified(text):
                             continue
                         tokens = tokenizer.encode(text, add_special_tokens=False)[:max_file_tokens]
                         if tokens:

@@ -152,6 +152,8 @@ class BgKITEncoder(nn.Module):
         target_ratio: float | None = None,
         level: str | None = None,
         min_per_sample: int = 0,
+        utility_grad_active: bool = False,
+        utility_grad_capture: dict | None = None,
     ) -> CompressionOutput:
         """Run the full encoder: compressor then projection block.
 
@@ -190,6 +192,8 @@ class BgKITEncoder(nn.Module):
                 target_ratio=target_ratio,
                 level=level or "l0",
                 min_per_sample=min_per_sample,
+                utility_grad_active=utility_grad_active,
+                utility_grad_capture=utility_grad_capture,
             )
 
             # Projection block sees the full sequence (prompt context preserved)
@@ -225,7 +229,7 @@ class BgKITEncoder(nn.Module):
         # Normed embeddings for auto-repro are content-only from compressor
         content_normed = comp_out.normed_embeddings[:, comp_out.content_slice, :]
 
-        return CompressionOutput(
+        out = CompressionOutput(
             survivor_embeddings=content_proj,
             all_embeddings=content_normed,
             survivor_attention_mask=content_mask,
@@ -233,13 +237,12 @@ class BgKITEncoder(nn.Module):
             survivor_counts=proj_out.survivor_counts,
             head_logits=comp_out.head_logits,
             survive_probs=comp_out.survive_probs,
-            layer7_embeddings=comp_out.layer7_embeddings,
-            full_after_head=comp_out.full_after_head,
-            full_attention_mask=comp_out.attention_mask,
             content_slice=comp_out.content_slice,
             base_raw=comp_out.base_raw,
             logits_for_op=comp_out.logits_for_op,
             survive_probs_metrics=comp_out.survive_probs_metrics,
+            base_raw_for_util=comp_out.base_raw_for_util,
+            post_head_content_values=comp_out.post_head_content_values,
             valid_count=comp_out.valid_count,
             organic_count=comp_out.organic_count,
             controllable_count=comp_out.controllable_count,
@@ -249,6 +252,12 @@ class BgKITEncoder(nn.Module):
             undecided_fraction=comp_out.undecided_fraction,
             theta_tensor=comp_out.theta_tensor,
         )
+        # Forward the backward-hook state reference so callers can read
+        # ``post_head_content_grad`` after ``total_loss.backward()``.
+        hook_state = getattr(comp_out, "_utility_grad_state", None)
+        if hook_state is not None:
+            out._utility_grad_state = hook_state  # type: ignore[attr-defined]
+        return out
 
     def auto_reproduce(self, normed_embeddings: torch.Tensor) -> torch.Tensor:
         """Map normed embeddings back to input embedding space."""

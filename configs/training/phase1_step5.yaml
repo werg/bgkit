@@ -33,17 +33,24 @@ l1_introduction_step: 0         # L0 already established in steps 1-4
 # L0 head already trained from Step 3 (no BCE re-warmup); L1 continues
 # from Step 4's cold-start.
 survivorship:
-  soft_attn_every_n_steps: 1
   l0:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
-    soft_attn_loss_weight: 0.2
+    utility_grad_loss_weight: 0.3
     moment_match_weight: 0.05           # halved from Step 3; lighter anchor
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
   l1:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.05
-    soft_attn_loss_weight: 0.3
+    utility_grad_loss_weight: 0.3
     moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
 
 ice_distillation:
   l0:
