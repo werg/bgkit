@@ -27,15 +27,15 @@ lr: 2.0e-4               # base LR (encoder gets this)
 decoder_lr: 1.0e-5        # decoder LoRA LR (low — LoRA concentrates gradients)
 encoder_lr: 2.0e-4        # encoder LR (higher — pruned encoder needs to adapt)
 warmup_steps: 500
-max_batch_tokens: 16384
-gradient_accumulation_steps: 4
-max_eval_samples: 2000
+max_batch_tokens: 32768
+gradient_accumulation_steps: 2
+max_eval_samples: 500
 eval_every: 500
 save_every: 500
-# Per-microbatch diagnostic metrics (base_norm, adapter_norm, head_logit_std,
-# floor_trigger_rate, theta, adapter_mu) each force a GPU→CPU sync. Gate
-# them on every 10th step — cheap loss/target metrics still emit every step.
-diagnostic_metrics_every_n_steps: 10
+# Per-microbatch diagnostic metrics (base_norm, head_logit_std,
+# floor_trigger_rate, theta) each force a GPU→CPU sync. Gate them on
+# every 50th step — cheap loss/target metrics still emit every step.
+diagnostic_metrics_every_n_steps: 50
 
 # Optional sidecar with pre-distilled head_base_l0 weights. Produced by
 # scripts/pretrain_survivorship_head.py. When set, online BCE warmup is
@@ -76,7 +76,11 @@ survivorship:
   # ~1.8× FLOPs during Stage A. After this step, the configured weight
   # takes effect and the adapter receives decoder-CE gradient.
   soft_attn_start_step: 2000
-  soft_attn_every_n_steps: 2
+  # Cadence 4 (was 2): adapter removal means no zero-init head needing
+  # frequent gradient to "come alive"; the full-encoder soft-attn replay
+  # (blocks 2-5 on all content positions) dominates wall-clock during
+  # Stage B, so halving its frequency saves ~1× step duration.
+  soft_attn_every_n_steps: 4
 
   # L0: base is pre-distilled offline; Stage A runs no ranking loss. Stage
   # B adds soft-attn through the adapter.
