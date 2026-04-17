@@ -15,13 +15,13 @@ class LiveConfig:
 
     The control file is shared across all training phases. Each phase reads
     only its own section, keyed by ``namespace`` (typically the training
-    phase name like ``phase1_step5``). Unrelated phases' settings are ignored.
+    phase name like ``phase1_step6``). Unrelated phases' settings are ignored.
 
     Control file format::
 
         {
-            "phase1_step5": {"eval_every": 500, "save_every": 500, "lr": 5e-5},
-            "phase1_step4": {"lr": 3e-5}
+            "phase1_step6": {"eval_every": 500, "save_every": 500, "lr": 5e-5},
+            "phase1_step5": {"lr": 3e-5}
         }
 
     Only keys that changed since the last poll are returned.

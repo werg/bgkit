@@ -406,7 +406,7 @@ class CommitEncodingTrainer(BaseTrainer):
         }]
 
     def _resolve_step1_checkpoint(self) -> str | None:
-        """Resolve step1_checkpoint: auto -> best phase1_step3 checkpoint."""
+        """Resolve step1_checkpoint: auto -> best phase1_step4 checkpoint."""
         step1_checkpoint = self.cfg.get("step1_checkpoint", None)
         self._input_sources = {}
 
@@ -414,7 +414,7 @@ class CommitEncodingTrainer(BaseTrainer):
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
             resolved = resolve_checkpoint(
                 checkpoint_dir,
-                phase="phase1_step3",
+                phase="phase1_step4",
                 metric="eval/loss",
                 label="step1_checkpoint",
             )

@@ -407,7 +407,7 @@ class CompressionTrainer(BaseTrainer):
                 )
 
     def _resolve_step1_checkpoint(self) -> str | None:
-        """Resolve step1_checkpoint: auto -> best phase1_step4 checkpoint.
+        """Resolve step1_checkpoint: auto -> best phase1_step5 checkpoint.
 
         Step 4 expects a checkpoint from step 3 (commit encoding), which has
         both a trained encoder and decoder.
@@ -421,7 +421,7 @@ class CompressionTrainer(BaseTrainer):
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
             resolved = resolve_checkpoint(
                 checkpoint_dir,
-                phase="phase1_step4",
+                phase="phase1_step5",
                 metric="eval/loss",
                 label="step1_checkpoint",
             )

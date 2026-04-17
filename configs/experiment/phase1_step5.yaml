@@ -1,10 +1,9 @@
 # @package _global_
-# Experiment preset: Phase 1 Step 5 compression training
+# Experiment preset: Phase 1 Step 5 commit encoding (two-level L0+L1)
 defaults:
   - /config
   - /training/phase1_step5
   - _self_
 
 run_name: phase1_step5
-
 step1_checkpoint: auto

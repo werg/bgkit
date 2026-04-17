@@ -1,0 +1,91 @@
+# Phase 1 Step 6: Multi-objective compression training (4 objectives, curriculum)
+#
+# Steps 1-4 handle encoder pretraining, pruning distillation, pruned
+# reconstruction, and commit encoding. Step 5 receives a checkpoint with:
+#   - Pruned encoder with compression at ~0.25 ratio
+#   - Completed bidi warmup (fully bidirectional)
+#   - Trained decoder on compressed representations
+#
+# Step 5 focuses on multi-objective training + L1 introduction.
+phase: phase1_step6
+optimizer: muon
+max_steps: 20000
+lr: 6.0e-5
+warmup_steps: 500
+bidi_warmup_steps: 0         # already completed in step 1
+max_batch_tokens: 49152
+
+objectives:
+  data_reconstruction: 0.35
+  description_generation: 0.15
+  structural_relational: 0.12
+  commit_reproduction: 0.20
+  query_conditioned: 0.18
+
+# Ratio scheduling
+target_ratio_start: 0.10
+target_ratio_end: 0.10
+target_ratio_ramp_steps: 1
+
+l1_introduction_step: 0         # L0 already established in steps 1-4
+
+# Survivorship head losses, per level. Both L0 and L1 are trained here.
+# L0 head already trained from Step 3 (no BCE re-warmup); L1 continues
+# from Step 4's cold-start.
+survivorship:
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.05           # halved from Step 3; lighter anchor
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+
+ice_distillation:
+  l0:
+    enabled: false                       # L0 already trained
+  l1:
+    enabled: false                       # never ICE at L1
+
+moment_match_reference:
+  l0:
+    path: ${oc.env:DATA_DIR}/diagnostics/ice_reference_moments.json
+  l1:
+    path: null
+
+decoder_lora:
+  enabled: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+freeze:
+  bgkit: false
+  decoder: false
+
+data:
+  file_tokens_path: ${oc.env:DATA_DIR}/processed/tokens
+  commit_tokens_path: ${oc.env:DATA_DIR}/processed/commit_reproduction
+  description_tokens_path: ${oc.env:DATA_DIR}/mmap/descriptions
+  structural_tokens_path: ${oc.env:DATA_DIR}/mmap/structural
+  prompt_variants_dir: configs/prompt_variants
+  qa_data_dir: ${oc.env:DATA_DIR}/mmap/qa_conditioned
+
+eval:
+  generation_samples: 8
+  generation_every_n_evals: 4
+
+eval_every: 2000
+save_every: 10000

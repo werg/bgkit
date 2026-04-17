@@ -560,7 +560,7 @@ class BaseTrainer(ABC):
 
         Expects scalar ``training.max_steps``, ``training.lr``, and
         ``training.warmup_steps``.  Phase configs with multi-step or
-        per-component LR schedules (phase1_step3, phase2) must override
+        per-component LR schedules (phase1_step4, phase2) must override
         this method with their own loop.
 
         Supports early stopping via ``training.early_stopping`` config:

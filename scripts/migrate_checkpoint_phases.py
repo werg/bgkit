@@ -3,8 +3,8 @@
 
 Rename mapping:
   phase1_step1a  -> phase1_step2
-  commit_encoding -> phase1_step3
-  phase1_step2   -> phase1_step4
+  commit_encoding -> phase1_step4
+  phase1_step2   -> phase1_step5
 
 This script:
 1. Renames checkpoint directories (phase prefix in name)
@@ -25,18 +25,24 @@ import json
 import sys
 from pathlib import Path
 
-# Phase rename map. Ordered by longest prefix first to avoid partial matches.
-# History of renames:
-#   v1: phase1_step1a -> phase1_step2, commit_encoding -> phase1_step3,
-#       phase1_step2 (old compression) -> phase1_step4
-#   v2: phase1_step3 (commit_encoding) -> phase1_step4,
-#       phase1_step4 (compression) -> phase1_step5
+# Phase rename map for the CURRENT migration. History of past migrations:
+#   v1 (pre-2026-04): phase1_step1a -> phase1_step2,
+#                     commit_encoding -> phase1_step3,
+#                     phase1_step2 (old compression) -> phase1_step4
+#   v2 (2026-04):     phase1_step3 (commit_encoding) -> phase1_step4,
+#                     phase1_step4 (compression)     -> phase1_step5
+#   v3 (2026-04-17):  phase1_step5 (compression)     -> phase1_step6,
+#                     phase1_step4 (commit encoding) -> phase1_step5,
+#                     phase1_step3 (LoRA recon)      -> phase1_step4
+#                     — making room for the new phase1_step3
+#                       (QA-conditioned head supervision).
+#
+# Iteration order matters: main() reverse-sorts directory names so a
+# freshly-renamed step4 never re-matches a step3 rule mid-pass.
 RENAME_MAP = {
-    "phase1_step4": "phase1_step5",  # old compression -> step 5
-    "phase1_step3": "phase1_step4",  # old commit_encoding -> step 4
-    # Earlier renames (already applied, kept for completeness):
-    # "phase1_step1a": "phase1_step2",
-    # "commit_encoding": "phase1_step3",
+    "phase1_step5": "phase1_step6",  # multi-objective compression
+    "phase1_step4": "phase1_step5",  # commit encoding
+    "phase1_step3": "phase1_step4",  # LoRA reconstruction
 }
 
 
@@ -144,9 +150,12 @@ def main():
     print(f"  Rename map: {RENAME_MAP}")
     print()
 
-    # Step 1: Rename checkpoint directories (process phase1_step2->step4 FIRST
-    # to avoid collision with phase1_step1a->step2)
-    dirs = sorted(checkpoint_dir.iterdir())
+    # Step 1: Rename checkpoint directories.
+    # Reverse-sort by name so phase1_step5_* directories get renamed to
+    # phase1_step6_* BEFORE we reach phase1_step4_* directories — otherwise
+    # a freshly-renamed step4_* would re-match the step3->step4 rule on
+    # the next iteration and be silently skipped (target exists).
+    dirs = sorted(checkpoint_dir.iterdir(), reverse=True)
     renamed = 0
     for d in dirs:
         if not d.is_dir() or d.name.startswith("."):

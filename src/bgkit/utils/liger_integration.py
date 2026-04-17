@@ -305,7 +305,7 @@ def apply_liger_to_qwen35(
     **``patch_rmsnorm`` defaults to False** as of 2026-04-16:
     liger-kernel 0.7.x's ``LigerRMSNorm`` silently corrupts the backward
     pass on Qwen3.5 (decoder loss jumps to the LM prior at near-zero LR,
-    grad_norm ~500 but no NaN). Discovered during phase1_step3 after
+    grad_norm ~500 but no NaN). Discovered during phase1_step4 after
     ~24 hours of debugging; see commit 313f597. Only flip this to True
     if you have independently verified the kernel is good against the
     current ``transformers`` + Qwen3.5 combination. SwiGLU / RoPE /

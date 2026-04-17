@@ -7,7 +7,7 @@ export
 # reading the file itself for ${VAR} interpolation in the YAML).
 DC := docker compose --env-file .env -f docker/docker-compose.yaml
 
-.PHONY: install install-gpu install-fa4-local install-gpu-local-fa4 test test-unit test-gpu test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos train-phase1-step1 train-phase1-step2 train-phase1-step3 train-phase1-step4 train-phase1-step5 ckpt-backfill extract-structural generate-descriptions extract-commits prepare-commit-encoding convert-tokens convert-structural convert-descriptions convert-commits convert-commit-encoding generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full prepare-data-all
+.PHONY: install install-gpu install-fa4-local install-gpu-local-fa4 test test-unit test-gpu test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos train-phase1-step1 train-phase1-step2 train-phase1-step3 train-phase1-step4 train-phase1-step5 train-phase1-step6 ckpt-backfill extract-structural generate-descriptions extract-commits prepare-commit-encoding convert-tokens convert-structural convert-descriptions convert-commits convert-commit-encoding generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full prepare-data-all
 
 FLASH_ATTN_DIR ?= ../flash-attention
 
@@ -32,7 +32,7 @@ test-gpu:
 	$(DC) run --rm --no-deps \
 		-v $(CURDIR)/tests:/workspace/bgkit/tests:ro \
 		-v $(CURDIR)/pyproject.toml:/workspace/bgkit/pyproject.toml:ro \
-		--entrypoint pytest train-phase1-step3 tests/unit -v -m gpu --ignore=tests/unit/data $(ARGS)
+		--entrypoint pytest train-phase1-step4 tests/unit -v -m gpu --ignore=tests/unit/data $(ARGS)
 
 test-integration:
 	uv run pytest tests/integration -v -m integration
@@ -81,6 +81,9 @@ train-phase1-step4:
 
 train-phase1-step5:
 	scripts/run-train.sh train-phase1-step5
+
+train-phase1-step6:
+	scripts/run-train.sh train-phase1-step6
 
 train-phase2-kb-stage-a:
 	scripts/run-train.sh train-phase2-kb-stage-a

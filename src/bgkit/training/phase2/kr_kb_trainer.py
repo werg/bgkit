@@ -495,7 +495,7 @@ class KRKBTrainer(BaseTrainer):
             try:
                 phase1_ckpt = str(resolve_checkpoint(
                     checkpoint_dir,
-                    phase="phase1_step5",
+                    phase="phase1_step6",
                     metric="eval/loss",
                     lower_is_better=True,
                 ))
@@ -582,7 +582,7 @@ class KRKBTrainer(BaseTrainer):
             checkpoint_dir = Path(str(self.cfg.get("checkpoint_dir", "checkpoints")))
             phase1_ckpt = str(resolve_checkpoint(
                 checkpoint_dir,
-                phase="phase1_step5",
+                phase="phase1_step6",
                 metric="eval/loss",
                 lower_is_better=True,
             ))
@@ -1056,7 +1056,7 @@ class KRKBTrainer(BaseTrainer):
             )
 
         # --- Head-tanh temperature calibration (L0 + L1) ---
-        # Inherited from Phase 1 Step 5 checkpoint but re-probed against
+        # Inherited from Phase 1 Step 6 checkpoint but re-probed against
         # Phase 2 text corpus (Wikipedia / KILT / PubMed-MeSH / etc.)
         # so T reflects the actual head-output std Stage A / Stage B
         # will see. Skipped when no KB text can be extracted.

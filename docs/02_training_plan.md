@@ -17,7 +17,7 @@ Phase 1 trains BgKIT's compression on code repositories, establishing the L0/L1 
 | Decoder | Qwen3.5-0.8B | ~800M | The serving model. Co-trained from Phase 1 onward to reconstruct content and answer questions from BgKIT survivors. |
 | ICE | Custom 1D CNN | ~0.7M | Information content estimator for survivor selection. |
 
-Note: The decoder is Qwen3.5-0.8B throughout — there is no separate larger target LLM. Encoder and decoder share the tokenizer (`Qwen/Qwen3.5-0.8B-Base`) and hidden dimension, so the projection block stays at 1024 dim and never needs dimensional extension. LoRA on the decoder is available but optional and is primarily used in Phase 1 Step 3 and Phase 2 KB Stages B/C to keep decoder drift under control.
+Note: The decoder is Qwen3.5-0.8B throughout — there is no separate larger target LLM. Encoder and decoder share the tokenizer (`Qwen/Qwen3.5-0.8B-Base`) and hidden dimension, so the projection block stays at 1024 dim and never needs dimensional extension. LoRA on the decoder is available but optional and is primarily used in Phase 1 Step 4 and Phase 2 KB Stages B/C to keep decoder drift under control.
 
 ## Data
 
@@ -70,15 +70,19 @@ Train the reconstruction decoder to generate text from BgKIT's full (uncompresse
 
 Remove the 18 DeltaNet linear-attention layers from the encoder via structured pruning with knowledge distillation. Replace with lightweight ResidualConv1d (local mixing) + MLP-only layers. Distills the full encoder (teacher) into the pruned encoder (student) using boundary MSE, auto-repro MSE, projection MSE, and cosine losses. Four-stage unfreezing: conv1d → retrained MLPs → all MLPs → everything. Reduces encoder from ~754M to ~499M params, eliminates DeltaNet numerical stability issues.
 
-### Step 3: Pruned Reconstruction (`phase1_step3`)
+### Step 3: QA-Conditioned Head Supervision (`phase1_step3`)
 
-Retrain the decoder (via LoRA) and encoder (full fine-tune) on the content reproduction task using the pruned encoder from step 2. Skips all curriculum phases — encoder unfrozen and compression active from step 0. Higher encoder LR, lower decoder LR. Bridges the quality gap between the distilled pruned encoder and the original unpruned encoder.
+Train the survivorship head to surface answer-relevant tokens, conditioned on a question passed to the encoder. Uses the synthetic QA pairs (filtered for grounding, multi-hot answer-position annotations recovered via identifier-substring search). Mixed-objective: decoder CE on the answer + a direct BCE-with-logits supervision on the head pushing logits up at answer-grounded positions and down elsewhere. Breaks the autoregressive shortcut observed at the (now Step 4) reconstruction phase: short answers + question-conditioned compression force the decoder to actually consume survivors. Rationale and ablation evidence in the 2026-04-17 survivor analyzer + ablation runs.
 
-### Step 4: Commit Encoding (`phase1_step4`)
+### Step 4: Pruned Reconstruction (`phase1_step4`)
+
+Retrain the decoder (via LoRA) and encoder (full fine-tune) on the content reproduction task using the pruned encoder from step 2 + the QA-pretrained head from step 3. Skips all curriculum phases — encoder unfrozen and compression active from step 0. Higher encoder LR, lower decoder LR. Bridges the quality gap between the distilled pruned encoder and the original unpruned encoder.
+
+### Step 5: Commit Encoding (`phase1_step5`)
 
 Single-objective trainer with L0 (per-file) + L1 (cross-file) compression on commit reproduction data. Trains both encoder and decoder.
 
-### Step 5: Compression Training (`phase1_step5`)
+### Step 6: Compression Training (`phase1_step6`)
 
 Introduce the drop-flag mechanism with all four core reconstruction objectives, using the co-trained decoder:
 
@@ -112,7 +116,7 @@ Because the decoder is co-trained alongside BgKIT throughout Phase 1 (rather tha
 
 ### Eval 1: Post-Phase 1 Baseline Comparisons (`eval_phase1`)
 
-Run immediately after Phase 1 Step 5 completes, before starting Phase 2. This is the first comprehensive test of BgKIT compression quality and the foundation for all later comparisons. Most infrastructure already exists (`src/bgkit/eval/`).
+Run immediately after Phase 1 Step 6 completes, before starting Phase 2. This is the first comprehensive test of BgKIT compression quality and the foundation for all later comparisons. Most infrastructure already exists (`src/bgkit/eval/`).
 
 **Compression curve** (existing: `compute_compression_curve()`):
 - Evaluate reconstruction loss + parse success rate at retention ratios: 0.50, 0.25, 0.10, 0.05, 0.02
@@ -140,7 +144,7 @@ Run immediately after Phase 1 Step 5 completes, before starting Phase 2. This is
 - ROUGE-L on generated descriptions from compressed context.
 - Sanity check: do descriptions at 0.10 retention still capture the file's purpose?
 
-**Output:** A single report with all metrics, saved alongside the Phase 1 Step 5 checkpoint. This report establishes the baseline numbers that Phase 2 improvements are measured against.
+**Output:** A single report with all metrics, saved alongside the Phase 1 Step 6 checkpoint. This report establishes the baseline numbers that Phase 2 improvements are measured against.
 
 ## Phase 2: Knowledge Retrieval
 
@@ -157,7 +161,7 @@ Phase 2 has two complementary strands that share the same encoder and decoder:
 
 **Key architectural insight:** The L0/L1 hierarchy maps naturally to every Phase 2 setting. L0 compresses individual documents/commits/sessions independently (parallelizable, cacheable). L1 jointly compresses L0 survivors from multiple items, enabling cross-document knowledge interaction. For large corpora, L0 is pre-computed and frozen (Steps 3-4 and KB Stages B/C); only L1 + decoder train.
 
-**Training objective shift:** Phase 1 trains on reconstruction ("reproduce the original text from compressed embeddings"). Phase 2 adds QA loss ("answer questions about compressed content"). Both objectives run jointly — reconstruction as a regularizer, QA as the primary signal. The existing multi-objective infrastructure from Phase 1 Step 5 supports this directly.
+**Training objective shift:** Phase 1 trains on reconstruction ("reproduce the original text from compressed embeddings"). Phase 2 adds QA loss ("answer questions about compressed content"). Both objectives run jointly — reconstruction as a regularizer, QA as the primary signal. The existing multi-objective infrastructure from Phase 1 Step 6 supports this directly.
 
 **Question conditioning:** In Steps 1-4, the decoder receives compressed L1 survivors as a prefix, then the question as normal token input, and generates the answer. This reuses the existing `ReconstructionDecoder` prefix-conditioning mechanism with no architectural changes. In KB Stages A/B/C, the decoder sees a multi-turn chat with `browse` and `bgkit` tool calls interleaved; survivors are spliced into the decoder's forward sequence in-place at each `bgkit` tool response. See the Phase 2 KB-scale section below for details.
 
@@ -170,12 +174,12 @@ Train on short single documents with QA supervision, pushing retention from 0.10
 **Why these first:** PubMedQA abstracts are short enough that even 0.01 retention yields 2-3 survivors — validates the pipeline at extreme compression. NewsQA's diverse reasoning types (33% word match, 27% paraphrase, 21% synthesis, 13% inference) test whether compressed embeddings preserve different information types.
 
 **Configuration:**
-- Continues from Phase 1 Step 5 checkpoint
+- Continues from Phase 1 Step 6 checkpoint
 - L0 only (no L1 needed — single documents)
 - Retention ratio curriculum: 0.10 → 0.01 over training
 - Loss: `α * QA_CE + (1-α) * reconstruction_CE`, α ramps 0.3 → 0.7
 - Gap-filling relaxed: `max_survivor_gap` increased or removed, since positional coverage matters less for QA than reconstruction
-- Decoder: LoRA (continuing from Phase 1 Step 3/5 setup)
+- Decoder: LoRA (continuing from Phase 1 Step 4/6 setup)
 
 **Quality gate:** Decoder achieves >70% accuracy on PubMedQA (yes/no/maybe) and >40% F1 on NewsQA extractive spans at 0.01 retention. If not, investigate whether the information bottleneck is in compression or decoding.
 
@@ -268,7 +272,7 @@ Runs in parallel with Track A Steps 2-4. Compress a repo's git history and train
 
 **Data source:** Our existing 10K+ repo collection with full git histories. The commit extraction pipeline (`src/bgkit/data/commit_extraction.py`) already parses commits with diffs, filters merges and trivial changes. `get_file_at_commit()` reconstructs codebase state at any point.
 
-**What gets compressed (L0):** Individual commits — each serialized as commit message + author + timestamp + unified diff + surrounding file context (files touched by the diff, checked out at `base_commit`). This extends the Phase 1 Step 4 commit reproduction format with richer file context.
+**What gets compressed (L0):** Individual commits — each serialized as commit message + author + timestamp + unified diff + surrounding file context (files touched by the diff, checked out at `base_commit`). This extends the Phase 1 Step 5 commit reproduction format with richer file context.
 
 **What gets jointly compressed (L1):** A repo's commit chain — L0 survivors from a sequence of related commits (grouped by file overlap or temporal proximity), enabling cross-commit reasoning.
 
@@ -449,7 +453,7 @@ ID pinning is the mechanism that lets a `bgkit(leaf_tag, query)` call hand back 
 
 ### Per-level LoRA
 
-The encoder base weights are frozen (the Phase 1 Step 5 checkpoint) throughout Phase 2 KB. All adaptation happens through two small LoRA adapters:
+The encoder base weights are frozen (the Phase 1 Step 6 checkpoint) throughout Phase 2 KB. All adaptation happens through two small LoRA adapters:
 
 - **L0 LoRA** — trained in Stage A, then frozen. Shapes within-document salience on top of the code-trained Phase 1 encoder.
 - **L1 LoRA** — trained in all three stages. Shapes query-conditioned cross-document fusion.
@@ -483,7 +487,7 @@ L0 retention ratios differ per dataset to match their information density: `kilt
 
 ### Integration with Steps 1-4 and Tracks B/C
 
-The flat-retrieval steps (Steps 1-4 plus Tracks B/C) still exist and still run before KB-scale — they establish the encoder's basic QA behaviour on curated document lists. KB-scale Stage A loads the best Phase 1 Step 5 checkpoint via `phase1_checkpoint: auto` (the same source the flat Steps 1-4 use). Stage A then re-uses the same Phase 2 mmaps (PubMedQA, NarrativeQA, memory, git-history QA) as its small-corpus bootstrap, so no data is wasted. Stages B/C add the Wikipedia scale that the flat pipeline cannot absorb in a single L1 pass.
+The flat-retrieval steps (Steps 1-4 plus Tracks B/C) still exist and still run before KB-scale — they establish the encoder's basic QA behaviour on curated document lists. KB-scale Stage A loads the best Phase 1 Step 6 checkpoint via `phase1_checkpoint: auto` (the same source the flat Steps 1-4 use). Stage A then re-uses the same Phase 2 mmaps (PubMedQA, NarrativeQA, memory, git-history QA) as its small-corpus bootstrap, so no data is wasted. Stages B/C add the Wikipedia scale that the flat pipeline cannot absorb in a single L1 pass.
 
 Pragmatically: Steps 1-4 and the KB-scale stages train the same model on overlapping objectives. If the quality gate at Eval 3 shows the KB-scale pipeline subsumes the flat one (cross-track comparison `(e) > (d)` on most benchmarks), Steps 1-4 can be dropped from future pipeline runs. Until then, both run.
 

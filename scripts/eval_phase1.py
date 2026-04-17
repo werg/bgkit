@@ -6,7 +6,7 @@ per-language parse success, embedding health, and description quality.
 
 Usage:
     python scripts/eval_phase1.py \
-        +eval.checkpoint=checkpoints/phase1_step5_best \
+        +eval.checkpoint=checkpoints/phase1_step6_best \
         +eval.output_dir=eval_reports
 """
 

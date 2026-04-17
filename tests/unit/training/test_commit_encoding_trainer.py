@@ -178,7 +178,7 @@ def trainer():
 
     cfg = OmegaConf.create({
         "training": {
-            "phase": "phase1_step4",
+            "phase": "phase1_step5",
             "max_steps": 100,
             "lr": 1e-3,
             "warmup_steps": 10,
@@ -371,7 +371,7 @@ class TestCheckpoint:
 
         # Load as CompressionTrainer would (separate encoder/decoder state dicts)
         metadata, state_dicts = load_checkpoint(ckpt_path)
-        assert metadata.phase == "phase1_step4"
+        assert metadata.phase == "phase1_step5"
         assert "encoder" in state_dicts
         assert "decoder" in state_dicts
 

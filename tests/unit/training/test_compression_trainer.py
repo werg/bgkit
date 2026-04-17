@@ -215,7 +215,7 @@ def trainer():
 
     cfg = OmegaConf.create({
         "training": {
-            "phase": "phase1_step5",
+            "phase": "phase1_step6",
             "max_steps": 100,
             "lr": 1e-3,
             "warmup_steps": 10,
@@ -519,8 +519,8 @@ class TestCheckpointRoundtrip:
 
 
 class TestResolveStep1Checkpoint:
-    def test_auto_resolves_phase1_step3(self, trainer):
-        """Auto should resolve the best phase1_step3 checkpoint."""
+    def test_auto_resolves_phase1_step4(self, trainer):
+        """Auto should resolve the best phase1_step4 checkpoint."""
         from pathlib import Path
         from unittest.mock import patch
 
@@ -530,7 +530,7 @@ class TestResolveStep1Checkpoint:
             "checkpoint_dir": "/tmp/ckpts",
         })
 
-        mock_path = Path("/tmp/ckpts/phase1_step3_step10000_20260301")
+        mock_path = Path("/tmp/ckpts/phase1_step4_step10000_20260301")
         with patch(
             "bgkit.training.phase1.compression.resolve_checkpoint",
             return_value=mock_path,
@@ -539,15 +539,15 @@ class TestResolveStep1Checkpoint:
 
         mock_resolve.assert_called_once_with(
             Path("/tmp/ckpts"),
-            phase="phase1_step4",
+            phase="phase1_step5",
             metric="eval/loss",
             label="step1_checkpoint",
         )
         assert result == str(mock_path)
-        assert trainer._input_sources["step1"] == "phase1_step3_step10000_20260301"
+        assert trainer._input_sources["step1"] == "phase1_step4_step10000_20260301"
 
     def test_auto_raises_when_no_checkpoint(self, trainer):
-        """Auto should raise when no phase1_step3 checkpoint exists."""
+        """Auto should raise when no phase1_step4 checkpoint exists."""
         from unittest.mock import patch
 
         import pytest
@@ -559,8 +559,8 @@ class TestResolveStep1Checkpoint:
 
         with patch(
             "bgkit.training.phase1.compression.resolve_checkpoint",
-            side_effect=ValueError("No phase1_step4 checkpoint found"),
-        ), pytest.raises(ValueError, match="phase1_step4"):
+            side_effect=ValueError("No phase1_step5 checkpoint found"),
+        ), pytest.raises(ValueError, match="phase1_step5"):
             trainer._resolve_step1_checkpoint()
 
     def test_explicit_path_passthrough(self, trainer):

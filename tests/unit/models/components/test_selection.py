@@ -144,7 +144,10 @@ def test_threshold_step_skips_nan_rate():
 def test_threshold_theta_preserves_fp32_storage_under_bf16_cast():
     """The _apply override must block dtype casts on theta_param /
     _velocity, so small dual-ascent deltas don't lose precision."""
-    ctrl = DualThresholdController(init_theta=-1.4)
+    # init_theta within the controller's clamp range (default ±0.99) so
+    # the linear-update arithmetic is observable; an out-of-range init
+    # silently clamps on first step and masks the precision check.
+    ctrl = DualThresholdController(init_theta=-0.5)
     ctrl.to(dtype=torch.bfloat16)
     # Underlying storage must remain fp32.
     assert ctrl.theta_param.dtype == torch.float32
@@ -152,9 +155,10 @@ def test_threshold_theta_preserves_fp32_storage_under_bf16_cast():
     assert ctrl.theta.dtype == torch.float32
 
     # Small-delta update (0.001) must be preserved, not truncated to bf16.
-    ctrl.step(current_rate=0.501, target_rate=0.5)  # gap=0.001, lr=0.1
-    # Expected: theta = -1.4 + 0.0001 = -1.3999
-    expected = -1.4 + 0.1 * 0.001
+    # Controller default lr is 0.02 (see selection.py).
+    ctrl.step(current_rate=0.501, target_rate=0.5)  # gap=0.001, lr=0.02
+    # Expected: theta = -0.5 + 0.02 * 0.001 = -0.49998
+    expected = -0.5 + 0.02 * 0.001
     assert abs(float(ctrl.theta.item()) - expected) < 1e-6
 
 

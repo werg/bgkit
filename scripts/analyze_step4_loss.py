@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Per-token reconstruction-loss analyzer for Phase 1 Step 3 checkpoints.
+"""Per-token reconstruction-loss analyzer for Phase 1 Step 4 checkpoints.
 
 Loads a completed Step 3 checkpoint, runs the standard training-time eval
 loop with ``return_hidden_states=True`` on the decoder, and dumps per-token
@@ -10,10 +10,10 @@ or its checkpoint.
 Usage (inside Docker, via the ``analyze-phase1-step3-loss`` compose service
 or ad-hoc):
 
-    python scripts/analyze_step3_loss.py \\
-        +experiment=phase1_step3 \\
-        +analyze.checkpoint=/workspace/checkpoints/phase1_step3_step1500_20260417_042208 \\
-        +analyze.output_dir=/workspace/data/diagnostics/analyze_step3_step1500 \\
+    python scripts/analyze_step4_loss.py \\
+        +experiment=phase1_step4 \\
+        +analyze.checkpoint=/workspace/checkpoints/phase1_step4_step1500_20260417_042208 \\
+        +analyze.output_dir=/workspace/data/diagnostics/analyze_step4_step1500 \\
         +analyze.max_samples=500
 
 Outputs under ``analyze.output_dir``:
@@ -300,10 +300,10 @@ def main(cfg: DictConfig) -> None:
         raise ValueError("Pass +analyze.output_dir=<path>")
 
     phase = cfg.training.get("phase", None)
-    if phase != "phase1_step3":
+    if phase != "phase1_step4":
         raise ValueError(
-            f"analyze_step3_loss expects phase=phase1_step3, got {phase}. "
-            "Use +experiment=phase1_step3.",
+            f"analyze_step4_loss expects phase=phase1_step4, got {phase}. "
+            "Use +experiment=phase1_step4.",
         )
 
     print(OmegaConf.to_yaml(cfg))

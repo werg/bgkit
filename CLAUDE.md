@@ -103,10 +103,11 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 | Joint Block → Step 1 | `bgkit_checkpoint` | `joint_block_pretrain` | `phase1_step1` | `eval/mse_repro` |
 | Step 1 → Step 2 | `step1_checkpoint` | `phase1_step1` | `phase1_step2` | `eval/loss` |
 | Step 2 → Step 3 | `bgkit_checkpoint` | `phase1_step2` | `phase1_step3` | `eval/loss` |
-| Step 3 → Step 4 | `step1_checkpoint` | `phase1_step3` | `phase1_step4` | `eval/loss` |
+| Step 3 → Step 4 | `bgkit_checkpoint` | `phase1_step3` | `phase1_step4` | `eval/loss` |
 | Step 4 → Step 5 | `step1_checkpoint` | `phase1_step4` | `phase1_step5` | `eval/loss` |
+| Step 5 → Step 6 | `step1_checkpoint` | `phase1_step5` | `phase1_step6` | `eval/loss` |
 
-**Training phase pipeline**: Joint Block Pretrain → Phase 1 Steps 1-5 (compression pre-training on code) → Phase 2 (single-doc KR Steps 1-4, KB-scale KR Stages A/B/C, Track B git history, Track C user memory) → Phase 3 (agentic distillation from SWE-bench trajectories). The decoder is **Qwen3.5-0.8B throughout** — bgkit does not train any larger in-house target LLM.
+**Training phase pipeline**: Joint Block Pretrain → Phase 1 Steps 1-6 (compression pre-training on code; Step 3 is QA-conditioned head supervision, Steps 4–6 are reconstruction / commit encoding / multi-objective compression) → Phase 2 (single-doc KR Steps 1-4, KB-scale KR Stages A/B/C, Track B git history, Track C user memory) → Phase 3 (agentic distillation from SWE-bench trajectories). The decoder is **Qwen3.5-0.8B throughout** — bgkit does not train any larger in-house target LLM.
 
 **Survivorship head (2026-04-16 single-head)**: Phase 1 Step 3+ and Phase 2 use a **single head per level** inside the encoder (at layer 7 / pruned block 1):
 
@@ -141,8 +142,8 @@ Hard flag embeddings (survive/doomed) propagate the decision to subsequent layer
 | Task | Command |
 |---|---|
 | Backfill registry | `make ckpt-backfill` or `.venv/bin/bgkit-ckpt backfill` |
-| List checkpoints | `.venv/bin/bgkit-ckpt list --phase phase1_step3` |
-| Best checkpoint | `.venv/bin/bgkit-ckpt best --phase phase1_step5 --metric eval/loss` |
+| List checkpoints | `.venv/bin/bgkit-ckpt list --phase phase1_step4` |
+| Best checkpoint | `.venv/bin/bgkit-ckpt best --phase phase1_step6 --metric eval/loss` |
 
 ## Inference Server
 
@@ -239,11 +240,11 @@ All code is implemented. The items below are **execution tasks** that require tr
     --workers 8
   ```
 
-### Phase 1 Evaluation (gate: Phase 1 Step 5 checkpoint exists)
+### Phase 1 Evaluation (gate: Phase 1 Step 6 checkpoint exists)
 
 - [ ] **Run Eval 1 (post-Phase 1 baselines)** — GPU needed for encoder/decoder inference.
   ```bash
-  python scripts/eval_phase1.py +eval.checkpoint=$CHECKPOINT_DIR/phase1_step5_best +eval.output_dir=$CHECKPOINT_DIR/eval_reports
+  python scripts/eval_phase1.py +eval.checkpoint=$CHECKPOINT_DIR/phase1_step6_best +eval.output_dir=$CHECKPOINT_DIR/eval_reports
   ```
 
 ### Phase 2 Training (gate: mmap datasets + Phase 1 checkpoint)
@@ -366,7 +367,7 @@ Each dataset (`kilt_wikipedia`, `msmarco_passage`, `pubmedqa`, `newsqa`, `search
   python scripts/precompute_l0_subset.py \
     --articles $DATA_DIR/trajectory_sets/$DS.jsonl \
     --mmap-dir $DATA_DIR/mmap/phase2 \
-    --phase1-checkpoint $CHECKPOINT_DIR/phase1_step5_best \
+    --phase1-checkpoint $CHECKPOINT_DIR/phase1_step6_best \
     --output-dir $DATA_DIR/l0_cache_kb \
     --retention-json configs/phase2_kb/l0_retention.json \
     --lora-rank 32
@@ -391,7 +392,7 @@ Each dataset (`kilt_wikipedia`, `msmarco_passage`, `pubmedqa`, `newsqa`, `search
   python scripts/precompute_l0_subset.py \
     --articles $DATA_DIR/trajectory_sets/stage_b.jsonl \
     --mmap-dir $DATA_DIR/mmap/phase2 \
-    --phase1-checkpoint $CHECKPOINT_DIR/phase1_step5_best \
+    --phase1-checkpoint $CHECKPOINT_DIR/phase1_step6_best \
     --stage-a-checkpoint $CHECKPOINT_DIR/phase2_kb_stage_a_best \
     --output-dir $DATA_DIR/l0_cache_kb \
     --retention-json configs/phase2_kb/l0_retention.json \

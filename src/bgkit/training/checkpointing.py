@@ -17,7 +17,7 @@ logger = structlog.get_logger()
 class CheckpointMetadata:
     """Metadata stored with each checkpoint."""
 
-    phase: str  # e.g. "phase1_step4", "phase2"
+    phase: str  # e.g. "phase1_step5", "phase2"
     step: int
     epoch: int
     parent_checkpoint: str | None  # Lineage: which checkpoint this was initialized from

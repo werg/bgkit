@@ -618,13 +618,17 @@ class DecoderInitTrainer(BaseTrainer):
         """Resolve bgkit_checkpoint: 'auto' -> best from preceding phase.
 
         For phase1_step1: resolves from joint_block_pretrain.
-        For phase1_step3: resolves from phase1_step2 (pruned encoder).
+        For phase1_step3 (QA-conditioned head supervision) and phase1_step4
+        (LoRA reconstruction): both resolve from phase1_step2 (pruned
+        encoder). Once phase1_step3 has been trained and produces stable
+        checkpoints, phase1_step4 should be updated to resolve from
+        phase1_step3 instead.
         """
         bgkit_checkpoint = self.cfg.get("bgkit_checkpoint", None)
         if bgkit_checkpoint == "auto":
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
             phase = self.cfg.training.get("phase", "phase1_step1")
-            if phase == "phase1_step3":
+            if phase in ("phase1_step3", "phase1_step4"):
                 resolved = resolve_checkpoint(
                     checkpoint_dir,
                     phase="phase1_step2",

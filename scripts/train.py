@@ -34,14 +34,22 @@ def _create_trainer(cfg: DictConfig):
 
         return PruningDistillTrainer(cfg)
     elif phase == "phase1_step3":
+        # QA-conditioned head supervision. Reuses DecoderInitTrainer because
+        # the data flow is identical (encoder + decoder + chat template);
+        # the QA-position loss + question-as-compression-prompt wiring lives
+        # in the config + survivorship_helpers.
         from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
         return DecoderInitTrainer(cfg)
     elif phase == "phase1_step4":
+        from bgkit.training.phase1.decoder_init import DecoderInitTrainer
+
+        return DecoderInitTrainer(cfg)
+    elif phase == "phase1_step5":
         from bgkit.training.phase1.commit_encoding import CommitEncodingTrainer
 
         return CommitEncodingTrainer(cfg)
-    elif phase == "phase1_step5":
+    elif phase == "phase1_step6":
         from bgkit.training.phase1.compression import CompressionTrainer
 
         return CompressionTrainer(cfg)

@@ -17,9 +17,9 @@ at depth confirms survivors are doing real work; a small Δ confirms the
 decoder is autoregressing past the splice.
 
 Usage (compose service ``analyze-phase1-step3-survivor-ablation``):
-    python scripts/analyze_step3_survivor_ablation.py \\
-        +experiment=phase1_step3 \\
-        +analyze.checkpoint=/workspace/checkpoints/phase1_step3_step1500_20260417_042208 \\
+    python scripts/analyze_step4_survivor_ablation.py \\
+        +experiment=phase1_step4 \\
+        +analyze.checkpoint=/workspace/checkpoints/phase1_step4_step1500_20260417_042208 \\
         +analyze.output_dir=/workspace/data/diagnostics/ablation_step3_step1500 \\
         +analyze.max_samples=500 \\
         ++compute.attention_implementation=sdpa \\
@@ -296,9 +296,9 @@ def main(cfg: DictConfig) -> None:
     if not cfg.analyze.get("output_dir", None):
         raise ValueError("Pass +analyze.output_dir=<path>")
     phase = cfg.training.get("phase", None)
-    if phase != "phase1_step3":
+    if phase != "phase1_step4":
         raise ValueError(
-            f"expects phase=phase1_step3, got {phase}. Use +experiment=phase1_step3.",
+            f"expects phase=phase1_step4, got {phase}. Use +experiment=phase1_step4.",
         )
 
     print(OmegaConf.to_yaml(cfg))

@@ -1,83 +1,151 @@
-# Commit encoding: two-level L0+L1 compression for commit reproduction
+# Phase 1 Step 4: Pruned encoder reconstruction
+#
+# Retrains the decoder (via LoRA) and encoder (full) on the content
+# reproduction task using the pruned encoder from step 2. All curriculum
+# phases are skipped — encoder is unfrozen from step 0.
+#
+# Cold start:
+#   - head_base_l0 is pre-distilled offline against ICE (sidecar path
+#     below) so the ranking signal is installed BEFORE Step 3 starts.
+#   - No online BCE (ICE is not loaded).
+#   - Moment-match holds base's distribution shape.
+#   - Utility-gradient BCE distillation trains the head from the decoder
+#     CE gradient captured at content_hidden via a backward hook, then
+#     a top-k teacher is built from ``-(grad · value)``. Replaced the
+#     soft-attention second-forward path (2026-04-17).
 phase: phase1_step4
 optimizer: muon
 max_steps: 15000
-lr: 3.0e-5
-encoder_lr: 1.0e-5
-decoder_lr: 5.0e-5
+lr: 2.0e-4               # base LR (encoder gets this)
+decoder_lr: 1.0e-5        # decoder LoRA LR (low — LoRA concentrates gradients)
+encoder_lr: 2.0e-4        # encoder LR (higher — pruned encoder needs to adapt)
 warmup_steps: 500
-bidi_warmup_steps: 0       # already bidirectional from previous steps
+max_batch_tokens: 32768
+gradient_accumulation_steps: 2
+max_eval_samples: 500
+eval_every: 500
+save_every: 500
+# Per-microbatch diagnostic metrics (base_norm, head_logit_std,
+# floor_trigger_rate, theta) each force a GPU→CPU sync. Gate them on
+# every 50th step — cheap loss/target metrics still emit every step.
+diagnostic_metrics_every_n_steps: 50
 
-# Ratio scheduling — already at target from Step 3; Step 4 adds L1 on top.
-target_ratio_start: 0.10
+# Optional sidecar with pre-distilled head_base_l0 weights. Produced by
+# scripts/pretrain_survivorship_head.py. When set, online BCE warmup is
+# NOT needed (set ice_distillation.l0.enabled: false below).
+survivorship_head_sidecar: /workspace/checkpoints/survivorship_head_base_l0_20260416_132842/head_base_l0.pt
+
+# Everything unfrozen from step 0 — no curriculum phases
+train_projection_block: true
+projection_only_steps: 0
+projection_lr: null
+encoder_unfreeze_step: 0
+bidi_warmup_steps: 0       # already bidirectional from step 2
+
+# Compression active from step 0
+compression_introduction_step: 0
+
+# Cold-start curriculum: ratio anneals 0.95 → 0.10 over 1k steps.
+target_ratio_start: 0.95
 target_ratio_end: 0.10
-target_ratio_ramp_steps: 1
+target_ratio_ramp_steps: 1000
 
-# Survivorship head losses, per level. Step 4 is where L1 first activates.
-# L0 head is trained from Step 3 (no BCE re-warmup); L1 cold-starts here
-# via decisiveness + utility-gradient BCE distillation.
+# Liger kernels: SwiGLU + RoPE + fused linear-CE are enabled. LigerRMSNorm
+# is pinned OFF due to a silent backward-pass corruption on Qwen3.5 in
+# liger-kernel 0.7.x. Symptom: loss ~1.6 at step 0 → ~13 (LM prior) by
+# step 10 at near-zero LR, grad_norm ~500, no NaN. Neither the
+# in_place=False fix to LigerRMSNorm nor disabling LigerCE resolves it.
+# LigerRMSNorm's casting_mode="llama" default doesn't match Qwen3.5's
+# RMSNorm math. Re-enable only after upstream ships an
+# `apply_liger_kernel_to_qwen3_5` with Qwen-specific RMSNorm handling
+# (Liger issue #1119) or after a targeted version-downgrade test.
+use_liger: true
+use_liger_rmsnorm: false
+
+# Survivorship head losses, per level.
 survivorship:
+  # L0: base is pre-distilled offline; utility-gradient BCE trains it
+  # online from the decoder-CE gradient captured at content_hidden.
+  #
+  # Moment-match provides a permanent corpus-wide shape anchor on
+  # base_raw so the head can't drift into degenerate distribution
+  # shapes during utility-grad training. The start_step=500 gives the
+  # encoder time to warm up before moment-match applies pressure;
+  # weight 0.05 keeps the gradient subordinate to decoder CE.
   l0:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
     utility_grad_loss_weight: 0.3
-    moment_match_weight: 0.05        # halved from Step 3; lighter anchor
+    moment_match_weight: 0.05
+    moment_match_start_step: 500
+    # Minimum-survivors floor loss: relative squared hinge on soft
+    # survivor count, using a larger-tau sigmoid so gradient flows
+    # through tanh saturation. Push the head off "confidently silent"
+    # for samples that currently get zero survivors.
     min_survivors_loss_weight: 0.05
     min_survivors_floor_ratio: 0.02
     min_survivors_absolute_min: 1
     min_survivors_tau: 0.3
+
+  # L1: no ICE anchor; utility-grad BCE drives, decisiveness breaks symmetry.
+  # (Step 3 doesn't activate L1 — included for forward compatibility.)
   l1:
     ratio_loss_weight: 0.0
-    # L1 cold-start: hold a 4× stronger decisiveness signal for the first
-    # 2k steps (the window in which utility-grad BCE is weakest — decoder
-    # needs meaningful L1 output to produce useful gradients, but L1 needs
-    # decoder gradient to know what's useful; a strong bimodal push here
-    # breaks the chicken-and-egg tie). Linearly anneals down to the
-    # steady-state weight so it doesn't fight utility-grad BCE once that's
-    # doing the work. See docs/survivorship_design.md for the collapse
-    # mode this defends against.
-    decisiveness_loss_weight: 0.05   # symmetry-break — no BCE at L1
-    decisiveness_warmup_weight: 0.20
-    decisiveness_warmup_steps: 2000
-    utility_grad_loss_weight: 0.3    # primary signal at L1
-    moment_match_weight: 0.0         # ICE shape doesn't apply at L1
+    decisiveness_loss_weight: 0.05
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
     min_survivors_loss_weight: 0.05
     min_survivors_floor_ratio: 0.02
     min_survivors_absolute_min: 1
     min_survivors_tau: 0.3
 
+# ICE distillation: disabled at runtime because head_base_l0 is pre-
+# distilled via the sidecar. The only remaining runtime link to ICE is
+# the reference moments (loaded as two floats — no ICE model on device).
 ice_distillation:
+  checkpoint_path: /workspace/checkpoints/ice_step89999_20260306_213825
+  input_dim: 1024
+  hidden_dim: 192
+  num_layers: 3
+  kernel_size: 5
   l0:
-    enabled: false                   # L0 head already trained from Step 3
+    enabled: false                   # sidecar replaces online BCE
+    bce_warmup_weight: 0.0
+    bce_warmup_steps: 0
+    teacher_ratio: 0.10
   l1:
-    enabled: false                   # never ICE at L1
+    enabled: false
 
+# Pre-computed reference moments for the moment_match loss. The probe
+# script writes a JSON with {skew, excess_kurt, n_positions}.
 moment_match_reference:
   l0:
     path: ${oc.env:DATA_DIR}/diagnostics/ice_reference_moments.json
   l1:
-    path: null
+    path: null                       # unused at L1
 
+# LoRA config for decoder — small adapter, fast adaptation
 decoder_lora:
   enabled: true
   r: 16
   alpha: 32
   dropout: 0.05
-  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
-freeze:
-  bgkit: false
-  decoder: false
+# Do NOT freeze top layer — LoRA handles parameter efficiency
+freeze_top_layer: false
+lr_scale_bottom: 1.0
 
-data:
-  commit_encoding_dir: ${oc.env:DATA_DIR}/processed/commit_encoding
-  prompt_variants_dir: configs/prompt_variants
-  max_diff_tokens_per_file: 4096
-  max_files_per_commit: 16
-  max_message_tokens: 256
+reset_wandb: true
 
-max_batch_tokens: 65536
-gradient_accumulation_steps: 1
-
-eval_every: 1000
-save_every: 5000
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+early_stopping:
+  enabled: false
+qa_ratio: 0.0
+eval:
+  generation_samples: 50
+  generation_eval_every: 4

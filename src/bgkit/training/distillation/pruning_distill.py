@@ -4,7 +4,7 @@ Distills a full BgKIT encoder (teacher) into a pruned version (student)
 with DeltaNet layers removed and lightweight conv1d added. Uses staged
 unfreezing with boundary MSE, auto-repro, projection, and cosine losses.
 
-Pipeline position: phase1_step1 -> phase1_step2 -> phase1_step3 -> phase1_step4 -> phase1_step5
+Pipeline position: phase1_step1 -> phase1_step2 -> phase1_step4 -> phase1_step5 -> phase1_step6
 """
 
 from __future__ import annotations
