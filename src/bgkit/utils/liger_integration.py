@@ -284,7 +284,7 @@ def _patch_rope(root: nn.Module) -> int:
 
 def apply_liger_to_qwen35(
     model: nn.Module | None,
-    patch_rmsnorm: bool = True,
+    patch_rmsnorm: bool = False,
     patch_swiglu: bool = True,
     patch_rope: bool = True,
 ) -> int:
@@ -299,8 +299,18 @@ def apply_liger_to_qwen35(
     Component toggles allow bisecting which fused kernel introduces a
     regression (e.g., a liger-kernel version bump may silently break
     backward-pass numerics on one module type). Call with
-    ``patch_rmsnorm=False`` or ``patch_swiglu=False`` to skip that
-    kernel specifically while keeping the others active.
+    ``patch_rmsnorm=True`` to opt into the RMSNorm kernel, or
+    ``patch_swiglu=False`` / ``patch_rope=False`` to skip those kernels.
+
+    **``patch_rmsnorm`` defaults to False** as of 2026-04-16:
+    liger-kernel 0.7.x's ``LigerRMSNorm`` silently corrupts the backward
+    pass on Qwen3.5 (decoder loss jumps to the LM prior at near-zero LR,
+    grad_norm ~500 but no NaN). Discovered during phase1_step3 after
+    ~24 hours of debugging; see commit 313f597. Only flip this to True
+    if you have independently verified the kernel is good against the
+    current ``transformers`` + Qwen3.5 combination. SwiGLU / RoPE /
+    fused linear-CE are unaffected and still default-on — they provide
+    the bulk of the throughput win.
 
     Safe to call on encoders and decoders alike, on top of LoRA wrappers,
     before or after ``enable_gradient_checkpointing``, and multiple times

@@ -334,6 +334,16 @@ class CommitEncodingTrainer(BaseTrainer):
         self._surv_state_l1 = init_state()
         self._last_post_step_metrics: dict[str, float] = {}
 
+        # --- Head-tanh temperature calibration (L0 + L1) ---
+        # L0 inherits from Step 3's sidecar-calibrated T via the loaded
+        # checkpoint; L1 is brand-new at Step 4 and needs its own T set
+        # against its head's init-scale output std. Running the probe
+        # unconditionally at both levels is cheap (4 batches, no backward)
+        # and robust to checkpoint-vs-fresh-head distinctions: if L0 was
+        # already calibrated, the probe confirms it; if the user resumes
+        # from a checkpoint with drifted T, the probe corrects it.
+        self._calibrate_head_tanh_temperatures()
+
         # --- Profiling ---
         self._profile_enabled = os.environ.get("BGKIT_PROFILE", "") == "1"
 
@@ -344,6 +354,29 @@ class CommitEncodingTrainer(BaseTrainer):
             device=str(device),
             profile=self._profile_enabled,
         )
+
+    def _calibrate_head_tanh_temperatures(self, n_probe_batches: int = 4) -> None:
+        """Probe L0 + L1 head output std at startup and set their per-level
+        ``head_tanh_temperature_l{0,1}`` buffers. See
+        :func:`bgkit.training.survivorship_helpers.calibrate_head_tanh_temperature`.
+        """
+        from bgkit.training.survivorship_helpers import (
+            calibrate_head_tanh_temperature,
+        )
+        for level in ("l0", "l1"):
+            calibrated_T = calibrate_head_tanh_temperature(
+                self.encoder.compressor,
+                self.train_dataloader,
+                self.device,
+                level=level,
+                n_probe_batches=n_probe_batches,
+            )
+            if calibrated_T is not None:
+                logger.info(
+                    "head_tanh_temperature_calibrated",
+                    level=level,
+                    T=calibrated_T,
+                )
 
     def _load_variant_bank(self, data_cfg) -> list[dict[str, str]]:
         """Load commit_encoding variant bank from prompt_variants_dir."""

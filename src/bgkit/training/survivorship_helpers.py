@@ -337,6 +337,117 @@ def compute_survivorship_losses(
     return total, metrics
 
 
+def _default_batch_to_content(batch):
+    """Default content extractor for Phase 1 trainers whose batches carry
+    ``content_token_ids`` + ``content_attention_mask`` tensors directly.
+    Returns ``(token_ids, attention_mask)`` or ``None`` if the batch
+    doesn't match that schema.
+    """
+    if not isinstance(batch, dict):
+        return None
+    ids = batch.get("content_token_ids")
+    mask = batch.get("content_attention_mask")
+    if ids is None or mask is None:
+        return None
+    return ids, mask
+
+
+@torch.no_grad()
+def calibrate_head_tanh_temperature(
+    compressor,
+    dataloader,
+    device,
+    level: str,
+    n_probe_batches: int = 4,
+    t_floor: float = 0.5,
+    batch_to_content=None,
+) -> float | None:
+    """Probe the given level's head raw-logit std and set
+    ``head_tanh_temperature_{level}`` to match.
+
+    The operator applies ``tanh(base_raw / T)``. When T matches
+    ``base_raw``'s std, most positions land in tanh's linear region and
+    ranking is preserved. A hardcoded T is brittle to the head's init
+    scale, to sidecar-distillation hyperparameter drift, and — most
+    importantly — to the L0 vs. L1 split (L1's input distribution differs
+    from L0's, so sharing a single T under-uses L1's range).
+
+    Runs a fresh backbone forward with ``return_intermediates=True`` to
+    get the layer-7 tap, applies the level's head to get ``base_raw``,
+    and averages std across ``n_probe_batches`` batches. Clamped to
+    ``t_floor`` to avoid a vanishing T on a near-constant fresh head.
+
+    Called at trainer startup for each level the trainer will train.
+    Returns the calibrated T (or None if the probe could not run).
+
+    Uses layer-7 activations from raw content as a stand-in for L1's
+    true input (L0 survivors). For a freshly-initialized L1 head the
+    difference is small: the output std is dominated by init scale and
+    hidden-dim, not by the modest distribution shift between raw content
+    and L0-compressed content. The result is a T within a factor of ~2
+    of the ideal, which keeps tanh in its linear region — the same
+    precision we get at the L0 sidecar-load probe.
+
+    ``batch_to_content`` lets callers whose batches aren't plain dicts
+    with ``content_token_ids`` + ``content_attention_mask`` (e.g. Phase 2
+    KB, which batches ``KBSample`` objects) plug in their own extractor.
+    The callable receives a batch and returns
+    ``(token_ids: LongTensor, attention_mask: BoolTensor)`` or ``None``
+    to skip that batch. Defaults to the Phase 1 dict-based extractor.
+    """
+    if level not in {"l0", "l1"}:
+        raise ValueError(f"Unknown level: {level!r}")
+    if batch_to_content is None:
+        batch_to_content = _default_batch_to_content
+
+    head, _ = compressor._heads_for_level(level)
+    backbone = compressor.backbone
+    stds: list[float] = []
+    was_training = compressor.training
+    backbone.eval()
+    head.eval()
+    try:
+        probed = 0
+        for batch in dataloader:
+            if probed >= n_probe_batches:
+                break
+            extracted = batch_to_content(batch)
+            if extracted is None:
+                continue
+            content_token_ids, content_mask = extracted
+            content_token_ids = content_token_ids.to(device)
+            content_mask = content_mask.to(device).bool()
+            embed_tokens = backbone.get_input_embeddings()
+            inputs_embeds = embed_tokens(content_token_ids)
+            backbone_out = backbone(
+                inputs_embeds=inputs_embeds,
+                attention_mask=content_mask,
+                return_intermediates=True,
+            )
+            intermediates = getattr(backbone_out, "hidden_states", None)
+            if intermediates is None or len(intermediates) < 2:
+                return None
+            layer7 = intermediates[1]
+            base_raw = head(layer7.to(dtype=head.head[0].weight.dtype))
+            valid_f = content_mask.float()
+            denom = valid_f.sum().clamp(min=1)
+            mean = (base_raw.float() * valid_f).sum() / denom
+            var = (((base_raw.float() - mean) ** 2) * valid_f).sum() / denom
+            stds.append(float(var.clamp(min=1e-8).sqrt().item()))
+            probed += 1
+    finally:
+        if was_training:
+            backbone.train()
+            head.train()
+
+    if not stds:
+        return None
+    calibrated_T = max(sum(stds) / len(stds), t_floor)
+    buf = compressor._head_tanh_temperature_for_level(level)
+    buf.fill_(calibrated_T)
+    return calibrated_T
+
+
 @torch.no_grad()
 def apply_post_step_updates(
     compressor,

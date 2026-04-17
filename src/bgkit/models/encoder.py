@@ -460,6 +460,24 @@ class BgKITEncoder(nn.Module):
                 n_filtered,
             )
 
+        # Migrate pre-2026-04-17 single-buffer ``head_tanh_temperature``
+        # into the per-level ``head_tanh_temperature_l{0,1}`` split. Old
+        # checkpoints only calibrated L0; inherit that calibrated value
+        # as L0's buffer. L1 stays at its default until the owning
+        # trainer re-calibrates it (cheap — 4 probe batches at startup).
+        legacy_tanh_key = "compressor.head_tanh_temperature"
+        if legacy_tanh_key in filtered_state_dict:
+            legacy_value = filtered_state_dict.pop(legacy_tanh_key)
+            filtered_state_dict.setdefault(
+                "compressor.head_tanh_temperature_l0", legacy_value,
+            )
+            logger.info(
+                "migrated legacy head_tanh_temperature → "
+                "head_tanh_temperature_l0 (value=%.3f); L1 buffer left at "
+                "default until trainer re-calibrates it",
+                float(legacy_value.item()) if hasattr(legacy_value, "item") else float(legacy_value),
+            )
+
         result = encoder.load_state_dict(filtered_state_dict, strict=False)
         if result.missing_keys:
             logger.info(

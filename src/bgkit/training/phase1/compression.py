@@ -366,6 +366,12 @@ class CompressionTrainer(BaseTrainer):
         # --- Profiling ---
         self._profile_enabled = os.environ.get("BGKIT_PROFILE", "") == "1"
 
+        # Head-tanh temperature calibration for both levels. See
+        # CommitEncodingTrainer._calibrate_head_tanh_temperatures for the
+        # rationale; the probe is cheap and confirms/corrects the loaded
+        # checkpoint's T values against the current head outputs.
+        self._calibrate_head_tanh_temperatures()
+
         logger.info(
             "compression_trainer_setup",
             train_samples=train_size,
@@ -374,6 +380,27 @@ class CompressionTrainer(BaseTrainer):
             l1_introduction_step=self._l1_introduction_step,
             profile=self._profile_enabled,
         )
+
+    def _calibrate_head_tanh_temperatures(self, n_probe_batches: int = 4) -> None:
+        """Probe L0 + L1 head output std at startup and set per-level
+        ``head_tanh_temperature_l{0,1}`` buffers."""
+        from bgkit.training.survivorship_helpers import (
+            calibrate_head_tanh_temperature,
+        )
+        for level in ("l0", "l1"):
+            calibrated_T = calibrate_head_tanh_temperature(
+                self.encoder.compressor,
+                self.train_dataloader,
+                self.device,
+                level=level,
+                n_probe_batches=n_probe_batches,
+            )
+            if calibrated_T is not None:
+                logger.info(
+                    "head_tanh_temperature_calibrated",
+                    level=level,
+                    T=calibrated_T,
+                )
 
     def _resolve_step1_checkpoint(self) -> str | None:
         """Resolve step1_checkpoint: auto -> best phase1_step4 checkpoint.

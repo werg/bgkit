@@ -86,3 +86,32 @@ def test_filter_preserves_new_head_names():
     assert filtered == state_dict, (
         "new two-head keys should not be filtered by the legacy prefix filter"
     )
+
+
+def test_legacy_head_tanh_temperature_migrated_to_l0():
+    """Pre-2026-04-17 checkpoints carry a single ``compressor.head_tanh_temperature``
+    buffer (no level suffix). The loader must rename it to
+    ``head_tanh_temperature_l0`` so the calibrated value is preserved; L1's
+    buffer stays at its default until the trainer re-calibrates it.
+
+    This mirrors the migration block in
+    ``BgKITEncoder.from_pretrained_with_state_dict``.
+    """
+    state_dict = {
+        "compressor.head_tanh_temperature": torch.tensor(1.07),
+        "compressor.head_base_l0.head.0.weight": torch.zeros(8, 16),
+    }
+    # Replicate the migration step (rename, not drop).
+    filtered = dict(state_dict)
+    legacy_key = "compressor.head_tanh_temperature"
+    if legacy_key in filtered:
+        legacy_value = filtered.pop(legacy_key)
+        filtered.setdefault("compressor.head_tanh_temperature_l0", legacy_value)
+
+    assert "compressor.head_tanh_temperature" not in filtered
+    assert "compressor.head_tanh_temperature_l0" in filtered
+    assert float(filtered["compressor.head_tanh_temperature_l0"].item()) == pytest.approx(1.07)
+    # L1 buffer intentionally absent — the compressor's register_buffer
+    # default will populate it, and the trainer's startup calibration
+    # will overwrite it against the live L1 head's output std.
+    assert "compressor.head_tanh_temperature_l1" not in filtered

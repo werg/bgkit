@@ -264,9 +264,12 @@ class DecoderInitTrainer(BaseTrainer):
             from bgkit.utils.liger_integration import apply_liger_to_qwen35
 
             # Per-kernel toggles for bisecting which Liger component
-            # regressed (2026-04-16 observation: v0.5→0.7 upgrade
-            # corrupts backward). Defaults match full-Liger behavior.
-            patch_rmsnorm = bool(tcfg.get("use_liger_rmsnorm", True))
+            # regressed. ``use_liger_rmsnorm`` defaults to False
+            # (2026-04-16: liger-kernel 0.7.x's LigerRMSNorm silently
+            # corrupts Qwen3.5 backward — see commit 313f597). SwiGLU /
+            # RoPE / fused linear-CE default to True — they provide the
+            # bulk of the throughput win and are unaffected.
+            patch_rmsnorm = bool(tcfg.get("use_liger_rmsnorm", False))
             patch_swiglu = bool(tcfg.get("use_liger_swiglu", True))
             patch_rope = bool(tcfg.get("use_liger_rope", True))
             use_liger_ce = bool(tcfg.get("use_liger_ce", True))
@@ -558,63 +561,34 @@ class DecoderInitTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     def _calibrate_head_tanh_temperature(self, n_probe_batches: int = 4) -> None:
-        """Probe base_raw's std and set ``head_tanh_temperature`` to match.
+        """Auto-calibrate L0's head-tanh temperature from the current head.
 
-        The operator applies ``tanh(base_raw / T)``. When T
-        matches the raw-logit std, most positions land in tanh's linear
-        region and ranking is preserved. A hardcoded T is brittle to
-        changes in the sidecar's training pipeline (BCE schedule, data,
-        teacher ratio); probing makes T adapt automatically.
+        Step 3 only trains L0; L1 calibration is the responsibility of
+        the trainers that first introduce L1 (Step 4+, Phase 2).
 
-        Skips when no sidecar was loaded (fresh head has std near zero
-        anyway, any T works), or when compression is disabled.
+        Skipped when no sidecar was loaded — the fresh default T=5.0 is
+        fine for an all-random head whose output std is near-zero anyway,
+        and re-probing at step 0 would lock in a meaningless T before
+        any training has happened.
         """
         if not getattr(self, "_sidecar_loaded", False):
             return
-        compressor = self.encoder.compressor
-        if not hasattr(compressor, "head_tanh_temperature"):
-            return
-
-        head = compressor.head_base_l0
-        backbone = compressor.backbone
-        stds: list[float] = []
-        self.encoder.eval()
-        with torch.no_grad():
-            for i, batch in enumerate(self.train_dataloader):
-                if i >= n_probe_batches:
-                    break
-                content_token_ids = batch["content_token_ids"].to(self.device)
-                content_mask = batch["content_attention_mask"].to(self.device).bool()
-                embed_tokens = backbone.get_input_embeddings()
-                inputs_embeds = embed_tokens(content_token_ids)
-                # Run backbone up to head-tap (pruned block 1 / layer 7).
-                # Use return_intermediates so we don't need the head hook.
-                backbone_out = backbone(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=content_mask,
-                    return_intermediates=True,
-                )
-                intermediates = backbone_out.hidden_states
-                if intermediates is None or len(intermediates) < 2:
-                    return  # nothing to probe; leave T at its default
-                layer7 = intermediates[1]
-                base_raw = head(layer7.to(dtype=head.head[0].weight.dtype))
-                valid_f = content_mask.float()
-                mean = (base_raw.float() * valid_f).sum() / valid_f.sum().clamp(min=1)
-                var = (
-                    ((base_raw.float() - mean) ** 2) * valid_f
-                ).sum() / valid_f.sum().clamp(min=1)
-                stds.append(float(var.clamp(min=1e-8).sqrt().item()))
-        if not stds:
-            return
-        calibrated_T = max(sum(stds) / len(stds), 0.5)  # floor to avoid tiny T
-        compressor.head_tanh_temperature.fill_(calibrated_T)
-        logger.info(
-            "head_tanh_temperature_calibrated",
-            T=calibrated_T,
-            probe_batches=len(stds),
-            probe_stds=[round(s, 3) for s in stds],
+        from bgkit.training.survivorship_helpers import (
+            calibrate_head_tanh_temperature,
         )
+        calibrated_T = calibrate_head_tanh_temperature(
+            self.encoder.compressor,
+            self.train_dataloader,
+            self.device,
+            level="l0",
+            n_probe_batches=n_probe_batches,
+        )
+        if calibrated_T is not None:
+            logger.info(
+                "head_tanh_temperature_calibrated",
+                level="l0",
+                T=calibrated_T,
+            )
 
     # ------------------------------------------------------------------
     # Curriculum initialization

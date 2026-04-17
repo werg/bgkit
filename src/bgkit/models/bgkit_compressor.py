@@ -18,10 +18,13 @@ one head (``head_base_l{0,1}``; name retained for sidecar compatibility)
 trained by BCE warmup + moment-match + soft-attn.
 
 The operator-facing logit is ``tanh(base_raw / T)`` where T is a
-per-compressor buffer (``head_tanh_temperature``) calibrated from the
-head's raw-logit std at sidecar load. Tanh bounds the output to (-1, 1)
-so θ lives in a head-agnostic coordinate system and saturation is the
-structural guard against soft-attn inflating the aggregate logit mass.
+per-level buffer (``head_tanh_temperature_l{0,1}``) calibrated from the
+head's raw-logit std at sidecar load (L0) or at trainer startup (L1).
+Tanh bounds the output to (-1, 1) so θ lives in a head-agnostic
+coordinate system and saturation is the structural guard against
+soft-attn inflating the aggregate logit mass. L0 and L1 see different
+input distributions (L1's input is L0's survivors, with a narrower
+IC range), so each level needs its own T.
 
 Selection is ``logit > θ`` against a single global threshold θ owned by
 ``DualThresholdController`` and updated externally by dual ascent against
@@ -151,17 +154,29 @@ class BgKITCompressor(nn.Module):
         self.backbone = backbone
         self.norm = norm
         self.hidden_dim = hidden_dim
-        # Temperature for the operator-facing tanh: logit_op = tanh(raw / T).
-        # BCE-with-logits distillation naturally produces raw logits with
-        # std roughly equal to the "confidence gap" between classes — in
-        # practice ~5 for 10% positive targets. Tanh saturates at ±3+, so
-        # applying it directly to std~5 logits collapses most positions
-        # to ±1 and destroys ranking. T matches the raw std so base_raw/T
-        # has std ~1, keeping most positions in tanh's linear region.
-        # Save as a buffer so it serializes with the state_dict and can
-        # be auto-calibrated at sidecar load if needed.
+        # Per-level temperature for the operator-facing tanh:
+        # ``logit_op = tanh(raw / T)``. BCE-with-logits distillation
+        # naturally produces raw logits with std roughly equal to the
+        # "confidence gap" between classes — in practice ~5 for 10%
+        # positive targets. Tanh saturates at ±3+, so applying it
+        # directly to std~5 logits collapses most positions to ±1 and
+        # destroys ranking. T matches the raw std so ``base_raw/T`` has
+        # std ~1, keeping most positions in tanh's linear region.
+        #
+        # L0 and L1 need separate T buffers because L1's input (L0's
+        # survivors) has a narrower IC range and therefore a different
+        # raw-logit std. Sharing a single T across levels was an
+        # oversight before the 2026-04-17 fix; L1 ran with L0-calibrated
+        # T, typically over-saturating or under-using its head's range.
+        #
+        # Saved as buffers so they serialize with the state_dict and
+        # survive checkpoint round-trips.
         self.register_buffer(
-            "head_tanh_temperature",
+            "head_tanh_temperature_l0",
+            torch.tensor(float(head_tanh_temperature), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "head_tanh_temperature_l1",
             torch.tensor(float(head_tanh_temperature), dtype=torch.float32),
         )
 
@@ -200,6 +215,13 @@ class BgKITCompressor(nn.Module):
             return (self.head_base_l0, self.threshold_l0)
         if level == "l1":
             return (self.head_base_l1, self.threshold_l1)
+        raise ValueError(f"Unknown level: {level!r}")
+
+    def _head_tanh_temperature_for_level(self, level: str) -> torch.Tensor:
+        if level == "l0":
+            return self.head_tanh_temperature_l0
+        if level == "l1":
+            return self.head_tanh_temperature_l1
         raise ValueError(f"Unknown level: {level!r}")
 
     def forward(
@@ -329,7 +351,7 @@ class BgKITCompressor(nn.Module):
             # monotonic). Pre-tanh raw values are still exposed on
             # hook_state for BCE-with-logits losses, which need unbounded
             # input to be numerically stable.
-            T = self.head_tanh_temperature.to(base_raw.dtype)
+            T = self._head_tanh_temperature_for_level(level).to(base_raw.dtype)
             logits_for_op = torch.tanh(base_raw / T)
 
             # Build the valid mask in content-space.

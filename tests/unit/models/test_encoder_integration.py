@@ -127,7 +127,9 @@ def test_logits_composition_numerical():
     content = torch.randn(1, 5, HIDDEN_DIM)
     out = comp(content, target_ratio=0.5, level="l0")
     # logits_for_op = tanh(base_raw / T) under single-head composition.
-    T = comp.head_tanh_temperature
+    # Per-level T buffers (L0/L1 see different input distributions);
+    # this test exercises the L0 path so use L0's T.
+    T = comp.head_tanh_temperature_l0
     expected = torch.tanh(out.base_raw / T)
     assert torch.allclose(out.logits_for_op, expected, atol=1e-5)
 

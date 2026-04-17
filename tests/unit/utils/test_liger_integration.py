@@ -94,6 +94,28 @@ class TestApplyLigerToQwen35Fallback:
         w = Wrap()
         assert _iter_text_backbone(w) is w.backbone
 
+    def test_patch_rmsnorm_default_is_false(self):
+        """Regression: apply_liger_to_qwen35's ``patch_rmsnorm`` kwarg must
+        default to False. liger-kernel 0.7.x's LigerRMSNorm silently
+        corrupts Qwen3.5 backward (decoder loss jumps to the LM prior at
+        near-zero LR); the safe default is off. Callers that need the
+        kernel must opt in explicitly.
+
+        Flipping this default back to True without independently verifying
+        the kernel is good against the current transformers + Qwen3.5
+        combination will silently break training. Keep the test — the
+        false-positive cost is a one-line flip; the miss cost is another
+        24-hour debug session.
+        """
+        import inspect
+
+        sig = inspect.signature(apply_liger_to_qwen35)
+        assert sig.parameters["patch_rmsnorm"].default is False
+        # SwiGLU / RoPE are unaffected by the 0.7.x regression — they
+        # should still default to on so the throughput win is preserved.
+        assert sig.parameters["patch_swiglu"].default is True
+        assert sig.parameters["patch_rope"].default is True
+
 
 # ---------------------------------------------------------------------------
 # liger_chunked_ce_loss — fallback path

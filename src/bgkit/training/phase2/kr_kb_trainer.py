@@ -1057,6 +1057,74 @@ class KRKBTrainer(BaseTrainer):
                 max_steps=one_epoch,
             )
 
+        # --- Head-tanh temperature calibration (L0 + L1) ---
+        # Inherited from Phase 1 Step 5 checkpoint but re-probed against
+        # Phase 2 text corpus (Wikipedia / KILT / PubMed-MeSH / etc.)
+        # so T reflects the actual head-output std Stage A / Stage B
+        # will see. Skipped when no KB text can be extracted.
+        self._calibrate_head_tanh_temperatures()
+
+    def _calibrate_head_tanh_temperatures(self, n_probe_batches: int = 4) -> None:
+        """Probe L0 + L1 head output std against Phase 2 KB content.
+
+        Phase 2 batches are lists of ``KBSample`` objects, not dicts of
+        tensors, so the shared calibration helper can't read
+        ``content_token_ids`` directly. We plug in a KB-aware extractor
+        that tokenizes each sample's ``question`` + the first rendered
+        trajectory step via ``encoder_tokenizer``. Question + trajectory
+        text is representative Phase 2 content; tokenizing a few of them
+        gives the backbone realistic input for the probe.
+        """
+        from bgkit.training.survivorship_helpers import (
+            calibrate_head_tanh_temperature,
+        )
+
+        tokenizer = getattr(self, "encoder_tokenizer", None)
+        if tokenizer is None:
+            logger.info("phase2_kb_tanh_calibration_skipped", reason="no_tokenizer")
+            return
+
+        def _batch_to_content(batch):
+            # batch is a list of KBSample objects post-_collate_kb. Pick
+            # the first sample; tokenize its question text as a probe.
+            if not batch:
+                return None
+            sample = batch[0]
+            text = getattr(sample, "question", None) or ""
+            if not text:
+                return None
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if not ids:
+                return None
+            # Truncate to a sensible probe length to bound backbone cost.
+            ids = ids[:512]
+            token_ids = torch.tensor([ids], dtype=torch.long)
+            mask = torch.ones_like(token_ids, dtype=torch.bool)
+            return token_ids, mask
+
+        for level in ("l0", "l1"):
+            calibrated_T = calibrate_head_tanh_temperature(
+                self.encoder.compressor,
+                self.train_dataloader,
+                self.device,
+                level=level,
+                n_probe_batches=n_probe_batches,
+                batch_to_content=_batch_to_content,
+            )
+            if calibrated_T is not None:
+                logger.info(
+                    "head_tanh_temperature_calibrated",
+                    level=level,
+                    T=calibrated_T,
+                    phase="phase2_kb",
+                )
+            else:
+                logger.info(
+                    "phase2_kb_tanh_calibration_skipped",
+                    level=level,
+                    reason="no_extractable_content",
+                )
+
     # ------------------------------------------------------------------
     # Optimizer
     # ------------------------------------------------------------------
