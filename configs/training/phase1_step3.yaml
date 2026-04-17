@@ -144,14 +144,17 @@ early_stopping:
 # compression behavior on the same head.
 qa_ratio: 0.7
 
+# NOTE: ``cfg.data.qa_data_dir`` must be set from the experiment shim
+# (configs/experiment/phase1_step3.yaml) because that file uses
+# ``@package _global_``; a ``data:`` block here would land at
+# ``cfg.training.data`` and be silently ignored by the trainer.
+#
 # QA mmap with answer-position annotations. Produced by:
 #   scripts/filter_qa_with_positions.py --input-dir $DATA_DIR/qa_pairs/ \\
 #       --repos-dir $DATA_DIR/repos/ \\
 #       --output-dir $DATA_DIR/qa_pairs_filtered/
 #   scripts/convert_qa_pairs_to_npy.py --input-dir $DATA_DIR/qa_pairs_filtered/ \\
 #       --output-dir $DATA_DIR/mmap/qa_conditioned_filtered/
-data:
-  qa_data_dir: ${oc.env:DATA_DIR}/mmap/qa_conditioned_filtered
 
 eval:
   generation_samples: 50

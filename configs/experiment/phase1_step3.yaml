@@ -11,3 +11,10 @@ run_name: phase1_step3
 # Once Step 3 has stable checkpoints, Step 4 should switch to loading
 # from `phase1_step3` (see DecoderInitTrainer._resolve_bgkit_checkpoint).
 bgkit_checkpoint: auto
+
+# Override the global ``data.qa_data_dir`` from data/tokens.yaml. Must
+# live here (with @package _global_) because the trainer reads
+# ``cfg.data.qa_data_dir`` — a ``data:`` block inside training/*.yaml
+# would land at ``cfg.training.data:`` and be silently ignored.
+data:
+  qa_data_dir: ${oc.env:DATA_DIR}/mmap/qa_conditioned_filtered
