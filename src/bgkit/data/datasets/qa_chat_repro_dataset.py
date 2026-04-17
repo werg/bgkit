@@ -50,12 +50,17 @@ class QAChatReproDataset(Dataset):
         self._base_seed = seed
         self._epoch_seed = seed
 
-        # Build join: QA row -> source file token index (single-chunk only)
+        # Build join: QA row -> source file token index (single-chunk only).
+        # The two sides store ``repo_path`` differently — QA records use
+        # relative ``owner/repo`` (set at QA-generation time), while the
+        # file dataset stores the absolute disk path. Normalize both to
+        # ``owner/repo`` (last two path components) before keying.
         file_key_to_chunk: dict[tuple[str, str, str], tuple[int, int]] = {}
         for tok_idx in range(len(file_token_dataset)):
             key = file_token_dataset.file_key(tok_idx)
             if key is None:
                 continue
+            key = self._normalize_key(key)
             if key not in file_key_to_chunk:
                 file_key_to_chunk[key] = (tok_idx, 1)
             else:
@@ -72,6 +77,7 @@ class QAChatReproDataset(Dataset):
             key = qa_dataset.file_key(qa_idx)
             if key is None:
                 continue
+            key = self._normalize_key(key)
             tok_idx = single_chunk_keys.get(key)
             if tok_idx is not None:
                 self._joined_indices.append((tok_idx, qa_idx))
@@ -104,6 +110,16 @@ class QAChatReproDataset(Dataset):
             qa_dataset.lengths[qa_idx] for _, qa_idx in self._joined_indices
         ], dtype=np.int32)
         self._lengths = answer_lens + self._max_overhead
+
+    @staticmethod
+    def _normalize_key(key: tuple[str, str, str]) -> tuple[str, str, str]:
+        """Reduce repo_path to ``owner/repo`` so absolute and relative
+        forms match across the QA + file_token datasets."""
+        repo_path, file_path, commit_sha = key
+        # Strip trailing slash, take last two components.
+        parts = repo_path.rstrip("/").split("/")
+        norm_repo = "/".join(parts[-2:]) if len(parts) >= 2 else repo_path
+        return (norm_repo, file_path, commit_sha)
 
     @staticmethod
     def _build_variant_stub() -> dict[str, str]:
