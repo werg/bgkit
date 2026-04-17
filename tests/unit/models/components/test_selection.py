@@ -158,6 +158,57 @@ def test_threshold_theta_preserves_fp32_storage_under_bf16_cast():
     assert abs(float(ctrl.theta.item()) - expected) < 1e-6
 
 
+def test_organic_rate_std_reflects_cross_sample_variance():
+    """L1 collapse-detection signal: std of per-sample organic keep rates.
+
+    When every sample keeps the same fraction (constant rate regardless
+    of content), std should be ~0 — that's the collapse mode we want to
+    catch. When samples differ, std should be meaningfully > 0.
+    """
+    # Constant rate across samples: all samples keep the first 2 of 4
+    # positions by design.
+    logits_const = torch.tensor([
+        [1.0, 1.0, -1.0, -1.0],
+        [1.0, 1.0, -1.0, -1.0],
+        [1.0, 1.0, -1.0, -1.0],
+    ])
+    valid = torch.ones_like(logits_const, dtype=torch.bool)
+    out_const = adaptive_threshold_select(logits_const, valid, _theta(0.0))
+    assert out_const.organic_rate_std is not None
+    assert float(out_const.organic_rate_std.item()) == pytest.approx(0.0, abs=1e-5)
+
+    # Varied rate across samples: sample 0 keeps 1/4, sample 1 keeps 2/4,
+    # sample 2 keeps 3/4.
+    logits_varied = torch.tensor([
+        [1.0, -1.0, -1.0, -1.0],
+        [1.0, 1.0, -1.0, -1.0],
+        [1.0, 1.0, 1.0, -1.0],
+    ])
+    out_varied = adaptive_threshold_select(logits_varied, valid, _theta(0.0))
+    assert out_varied.organic_rate_std is not None
+    std = float(out_varied.organic_rate_std.item())
+    # Rates are [0.25, 0.50, 0.75]; population std = sqrt(2/3 * 0.0625) ≈ 0.204.
+    assert std == pytest.approx(0.2041, abs=1e-3)
+
+
+def test_organic_rate_std_handles_zero_controllable_samples():
+    """Samples with no controllable positions (all pinned / all padded)
+    must not poison the std calculation with a spurious 0.0 rate."""
+    logits = torch.tensor([
+        [1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0],
+    ])
+    valid = torch.tensor([
+        [True, True, True, True],
+        [False, False, False, False],  # fully padded
+    ])
+    out = adaptive_threshold_select(logits, valid, _theta(0.0))
+    # Only sample 0 has a valid rate (1.0); sample 1 is excluded from std.
+    # With one valid sample, std = 0.
+    assert out.organic_rate_std is not None
+    assert float(out.organic_rate_std.item()) == pytest.approx(0.0, abs=1e-5)
+
+
 def test_threshold_momentum_damps_initial_response():
     # Momentum here is exponential averaging of the gap (damping), so early
     # response is SMALLER than no-momentum — useful when the rate signal is

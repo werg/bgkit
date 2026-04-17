@@ -2748,6 +2748,35 @@ class KRKBTrainer(BaseTrainer):
             "soft_attn_loss": soft_attn_metric,
         }
         metrics_out.update(aux_metrics)
+
+        # Head-health diagnostics (organic-rate std, undecided fraction,
+        # floor/pinned/θ) per level. Sampled from the last accumulated
+        # enc_out for each level — adequate for detecting collapse modes
+        # without paying for a reduce across all accumulated outputs.
+        from bgkit.training.survivorship_helpers import survivorship_diagnostics
+        diag_every_n = int(
+            self.step_cfg.get("diagnostic_metrics_every_n_steps", 10) or 1,
+        )
+        if self._pending_l0_outputs:
+            last_l0 = self._pending_l0_outputs[-1].get("enc_out")
+            if last_l0 is not None:
+                metrics_out.update(
+                    survivorship_diagnostics(
+                        last_l0, level="l0",
+                        global_step=self.global_step,
+                        every_n_steps=diag_every_n,
+                    )
+                )
+        if self._pending_l1_outputs:
+            last_l1 = self._pending_l1_outputs[-1].get("enc_out")
+            if last_l1 is not None:
+                metrics_out.update(
+                    survivorship_diagnostics(
+                        last_l1, level="l1",
+                        global_step=self.global_step,
+                        every_n_steps=diag_every_n,
+                    )
+                )
         return metrics_out
 
     # ------------------------------------------------------------------

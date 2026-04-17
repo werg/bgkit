@@ -366,6 +366,11 @@ class CompressionTrainer(BaseTrainer):
         # --- Profiling ---
         self._profile_enabled = os.environ.get("BGKIT_PROFILE", "") == "1"
 
+        # --- Diagnostic metrics cadence ---
+        self._diagnostic_metrics_every_n_steps = int(
+            tcfg.get("diagnostic_metrics_every_n_steps", 10),
+        )
+
         # Head-tanh temperature calibration for both levels. See
         # CommitEncodingTrainer._calibrate_head_tanh_temperatures for the
         # rationale; the probe is cheap and confirms/corrects the loaded
@@ -598,6 +603,7 @@ class CompressionTrainer(BaseTrainer):
             accumulate,
             compute_survivorship_losses,
             init_state,
+            survivorship_diagnostics,
         )
 
         if level == "l0":
@@ -630,7 +636,15 @@ class CompressionTrainer(BaseTrainer):
             target_ratio=target_ratio,
         )
         accumulate(state, enc_out)
-        return loss, {f"{level}_{k}": v for k, v in metrics.items()}
+        out_metrics = {f"{level}_{k}": v for k, v in metrics.items()}
+        diag_every_n = int(getattr(self, "_diagnostic_metrics_every_n_steps", 1) or 1)
+        out_metrics.update(
+            survivorship_diagnostics(
+                enc_out, level=level, global_step=self.global_step,
+                every_n_steps=diag_every_n,
+            )
+        )
+        return loss, out_metrics
 
     def _soft_attention_forward(
         self,

@@ -245,6 +245,8 @@ class BgKITEncoder(nn.Module):
             controllable_count=comp_out.controllable_count,
             floor_trigger_rate=comp_out.floor_trigger_rate,
             num_pinned=comp_out.num_pinned,
+            organic_rate_std=comp_out.organic_rate_std,
+            undecided_fraction=comp_out.undecided_fraction,
             theta_tensor=comp_out.theta_tensor,
         )
 

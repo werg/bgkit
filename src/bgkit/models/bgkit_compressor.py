@@ -83,6 +83,14 @@ class CompressorOutput:
     # Trainers .item() these only when actually emitting a log line.
     floor_trigger_rate: torch.Tensor | None = None  # frac samples needing floor
     num_pinned: torch.Tensor | None = None  # # pinned positions (logging)
+    # Diagnostics (zero-dim tensors) — L1 health signal per
+    # ``docs/survivorship_design.md``. Near-zero ``organic_rate_std``
+    # means L1 is applying a near-constant compression rate regardless of
+    # content (collapse mode invisible to mean rate / θ). High
+    # ``undecided_fraction`` (survive_probs in [0.2, 0.8]) means the head
+    # is refusing to commit — soft-attn isn't providing enough signal.
+    organic_rate_std: torch.Tensor | None = None
+    undecided_fraction: torch.Tensor | None = None
     # θ tensor (no per-microbatch .item() sync). Trainers read the float
     # value once per optimizer-step for logging, either via .item() at that
     # boundary or directly from compressor.threshold_l{0,1}.theta.
@@ -113,6 +121,8 @@ class CompressionOutput:
     controllable_count: torch.Tensor | None = None
     floor_trigger_rate: torch.Tensor | None = None
     num_pinned: torch.Tensor | None = None
+    organic_rate_std: torch.Tensor | None = None
+    undecided_fraction: torch.Tensor | None = None
     theta_tensor: torch.Tensor | None = None
 
 
@@ -434,6 +444,23 @@ class BgKITCompressor(nn.Module):
             hook_state["controllable_count"] = controllable_count
             hook_state["floor_trigger_rate"] = sel.floor_trigger_rate
             hook_state["num_pinned"] = sel.num_pinned
+            hook_state["organic_rate_std"] = sel.organic_rate_std
+            # Undecided-fraction diagnostic: fraction of controllable
+            # positions whose survive_probs land in the "uncommitted"
+            # middle. Low = head is committing (healthy); high = head is
+            # refusing to decide (soft-attn not providing enough signal,
+            # or pre-curriculum decisiveness needs more weight).
+            # Bounds match phase1 step3's default diagnostic gate.
+            with torch.no_grad():
+                undecided_mask = (
+                    (survive_probs_metrics > 0.2)
+                    & (survive_probs_metrics < 0.8)
+                    & valid
+                )
+                denom = valid.sum().float().clamp(min=1.0)
+                hook_state["undecided_fraction"] = (
+                    undecided_mask.sum().float() / denom
+                )
             # Keep theta as a tensor; trainer .item()s once per optimizer step
             # at log time instead of per microbatch.
             hook_state["theta_tensor"] = theta.detach()
@@ -484,6 +511,8 @@ class BgKITCompressor(nn.Module):
             controllable_count=hook_state.get("controllable_count"),
             floor_trigger_rate=hook_state.get("floor_trigger_rate"),
             num_pinned=hook_state.get("num_pinned"),
+            organic_rate_std=hook_state.get("organic_rate_std"),
+            undecided_fraction=hook_state.get("undecided_fraction"),
             theta_tensor=hook_state.get("theta_tensor"),
         )
 

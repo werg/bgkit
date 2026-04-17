@@ -12,6 +12,7 @@ from bgkit.training.survivorship_helpers import (  # noqa: E402
     LevelICECfg,
     LevelLossCfg,
     MicrobatchAggState,
+    _effective_decisiveness_weight,
     accumulate,
     apply_post_step_updates,
     compute_survivorship_losses,
@@ -20,6 +21,7 @@ from bgkit.training.survivorship_helpers import (  # noqa: E402
     maybe_unload_ice,
     resolve_level_ice_cfg,
     resolve_level_loss_cfg,
+    survivorship_diagnostics,
 )
 
 
@@ -348,3 +350,133 @@ def test_resolve_level_ice_cfg_complete():
     })
     assert cfg.enabled is True
     assert cfg.bce_warmup_steps == 1000
+
+
+# ----------------------------------------------------------------------
+# Decisiveness warmup
+# ----------------------------------------------------------------------
+
+
+def test_effective_decisiveness_weight_warmup_disabled():
+    """Zero warmup config → returns steady-state weight regardless of step."""
+    w = LevelLossCfg(decisiveness_loss_weight=0.05)
+    assert _effective_decisiveness_weight(w, global_step=0) == pytest.approx(0.05)
+    assert _effective_decisiveness_weight(w, global_step=10000) == pytest.approx(0.05)
+
+
+def test_effective_decisiveness_weight_warmup_active():
+    """Linear anneal from warmup_weight at step 0 to steady_weight at
+    warmup_steps."""
+    w = LevelLossCfg(
+        decisiveness_loss_weight=0.05,
+        decisiveness_warmup_weight=0.20,
+        decisiveness_warmup_steps=2000,
+    )
+    # Step 0: full warmup weight.
+    assert _effective_decisiveness_weight(w, global_step=0) == pytest.approx(0.20)
+    # Step 1000 (halfway): halfway between warmup and steady.
+    midpoint = 0.20 * 0.5 + 0.05 * 0.5
+    assert _effective_decisiveness_weight(w, global_step=1000) == pytest.approx(midpoint)
+    # Step 2000 (end of warmup): steady weight.
+    assert _effective_decisiveness_weight(w, global_step=2000) == pytest.approx(0.05)
+    # Past end: still steady weight (no overshoot).
+    assert _effective_decisiveness_weight(w, global_step=5000) == pytest.approx(0.05)
+
+
+def test_effective_decisiveness_weight_skips_when_warmup_weight_zero():
+    """Warmup weight must be > 0 to activate; a zero warmup weight yields
+    steady-state even with a non-zero warmup_steps (config hygiene)."""
+    w = LevelLossCfg(
+        decisiveness_loss_weight=0.05,
+        decisiveness_warmup_weight=0.0,  # disabled
+        decisiveness_warmup_steps=2000,
+    )
+    assert _effective_decisiveness_weight(w, global_step=0) == pytest.approx(0.05)
+
+
+def test_compute_losses_decisiveness_warmup_at_step_zero():
+    """End-to-end: decisiveness loss weight in the returned metrics uses
+    the warmup weight at step 0."""
+    enc, _ = _make_minimal_enc_out()
+    weights = LevelLossCfg(
+        decisiveness_loss_weight=0.05,
+        decisiveness_warmup_weight=0.20,
+        decisiveness_warmup_steps=2000,
+    )
+    _, metrics = compute_survivorship_losses(
+        enc, "l0", weights, LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=0,
+        content_token_ids=None, content_attn_mask=None, target_ratio=0.1,
+    )
+    assert "decisiveness_weight" in metrics
+    assert metrics["decisiveness_weight"] == pytest.approx(0.20)
+
+
+def test_compute_losses_decisiveness_warmup_past_end():
+    """After ``decisiveness_warmup_steps``, the effective weight equals the
+    steady-state weight."""
+    enc, _ = _make_minimal_enc_out()
+    weights = LevelLossCfg(
+        decisiveness_loss_weight=0.05,
+        decisiveness_warmup_weight=0.20,
+        decisiveness_warmup_steps=2000,
+    )
+    _, metrics = compute_survivorship_losses(
+        enc, "l0", weights, LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=5000,
+        content_token_ids=None, content_attn_mask=None, target_ratio=0.1,
+    )
+    assert metrics["decisiveness_weight"] == pytest.approx(0.05)
+
+
+# ----------------------------------------------------------------------
+# Health-diagnostic helper
+# ----------------------------------------------------------------------
+
+
+class _FakeEncOutDiag:
+    """Minimal enc_out fixture exposing the zero-dim diagnostic tensors."""
+
+    def __init__(
+        self, organic_rate_std=None, undecided_fraction=None,
+        floor_trigger_rate=None, num_pinned=None, theta=None,
+    ):
+        def _t(x):
+            return None if x is None else torch.tensor(float(x))
+        self.organic_rate_std = _t(organic_rate_std)
+        self.undecided_fraction = _t(undecided_fraction)
+        self.floor_trigger_rate = _t(floor_trigger_rate)
+        self.num_pinned = _t(num_pinned)
+        self.theta_tensor = _t(theta)
+
+
+def test_survivorship_diagnostics_emits_level_prefixed_floats():
+    enc = _FakeEncOutDiag(
+        organic_rate_std=0.123, undecided_fraction=0.30,
+        floor_trigger_rate=0.05, num_pinned=4, theta=-0.8,
+    )
+    metrics = survivorship_diagnostics(enc, level="l1", global_step=0, every_n_steps=1)
+    assert metrics["l1_organic_rate_std"] == pytest.approx(0.123)
+    assert metrics["l1_undecided_fraction"] == pytest.approx(0.30)
+    assert metrics["l1_floor_trigger_rate"] == pytest.approx(0.05)
+    assert metrics["l1_num_pinned"] == pytest.approx(4.0)
+    assert metrics["l1_theta"] == pytest.approx(-0.8)
+
+
+def test_survivorship_diagnostics_gate_closes_on_off_steps():
+    """``every_n_steps=50`` emits on step 0, 50, 100; otherwise empty dict."""
+    enc = _FakeEncOutDiag(organic_rate_std=0.1)
+    assert survivorship_diagnostics(enc, "l0", global_step=0, every_n_steps=50)
+    assert not survivorship_diagnostics(enc, "l0", global_step=1, every_n_steps=50)
+    assert not survivorship_diagnostics(enc, "l0", global_step=49, every_n_steps=50)
+    assert survivorship_diagnostics(enc, "l0", global_step=50, every_n_steps=50)
+
+
+def test_survivorship_diagnostics_missing_tensors_are_skipped():
+    """A partially-populated enc_out (e.g. compression disabled) should not
+    raise — missing fields simply don't appear in the output dict."""
+    enc = _FakeEncOutDiag(organic_rate_std=0.1)  # only one field set
+    metrics = survivorship_diagnostics(enc, "l0", global_step=0, every_n_steps=1)
+    assert "l0_organic_rate_std" in metrics
+    assert "l0_undecided_fraction" not in metrics
+    assert "l0_floor_trigger_rate" not in metrics

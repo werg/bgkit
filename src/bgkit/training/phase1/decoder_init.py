@@ -1182,6 +1182,16 @@ class DecoderInitTrainer(BaseTrainer):
                         metrics["head_logit_std"] = float(logits.std().item())
                         metrics["head_logit_min"] = float(logits.min().item())
                         metrics["head_logit_max"] = float(logits.max().item())
+                    # L0 collapse-detection diagnostics. See
+                    # ``survivorship_diagnostics`` docstring.
+                    if enc_out.organic_rate_std is not None:
+                        metrics["l0_organic_rate_std"] = float(
+                            enc_out.organic_rate_std.item(),
+                        )
+                    if enc_out.undecided_fraction is not None:
+                        metrics["l0_undecided_fraction"] = float(
+                            enc_out.undecided_fraction.item(),
+                        )
 
             # Soft attention branch (every Nth step). Cadence defaults to 1
             # (every step). Soft-attn provides one of three head-gradient

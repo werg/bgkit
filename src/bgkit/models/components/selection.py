@@ -36,6 +36,12 @@ class SelectionOut:
             Kept as a zero-dim tensor to avoid sync; trainer .item()s at log time.
         num_pinned: number of pinned positions across the batch (logging),
             as a zero-dim tensor.
+        organic_rate_std: zero-dim tensor, std of per-sample organic keep rates
+            across the batch. A healthy L1 shows non-trivial variance here
+            (different content → different keep counts). Near-zero variance
+            means L1 is applying a near-constant compression rate regardless
+            of content — a collapse mode invisible to mean rate / θ.
+            Kept as a zero-dim tensor; trainer .item()s at log time.
         _organic_numerator / _organic_denominator: zero-dim tensors used by
             ``organic_keep_rate`` for lazy sync-on-access. Training code
             should NOT read ``organic_keep_rate`` in the hot path — use
@@ -46,6 +52,7 @@ class SelectionOut:
     mask: Tensor
     floor_trigger_rate: Tensor
     num_pinned: Tensor
+    organic_rate_std: Tensor | None = None
     _organic_numerator: Tensor | None = None
     _organic_denominator: Tensor | None = None
 
@@ -147,10 +154,32 @@ def adaptive_threshold_select(
     organic_numerator = (organic & controllable).sum()
     organic_denominator = controllable.sum()
 
+    # Per-sample organic keep-rate std. Tracks cross-sample variance in
+    # compression behavior: a healthy L1 head applies different rates to
+    # different content (varied information density → varied keep counts);
+    # a collapsed L1 applies a near-constant rate that satisfies the
+    # aggregate θ constraint but provides no real selection signal. The
+    # aggregate mean rate + θ alone cannot catch this.
+    #
+    # Computed on-device as a zero-dim tensor; trainer .item()s at log
+    # time. Skipped (NaN) when no controllable positions exist.
+    per_sample_org = (organic & controllable).sum(dim=1).float()
+    per_sample_ctrl = controllable.sum(dim=1).float()
+    # Mask out samples with zero controllable positions to avoid a
+    # spurious 0.0 in the std calculation.
+    per_sample_rate = per_sample_org / per_sample_ctrl.clamp(min=1.0)
+    per_sample_valid = per_sample_ctrl > 0
+    n_valid_samples = per_sample_valid.sum().float().clamp(min=1.0)
+    masked_rate = per_sample_rate * per_sample_valid.float()
+    mean_rate = masked_rate.sum() / n_valid_samples
+    sq_dev = ((per_sample_rate - mean_rate) ** 2) * per_sample_valid.float()
+    organic_rate_std = (sq_dev.sum() / n_valid_samples).clamp(min=0).sqrt()
+
     return SelectionOut(
         mask=final_mask,
         floor_trigger_rate=floor_trigger_rate,
         num_pinned=num_pinned,
+        organic_rate_std=organic_rate_std,
         _organic_numerator=organic_numerator,
         _organic_denominator=organic_denominator,
     )

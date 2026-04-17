@@ -334,6 +334,13 @@ class CommitEncodingTrainer(BaseTrainer):
         self._surv_state_l1 = init_state()
         self._last_post_step_metrics: dict[str, float] = {}
 
+        # --- Diagnostic metrics cadence ---
+        # Gates the GPU→CPU syncs for head-health metrics (organic rate
+        # std, undecided fraction, floor trigger rate, θ). Mirrors Step 3.
+        self._diagnostic_metrics_every_n_steps = int(
+            tcfg.get("diagnostic_metrics_every_n_steps", 10),
+        )
+
         # --- Head-tanh temperature calibration (L0 + L1) ---
         # L0 inherits from Step 3's sidecar-calibrated T via the loaded
         # checkpoint; L1 is brand-new at Step 4 and needs its own T set
@@ -1215,6 +1222,7 @@ class CommitEncodingTrainer(BaseTrainer):
             accumulate,
             compute_survivorship_losses,
             init_state,
+            survivorship_diagnostics,
         )
 
         if level == "l0":
@@ -1248,7 +1256,18 @@ class CommitEncodingTrainer(BaseTrainer):
             target_ratio=target_ratio,
         )
         accumulate(state, enc_out)
-        return loss, {f"{level}_{k}": v for k, v in metrics.items()}
+        out_metrics = {f"{level}_{k}": v for k, v in metrics.items()}
+        # Head-health diagnostics (organic-rate std, undecided fraction,
+        # floor/pinned/θ). Each read is a GPU→CPU sync; gate via the
+        # configured diagnostic cadence.
+        diag_every_n = int(getattr(self, "_diagnostic_metrics_every_n_steps", 1) or 1)
+        out_metrics.update(
+            survivorship_diagnostics(
+                enc_out, level=level, global_step=self.global_step,
+                every_n_steps=diag_every_n,
+            )
+        )
+        return loss, out_metrics
 
     def _post_step(self, step: int) -> None:
         """Advance bidirectional warmup and run dual-ascent θ + EMA μ updates."""

@@ -155,9 +155,95 @@ class LevelLossCfg:
 
     ratio_loss_weight: float = 0.0
     decisiveness_loss_weight: float = 0.0
+    # Decisiveness warmup: hold a higher weight at step 0 and linearly
+    # anneal down to ``decisiveness_loss_weight`` over
+    # ``decisiveness_warmup_steps``. Used at L1 cold-start (Step 4+,
+    # Phase 2) to force an early bimodal split before soft-attn takes
+    # over — without it, L1 can bootstrap into a near-uniform collapse
+    # that soft-attn alone is too weak to break. Disabled when
+    # ``decisiveness_warmup_weight <= 0`` or
+    # ``decisiveness_warmup_steps <= 0``.
+    decisiveness_warmup_weight: float = 0.0
+    decisiveness_warmup_steps: int = 0
     moment_match_weight: float = 0.0
     moment_match_start_step: int = 0
     soft_attn_loss_weight: float = 0.0
+
+
+def survivorship_diagnostics(
+    enc_out,
+    level: str,
+    global_step: int,
+    every_n_steps: int = 1,
+) -> dict[str, float]:
+    """Read the diagnostic zero-dim tensors off ``enc_out`` and surface them
+    as floats for logging. Each read forces a GPU→CPU sync, so the caller
+    gates on ``every_n_steps`` (default 1 = every step).
+
+    Emits:
+
+    - ``{level}_organic_rate_std``: std of per-sample organic keep rates.
+      Near-zero means the head is compressing at a near-constant rate
+      regardless of content — a collapse mode invisible to the aggregate
+      mean rate + θ. Expected to be meaningfully > 0 at a healthy L1.
+    - ``{level}_undecided_fraction``: fraction of ``survive_probs`` in
+      [0.2, 0.8] (the "uncommitted middle"). Low = head is committing to
+      binary decisions (healthy); high = head is refusing to decide
+      (soft-attn not yet providing signal, or decisiveness curriculum
+      needs more weight).
+    - ``{level}_floor_trigger_rate``, ``{level}_num_pinned``,
+      ``{level}_theta``: existing per-level operator diagnostics pulled
+      through the same gate so all head-health metrics emit on the same
+      cadence.
+
+    Returns an empty dict when the gate is closed or when compression
+    is disabled on this ``enc_out``.
+    """
+    if every_n_steps <= 1:
+        should_emit = True
+    else:
+        should_emit = (global_step % every_n_steps) == 0
+    if not should_emit:
+        return {}
+
+    metrics: dict[str, float] = {}
+    prefix = level
+    ors = getattr(enc_out, "organic_rate_std", None)
+    if ors is not None:
+        metrics[f"{prefix}_organic_rate_std"] = float(ors.item())
+    uf = getattr(enc_out, "undecided_fraction", None)
+    if uf is not None:
+        metrics[f"{prefix}_undecided_fraction"] = float(uf.item())
+    ftr = getattr(enc_out, "floor_trigger_rate", None)
+    if ftr is not None:
+        metrics[f"{prefix}_floor_trigger_rate"] = float(ftr.item())
+    npin = getattr(enc_out, "num_pinned", None)
+    if npin is not None:
+        metrics[f"{prefix}_num_pinned"] = float(npin.item())
+    theta_t = getattr(enc_out, "theta_tensor", None)
+    if theta_t is not None:
+        metrics[f"{prefix}_theta"] = float(theta_t.item())
+    return metrics
+
+
+def _effective_decisiveness_weight(weights: "LevelLossCfg", global_step: int) -> float:
+    """Linear-anneal decisiveness weight from ``decisiveness_warmup_weight``
+    at step 0 to ``decisiveness_loss_weight`` at ``decisiveness_warmup_steps``.
+
+    Returns ``decisiveness_loss_weight`` when warmup is disabled
+    (``decisiveness_warmup_weight <= 0`` or ``decisiveness_warmup_steps <= 0``)
+    or when ``global_step >= decisiveness_warmup_steps``. The anneal is
+    clamped at the boundaries so callers can read a valid float at any
+    step without branching.
+    """
+    warmup_w = weights.decisiveness_warmup_weight
+    warmup_n = weights.decisiveness_warmup_steps
+    steady_w = weights.decisiveness_loss_weight
+    if warmup_w <= 0.0 or warmup_n <= 0 or global_step >= warmup_n:
+        return steady_w
+    # Linear interpolation: frac 0 → warmup_w, frac 1 → steady_w.
+    frac = float(global_step) / float(warmup_n)
+    return warmup_w * (1.0 - frac) + steady_w * frac
 
 
 @dataclass
@@ -279,12 +365,20 @@ def compute_survivorship_losses(
         metrics["mean_survive_prob"] = float(mean_prob.item())
         total = total + weights.ratio_loss_weight * ratio_loss
 
-    # Decisiveness loss (operator-side): mean(4 · p · (1 − p)) penalizes p≈0.5
-    if weights.decisiveness_loss_weight > 0.0 and probs_op is not None:
+    # Decisiveness loss (operator-side): mean(4 · p · (1 − p)) penalizes p≈0.5.
+    # With warmup configured, hold ``decisiveness_warmup_weight`` at step 0
+    # and linearly anneal down to the steady-state ``decisiveness_loss_weight``
+    # over ``decisiveness_warmup_steps``. Used at L1 cold-start — a strong
+    # early bimodal push breaks symmetry before soft-attn is strong enough
+    # to do so on its own; annealing out avoids fighting soft-attn once it
+    # has taken over.
+    effective_decisiveness_weight = _effective_decisiveness_weight(weights, global_step)
+    if effective_decisiveness_weight > 0.0 and probs_op is not None:
         valid_f = valid.to(probs_op.dtype)
         decisive = ((4.0 * probs_op * (1.0 - probs_op)) * valid_f).sum() / valid_f.sum().clamp(min=1)
         metrics["decisiveness_loss"] = float(decisive.item())
-        total = total + weights.decisiveness_loss_weight * decisive
+        metrics["decisiveness_weight"] = effective_decisiveness_weight
+        total = total + effective_decisiveness_weight * decisive
 
     # Moment match (base-side): standardized 3rd+4th moments of base_raw
     # vs fixed reference. Anchors base distribution shape to ICE.
@@ -527,6 +621,8 @@ def resolve_level_loss_cfg(cfg_block: dict | None) -> LevelLossCfg:
     return LevelLossCfg(
         ratio_loss_weight=float(cfg.get("ratio_loss_weight", 0.0)),
         decisiveness_loss_weight=float(cfg.get("decisiveness_loss_weight", 0.0)),
+        decisiveness_warmup_weight=float(cfg.get("decisiveness_warmup_weight", 0.0)),
+        decisiveness_warmup_steps=int(cfg.get("decisiveness_warmup_steps", 0)),
         moment_match_weight=float(cfg.get("moment_match_weight", 0.0)),
         moment_match_start_step=int(cfg.get("moment_match_start_step", 0)),
         soft_attn_loss_weight=float(cfg.get("soft_attn_loss_weight", 0.0)),
