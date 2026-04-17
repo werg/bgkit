@@ -1,0 +1,13 @@
+# @package _global_
+# Experiment preset: Phase 1 Step 3 QA-conditioned head supervision
+defaults:
+  - /config
+  - /training/phase1_step3
+  - _self_
+
+run_name: phase1_step3
+
+# Load pruned encoder + decoder from step 2 distillation checkpoint.
+# Once Step 3 has stable checkpoints, Step 4 should switch to loading
+# from `phase1_step3` (see DecoderInitTrainer._resolve_bgkit_checkpoint).
+bgkit_checkpoint: auto

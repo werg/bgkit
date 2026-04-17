@@ -975,12 +975,17 @@ class DecoderInitTrainer(BaseTrainer):
         content_token_ids: torch.Tensor | None = None,
         content_attention_mask: torch.Tensor | None = None,
         level: str = "l0",
+        answer_position_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Delegate to ``compute_survivorship_losses`` from the shared helpers.
 
         Step 3 only consumes l0; level kwarg is forward-compatible for Step 4+.
         BCE/moment-match consume base_raw directly (NOT logits_for_op) — base
         is independently anchored to ICE; adapter is free to deviate.
+
+        ``answer_position_mask`` is forwarded only for QA batches (Phase 1
+        Step 3); reconstruction batches pass ``None`` and the QA-position
+        loss is inactive even if its weight is configured.
         """
         from bgkit.training.survivorship_helpers import (
             LevelICECfg,
@@ -1010,6 +1015,7 @@ class DecoderInitTrainer(BaseTrainer):
             content_token_ids=content_token_ids,
             content_attn_mask=content_attention_mask,
             target_ratio=target_ratio,
+            answer_position_mask=answer_position_mask,
         )
 
     # ------------------------------------------------------------------
@@ -1136,12 +1142,16 @@ class DecoderInitTrainer(BaseTrainer):
             from bgkit.training.survivorship_helpers import accumulate
 
             target_ratio = self._current_target_ratio()
+            answer_position_mask = batch.get("answer_position_mask")
+            if answer_position_mask is not None:
+                answer_position_mask = answer_position_mask.to(self.device)
             surv_loss, surv_metrics = self._compute_survivorship_losses(
                 enc_out,
                 target_ratio,
                 content_token_ids=batch["content_token_ids"].to(self.device),
                 content_attention_mask=batch["content_attention_mask"].to(self.device),
                 level="l0",
+                answer_position_mask=answer_position_mask,
             )
             total_loss = total_loss + surv_loss
             metrics.update(surv_metrics)

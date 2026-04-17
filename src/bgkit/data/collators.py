@@ -114,7 +114,7 @@ def collate_chat_repro(batch: list[dict]) -> dict:
     prefix_ids, prefix_attention_mask = pad_and_collate(
         [s["prefix_ids"] for s in batch], pad_value=0,
     )
-    return {
+    out = {
         "token_ids": token_ids,
         "attention_mask": attention_mask,
         "loss_mask": loss_mask,
@@ -132,6 +132,30 @@ def collate_chat_repro(batch: list[dict]) -> dict:
         ),
         "languages": [s["language"] for s in batch],
     }
+
+    # Optional QA answer-position mask. Present only on QA-mode batches
+    # produced by QAChatReproDataset; reconstruction batches omit it. The
+    # _InterleavingDataLoader keeps QA and reconstruction batches separate
+    # (interleaving happens at batch granularity), so we expect all-or-none
+    # within a single batch — fail loudly if that assumption breaks.
+    has_pos = ["answer_position_mask" in s for s in batch]
+    if any(has_pos):
+        if not all(has_pos):
+            raise ValueError(
+                "collate_chat_repro: batch mixes samples with and without "
+                "answer_position_mask. Interleaving must operate at batch "
+                "granularity, not within a batch.",
+            )
+        max_content_len = content_token_ids.size(1)
+        position_mask = torch.zeros(
+            len(batch), max_content_len, dtype=torch.bool,
+        )
+        for i, s in enumerate(batch):
+            m = s["answer_position_mask"]
+            n = min(m.size(0), max_content_len)
+            position_mask[i, :n] = m[:n]
+        out["answer_position_mask"] = position_mask
+    return out
 
 
 def collate_compression(

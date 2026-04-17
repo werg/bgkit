@@ -452,3 +452,66 @@ class TestFullVariantBank:
                     assert token not in text, (
                         f"Variant {i}: structural token '{token}' in field '{field}'"
                     )
+
+
+class TestCollateChatReproQAPositionMask:
+    """Verify the answer_position_mask plumbing through collate_chat_repro."""
+
+    def _make_sample(
+        self, content_len: int = 8, with_position_mask: bool = False,
+    ) -> dict:
+        s = {
+            "token_ids": torch.zeros(20, dtype=torch.long),
+            "loss_mask": torch.zeros(20, dtype=torch.long),
+            "content_token_ids": torch.zeros(content_len, dtype=torch.long),
+            "compression_prompt_ids": torch.zeros(4, dtype=torch.long),
+            "prefix_ids": torch.zeros(8, dtype=torch.long),
+            "language": "Python",
+            "bgkit_splice_start": 5,
+            "bgkit_splice_len": 2,
+        }
+        if with_position_mask:
+            mask = torch.zeros(content_len, dtype=torch.bool)
+            mask[1] = True
+            mask[3] = True
+            s["answer_position_mask"] = mask
+        return s
+
+    def test_omitted_when_no_sample_has_mask(self):
+        batch = [self._make_sample(), self._make_sample()]
+        out = collate_chat_repro(batch)
+        assert "answer_position_mask" not in out
+
+    def test_emitted_when_all_samples_have_mask(self):
+        batch = [
+            self._make_sample(content_len=8, with_position_mask=True),
+            self._make_sample(content_len=8, with_position_mask=True),
+        ]
+        out = collate_chat_repro(batch)
+        assert "answer_position_mask" in out
+        m = out["answer_position_mask"]
+        assert m.shape == (2, 8)
+        assert m.dtype == torch.bool
+        assert m[0, 1].item() and m[0, 3].item()
+        assert not m[0, 0].item() and not m[0, 2].item()
+
+    def test_padded_to_max_content_len(self):
+        # Different content lengths — collator pads content_token_ids to max,
+        # answer_position_mask must follow.
+        batch = [
+            self._make_sample(content_len=4, with_position_mask=True),
+            self._make_sample(content_len=10, with_position_mask=True),
+        ]
+        out = collate_chat_repro(batch)
+        assert out["content_token_ids"].size(1) == 10
+        assert out["answer_position_mask"].size(1) == 10
+        # Sample 0's mask was length 4; positions ≥ 4 must be False.
+        assert not out["answer_position_mask"][0, 4:].any()
+
+    def test_raises_on_partial_mask(self):
+        batch = [
+            self._make_sample(with_position_mask=True),
+            self._make_sample(with_position_mask=False),
+        ]
+        with pytest.raises(ValueError, match="answer_position_mask"):
+            collate_chat_repro(batch)

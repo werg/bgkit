@@ -68,6 +68,15 @@ def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: 
     answer_lengths: list[int] = []
     question_chunks: list[np.ndarray] = []
     question_lengths: list[int] = []
+    # Optional: per-row sorted answer-position indices into the source file's
+    # token stream, produced by scripts/filter_qa_with_positions.py. Stored
+    # CSR-style alongside answer/question tokens. When present in input
+    # records, all rows must have it (we hard-fail mid-stream otherwise so
+    # training doesn't silently get partial supervision).
+    position_index_chunks: list[np.ndarray] = []
+    position_index_lengths: list[int] = []
+    saw_positions = False
+    saw_no_positions = False
     meta: dict[str, list] = {col: [] for col in META_COLUMNS}
     skipped = 0
 
@@ -102,6 +111,27 @@ def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: 
                 answer_lengths.append(len(answer_arr))
                 question_chunks.append(question_arr)
                 question_lengths.append(len(question_arr))
+
+                # Optional answer-position annotations.
+                pos_indices = record.get("answer_position_indices")
+                if pos_indices is not None:
+                    if saw_no_positions:
+                        sys.exit(
+                            "ERROR: input dir mixes records with and without "
+                            "'answer_position_indices'. Re-run the filter to "
+                            "produce a uniform set, or convert separately.",
+                        )
+                    saw_positions = True
+                    pos_arr = np.array(pos_indices, dtype=np.int32)
+                    position_index_chunks.append(pos_arr)
+                    position_index_lengths.append(len(pos_arr))
+                else:
+                    if saw_positions:
+                        sys.exit(
+                            "ERROR: input dir mixes records with and without "
+                            "'answer_position_indices'.",
+                        )
+                    saw_no_positions = True
 
                 # Metadata
                 meta["repo_path"].append(record.get("repo_path", repo_path))
@@ -158,26 +188,44 @@ def convert(input_dir: Path, output_dir: Path, tokenizer_name: str, max_tokens: 
 
     meta_table = pa.table(meta_columns)
 
+    extra_arrays = {
+        "question_tokens.npy": question_tokens,
+        "question_offsets.npy": question_offsets,
+    }
+    manifest_extras = {
+        "dataset_type": "qa_conditioned",
+        "skipped_over_max_tokens": skipped,
+        "max_tokens": max_tokens,
+        "tokenizer": tokenizer_name,
+        "source_jsonl_count": len(jsonl_files),
+        "total_question_tokens": total_question_tokens,
+        "has_answer_positions": saw_positions,
+    }
+
+    if saw_positions:
+        position_indices = np.concatenate(position_index_chunks)
+        position_offsets = build_csr_offsets(
+            np.array(position_index_lengths, dtype=np.int64),
+        )
+        extra_arrays["answer_position_indices.npy"] = position_indices
+        extra_arrays["answer_position_offsets.npy"] = position_offsets
+        total_pos = int(position_offsets[-1])
+        manifest_extras["total_answer_position_indices"] = total_pos
+        print(f"  {total_pos} answer-position indices "
+              f"({position_indices.nbytes / 1e6:.1f} MB)")
+
     manifest = write_mmap_artifacts(
         output_dir, answer_tokens, answer_offsets,
-        manifest_extra={
-            "dataset_type": "qa_conditioned",
-            "skipped_over_max_tokens": skipped,
-            "max_tokens": max_tokens,
-            "tokenizer": tokenizer_name,
-            "source_jsonl_count": len(jsonl_files),
-            "total_question_tokens": total_question_tokens,
-        },
+        manifest_extra=manifest_extras,
         metadata_table=meta_table,
-        extra_arrays={
-            "question_tokens.npy": question_tokens,
-            "question_offsets.npy": question_offsets,
-        },
+        extra_arrays=extra_arrays,
     )
 
     print(f"\n  Wrote {output_dir}/tokens.npy ({answer_tokens.nbytes / 1e9:.2f} GB)")
     print(f"  Wrote {output_dir}/question_tokens.npy ({question_tokens.nbytes / 1e6:.1f} MB)")
     print(f"  Wrote {output_dir}/offsets.npy, question_offsets.npy")
+    if saw_positions:
+        print(f"  Wrote {output_dir}/answer_position_indices.npy, answer_position_offsets.npy")
     print(f"  Wrote {output_dir}/metadata.parquet, manifest.json")
 
     return manifest

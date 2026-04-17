@@ -162,6 +162,22 @@ class QAChatReproDataset(Dataset):
         # tokenize_with_sentinel sets content_token_ids = answer tokens (used for
         # building the decoder sequence), but _compute_survivors feeds
         # content_token_ids into the encoder, which must compress the source file.
-        result["content_token_ids"] = source["token_ids"]
+        source_tokens = source["token_ids"]
+        result["content_token_ids"] = source_tokens
         result["language"] = language
+
+        # Build per-content-token answer-position mask for the survivorship
+        # head's QA position loss. Indices in qa["answer_position_indices"]
+        # are token positions inside the *original* source file at filter
+        # time; clip against the in-batch source length in case the dataset
+        # truncated the file shorter than the filter saw.
+        pos_indices = qa.get("answer_position_indices")
+        if pos_indices is not None:
+            n_src = int(source_tokens.size(0))
+            mask = torch.zeros(n_src, dtype=torch.bool)
+            if pos_indices.numel() > 0:
+                in_range = pos_indices[(pos_indices >= 0) & (pos_indices < n_src)]
+                if in_range.numel() > 0:
+                    mask[in_range] = True
+            result["answer_position_mask"] = mask
         return result

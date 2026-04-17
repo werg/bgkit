@@ -63,6 +63,25 @@ class MmapQAConditionedDataset(BaseMmapDataset):
             self._data_path / "question_offsets.npy"
         )
 
+        # Optional: per-row answer-position indices into the source file's
+        # token stream. Produced by scripts/filter_qa_with_positions.py and
+        # written by convert_qa_pairs_to_npy.py. Used to supervise the
+        # survivorship head directly in Phase 1 Step 3 (QA-conditioned).
+        # When absent, __getitem__ omits the field and downstream code
+        # falls back to QA-without-position-supervision behavior.
+        pos_idx_path = self._data_path / "answer_position_indices.npy"
+        pos_off_path = self._data_path / "answer_position_offsets.npy"
+        if pos_idx_path.exists() and pos_off_path.exists():
+            self._answer_position_indices = np.load(
+                pos_idx_path, mmap_mode="r",
+            )
+            self._answer_position_offsets = np.load(pos_off_path)
+            self._has_answer_positions = True
+        else:
+            self._answer_position_indices = None
+            self._answer_position_offsets = None
+            self._has_answer_positions = False
+
         # Load metadata for join keys
         meta = pq.read_table(
             self._data_path / "metadata.parquet",
@@ -71,6 +90,10 @@ class MmapQAConditionedDataset(BaseMmapDataset):
         self._repo_paths = meta.column("repo_path").to_pylist()
         self._file_paths = meta.column("file_path").to_pylist()
         self._commit_shas = meta.column("commit_sha").to_pylist()
+
+    @property
+    def has_answer_positions(self) -> bool:
+        return self._has_answer_positions
 
     def file_key(self, idx: int) -> tuple[str, str, str] | None:
         """Return (repo_path, file_path, commit_sha) for a valid index."""
@@ -93,9 +116,17 @@ class MmapQAConditionedDataset(BaseMmapDataset):
         result["question_token_ids"] = torch.from_numpy(q_tokens)
         result["answer_token_ids"] = result.pop("token_ids")
 
+        if self._has_answer_positions:
+            p_start = int(self._answer_position_offsets[orig_idx])
+            p_end = int(self._answer_position_offsets[orig_idx + 1])
+            pos = self._answer_position_indices[p_start:p_end].astype(np.int64)
+            result["answer_position_indices"] = torch.from_numpy(pos)
+
         return result
 
     def _get_mmap_fields(self) -> list[str]:
+        if self._has_answer_positions:
+            return ["_tokens", "_question_tokens", "_answer_position_indices"]
         return ["_tokens", "_question_tokens"]
 
     def _reopen_mmaps(self) -> None:
@@ -103,6 +134,10 @@ class MmapQAConditionedDataset(BaseMmapDataset):
         self._question_tokens = np.load(
             self._data_path / "question_tokens.npy", mmap_mode="r"
         )
+        if self._has_answer_positions:
+            self._answer_position_indices = np.load(
+                self._data_path / "answer_position_indices.npy", mmap_mode="r",
+            )
 
 
 _FILE_READ_QUERY_CONFIG = TOOL_CONFIGS["file_read_query"]

@@ -1,0 +1,158 @@
+# Phase 1 Step 3: QA-conditioned head supervision
+#
+# Trains the survivorship head to surface answer-relevant tokens, with
+# direct gold-position supervision derived from synthetic QA pairs.
+# Breaks the autoregressive shortcut quantified by the 2026-04-17
+# with-vs-without-survivors ablation (Δ ≈ 0.002 on the old Step 3 LoRA
+# reconstruction phase).
+#
+# Inputs:
+#   - phase1_step2 checkpoint (pruned encoder)
+#   - Pre-distilled head_base_l0 sidecar (same one used by Step 4+)
+#   - Filtered QA mmap with answer-position annotations
+#     (run scripts/filter_qa_with_positions.py then convert_qa_pairs_to_npy.py)
+#
+# Training mix (via _InterleavingDataLoader at qa_ratio): mostly QA so
+# the head + decoder learn the new behavior, with a meaningful slice of
+# reconstruction batches to keep general compression alive.
+#
+# Loss composition on QA batches:
+#   - Decoder CE on the answer tokens (standard teacher forcing)
+#   - QA-position BCE on base_raw (target=1 at answer-grounded source
+#     positions, target=qa_non_answer_target=0.10 elsewhere)
+#   - Moment-match anchor on base_raw (subordinate to QA loss)
+#   - Min-survivors floor loss
+# On reconstruction batches, the QA-position term is inactive (no mask)
+# and behavior matches the standard reconstruction mix.
+phase: phase1_step3
+optimizer: muon
+max_steps: 8000
+lr: 1.5e-4               # base LR (encoder)
+decoder_lr: 1.0e-5        # decoder LoRA LR (low — LoRA concentrates gradients)
+encoder_lr: 1.5e-4        # encoder LR
+warmup_steps: 500
+max_batch_tokens: 32768
+gradient_accumulation_steps: 2
+max_eval_samples: 500
+eval_every: 500
+save_every: 500
+diagnostic_metrics_every_n_steps: 50
+
+# Sidecar (same as Step 4+).
+survivorship_head_sidecar: /workspace/checkpoints/survivorship_head_base_l0_20260416_132842/head_base_l0.pt
+
+# Everything unfrozen from step 0.
+train_projection_block: true
+projection_only_steps: 0
+projection_lr: null
+encoder_unfreeze_step: 0
+bidi_warmup_steps: 0       # already bidirectional from step 2
+
+# Compression active from step 0. Step 3 holds a constant target ratio
+# rather than ramping — the QA signal works best when compression is
+# already at the intended operating point so the head's selection
+# decisions translate directly to what the decoder will see at later
+# steps.
+compression_introduction_step: 0
+target_ratio_start: 0.10
+target_ratio_end: 0.10
+target_ratio_ramp_steps: 1
+
+use_liger: true
+use_liger_rmsnorm: false
+
+# Survivorship head losses, per level. Step 3 only consumes l0; l1 is
+# included with weights matching Step 4 for forward compatibility.
+survivorship:
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    # Lower than Step 4 — the QA-position loss is the primary head
+    # supervision signal here; we want utility-grad to be a complement,
+    # not a competitor.
+    utility_grad_loss_weight: 0.1
+    moment_match_weight: 0.05
+    moment_match_start_step: 500
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+    # NEW: direct supervision on the head from QA position annotations.
+    # 0.5 puts this loss on par with decoder CE at typical magnitudes.
+    qa_position_loss_weight: 0.5
+    qa_non_answer_target: 0.10  # = target_ratio (no extra suppression)
+
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+    # L1 doesn't see QA position masks (Phase 1 Step 3 trains L0 only).
+    qa_position_loss_weight: 0.0
+    qa_non_answer_target: 0.10
+
+# ICE distillation: disabled — sidecar is pre-distilled.
+ice_distillation:
+  checkpoint_path: /workspace/checkpoints/ice_step89999_20260306_213825
+  input_dim: 1024
+  hidden_dim: 192
+  num_layers: 3
+  kernel_size: 5
+  l0:
+    enabled: false
+    bce_warmup_weight: 0.0
+    bce_warmup_steps: 0
+    teacher_ratio: 0.10
+  l1:
+    enabled: false
+
+moment_match_reference:
+  l0:
+    path: ${oc.env:DATA_DIR}/diagnostics/ice_reference_moments.json
+  l1:
+    path: null
+
+# LoRA config for decoder — same as Step 4 (small adapter, fast adaptation).
+decoder_lora:
+  enabled: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+freeze_top_layer: false
+lr_scale_bottom: 1.0
+
+reset_wandb: true
+
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+early_stopping:
+  enabled: false
+
+# QA training — heavy mix. The interleaver pulls a QA batch with
+# probability qa_ratio at each training step; reconstruction batches
+# fill the rest. Pure QA (1.0) risks specializing the head into
+# extractive-only mode; we keep 30% reconstruction to retain general
+# compression behavior on the same head.
+qa_ratio: 0.7
+
+# QA mmap with answer-position annotations. Produced by:
+#   scripts/filter_qa_with_positions.py --input-dir $DATA_DIR/qa_pairs/ \\
+#       --repos-dir $DATA_DIR/repos/ \\
+#       --output-dir $DATA_DIR/qa_pairs_filtered/
+#   scripts/convert_qa_pairs_to_npy.py --input-dir $DATA_DIR/qa_pairs_filtered/ \\
+#       --output-dir $DATA_DIR/mmap/qa_conditioned_filtered/
+data:
+  qa_data_dir: ${oc.env:DATA_DIR}/mmap/qa_conditioned_filtered
+
+eval:
+  generation_samples: 50
+  generation_eval_every: 4

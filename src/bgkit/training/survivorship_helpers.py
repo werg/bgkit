@@ -189,6 +189,20 @@ class LevelLossCfg:
     min_survivors_floor_ratio: float = 0.02
     min_survivors_absolute_min: int = 1
     min_survivors_tau: float = 0.3
+    # QA-conditioned answer-position supervision. When the batch carries
+    # an ``answer_position_mask`` and ``qa_position_loss_weight > 0``, the
+    # head's ``base_raw`` is supervised with BCE-with-logits against:
+    #   target = 1.0                  at answer-grounded positions
+    #   target = qa_non_answer_target at non-answer valid positions
+    #     (default 0.10 = target_ratio so the head's general-compression
+    #      behavior on shared reconstruction batches isn't disrupted).
+    # Used by Phase 1 Step 3 (QA-conditioned head supervision) to break
+    # the autoregressive shortcut: the answer-grounded positions are the
+    # tokens the decoder genuinely needs to attend to, and direct head
+    # supervision avoids relying on indirect signal that has to propagate
+    # back through the decoder.
+    qa_position_loss_weight: float = 0.0
+    qa_non_answer_target: float = 0.10
 
 
 def survivorship_diagnostics(
@@ -305,6 +319,7 @@ def compute_survivorship_losses(
     content_token_ids: Tensor | None,
     content_attn_mask: Tensor | None,
     target_ratio: float,
+    answer_position_mask: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, float]]:
     """Compose ratio + decisiveness + moment_match + bce_warmup losses.
 
@@ -477,6 +492,45 @@ def compute_survivorship_losses(
         mm = moment_match_loss(base_raw, valid, ref_skew=ref_skew, ref_kurt=ref_kurt)
         metrics["moment_match_loss"] = float(mm.item())
         total = total + weights.moment_match_weight * mm
+
+    # QA position supervision (base-side, Phase 1 Step 3 primary signal).
+    # BCE-with-logits on base_raw with target = 1 at answer-grounded
+    # positions and target = qa_non_answer_target at all other valid
+    # positions. Direct gradient on the head — does not depend on the
+    # decoder picking up the signal indirectly.
+    qa_active = (
+        weights.qa_position_loss_weight > 0.0
+        and answer_position_mask is not None
+        and base_raw is not None
+        and valid_count > 0
+    )
+    if qa_active:
+        # Align mask to base_raw shape; tolerate length mismatch from
+        # post-collation truncation by clipping to the shorter dimension.
+        am = answer_position_mask.to(device=base_raw.device, dtype=torch.bool)
+        if am.shape != base_raw.shape:
+            min_b = min(am.size(0), base_raw.size(0))
+            min_l = min(am.size(1), base_raw.size(1))
+            am = am[:min_b, :min_l]
+            base_for_qa = base_raw[:min_b, :min_l]
+            valid_for_qa = valid[:min_b, :min_l]
+        else:
+            base_for_qa = base_raw
+            valid_for_qa = valid
+        target = torch.where(
+            am,
+            torch.ones_like(base_for_qa),
+            torch.full_like(base_for_qa, weights.qa_non_answer_target),
+        )
+        bce_per_pos = torch.nn.functional.binary_cross_entropy_with_logits(
+            base_for_qa.float(), target.float(), reduction="none",
+        )
+        valid_f = valid_for_qa.to(bce_per_pos.dtype)
+        denom = valid_f.sum().clamp(min=1)
+        qa_loss = (bce_per_pos * valid_f).sum() / denom
+        metrics["qa_position_loss"] = float(qa_loss.item())
+        metrics["qa_position_grounded_count"] = float((am & valid_for_qa).sum().item())
+        total = total + weights.qa_position_loss_weight * qa_loss.to(total.dtype)
 
     # BCE warmup (base-side): direct ICE-teacher supervision on base_raw.
     # Cuts off hard at bce_warmup_steps. ICE can be unloaded after.
@@ -707,6 +761,8 @@ def resolve_level_loss_cfg(cfg_block: dict | None) -> LevelLossCfg:
         min_survivors_floor_ratio=float(cfg.get("min_survivors_floor_ratio", 0.02)),
         min_survivors_absolute_min=int(cfg.get("min_survivors_absolute_min", 1)),
         min_survivors_tau=float(cfg.get("min_survivors_tau", 0.3)),
+        qa_position_loss_weight=float(cfg.get("qa_position_loss_weight", 0.0)),
+        qa_non_answer_target=float(cfg.get("qa_non_answer_target", 0.10)),
     )
 
 

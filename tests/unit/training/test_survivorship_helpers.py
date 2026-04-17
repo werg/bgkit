@@ -660,6 +660,117 @@ def test_resolve_level_loss_cfg_reads_min_survivors_fields():
     assert cfg.min_survivors_tau == pytest.approx(0.4)
 
 
+def test_qa_position_loss_zero_when_weight_zero():
+    """Default config (weight=0) must not emit the metric or contribute."""
+    enc, _ = _make_minimal_enc_out()
+    weights = LevelLossCfg()  # qa_position_loss_weight=0 by default
+    answer_mask = torch.zeros(enc.base_raw.shape, dtype=torch.bool)
+    answer_mask[0, 0] = True
+    total, metrics = compute_survivorship_losses(
+        enc, "l0", weights, LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=0,
+        content_token_ids=None, content_attn_mask=None, target_ratio=0.1,
+        answer_position_mask=answer_mask,
+    )
+    assert "qa_position_loss" not in metrics
+    assert float(total.item()) == 0.0
+
+
+def test_qa_position_loss_zero_when_mask_none():
+    """No mask in batch → loss skipped even if weight > 0."""
+    enc, _ = _make_minimal_enc_out()
+    weights = LevelLossCfg(qa_position_loss_weight=1.0)
+    total, metrics = compute_survivorship_losses(
+        enc, "l0", weights, LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=0,
+        content_token_ids=None, content_attn_mask=None, target_ratio=0.1,
+        answer_position_mask=None,
+    )
+    assert "qa_position_loss" not in metrics
+
+
+def test_qa_position_loss_emits_when_active():
+    """Loss appears in metrics + contributes to total when mask + weight present."""
+    enc, base_raw = _make_minimal_enc_out(B=2, L=8)
+    weights = LevelLossCfg(qa_position_loss_weight=1.0, qa_non_answer_target=0.1)
+    answer_mask = torch.zeros_like(base_raw, dtype=torch.bool)
+    answer_mask[0, 1:3] = True  # sample 0 has 2 answer-positions
+    answer_mask[1, 5] = True    # sample 1 has 1
+    total, metrics = compute_survivorship_losses(
+        enc, "l0", weights, LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=0,
+        content_token_ids=None, content_attn_mask=None, target_ratio=0.1,
+        answer_position_mask=answer_mask,
+    )
+    assert "qa_position_loss" in metrics
+    assert metrics["qa_position_loss"] > 0.0
+    assert metrics["qa_position_grounded_count"] == 3
+    assert float(total.item()) > 0.0
+
+
+def test_qa_position_loss_flows_gradient_to_base_raw():
+    """The loss must produce gradient on base_raw (head supervision target)."""
+    B, L = 2, 8
+    base_raw = torch.randn(B, L, requires_grad=True)
+    enc = _FakeEncOut(
+        organic=10, controllable=B * L,
+        base_raw=base_raw, logits_for_op=base_raw + 0.0,
+        survive_probs_metrics=torch.sigmoid(base_raw.detach()),
+    )
+    weights = LevelLossCfg(qa_position_loss_weight=1.0)
+    answer_mask = torch.zeros(B, L, dtype=torch.bool)
+    answer_mask[0, 0] = True
+    answer_mask[1, 3] = True
+    total, _ = compute_survivorship_losses(
+        enc, "l0", weights, LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=0,
+        content_token_ids=None, content_attn_mask=None, target_ratio=0.1,
+        answer_position_mask=answer_mask,
+    )
+    total.backward()
+    assert base_raw.grad is not None
+    # Gradient at answer positions should push base_raw UP toward target=1.
+    # Gradient sign for BCE-with-logits: ∂L/∂x = σ(x) - target.
+    # At answer positions (target=1), σ(x) - 1 < 0 → grad pushes x up.
+    grad_at_answer = base_raw.grad[answer_mask]
+    assert (grad_at_answer < 0).all()
+
+
+def test_qa_position_loss_respects_attention_mask():
+    """Padded positions (attn_mask=False) must not contribute to the loss."""
+    B, L = 1, 10
+    valid_len = 5
+    base_raw = torch.zeros(B, L, requires_grad=True)
+    enc = _FakeEncOut(
+        organic=valid_len, controllable=valid_len,
+        base_raw=base_raw, logits_for_op=base_raw + 0.0,
+        survive_probs_metrics=torch.sigmoid(base_raw.detach()),
+    )
+    attn = torch.zeros(B, L, dtype=torch.bool)
+    attn[:, :valid_len] = True
+    answer_mask = torch.zeros(B, L, dtype=torch.bool)
+    answer_mask[0, 7] = True  # answer position OUTSIDE the valid window
+    _, metrics = compute_survivorship_losses(
+        enc, "l0", weights=LevelLossCfg(qa_position_loss_weight=1.0),
+        ice_cfg=LevelICECfg(),
+        ref_moments=None, ice_teacher=None, global_step=0,
+        content_token_ids=None, content_attn_mask=attn, target_ratio=0.1,
+        answer_position_mask=answer_mask,
+    )
+    # Grounded count is restricted to valid positions; the position at idx 7
+    # is masked out by attn, so 0 grounded positions remain.
+    assert metrics["qa_position_grounded_count"] == 0
+
+
+def test_resolve_level_loss_cfg_reads_qa_position_fields():
+    cfg = resolve_level_loss_cfg({
+        "qa_position_loss_weight": 0.5,
+        "qa_non_answer_target": 0.05,
+    })
+    assert cfg.qa_position_loss_weight == pytest.approx(0.5)
+    assert cfg.qa_non_answer_target == pytest.approx(0.05)
+
+
 def test_survivor_count_diagnostics_emitted_from_survivor_mask():
     """zero_survivor_rate, low_survivor_rate_lt5, median_survivors should
     come out of survivorship_diagnostics when survivor_mask is present."""
