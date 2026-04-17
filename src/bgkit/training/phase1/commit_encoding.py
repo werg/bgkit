@@ -913,8 +913,8 @@ class CommitEncodingTrainer(BaseTrainer):
                         total = total + l1_surv_loss * group_scale
 
                     # L1 soft-attn: primary discrimination signal at L1
-                    # (no BCE / moment-match). Gradient flows to adapter
-                    # only via logits_for_softattn.
+                    # (no BCE / moment-match). Gradient flows into the L1
+                    # head via logits_for_op.
                     from bgkit.training.survivorship_helpers import LevelLossCfg
                     surv_l1 = getattr(self, "_surv_l1", LevelLossCfg())
                     soft_every = getattr(self, "_soft_attn_every_n_steps", 1)
@@ -1064,10 +1064,10 @@ class CommitEncodingTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """Second decoder forward on prob-gated layer-7 embeddings.
 
-        Routes the decoder's CE-loss gradient back to the head adapter
-        (NOT base — ``logits_for_softattn`` detaches base) through the
-        FULL remaining encoder via ``forward_from_block(start_block=2)``,
-        then projection_block, then decoder.
+        Routes the decoder's CE-loss gradient back to the level's head
+        via ``logits_for_op = tanh(base_raw / T)`` through the FULL
+        remaining encoder via ``forward_from_block(start_block=2)``, then
+        projection_block, then decoder.
 
         Head hook fires after backbone block 1; blocks 2..end remain.
         Block indices are positions in the backbone, NOT indices into the
@@ -1079,7 +1079,8 @@ class CommitEncodingTrainer(BaseTrainer):
 
         Critical for Step 4's L1 cold-start: L1 has no BCE and no
         moment-match, so soft-attn is the primary discrimination signal
-        flowing into head_adapter_l1.
+        flowing into the L1 head. Tanh saturation at ±1 bounds the
+        aggregate logit mass to guard against soft-attn inflation.
         """
         compressor = self.encoder.compressor
         controller = (

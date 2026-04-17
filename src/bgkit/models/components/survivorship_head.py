@@ -47,9 +47,8 @@ class SurvivorshipHead(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Predict per-position raw survive logits (pre-tanh).
 
-        Callers compose multiple heads (``base_raw + adapter_zm``) in
-        unbounded space, then apply tanh at the composition level so the
-        operator-facing logit is bounded to (-1, 1) — see
+        The operator applies ``tanh(base_raw / T)`` at the composition
+        level so the operator-facing logit is bounded to (-1, 1) — see
         :class:`BgKITCompressor` hook. BCE-with-logits distillation / warmup
         consumes this raw output directly.
 

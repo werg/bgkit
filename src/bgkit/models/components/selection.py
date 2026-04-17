@@ -8,9 +8,9 @@ Rate-distortion framing for the survivorship head:
 - ``adaptive_threshold_select`` returns a bool mask only. There is no
   straight-through estimator; head gradient flows only through BCE + moment-match
   + soft-attn paths, NEVER through the hard mask.
-- ``DualThresholdController`` and ``AdapterMeanEMA`` own fp32 scalar buffers and
-  expose ``.theta`` / ``.value`` properties that always return fp32 views (so
-  ``encoder.to(bf16)`` casts are tolerated cheaply: reads recast every time).
+- ``DualThresholdController`` owns an fp32 scalar θ buffer and exposes a
+  ``.theta`` property that always returns an fp32 view (so ``encoder.to(bf16)``
+  casts are tolerated cheaply: reads recast every time).
 - ``moment_match_loss`` standardizes raw head logits over all valid positions in
   the micro-batch (one global mean + std) and matches their 3rd + 4th moments
   to fixed reference targets pre-computed offline from ICE.

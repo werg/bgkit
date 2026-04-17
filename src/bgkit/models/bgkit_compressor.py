@@ -118,9 +118,9 @@ class BgKITCompressor(nn.Module):
 
     Wraps a pretrained backbone (BidirectionalQwen35 or PrunedBidirectionalQwen35)
     with:
-    - Two-head survivorship per level (base + zero-init adapter)
+    - Single survivorship head per level, composed as
+      ``logits_for_op = tanh(base_raw / T)``
     - Per-level ``DualThresholdController`` (owns θ scalar, dual ascent)
-    - Per-level ``AdapterMeanEMA`` (owns μ buffer for adapter zero-mean projection)
     - Learned binary embeddings for survive/doomed flags
     - Auto-reproduction output head
 
@@ -293,15 +293,15 @@ class BgKITCompressor(nn.Module):
         compression_off = target_ratio is None or target_ratio >= 0.999
 
         def _hook_after_head_layer(hidden: torch.Tensor) -> torch.Tensor:
-            """Run two-head survivorship + adaptive-threshold selection.
+            """Run single-head survivorship + adaptive-threshold selection.
 
-            Composes ``logits_for_op = base_raw + adapter_zm`` and
-            Single-head composition: ``logits_for_op = tanh(base_raw / T)``.
-            Bool mask detached to prevent an uncontrolled head-gradient path
-            through every position's flag contribution. All three loss
-            paths (BCE warmup, moment-match, soft-attn) flow back to the
-            same head; tanh saturation at ±1 is the sole structural guard
-            against soft-attn inflating the aggregate logit mass.
+            Composes ``logits_for_op = tanh(base_raw / T)`` then runs
+            ``adaptive_threshold_select`` against θ. Bool mask detached to
+            prevent an uncontrolled head-gradient path through every
+            position's flag contribution. All three loss paths (BCE warmup,
+            moment-match, soft-attn) flow back to the same head; tanh
+            saturation at ±1 is the sole structural guard against soft-attn
+            inflating the aggregate logit mass.
             """
             if compression_off:
                 return hidden

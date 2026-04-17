@@ -2254,36 +2254,29 @@ class KRKBTrainer(BaseTrainer):
         metrics: dict[str, float] = {}
         total = torch.zeros((), device=self.device, dtype=torch.float32)
 
-        # Ratio / decisiveness / relevance are operator-side shape losses;
-        # they pull the BASE head, not the adapter. To honor the
-        # "soft-attn trains adapter only" invariant, we recompute probs
-        # from `base_raw + adapter_zm.detach()` — attached on base,
-        # detached on adapter. This mirrors the design in
-        # compute_survivorship_losses but uses the attached base path
-        # (rather than base_raw directly) so that θ's role in the prob
-        # computation still matters. The probs go to the BASE subgraph.
+        # Ratio / decisiveness / relevance are operator-side shape losses.
+        # Single-head architecture (post-2026-04-16): probs are recomputed
+        # from the attached ``logits_for_op`` (= tanh(base_raw / T)) + θ so
+        # gradient flows directly into the head. This mirrors
+        # compute_survivorship_losses in survivorship_helpers.py but runs
+        # over accumulated per-turn encoder outputs.
         l0_ratio_losses: list[torch.Tensor] = []
         l0_decisive_losses: list[torch.Tensor] = []
         for entry in self._pending_l0_outputs:
             enc_out = entry["enc_out"]
-            base_raw = enc_out.base_raw
-            adapter_zm = enc_out.adapter_zm
-            if base_raw is None:
+            logits_for_op = enc_out.logits_for_op
+            if logits_for_op is None:
                 continue
-            # base_attached + adapter_detached — gradient to head_base only.
-            logits_base_only = base_raw + (
-                adapter_zm.detach() if adapter_zm is not None else 0.0
-            )
             theta_t = getattr(enc_out, "theta_tensor", None)
             if theta_t is None:
                 legacy = getattr(enc_out, "theta_value", 0.0)
                 theta_t = torch.tensor(
                     float(legacy), dtype=torch.float32,
-                    device=base_raw.device,
+                    device=logits_for_op.device,
                 )
             probs = torch.sigmoid(
-                logits_base_only.float() - theta_t.to(base_raw.device).float()
-            ).to(base_raw.dtype)
+                logits_for_op.float() - theta_t.to(logits_for_op.device).float()
+            ).to(logits_for_op.dtype)
             target_ratio = entry["ratio"]
             mean_prob = probs.float().mean()
             l0_ratio_losses.append((mean_prob - target_ratio) ** 2)
@@ -2301,31 +2294,26 @@ class KRKBTrainer(BaseTrainer):
             metrics["l0_decisiveness_loss"] = l0_decisive_loss.item()
 
         # --- L1 aux losses (ratio + decisiveness + relevance) ---
-        # Same recomposition as L0: base attached, adapter detached — so
-        # these losses train head_base_l1 only, not head_adapter_l1. The
-        # adapter receives its gradient exclusively via soft-attn.
+        # Same single-head pattern as L0: attached ``logits_for_op`` + θ
+        # drives probs; gradient flows into the L1 head directly.
         l1_ratio_losses: list[torch.Tensor] = []
         l1_decisive_losses: list[torch.Tensor] = []
         l1_relevance_losses: list[torch.Tensor] = []
         for entry in self._pending_l1_outputs:
             enc_out = entry["enc_out"]
-            base_raw = enc_out.base_raw
-            adapter_zm = enc_out.adapter_zm
-            if base_raw is None:
+            logits_for_op = enc_out.logits_for_op
+            if logits_for_op is None:
                 continue
-            logits_base_only = base_raw + (
-                adapter_zm.detach() if adapter_zm is not None else 0.0
-            )
             theta_t = getattr(enc_out, "theta_tensor", None)
             if theta_t is None:
                 legacy = getattr(enc_out, "theta_value", 0.0)
                 theta_t = torch.tensor(
                     float(legacy), dtype=torch.float32,
-                    device=base_raw.device,
+                    device=logits_for_op.device,
                 )
             probs = torch.sigmoid(
-                logits_base_only.float() - theta_t.to(base_raw.device).float()
-            ).to(base_raw.dtype)
+                logits_for_op.float() - theta_t.to(logits_for_op.device).float()
+            ).to(logits_for_op.dtype)
             target_ratio = entry["ratio"]
             content_mask = entry["content_mask"]
             pinned = entry["pinned"]
@@ -2430,17 +2418,17 @@ class KRKBTrainer(BaseTrainer):
                 continue
             enc_out = entry["enc_out"]
             if (
-                enc_out.logits_for_softattn is None
+                enc_out.logits_for_op is None
                 or enc_out.layer7_embeddings is None
             ):
                 continue
-            # Prob-gate content positions via the adapter-only gradient
-            # path. Recompute softattn_probs here so gradient flows through
-            # `adapter_zm` only (base is detached in logits_for_softattn).
-            # Pick the level-appropriate controller: entries from L0 use
-            # threshold_l0, L1 entries use threshold_l1. _pending_l1_outputs
-            # is named for the outer pipeline stage but a given entry may
-            # have been produced at either level — check the marker.
+            # Prob-gate content positions. ``logits_for_op = tanh(base_raw / T)``
+            # carries head gradient directly (single-head architecture
+            # post-2026-04-16 simplification). Pick the level-appropriate
+            # controller: entries from L0 use threshold_l0, L1 entries use
+            # threshold_l1. _pending_l1_outputs is named for the outer
+            # pipeline stage but a given entry may have been produced at
+            # either level — check the marker.
             content_mask = entry["content_mask"]
             compressor = self.encoder.compressor
             level = entry.get("level", "l1")
@@ -2449,7 +2437,7 @@ class KRKBTrainer(BaseTrainer):
                 else compressor.threshold_l1
             )
             theta = controller.theta.to(self.device)
-            logits_softattn = enc_out.logits_for_softattn
+            logits_softattn = enc_out.logits_for_op
             l7 = enc_out.layer7_embeddings
             base_dtype = l7.dtype
             softattn_probs = torch.sigmoid(
@@ -2784,7 +2772,6 @@ class KRKBTrainer(BaseTrainer):
             target_ratio=target_l0,
             level="l0",
             skip_threshold_step=not self._live_l0,
-            skip_ema_update=not self._live_l0,
         )
         merged.update(l0_metrics)
         self._surv_state_l0 = init_state()

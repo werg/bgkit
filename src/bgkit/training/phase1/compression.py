@@ -613,9 +613,10 @@ class CompressionTrainer(BaseTrainer):
     ) -> torch.Tensor:
         """Second decoder forward on prob-gated layer-7 embeddings.
 
-        Routes the decoder's CE-loss gradient back to the head adapter
-        (NOT base) through the FULL remaining encoder (blocks 2..end +
-        final norm + projection + decoder) via forward_from_block(2).
+        Routes the decoder's CE-loss gradient back to the level's head
+        via ``logits_for_op`` through the FULL remaining encoder (blocks
+        2..end + final norm + projection + decoder) via
+        forward_from_block(2).
 
         layer7 kept at full magnitude; flags blended by p. Matches hard
         forward (``hidden = layer7 + flag_emb``) at p∈{0,1}. Multiplying

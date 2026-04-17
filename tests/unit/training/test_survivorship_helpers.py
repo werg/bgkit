@@ -31,7 +31,7 @@ from bgkit.training.survivorship_helpers import (  # noqa: E402
 class _FakeEncOut:
     def __init__(
         self,
-        organic=None, controllable=None, adapter_sum=None, valid=None,
+        organic=None, controllable=None,
         base_raw=None, logits_for_op=None, survive_probs_metrics=None,
     ):
         self.organic_count = (
@@ -40,11 +40,10 @@ class _FakeEncOut:
         self.controllable_count = (
             None if controllable is None else torch.tensor(controllable)
         )
-        self.adapter_sum = (
-            None if adapter_sum is None else torch.tensor(adapter_sum)
-        )
+        # valid_count is still required by accumulate()'s guard (None →
+        # skip), so present it as None/tensor alongside controllable_count.
         self.valid_count = (
-            None if valid is None else torch.tensor(valid)
+            None if controllable is None else torch.tensor(controllable)
         )
         self.base_raw = base_raw
         self.logits_for_op = logits_for_op
@@ -55,38 +54,31 @@ def test_init_state_is_zero():
     s = init_state()
     assert s.organic_count_sum == 0
     assert s.controllable_count_sum == 0
-    assert s.adapter_sum == 0.0
-    assert s.valid_count_sum == 0
     assert s.controllable_empty_count == 0
 
 
 def test_accumulate_typical_microbatches():
     s = init_state()
-    accumulate(s, _FakeEncOut(organic=10, controllable=20, adapter_sum=2.5, valid=30))
-    accumulate(s, _FakeEncOut(organic=5, controllable=15, adapter_sum=1.5, valid=20))
+    accumulate(s, _FakeEncOut(organic=10, controllable=20))
+    accumulate(s, _FakeEncOut(organic=5, controllable=15))
     assert s.organic_count_sum == 15
     assert s.controllable_count_sum == 35
-    assert s.adapter_sum == pytest.approx(4.0)
-    assert s.valid_count_sum == 50
 
 
 def test_accumulate_skips_when_no_compression():
     s = init_state()
     accumulate(s, _FakeEncOut())  # no compression
     assert s.organic_count_sum == 0
-    assert s.valid_count_sum == 0
+    assert s.controllable_count_sum == 0
 
 
 def test_accumulate_handles_zero_controllable():
     """controllable=0 → don't accumulate rate, but increment empty counter."""
     s = init_state()
-    accumulate(s, _FakeEncOut(organic=0, controllable=0, adapter_sum=1.0, valid=10))
+    accumulate(s, _FakeEncOut(organic=0, controllable=0))
     assert s.organic_count_sum == 0
     assert s.controllable_count_sum == 0
-    assert s.controllable_empty_count == 1
-    # Adapter sum still aggregates because valid_count > 0.
-    assert s.adapter_sum == pytest.approx(1.0)
-    assert s.valid_count_sum == 10
+    assert int(s.controllable_empty_count) == 1
 
 
 # ----------------------------------------------------------------------
@@ -96,10 +88,13 @@ def test_accumulate_handles_zero_controllable():
 
 def _make_minimal_enc_out(B=2, L=8):
     base_raw = torch.randn(B, L, requires_grad=True)
-    logits_for_op = base_raw + 0.0  # simulate adapter contribution = 0 at step 0
+    # Single-head operator: logits_for_op = tanh(base_raw / T). Use
+    # base_raw directly as a stand-in (T=1, pre-saturation) to keep
+    # gradient flow and loss-shape unchanged for these tests.
+    logits_for_op = base_raw + 0.0
     probs = torch.sigmoid(logits_for_op.detach())
     enc = _FakeEncOut(
-        organic=10, controllable=B * L, adapter_sum=0.0, valid=B * L,
+        organic=10, controllable=B * L,
         base_raw=base_raw, logits_for_op=logits_for_op,
         survive_probs_metrics=probs,
     )
@@ -139,7 +134,7 @@ def test_compute_losses_ratio_produces_gradients_to_logits():
     B, L = 2, 8
     logits = _torch.randn(B, L, requires_grad=True)
     enc = _FakeEncOut(
-        organic=10, controllable=B * L, adapter_sum=0.0, valid=B * L,
+        organic=10, controllable=B * L,
         base_raw=None, logits_for_op=logits,
         survive_probs_metrics=_torch.sigmoid(logits.detach()),
     )

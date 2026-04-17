@@ -1,5 +1,16 @@
 # Survivorship Head: Two-Head + Adaptive-Threshold Design
 
+> **Superseded 2026-04-16.** The two-head `base + (adapter_raw − μ)` split
+> and `AdapterMeanEMA` described below were removed once training stabilized
+> after the LigerRMSNorm fix. The current architecture is **single head per
+> level**: `logits_for_op = tanh(base_raw / T)` with the head trained by
+> BCE + moment-match + soft-attn directly. Tanh saturation at ±1 replaces
+> the adapter's μ-subtraction as the guard against soft-attn inflation.
+> θ (dual ascent) and the rate-distortion framing below still hold. See
+> CLAUDE.md "Survivorship head (2026-04-16 single-head)" for the current
+> state; the rest of this doc is retained as the historical record of why
+> the two-head path was tried and what the pieces were meant to do.
+
 This document captures the rationale behind the survivorship-head architecture
 introduced in the 2026-04-15 pivot. The plan that drove it was discarded after
 implementation; this is the durable record of *why* the pieces look the way

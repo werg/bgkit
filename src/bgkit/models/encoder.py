@@ -428,17 +428,24 @@ class BgKITEncoder(nn.Module):
         # Filter legacy keys removed in the survivorship-head refactor.
         # Pre-2026-04 Step 2 checkpoints carry compressor.ratio_embedding.*
         # weights; the encoder no longer has that submodule. Also filter
-        # the old single-head names (compressor.survivorship_head_l{0,1}.*)
-        # that were replaced by the two-head split
-        # (head_base_l{0,1}, head_adapter_l{0,1}). Filtering avoids noisy
-        # "unexpected keys" entries and prevents accidentally loading an
-        # old unpruned head into the new base head (distribution mismatch).
+        # the old pre-simplification single-head names
+        # (compressor.survivorship_head_l{0,1}.*) and the short-lived
+        # two-head adapter (compressor.head_adapter_l{0,1}.*, removed
+        # 2026-04-16 — base head kept its name as head_base_l{0,1}).
+        # Filtering avoids noisy "unexpected keys" entries and prevents
+        # accidentally loading an old unpruned head into the current base
+        # head (distribution mismatch).
         # The encoder receives a sub-state-dict rooted at compressor.*
         # (NOT encoder.compressor.*), so prefixes are plain compressor.*.
         legacy_prefixes = (
             "compressor.ratio_embedding.",
             "compressor.survivorship_head_l0.",
             "compressor.survivorship_head_l1.",
+            # Two-head adapter (removed 2026-04-16): drop befd361-era keys.
+            "compressor.head_adapter_l0.",
+            "compressor.head_adapter_l1.",
+            "compressor.adapter_mean_ema_l0.",
+            "compressor.adapter_mean_ema_l1.",
         )
         filtered_state_dict = {
             k: v for k, v in encoder_state_dict.items()
@@ -457,8 +464,8 @@ class BgKITEncoder(nn.Module):
         if result.missing_keys:
             logger.info(
                 "Missing keys when loading encoder state dict (expected for "
-                "new survivorship head / threshold controller / adapter EMA "
-                "components, which initialize from config defaults): %s",
+                "new survivorship head / threshold controller components, "
+                "which initialize from config defaults): %s",
                 result.missing_keys,
             )
         return encoder

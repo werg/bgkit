@@ -2,8 +2,8 @@
 
 Five trainers (Step 1, Step 3 via decoder_init.py; Step 2 via pruning_distill.py;
 Step 4 via commit_encoding.py; Step 5 via compression.py; Phase 2 via
-kr_kb_trainer.py) share the same dual-ascent θ + AdapterMeanEMA μ pattern and
-the same loss composition (BCE warmup + moment match + ratio + decisiveness).
+kr_kb_trainer.py) share the same dual-ascent θ pattern and the same loss
+composition (BCE warmup + moment match + ratio + decisiveness).
 
 Each trainer imports and calls the helpers; per-trainer specialization happens
 via per-level config (``cfg.survivorship[level]``, ``cfg.ice_distillation[level]``,
@@ -186,22 +186,20 @@ def compute_survivorship_losses(
 
     Gradient routing (per the design doc):
 
-    - **BCE warmup + moment-match** consume ``base_raw`` directly — gradient
-      to head_base only. If these losses saw ``base + adapter_zm.detach()``,
-      base would learn to compensate for adapter's current distribution,
-      breaking ICE-anchoring. Match base to ICE in isolation; let adapter
-      freely deviate.
+    - **BCE warmup + moment-match** consume ``base_raw`` directly so the
+      head matches the ICE reference moments in isolation, without θ or
+      tanh-saturation mixed in.
 
     - **Ratio + decisiveness** recompute probs from the ATTACHED
-      ``logits_for_op`` + θ. These are operator-side shape losses; gradient
-      flows into head_base AND head_adapter (both contribute to the
-      composition). Default weights are 0.0 — ratio loss is redundant with
+      ``logits_for_op`` (= tanh(base_raw / T)) + θ. These are operator-side
+      shape losses; gradient flows into the head directly (single-head
+      architecture). Default weights are 0.0 — ratio loss is redundant with
       dual-ascent θ and decisiveness is usually the L1 cold-start signal
       only. A warning fires if ratio_loss_weight > 0.
 
-    - **Soft-attn** loss is NOT in this composition. It lives in a different
-      gradient subgraph (adapter-only via ``logits_for_softattn``) and is
-      added to ``total_loss`` separately in the trainer's main step.
+    - **Soft-attn** loss is NOT in this composition. It runs a separate
+      decoder forward via ``forward_from_block`` and is added to
+      ``total_loss`` separately in the trainer's main step.
 
     ICE is NOT called online after BCE warmup. Reference moments are
     pre-computed offline by scripts/probe_ice_distribution.py and loaded
