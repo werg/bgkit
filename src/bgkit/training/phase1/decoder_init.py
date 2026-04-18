@@ -722,6 +722,37 @@ class DecoderInitTrainer(BaseTrainer):
     # Freeze / unfreeze management
     # ------------------------------------------------------------------
 
+    def _unfreeze_decoder_respecting_lora(self) -> None:
+        """Set requires_grad=True on the decoder, honoring LoRA freezing.
+
+        When LoRA is applied, ``peft.get_peft_model`` has already frozen
+        the base decoder weights and left only the LoRA adapters
+        trainable. A naive ``self.decoder.requires_grad_(True)`` here
+        would undo that — we'd train the full 758 M base decoder
+        alongside the 6 M LoRA adapters, silently defeating the whole
+        point of the LoRA config (bug caught 2026-04-18 after
+        ``trainable_state_configured decoder_params=758782784`` was
+        logged alongside ``decoder_lora_applied ratio=0.0084``).
+
+        When LoRA is not applied, behave as before: unfreeze everything.
+        """
+        if getattr(self.decoder, "_has_lora", False):
+            n_adapter = 0
+            n_total = 0
+            for name, p in self.decoder.named_parameters():
+                is_adapter = "lora_" in name
+                p.requires_grad_(is_adapter)
+                n_total += 1
+                if is_adapter:
+                    n_adapter += 1
+            logger.info(
+                "decoder_unfreeze_lora_only",
+                adapter_params=n_adapter,
+                total_params=n_total,
+            )
+        else:
+            self.decoder.requires_grad_(True)
+
     def _apply_freeze(self) -> None:
         """Freeze top transformer layer, lm_head, and embed_tokens if configured."""
         tcfg = self.cfg.training
@@ -759,7 +790,7 @@ class DecoderInitTrainer(BaseTrainer):
         if self._decoder_frozen:
             self.decoder.requires_grad_(False)
         else:
-            self.decoder.requires_grad_(True)
+            self._unfreeze_decoder_respecting_lora()
             self._apply_freeze()
 
         # Encoder: frozen until encoder_unfreeze_step
@@ -814,7 +845,7 @@ class DecoderInitTrainer(BaseTrainer):
         if self.global_step < self._projection_only_steps:
             return
 
-        self.decoder.requires_grad_(True)
+        self._unfreeze_decoder_respecting_lora()
         self._apply_freeze()
         self._decoder_frozen = False
 
