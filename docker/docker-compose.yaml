@@ -108,7 +108,15 @@ services:
 
   train-phase1-step3:
     <<: *gpu-common
-    command: ["scripts/train.py", "+experiment=phase1_step3"]
+    # FA4 TEMPORARILY DISABLED (2026-04-18): varlen fwd→bwd→fwd on sm_121 crashes
+    # with cudaErrorIllegalAddress on the 2nd forward after a backward. Minimal
+    # repro: single Qwen3_5 full_attn layer loaded from phase1_step2p5 weights,
+    # called 2× with loss.backward() between — "bwd 1 OK, bwd 2 CRASH". Works
+    # fine with fresh HF weights (5-layer chain probe 10 FA4 calls pass),
+    # works fine with no backward between calls (7 kept-graph forwards pass).
+    # Diagnosis deferred; running on SDPA which was the (silent) impl used for
+    # Step 2.5 and is numerically equivalent within bf16 tolerance.
+    command: ["scripts/train.py", "+experiment=phase1_step3", "++compute.attention_implementation=sdpa"]
 
   train-phase1-step4:
     <<: *gpu-common
@@ -140,22 +148,26 @@ services:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_step6", "++training.reset_wandb=true"]
 
-  # Per-token loss analyzer for a Phase 1 Step 4 checkpoint.
+  # Per-token loss analyzer for a Phase 1 Step 3 reconstruction checkpoint.
   # Shares the GPU with an ongoing training container; expect a ~20–30%
   # slowdown while it runs. Pinned to the already-built
-  # docker-train-phase1-step4 image so it never triggers a rebuild while
+  # docker-train-phase1-step3 image so it never triggers a rebuild while
   # training is live. Invoke via:
-  #   docker compose --env-file .env -f docker/docker-compose.yaml run --rm analyze-phase1-step4-loss
+  #   docker compose --env-file .env -f docker/docker-compose.yaml run --rm analyze-phase1-step3-loss
   # Override checkpoint / output / max_samples via +analyze.* args.
-  analyze-phase1-step4-loss:
+  # NOTE: the hardcoded checkpoint paths below refer to the legacy
+  # pre-Step-2.5-repair LoRA-recon run (renamed to phase1_step3_legacy
+  # by scripts/migrate_checkpoint_phases.py v4). Override +analyze.checkpoint
+  # to point at a new Step 3 checkpoint once training produces one.
+  analyze-phase1-step3-loss:
     <<: *gpu-common
-    image: docker-train-phase1-step4:latest
+    image: docker-train-phase1-step3:latest
     build: !reset null
     command: [
-      "scripts/analyze_step4_loss.py",
-      "+experiment=phase1_step4",
-      "+analyze.checkpoint=/workspace/checkpoints/phase1_step4_step1500_20260417_042208",
-      "+analyze.output_dir=/workspace/data/diagnostics/analyze_step4_step1500_20260417_042208",
+      "scripts/analyze_step3_loss.py",
+      "+experiment=phase1_step3",
+      "+analyze.checkpoint=/workspace/checkpoints/phase1_step3_legacy_step1500_20260417_042208",
+      "+analyze.output_dir=/workspace/data/diagnostics/analyze_step3_step1500_20260417_042208",
       "+analyze.max_samples=500",
       # Use SDPA attention — avoids FA4's CUDA-error concurrency
       # fragility when training is also using FA4 on the same GPU.
@@ -168,15 +180,15 @@ services:
   # Survivor counterfactual + logit-distribution analyzer for Phase 1
   # Step 3. Runs eval twice (min_per_sample=0 vs =1) on the same samples
   # and dumps per-sample logit stats + content for zero-survivor samples.
-  analyze-phase1-step4-survivors:
+  analyze-phase1-step3-survivors:
     <<: *gpu-common
-    image: docker-train-phase1-step4:latest
+    image: docker-train-phase1-step3:latest
     build: !reset null
     command: [
-      "scripts/analyze_step4_survivors.py",
-      "+experiment=phase1_step4",
-      "+analyze.checkpoint=/workspace/checkpoints/phase1_step4_step1500_20260417_042208",
-      "+analyze.output_dir=/workspace/data/diagnostics/survivors_step4_step1500",
+      "scripts/analyze_step3_survivors.py",
+      "+experiment=phase1_step3",
+      "+analyze.checkpoint=/workspace/checkpoints/phase1_step3_legacy_step1500_20260417_042208",
+      "+analyze.output_dir=/workspace/data/diagnostics/survivors_step3_step1500",
       "+analyze.max_samples=500",
       "++compute.attention_implementation=sdpa",
       "++training.max_batch_tokens=8192",
@@ -185,19 +197,84 @@ services:
   # With-vs-without-survivors ablation: same samples, two decoder passes
   # (real survivors vs zeroed). Per-position Δ tells us whether the
   # decoder is using survivor info at depth or just autoregressing.
-  analyze-phase1-step4-survivor-ablation:
+  analyze-phase1-step3-survivor-ablation:
     <<: *gpu-common
-    image: docker-train-phase1-step4:latest
+    image: docker-train-phase1-step3:latest
     build: !reset null
     command: [
-      "scripts/analyze_step4_survivor_ablation.py",
-      "+experiment=phase1_step4",
-      "+analyze.checkpoint=/workspace/checkpoints/phase1_step4_step1500_20260417_042208",
-      "+analyze.output_dir=/workspace/data/diagnostics/ablation_step4_step1500",
+      "scripts/analyze_step3_survivor_ablation.py",
+      "+experiment=phase1_step3",
+      "+analyze.checkpoint=/workspace/checkpoints/phase1_step3_legacy_step1500_20260417_042208",
+      "+analyze.output_dir=/workspace/data/diagnostics/ablation_step3_step1500",
       "+analyze.max_samples=500",
       "++compute.attention_implementation=sdpa",
       "++training.max_batch_tokens=8192",
     ]
+
+  # Embedding-space deviation diagnostic. At target_ratio=None, how far
+  # does the projected output deviate from decoder.embed_tokens of the
+  # same content tokens? Geometric metrics (MSE / cosine / norm ratio),
+  # top-K NN retrieval against decoder vocab, and reconstruction-CE
+  # comparison vs the identity upper bound (decoder.embed_tokens fed as
+  # survivors).
+  analyze-phase1-step3-embedding-deviation:
+    <<: *gpu-common
+    image: docker-train-phase1-step3:latest
+    build: !reset null
+    command: [
+      "scripts/analyze_embedding_deviation.py",
+      "+experiment=phase1_step3",
+      "+analyze.checkpoint=/workspace/checkpoints/phase1_step3_legacy_step2000_20260417_083031",
+      "+analyze.output_dir=/workspace/data/diagnostics/embdev_step3_step2000",
+      "+analyze.max_samples=200",
+      "++compute.attention_implementation=sdpa",
+      "++training.max_batch_tokens=8192",
+    ]
+
+  # Same diagnostic, pointed at the step2p5 repair checkpoint. Verifies
+  # the embed-anchor actually translates to reconstruction improvement.
+  # ``training.optimizer=adamw`` override is needed because the step2p5
+  # checkpoint was saved under AdamW; the Step 3 base config defaults
+  # to Muon, and ``_check_optimizer_type_compat`` would otherwise reject
+  # the load. The optimizer is never stepped by the diagnostic, so the
+  # override is purely a type-check appeasement.
+  analyze-phase1-step2p5-embedding-deviation:
+    <<: *gpu-common
+    image: docker-train-phase1-step3:latest
+    build: !reset null
+    command: [
+      "scripts/analyze_embedding_deviation.py",
+      "+experiment=phase1_step3",
+      "+analyze.checkpoint=/workspace/checkpoints/phase1_step2p5_step1200_20260417_173305",
+      "+analyze.output_dir=/workspace/data/diagnostics/embdev_step2p5_step1200",
+      "+analyze.max_samples=200",
+      "++compute.attention_implementation=sdpa",
+      "++training.max_batch_tokens=8192",
+      "++training.optimizer=adamw",
+      # Step 2.5 saves a pre-LoRA decoder (passthrough from Step 2). The
+      # Step 3 base config applies LoRA in setup, which rewrites the
+      # decoder state_dict key namespace to ``base_model.model.*`` +
+      # LoRA adapters. Disabling LoRA here keeps the state_dict
+      # structure matching the checkpoint. Geometric metrics (cos, mse,
+      # norm-ratio) are LoRA-independent; the reconstruction-CE
+      # identity upper bound is not directly comparable to the earlier
+      # Step 3 diagnostic but the proj-vs-identity Δ within this run
+      # still quantifies the repair's effect.
+      "++training.decoder_lora.enabled=false",
+    ]
+
+  # Phase 1 Step 2.5: projection-only embed-anchor repair. Loads Step 2
+  # checkpoint, freezes compressor + decoder, re-trains only the
+  # projection block so its output lands on decoder.embed_tokens
+  # manifold. See scripts/analyze_embedding_deviation.py for the
+  # motivating diagnostic. Pinned to the phase1-step3 image to avoid
+  # triggering a rebuild that would hit the cutlass libcuda import
+  # issue; the image is already validated for this pipeline.
+  train-phase1-step2p5:
+    <<: *gpu-common
+    image: docker-train-phase1-step3:latest
+    build: !reset null
+    command: ["scripts/train.py", "+experiment=phase1_step2p5"]
 
   train-phase2-kb-stage-a:
     <<: *gpu-common

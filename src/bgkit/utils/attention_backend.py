@@ -124,6 +124,11 @@ def bgkit_flash_attention_4_forward(
     target_dtype = get_target_dtype(query, module)
     is_causal = is_causal if is_causal is not None else getattr(module, "is_causal", True)
 
+    if os.getenv("BGKIT_FA4_DEBUG_FIRST_CALL", "") == "1":
+        _fa4_debug_dump(query, key, value, padding_mask, query_length, is_causal, module=module)  # diag
+
+
+
     attn_output = _flash_attention_forward(
         query,
         key,
@@ -140,6 +145,61 @@ def bgkit_flash_attention_4_forward(
         **kwargs,
     )
     return attn_output, None
+
+
+_fa4_debug_n_dumped = 0
+
+
+def _fa4_debug_dump(q, k, v, padding_mask, query_length, is_causal, module=None):
+    """Diagnostic: log FA4 tensor shapes + mask summary + finiteness.
+
+    Gated on env var BGKIT_FA4_DEBUG_FIRST_CALL=1. Logs up to
+    ``BGKIT_FA4_DEBUG_N`` calls (default 8) per process. Also syncs after
+    logging so CUDA errors from prior kernels surface at this point.
+    """
+    global _fa4_debug_n_dumped
+    limit = int(os.getenv("BGKIT_FA4_DEBUG_N", "8"))
+    if _fa4_debug_n_dumped >= limit:
+        return
+    _fa4_debug_n_dumped += 1
+    idx = _fa4_debug_n_dumped
+    import sys
+    import torch as _t_mod
+
+    def _t(t):
+        if t is None:
+            return "None"
+        return f"shape={tuple(t.shape)} dtype={t.dtype} dev={t.device} contig={t.is_contiguous()}"
+
+    def _fin(t):
+        if t is None:
+            return "None"
+        ft = t.float()
+        return f"nan={int(_t_mod.isnan(ft).sum().item())} inf={int(_t_mod.isinf(ft).sum().item())} abs_max={ft.abs().max().item():.3e}"
+
+    mask_summary = "None"
+    if padding_mask is not None:
+        valid_per_row = padding_mask.sum(dim=-1)
+        mask_summary = (
+            f"{_t(padding_mask)} valid_per_row.min={valid_per_row.min().item()} "
+            f"max={valid_per_row.max().item()} total_valid={int(valid_per_row.sum().item())}"
+        )
+    mod_id = ""
+    if module is not None:
+        layer_idx = getattr(module, "layer_idx", None)
+        mod_id = f" layer_idx={layer_idx}"
+    # Sync so any pending async CUDA error surfaces here instead of later.
+    try:
+        _t_mod.cuda.synchronize()
+    except Exception as exc:  # noqa: BLE001 - we want the message
+        print(f"[fa4_debug #{idx}] PRE-CALL CUDA ERROR: {type(exc).__name__}: {exc}",
+              file=sys.stderr, flush=True)
+        raise
+    print(
+        f"[fa4_debug #{idx}]{mod_id} q={_t(q)} finQ:{_fin(q)} k={_t(k)} v={_t(v)} "
+        f"padding_mask={mask_summary} query_length={query_length} is_causal={is_causal}",
+        file=sys.stderr, flush=True,
+    )
 
 
 @lru_cache(maxsize=1)

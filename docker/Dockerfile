@@ -49,9 +49,22 @@ RUN pip install --no-cache-dir \
 # left libs-base's `_nvvm_ops_gen.py` shim on disk (FA4 atomic_add_fp32 also
 # handles the libs-cu13 shim via try/except, so this is a fail-loud guardrail,
 # not a hard requirement).
-RUN python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')" && \
+#
+# libcuda.so.1 isn't present during `docker build` (driver is only mounted by
+# nvidia-container-runtime at `docker run` time). The cutlass MLIR binding
+# dlopens it at import time, so we symlink the driver stub to the versioned
+# name and put the stubs dir on LD_LIBRARY_PATH **just for this RUN** —
+# Python reflection on MLIR classes doesn't call into real CUDA, so the stub
+# is enough to get past the import. Same workaround already used by
+# Dockerfile.llama; see CLAUDE.md "Llama" notes.
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+    python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')" && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
     python -c "import accelerate; print(f'accelerate {accelerate.__version__}')" && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
     python -c "from causal_conv1d import causal_conv1d_fn; print('causal_conv1d OK')" && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
     python -c "from cutlass._mlir.dialects import nvvm; import inspect; params = list(inspect.signature(nvvm.atomicrmw).parameters); print(f'cutlass-dsl atomicrmw first param: {params[0]!r}'); assert params[0] in ('res', 'op'), f'unrecognized atomicrmw signature: {params}'"
 
 ENV PYTHONUNBUFFERED=1 \
