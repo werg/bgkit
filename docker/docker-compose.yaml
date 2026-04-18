@@ -18,10 +18,22 @@ x-gpu-common: &gpu-common
     # Triton autotuner crash on sm_121 is handled by bgkit.utils.triton_patch
     # Persist torch.compile cache across container restarts
     - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
-    # Unified memory: allocate incrementally instead of large upfront chunks.
-    # Without this, PyTorch pre-allocates huge contiguous blocks that push
-    # other processes into swap on the DGX Spark's shared 128 GB pool.
-    - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    # Unified memory tuning for DGX Spark's single 128 GB pool:
+    #   - expandable_segments:True  — grow allocations incrementally instead
+    #     of pre-reserving huge contiguous blocks (otherwise PyTorch would
+    #     push other processes into swap on shared memory).
+    #   - garbage_collection_threshold:0.8  — return freed memory to OS
+    #     when the caching allocator exceeds 80% of reservations, rather
+    #     than hoarding it. Critical on unified memory where hoarded CUDA
+    #     blocks directly reduce system RAM for the CPU.
+    #   - max_split_size_mb:512  — cap the largest split the allocator
+    #     will hand back to a single alloc request. Limits fragmentation
+    #     from mixed-size allocations (variable batch shapes in our case).
+    # Added 2026-04-18 after Step 3 stalled at step 2351 with 119 GB of
+    # unified memory consumed (~45 MB/step accumulated) — likely a mix of
+    # genuine leaks and allocator fragmentation on the variable-shape
+    # batches from TokenBudgetBatchSampler.
+    - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
     # sm_121 stream-capture interaction: load_binary on a new kernel variant
     # inside a captured stream throws CUDA error 800 ("operation not permitted
     # when stream is capturing"). Disable inductor CUDA graphs to prevent
@@ -116,7 +128,18 @@ services:
     # works fine with no backward between calls (7 kept-graph forwards pass).
     # Diagnosis deferred; running on SDPA which was the (silent) impl used for
     # Step 2.5 and is numerically equivalent within bf16 tolerance.
-    command: ["scripts/train.py", "+experiment=phase1_step3", "++compute.attention_implementation=sdpa"]
+    #
+    # max_batch_tokens lowered 32768 → 24576 (-25%) on 2026-04-18 alongside the
+    # allocator tuning in gpu-common. Paired with the new memory diagnostics
+    # logging (mem/* metrics every 50 steps) so we can separate allocator
+    # fragmentation (sawtooth) from a real leak (linear slope) in the growth
+    # curve. Revert once fragmentation root cause is understood.
+    command: [
+      "scripts/train.py",
+      "+experiment=phase1_step3",
+      "++compute.attention_implementation=sdpa",
+      "++training.max_batch_tokens=24576",
+    ]
 
   train-phase1-step4:
     <<: *gpu-common
