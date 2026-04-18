@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-"""Survivor-behaviour analyzer for Phase 1 Step 4.
+"""Survivor-behaviour analyzer for Phase 1 Step 3.
 
-Companion to ``analyze_step4_loss.py``. Answers three questions about
+Companion to ``analyze_step3_loss.py``. Answers three questions about
 compression selection before we flip ``floor_post_warmup`` config:
 
 1. Counterfactual: does forcing ``min_per_sample=1`` materially reduce loss
@@ -18,9 +18,9 @@ Runs eval twice on the same samples: once with the config's
 zero-survivor-detail JSON that includes decoded content.
 
 Usage (inside the analyze-phase1-step3-survivors compose service):
-    python scripts/analyze_step4_survivors.py \
-        +experiment=phase1_step4 \
-        +analyze.checkpoint=/workspace/checkpoints/phase1_step4_step1500_20260417_042208 \
+    python scripts/analyze_step3_survivors.py \
+        +experiment=phase1_step3 \
+        +analyze.checkpoint=/workspace/checkpoints/phase1_step3_legacy_step1500_20260417_042208 \
         +analyze.output_dir=/workspace/data/diagnostics/survivors_step1500 \
         +analyze.max_samples=500 \
         ++compute.attention_implementation=sdpa \
@@ -383,9 +383,9 @@ def main(cfg: DictConfig) -> None:
     if not cfg.analyze.get("output_dir", None):
         raise ValueError("Pass +analyze.output_dir=<path>")
     phase = cfg.training.get("phase", None)
-    if phase != "phase1_step4":
+    if phase != "phase1_step3":
         raise ValueError(
-            f"expects phase=phase1_step4, got {phase}. Use +experiment=phase1_step4.",
+            f"expects phase=phase1_step3, got {phase}. Use +experiment=phase1_step3.",
         )
 
     print(OmegaConf.to_yaml(cfg))

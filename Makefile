@@ -32,7 +32,7 @@ test-gpu:
 	$(DC) run --rm --no-deps \
 		-v $(CURDIR)/tests:/workspace/bgkit/tests:ro \
 		-v $(CURDIR)/pyproject.toml:/workspace/bgkit/pyproject.toml:ro \
-		--entrypoint pytest train-phase1-step4 tests/unit -v -m gpu --ignore=tests/unit/data $(ARGS)
+		--entrypoint pytest train-phase1-step3 tests/unit -v -m gpu --ignore=tests/unit/data $(ARGS)
 
 test-integration:
 	uv run pytest tests/integration -v -m integration

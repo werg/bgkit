@@ -1,0 +1,19 @@
+# @package _global_
+# Experiment preset: Phase 1 Step 2.5 projection embed-anchor repair.
+defaults:
+  - /config
+  - /training/phase1_step2p5
+  - _self_
+
+run_name: phase1_step2p5
+
+# Load encoder + decoder from the best Step 2 checkpoint. 'auto'
+# resolves via the registry (phase=phase1_step2, metric=eval/loss).
+# Ignored on resume (the checkpoint being resumed from takes over).
+bgkit_checkpoint: auto
+
+# Explicit resume from step2000 (best post-unfreeze snapshot — cos 0.19,
+# norm essentially perfect at 0.998). Continues with compressor_lr
+# bumped from 3e-5 to 3e-4. Resume warmup re-ramps both param groups
+# gently to avoid a step-change shock on the compressor.
+resume_checkpoint: /workspace/checkpoints/phase1_step2p5_step2000_20260417_192527

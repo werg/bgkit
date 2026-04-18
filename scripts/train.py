@@ -33,15 +33,23 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.distillation.pruning_distill import PruningDistillTrainer
 
         return PruningDistillTrainer(cfg)
+    elif phase == "phase1_step2p5":
+        # Projection-only embed-anchor repair. Loads a Step 2 checkpoint,
+        # freezes compressor + decoder, re-trains only the projection
+        # block against decoder.embed_tokens(content_ids).
+        from bgkit.training.phase1.projection_repair import ProjectionRepairTrainer
+
+        return ProjectionRepairTrainer(cfg)
     elif phase == "phase1_step3":
-        # QA-conditioned head supervision. Reuses DecoderInitTrainer because
-        # the data flow is identical (encoder + decoder + chat template);
-        # the QA-position loss + question-as-compression-prompt wiring lives
-        # in the config + survivorship_helpers.
+        # Pruned reconstruction with compression curriculum (post Step 2.5).
         from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
         return DecoderInitTrainer(cfg)
     elif phase == "phase1_step4":
+        # QA-conditioned head supervision. Reuses DecoderInitTrainer because
+        # the data flow is identical (encoder + decoder + chat template);
+        # the QA-position loss + question-as-compression-prompt wiring lives
+        # in the config + survivorship_helpers.
         from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
         return DecoderInitTrainer(cfg)

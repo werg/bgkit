@@ -16,7 +16,7 @@ For each `(question, answer, repo_path, file_path, commit_sha)` record:
    - ``answer_position_meta``: {n_identifier_hits, n_positions, source_token_count}
 
 The downstream converter (``convert_qa_pairs_to_npy.py``) consumes these
-fields to build the position-mask mmap that the new Phase 1 Step 3
+fields to build the position-mask mmap that the Phase 1 Step 4
 (QA-conditioned head supervision) trainer uses to supervise the
 survivorship head directly.
 

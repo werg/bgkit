@@ -196,7 +196,7 @@ class LevelLossCfg:
     #   target = qa_non_answer_target at non-answer valid positions
     #     (default 0.10 = target_ratio so the head's general-compression
     #      behavior on shared reconstruction batches isn't disrupted).
-    # Used by Phase 1 Step 3 (QA-conditioned head supervision) to break
+    # Used by Phase 1 Step 4 (QA-conditioned head supervision) to break
     # the autoregressive shortcut: the answer-grounded positions are the
     # tokens the decoder genuinely needs to attend to, and direct head
     # supervision avoids relying on indirect signal that has to propagate

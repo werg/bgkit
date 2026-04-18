@@ -1,5 +1,5 @@
 # @package _global_
-# Experiment preset: Phase 1 Step 4 pruned encoder reconstruction (LoRA decoder)
+# Experiment preset: Phase 1 Step 4 QA-conditioned head supervision
 defaults:
   - /config
   - /training/phase1_step4
@@ -7,5 +7,13 @@ defaults:
 
 run_name: phase1_step4
 
-# Load pruned encoder + decoder from step 2 distillation checkpoint
+# Load encoder + LoRA-adapted decoder from the best Step 3 checkpoint.
+# 'auto' resolves via the registry (phase=phase1_step3, metric=eval/loss).
 bgkit_checkpoint: auto
+
+# Override the global ``data.qa_data_dir`` from data/tokens.yaml. Must
+# live here (with @package _global_) because the trainer reads
+# ``cfg.data.qa_data_dir`` — a ``data:`` block inside training/*.yaml
+# would land at ``cfg.training.data:`` and be silently ignored.
+data:
+  qa_data_dir: ${oc.env:DATA_DIR}/mmap/qa_conditioned_filtered

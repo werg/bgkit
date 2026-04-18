@@ -1,87 +1,107 @@
-# Phase 1 Step 3: QA-conditioned head supervision
+# Phase 1 Step 3: Reconstruction with compression curriculum (post Step 2.5)
 #
-# Trains the survivorship head to surface answer-relevant tokens, with
-# direct gold-position supervision derived from synthetic QA pairs.
-# Breaks the autoregressive shortcut quantified by the 2026-04-17
-# with-vs-without-survivors ablation (Δ ≈ 0.002 on the old Step 3 LoRA
-# reconstruction phase).
+# Re-introduces compression gently on top of the Step 2.5 projection
+# repair. The Step 2.5 run re-anchors the encoder's projection output to
+# the decoder's token-embedding manifold; Step 3 then retrains a fresh
+# decoder (LoRA) + the full encoder against the content-reproduction
+# objective, ramping the target ratio 0.95 → 0.10 over 1k steps.
 #
-# Inputs:
-#   - phase1_step2 checkpoint (pruned encoder)
-#   - Pre-distilled head_base_l0 sidecar (same one used by Step 4+)
-#   - Filtered QA mmap with answer-position annotations
-#     (run scripts/filter_qa_with_positions.py then convert_qa_pairs_to_npy.py)
+# The decoder from Step 1/2/2.5 is intentionally discarded
+# (``load_decoder_from_bgkit_checkpoint: false``). That decoder was
+# adapted against off-manifold projections; with the manifold fixed in
+# 2.5, we want a fresh decoder that learns against the repaired
+# projection under the new curriculum instead of carrying the earlier
+# adaptation forward.
 #
-# Training mix (via _InterleavingDataLoader at qa_ratio): mostly QA so
-# the head + decoder learn the new behavior, with a meaningful slice of
-# reconstruction batches to keep general compression alive.
-#
-# Loss composition on QA batches:
-#   - Decoder CE on the answer tokens (standard teacher forcing)
-#   - QA-position BCE on base_raw (target=1 at answer-grounded source
-#     positions, target=qa_non_answer_target=0.10 elsewhere)
-#   - Moment-match anchor on base_raw (subordinate to QA loss)
-#   - Min-survivors floor loss
-# On reconstruction batches, the QA-position term is inactive (no mask)
-# and behavior matches the standard reconstruction mix.
+# Cold-start head: the pre-distilled ``head_base_l0`` sidecar is loaded
+# from Step 1's offline ICE distillation; moment-match keeps the head's
+# distribution shape anchored and the utility-gradient BCE trains it
+# online from the decoder CE gradient captured at ``content_hidden``.
 phase: phase1_step3
 optimizer: muon
-max_steps: 8000
-lr: 1.5e-4               # base LR (encoder)
+max_steps: 15000
+lr: 2.0e-4               # base LR (encoder gets this)
 decoder_lr: 1.0e-5        # decoder LoRA LR (low — LoRA concentrates gradients)
-encoder_lr: 1.5e-4        # encoder LR
+encoder_lr: 2.0e-4        # encoder LR (higher — pruned encoder needs to adapt)
 warmup_steps: 500
 max_batch_tokens: 32768
 gradient_accumulation_steps: 2
 max_eval_samples: 500
 eval_every: 500
 save_every: 500
+# Per-microbatch diagnostic metrics (base_norm, head_logit_std,
+# floor_trigger_rate, theta) each force a GPU→CPU sync. Gate them on
+# every 50th step — cheap loss/target metrics still emit every step.
 diagnostic_metrics_every_n_steps: 50
 
-# Sidecar (same as Step 4+).
+# Discard the decoder carried through from Step 1/2/2.5 — see module
+# docstring. The encoder (incl. the repaired projection_block) IS
+# loaded from the bgkit_checkpoint; only the decoder state_dict is
+# skipped, falling back to a fresh HF Qwen3.5-0.8B.
+load_decoder_from_bgkit_checkpoint: false
+
+# Optional sidecar with pre-distilled head_base_l0 weights. Produced by
+# scripts/pretrain_survivorship_head.py. When set, online BCE warmup is
+# NOT needed (set ice_distillation.l0.enabled: false below).
 survivorship_head_sidecar: /workspace/checkpoints/survivorship_head_base_l0_20260416_132842/head_base_l0.pt
 
-# Everything unfrozen from step 0.
+# Everything unfrozen from step 0 — no curriculum phases
 train_projection_block: true
 projection_only_steps: 0
 projection_lr: null
 encoder_unfreeze_step: 0
 bidi_warmup_steps: 0       # already bidirectional from step 2
 
-# Compression active from step 0. Step 3 holds a constant target ratio
-# rather than ramping — the QA signal works best when compression is
-# already at the intended operating point so the head's selection
-# decisions translate directly to what the decoder will see at later
-# steps.
+# Compression active from step 0
 compression_introduction_step: 0
-target_ratio_start: 0.10
-target_ratio_end: 0.10
-target_ratio_ramp_steps: 1
 
+# Cold-start curriculum: ratio anneals 0.95 → 0.10 over 1k steps. The
+# decoder is fresh, so starting at near-identity (0.95) gives it a few
+# hundred steps to learn on lightly-compressed inputs before the head
+# has to commit to aggressive selection.
+target_ratio_start: 0.95
+target_ratio_end: 0.10
+target_ratio_ramp_steps: 1000
+
+# Liger kernels: SwiGLU + RoPE + fused linear-CE are enabled. LigerRMSNorm
+# is pinned OFF due to a silent backward-pass corruption on Qwen3.5 in
+# liger-kernel 0.7.x. Symptom: loss ~1.6 at step 0 → ~13 (LM prior) by
+# step 10 at near-zero LR, grad_norm ~500, no NaN. Neither the
+# in_place=False fix to LigerRMSNorm nor disabling LigerCE resolves it.
+# LigerRMSNorm's casting_mode="llama" default doesn't match Qwen3.5's
+# RMSNorm math. Re-enable only after upstream ships an
+# `apply_liger_kernel_to_qwen3_5` with Qwen-specific RMSNorm handling
+# (Liger issue #1119) or after a targeted version-downgrade test.
 use_liger: true
 use_liger_rmsnorm: false
 
-# Survivorship head losses, per level. Step 3 only consumes l0; l1 is
-# included with weights matching Step 4 for forward compatibility.
+# Survivorship head losses, per level.
 survivorship:
+  # L0: base is pre-distilled offline; utility-gradient BCE trains it
+  # online from the decoder-CE gradient captured at content_hidden.
+  #
+  # Moment-match provides a permanent corpus-wide shape anchor on
+  # base_raw so the head can't drift into degenerate distribution
+  # shapes during utility-grad training. The start_step=500 gives the
+  # encoder time to warm up before moment-match applies pressure;
+  # weight 0.05 keeps the gradient subordinate to decoder CE.
   l0:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
-    # Lower than Step 4 — the QA-position loss is the primary head
-    # supervision signal here; we want utility-grad to be a complement,
-    # not a competitor.
-    utility_grad_loss_weight: 0.1
+    utility_grad_loss_weight: 0.3
     moment_match_weight: 0.05
     moment_match_start_step: 500
+    # Minimum-survivors floor loss: relative squared hinge on soft
+    # survivor count, using a larger-tau sigmoid so gradient flows
+    # through tanh saturation. Push the head off "confidently silent"
+    # for samples that currently get zero survivors.
     min_survivors_loss_weight: 0.05
     min_survivors_floor_ratio: 0.02
     min_survivors_absolute_min: 1
     min_survivors_tau: 0.3
-    # NEW: direct supervision on the head from QA position annotations.
-    # 0.5 puts this loss on par with decoder CE at typical magnitudes.
-    qa_position_loss_weight: 0.5
-    qa_non_answer_target: 0.10  # = target_ratio (no extra suppression)
 
+  # L1: no ICE anchor; utility-grad BCE drives, decisiveness breaks symmetry.
+  # (Step 3 doesn't activate L1 — included for forward compatibility.)
   l1:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.05
@@ -91,11 +111,10 @@ survivorship:
     min_survivors_floor_ratio: 0.02
     min_survivors_absolute_min: 1
     min_survivors_tau: 0.3
-    # L1 doesn't see QA position masks (Phase 1 Step 3 trains L0 only).
-    qa_position_loss_weight: 0.0
-    qa_non_answer_target: 0.10
 
-# ICE distillation: disabled — sidecar is pre-distilled.
+# ICE distillation: disabled at runtime because head_base_l0 is pre-
+# distilled via the sidecar. The only remaining runtime link to ICE is
+# the reference moments (loaded as two floats — no ICE model on device).
 ice_distillation:
   checkpoint_path: /workspace/checkpoints/ice_step89999_20260306_213825
   input_dim: 1024
@@ -103,20 +122,22 @@ ice_distillation:
   num_layers: 3
   kernel_size: 5
   l0:
-    enabled: false
+    enabled: false                   # sidecar replaces online BCE
     bce_warmup_weight: 0.0
     bce_warmup_steps: 0
     teacher_ratio: 0.10
   l1:
     enabled: false
 
+# Pre-computed reference moments for the moment_match loss. The probe
+# script writes a JSON with {skew, excess_kurt, n_positions}.
 moment_match_reference:
   l0:
     path: ${oc.env:DATA_DIR}/diagnostics/ice_reference_moments.json
   l1:
-    path: null
+    path: null                       # unused at L1
 
-# LoRA config for decoder — same as Step 4 (small adapter, fast adaptation).
+# LoRA config for decoder — small adapter, fast adaptation
 decoder_lora:
   enabled: true
   r: 16
@@ -124,6 +145,7 @@ decoder_lora:
   dropout: 0.05
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
+# Do NOT freeze top layer — LoRA handles parameter efficiency
 freeze_top_layer: false
 lr_scale_bottom: 1.0
 
@@ -136,26 +158,7 @@ checkpoint_pruning:
   metric: eval/loss
 early_stopping:
   enabled: false
-
-# QA training — heavy mix. The interleaver pulls a QA batch with
-# probability qa_ratio at each training step; reconstruction batches
-# fill the rest. Pure QA (1.0) risks specializing the head into
-# extractive-only mode; we keep 30% reconstruction to retain general
-# compression behavior on the same head.
-qa_ratio: 0.7
-
-# NOTE: ``cfg.data.qa_data_dir`` must be set from the experiment shim
-# (configs/experiment/phase1_step3.yaml) because that file uses
-# ``@package _global_``; a ``data:`` block here would land at
-# ``cfg.training.data`` and be silently ignored by the trainer.
-#
-# QA mmap with answer-position annotations. Produced by:
-#   scripts/filter_qa_with_positions.py --input-dir $DATA_DIR/qa_pairs/ \\
-#       --repos-dir $DATA_DIR/repos/ \\
-#       --output-dir $DATA_DIR/qa_pairs_filtered/
-#   scripts/convert_qa_pairs_to_npy.py --input-dir $DATA_DIR/qa_pairs_filtered/ \\
-#       --output-dir $DATA_DIR/mmap/qa_conditioned_filtered/
-
+qa_ratio: 0.0
 eval:
   generation_samples: 50
   generation_eval_every: 4

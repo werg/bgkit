@@ -17,7 +17,7 @@ Phase 1 trains BgKIT's compression on code repositories, establishing the L0/L1 
 | Decoder | Qwen3.5-0.8B | ~800M | The serving model. Co-trained from Phase 1 onward to reconstruct content and answer questions from BgKIT survivors. |
 | ICE | Custom 1D CNN | ~0.7M | Information content estimator for survivor selection. |
 
-Note: The decoder is Qwen3.5-0.8B throughout — there is no separate larger target LLM. Encoder and decoder share the tokenizer (`Qwen/Qwen3.5-0.8B-Base`) and hidden dimension, so the projection block stays at 1024 dim and never needs dimensional extension. LoRA on the decoder is available but optional and is primarily used in Phase 1 Step 4 and Phase 2 KB Stages B/C to keep decoder drift under control.
+Note: The decoder is Qwen3.5-0.8B throughout — there is no separate larger target LLM. Encoder and decoder share the tokenizer (`Qwen/Qwen3.5-0.8B-Base`) and hidden dimension, so the projection block stays at 1024 dim and never needs dimensional extension. LoRA on the decoder is available but optional and is primarily used from Phase 1 Step 3 onward and Phase 2 KB Stages B/C to keep decoder drift under control.
 
 ## Data
 
@@ -70,13 +70,13 @@ Train the reconstruction decoder to generate text from BgKIT's full (uncompresse
 
 Remove the 18 DeltaNet linear-attention layers from the encoder via structured pruning with knowledge distillation. Replace with lightweight ResidualConv1d (local mixing) + MLP-only layers. Distills the full encoder (teacher) into the pruned encoder (student) using boundary MSE, auto-repro MSE, projection MSE, and cosine losses. Four-stage unfreezing: conv1d → retrained MLPs → all MLPs → everything. Reduces encoder from ~754M to ~499M params, eliminates DeltaNet numerical stability issues.
 
-### Step 3: QA-Conditioned Head Supervision (`phase1_step3`)
+### Step 3: Pruned Reconstruction with Compression Curriculum (`phase1_step3`)
 
-Train the survivorship head to surface answer-relevant tokens, conditioned on a question passed to the encoder. Uses the synthetic QA pairs (filtered for grounding, multi-hot answer-position annotations recovered via identifier-substring search). Mixed-objective: decoder CE on the answer + a direct BCE-with-logits supervision on the head pushing logits up at answer-grounded positions and down elsewhere. Breaks the autoregressive shortcut observed at the (now Step 4) reconstruction phase: short answers + question-conditioned compression force the decoder to actually consume survivors. Rationale and ablation evidence in the 2026-04-17 survivor analyzer + ablation runs.
+Re-introduce compression on top of the Step 2.5 projection repair. Loads the Step 2.5 encoder (with the repaired projection block) and a **fresh HF Qwen3.5-0.8B decoder** — the Step 1 decoder is intentionally discarded via `training.load_decoder_from_bgkit_checkpoint: false` because it was adapted against off-manifold projections. Retrains the decoder (via LoRA) and encoder (full fine-tune) on the content reproduction task with the target ratio ramping 0.95 → 0.10 over 1k steps. Higher encoder LR, lower decoder LR (LoRA). The compression curriculum is what makes this different from the 2026-04 run that sat at a single ratio: the fresh decoder gets a few hundred steps of light compression before the head has to commit to aggressive selection.
 
-### Step 4: Pruned Reconstruction (`phase1_step4`)
+### Step 4: QA-Conditioned Head Supervision (`phase1_step4`)
 
-Retrain the decoder (via LoRA) and encoder (full fine-tune) on the content reproduction task using the pruned encoder from step 2 + the QA-pretrained head from step 3. Skips all curriculum phases — encoder unfrozen and compression active from step 0. Higher encoder LR, lower decoder LR. Bridges the quality gap between the distilled pruned encoder and the original unpruned encoder.
+Fine-tune the Step-3-trained encoder + decoder on a QA-conditioned objective to give the survivorship head direct gold-position supervision. Uses the synthetic QA pairs (filtered for grounding, multi-hot answer-position annotations recovered via identifier-substring search). Mixed-objective: decoder CE on the answer + a direct BCE-with-logits supervision on the head pushing logits up at answer-grounded positions and down elsewhere. Breaks the autoregressive shortcut observed at the Step 3 reconstruction phase (2026-04-17 with-vs-without-survivors ablation: Δ ≈ 0.002): short answers + question-conditioned compression force the decoder to actually consume survivors. Rationale and ablation evidence in the 2026-04-17 survivor analyzer + ablation runs.
 
 ### Step 5: Commit Encoding (`phase1_step5`)
 
@@ -179,7 +179,7 @@ Train on short single documents with QA supervision, pushing retention from 0.10
 - Retention ratio curriculum: 0.10 → 0.01 over training
 - Loss: `α * QA_CE + (1-α) * reconstruction_CE`, α ramps 0.3 → 0.7
 - Gap-filling relaxed: `max_survivor_gap` increased or removed, since positional coverage matters less for QA than reconstruction
-- Decoder: LoRA (continuing from Phase 1 Step 4/6 setup)
+- Decoder: LoRA (continuing from Phase 1 Step 3/4/6 setup)
 
 **Quality gate:** Decoder achieves >70% accuracy on PubMedQA (yes/no/maybe) and >40% F1 on NewsQA extractive spans at 0.01 retention. If not, investigate whether the information bottleneck is in compression or decoding.
 

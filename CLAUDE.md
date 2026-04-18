@@ -102,12 +102,15 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 |---|---|---|---|---|
 | Joint Block → Step 1 | `bgkit_checkpoint` | `joint_block_pretrain` | `phase1_step1` | `eval/mse_repro` |
 | Step 1 → Step 2 | `step1_checkpoint` | `phase1_step1` | `phase1_step2` | `eval/loss` |
-| Step 2 → Step 3 | `bgkit_checkpoint` | `phase1_step2` | `phase1_step3` | `eval/loss` |
-| Step 3 → Step 4 | `bgkit_checkpoint` | `phase1_step3` | `phase1_step4` | `eval/loss` |
+| Step 2 → Step 2.5 | `bgkit_checkpoint` | `phase1_step2` | `phase1_step2p5` | `eval/loss` |
+| Step 2.5 (or 2 fallback) → Step 3 | `bgkit_checkpoint` | `phase1_step2p5` → `phase1_step2` | `phase1_step3` | `eval/loss` |
+| Step 3 (or 2.5/2 fallback) → Step 4 | `bgkit_checkpoint` | `phase1_step3` → `phase1_step2p5` → `phase1_step2` | `phase1_step4` | `eval/loss` |
 | Step 4 → Step 5 | `step1_checkpoint` | `phase1_step4` | `phase1_step5` | `eval/loss` |
 | Step 5 → Step 6 | `step1_checkpoint` | `phase1_step5` | `phase1_step6` | `eval/loss` |
 
-**Training phase pipeline**: Joint Block Pretrain → Phase 1 Steps 1-6 (compression pre-training on code; Step 3 is QA-conditioned head supervision, Steps 4–6 are reconstruction / commit encoding / multi-objective compression) → Phase 2 (single-doc KR Steps 1-4, KB-scale KR Stages A/B/C, Track B git history, Track C user memory) → Phase 3 (agentic distillation from SWE-bench trajectories). The decoder is **Qwen3.5-0.8B throughout** — bgkit does not train any larger in-house target LLM.
+**Step 2.5 (projection embed-anchor repair)**: Fixes the large-norm / orthogonal-direction drift between the encoder's projection output and the decoder's token-embedding manifold (diagnosed via `scripts/analyze_embedding_deviation.py` on 2026-04-17). Freezes compressor + decoder, retrains only `projection_block` (~19 M params) with MSE + cosine + log-norm loss against `decoder.embed_tokens(content_ids)` at `target_ratio=None`. `DecoderInitTrainer._resolve_bgkit_checkpoint` prefers `phase1_step2p5` for Step 3 and silently falls back to `phase1_step2` if no 2p5 checkpoint is registered — so this step is optional in the pipeline but, once present, is picked up automatically. Step 3 loads its encoder from Step 2.5 but sets `training.load_decoder_from_bgkit_checkpoint: false` — the Step 1 decoder (adapted to the pre-repair off-manifold projection) is discarded, and a fresh HF Qwen3.5-0.8B decoder is re-adapted via LoRA against the repaired projection under the Step 3 compression curriculum.
+
+**Training phase pipeline**: Joint Block Pretrain → Phase 1 Steps 1-6 (compression pre-training on code; Step 3 is LoRA reconstruction with compression curriculum 0.95→0.10, Step 4 is QA-conditioned head supervision, Steps 5–6 are commit encoding / multi-objective compression) → Phase 2 (single-doc KR Steps 1-4, KB-scale KR Stages A/B/C, Track B git history, Track C user memory) → Phase 3 (agentic distillation from SWE-bench trajectories). The decoder is **Qwen3.5-0.8B throughout** — bgkit does not train any larger in-house target LLM.
 
 **Survivorship head (2026-04-16 single-head)**: Phase 1 Step 3+ and Phase 2 use a **single head per level** inside the encoder (at layer 7 / pruned block 1):
 

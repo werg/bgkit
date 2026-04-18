@@ -1,0 +1,82 @@
+# Phase 1 Step 2.5: Projection embed-anchor repair.
+#
+# Re-trains only the encoder's projection block (~19 M params) so that
+# its output lands on the decoder's token-embedding manifold, fixing
+# the norm / direction drift discovered by
+# scripts/analyze_embedding_deviation.py.
+#
+# Everything else (compressor, decoder) stays frozen. Primary loss is
+# MSE against decoder.embed_tokens(content_ids) at every valid content
+# position (target_ratio=None, no compression). Optional cosine + norm
+# auxiliaries give direction / scale signals independent of MSE
+# magnitude. Optional end-to-end CE keeps the projection useful for
+# reconstruction.
+phase: phase1_step2p5
+# AdamW (not Muon): the repair needs to shrink projection output norm
+# by ~100×, which Muon's unit-spectral-norm orthogonalized updates
+# cannot do efficiently. AdamW's per-coordinate scaling lets the
+# optimizer directly shrink specific weight directions. First attempt
+# with Muon (2026-04-17) drove norm_ratio UP from 57→104 and loss
+# from 6.4→9.5 over 150 steps before we switched.
+optimizer: adamw
+# Run history (2026-04-17):
+#   #1 lr=1e-3 projection-only: peaked cos_sim=0.32 at step 1000,
+#      regressed to 0.23 by step 1200.
+#   #2 lr=3e-4 projection-only resume: drifted to cos_sim=0.16 by
+#      step 1800 post-warmup. Confirmed the projection block alone
+#      cannot exceed cos_sim ≈ 0.3 — the compressor's frozen features
+#      don't have enough rotation-ready structure.
+#   #3 (this run): unfreeze the compressor's last 2 blocks (tail +
+#      final full-attention block) for more rotation capacity. Resume
+#      from step 1400 (cos_sim=0.22, on-disk best — step 1000's peak
+#      was pruned).
+max_steps: 6000
+lr: 3.0e-4
+projection_lr: 3.0e-4
+# Compressor blocks share projection's LR. The initial run #3 used
+# 3e-5 (10× lower) as a "safety" value, but compressor updates were
+# too small to break the cos_sim ≈ 0.2 plateau over 600 steps with
+# norm already matched and MSE tiny. Matching projection LR lets the
+# compressor actually reshape its features.
+compressor_lr: 3.0e-4
+# Unfreeze the last 2 blocks of the pruned compressor backbone:
+# blocks[-1] (tail block: conv + 2 MLPs, ~25 M params) and blocks[-2]
+# (last full block with FullAttn, ~30 M params). Together ~55 M params
+# of additional rotation capacity on top of projection_block's 19 M.
+unfreeze_compressor_final_blocks: 2
+warmup_steps: 500
+resume_warmup_steps: 500
+reset_schedule: true
+max_batch_tokens: 32768
+gradient_accumulation_steps: 1
+max_eval_samples: 1000
+eval_every: 200
+save_every: 200
+
+use_liger: true
+use_liger_rmsnorm: false
+
+# Primary embed-anchor loss.
+anchor_weight: 1.0
+# Auxiliary direction loss. Useful early when MSE is dominated by the
+# norm gap; cosine keeps gradients on the direction even while scale
+# is collapsing.
+cos_weight: 0.5
+# Norm-match (log-ratio squared). Targets the 112× norm blowup
+# directly — without this the MSE does collapse scale but slowly.
+norm_weight: 0.2
+# Reconstruction CE through the frozen decoder. Off by default for the
+# first sanity-check run — turn on (e.g. 0.5) once the anchor loss is
+# dropping, to ensure the projection remains useful rather than just
+# copying dec_emb(id) exactly.
+ce_weight: 0.0
+
+reset_wandb: true
+
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/anchor_mse
+early_stopping:
+  enabled: false

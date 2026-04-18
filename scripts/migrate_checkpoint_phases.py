@@ -36,13 +36,23 @@ from pathlib import Path
 #                     phase1_step3 (LoRA recon)      -> phase1_step4
 #                     — making room for the new phase1_step3
 #                       (QA-conditioned head supervision).
+#   v4 (2026-04-17):  phase1_step4 (LoRA recon)      -> phase1_step3_legacy
+#                     — the v3 QA-as-Step-3 ordering was reverted after
+#                       the 2026-04-17 Step 2.5 projection repair.
+#                       The Step 3 slot returns to LoRA reconstruction
+#                       (now cold-started on a fresh decoder against the
+#                       repaired projection); QA-conditioned supervision
+#                       moves to Step 4. Existing phase1_step4_* dirs
+#                       hold the pre-repair LoRA-recon run and must not
+#                       auto-resolve as either new Step 3 (stale
+#                       encoder / decoder adaptation) or new Step 4
+#                       (wrong objective). Renaming to
+#                       ``phase1_step3_legacy`` removes them from both.
 #
 # Iteration order matters: main() reverse-sorts directory names so a
 # freshly-renamed step4 never re-matches a step3 rule mid-pass.
 RENAME_MAP = {
-    "phase1_step5": "phase1_step6",  # multi-objective compression
-    "phase1_step4": "phase1_step5",  # commit encoding
-    "phase1_step3": "phase1_step4",  # LoRA reconstruction
+    "phase1_step4": "phase1_step3_legacy",  # v4 (2026-04-17): disowns pre-repair LoRA recon
 }
 
 

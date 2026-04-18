@@ -240,11 +240,24 @@ class DecoderInitTrainer(BaseTrainer):
         )
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
 
-        # Load decoder weights from bgkit checkpoint if available (step 2 includes decoder)
+        # Load decoder weights from bgkit checkpoint if available (step 2 includes decoder).
+        # ``load_decoder_from_bgkit_checkpoint: false`` skips this and keeps the
+        # fresh HF base decoder — used by Step 3 after the Step 2.5 projection
+        # repair so the decoder re-adapts against the repaired projection under
+        # the Step 3 compression curriculum rather than carrying forward the
+        # Step 1 decoder that was trained against the pre-repair (off-manifold)
+        # projection.
+        load_decoder = bool(tcfg.get("load_decoder_from_bgkit_checkpoint", True))
         if self._bgkit_decoder_state is not None:
-            self.decoder.load_state_dict(self._bgkit_decoder_state)
+            if load_decoder:
+                self.decoder.load_state_dict(self._bgkit_decoder_state)
+                logger.info("loaded_decoder_from_bgkit_checkpoint")
+            else:
+                logger.info(
+                    "skipped_decoder_load_from_bgkit_checkpoint_per_config",
+                    reason="training.load_decoder_from_bgkit_checkpoint=false",
+                )
             del self._bgkit_decoder_state
-            logger.info("loaded_decoder_from_bgkit_checkpoint")
 
         # Optional LoRA wrapping for decoder (step 3 uses this for parameter-efficient adaptation)
         self._decoder_lora = False
@@ -617,24 +630,46 @@ class DecoderInitTrainer(BaseTrainer):
     def _resolve_bgkit_checkpoint(self) -> str | None:
         """Resolve bgkit_checkpoint: 'auto' -> best from preceding phase.
 
-        For phase1_step1: resolves from joint_block_pretrain.
-        For phase1_step3 (QA-conditioned head supervision) and phase1_step4
-        (LoRA reconstruction): both resolve from phase1_step2 (pruned
-        encoder). Once phase1_step3 has been trained and produces stable
-        checkpoints, phase1_step4 should be updated to resolve from
-        phase1_step3 instead.
+        Resolution by phase:
+          - phase1_step1: joint_block_pretrain.
+          - phase1_step3 (reconstruction with compression curriculum):
+            prefer phase1_step2p5 (projection embed-anchor repair),
+            fall back to phase1_step2 (pruned encoder).
+          - phase1_step4 (QA-conditioned head supervision): phase1_step3
+            (the reconstruction-trained encoder + LoRA decoder). Falls
+            back to phase1_step2p5 / phase1_step2 only if no Step 3
+            checkpoint is registered — logged prominently because QA
+            training on the bare pruned encoder is not the intended flow.
         """
         bgkit_checkpoint = self.cfg.get("bgkit_checkpoint", None)
         if bgkit_checkpoint == "auto":
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
             phase = self.cfg.training.get("phase", "phase1_step1")
-            if phase in ("phase1_step3", "phase1_step4"):
-                resolved = resolve_checkpoint(
-                    checkpoint_dir,
-                    phase="phase1_step2",
-                    metric="eval/loss",
-                    label="bgkit_checkpoint",
+            if phase == "phase1_step3":
+                resolved = self._resolve_step2p5_with_step2_fallback(
+                    checkpoint_dir, phase
                 )
+            elif phase == "phase1_step4":
+                try:
+                    resolved = resolve_checkpoint(
+                        checkpoint_dir,
+                        phase="phase1_step3",
+                        metric="eval/loss",
+                        label="bgkit_checkpoint",
+                    )
+                    logger.info(
+                        "resolved_from_phase1_step3",
+                        phase=phase,
+                        checkpoint=resolved.name,
+                    )
+                except ValueError:
+                    logger.warning(
+                        "no_phase1_step3_checkpoint_falling_back_to_2p5_or_2",
+                        phase=phase,
+                    )
+                    resolved = self._resolve_step2p5_with_step2_fallback(
+                        checkpoint_dir, phase
+                    )
             else:
                 resolved = resolve_checkpoint(
                     checkpoint_dir,
@@ -649,6 +684,39 @@ class DecoderInitTrainer(BaseTrainer):
             self._input_sources["bgkit"] = Path(bgkit_checkpoint).name
 
         return bgkit_checkpoint
+
+    def _resolve_step2p5_with_step2_fallback(
+        self, checkpoint_dir: Path, phase: str
+    ) -> Path:
+        """Prefer phase1_step2p5, fall back to phase1_step2.
+
+        Step 2.5 re-anchors the projection to decoder.embed_tokens;
+        skipping it bakes the off-manifold equilibrium into the caller.
+        """
+        try:
+            resolved = resolve_checkpoint(
+                checkpoint_dir,
+                phase="phase1_step2p5",
+                metric="eval/loss",
+                label="bgkit_checkpoint",
+            )
+            logger.info(
+                "resolved_from_phase1_step2p5",
+                phase=phase,
+                checkpoint=resolved.name,
+            )
+            return resolved
+        except ValueError:
+            logger.info(
+                "no_phase1_step2p5_checkpoint_falling_back_to_step2",
+                phase=phase,
+            )
+            return resolve_checkpoint(
+                checkpoint_dir,
+                phase="phase1_step2",
+                metric="eval/loss",
+                label="bgkit_checkpoint",
+            )
 
     # ------------------------------------------------------------------
     # Freeze / unfreeze management
