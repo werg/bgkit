@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,58 @@ from bgkit.training.live_config import LiveConfig
 from bgkit.training.scheduling import cosine_with_warmup
 
 logger = structlog.get_logger()
+
+
+def _collect_memory_diagnostics() -> dict[str, float]:
+    """Collect memory-usage metrics for leak/fragmentation diagnosis.
+
+    On DGX Spark / GB10 the GPU and CPU share one 128 GB pool, so a
+    training-side leak surfaces as system-memory thrashing rather than a
+    discrete OOM. The Phase 1 Step 3 run on 2026-04-18 hit a hard stall
+    at ~step 2350 after Python ingested 119 GB of unified memory — this
+    helper makes that growth visible before the allocator can't satisfy
+    the next kernel launch.
+
+    Returns floats (GB for memory, raw for counts) in a metrics-friendly
+    shape. Gated cheaply enough to call every log step; the torch
+    allocator queries are O(1) internal reads.
+    """
+    import torch
+
+    out: dict[str, float] = {}
+    if torch.cuda.is_available():
+        out["mem/cuda_allocated_gb"] = torch.cuda.memory_allocated() / 1e9
+        out["mem/cuda_reserved_gb"] = torch.cuda.memory_reserved() / 1e9
+        out["mem/cuda_max_allocated_gb"] = (
+            torch.cuda.max_memory_allocated() / 1e9
+        )
+        out["mem/cuda_max_reserved_gb"] = (
+            torch.cuda.max_memory_reserved() / 1e9
+        )
+    # Process RSS / VSZ from /proc/self/statm (fast, kernel-maintained).
+    try:
+        with open("/proc/self/statm") as f:
+            fields = f.read().split()
+        page_size = os.sysconf("SC_PAGESIZE")
+        out["mem/proc_rss_gb"] = int(fields[1]) * page_size / 1e9
+        out["mem/proc_vsz_gb"] = int(fields[0]) * page_size / 1e9
+    except (OSError, ValueError, IndexError):
+        pass
+    # System-wide free memory — lets us see the unified pool shrinking.
+    try:
+        with open("/proc/meminfo") as f:
+            meminfo = {
+                k.strip(): v.strip()
+                for k, v in (line.split(":", 1) for line in f)
+            }
+        # MemAvailable is KB by convention ("12345 kB") → bytes → GB.
+        avail_kb = int(meminfo["MemAvailable"].split()[0])
+        total_kb = int(meminfo["MemTotal"].split()[0])
+        out["mem/system_available_gb"] = avail_kb * 1024 / 1e9
+        out["mem/system_used_gb"] = (total_kb - avail_kb) * 1024 / 1e9
+    except (OSError, KeyError, ValueError, IndexError):
+        pass
+    return out
 
 
 class _DevicePrefetcher:
@@ -829,6 +882,15 @@ class BaseTrainer(ABC):
                             pg["lr"] for pg in self.optimizer.param_groups
                         )
                     self._add_step_metrics(metrics)
+
+                    # Memory diagnostics — cheap O(1) allocator queries +
+                    # one /proc read. Logged alongside train_step every
+                    # ``memory_log_every`` steps (default 50) so a slow
+                    # leak or allocator-fragmentation curve is visible in
+                    # wandb long before the unified-memory pool thrashes.
+                    mem_log_every = int(tcfg.get("memory_log_every", 50))
+                    if mem_log_every > 0 and step % mem_log_every == 0:
+                        metrics.update(_collect_memory_diagnostics())
 
                     # Log
                     if step % self._log_every == 0:
