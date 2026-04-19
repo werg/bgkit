@@ -139,6 +139,14 @@ services:
       "+experiment=phase1_step3",
       "++compute.attention_implementation=sdpa",
       "++training.max_batch_tokens=24576",
+      # Reattach to the existing wandb run stored in the checkpoint's
+      # training_state (run id 6mwt97ns for the 2026-04-17 Step 3 launch)
+      # instead of starting a fresh run on resume. The config default
+      # reset_wandb=true is the safe choice for a fresh step 3 launch
+      # (prevents accidental reattachment to an unrelated run), but on
+      # an intentional within-run resume we want continuity so the wandb
+      # history shows one continuous training curve.
+      "++training.reset_wandb=false",
     ]
 
   train-phase1-step4:
