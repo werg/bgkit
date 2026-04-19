@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
+import torch
 from omegaconf import OmegaConf
 
 from bgkit.training.checkpoint_manager import CheckpointManager
@@ -470,6 +471,80 @@ class BaseTrainer(ABC):
         metrics["grad_norm"] = grad_norm
         return metrics
 
+    def _named_parameters_for_optimizer(self):
+        """Yield ``(name, param)`` pairs for every param the optimizer tracks.
+
+        Used by the name-keyed optimizer state-dict save/load path so a
+        resume can survive param-group topology changes (LoRA toggling,
+        freeze flips, LoRA adapters added/removed, etc.). PyTorch's native
+        ``optimizer.load_state_dict`` requires exact param-group count
+        match and silently bails otherwise — we saw this fail when the
+        LoRA freeze fix changed Step 3's decoder topology between save
+        and load, discarding 2 000 steps of Muon momentum.
+
+        Default walks ``self.model.named_parameters()`` with a ``model.``
+        prefix. Subclasses with multi-module structures (e.g.
+        encoder + decoder + projection) override to yield from each
+        module with distinct prefixes. Names must be **stable across code
+        changes** — anchored to module structure, not to anything that
+        could renumber between runs.
+        """
+        if hasattr(self, "model") and isinstance(self.model, torch.nn.Module):
+            for name, param in self.model.named_parameters():
+                yield f"model.{name}", param
+        else:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no ``self.model`` attribute; "
+                "override ``_named_parameters_for_optimizer()`` to yield "
+                "(name, param) pairs across all trainable modules.",
+            )
+
+    def _build_optimizer_state_by_name(self) -> dict:
+        """Produce a ``{param_name: per_param_state}`` dict from the optimizer.
+
+        PyTorch's optimizer keys its per-parameter state by ``id(param)``,
+        stable only within one process. Serializing the native state
+        produces ``param_groups`` with integer ``params`` indices that
+        depend on build order — fatal under any topology change. This
+        method re-keys by stable module-path name instead, so the saved
+        state survives param-group rebuilds.
+        """
+        state_by_name: dict = {}
+        for name, param in self._named_parameters_for_optimizer():
+            if param in self.optimizer.state:
+                # Copy the per-param state dict so the saved tensor isn't
+                # aliased to the live optimizer buffer (torch.save will
+                # serialize whatever we hand it, but an aliased dict is
+                # fragile if the optimizer mutates mid-serialization).
+                state_by_name[name] = dict(self.optimizer.state[param])
+        return state_by_name
+
+    def _restore_optimizer_state_by_name(self, state_by_name: dict) -> None:
+        """Install name-keyed optimizer state into the current optimizer.
+
+        For each ``(name, param)`` the current optimizer tracks, if
+        ``name`` appears in ``state_by_name`` we copy the saved
+        per-parameter state into ``self.optimizer.state[param]``. Params
+        with no saved state keep fresh moments. Names present in the save
+        but absent from the current topology are silently dropped. Logs
+        counts for visibility.
+        """
+        matched = 0
+        new = 0
+        for name, param in self._named_parameters_for_optimizer():
+            if name in state_by_name:
+                self.optimizer.state[param] = state_by_name[name]
+                matched += 1
+            else:
+                new += 1
+        skipped = len(state_by_name) - matched
+        logger.info(
+            "optimizer_state_restored_by_name",
+            matched=matched,
+            new=new,
+            skipped=skipped,
+        )
+
     def save_checkpoint(
         self, checkpoint_dir: Path, metrics: dict[str, float] | None = None
     ) -> Path:
@@ -488,7 +563,7 @@ class BaseTrainer(ABC):
             checkpoint_dir,
             metadata,
             model=self.model.state_dict(),
-            optimizer=self.optimizer.state_dict(),
+            optimizer_state_by_name=self._build_optimizer_state_by_name(),
         )
         self._last_checkpoint_path = str(ckpt_path)
         return ckpt_path
@@ -510,16 +585,16 @@ class BaseTrainer(ABC):
         metadata, state_dicts = load_checkpoint(checkpoint_path)
         self._check_optimizer_type_compat(metadata)
         self.model.load_state_dict(state_dicts["model"])
-        if "optimizer" in state_dicts:
-            try:
-                self.optimizer.load_state_dict(state_dicts["optimizer"])
-            except (ValueError, KeyError, RuntimeError) as e:
-                logger.warning(
-                    "optimizer_state_load_failed",
-                    error=str(e),
-                    hint="optimizer topology changed (e.g. old checkpoint resumed "
-                    "with different optimizer type); fresh optimizer moments",
-                )
+        if "optimizer_state_by_name" in state_dicts:
+            self._restore_optimizer_state_by_name(
+                state_dicts["optimizer_state_by_name"],
+            )
+        else:
+            logger.warning(
+                "optimizer_state_missing_using_fresh_moments",
+                hint="checkpoint predates the name-keyed optimizer state "
+                "refactor; resuming with fresh moments",
+            )
         self.global_step = metadata.step
         self.epoch = metadata.epoch
         self._last_checkpoint_path = str(checkpoint_path)

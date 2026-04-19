@@ -1653,7 +1653,7 @@ class DecoderInitTrainer(BaseTrainer):
         save_kwargs = dict(
             encoder=self.encoder.state_dict(),
             decoder=self.decoder.state_dict(),
-            optimizer=self.optimizer.state_dict(),
+            optimizer_state_by_name=self._build_optimizer_state_by_name(),
         )
         # For LoRA: also save a merged decoder state dict so downstream steps
         # can load it as a plain decoder without the PeftModel wrapper.
@@ -1663,6 +1663,24 @@ class DecoderInitTrainer(BaseTrainer):
         ckpt_path = save_checkpoint(checkpoint_dir, metadata, **save_kwargs)
         self._last_checkpoint_path = str(ckpt_path)
         return ckpt_path
+
+    def _named_parameters_for_optimizer(self):
+        """Yield (name, param) pairs across encoder, decoder, projection_block.
+
+        Names are stable module paths within each top-level component; the
+        top-level prefix disambiguates the three modules. Matches the set
+        of params ``_build_decoder_param_groups`` /
+        ``_build_encoder_param_groups`` / ``_build_projection_param_groups``
+        feed to the optimizer. Required by BaseTrainer's name-keyed
+        optimizer state save/load so Step 3 can survive LoRA toggling or
+        freeze-flag changes between save and load.
+        """
+        for name, param in self.encoder.named_parameters():
+            yield f"encoder.{name}", param
+        for name, param in self.decoder.named_parameters():
+            yield f"decoder.{name}", param
+        # projection_block lives under encoder; already covered above.
+        # Listed here only for trainers where it becomes a separate module.
 
     def load_checkpoint(self, checkpoint_path: Path) -> None:
         """Load both BgKIT encoder and decoder models + curriculum state."""
@@ -1699,16 +1717,16 @@ class DecoderInitTrainer(BaseTrainer):
         # Recompute freeze state + rebuild optimizer from restored global_step
         self._configure_trainable_state()
 
-        # Load optimizer state
-        if "optimizer" in state_dicts:
-            try:
-                self.optimizer.load_state_dict(state_dicts["optimizer"])
-            except (ValueError, KeyError, RuntimeError) as e:
-                logger.warning(
-                    "optimizer_state_load_failed",
-                    error=str(e),
-                    hint="config topology may have changed between runs; "
-                    "optimizer state reset, training continues with fresh moments",
+        # Load optimizer state (name-keyed, survives topology changes)
+        if "optimizer_state_by_name" in state_dicts:
+            self._restore_optimizer_state_by_name(
+                state_dicts["optimizer_state_by_name"],
+            )
+        else:
+            logger.warning(
+                "optimizer_state_missing_using_fresh_moments",
+                hint="checkpoint predates the name-keyed optimizer state "
+                "refactor; resuming with fresh moments",
                 )
 
         logger.info("restored_from_checkpoint", step=self.global_step)

@@ -2266,15 +2266,15 @@ class KRKBTrainer(BaseTrainer):
                 path=str(checkpoint_path),
             )
 
-        if "optimizer" in state_dicts:
-            try:
-                self.optimizer.load_state_dict(state_dicts["optimizer"])
-            except (ValueError, KeyError, RuntimeError) as e:
-                logger.warning(
-                    "optimizer_state_load_failed",
-                    error=str(e),
-                    hint="optimizer topology changed; fresh optimizer moments",
-                )
+        if "optimizer_state_by_name" in state_dicts:
+            self._restore_optimizer_state_by_name(
+                state_dicts["optimizer_state_by_name"],
+            )
+        else:
+            logger.warning(
+                "optimizer_state_missing_using_fresh_moments",
+                hint="checkpoint predates the name-keyed optimizer state refactor",
+            )
         self.global_step = metadata.step
         self.epoch = metadata.epoch
         self._last_checkpoint_path = str(checkpoint_path)

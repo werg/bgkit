@@ -498,13 +498,24 @@ class ProjectionRepairTrainer(BaseTrainer):
         )
         save_kwargs = dict(
             encoder=self.encoder.state_dict(),
-            optimizer=self.optimizer.state_dict(),
+            optimizer_state_by_name=self._build_optimizer_state_by_name(),
         )
         if self._decoder_state_dict is not None:
             save_kwargs["decoder"] = self._decoder_state_dict
         ckpt_path = save_checkpoint(checkpoint_dir, metadata, **save_kwargs)
         self._last_checkpoint_path = str(ckpt_path)
         return ckpt_path
+
+    def _named_parameters_for_optimizer(self):
+        """Yield (name, param) pairs for the encoder only.
+
+        Step 2.5 freezes the decoder and only trains ``projection_block``
+        inside the encoder (plus optionally the final compressor blocks).
+        Decoder state is passed through unchanged from the Step 2 source
+        checkpoint and carries no optimizer state.
+        """
+        for name, param in self.encoder.named_parameters():
+            yield f"encoder.{name}", param
 
     def load_checkpoint(self, checkpoint_path: Path) -> None:
         metadata, state_dicts = load_checkpoint(checkpoint_path)
@@ -520,11 +531,12 @@ class ProjectionRepairTrainer(BaseTrainer):
             self._schedule_params = metadata.schedule_params
         if metadata.training_state is not None:
             self._training_state = metadata.training_state
-        if "optimizer" in state_dicts:
-            try:
-                self.optimizer.load_state_dict(state_dicts["optimizer"])
-            except (ValueError, KeyError, RuntimeError) as e:
-                logger.warning(
-                    "optimizer_state_load_failed", error=str(e),
-                    hint="fresh moments",
-                )
+        if "optimizer_state_by_name" in state_dicts:
+            self._restore_optimizer_state_by_name(
+                state_dicts["optimizer_state_by_name"],
+            )
+        else:
+            logger.warning(
+                "optimizer_state_missing_using_fresh_moments",
+                hint="checkpoint predates the name-keyed optimizer state refactor",
+            )

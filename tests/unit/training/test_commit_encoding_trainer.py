@@ -330,7 +330,7 @@ class TestCheckpoint:
         # Verify multi-artifact format
         assert (ckpt_path / "encoder.pt").exists()
         assert (ckpt_path / "decoder.pt").exists()
-        assert (ckpt_path / "optimizer.pt").exists()
+        assert (ckpt_path / "optimizer_state_by_name.pt").exists()
         assert (ckpt_path / "metadata.json").exists()
 
     def test_checkpoint_roundtrip(self, trainer, tmp_path):

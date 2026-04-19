@@ -470,31 +470,37 @@ class JointBlockTrainer(BaseTrainer):
             checkpoint_dir,
             metadata,
             encoder=self.encoder.state_dict(),
-            optimizer=self.optimizer.state_dict(),
+            optimizer_state_by_name=self._build_optimizer_state_by_name(),
         )
         self._last_checkpoint_path = str(ckpt_path)
         return ckpt_path
+
+    def _named_parameters_for_optimizer(self):
+        """Yield (name, param) pairs across the encoder only."""
+        for name, param in self.encoder.named_parameters():
+            yield f"encoder.{name}", param
 
     def load_checkpoint(self, checkpoint_path: Path) -> None:
         """Load encoder state dict and restore training state.
 
         Raises on optimizer type mismatch (e.g. checkpoint saved with adamw,
         config now says muon). Topology mismatches within the same optimizer
-        type (e.g. switching heads_only mode) are warned and the optimizer
-        starts fresh.
+        type (e.g. switching heads_only mode) now preserve per-param
+        moments where names match — the name-keyed optimizer state
+        refactor replaces the old all-or-nothing native load.
         """
         metadata, state_dicts = load_checkpoint(checkpoint_path)
         self._check_optimizer_type_compat(metadata)
         self.encoder.load_state_dict(state_dicts["encoder"])
-        if "optimizer" in state_dicts:
-            try:
-                self.optimizer.load_state_dict(state_dicts["optimizer"])
-            except (ValueError, KeyError, RuntimeError) as e:
-                logger.warning(
-                    "optimizer_state_load_failed",
-                    error=str(e),
-                    hint="config topology may have changed; fresh optimizer moments",
-                )
+        if "optimizer_state_by_name" in state_dicts:
+            self._restore_optimizer_state_by_name(
+                state_dicts["optimizer_state_by_name"],
+            )
+        else:
+            logger.warning(
+                "optimizer_state_missing_using_fresh_moments",
+                hint="checkpoint predates the name-keyed optimizer state refactor",
+            )
         self.global_step = metadata.step
         self.epoch = metadata.epoch
         self._last_checkpoint_path = str(checkpoint_path)

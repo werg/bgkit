@@ -1463,7 +1463,7 @@ class CommitEncodingTrainer(BaseTrainer):
         save_kwargs = dict(
             encoder=self.encoder.state_dict(),
             decoder=self.decoder.state_dict(),
-            optimizer=self.optimizer.state_dict(),
+            optimizer_state_by_name=self._build_optimizer_state_by_name(),
         )
         if getattr(self, "_decoder_lora", False):
             save_kwargs["decoder_merged"] = self.decoder.merge_lora()
@@ -1471,6 +1471,13 @@ class CommitEncodingTrainer(BaseTrainer):
         ckpt_path = save_checkpoint(checkpoint_dir, metadata, **save_kwargs)
         self._last_checkpoint_path = str(ckpt_path)
         return ckpt_path
+
+    def _named_parameters_for_optimizer(self):
+        """Yield (name, param) pairs across encoder + decoder."""
+        for name, param in self.encoder.named_parameters():
+            yield f"encoder.{name}", param
+        for name, param in self.decoder.named_parameters():
+            yield f"decoder.{name}", param
 
     def load_checkpoint(self, checkpoint_path: Path) -> None:
         """Load checkpoint and restore all training state."""
@@ -1494,12 +1501,16 @@ class CommitEncodingTrainer(BaseTrainer):
         if "decoder" in state_dicts:
             self.decoder.load_state_dict(state_dicts["decoder"])
 
-        # Restore optimizer
-        if "optimizer" in state_dicts:
-            try:
-                self.optimizer.load_state_dict(state_dicts["optimizer"])
-            except (ValueError, KeyError, RuntimeError) as e:
-                logger.warning("optimizer_state_load_failed", error=str(e))
+        # Restore optimizer (name-keyed, survives topology changes)
+        if "optimizer_state_by_name" in state_dicts:
+            self._restore_optimizer_state_by_name(
+                state_dicts["optimizer_state_by_name"],
+            )
+        else:
+            logger.warning(
+                "optimizer_state_missing_using_fresh_moments",
+                hint="checkpoint predates the name-keyed optimizer state refactor",
+            )
 
         logger.info("restored_from_checkpoint", step=self.global_step)
 

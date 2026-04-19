@@ -699,7 +699,7 @@ class PruningDistillTrainer(BaseTrainer):
 
         save_kwargs = dict(
             encoder=self.student_encoder.state_dict(),
-            optimizer=self.optimizer.state_dict(),
+            optimizer_state_by_name=self._build_optimizer_state_by_name(),
         )
         # Pass through decoder from original step1 checkpoint (unchanged)
         if self._decoder_state_dict is not None:
@@ -708,6 +708,15 @@ class PruningDistillTrainer(BaseTrainer):
         ckpt_path = save_checkpoint(checkpoint_dir, metadata, **save_kwargs)
         self._last_checkpoint_path = str(ckpt_path)
         return ckpt_path
+
+    def _named_parameters_for_optimizer(self):
+        """Yield (name, param) pairs across the student encoder only.
+
+        The decoder is pass-through from step 1 (frozen, no optimizer
+        state) so it's excluded.
+        """
+        for name, param in self.student_encoder.named_parameters():
+            yield f"encoder.{name}", param
 
     def load_checkpoint(self, checkpoint_path: Path) -> None:
         """Load step1a checkpoint: restore student encoder + stage state."""
@@ -748,14 +757,15 @@ class PruningDistillTrainer(BaseTrainer):
         self._advance_to_current_stage()
         self._setup_optimizer()
 
-        # Load optimizer state
-        if "optimizer" in state_dicts:
-            try:
-                self.optimizer.load_state_dict(state_dicts["optimizer"])
-            except (ValueError, KeyError, RuntimeError) as e:
-                logger.warning(
-                    "optimizer_state_load_failed", error=str(e),
-                    hint="stage topology may have changed; fresh optimizer moments",
-                )
+        # Load optimizer state (name-keyed, survives topology changes)
+        if "optimizer_state_by_name" in state_dicts:
+            self._restore_optimizer_state_by_name(
+                state_dicts["optimizer_state_by_name"],
+            )
+        else:
+            logger.warning(
+                "optimizer_state_missing_using_fresh_moments",
+                hint="checkpoint predates the name-keyed optimizer state refactor",
+            )
 
         logger.info("restored_from_checkpoint", step=self.global_step, stage=self._current_stage)

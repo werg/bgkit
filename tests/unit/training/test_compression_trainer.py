@@ -461,7 +461,7 @@ class TestCheckpointRoundtrip:
         assert (Path(ckpt_path) / "metadata.json").exists()
         assert (Path(ckpt_path) / "encoder.pt").exists()
         assert (Path(ckpt_path) / "decoder.pt").exists()
-        assert (Path(ckpt_path) / "optimizer.pt").exists()
+        assert (Path(ckpt_path) / "optimizer_state_by_name.pt").exists()
 
         # Mutate state
         trainer.global_step = 0
