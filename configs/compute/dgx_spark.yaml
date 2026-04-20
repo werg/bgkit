@@ -6,7 +6,10 @@ mixed_precision: bf16
 # Gradient checkpointing across BgKIT encoder levels and the 0.8B decoder
 gradient_checkpointing: true
 # Conservative defaults -- must be profiled on actual hardware
-max_seq_len: 8192
+# max_seq_len: 8192 pre-2026-04-19. Lowered to 4096 because decoder
+# splice under target_ratio≈0.9 balloons single-sample seq to 15K
+# tokens and wedges unified memory into page-thrash.
+max_seq_len: 4096
 microbatch_size: 1
 gradient_accumulation_steps: 8
 # Effective batch size = microbatch * gradient_accumulation = 8

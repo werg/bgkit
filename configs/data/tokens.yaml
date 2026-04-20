@@ -1,6 +1,14 @@
 tokens:
   input_dir: ${oc.env:DATA_DIR}/processed/tokens
-  max_seq_len: 8192
+  # Content length hard cap. Lowered 8192→4096 on 2026-04-19 after
+  # the combination of long-content samples + target_ratio=0.92 +
+  # grad_accum=8 produced decoder sequences of ~15K tokens (prefix
+  # + survivors + content + suffix) whose attention matrices wedged
+  # unified memory into page-thrash and killed the host. Halving
+  # content halves decoder seq → ~4× less attention memory. Content
+  # above 4096 tokens is truncated at dataset load; below stays
+  # intact.
+  max_seq_len: 4096
   variant_bank_path: configs/prompt_variants/file_read_repro.json
 
 qa_data_dir: null  # set to ${oc.env:DATA_DIR}/mmap/qa_conditioned when QA data exists
