@@ -1,11 +1,12 @@
-"""Tests for CompressionTrainer: ratio curriculum, L1 gating, resolve wiring.
+"""Tests for CompressionTrainer: ratio curriculum, L1 gating, packed forward.
 
-Under the FA4 packed-attention migration the full ``train_step`` /
-``_forward_backward`` paths need a Qwen3.5-shaped encoder + decoder with
-``_packed_full_attention`` plumbing. The unit tests here cover only the
-pure-Python control plane (curriculum math, L1 rebuild gating, and
-``_resolve_step1_checkpoint``). Forward-pass tests are skipped individually
-and covered by integration tests + live runs.
+Control-plane tests (curriculum math, L1 rebuild gating, checkpoint
+resolve) run standalone. Forward-pass tests exercise the packed
+``_forward_backward`` path via an SDPA monkey-patch of
+``_packed_full_attention`` (FA4 is GPU-only). Repo-batch / mixed-batch
+tests remain skipped — they need multi-level L0 → L1 packing + the
+``CompressionDataset`` object machinery to build valid ``cu_file`` /
+``cu_repo`` batches, which this unit-level suite does not mock.
 """
 
 from __future__ import annotations
@@ -14,16 +15,23 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from pathlib import Path
+from unittest.mock import patch
+
+from omegaconf import OmegaConf
 from torch import nn
 
+from bgkit.data.collators import _collate_file_samples
+from bgkit.data.datasets.compression_dataset import FileCompressionSample
 from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.training.phase1.compression import CompressionTrainer
+from bgkit.training.survivorship_helpers import LevelLossCfg, init_state
 
 # ---------------------------------------------------------------------------
-# Minimal mocks — no forward pass exercised.
+# Mocks — Qwen3.5-shaped packed surface.
 # ---------------------------------------------------------------------------
 
 HIDDEN_DIM = 32
@@ -46,8 +54,22 @@ class MockEncoderBackbone(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def forward(self, inputs_embeds=None, **kwargs):
-        return _Output(last_hidden_state=self.layers[0](inputs_embeds))
+    def forward(
+        self,
+        inputs_embeds=None,
+        cu_seqlens=None,
+        max_seqlen=None,
+        position_ids=None,
+        return_intermediates=False,
+        layer_hooks=None,
+        **kwargs,
+    ):
+        x = inputs_embeds
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if layer_hooks and i in layer_hooks:
+                x = layer_hooks[i](x)
+        return _Output(last_hidden_state=x)
 
 
 class MockSelfAttn(nn.Module):
@@ -111,6 +133,13 @@ class _MockQwen3Model(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
+    def forward(self, inputs_embeds=None, position_ids=None, **kwargs):
+        x = inputs_embeds
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        return _ModelOutput(last_hidden_state=x)
+
 
 class MockCausalLMBackbone(nn.Module):
     def __init__(
@@ -126,6 +155,10 @@ class MockCausalLMBackbone(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def forward(self, inputs_embeds=None, **kwargs):
+        hid = self.model(inputs_embeds=inputs_embeds, **kwargs).last_hidden_state
+        return _CausalLMOutput(logits=self.lm_head(hid))
+
 
 def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
     backbone = MockEncoderBackbone(hidden_dim=hidden_dim)
@@ -140,10 +173,91 @@ def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
     return BgKITEncoder(compressor, projection_block)
 
 
+# ---------------------------------------------------------------------------
+# SDPA packed-attention shim (FA4 is GPU-only).
+# ---------------------------------------------------------------------------
+
+
+def _sdpa_packed_attention(
+    self_attn,
+    hidden_states,
+    position_embeddings,
+    cu_seqlens,
+    max_seqlen,
+    position_ids,
+    is_causal,
+):
+    from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
+
+    n = hidden_states.shape[0]
+    head_dim = self_attn.head_dim
+    n_heads = self_attn.q_proj.out_features // (head_dim * 2)
+    n_kv_heads = self_attn.k_proj.out_features // head_dim
+
+    qg = self_attn.q_proj(hidden_states).view(n, n_heads, 2 * head_dim)
+    q, gate = torch.chunk(qg, 2, dim=-1)
+    gate = gate.reshape(n, n_heads * head_dim)
+    k = self_attn.k_proj(hidden_states).view(n, n_kv_heads, head_dim)
+    v = self_attn.v_proj(hidden_states).view(n, n_kv_heads, head_dim)
+    q = self_attn.q_norm(q)
+    k = self_attn.k_norm(k)
+
+    q4 = q.transpose(0, 1).unsqueeze(0)
+    k4 = k.transpose(0, 1).unsqueeze(0)
+    cos, sin = position_embeddings
+    q4, k4 = apply_rotary_pos_emb(q4, k4, cos, sin, unsqueeze_dim=1)
+    q = q4.squeeze(0).transpose(0, 1).contiguous()
+    k = k4.squeeze(0).transpose(0, 1).contiguous()
+    v = v.contiguous()
+
+    if n_kv_heads < n_heads:
+        repeat = n_heads // n_kv_heads
+        k = k.repeat_interleave(repeat, dim=1)
+        v = v.repeat_interleave(repeat, dim=1)
+
+    cu = cu_seqlens.tolist()
+    outs: list[torch.Tensor] = []
+    for b in range(len(cu) - 1):
+        start, end = int(cu[b]), int(cu[b + 1])
+        if end == start:
+            continue
+        qb = q[start:end].transpose(0, 1).unsqueeze(0)
+        kb = k[start:end].transpose(0, 1).unsqueeze(0)
+        vb = v[start:end].transpose(0, 1).unsqueeze(0)
+        ob = torch.nn.functional.scaled_dot_product_attention(
+            qb, kb, vb, attn_mask=None, is_causal=is_causal, scale=self_attn.scaling,
+        )
+        outs.append(ob.squeeze(0).transpose(0, 1))
+    attn_out = torch.cat(outs, dim=0)
+    attn_out = attn_out.reshape(n, n_heads * head_dim).contiguous()
+    attn_out = attn_out * torch.sigmoid(gate)
+    return self_attn.o_proj(attn_out)
+
+
+@pytest.fixture(autouse=True)
+def _patch_packed_attention(monkeypatch):
+    from bgkit.models import (
+        bidirectional_qwen35 as bq,
+    )
+    from bgkit.models import (
+        projection_block as pb,
+    )
+    from bgkit.models import (
+        pruned_qwen35 as pq,
+    )
+
+    monkeypatch.setattr(bq, "_packed_full_attention", _sdpa_packed_attention)
+    monkeypatch.setattr(pb, "_packed_full_attention", _sdpa_packed_attention)
+    monkeypatch.setattr(pq, "_packed_full_attention", _sdpa_packed_attention)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures.
+# ---------------------------------------------------------------------------
+
+
 @pytest.fixture()
 def trainer():
-    from omegaconf import OmegaConf
-
     cfg = OmegaConf.create({
         "training": {
             "phase": "phase1_step6",
@@ -189,11 +303,61 @@ def trainer():
     t._is_evaluating = False
     t._eval_count = 0
     t._profile_enabled = False
+    t._accum_steps = 1
 
     t._ratio_loss_weight = 0.1
     t._decisiveness_loss_weight = 0.05
 
+    # Survivorship helper state expected by the file path.
+    t._surv_l0 = LevelLossCfg()
+    t._surv_l1 = LevelLossCfg()
+    t._ice_l0 = None
+    t._ice_l1 = None
+    t._ref_moments_l0 = None
+    t._ref_moments_l1 = None
+    t._ice_teacher = None
+    t._surv_state_l0 = init_state()
+    t._surv_state_l1 = init_state()
+    t._last_post_step_metrics = {}
+
     return t
+
+
+def _make_file_sample(
+    content_len: int = 4,
+    prefix_len: int = 2,
+    suffix_len: int = 2,
+    prompt_len: int = 2,
+    vocab_size: int = VOCAB_SIZE,
+) -> FileCompressionSample:
+    """Build a single ``FileCompressionSample`` with loss-bearing suffix."""
+    target_len = prefix_len + content_len + suffix_len
+    target_ids = torch.randint(1, vocab_size, (target_len,), dtype=torch.long)
+    target_loss_mask = torch.zeros(target_len, dtype=torch.bool)
+    target_loss_mask[prefix_len + content_len :] = True
+    return FileCompressionSample(
+        objective="reproduce",
+        content_token_ids=torch.randint(
+            1, vocab_size, (content_len,), dtype=torch.long,
+        ),
+        content_attention_mask=torch.ones(content_len, dtype=torch.bool),
+        compression_ratio=1.0,
+        compression_level=0,
+        target_token_ids=target_ids,
+        target_attention_mask=torch.ones(target_len, dtype=torch.bool),
+        target_loss_mask=target_loss_mask,
+        prefix_ids=target_ids[:prefix_len].clone(),
+        compression_prompt_ids=torch.randint(
+            1, vocab_size, (prompt_len,), dtype=torch.long,
+        ),
+        bgkit_splice_start=prefix_len,
+        bgkit_splice_len=content_len,
+    )
+
+
+def _make_file_batch(batch_size: int = 2) -> dict:
+    samples = [_make_file_sample() for _ in range(batch_size)]
+    return _collate_file_samples(samples)
 
 
 # ---------------------------------------------------------------------------
@@ -223,34 +387,106 @@ class TestSetupCreatesComponents:
 
 
 # ---------------------------------------------------------------------------
-# Forward-pass dependent tests — skipped (see module docstring).
+# File-batch train step (packed forward via SDPA shim).
 # ---------------------------------------------------------------------------
 
 
-_FORWARD_SKIP = pytest.mark.skip(
-    reason="Requires packed-attention forward pass; covered by integration tests.",
-)
-
-
-@_FORWARD_SKIP
 class TestTrainStepFileSample:
     def test_returns_expected_metrics(self, trainer):
-        pass
+        batch = _make_file_batch()
+        metrics = trainer._forward_backward(batch)
+        assert "loss" in metrics
+        assert metrics["sample_type"] == "file"
+        assert "actual_ratio" in metrics
+        assert "min_target_ratio" in metrics
 
     def test_loss_is_finite(self, trainer):
-        pass
+        batch = _make_file_batch()
+        metrics = trainer._forward_backward(batch)
+        assert torch.isfinite(torch.tensor(metrics["loss"]))
 
-    def test_encoder_is_trainable(self, trainer):
-        pass
+    def test_encoder_gets_gradients(self, trainer):
+        batch = _make_file_batch()
+        trainer._forward_backward(batch)
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum().item() > 0
+            for p in trainer.encoder.parameters()
+        )
+        assert has_grad
 
     def test_decoder_gets_gradients(self, trainer):
-        pass
+        batch = _make_file_batch()
+        trainer._forward_backward(batch)
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum().item() > 0
+            for p in trainer.decoder.parameters()
+        )
+        assert has_grad
 
-    def test_loss_decreases(self, trainer):
-        pass
+
+# ---------------------------------------------------------------------------
+# Checkpoint state-dict round-trip (save/load the raw dicts — the full
+# ``save_checkpoint`` path exercises metadata + registry I/O which the
+# control-plane suite covers separately).
+# ---------------------------------------------------------------------------
 
 
-@_FORWARD_SKIP
+class TestCheckpointRoundtrip:
+    def test_encoder_state_dict_roundtrip(self, trainer, tmp_path):
+        state = trainer.encoder.state_dict()
+        torch.save(state, tmp_path / "encoder.pt")
+        reloaded = torch.load(tmp_path / "encoder.pt", weights_only=True)
+        assert set(state.keys()) == set(reloaded.keys())
+        for k in state:
+            assert torch.equal(state[k], reloaded[k])
+
+    def test_decoder_state_dict_roundtrip(self, trainer, tmp_path):
+        state = trainer.decoder.state_dict()
+        torch.save(state, tmp_path / "decoder.pt")
+        reloaded = torch.load(tmp_path / "decoder.pt", weights_only=True)
+        assert set(state.keys()) == set(reloaded.keys())
+        for k in state:
+            assert torch.equal(state[k], reloaded[k])
+
+
+# ---------------------------------------------------------------------------
+# Evaluate on a file-only eval dataloader.
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluateFileBatch:
+    def test_evaluate_returns_token_weighted_loss(self, trainer):
+        """evaluate() aggregates across file-only batches."""
+        trainer.eval_dataloader = [_make_file_batch(batch_size=2) for _ in range(2)]
+        metrics = trainer.evaluate()
+        assert "loss" in metrics
+        assert "perplexity" in metrics
+        assert torch.isfinite(torch.tensor(metrics["loss"]))
+
+    def test_evaluate_per_objective_breakdown(self, trainer):
+        trainer.eval_dataloader = [_make_file_batch(batch_size=2)]
+        metrics = trainer.evaluate()
+        # Each sample used objective="reproduce" in the helper.
+        assert "reproduce_loss" in metrics
+        assert "reproduce_tokens" in metrics
+        assert metrics["reproduce_tokens"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Forward-pass tests requiring repo / mixed batches — deferred.
+#
+# Repo-batch forward (``_forward_backward_repo_packed``) runs a packed L0
+# across files then a packed L1 across repos, and needs carefully-built
+# ``cu_file_seqlens`` / ``cu_repo_seqlens`` plus the ``_regroup_survivors_per_repo``
+# indexing path. Mixed-batch forward splits between file + repo subpaths.
+# Both are covered by ``tests/integration/`` end-to-end runs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skip(
+    reason="Requires repo L0+L1 packed forward with cu_file/cu_repo hierarchy; "
+    "covered by integration tests.",
+)
 class TestTrainStepRepoSample:
     def test_returns_expected_metrics(self, trainer):
         pass
@@ -262,19 +498,10 @@ class TestTrainStepRepoSample:
         pass
 
 
-@_FORWARD_SKIP
-class TestCheckpointRoundtrip:
-    def test_save_load_roundtrip(self, trainer, tmp_path):
-        pass
-
-    def test_encoder_weights_restored(self, trainer, tmp_path):
-        pass
-
-    def test_decoder_weights_restored(self, trainer, tmp_path):
-        pass
-
-
-@_FORWARD_SKIP
+@pytest.mark.skip(
+    reason="Mixed batches dispatch to the repo L0+L1 path; covered by "
+    "integration tests.",
+)
 class TestForwardBackwardMixed:
     def test_mixed_batch_returns_expected_metrics(self, trainer):
         pass
@@ -289,7 +516,10 @@ class TestForwardBackwardMixed:
         pass
 
 
-@_FORWARD_SKIP
+@pytest.mark.skip(
+    reason="Repo-batch evaluation uses the L0→L1 packed path; covered by "
+    "integration tests.",
+)
 class TestEvaluateRepoBatchPersample:
     def test_repo_eval_returns_token_weighted_loss(self, trainer):
         pass
@@ -298,16 +528,10 @@ class TestEvaluateRepoBatchPersample:
         pass
 
 
-@_FORWARD_SKIP
-class TestEvaluateBreakdown:
-    def test_evaluate_reports_token_weighted_per_objective_metrics(self, trainer):
-        pass
-
-    def test_evaluate_handles_mixed_batches_instead_of_skipping(self, trainer):
-        pass
-
-
-@_FORWARD_SKIP
+@pytest.mark.skip(
+    reason="L0→L1 auto-reproduction only fires on repo batches; covered by "
+    "integration tests.",
+)
 class TestL0ToL1AutoRepro:
     def test_auto_reproduce_called_in_per_sample_loop(self, trainer):
         pass
@@ -374,10 +598,6 @@ class TestL1RebuildPending:
 
 class TestResolveStep1Checkpoint:
     def test_auto_resolves_phase1_step5(self, trainer):
-        from pathlib import Path
-        from unittest.mock import patch
-
-        from omegaconf import OmegaConf
         trainer.cfg = OmegaConf.merge(trainer.cfg, {
             "step1_checkpoint": "auto",
             "checkpoint_dir": "/tmp/ckpts",
@@ -400,9 +620,6 @@ class TestResolveStep1Checkpoint:
         assert trainer._input_sources["step1"] == "phase1_step5_step10000_20260301"
 
     def test_auto_raises_when_no_checkpoint(self, trainer):
-        from unittest.mock import patch
-
-        from omegaconf import OmegaConf
         trainer.cfg = OmegaConf.merge(trainer.cfg, {
             "step1_checkpoint": "auto",
             "checkpoint_dir": "/tmp/ckpts",
@@ -415,7 +632,6 @@ class TestResolveStep1Checkpoint:
             trainer._resolve_step1_checkpoint()
 
     def test_explicit_path_passthrough(self, trainer):
-        from omegaconf import OmegaConf
         trainer.cfg = OmegaConf.merge(trainer.cfg, {
             "step1_checkpoint": "/workspace/checkpoints/step1_ckpt_300",
         })
