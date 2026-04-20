@@ -38,6 +38,20 @@ _FA4_ALIASES = frozenset({"fa4", "flash_attention_4", BGKIT_FA4_ATTENTION_IMPL})
 logger = logging.getLogger(__name__)
 
 
+def _sm12x_native_true_gqa_ready() -> bool:
+    """Return True when BG10 can use FA's native SM12x GQA path directly."""
+    if not torch.cuda.is_available():
+        return False
+    major, _minor = torch.cuda.get_device_capability()
+    if major != 12:
+        return False
+    try:
+        from flash_attn.cute.native_sm12x import native_sm12x_owned_backend_available
+    except Exception:
+        return False
+    return native_sm12x_owned_backend_available()
+
+
 def _attention_mask_to_padding_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
     """Convert supported mask layouts into the 2D padding mask FA4 expects."""
     if attention_mask is None:
@@ -90,28 +104,40 @@ def bgkit_flash_attention_4_forward(
         )
 
     padding_mask = _attention_mask_to_padding_mask(attention_mask)
+    native_sm12x_gqa = (
+        key.shape[1] < query.shape[1]
+        and query.shape[1] % key.shape[1] == 0
+        and padding_mask is not None
+        and _sm12x_native_true_gqa_ready()
+    )
+    # An all-valid padding mask is semantically equivalent to no mask at all.
+    # Clearing it here avoids routing through FA's varlen/unpadding path when
+    # there is nothing to pack, which is especially important on SM12x where the
+    # pointless varlen path is less stable than dense FA.
+    if padding_mask is not None and bool(torch.all(padding_mask)) and not native_sm12x_gqa:
+        padding_mask = None
     if attention_mask is not None and padding_mask is None:
-        return _qwen_eager_attention_forward(
-            module,
-            query,
-            key,
-            value,
-            attention_mask,
-            dropout=dropout,
-            scaling=scaling,
-            **kwargs,
-        )
+        if _attention_mask_to_padding_mask(attention_mask) is None:
+            return _qwen_eager_attention_forward(
+                module,
+                query,
+                key,
+                value,
+                attention_mask,
+                dropout=dropout,
+                scaling=scaling,
+                **kwargs,
+            )
+        attention_mask = None
 
     from transformers.integrations.flash_attention import get_target_dtype
     from transformers.modeling_flash_attention_utils import _flash_attention_forward
 
-    # GQA → MHA via repeat_interleave: works around the FA4 SM120 pack_gqa
-    # upstream bug. Both `pack_gqa=True` (crd2idx MLIR error) and
-    # `pack_gqa=False` (cudaErrorInvalidValue) fail for qhead_per_kvhead > 1
-    # on sm_120. The broadcast is numerically identical to true GQA.
+    # GQA → MHA via repeat_interleave remains the fallback for paths that do not
+    # go through the owned SM12x native backend yet.
     num_q_heads = query.shape[1]
     num_kv_heads = key.shape[1]
-    if num_kv_heads < num_q_heads and num_q_heads % num_kv_heads == 0:
+    if num_kv_heads < num_q_heads and num_q_heads % num_kv_heads == 0 and not native_sm12x_gqa:
         repeat = num_q_heads // num_kv_heads
         key = key.repeat_interleave(repeat, dim=1)
         value = value.repeat_interleave(repeat, dim=1)
@@ -174,32 +200,33 @@ def _fa4_debug_dump(q, k, v, padding_mask, query_length, is_causal, module=None)
     def _fin(t):
         if t is None:
             return "None"
-        ft = t.float()
+        ft = t.detach().float()
         return f"nan={int(_t_mod.isnan(ft).sum().item())} inf={int(_t_mod.isinf(ft).sum().item())} abs_max={ft.abs().max().item():.3e}"
 
-    mask_summary = "None"
-    if padding_mask is not None:
-        valid_per_row = padding_mask.sum(dim=-1)
-        mask_summary = (
-            f"{_t(padding_mask)} valid_per_row.min={valid_per_row.min().item()} "
-            f"max={valid_per_row.max().item()} total_valid={int(valid_per_row.sum().item())}"
+    with _t_mod.no_grad():
+        mask_summary = "None"
+        if padding_mask is not None:
+            valid_per_row = padding_mask.detach().sum(dim=-1)
+            mask_summary = (
+                f"{_t(padding_mask)} valid_per_row.min={valid_per_row.min().item()} "
+                f"max={valid_per_row.max().item()} total_valid={int(valid_per_row.sum().item())}"
+            )
+        mod_id = ""
+        if module is not None:
+            layer_idx = getattr(module, "layer_idx", None)
+            mod_id = f" layer_idx={layer_idx}"
+        # Sync so any pending async CUDA error surfaces here instead of later.
+        try:
+            _t_mod.cuda.synchronize()
+        except Exception as exc:  # noqa: BLE001 - we want the message
+            print(f"[fa4_debug #{idx}] PRE-CALL CUDA ERROR: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+            raise
+        print(
+            f"[fa4_debug #{idx}]{mod_id} q={_t(q)} finQ:{_fin(q)} k={_t(k)} v={_t(v)} "
+            f"padding_mask={mask_summary} query_length={query_length} is_causal={is_causal}",
+            file=sys.stderr, flush=True,
         )
-    mod_id = ""
-    if module is not None:
-        layer_idx = getattr(module, "layer_idx", None)
-        mod_id = f" layer_idx={layer_idx}"
-    # Sync so any pending async CUDA error surfaces here instead of later.
-    try:
-        _t_mod.cuda.synchronize()
-    except Exception as exc:  # noqa: BLE001 - we want the message
-        print(f"[fa4_debug #{idx}] PRE-CALL CUDA ERROR: {type(exc).__name__}: {exc}",
-              file=sys.stderr, flush=True)
-        raise
-    print(
-        f"[fa4_debug #{idx}]{mod_id} q={_t(q)} finQ:{_fin(q)} k={_t(k)} v={_t(v)} "
-        f"padding_mask={mask_summary} query_length={query_length} is_causal={is_causal}",
-        file=sys.stderr, flush=True,
-    )
 
 
 @lru_cache(maxsize=1)

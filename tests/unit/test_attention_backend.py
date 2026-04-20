@@ -106,6 +106,44 @@ def test_bgkit_fa4_forward_falls_back_for_query_specific_masks():
     assert out == ("fallback", "weights")
 
 
+def test_bgkit_fa4_forward_keeps_true_gqa_when_sm12x_native_ready():
+    class _DummyModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(_attn_implementation=ab.BGKIT_FA4_ATTENTION_IMPL)
+            self.is_causal = False
+
+    module = _DummyModule()
+    query = torch.randn(2, 4, 5, 8)
+    key = torch.randn(2, 2, 5, 8)
+    value = torch.randn(2, 2, 5, 8)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+
+    with patch.object(ab, "_sm12x_native_true_gqa_ready", return_value=True), patch(
+        "transformers.integrations.flash_attention.get_target_dtype",
+        return_value=None,
+    ), patch(
+        "transformers.modeling_flash_attention_utils._flash_attention_forward",
+        return_value=torch.zeros(2, 5, 4, 8),
+    ) as flash_mock:
+        out, attn = ab.bgkit_flash_attention_4_forward(
+            module,
+            query,
+            key,
+            value,
+            mask,
+            is_causal=False,
+        )
+
+    assert attn is None
+    assert out.shape == (2, 5, 4, 8)
+    args = flash_mock.call_args.args
+    assert args[1].shape[-2] == 2
+    assert args[2].shape[-2] == 2
+    assert args[3].dtype == torch.bool
+    assert args[3].shape == (2, 5)
+
+
 def test_bidirectional_qwen35_forces_noncausal_attention():
     layer = _DummyAttentionLayer()
 
