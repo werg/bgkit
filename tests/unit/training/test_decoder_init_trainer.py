@@ -283,7 +283,11 @@ def _patch_packed_attention(monkeypatch):
     """
     from bgkit.models import (
         bidirectional_qwen35 as bq,
+    )
+    from bgkit.models import (
         projection_block as pb,
+    )
+    from bgkit.models import (
         pruned_qwen35 as pq,
     )
 
