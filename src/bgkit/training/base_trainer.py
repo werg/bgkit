@@ -198,6 +198,12 @@ class BaseTrainer(ABC):
 
     LIVE_CONFIG_FIELDS: dict[str, str] = {}
 
+    #: Registry of live-config handler methods for keys that need custom
+    #: validation (e.g. nullable fields, range checks).  Maps control-file
+    #: key → unbound method name on ``self``.  Merged across the MRO so
+    #: subclasses add handlers without rewriting ``apply_live_config``.
+    LIVE_CONFIG_HANDLERS: dict[str, str] = {}
+
     #: Steps between structured log messages. Override in subclass.
     _log_every: int = 10
 
@@ -750,17 +756,36 @@ class BaseTrainer(ABC):
     def apply_live_config(self, changes: dict) -> None:
         """Apply trainer-specific live config changes.
 
-        Automatically handles fields declared in ``LIVE_CONFIG_FIELDS``
-        (merged across MRO).  Override for custom validation and call
-        ``super().apply_live_config(changes)`` to keep auto-apply.
+        Dispatch is two-stage:
+
+        1. Keys in :attr:`LIVE_CONFIG_HANDLERS` (merged across MRO) are
+           dispatched to the named method as ``self.<method>(value)``.
+           Use for fields that need custom validation or that accept
+           non-numeric values (e.g. ``None`` to clear an override).
+        2. Keys in :attr:`LIVE_CONFIG_FIELDS` that are NOT covered by a
+           handler fall through to the declarative numeric path:
+           ``setattr(self, attr, value)`` with numeric coercion.
+
+        Subclasses with dynamic / prefix-based keys (e.g. PruningDistill's
+        ``stage_N_steps``) can still override ``apply_live_config``; call
+        ``super().apply_live_config(changes)`` to preserve registry
+        dispatch.
         """
-        # Merge LIVE_CONFIG_FIELDS from all classes in MRO
+        handlers: dict[str, str] = {}
+        for cls in reversed(type(self).__mro__):
+            handlers.update(getattr(cls, "LIVE_CONFIG_HANDLERS", {}))
+
         fields: dict[str, str] = {}
         for cls in reversed(type(self).__mro__):
             fields.update(getattr(cls, "LIVE_CONFIG_FIELDS", {}))
 
-        for key, attr in fields.items():
+        for key, method_name in handlers.items():
             if key not in changes:
+                continue
+            getattr(self, method_name)(changes[key])
+
+        for key, attr in fields.items():
+            if key not in changes or key in handlers:
                 continue
             val = changes[key]
             old = getattr(self, attr, None)
@@ -769,6 +794,31 @@ class BaseTrainer(ABC):
                 continue
             setattr(self, attr, type(old)(val) if old is not None else float(val))
             logger.info("live_config_update", key=key, attr=attr, old=old, new=val)
+
+    def _handle_target_ratio(self, val: float | int | None) -> None:
+        """Live-config handler for ``target_ratio`` override.
+
+        Sets ``self._target_ratio_override`` to ``None`` (resume the
+        curriculum ramp) or to a validated float in ``(0, 1)``.  Shared
+        across trainers that expose a compression-ratio override
+        (DecoderInit, Compression, CommitEncoding).
+        """
+        if val is None:
+            self._target_ratio_override = None
+            logger.info("live_target_ratio_cleared", resuming="ramp")
+            return
+        if isinstance(val, (int, float)) and 0 < val < 1:
+            self._target_ratio_override = float(val)
+            logger.info(
+                "live_target_ratio_update",
+                target_ratio=self._target_ratio_override,
+            )
+            return
+        logger.warning(
+            "live_target_ratio_invalid",
+            value=val,
+            expected="None or float in (0, 1)",
+        )
 
     def _registry_parent(self) -> str | None:
         """Return normalized parent checkpoint name, or None."""

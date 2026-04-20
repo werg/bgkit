@@ -117,6 +117,10 @@ class DecoderInitTrainer(BaseTrainer):
         "diagnostic_metrics_every_n_steps": "_diagnostic_metrics_every_n_steps",
     }
 
+    LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
+        "target_ratio": "_handle_target_ratio",
+    }
+
     def setup(self) -> None:
         """Load BgKIT encoder, decoder, and configure compression curriculum."""
         tcfg = self.cfg.training
@@ -1710,20 +1714,3 @@ class DecoderInitTrainer(BaseTrainer):
         # Recompute freeze state + rebuild optimizer from restored global_step.
         self._configure_trainable_state()
 
-    # ------------------------------------------------------------------
-    # Live config
-    # ------------------------------------------------------------------
-
-    def apply_live_config(self, changes: dict) -> None:
-        """Support live tuning of target compression ratio + base fields."""
-        if "target_ratio" in changes:
-            val = changes["target_ratio"]
-            if val is None:
-                self._target_ratio_override = None
-                logger.info("live_target_ratio_cleared", resuming="ramp")
-            elif isinstance(val, (int, float)) and 0 < val < 1:
-                self._target_ratio_override = float(val)
-                logger.info(
-                    "live_target_ratio_update", target_ratio=self._target_ratio_override,
-                )
-        super().apply_live_config(changes)

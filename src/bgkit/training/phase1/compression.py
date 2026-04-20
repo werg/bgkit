@@ -65,6 +65,10 @@ class CompressionTrainer(BaseTrainer):
         "l1_introduction_step": "_l1_introduction_step",
     }
 
+    LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
+        "target_ratio": "_handle_target_ratio",
+    }
+
     def setup(self) -> None:
         """Load trainable encoder/decoder, create dataset and optimizer."""
         import gc
@@ -1623,18 +1627,3 @@ class CompressionTrainer(BaseTrainer):
         self._l1_rebuild_pending = training_state.get("l1_rebuild_pending", False)
         self._target_ratio_override = training_state.get("target_ratio_override")
 
-    # ------------------------------------------------------------------
-    # Live config
-    # ------------------------------------------------------------------
-
-    def apply_live_config(self, changes: dict) -> None:
-        """Support live tuning of target compression ratio + base fields."""
-        if "target_ratio" in changes:
-            val = changes["target_ratio"]
-            if val is None:
-                self._target_ratio_override = None
-                logger.info("live_target_ratio_cleared", resuming="ramp")
-            elif isinstance(val, (int, float)) and 0 < val < 1:
-                self._target_ratio_override = float(val)
-                logger.info("live_target_ratio_update", target_ratio=self._target_ratio_override)
-        super().apply_live_config(changes)

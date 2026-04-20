@@ -52,6 +52,10 @@ class CommitEncodingTrainer(BaseTrainer):
         "target_ratio_end": "_target_ratio_end",
     }
 
+    LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
+        "target_ratio": "_handle_target_ratio",
+    }
+
     def setup(self) -> None:
         """Load trainable encoder/decoder, create dataset and optimizer."""
         tcfg = self.cfg.training
@@ -1498,15 +1502,3 @@ class CommitEncodingTrainer(BaseTrainer):
     def _restore_training_state(self, training_state: dict) -> None:
         self._target_ratio_override = training_state.get("target_ratio_override")
 
-    # ------------------------------------------------------------------
-    # Live config
-    # ------------------------------------------------------------------
-
-    def apply_live_config(self, changes: dict) -> None:
-        if "target_ratio" in changes:
-            val = changes["target_ratio"]
-            if val is None:
-                self._target_ratio_override = None
-            elif isinstance(val, (int, float)) and 0 < val < 1:
-                self._target_ratio_override = float(val)
-        super().apply_live_config(changes)
