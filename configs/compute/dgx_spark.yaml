@@ -33,3 +33,24 @@ attention_implementation: auto
 # Dataloader
 num_workers: 0  # fork workers cause CoW memory exhaustion on unified memory
 pin_memory: false  # unified memory, pinning not applicable
+# Unified-memory accounting. Training, evaluation, generation, and
+# checkpoint save all claim from one 128 GB pool; without a contract
+# between them the first subsystem to overshoot triggers Linux swap.
+# These are hardware-level caps, not phase-level — every training run on
+# this box gets them; override in a phase config only if the phase has
+# a genuinely unusual footprint.
+memory:
+  # Polling cadence for the global safety rail + wandb mem/* curves.
+  log_every_steps: 10
+  # Hard floor on system-wide used GB. Hit → emergency checkpoint +
+  # SystemExit. Leaves headroom for save_checkpoint + ssh. 0 disables.
+  system_abort_gb: 110
+  # Per-scope CUDA peak caps for memory_budget_scope (phase-boundary
+  # enforcement; complements the periodic poll above). None disables
+  # enforcement for that scope (still logs peak). Populate after a
+  # run's mem_scope_exit logs establish baselines; set ~15 % above
+  # observed peaks so transient fluctuations don't trip.
+  scope_budgets:
+    evaluate_gb: null
+    gen_eval_gb: null
+    save_checkpoint_gb: null

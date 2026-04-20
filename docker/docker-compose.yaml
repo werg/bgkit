@@ -157,12 +157,10 @@ services:
       # (8192 * 8 = 65536, same as 16384 * 4).
       "++training.max_batch_tokens=8192",
       "++training.gradient_accumulation_steps=8",
-      # Check memory every 10 steps so the safety rail + wandb curve
-      # catches a leak early. Default 50 was too coarse — we could
-      # grow 7 GB between checks under 2026-04-19's 140 MB/step leak.
-      "++training.memory_log_every=10",
-      # Abort threshold (training.memory_abort_system_used_gb) defaults
-      # to 110 in BaseTrainer — no override needed here.
+      # Memory log cadence + safety rail live in configs/compute/dgx_spark.yaml
+      # under compute.memory (log_every_steps=10, system_abort_gb=110).
+      # No per-service override needed — every training run on this box
+      # inherits the same hardware contract.
       # Force a fresh wandb run. Intentional break from the prior
       # continuity pattern because (a) we're rolling back to an earlier
       # checkpoint so the prior wandb history would claim later step

@@ -771,17 +771,72 @@ class BaseTrainer(ABC):
             expected="None or float in (0, 1)",
         )
 
-    def _scope_cap(self, scope: str) -> float | None:
-        """Read a :func:`memory_budget_scope` cap from config.
+    # ------------------------------------------------------------------
+    # Memory accounting: everything comes from ``compute.memory`` — a
+    # hardware-level concern, not a per-phase one. Backcompat: old
+    # ``training.memory_*`` keys are still honored with a one-shot warn
+    # so in-flight resume configs don't break.
+    # ------------------------------------------------------------------
 
-        Looks up ``training.memory_budget.<scope>_cap_gb``.  Absent or
-        ``None`` disables enforcement (scope still logs peak).
-        Subsystems that need a fixed cap can override this method.
+    _memory_legacy_warned = False
+
+    def _memory_cfg(self) -> dict:
+        """Return the resolved ``compute.memory`` config block.
+
+        Pulls from ``cfg.compute.memory`` (the canonical location — a
+        single block inherited by every training config on this box).
+        Reads legacy ``training.memory_*`` scalars as a fallback so
+        existing resume configs keep working; warns once when any are
+        found so the operator can migrate them.
         """
-        mb = self.cfg.training.get("memory_budget", None)
-        if not mb:
+        compute = self.cfg.get("compute", None)
+        mem = compute.get("memory", None) if compute else None
+        out = dict(mem) if mem else {}
+
+        tcfg = self.cfg.training
+        legacy: dict = {}
+        if "memory_log_every" in tcfg:
+            legacy["log_every_steps"] = int(tcfg.memory_log_every)
+        if "memory_abort_system_used_gb" in tcfg:
+            legacy["system_abort_gb"] = float(
+                tcfg.memory_abort_system_used_gb,
+            )
+        if "memory_budget" in tcfg:
+            mb = tcfg.memory_budget
+            budgets = dict(out.get("scope_budgets", {}) or {})
+            for scope in ("evaluate", "gen_eval", "save_checkpoint"):
+                k = f"{scope}_cap_gb"
+                if k in mb and mb.get(k) is not None:
+                    budgets[f"{scope}_gb"] = float(mb.get(k))
+            if budgets:
+                legacy["scope_budgets"] = budgets
+
+        if legacy and not BaseTrainer._memory_legacy_warned:
+            logger.warning(
+                "memory_cfg_legacy_training_keys",
+                keys=sorted(legacy.keys()),
+                hint="move to configs/compute/<host>.yaml under memory: "
+                "— training.memory_* is a backcompat shim, not the "
+                "canonical location",
+            )
+            BaseTrainer._memory_legacy_warned = True
+        for k, v in legacy.items():
+            out.setdefault(k, v)
+
+        return out
+
+    def _scope_cap(self, scope: str) -> float | None:
+        """Read a :func:`memory_budget_scope` cap for ``scope``.
+
+        Looks up ``compute.memory.scope_budgets.<scope>_gb``.  ``None``
+        (or absent) disables enforcement — the scope still logs peak
+        but does not raise.  Subsystems that need a fixed cap regardless
+        of config can override this method.
+        """
+        budgets = self._memory_cfg().get("scope_budgets", None)
+        if not budgets:
             return None
-        val = mb.get(f"{scope}_cap_gb", None)
+        val = budgets.get(f"{scope}_gb", None)
         if val is None:
             return None
         return float(val)
@@ -1159,28 +1214,23 @@ class BaseTrainer(ABC):
 
                     # Memory diagnostics — cheap O(1) allocator queries +
                     # one /proc read. Logged alongside train_step every
-                    # ``memory_log_every`` steps (default 50) so a slow
-                    # leak or allocator-fragmentation curve is visible in
-                    # wandb long before the unified-memory pool thrashes.
-                    mem_log_every = int(tcfg.get("memory_log_every", 50))
+                    # ``compute.memory.log_every_steps`` so a slow leak or
+                    # allocator-fragmentation curve is visible in wandb
+                    # long before the unified-memory pool thrashes.
+                    mem_cfg = self._memory_cfg()
+                    mem_log_every = int(mem_cfg.get("log_every_steps", 50))
                     if mem_log_every > 0 and step % mem_log_every == 0:
                         mem_diag = _collect_memory_diagnostics()
                         metrics.update(mem_diag)
 
                         # Safety rail — save a final checkpoint and hard-
                         # exit if the unified pool gets dangerously full.
-                        # Prevents the 8-hour all-the-way-to-OOM wedge we
-                        # lived through on 2026-04-19 (step 3 training
-                        # leaked ~140 MB / step; Linux OOM-killer claimed
-                        # the container and the host ran out of usable
-                        # memory before ssh could come back). On the DGX
-                        # Spark's 121 GB unified pool, tripping at 110 GB
-                        # used (~91 %) leaves ~11 GB headroom for the
-                        # save_checkpoint call itself + ssh. Override via
-                        # ``training.memory_abort_system_used_gb``; set to
-                        # 0 to disable.
+                        # Complements memory_budget_scope (which bounds
+                        # named scopes); this rail is the safety net for
+                        # slow leaks in the training hot-loop that don't
+                        # live inside any scope. 0 disables.
                         abort_threshold = float(
-                            tcfg.get("memory_abort_system_used_gb", 110.0),
+                            mem_cfg.get("system_abort_gb", 110.0),
                         )
                         sys_used = mem_diag.get("mem/system_used_gb", 0.0)
                         if abort_threshold > 0 and sys_used >= abort_threshold:
