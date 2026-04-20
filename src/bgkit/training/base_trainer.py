@@ -646,20 +646,30 @@ class BaseTrainer(ABC):
             )
 
     def load_checkpoint(self, checkpoint_path: Path) -> None:
-        """Load checkpoint and restore training state."""
+        """Load checkpoint and restore training state.
+
+        Subclasses customize by overriding the hooks below instead of
+        rewriting this method:
+
+        * :meth:`_restore_model_state` — load weights (default loads
+          ``state_dicts["model"]`` into ``self.model``).
+        * :meth:`_restore_training_state` — restore subclass-specific
+          fields from the ``training_state`` dict (e.g. curriculum
+          overrides, stage number).  Called only when training_state is
+          present in the checkpoint.
+        * :meth:`_post_weight_load_hook` — run after weights + step are
+          restored, before optimizer state is loaded.  The canonical
+          place to rebuild the optimizer when trainable parameters
+          depend on restored state (e.g. distillation stage, freeze
+          schedule keyed off ``global_step``).
+        * :meth:`_log_restore` — final log line.  Override when the
+          subclass wants to include extra fields (stage, ratio, ...).
+        """
         metadata, state_dicts = load_checkpoint(checkpoint_path)
         self._check_optimizer_type_compat(metadata)
-        self.model.load_state_dict(state_dicts["model"])
-        if "optimizer_state_by_name" in state_dicts:
-            self._restore_optimizer_state_by_name(
-                state_dicts["optimizer_state_by_name"],
-            )
-        elif not self._legacy_optimizer_fallback(state_dicts):
-            logger.warning(
-                "optimizer_state_missing_using_fresh_moments",
-                hint="checkpoint predates the name-keyed optimizer state "
-                "refactor; resuming with fresh moments",
-            )
+
+        self._restore_model_state(state_dicts)
+
         self.global_step = metadata.step
         self.epoch = metadata.epoch
         self._last_checkpoint_path = str(checkpoint_path)
@@ -670,6 +680,60 @@ class BaseTrainer(ABC):
             self._microbatches_in_epoch = int(
                 metadata.training_state.get("microbatches_in_epoch", 0),
             )
+            self._restore_training_state(metadata.training_state)
+
+        self._post_weight_load_hook()
+
+        if "optimizer_state_by_name" in state_dicts:
+            self._restore_optimizer_state_by_name(
+                state_dicts["optimizer_state_by_name"],
+            )
+        elif not self._legacy_optimizer_fallback(state_dicts):
+            logger.warning(
+                "optimizer_state_missing_using_fresh_moments",
+                hint="checkpoint predates the name-keyed optimizer state "
+                "refactor; resuming with fresh moments",
+            )
+
+        self._log_restore()
+
+    # ------------------------------------------------------------------
+    # load_checkpoint hooks
+    # ------------------------------------------------------------------
+
+    def _restore_model_state(self, state_dicts: dict) -> None:
+        """Load model weights from ``state_dicts``.
+
+        Default implementation loads ``state_dicts["model"]`` into
+        ``self.model``.  Override when the trainer holds a different
+        set of modules (encoder-only, encoder + decoder, student /
+        teacher pair, ...).
+        """
+        self.model.load_state_dict(state_dicts["model"])
+
+    def _restore_training_state(self, training_state: dict) -> None:
+        """Restore subclass-specific fields from ``training_state``.
+
+        Default: no-op.  Called only when ``training_state`` is present
+        in the checkpoint.  The base class has already stashed the dict
+        on ``self._training_state`` and restored
+        ``_microbatches_in_epoch`` before this hook fires.
+        """
+
+    def _post_weight_load_hook(self) -> None:
+        """Run after weights + step + training_state are restored,
+        before the optimizer state is loaded.
+
+        Default: no-op.  The canonical place to rebuild the optimizer
+        when trainable parameters depend on restored state (e.g. a
+        distillation stage from ``training_state`` or a freeze schedule
+        keyed off ``global_step``).
+        """
+
+    def _log_restore(self) -> None:
+        """Emit the restore log line.  Override to include extra
+        fields (stage, ratio, ...) alongside ``step``.
+        """
         logger.info("restored_from_checkpoint", step=self.global_step)
 
     def _sync_epoch(self, epoch: int) -> None:

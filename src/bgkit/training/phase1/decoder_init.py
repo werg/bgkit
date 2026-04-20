@@ -1688,12 +1688,8 @@ class DecoderInitTrainer(BaseTrainer):
         # projection_block lives under encoder; already covered above.
         # Listed here only for trainers where it becomes a separate module.
 
-    def load_checkpoint(self, checkpoint_path: Path) -> None:
-        """Load both BgKIT encoder and decoder models + curriculum state."""
-        metadata, state_dicts = load_checkpoint(checkpoint_path)
-        self._check_optimizer_type_compat(metadata)
-
-        # Restore model weights
+    def _restore_model_state(self, state_dicts: dict) -> None:
+        """Restore encoder (with legacy-key tolerance) + decoder."""
         if "encoder" not in state_dicts:
             raise ValueError(
                 f"Resume checkpoint missing 'encoder' key. Found: {list(state_dicts.keys())}"
@@ -1707,41 +1703,12 @@ class DecoderInitTrainer(BaseTrainer):
             )
         self.decoder.load_state_dict(state_dicts["decoder"])
 
-        # Restore step position
-        self.global_step = metadata.step
-        self.epoch = metadata.epoch
-        self._last_checkpoint_path = str(checkpoint_path)
-        if metadata.schedule_params is not None:
-            self._schedule_params = metadata.schedule_params
-        if metadata.training_state is not None:
-            self._training_state = metadata.training_state
-            # Restore curriculum overrides
-            self._target_ratio_override = metadata.training_state.get(
-                "target_ratio_override",
-            )
-            # Restore dataloader position (epoch-relative) so resume
-            # doesn't rewind to short-sample regime. See BaseTrainer
-            # ``_microbatches_in_epoch`` docstring.
-            self._microbatches_in_epoch = int(
-                metadata.training_state.get("microbatches_in_epoch", 0),
-            )
+    def _restore_training_state(self, training_state: dict) -> None:
+        self._target_ratio_override = training_state.get("target_ratio_override")
 
-        # Recompute freeze state + rebuild optimizer from restored global_step
+    def _post_weight_load_hook(self) -> None:
+        # Recompute freeze state + rebuild optimizer from restored global_step.
         self._configure_trainable_state()
-
-        # Load optimizer state (name-keyed, survives topology changes)
-        if "optimizer_state_by_name" in state_dicts:
-            self._restore_optimizer_state_by_name(
-                state_dicts["optimizer_state_by_name"],
-            )
-        elif not self._legacy_optimizer_fallback(state_dicts):
-            logger.warning(
-                "optimizer_state_missing_using_fresh_moments",
-                hint="checkpoint predates the name-keyed optimizer state "
-                "refactor; resuming with fresh moments",
-                )
-
-        logger.info("restored_from_checkpoint", step=self.global_step)
 
     # ------------------------------------------------------------------
     # Live config

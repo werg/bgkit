@@ -2209,31 +2209,21 @@ class KRKBTrainer(BaseTrainer):
     # Checkpoint loading (with LoRA key remap fallback)
     # ------------------------------------------------------------------
 
-    def load_checkpoint(self, checkpoint_path: Path) -> None:
-        """Load a checkpoint with a LoRA key-shape fallback.
+    def _restore_model_state(self, state_dicts: dict) -> None:
+        """Load model state with a pre-LoRA → post-LoRA key remap fallback.
 
-        The default ``BaseTrainer.load_checkpoint`` calls
-        ``self.model.load_state_dict(...)`` strict, which fails when the
-        state-dict key shapes mismatch. This happens when a user points
-        ``resume_checkpoint`` at a *pre-LoRA* checkpoint (e.g. a raw
-        Phase 1 checkpoint) and the current trainer has already installed
-        LoRA wrappers in ``setup()`` — so keys are ``q_proj.weight`` on
-        disk vs ``q_proj.base_layer.weight`` in memory.
+        The strict load fails when a user points ``resume_checkpoint``
+        at a pre-LoRA checkpoint (e.g. a raw Phase 1 checkpoint) while
+        the current trainer has already installed LoRA wrappers in
+        ``setup()`` — on-disk keys are ``q_proj.weight`` but in-memory
+        keys are ``q_proj.base_layer.weight``.
 
-        We detect this situation by attempting the strict load first and,
-        on any ``RuntimeError`` that mentions missing keys in the
-        base_layer form, retry with :func:`remap_base_keys_to_lora`
-        applied to the encoder sub-state. LoRA adapter parameters are
-        missing from a pre-LoRA checkpoint — we load with ``strict=False``
-        on the retry, leaving those adapters at their zero-initialized
-        state.
+        On the first ``RuntimeError`` we retry with
+        :func:`remap_base_keys_to_lora` applied to the encoder sub-state
+        and ``strict=False``, leaving LoRA adapter params at their
+        zero-initialized state.
         """
-        from bgkit.training.checkpointing import load_checkpoint as _load_ckpt
-
-        metadata, state_dicts = _load_ckpt(checkpoint_path)
-        self._check_optimizer_type_compat(metadata)
         model_state = state_dicts["model"]
-
         try:
             self.model.load_state_dict(model_state)
         except RuntimeError as e:
@@ -2241,7 +2231,6 @@ class KRKBTrainer(BaseTrainer):
                 raise
             logger.warning(
                 "phase2_kb_checkpoint_load_remap",
-                path=str(checkpoint_path),
                 error=str(e)[:300],
                 hint="retrying with pre-LoRA → post-LoRA key remap",
             )
@@ -2249,7 +2238,6 @@ class KRKBTrainer(BaseTrainer):
             missing, unexpected = self.model.load_state_dict(
                 remapped, strict=False,
             )
-            # Anything missing must be a LoRA adapter param (zero-init).
             bad_missing = [
                 k for k in missing
                 if ".adapters." not in k or (
@@ -2261,28 +2249,7 @@ class KRKBTrainer(BaseTrainer):
                     f"LoRA remap load failed: unexpected={unexpected[:5]}, "
                     f"missing_non_adapter={bad_missing[:5]}"
                 ) from e
-            logger.info(
-                "phase2_kb_checkpoint_loaded_via_remap",
-                path=str(checkpoint_path),
-            )
-
-        if "optimizer_state_by_name" in state_dicts:
-            self._restore_optimizer_state_by_name(
-                state_dicts["optimizer_state_by_name"],
-            )
-        elif not self._legacy_optimizer_fallback(state_dicts):
-            logger.warning(
-                "optimizer_state_missing_using_fresh_moments",
-                hint="checkpoint predates the name-keyed optimizer state refactor",
-            )
-        self.global_step = metadata.step
-        self.epoch = metadata.epoch
-        self._last_checkpoint_path = str(checkpoint_path)
-        if metadata.schedule_params is not None:
-            self._schedule_params = metadata.schedule_params
-        if metadata.training_state is not None:
-            self._training_state = metadata.training_state
-        logger.info("restored_from_checkpoint", step=self.global_step)
+            logger.info("phase2_kb_checkpoint_loaded_via_remap")
 
     def _has_lora_installed(self) -> bool:
         """Return True if the encoder has any LoRALinearWrapper children."""

@@ -30,7 +30,7 @@ from bgkit.data.samplers import TokenBudgetBatchSampler
 from bgkit.models.components.auto_reproduction import auto_reproduction_loss
 from bgkit.models.encoder import BgKITEncoder, _resolve_layers
 from bgkit.training.base_trainer import BaseTrainer
-from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
+from bgkit.training.checkpointing import CheckpointMetadata, save_checkpoint
 from bgkit.training.gradient_utils import enable_gradient_checkpointing
 from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.model_utils import count_parameters, slerp_merge
@@ -485,35 +485,12 @@ class JointBlockTrainer(BaseTrainer):
         for name, param in self.encoder.named_parameters():
             yield f"encoder.{name}", param
 
-    def load_checkpoint(self, checkpoint_path: Path) -> None:
-        """Load encoder state dict and restore training state.
+    def _restore_model_state(self, state_dicts: dict) -> None:
+        """Load encoder state dict.
 
-        Raises on optimizer type mismatch (e.g. checkpoint saved with adamw,
-        config now says muon). Topology mismatches within the same optimizer
-        type (e.g. switching heads_only mode) now preserve per-param
-        moments where names match — the name-keyed optimizer state
-        refactor replaces the old all-or-nothing native load.
+        Topology mismatches within the same optimizer type (e.g.
+        switching heads_only mode) preserve per-param moments where
+        names match via the name-keyed optimizer state path — this
+        load uses strict matching for the encoder weights themselves.
         """
-        metadata, state_dicts = load_checkpoint(checkpoint_path)
-        self._check_optimizer_type_compat(metadata)
         self.encoder.load_state_dict(state_dicts["encoder"])
-        if "optimizer_state_by_name" in state_dicts:
-            self._restore_optimizer_state_by_name(
-                state_dicts["optimizer_state_by_name"],
-            )
-        elif not self._legacy_optimizer_fallback(state_dicts):
-            logger.warning(
-                "optimizer_state_missing_using_fresh_moments",
-                hint="checkpoint predates the name-keyed optimizer state refactor",
-            )
-        self.global_step = metadata.step
-        self.epoch = metadata.epoch
-        self._last_checkpoint_path = str(checkpoint_path)
-        if metadata.schedule_params is not None:
-            self._schedule_params = metadata.schedule_params
-        if metadata.training_state is not None:
-            self._training_state = metadata.training_state
-            self._microbatches_in_epoch = int(
-                metadata.training_state.get("microbatches_in_epoch", 0),
-            )
-        logger.info("restored_from_checkpoint", step=self.global_step)
