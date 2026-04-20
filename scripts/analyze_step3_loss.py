@@ -36,13 +36,12 @@ import pandas as pd
 import structlog
 import torch
 import torch.nn.functional as F
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 
-from bgkit.utils.deltanet_patch import patch_gated_delta_rule_numerics
-from bgkit.utils.logging import setup_logging
-from bgkit.utils.reproducibility import set_seed
-from bgkit.utils.triton_alloc_patch import patch_triton_allocator
-from bgkit.utils.triton_patch import patch_triton_autotuner
+from bgkit.utils.diagnostic_harness import (
+    apply_diagnostic_patches,
+    prepare_diagnostic_trainer,
+)
 
 logger = structlog.get_logger()
 
@@ -286,42 +285,14 @@ def _run_analysis(trainer, cfg: DictConfig) -> None:
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig) -> None:
-    patch_triton_allocator()
-    patch_triton_autotuner()
-    patch_gated_delta_rule_numerics()
-    setup_logging()
-    set_seed(cfg.seed)
-
-    if not cfg.get("analyze", None) or not cfg.analyze.get("checkpoint", None):
-        raise ValueError(
-            "Pass +analyze.checkpoint=<path> +analyze.output_dir=<path>",
-        )
-    if not cfg.analyze.get("output_dir", None):
-        raise ValueError("Pass +analyze.output_dir=<path>")
-
-    phase = cfg.training.get("phase", None)
-    if phase != "phase1_step3":
-        raise ValueError(
-            f"analyze_step3_loss expects phase=phase1_step3, got {phase}. "
-            "Use +experiment=phase1_step3.",
-        )
-
-    print(OmegaConf.to_yaml(cfg))
-
+    apply_diagnostic_patches()
     from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
-    trainer = DecoderInitTrainer(cfg)
-    # setup() is normally called inside train(); we call it manually for
-    # eval-only use. Builds encoder (Step 2 weights via bgkit_checkpoint=auto),
-    # decoder (Qwen3.5 base + LoRA), dataset, optimizer.
-    trainer.setup()
-
-    checkpoint_path = Path(str(cfg.analyze.checkpoint))
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    logger.info("loading_step3_checkpoint_override", path=str(checkpoint_path))
-    trainer.load_checkpoint(checkpoint_path)
-
+    trainer = prepare_diagnostic_trainer(
+        cfg,
+        trainer_cls=DecoderInitTrainer,
+        expected_phases=("phase1_step3",),
+    )
     _run_analysis(trainer, cfg)
 
 
