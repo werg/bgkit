@@ -515,6 +515,13 @@ class PruningDistillTrainer(BaseTrainer):
         metrics["actual_ratio"] = n_survivors / max(n_valid, 1)
         metrics["stage"] = self._current_stage
 
+        # Drop compressor-output tensor refs (teacher + student) per
+        # ``CompressorOutput.release()`` contract. Pruning distillation
+        # doesn't activate the utility-grad path so no hook leak in
+        # practice, but the call standardises the per-step cleanup.
+        teacher_comp.release()
+        student_comp.release()
+
         return {k: v.item() if hasattr(v, "item") else v for k, v in metrics.items()}
 
     # ------------------------------------------------------------------

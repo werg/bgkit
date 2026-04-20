@@ -125,6 +125,44 @@ class CompressorOutput:
             return state.get("post_head_content_grad")
         return self.post_head_content_grad
 
+    def release(self) -> None:
+        """Explicitly drop all tensor references held by this output.
+
+        Counteracts a leak in the utility-grad backward-hook path
+        (diagnosed 2026-04-20): ``_utility_grad_state`` is a Python
+        dict held alive by a ``register_hook`` closure on
+        ``content_hidden``. Under gradient checkpointing the hook's
+        lifecycle can outlive the main backward graph, pinning the
+        dict (and its ``base_raw_for_util`` disjoint-subgraph
+        activations + ``post_head_content_values`` clone) past the
+        point where refcount alone would release them. Trainers
+        should call ``release()`` at end of each step (typically in a
+        ``try/finally`` around the backward). Safe to call repeatedly
+        and on outputs that never used utility-grad.
+        """
+        hook_state = getattr(self, "_utility_grad_state", None)
+        if isinstance(hook_state, dict):
+            hook_state.clear()
+        for _field in _COMPRESSOR_OUTPUT_RELEASE_FIELDS:
+            if hasattr(self, _field):
+                setattr(self, _field, None)
+
+
+# Tensor fields cleared by release(). Tuple so it's immutable + shared
+# between CompressorOutput and CompressionOutput (latter has a superset).
+_COMPRESSOR_OUTPUT_RELEASE_FIELDS: tuple[str, ...] = (
+    "raw_embeddings", "normed_embeddings", "attention_mask",
+    "head_logits", "survive_probs", "survivor_mask", "intermediates",
+    "base_raw", "logits_for_op", "survive_probs_metrics",
+    "base_raw_for_util", "post_head_content_values", "post_head_content_grad",
+    "valid_count", "organic_count", "controllable_count",
+    "floor_trigger_rate", "num_pinned",
+    "organic_rate_std", "undecided_fraction", "theta_tensor",
+    # CompressionOutput-only fields (no-op for CompressorOutput):
+    "survivor_embeddings", "all_embeddings", "survivor_attention_mask",
+    "survivor_counts",
+)
+
 
 @dataclass
 class CompressionOutput:
@@ -161,6 +199,15 @@ class CompressionOutput:
         if state is not None:
             return state.get("post_head_content_grad")
         return self.post_head_content_grad
+
+    def release(self) -> None:
+        """Explicitly drop all tensor references — see CompressorOutput.release()."""
+        hook_state = getattr(self, "_utility_grad_state", None)
+        if isinstance(hook_state, dict):
+            hook_state.clear()
+        for _field in _COMPRESSOR_OUTPUT_RELEASE_FIELDS:
+            if hasattr(self, _field):
+                setattr(self, _field, None)
 
 
 class BgKITCompressor(nn.Module):

@@ -2797,6 +2797,18 @@ class KRKBTrainer(BaseTrainer):
                         every_n_steps=diag_every_n,
                     )
                 )
+
+        # Drop CompressorOutput tensor refs held by this step's pending
+        # outputs. Even though the lists are re-assigned at the top of
+        # the next ``_forward_backward`` call, explicit release here
+        # ensures the hook-closure retention (see
+        # ``CompressorOutput.release()``) doesn't keep subgraph
+        # activations pinned across optimizer steps.
+        for _entry in (*self._pending_l0_outputs, *self._pending_l1_outputs):
+            _enc_out = _entry.get("enc_out")
+            if _enc_out is not None and hasattr(_enc_out, "release"):
+                _enc_out.release()
+
         return metrics_out
 
     # ------------------------------------------------------------------

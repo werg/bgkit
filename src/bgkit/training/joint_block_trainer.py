@@ -389,13 +389,18 @@ class JointBlockTrainer(BaseTrainer):
             cos_proj = F.cosine_similarity(fwd.proj_content, target_proj, dim=-1)
             cos_proj_avg = (cos_proj * mask_f).sum() / mask_f.sum().clamp(min=1)
 
-        return {
+        metrics = {
             "loss": fwd.loss.detach(),
             "loss_repro": fwd.loss_repro.detach(),
             "loss_proj": fwd.loss_proj.detach(),
             "cosine_sim_repro": cos_repro_avg.detach(),
             "cosine_sim_proj": cos_proj_avg.detach(),
         }
+
+        # Drop CompressorOutput tensor refs per release() contract.
+        fwd.comp_out.release()
+
+        return metrics
 
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:

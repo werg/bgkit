@@ -1157,6 +1157,16 @@ class CommitEncodingTrainer(BaseTrainer):
             "actual_ratio": actual_ratio,
         }
         result.update(aux_metrics)
+
+        # Release every CompressorOutput referenced by the bundles.
+        # Utility-grad BCE has already consumed everything it needs
+        # from them at this point. See ``CompressorOutput.release()``
+        # for the leak this mitigates.
+        for bundle in (*util_l0_bundles, *util_l1_bundles):
+            enc_out = bundle.get("enc_out")
+            if enc_out is not None and hasattr(enc_out, "release"):
+                enc_out.release()
+
         return result
 
     def _apply_utility_grad_bce(

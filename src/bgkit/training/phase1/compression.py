@@ -906,8 +906,15 @@ class CompressionTrainer(BaseTrainer):
             )
             n_valid = int(batch["content_attention_mask"].sum().item())
             total_loss = loss.item()
+
+            # Drop tensor refs on the file-path enc_out — see
+            # ``CompressorOutput.release()``.
+            enc_out.release()
         else:
-            # Repo batches: per-sample accumulation
+            # Repo batches: per-sample accumulation. Cleanup of
+            # per-sample / per-bundle enc_outs lives inside
+            # ``_forward_backward_repo_persample`` (enc_outs are bound
+            # to scopes that close naturally before return).
             total_loss, n_survivors, n_valid = self._forward_backward_repo_persample(batch)
             surv_metrics = {}
 
@@ -1165,6 +1172,13 @@ class CompressionTrainer(BaseTrainer):
                     )
                     if util_loss.requires_grad:
                         (util_loss * util_w_l1 * scale).backward()
+
+            # Drop every cached enc_out's tensor refs now that utility-
+            # grad has consumed them (see ``CompressorOutput.release()``).
+            for bundle in l1_util_bundles:
+                enc_out = bundle.get("enc_out")
+                if enc_out is not None and hasattr(enc_out, "release"):
+                    enc_out.release()
 
         # (flush_calibrator parameter retained for API compat but no-op)
 
