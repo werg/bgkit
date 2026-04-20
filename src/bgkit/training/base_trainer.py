@@ -1094,14 +1094,13 @@ class BaseTrainer(ABC):
                         # leaked ~140 MB / step; Linux OOM-killer claimed
                         # the container and the host ran out of usable
                         # memory before ssh could come back). On the DGX
-                        # Spark's 121 GB unified pool, tripping at 100 GB
-                        # used (~83 %) leaves ~20 GB headroom for the
-                        # save_checkpoint call itself + anyone else on the
-                        # box. Override via
+                        # Spark's 121 GB unified pool, tripping at 110 GB
+                        # used (~91 %) leaves ~11 GB headroom for the
+                        # save_checkpoint call itself + ssh. Override via
                         # ``training.memory_abort_system_used_gb``; set to
                         # 0 to disable.
                         abort_threshold = float(
-                            tcfg.get("memory_abort_system_used_gb", 100.0),
+                            tcfg.get("memory_abort_system_used_gb", 110.0),
                         )
                         sys_used = mem_diag.get("mem/system_used_gb", 0.0)
                         if abort_threshold > 0 and sys_used >= abort_threshold:

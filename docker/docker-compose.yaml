@@ -161,12 +161,8 @@ services:
       # catches a leak early. Default 50 was too coarse — we could
       # grow 7 GB between checks under 2026-04-19's 140 MB/step leak.
       "++training.memory_log_every=10",
-      # Abort training (after emergency save) if system memory exceeds
-      # 110 GB out of 121 — leaves ~11 GB headroom for the save_checkpoint
-      # call itself and for ssh/system. Raised from 100 on 2026-04-20 to
-      # let training run longer before tripping while still guarding the
-      # host from the all-the-way-to-OOM wedge.
-      "++training.memory_abort_system_used_gb=110",
+      # Abort threshold (training.memory_abort_system_used_gb) defaults
+      # to 110 in BaseTrainer — no override needed here.
       # Force a fresh wandb run. Intentional break from the prior
       # continuity pattern because (a) we're rolling back to an earlier
       # checkpoint so the prior wandb history would claim later step
