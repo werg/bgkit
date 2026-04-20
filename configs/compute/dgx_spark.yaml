@@ -46,11 +46,15 @@ memory:
   # SystemExit. Leaves headroom for save_checkpoint + ssh. 0 disables.
   system_abort_gb: 110
   # Per-scope CUDA peak caps for memory_budget_scope (phase-boundary
-  # enforcement; complements the periodic poll above). None disables
-  # enforcement for that scope (still logs peak). Populate after a
-  # run's mem_scope_exit logs establish baselines; set ~15 % above
-  # observed peaks so transient fluctuations don't trip.
+  # enforcement; complements the periodic poll above).  Calibrated from
+  # the 2026-04-20 Phase 1 Step 3 run (cuda_max_allocated ~14 GB at
+  # training baseline; save is mostly host-side pickle and hardly
+  # touches CUDA).  ~1.5× the observed / estimated peak leaves headroom
+  # for the ratio-annealing curriculum's growing splice without making
+  # the cap so loose that a real regression slips past.  A cap trip is a
+  # legible error; bump by 5 GB and re-run if a new regime hits it
+  # legitimately.  ``null`` disables enforcement for that scope.
   scope_budgets:
-    evaluate_gb: null
-    gen_eval_gb: null
-    save_checkpoint_gb: null
+    evaluate_gb: 25           # ~14 GB train-baseline × 1.5 + headroom for long eval batches
+    gen_eval_gb: 35           # encoder fwd + KV cache for generate with max_new_tokens=2048
+    save_checkpoint_gb: 15    # torch.save is host-side; CUDA peak stays near baseline
