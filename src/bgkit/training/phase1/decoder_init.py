@@ -38,6 +38,7 @@ from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, sa
 from bgkit.training.gradient_utils import enable_gradient_checkpointing
 from bgkit.training.scheduling import cosine_with_warmup
 from bgkit.utils.attention_backend import resolve_attention_implementation
+from bgkit.utils.memory_budget import memory_budget_scope
 
 logger = structlog.get_logger()
 
@@ -1459,11 +1460,17 @@ class DecoderInitTrainer(BaseTrainer):
                         total_loss + qa_loss
                     ) / combined_tokens
 
-            # Generation metrics (expensive -- only every Nth eval)
+            # Generation metrics (expensive -- only every Nth eval).
+            # Scoped separately from outer ``evaluate`` because the KV
+            # cache under ``max_new_tokens`` is a different memory regime
+            # than CE-only eval and deserves its own budget contract.
             tcfg = self.cfg.training
             gen_every = tcfg.get("eval", {}).get("generation_eval_every", 4)
             if self._eval_count % gen_every == 0:
-                gen_metrics = self._run_generation_eval()
+                with memory_budget_scope(
+                    "gen_eval", cap_gb=self._scope_cap("gen_eval"),
+                ):
+                    gen_metrics = self._run_generation_eval()
                 metrics.update(gen_metrics)
 
         finally:
