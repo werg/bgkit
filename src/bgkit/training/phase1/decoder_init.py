@@ -1341,6 +1341,46 @@ class DecoderInitTrainer(BaseTrainer):
             if content_grad is not None:
                 metrics["l0_content_grad_norm"] = float(content_grad.norm().item())
 
+        # ------ Explicit cleanup of CompressorOutput's retained state ------
+        # Diagnosed 2026-04-20: step 3 training leaked ~140 MB per
+        # optimizer step of CUDA-allocated tensors, growing linearly to
+        # ~107 GB at step 2650 before the Linux OOM killer wedged the
+        # host. Root cause: ``CompressorOutput._utility_grad_state`` holds
+        # a ``base_raw_for_util`` tensor whose disjoint autograd subgraph
+        # (a separate forward through the survivorship head with
+        # ``content_hidden.detach()`` input) retains head-forward
+        # activations, plus a ``post_head_content_values`` clone of
+        # content_hidden. In the normal path these are released when
+        # ``enc_out`` goes out of scope at function return, but a
+        # backward-hook closure on ``content_hidden`` (captured by
+        # ``register_hook`` inside the compressor) references the
+        # ``hook_state`` dict; under gradient checkpointing on the
+        # compressor backbone the hook's lifecycle interacts with
+        # recomputed activations in a way that defeats Python's
+        # reference counting and leaves the dict (and its tensors)
+        # pinned. Explicitly clearing the dict and nulling the dataclass
+        # fields here forces release per step and keeps memory bounded.
+        # The util-grad backward has already consumed the values it
+        # needed (`base_raw_for_util`, `content_grad`, `content_values`)
+        # by this point, so the clear is safe.
+        try:
+            hook_state = getattr(enc_out, "_utility_grad_state", None)
+            if isinstance(hook_state, dict):
+                hook_state.clear()
+            for _field in (
+                "survivor_embeddings", "all_embeddings", "survivor_attention_mask",
+                "survivor_mask", "survivor_counts", "head_logits", "survive_probs",
+                "base_raw", "logits_for_op", "survive_probs_metrics",
+                "base_raw_for_util", "post_head_content_values",
+                "valid_count", "organic_count", "controllable_count",
+                "floor_trigger_rate", "num_pinned", "organic_rate_std",
+                "undecided_fraction", "theta_tensor",
+            ):
+                if hasattr(enc_out, _field):
+                    setattr(enc_out, _field, None)
+        except Exception:
+            pass
+
         return metrics
 
     # ------------------------------------------------------------------
@@ -1713,6 +1753,12 @@ class DecoderInitTrainer(BaseTrainer):
             self._target_ratio_override = metadata.training_state.get(
                 "target_ratio_override",
             )
+            # Restore dataloader position (epoch-relative) so resume
+            # doesn't rewind to short-sample regime. See BaseTrainer
+            # ``_microbatches_in_epoch`` docstring.
+            self._microbatches_in_epoch = int(
+                metadata.training_state.get("microbatches_in_epoch", 0),
+            )
 
         # Recompute freeze state + rebuild optimizer from restored global_step
         self._configure_trainable_state()
@@ -1722,7 +1768,7 @@ class DecoderInitTrainer(BaseTrainer):
             self._restore_optimizer_state_by_name(
                 state_dicts["optimizer_state_by_name"],
             )
-        else:
+        elif not self._legacy_optimizer_fallback(state_dicts):
             logger.warning(
                 "optimizer_state_missing_using_fresh_moments",
                 hint="checkpoint predates the name-keyed optimizer state "

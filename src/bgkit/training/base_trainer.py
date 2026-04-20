@@ -214,6 +214,15 @@ class BaseTrainer(ABC):
         self._input_sources: dict[str, str] | None = None
         self._accum_steps = 1
         self._dataloader_invalidated = False  # set True in _pre_step_hook to force re-iter
+        # Microbatches already consumed from the current epoch's dataloader.
+        # Persisted and restored on resume so we don't rewind the iterator
+        # back to batch 0 every restart -- critical for length-sorted
+        # samplers where early-epoch batches are systematically short and
+        # out-of-distribution for a model mid-trained on longer samples
+        # (diagnosed 2026-04-19 when resuming Step 3 step2000 caused the
+        # trained head to over-compress short content, spiking loss and
+        # degrading eval through the re-adaptation).
+        self._microbatches_in_epoch: int = 0
         # Optimizer type: set from config, overridden by _create_optimizer()
         self._optimizer_type: str = cfg.training.get("optimizer", "muon")
         self._muon_exclude_set: frozenset[int] = frozenset()
@@ -286,6 +295,7 @@ class BaseTrainer(ABC):
             "es_best": es_best,
             "es_evals_without_improvement": es_evals_without_improvement,
             "wandb_run_id": wandb_run.id if wandb_run is not None else None,
+            "microbatches_in_epoch": self._microbatches_in_epoch,
         }
 
     def _create_dataloader_iter(self):
@@ -519,6 +529,45 @@ class BaseTrainer(ABC):
                 state_by_name[name] = dict(self.optimizer.state[param])
         return state_by_name
 
+    def _legacy_optimizer_fallback(self, state_dicts: dict) -> bool:
+        """TRANSITIONAL: load pre-refactor ``optimizer.pt`` state if present.
+
+        Added 2026-04-19 so the in-flight Phase 1 Step 3 run can still be
+        resumed from one of its pre-step-4000 checkpoints (which only
+        have the legacy ``optimizer.pt`` artifact) if the container
+        stalls before the next save under the new name-keyed format.
+        Success prints ``optimizer_state_loaded_via_legacy_fallback``;
+        failure prints ``optimizer_state_legacy_load_failed`` and
+        returns False so the caller logs the standard
+        ``_missing_using_fresh_moments`` warning and proceeds.
+
+        Discard this method + its callers once all live checkpoints on
+        disk are in the name-keyed format. At that point the block
+        becomes dead code that silently masks a "someone resumed a very
+        old checkpoint" bug.
+
+        Returns True iff legacy state was found and loaded successfully.
+        """
+        legacy = state_dicts.get("optimizer")
+        if legacy is None:
+            return False
+        try:
+            self.optimizer.load_state_dict(legacy)
+        except (ValueError, KeyError, RuntimeError) as exc:
+            logger.warning(
+                "optimizer_state_legacy_load_failed",
+                error=str(exc)[:200],
+                hint="param-group topology differs from legacy save; "
+                "fresh moments",
+            )
+            return False
+        logger.info(
+            "optimizer_state_loaded_via_legacy_fallback",
+            hint="transitional path; remove after 2026-04-19 refactor's "
+            "checkpoints are all on disk",
+        )
+        return True
+
     def _restore_optimizer_state_by_name(self, state_by_name: dict) -> None:
         """Install name-keyed optimizer state into the current optimizer.
 
@@ -528,12 +577,28 @@ class BaseTrainer(ABC):
         with no saved state keep fresh moments. Names present in the save
         but absent from the current topology are silently dropped. Logs
         counts for visibility.
+
+        Saved state tensors may be on a different device than the live
+        params (e.g. a migration script that ran on CPU produced the
+        ``optimizer_state_by_name.pt`` file). Move each tensor in the
+        per-param state onto the live param's device before installing.
+        Without this, the first Muon/Adam update crashes with "Expected
+        all tensors to be on the same device" when the momentum buffer
+        is on CPU and the grad is on cuda:0.
         """
+        import torch
+
         matched = 0
         new = 0
         for name, param in self._named_parameters_for_optimizer():
             if name in state_by_name:
-                self.optimizer.state[param] = state_by_name[name]
+                saved = state_by_name[name]
+                device = param.device
+                moved = {
+                    k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                    for k, v in saved.items()
+                }
+                self.optimizer.state[param] = moved
                 matched += 1
             else:
                 new += 1
@@ -589,7 +654,7 @@ class BaseTrainer(ABC):
             self._restore_optimizer_state_by_name(
                 state_dicts["optimizer_state_by_name"],
             )
-        else:
+        elif not self._legacy_optimizer_fallback(state_dicts):
             logger.warning(
                 "optimizer_state_missing_using_fresh_moments",
                 hint="checkpoint predates the name-keyed optimizer state "
@@ -602,6 +667,9 @@ class BaseTrainer(ABC):
             self._schedule_params = metadata.schedule_params
         if metadata.training_state is not None:
             self._training_state = metadata.training_state
+            self._microbatches_in_epoch = int(
+                metadata.training_state.get("microbatches_in_epoch", 0),
+            )
         logger.info("restored_from_checkpoint", step=self.global_step)
 
     def _sync_epoch(self, epoch: int) -> None:
@@ -838,6 +906,37 @@ class BaseTrainer(ABC):
 
         dataloader_iter = self._create_dataloader_iter()
 
+        # Advance the dataloader iterator on resume so the model sees
+        # samples from roughly where it was trained, not epoch 0 batch 0.
+        # Without this, a length-sorted sampler (or any sampler where
+        # batch i is correlated with training dynamics) re-enters a
+        # stale sub-distribution on every resume. See
+        # ``self._microbatches_in_epoch`` docstring for the diagnosis.
+        if is_resuming and self._microbatches_in_epoch > 0:
+            skip_target = int(self._microbatches_in_epoch)
+            logger.info(
+                "dataloader_resume_skip_start",
+                microbatches_to_skip=skip_target,
+                epoch=self.epoch,
+            )
+            skipped = 0
+            try:
+                for _ in range(skip_target):
+                    next(dataloader_iter)
+                    skipped += 1
+            except StopIteration:
+                # Edge case: epoch ended exactly at save; roll over.
+                self.epoch += 1
+                self._microbatches_in_epoch = 0
+                self._sync_epoch(self.epoch)
+                dataloader_iter = self._create_dataloader_iter()
+            logger.info(
+                "dataloader_resume_skip_done",
+                skipped=skipped,
+                target=skip_target,
+                epoch=self.epoch,
+            )
+
         accum_steps = self._validate_accum_steps(
             tcfg.get("gradient_accumulation_steps", 1)
         )
@@ -931,11 +1030,14 @@ class BaseTrainer(ABC):
                     for _micro in range(accum_steps):
                         try:
                             batch = next(dataloader_iter)
+                            self._microbatches_in_epoch += 1
                         except StopIteration:
                             self.epoch += 1
+                            self._microbatches_in_epoch = 0
                             self._sync_epoch(self.epoch)
                             dataloader_iter = self._create_dataloader_iter()
                             batch = next(dataloader_iter)
+                            self._microbatches_in_epoch += 1
                         micro_metrics = self._forward_backward(batch)
                         accum_metrics.append(micro_metrics)
 
@@ -948,6 +1050,23 @@ class BaseTrainer(ABC):
                         )
                     self.optimizer.step()
                     self._post_optimizer_step(step)
+
+                    # Release cached-but-unused CUDA allocator blocks back
+                    # to the OS each optimizer step. The DGX Spark's
+                    # unified-memory allocator, combined with variable-
+                    # shape batches from a shuffled-order sampler, was
+                    # observed to accumulate fragmentation (monotonic
+                    # system-memory growth over ~30 steps leading to a
+                    # whole-machine stall, 2026-04-19). ``empty_cache``
+                    # forces a defragmentation pass; cost is ~ms scale
+                    # compared to multi-second steps. Gate via
+                    # ``training.cuda_empty_cache_every_step`` in case a
+                    # future workload hits an allocator path where this
+                    # hurts more than it helps.
+                    if tcfg.get("cuda_empty_cache_every_step", True):
+                        import torch as _t
+                        if _t.cuda.is_available():
+                            _t.cuda.empty_cache()
 
                     metrics = _average_metrics(accum_metrics)
                     metrics["grad_norm"] = grad_norm
@@ -965,7 +1084,53 @@ class BaseTrainer(ABC):
                     # wandb long before the unified-memory pool thrashes.
                     mem_log_every = int(tcfg.get("memory_log_every", 50))
                     if mem_log_every > 0 and step % mem_log_every == 0:
-                        metrics.update(_collect_memory_diagnostics())
+                        mem_diag = _collect_memory_diagnostics()
+                        metrics.update(mem_diag)
+
+                        # Safety rail — save a final checkpoint and hard-
+                        # exit if the unified pool gets dangerously full.
+                        # Prevents the 8-hour all-the-way-to-OOM wedge we
+                        # lived through on 2026-04-19 (step 3 training
+                        # leaked ~140 MB / step; Linux OOM-killer claimed
+                        # the container and the host ran out of usable
+                        # memory before ssh could come back). On the DGX
+                        # Spark's 121 GB unified pool, tripping at 100 GB
+                        # used (~83 %) leaves ~20 GB headroom for the
+                        # save_checkpoint call itself + anyone else on the
+                        # box. Override via
+                        # ``training.memory_abort_system_used_gb``; set to
+                        # 0 to disable.
+                        abort_threshold = float(
+                            tcfg.get("memory_abort_system_used_gb", 100.0),
+                        )
+                        sys_used = mem_diag.get("mem/system_used_gb", 0.0)
+                        if abort_threshold > 0 and sys_used >= abort_threshold:
+                            logger.error(
+                                "memory_abort_triggered",
+                                system_used_gb=sys_used,
+                                threshold_gb=abort_threshold,
+                                step=step,
+                                hint="training halted before Linux OOM "
+                                "could wedge the host; investigate the "
+                                "mem/* wandb curves",
+                            )
+                            # Emergency save — best effort, no metrics
+                            # evaluation (may itself allocate).
+                            try:
+                                self._training_state = self._build_training_state(
+                                    es_best, es_evals_without_improvement,
+                                    wandb_run,
+                                )
+                                self.save_checkpoint(checkpoint_dir, metrics=None)
+                            except Exception as save_exc:
+                                logger.warning(
+                                    "memory_abort_save_failed",
+                                    error=str(save_exc)[:200],
+                                )
+                            raise SystemExit(
+                                f"Memory abort: system_used={sys_used:.1f} "
+                                f">= {abort_threshold:.1f} GB",
+                            )
 
                     # Log
                     if step % self._log_every == 0:

@@ -1605,6 +1605,9 @@ class CompressionTrainer(BaseTrainer):
             self._schedule_params = metadata.schedule_params
         if metadata.training_state is not None:
             self._training_state = metadata.training_state
+            self._microbatches_in_epoch = int(
+                metadata.training_state.get("microbatches_in_epoch", 0),
+            )
 
             # Restore curriculum state
             ts = metadata.training_state
@@ -1630,7 +1633,7 @@ class CompressionTrainer(BaseTrainer):
             self._restore_optimizer_state_by_name(
                 state_dicts["optimizer_state_by_name"],
             )
-        else:
+        elif not self._legacy_optimizer_fallback(state_dicts):
             logger.warning(
                 "optimizer_state_missing_using_fresh_moments",
                 hint="checkpoint predates the name-keyed optimizer state refactor",

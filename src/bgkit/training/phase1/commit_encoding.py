@@ -1506,7 +1506,7 @@ class CommitEncodingTrainer(BaseTrainer):
             self._restore_optimizer_state_by_name(
                 state_dicts["optimizer_state_by_name"],
             )
-        else:
+        elif not self._legacy_optimizer_fallback(state_dicts):
             logger.warning(
                 "optimizer_state_missing_using_fresh_moments",
                 hint="checkpoint predates the name-keyed optimizer state refactor",

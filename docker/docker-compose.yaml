@@ -138,15 +138,41 @@ services:
       "scripts/train.py",
       "+experiment=phase1_step3",
       "++compute.attention_implementation=sdpa",
-      "++training.max_batch_tokens=24576",
-      # Reattach to the existing wandb run stored in the checkpoint's
-      # training_state (run id 6mwt97ns for the 2026-04-17 Step 3 launch)
-      # instead of starting a fresh run on resume. The config default
-      # reset_wandb=true is the safe choice for a fresh step 3 launch
-      # (prevents accidental reattachment to an unrelated run), but on
-      # an intentional within-run resume we want continuity so the wandb
-      # history shows one continuous training curve.
-      "++training.reset_wandb=false",
+      # 2026-04-19: ablation comparison of step2000 vs step4000 showed
+      # step2000 is marginally better (mean Δ 0.65 vs 0.60; lower WITH
+      # loss at positions 8-256). Rolling back to step2000 and
+      # restarting from there. The step3000/3500/4000 checkpoints
+      # appear to have mildly regressed under the compressed-ratio
+      # drift that happened post last-restart.
+      "++resume_checkpoint=/workspace/checkpoints/phase1_step3_step2000_20260418_153212",
+      # 2026-04-19 evening: halved max_batch_tokens 16384→8192 and
+      # doubled grad_accum 4→8 after the random-batch-shuffle fix
+      # surfaced the latent memory-per-batch ceiling early — a step
+      # 2020 batch of long-content samples at target_ratio=0.92
+      # produced ~2800 survivors per sample, which puts 30K+ tokens
+      # into the decoder per microbatch and overflows memory. The
+      # prior runs hid this by scheduling long batches late in the
+      # epoch (length-sorted sampler), which just deferred the
+      # crash. Effective batch size per optimizer step is unchanged
+      # (8192 * 8 = 65536, same as 16384 * 4).
+      "++training.max_batch_tokens=8192",
+      "++training.gradient_accumulation_steps=8",
+      # Check memory every 10 steps so the safety rail + wandb curve
+      # catches a leak early. Default 50 was too coarse — we could
+      # grow 7 GB between checks under 2026-04-19's 140 MB/step leak.
+      "++training.memory_log_every=10",
+      # Abort training (after emergency save) if system memory exceeds
+      # 110 GB out of 121 — leaves ~11 GB headroom for the save_checkpoint
+      # call itself and for ssh/system. Raised from 100 on 2026-04-20 to
+      # let training run longer before tripping while still guarding the
+      # host from the all-the-way-to-OOM wedge.
+      "++training.memory_abort_system_used_gb=110",
+      # Force a fresh wandb run. Intentional break from the prior
+      # continuity pattern because (a) we're rolling back to an earlier
+      # checkpoint so the prior wandb history would claim later step
+      # numbers and hide new incoming logs, and (b) the user explicitly
+      # asked for reset.
+      "++training.reset_wandb=true",
     ]
 
   train-phase1-step4:
