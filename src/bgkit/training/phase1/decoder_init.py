@@ -1410,6 +1410,11 @@ class DecoderInitTrainer(BaseTrainer):
                     content_mask = batch["content_attention_mask"].to(self.device)
                     total_content += int(content_mask.sum().item())
 
+                # Drop per-iteration encoder output so it doesn't linger
+                # in the allocator until the next iteration overwrites
+                # the reference; matches training-path discipline.
+                enc_out.release()
+
             avg_loss = total_loss / max(total_content_tokens, 1)
             perplexity = torch.exp(torch.tensor(avg_loss)).item()
 
@@ -1449,6 +1454,7 @@ class DecoderInitTrainer(BaseTrainer):
                     bt = loss_mask.sum().item()
                     qa_loss += loss.item() * bt
                     qa_tokens += bt
+                    enc_out.release()
 
                 qa_avg = qa_loss / max(qa_tokens, 1)
                 metrics["qa_loss"] = qa_avg
@@ -1526,6 +1532,12 @@ class DecoderInitTrainer(BaseTrainer):
             generated_texts.extend(gen_output.content_text)
             generated_languages.extend(batch["languages"])
             samples_seen += survivors.size(0)
+            # Drop the encoder output + survivors references; the KV
+            # cache inside ``gen_output`` is already released by
+            # generate().  Leaves only ``content_text`` (Python strings)
+            # to accumulate across iterations.
+            del survivors, survivor_mask, gen_output
+            enc_out.release()
 
         # Parse success rate
         if generated_texts:

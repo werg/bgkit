@@ -118,6 +118,43 @@ def test_memory_cfg_new_keys_win_over_legacy():
     assert mc["system_abort_gb"] == 110
 
 
+def test_release_transients_zeros_grads_and_drops_prefetched_batch():
+    """``_release_training_transients`` frees grads + prefetcher state."""
+    _reset_legacy_warn()
+    cfg = OmegaConf.create({"training": {}, "compute": {"memory": {}}})
+    t = _StubTrainer(cfg)
+
+    class _FakeOptim:
+        def __init__(self):
+            self.zero_grad_calls: list[bool] = []
+
+        def zero_grad(self, set_to_none: bool = False):
+            self.zero_grad_calls.append(set_to_none)
+
+    class _FakePrefetcher:
+        def __init__(self):
+            self._next_batch = {"sentinel": object()}
+
+    t.optimizer = _FakeOptim()
+    t._active_dataloader_iter = _FakePrefetcher()
+
+    t._release_training_transients()
+
+    # Gradients dropped via set_to_none=True (not just zero-in-place).
+    assert t.optimizer.zero_grad_calls == [True]
+    # Prefetched training batch released.
+    assert t._active_dataloader_iter._next_batch is None
+
+
+def test_release_transients_tolerates_missing_state():
+    """No optimizer yet (pre-``setup``) — must not raise."""
+    _reset_legacy_warn()
+    cfg = OmegaConf.create({"training": {}, "compute": {"memory": {}}})
+    t = _StubTrainer(cfg)
+    # Neither attribute set — just returns cleanly.
+    t._release_training_transients()
+
+
 def test_memory_cfg_legacy_memory_budget_maps_to_scope_budgets():
     """Legacy ``training.memory_budget.<scope>_cap_gb`` maps into
     ``scope_budgets.<scope>_gb`` for the same resolved key shape."""

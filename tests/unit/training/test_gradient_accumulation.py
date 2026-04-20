@@ -93,7 +93,12 @@ class TestAccumulationLoopBehavior:
 
         # 5 optimizer steps, each consuming 4 micro-batches
         assert trainer.step_count == 5
-        assert trainer.zero_grad_count == 5
+        # zero_grad fires (a) once at the top of each optimizer step (5
+        # calls) and (b) once via ``_release_training_transients`` before
+        # each memory-budgeted phase-boundary scope.  With eval_every /
+        # save_every both 0 the only such scopes are the post-loop final
+        # eval + final save (+2 calls).
+        assert trainer.zero_grad_count == 5 + 2
         assert trainer.fb_calls == 20  # 5 steps * 4 micro-batches
 
     @patch.object(BaseTrainer, "save_checkpoint")

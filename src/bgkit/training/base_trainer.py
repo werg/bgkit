@@ -259,14 +259,21 @@ class BaseTrainer(ABC):
         """Create an iterator over the train dataloader.
 
         Default wraps in _DevicePrefetcher for async GPU transfer.
-        Override to disable prefetching (e.g. to save memory).
+        Override to disable prefetching (e.g. to save memory); make
+        sure overrides also assign ``self._active_dataloader_iter`` so
+        :meth:`_release_training_transients` can clear the prefetched
+        batch at phase boundaries.
         """
         if not self._use_device_prefetcher:
-            return iter(self.train_dataloader)
-        device = getattr(self, "device", None)
-        if device is not None and hasattr(device, "type"):
-            return _DevicePrefetcher(iter(self.train_dataloader), device)
-        return iter(self.train_dataloader)
+            it = iter(self.train_dataloader)
+        else:
+            device = getattr(self, "device", None)
+            if device is not None and hasattr(device, "type"):
+                it = _DevicePrefetcher(iter(self.train_dataloader), device)
+            else:
+                it = iter(self.train_dataloader)
+        self._active_dataloader_iter = it
+        return it
 
     def _pre_train_loop(self) -> None:
         """Called after all train() setup but before the loop starts.
@@ -825,6 +832,39 @@ class BaseTrainer(ABC):
 
         return out
 
+    def _release_training_transients(self) -> None:
+        """Drop training-side tensors before entering a memory-budgeted scope.
+
+        Called immediately before every ``evaluate`` / ``gen_eval`` /
+        ``save_checkpoint`` scope entry in :meth:`train`.  Frees:
+
+        * Optimizer gradients — one tensor per trainable param, live
+          between ``optimizer.step()`` and the next step's
+          ``zero_grad()``.  Under full-model training these sum to
+          several GB of otherwise-idle memory during a 5-minute eval.
+        * Any training batch held on device by
+          :class:`_DevicePrefetcher` (``_next_batch``).  The prefetcher
+          stages the next batch at the end of each ``__next__``; if
+          eval fires right after a micro-batch the staged tensor sits
+          through the entire eval.  Re-prefetch costs one extra
+          host→device transfer, cheap compared to the hold.
+
+        The scope's own ``gc.collect`` + ``empty_cache`` then reclaim
+        the freed blocks back to the OS.
+
+        Subclasses should override and call ``super()`` to add their
+        own phase-boundary transients (e.g. survivorship state, cached
+        ICE teacher).  No-op on trainers that haven't reached
+        :meth:`setup` yet.
+        """
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+
+        it = getattr(self, "_active_dataloader_iter", None)
+        if it is not None and hasattr(it, "_next_batch"):
+            it._next_batch = None
+
     def _scope_cap(self, scope: str) -> float | None:
         """Read a :func:`memory_budget_scope` cap for ``scope``.
 
@@ -1269,6 +1309,7 @@ class BaseTrainer(ABC):
 
                     # Eval
                     if eval_every > 0 and step > 0 and step % eval_every == 0:
+                        self._release_training_transients()
                         with memory_budget_scope(
                             "evaluate", cap_gb=self._scope_cap("evaluate"),
                         ):
@@ -1386,6 +1427,7 @@ class BaseTrainer(ABC):
                             last_eval_metrics if last_eval_step == step else None
                         )
                         parent = self._registry_parent()
+                        self._release_training_transients()
                         with memory_budget_scope(
                             "save_checkpoint",
                             cap_gb=self._scope_cap("save_checkpoint"),
@@ -1412,6 +1454,7 @@ class BaseTrainer(ABC):
                                 es_best, es_evals_without_improvement, wandb_run,
                             )
                             parent = self._registry_parent()
+                            self._release_training_transients()
                             # Graceful shutdown: do NOT enforce the cap — we
                             # want the rescue-save to succeed even under
                             # memory pressure that may be causing the
@@ -1441,6 +1484,7 @@ class BaseTrainer(ABC):
                     step += 1
 
                 # Final eval + checkpoint
+                self._release_training_transients()
                 with memory_budget_scope(
                     "evaluate", cap_gb=self._scope_cap("evaluate"),
                 ):
@@ -1453,6 +1497,7 @@ class BaseTrainer(ABC):
                     es_best, es_evals_without_improvement, wandb_run,
                 )
                 parent = self._registry_parent()
+                self._release_training_transients()
                 with memory_budget_scope(
                     "save_checkpoint",
                     cap_gb=self._scope_cap("save_checkpoint"),
