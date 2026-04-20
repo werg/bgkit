@@ -24,7 +24,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from bgkit.data.collators import collate_chat_repro
 from bgkit.data.datasets.chat_repro_dataset import ChatReproDataset
 from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
-from bgkit.data.samplers import TokenBudgetBatchSampler
+from bgkit.data.samplers import PackedTokenBudgetSampler
 from bgkit.eval.ablations import (
     AblationCondition,
     compute_ablation_gap,
@@ -135,7 +135,12 @@ def main(cfg: DictConfig) -> None:
     if cfg.get("training"):
         max_batch_tokens = cfg.training.get("max_batch_tokens", max_batch_tokens)
     eval_lengths = chat_dataset.lengths
-    eval_sampler = TokenBudgetBatchSampler(eval_lengths, max_batch_tokens, shuffle=False)
+    eval_sampler = PackedTokenBudgetSampler(
+        dataset=None,
+        lengths=eval_lengths,
+        max_batch_tokens=max_batch_tokens,
+        shuffle=False,
+    )
     eval_dataloader = DataLoader(
         chat_dataset, batch_sampler=eval_sampler, collate_fn=collate_chat_repro,
     )

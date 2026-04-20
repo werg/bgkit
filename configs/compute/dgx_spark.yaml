@@ -55,6 +55,11 @@ memory:
   # legible error; bump by 5 GB and re-run if a new regime hits it
   # legitimately.  ``null`` disables enforcement for that scope.
   scope_budgets:
-    evaluate_gb: 25           # ~14 GB train-baseline × 1.5 + headroom for long eval batches
-    gen_eval_gb: 35           # encoder fwd + KV cache for generate with max_new_tokens=2048
+    # Wave 4 retune (2026-04-20): eval caps raised to accommodate the
+    # packed eval budget (phase1_step3.max_batch_tokens_eval = 131072,
+    # 2× training). Eval has no backward so it packs bigger for the
+    # same CUDA peak. Gen eval caps lowered: sequential B=1 per-sample
+    # generation peaks well below batched.
+    evaluate_gb: 40           # packed eval at 2× training budget, no backward
+    gen_eval_gb: 15           # sequential B=1 generation + KV cache
     save_checkpoint_gb: 15    # torch.save is host-side; CUDA peak stays near baseline

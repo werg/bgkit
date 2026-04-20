@@ -1,3 +1,16 @@
+"""Tests for attention_backend — packed path only.
+
+The old mask-based tests (test_bgkit_fa4_forward_uses_padding_mask_path,
+test_bgkit_fa4_forward_rejects_query_specific_masks,
+test_bgkit_fa4_forward_keeps_true_gqa_when_sm12x_native_ready) were removed
+when the mask path was deleted in the Wave-0 packed migration.
+
+Remaining coverage:
+- resolve_attention_implementation (strict FA-only)
+- SM12x owned-backend fail-fast guard
+- output_attentions rejection
+"""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -6,30 +19,30 @@ from unittest.mock import patch
 import torch
 import torch.nn as nn
 
-from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
-from bgkit.models.projection_block import ProjectionBlock
-from bgkit.models.pruned_qwen35 import _run_attn_layer
 from bgkit.utils import attention_backend as ab
 
 
-class _DummyRotary(nn.Module):
-    def forward(self, hidden_states, position_ids):
-        return (hidden_states, position_ids)
-
-
-class _DummyAttentionLayer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.last_kwargs = None
-
-    def forward(self, hidden_states, position_embeddings, attention_mask=None, **kwargs):
-        self.last_kwargs = {"attention_mask": attention_mask, **kwargs}
-        return hidden_states
+# ---------------------------------------------------------------------------
+# resolve_attention_implementation
+# ---------------------------------------------------------------------------
 
 
 def test_resolve_attention_implementation_auto_prefers_bgkit_fa4():
-    with patch.object(ab, "install_bgkit_attention_backend", return_value=True):
+    with (
+        patch.object(ab, "install_bgkit_attention_backend", return_value=True),
+        patch.object(ab, "require_sm12x_owned_backend", return_value=None),
+    ):
         assert ab.resolve_attention_implementation("auto") == ab.BGKIT_FA4_ATTENTION_IMPL
+
+
+def test_resolve_attention_implementation_auto_requires_fa4():
+    with patch.object(ab, "install_bgkit_attention_backend", return_value=False):
+        try:
+            ab.resolve_attention_implementation("auto")
+        except RuntimeError as exc:
+            assert "strict FlashAttention-only" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("expected strict auto resolution to fail without FA4")
 
 
 def test_resolve_attention_implementation_explicit_fa4_requires_install():
@@ -42,7 +55,65 @@ def test_resolve_attention_implementation_explicit_fa4_requires_install():
             raise AssertionError("expected explicit FA4 request to fail without FA4")
 
 
-def test_bgkit_fa4_forward_uses_padding_mask_path():
+def test_resolve_attention_implementation_unknown_raises():
+    try:
+        ab.resolve_attention_implementation("some_unknown_backend")
+    except ValueError as exc:
+        assert "Unsupported attention implementation" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected unknown backend to raise ValueError")
+
+
+def test_require_sm12x_owned_backend_noops_off_cuda():
+    with patch.object(ab.torch.cuda, "is_available", return_value=False):
+        ab.require_sm12x_owned_backend()
+
+
+def test_require_sm12x_owned_backend_rejects_unowned_sm12x_backend():
+    with (
+        patch.object(ab.torch.cuda, "is_available", return_value=True),
+        patch.object(ab.torch.cuda, "get_device_capability", return_value=(12, 1)),
+        patch.dict(
+            "sys.modules",
+            {
+                "flash_attn.cute.native_sm12x": SimpleNamespace(
+                    native_sm12x_backend_kind=lambda: "aten",
+                    native_sm12x_owned_backend_available=lambda: False,
+                )
+            },
+        ),
+    ):
+        try:
+            ab.require_sm12x_owned_backend()
+        except RuntimeError as exc:
+            assert "backend_kind='aten'" in str(exc)
+        else:  # pragma: no cover
+            raise AssertionError("expected unowned SM12x backend to fail fast")
+
+
+def test_require_sm12x_owned_backend_accepts_owned_sm12x_backend():
+    with (
+        patch.object(ab.torch.cuda, "is_available", return_value=True),
+        patch.object(ab.torch.cuda, "get_device_capability", return_value=(12, 1)),
+        patch.dict(
+            "sys.modules",
+            {
+                "flash_attn.cute.native_sm12x": SimpleNamespace(
+                    native_sm12x_backend_kind=lambda: "flash_attn",
+                    native_sm12x_owned_backend_available=lambda: True,
+                )
+            },
+        ),
+    ):
+        ab.require_sm12x_owned_backend()
+
+
+# ---------------------------------------------------------------------------
+# bgkit_flash_attention_4_forward — output_attentions rejection
+# ---------------------------------------------------------------------------
+
+
+def test_bgkit_fa4_forward_rejects_output_attentions():
     class _DummyModule(nn.Module):
         def __init__(self):
             super().__init__()
@@ -50,139 +121,23 @@ def test_bgkit_fa4_forward_uses_padding_mask_path():
             self.is_causal = False
 
     module = _DummyModule()
-    query = torch.randn(2, 3, 4, 8)
-    key = torch.randn(2, 3, 4, 8)
-    value = torch.randn(2, 3, 4, 8)
-    pad = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]], dtype=torch.float32)
-    mask = (1.0 - pad[:, None, None, :]) * torch.finfo(torch.float32).min
+    n, h, d = 10, 2, 8
+    q = torch.randn(n, h, d)
+    k = torch.randn(n, h, d)
+    v = torch.randn(n, h, d)
+    cu_seqlens = torch.tensor([0, 5, 10], dtype=torch.int32)
 
-    with patch(
-        "transformers.integrations.flash_attention.get_target_dtype",
-        return_value=None,
-    ), patch(
-        "transformers.modeling_flash_attention_utils._flash_attention_forward",
-        return_value=torch.zeros(2, 4, 3, 8),
-    ) as flash_mock:
-        out, attn = ab.bgkit_flash_attention_4_forward(
+    try:
+        ab.bgkit_flash_attention_4_forward(
             module,
-            query,
-            key,
-            value,
-            mask,
-            is_causal=False,
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=5,
+            output_attentions=True,
         )
-
-    assert attn is None
-    assert out.shape == (2, 4, 3, 8)
-    args = flash_mock.call_args.args
-    kwargs = flash_mock.call_args.kwargs
-    assert args[3].dtype == torch.bool
-    assert args[3].shape == (2, 4)
-    assert kwargs["attn_implementation"] == "flash_attention_4"
-    assert kwargs["is_causal"] is False
-
-
-def test_bgkit_fa4_forward_falls_back_for_query_specific_masks():
-    class _DummyModule(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.config = SimpleNamespace(_attn_implementation=ab.BGKIT_FA4_ATTENTION_IMPL)
-            self.is_causal = False
-
-    module = _DummyModule()
-    query = torch.randn(1, 2, 3, 4)
-    key = torch.randn(1, 2, 3, 4)
-    value = torch.randn(1, 2, 3, 4)
-    mask = torch.zeros(1, 1, 3, 3)
-
-    with patch.object(
-        ab,
-        "_qwen_eager_attention_forward",
-        return_value=("fallback", "weights"),
-    ) as eager_mock:
-        out = ab.bgkit_flash_attention_4_forward(module, query, key, value, mask, is_causal=False)
-
-    eager_mock.assert_called_once()
-    assert out == ("fallback", "weights")
-
-
-def test_bgkit_fa4_forward_keeps_true_gqa_when_sm12x_native_ready():
-    class _DummyModule(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.config = SimpleNamespace(_attn_implementation=ab.BGKIT_FA4_ATTENTION_IMPL)
-            self.is_causal = False
-
-    module = _DummyModule()
-    query = torch.randn(2, 4, 5, 8)
-    key = torch.randn(2, 2, 5, 8)
-    value = torch.randn(2, 2, 5, 8)
-    mask = torch.ones(2, 5, dtype=torch.bool)
-
-    with patch.object(ab, "_sm12x_native_true_gqa_ready", return_value=True), patch(
-        "transformers.integrations.flash_attention.get_target_dtype",
-        return_value=None,
-    ), patch(
-        "transformers.modeling_flash_attention_utils._flash_attention_forward",
-        return_value=torch.zeros(2, 5, 4, 8),
-    ) as flash_mock:
-        out, attn = ab.bgkit_flash_attention_4_forward(
-            module,
-            query,
-            key,
-            value,
-            mask,
-            is_causal=False,
-        )
-
-    assert attn is None
-    assert out.shape == (2, 5, 4, 8)
-    args = flash_mock.call_args.args
-    assert args[1].shape[-2] == 2
-    assert args[2].shape[-2] == 2
-    assert args[3].dtype == torch.bool
-    assert args[3].shape == (2, 5)
-
-
-def test_bidirectional_qwen35_forces_noncausal_attention():
-    layer = _DummyAttentionLayer()
-
-    class _FakeBaseModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed_tokens = nn.Embedding(8, 4)
-            self.norm = nn.Identity()
-            self.rotary_emb = _DummyRotary()
-            self.layers = nn.ModuleList([layer])
-            self.config = SimpleNamespace(model_type="qwen3_5")
-
-    model = BidirectionalQwen35(_FakeBaseModel(), bidi_warmup_steps=0)
-    hidden = torch.randn(1, 3, 4)
-    model(hidden, attention_mask=None)
-
-    assert layer.last_kwargs["is_causal"] is False
-
-
-def test_pruned_attention_runner_forces_noncausal_attention():
-    layer = _DummyAttentionLayer()
-    hidden = torch.randn(1, 3, 4)
-    pos = (_DummyRotary()(hidden, torch.arange(3).unsqueeze(0)))
-
-    _run_attn_layer(layer, hidden, None, pos, use_ckpt=False)
-
-    assert layer.last_kwargs["is_causal"] is False
-
-
-def test_projection_block_forces_noncausal_attention():
-    layer = _DummyAttentionLayer()
-    block = ProjectionBlock(
-        transformer_layer=layer,
-        output_norm=nn.Identity(),
-        rotary_emb=_DummyRotary(),
-        hidden_dim=4,
-    )
-    hidden = torch.randn(1, 3, 4)
-
-    block(hidden)
-
-    assert layer.last_kwargs["is_causal"] is False
+    except NotImplementedError as exc:
+        assert "output_attentions" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected output_attentions to fail fast")

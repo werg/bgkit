@@ -255,7 +255,26 @@ class BaseTrainer(ABC):
             "microbatches_in_epoch": self._microbatches_in_epoch,
         }
 
-    def _create_dataloader_iter(self):
+    def _wrap_dataloader_iter(self, iterator, *, use_prefetch: bool | None = None):
+        """Wrap a raw train-dataloader iterator for runtime consumption.
+
+        ``use_prefetch=False`` is used for resume-time skipping so we do not
+        pay host->device copies for microbatches that will be discarded.
+        """
+        if use_prefetch is None:
+            use_prefetch = self._use_device_prefetcher
+        if not use_prefetch:
+            it = iterator
+        else:
+            device = getattr(self, "device", None)
+            if device is not None and hasattr(device, "type"):
+                it = _DevicePrefetcher(iterator, device)
+            else:
+                it = iterator
+        self._active_dataloader_iter = it
+        return it
+
+    def _create_dataloader_iter(self, *, use_prefetch: bool | None = None):
         """Create an iterator over the train dataloader.
 
         Default wraps in _DevicePrefetcher for async GPU transfer.
@@ -264,16 +283,9 @@ class BaseTrainer(ABC):
         :meth:`_release_training_transients` can clear the prefetched
         batch at phase boundaries.
         """
-        if not self._use_device_prefetcher:
-            it = iter(self.train_dataloader)
-        else:
-            device = getattr(self, "device", None)
-            if device is not None and hasattr(device, "type"):
-                it = _DevicePrefetcher(iter(self.train_dataloader), device)
-            else:
-                it = iter(self.train_dataloader)
-        self._active_dataloader_iter = it
-        return it
+        return self._wrap_dataloader_iter(
+            iter(self.train_dataloader), use_prefetch=use_prefetch,
+        )
 
     def _pre_train_loop(self) -> None:
         """Called after all train() setup but before the loop starts.
@@ -1079,26 +1091,63 @@ class BaseTrainer(ABC):
         # Subclass hook for resume-time setup (e.g. L1 dataloader rebuild)
         self._pre_train_loop()
 
-        dataloader_iter = self._create_dataloader_iter()
-
-        # Advance the dataloader iterator on resume so the model sees
+        # Restore the dataloader cursor on resume so the model sees
         # samples from roughly where it was trained, not epoch 0 batch 0.
         # Without this, a length-sorted sampler (or any sampler where
         # batch i is correlated with training dynamics) re-enters a
         # stale sub-distribution on every resume. See
         # ``self._microbatches_in_epoch`` docstring for the diagnosis.
+        #
+        # Two paths:
+        #
+        # * Sampler supports ``set_batch_cursor`` — the sampler builds
+        #   its batch list and starts iteration at the stored logical
+        #   cursor.  No replay, no wasted CPU.  This is the fast path.
+        # * Sampler lacks cursor support — fall back to replay: pull and
+        #   discard microbatches one by one on CPU (no prefetch, no
+        #   host→device copies).  Kept for legacy samplers and for
+        #   ``_InterleavingDataLoader`` until it too exposes cursor
+        #   state.
+        #
+        # The logical cursor is the trainer's
+        # ``_microbatches_in_epoch``, **not** an iterator-internal
+        # position: ``_DevicePrefetcher`` stages one batch ahead, so a
+        # raw iterator cursor would be off by one.
+        dataloader_iter = None
+        cursor_restored = False
         if is_resuming and self._microbatches_in_epoch > 0:
+            batch_sampler = getattr(self.train_dataloader, "batch_sampler", None)
+            if batch_sampler is not None and hasattr(batch_sampler, "set_batch_cursor"):
+                batch_sampler.set_batch_cursor(self._microbatches_in_epoch)
+                logger.info(
+                    "dataloader_resume_cursor_restored",
+                    batch_cursor=self._microbatches_in_epoch,
+                    epoch=self.epoch,
+                )
+                cursor_restored = True
+
+        if is_resuming and self._microbatches_in_epoch > 0 and not cursor_restored:
             skip_target = int(self._microbatches_in_epoch)
             logger.info(
                 "dataloader_resume_skip_start",
                 microbatches_to_skip=skip_target,
                 epoch=self.epoch,
+                reason="batch_sampler has no set_batch_cursor",
             )
             skipped = 0
             try:
+                raw_dataloader_iter = self._create_dataloader_iter(use_prefetch=False)
                 for _ in range(skip_target):
-                    next(dataloader_iter)
+                    next(raw_dataloader_iter)
                     skipped += 1
+                    if skipped % 250 == 0 or skipped == skip_target:
+                        logger.info(
+                            "dataloader_resume_skip_progress",
+                            skipped=skipped,
+                            target=skip_target,
+                            epoch=self.epoch,
+                        )
+                dataloader_iter = self._wrap_dataloader_iter(raw_dataloader_iter)
             except StopIteration:
                 # Edge case: epoch ended exactly at save; roll over.
                 self.epoch += 1
@@ -1111,6 +1160,9 @@ class BaseTrainer(ABC):
                 target=skip_target,
                 epoch=self.epoch,
             )
+
+        if dataloader_iter is None:
+            dataloader_iter = self._create_dataloader_iter()
 
         accum_steps = self._validate_accum_steps(
             tcfg.get("gradient_accumulation_steps", 1)

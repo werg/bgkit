@@ -60,6 +60,7 @@ class MockCausalLMBackbone(nn.Module):
         super().__init__()
         self.model = _MockInnerModel(vocab_size, hidden_dim)
         self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
+
         # HF-compat: peft accesses config via both .attr and .get()
         class _Config(dict):
             def __getattr__(self, name):
@@ -108,15 +109,11 @@ class TestApplyLora:
         backbone = MockCausalLMBackbone()
         decoder = ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
 
-        trainable_before = sum(
-            p.numel() for p in decoder.parameters() if p.requires_grad
-        )
+        trainable_before = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
 
         decoder.apply_lora(LORA_CONFIG)
 
-        trainable_after = sum(
-            p.numel() for p in decoder.parameters() if p.requires_grad
-        )
+        trainable_after = sum(p.numel() for p in decoder.parameters() if p.requires_grad)
 
         assert trainable_after < trainable_before
         assert trainable_after > 0
@@ -181,7 +178,7 @@ class TestMergeLora:
         assert changed, "Merged weights should differ from base after LoRA training"
 
     def test_roundtrip_single_splice_loss_equivalence(self):
-        """Single-splice loss matches before and after LoRA merge."""
+        """Single-splice packed loss matches before and after LoRA merge."""
         torch.manual_seed(42)
 
         backbone = MockCausalLMBackbone()
@@ -193,21 +190,18 @@ class TestMergeLora:
             if "lora_" in name and param.requires_grad:
                 param.data.normal_(0, 0.01)
 
-        # Evaluate through the LoRA decoder
-        survivors = torch.randn(1, 3, HIDDEN_DIM)
+        # Packed inputs: 3 survivors (flat), no prefix, 8 suffix tokens
+        surv_flat = torch.randn(3, HIDDEN_DIM)
+        cu = torch.tensor([0, 3], dtype=torch.int32)
         target_ids = torch.randint(0, VOCAB_SIZE, (1, 8))
-        target_mask = torch.ones(1, 8, dtype=torch.bool)
-        survivor_mask = torch.ones(1, 3, dtype=torch.bool)
 
         decoder.eval()
         with torch.no_grad():
             lora_loss = decoder.forward_with_single_splice(
-                survivor_embeddings=survivors,
-                survivor_attention_mask=survivor_mask,
-                token_ids=target_ids,
-                token_attention_mask=target_mask,
-                splice_starts=torch.zeros(1, dtype=torch.long),
-                splice_lengths=torch.zeros(1, dtype=torch.long),
+                survivor_embeddings=surv_flat,
+                survivor_cu_seqlens=cu,
+                prefix_ids=[torch.zeros(0, dtype=torch.long)],
+                suffix_ids=[target_ids[0]],
             )
 
         # Merge and load into plain decoder
@@ -219,12 +213,10 @@ class TestMergeLora:
 
         with torch.no_grad():
             plain_loss = fresh_decoder.forward_with_single_splice(
-                survivor_embeddings=survivors,
-                survivor_attention_mask=survivor_mask,
-                token_ids=target_ids,
-                token_attention_mask=target_mask,
-                splice_starts=torch.zeros(1, dtype=torch.long),
-                splice_lengths=torch.zeros(1, dtype=torch.long),
+                survivor_embeddings=surv_flat,
+                survivor_cu_seqlens=cu,
+                prefix_ids=[torch.zeros(0, dtype=torch.long)],
+                suffix_ids=[target_ids[0]],
             )
 
         torch.testing.assert_close(lora_loss, plain_loss, atol=1e-4, rtol=1e-4)

@@ -52,7 +52,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from bgkit.data.collators import collate_chat_repro
 from bgkit.data.datasets.chat_repro_dataset import ChatReproDataset
 from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
-from bgkit.data.samplers import TokenBudgetBatchSampler
+from bgkit.data.samplers import PackedTokenBudgetSampler
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
@@ -227,17 +227,27 @@ class ProjectionRepairTrainer(BaseTrainer):
         )
 
         max_batch_tokens = tcfg.get("max_batch_tokens", 32768)
+        # Eval has no backward — its packed budget can be larger than
+        # training's. Falls back to ``max_batch_tokens`` when unset.
+        max_batch_tokens_eval = tcfg.get("max_batch_tokens_eval", max_batch_tokens)
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
         seed = self.cfg.get("seed", 42)
 
         train_lengths = full_dataset.lengths[np.array(self.train_dataset.indices)]
         eval_lengths = full_dataset.lengths[np.array(self.eval_dataset.indices)]
-        self.train_sampler = TokenBudgetBatchSampler(
-            train_lengths, max_batch_tokens, shuffle=True, seed=seed,
+        self.train_sampler = PackedTokenBudgetSampler(
+            self.train_dataset,
+            lengths=train_lengths,
+            max_batch_tokens=max_batch_tokens,
+            shuffle=True,
+            seed=seed,
         )
-        eval_sampler = TokenBudgetBatchSampler(
-            eval_lengths, max_batch_tokens, shuffle=False,
+        eval_sampler = PackedTokenBudgetSampler(
+            self.eval_dataset,
+            lengths=eval_lengths,
+            max_batch_tokens=max_batch_tokens_eval,
+            shuffle=False,
         )
         self.train_dataloader = DataLoader(
             self.train_dataset,
@@ -331,74 +341,128 @@ class ProjectionRepairTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     def _encoder_forward_nocomp(self, batch: dict):
-        """Run the (frozen) compressor + (trainable) projection at ratio=None."""
+        """Run the (frozen) compressor + (trainable) projection at ratio=None.
+
+        Packed inputs: flat ``(N_content, D)`` content embeddings +
+        ``content_cu_seqlens``. Returns the encoder output, flat content
+        token IDs, and the content segmentation for downstream reductions.
+        """
         device = self.device
         content_token_ids = batch["content_token_ids"].to(device)
-        content_attention_mask = batch["content_attention_mask"].to(device)
-        compression_prompt_ids = batch["compression_prompt_ids"].to(device)
-        compression_prompt_mask = batch["compression_prompt_mask"].to(device)
+        content_cu = batch["content_cu_seqlens"].to(device)
+        content_position_ids = batch["content_position_ids"].to(device)
+        prompt_ids = batch["compression_prompt_ids"].to(device)
+        prompt_cu = batch["compression_prompt_cu_seqlens"].to(device)
+        from bgkit.utils.packing import position_ids_from_cu
+        prompt_position_ids = position_ids_from_cu(prompt_cu, int(prompt_ids.shape[0]))
         bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
-        return self.encoder(
-            input_embeddings=bgkit_embed(content_token_ids),
-            attention_mask=content_attention_mask,
-            prompt_embeddings=bgkit_embed(compression_prompt_ids),
-            prompt_attention_mask=compression_prompt_mask,
+        enc_out = self.encoder(
+            content_embeddings=bgkit_embed(content_token_ids),
+            content_cu_seqlens=content_cu,
+            content_position_ids=content_position_ids,
+            prompt_embeddings=bgkit_embed(prompt_ids),
+            prompt_cu_seqlens=prompt_cu,
+            prompt_position_ids=prompt_position_ids,
             target_ratio=None,
             level="l0",
             min_per_sample=0,
-        ), content_token_ids, content_attention_mask.bool()
+        )
+        return enc_out, content_token_ids, content_cu
 
     def _anchor_losses(
         self,
-        proj: torch.Tensor,      # (B, L, D)
-        target: torch.Tensor,    # (B, L, D)
-        mask: torch.Tensor,      # (B, L)
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        """Compute MSE + optional cosine + norm-match losses."""
-        m = mask.to(proj.dtype).unsqueeze(-1)         # (B, L, 1)
-        n_pos = mask.to(proj.dtype).sum().clamp(min=1.0)
+        proj: torch.Tensor,      # (N_content, D)
+        target: torch.Tensor,    # (N_content, D)
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Compute MSE + cosine + norm-match losses on flat (N, D) packed tensors.
 
-        # MSE per valid position, averaged over D.
-        diff = (proj - target) * m
+        All content positions in a packed batch are valid (no padding), so
+        we simply mean over the flat axis.
+        """
+        n_pos = max(proj.shape[0], 1)
+
+        # MSE over all valid flat positions and D.
+        diff = proj - target
         mse = diff.pow(2).sum() / (n_pos * proj.size(-1))
 
         # Cosine direction loss: 1 - cos.
-        cos = F.cosine_similarity(proj, target, dim=-1)  # (B, L)
-        cos_loss = ((1.0 - cos) * mask.to(cos.dtype)).sum() / n_pos
+        cos = F.cosine_similarity(proj, target, dim=-1)  # (N,)
+        cos_loss = (1.0 - cos).sum() / n_pos
 
         # Norm-match (log-ratio squared, robust to scale).
         proj_norm = proj.norm(dim=-1).clamp(min=1e-6)
         tgt_norm = target.norm(dim=-1).clamp(min=1e-6)
         norm_loss = (
             (torch.log(proj_norm) - torch.log(tgt_norm)).pow(2)
-            * mask.to(proj_norm.dtype)
         ).sum() / n_pos
 
         return mse, {
             "anchor_mse": mse.detach(),
             "anchor_cos": cos_loss.detach(),
             "anchor_norm_log": norm_loss.detach(),
-            "cos_sim_mean": (cos * mask.to(cos.dtype)).sum().detach() / n_pos,
-            "norm_ratio_mean": (proj_norm / tgt_norm * mask.to(proj_norm.dtype)).sum().detach() / n_pos,
+            "cos_sim_mean": cos.sum().detach() / n_pos,
+            "norm_ratio_mean": (proj_norm / tgt_norm).sum().detach() / n_pos,
         }, cos_loss, norm_loss
 
-    def _decoder_ce(self, batch: dict, proj: torch.Tensor, proj_mask: torch.Tensor) -> torch.Tensor:
-        """End-to-end reconstruction CE via the frozen decoder."""
+    def _decoder_ce(
+        self,
+        batch: dict,
+        proj: torch.Tensor,
+        survivor_cu: torch.Tensor,
+    ) -> torch.Tensor:
+        """End-to-end reconstruction CE via the frozen decoder (packed).
+
+        Carves per-sample prefix/suffix token lists from the packed
+        ``token_ids`` using each sample's ``bgkit_splice_start`` (the
+        position where the survivor embeddings are spliced into the
+        token sequence). ``bgkit_splice_len`` is the span of dummy
+        placeholder tokens the collator left open for the splice
+        — typically 0 in repro batches.
+        """
         device = self.device
-        token_ids = batch["token_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        loss_mask = batch["loss_mask"].to(device)
+        token_ids_flat = batch["token_ids"].to(device)
+        tok_cu = batch["cu_seqlens"].to(device)
         splice_start = batch["bgkit_splice_start"].to(device)
         splice_len = batch["bgkit_splice_len"].to(device)
+        loss_mask_flat = batch["loss_mask"].to(device)
 
+        batch_size = int(tok_cu.shape[0]) - 1
+        tok_cu_list = tok_cu.to(torch.int64).tolist()
+        surv_cu_list = survivor_cu.to(torch.int64).tolist()
+
+        # Per-sample prefix/suffix + the assembled per-segment loss mask.
+        prefix_ids: list[torch.Tensor] = []
+        suffix_ids: list[torch.Tensor] = []
+        per_segment_loss_masks: list[torch.Tensor] = []
+        for b in range(batch_size):
+            sample_start = int(tok_cu_list[b])
+            sample_end = int(tok_cu_list[b + 1])
+            sample_tokens = token_ids_flat[sample_start:sample_end]
+            sample_loss = loss_mask_flat[sample_start:sample_end].to(torch.bool)
+            splice_b_start = int(splice_start[b].item())
+            splice_b_len = int(splice_len[b].item())
+            if splice_b_start < 0:
+                # No splice — treat whole sequence as prefix (nothing after).
+                splice_b_start = sample_tokens.shape[0]
+                splice_b_len = 0
+            pre = sample_tokens[:splice_b_start]
+            suf = sample_tokens[splice_b_start + splice_b_len :]
+            prefix_ids.append(pre)
+            suffix_ids.append(suf)
+
+            pre_mask = sample_loss[:splice_b_start]
+            suf_mask = sample_loss[splice_b_start + splice_b_len :]
+            k_i = int(surv_cu_list[b + 1]) - int(surv_cu_list[b])
+            surv_mask = torch.zeros(k_i, dtype=torch.bool, device=device)
+            per_segment_loss_masks.append(torch.cat([pre_mask, surv_mask, suf_mask], dim=0))
+
+        flat_loss_mask = torch.cat(per_segment_loss_masks, dim=0)
         return self.decoder.forward_with_single_splice(
             survivor_embeddings=proj,
-            survivor_attention_mask=proj_mask,
-            token_ids=token_ids,
-            token_attention_mask=attention_mask,
-            splice_starts=splice_start,
-            splice_lengths=splice_len,
-            loss_mask=loss_mask,
+            survivor_cu_seqlens=survivor_cu,
+            prefix_ids=prefix_ids,
+            suffix_ids=suffix_ids,
+            loss_mask=flat_loss_mask,
         )
 
     def _forward_backward(self, batch) -> dict[str, float]:
@@ -406,14 +470,14 @@ class ProjectionRepairTrainer(BaseTrainer):
         # we still need grads to flow through the projection, so a local
         # autocast+no-grad-on-frozen setup is not strictly necessary. The
         # frozen params have requires_grad=False.
-        enc_out, content_ids, content_mask = self._encoder_forward_nocomp(batch)
-        proj = enc_out.survivor_embeddings  # (B, L_content, D) at ratio=None
-        proj_mask = enc_out.survivor_attention_mask.bool()  # (B, L_content)
+        enc_out, content_ids, _content_cu = self._encoder_forward_nocomp(batch)
+        proj = enc_out.survivor_embeddings  # (N_content, D) at ratio=None
+        survivor_cu = enc_out.survivor_cu_seqlens  # same as content_cu when uncompressed
 
         with torch.no_grad():
             target_emb = self._decoder_embed(content_ids).detach()
 
-        mse, stats, cos_loss, norm_loss = self._anchor_losses(proj, target_emb, proj_mask)
+        mse, stats, cos_loss, norm_loss = self._anchor_losses(proj, target_emb)
 
         total = (
             self._anchor_weight * mse
@@ -431,7 +495,7 @@ class ProjectionRepairTrainer(BaseTrainer):
         }
 
         if self._ce_weight > 0.0:
-            ce = self._decoder_ce(batch, proj, proj_mask)
+            ce = self._decoder_ce(batch, proj, survivor_cu)
             total = total + self._ce_weight * ce
             metrics["loss/ce"] = ce.detach()
             metrics["loss"] = total
@@ -460,14 +524,12 @@ class ProjectionRepairTrainer(BaseTrainer):
         for batch in self.eval_dataloader:
             enc_out, content_ids, _ = self._encoder_forward_nocomp(batch)
             proj = enc_out.survivor_embeddings
-            proj_mask = enc_out.survivor_attention_mask.bool()
+            survivor_cu = enc_out.survivor_cu_seqlens
             target_emb = self._decoder_embed(content_ids)
-            mse, stats, cos_loss, norm_loss = self._anchor_losses(
-                proj, target_emb, proj_mask,
-            )
+            mse, stats, cos_loss, norm_loss = self._anchor_losses(proj, target_emb)
             ce_val = None
             if self._ce_weight > 0.0:
-                ce_val = self._decoder_ce(batch, proj, proj_mask)
+                ce_val = self._decoder_ce(batch, proj, survivor_cu)
 
             totals["anchor_mse"] = totals.get("anchor_mse", 0.0) + float(mse.item())
             totals["anchor_cos"] = totals.get("anchor_cos", 0.0) + float(cos_loss.item())

@@ -4,6 +4,12 @@
 The encoder's internal survivorship head produces the survivor mask from the
 target retention ratio. Produces sharded mmap survivors for fast training.
 
+Packed-attention migration (Wave 4.4): the encoder forward is called with
+flat ``(N, D)`` content embeddings + ``content_cu_seqlens`` + per-sample
+``content_position_ids``. All documents in a batch go through a single
+packed forward; varlen attention keeps documents from attending across
+their boundaries.
+
 Output format per shard:
   survivors.npy     - bfloat16 mmap, shape (total_survivors_in_shard, hidden_dim)
   offsets.npy       - int64 CSR offsets, shape (docs_in_shard + 1,)
@@ -16,7 +22,6 @@ Global index:
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
 from pathlib import Path
@@ -60,46 +65,66 @@ def _load_encoder(checkpoint_path: str, device: torch.device):
 
 def _encode_batch(
     encoder,
-    token_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
+    token_lists: list[np.ndarray],
     retention_ratio: float,
     device: torch.device,
 ) -> list[dict]:
-    """Encode a batch and return per-document survivors + survive probabilities."""
+    """Encode a batch of variable-length token sequences via a packed
+    encoder forward.
+
+    Inputs are per-document int64 token arrays (no pre-padding). They are
+    packed into a single flat ``(N,)`` buffer; the encoder returns flat
+    survivor embeddings with per-document segmentation in
+    ``survivor_cu_seqlens``.
+    """
+    from bgkit.utils.packing import position_ids_from_cu
+
     embed_tokens = encoder.compressor.backbone.get_input_embeddings()
-    input_embeddings = embed_tokens(token_ids)
 
-    results = []
-    batch_size = token_ids.size(0)
-    for i in range(batch_size):
-        length = int(attention_mask[i].sum())
-        if length == 0:
-            results.append({
-                "survivors": np.zeros((0, 1024), dtype=np.float16),
-                "probs": np.array([], dtype=np.float32),
-            })
-            continue
+    lengths = torch.tensor([int(t.size) for t in token_lists], dtype=torch.int32)
+    cu_seqlens = torch.zeros(len(token_lists) + 1, dtype=torch.int32)
+    cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
+    flat_tokens = torch.from_numpy(np.concatenate(token_lists, dtype=np.int64)).to(
+        device=device, dtype=torch.long,
+    )
+    input_embeds = embed_tokens(flat_tokens)
+    cu_seqlens = cu_seqlens.to(device)
+    position_ids = position_ids_from_cu(cu_seqlens, int(flat_tokens.size(0)))
 
-        # Survivorship head produces the mask internally from target_ratio
-        output = encoder(
-            input_embeddings=input_embeddings[i : i + 1],
-            attention_mask=attention_mask[i : i + 1],
-            target_ratio=retention_ratio,
-            level="l0",
-        )
-        # Drop padding from survivors
-        surv_mask_attn = output.survivor_attention_mask[0]
-        survivors = (
-            output.survivor_embeddings[0][surv_mask_attn]
-            .cpu().to(torch.float16).numpy()
-        )
-        # Gather probabilities at surviving positions
-        if output.survivor_mask is not None and output.survive_probs is not None:
-            probs = output.survive_probs[0][output.survivor_mask[0]]
-            probs_np = probs.cpu().float().numpy().astype(np.float32)
+    output = encoder(
+        content_embeddings=input_embeds,
+        content_cu_seqlens=cu_seqlens,
+        content_position_ids=position_ids,
+        target_ratio=retention_ratio,
+        level="l0",
+    )
+
+    survivors_flat = (
+        output.survivor_embeddings.cpu().to(torch.float16).numpy()
+    )
+    survivor_cu = output.survivor_cu_seqlens.cpu().to(torch.int64).numpy()
+
+    # Gather per-document survive probs from the flat ``(N_content,)``
+    # head outputs using the content_cu_seqlens (survivor positions are a
+    # subset of content positions).
+    probs_flat: np.ndarray | None = None
+    if output.survivor_mask is not None and output.survive_probs is not None:
+        probs = output.survive_probs[output.survivor_mask].cpu().float().numpy()
+        probs_flat = probs.astype(np.float32)
+
+    results: list[dict] = []
+    cursor_probs = 0
+    for i in range(len(token_lists)):
+        s = int(survivor_cu[i])
+        e = int(survivor_cu[i + 1])
+        row_survivors = survivors_flat[s:e]
+        if probs_flat is not None:
+            n = e - s
+            row_probs = probs_flat[cursor_probs : cursor_probs + n]
+            cursor_probs += n
         else:
-            probs_np = np.zeros(len(survivors), dtype=np.float32)
-        results.append({"survivors": survivors, "probs": probs_np})
+            row_probs = np.zeros(e - s, dtype=np.float32)
+        results.append({"survivors": row_survivors, "probs": row_probs})
 
     return results
 
@@ -193,23 +218,12 @@ def precompute_l0(
         if not batch_token_lists:
             continue
 
-        # Pad batch
-        max_len = max(len(t) for t in batch_token_lists)
-        padded = np.zeros((len(batch_token_lists), max_len), dtype=np.int64)
-        masks = np.zeros((len(batch_token_lists), max_len), dtype=np.bool_)
-        for i, t in enumerate(batch_token_lists):
-            padded[i, : len(t)] = t
-            masks[i, : len(t)] = True
-
-        token_tensor = torch.from_numpy(padded).to(device)
-        mask_tensor = torch.from_numpy(masks).to(device)
-
         with torch.no_grad():
             results = _encode_batch(
-                encoder, token_tensor, mask_tensor, retention_ratio, device,
+                encoder, batch_token_lists, retention_ratio, device,
             )
 
-        for i, (doc_idx, result) in enumerate(
+        for _i, (doc_idx, result) in enumerate(
             zip(batch_doc_indices, results, strict=False),
         ):
             survivors = result["survivors"]

@@ -22,8 +22,12 @@ class ResidualConv1d(nn.Module):
         self.norm = nn.RMSNorm(hidden_dim, eps=eps)
         # Depthwise: groups=hidden_dim, no bias
         self.conv = nn.Conv1d(
-            hidden_dim, hidden_dim, kernel_size,
-            groups=hidden_dim, bias=False, padding=0,
+            hidden_dim,
+            hidden_dim,
+            kernel_size,
+            groups=hidden_dim,
+            bias=False,
+            padding=0,
         )
         self.kernel_size = kernel_size
         # Symmetric "same" padding

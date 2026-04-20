@@ -1,4 +1,4 @@
-"""Tests for ReconstructionDecoder single-splice hidden-state path."""
+"""Tests for ReconstructionDecoder single-splice hidden-state path (packed API)."""
 
 from __future__ import annotations
 
@@ -53,6 +53,34 @@ class MockCausalLMBackbone(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Helpers — convert old (B, K, D) padded survivors to packed form
+# ---------------------------------------------------------------------------
+
+
+def _pack_survivors(
+    survivor_embeddings: torch.Tensor,
+    survivor_attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert padded (B, K_max, D) + mask to flat (K_total, D) + cu_seqlens."""
+    batch_size = survivor_embeddings.shape[0]
+    flat_list = []
+    lengths = []
+    for b in range(batch_size):
+        mask_b = survivor_attention_mask[b]  # (K_max,)
+        k_i = int(mask_b.sum().item())
+        flat_list.append(survivor_embeddings[b, :k_i])
+        lengths.append(k_i)
+    if flat_list:
+        flat = torch.cat(flat_list, dim=0)
+    else:
+        flat = survivor_embeddings.new_zeros(0, survivor_embeddings.shape[-1])
+    cu = torch.zeros(batch_size + 1, dtype=torch.int32)
+    for i, length in enumerate(lengths):
+        cu[i + 1] = cu[i] + length
+    return flat, cu
+
+
+# ---------------------------------------------------------------------------
 # Decoder single-splice tests
 # ---------------------------------------------------------------------------
 
@@ -65,60 +93,62 @@ class TestReconstructionDecoderSingleSplice:
         return ReconstructionDecoder(backbone, hidden_dim=hidden_dim)
 
     def test_hidden_output_shape(self, decoder):
-        """Hidden states should cover prefix, splice, and target tokens."""
+        """Hidden states should cover survivors and target tokens."""
         batch_size, num_survivors, target_len = 2, 5, 10
         survivors = torch.randn(batch_size, num_survivors, 64)
         target_ids = torch.randint(0, 1000, (batch_size, target_len))
-        target_mask = torch.ones(batch_size, target_len, dtype=torch.bool)
         survivor_mask = torch.ones(batch_size, num_survivors, dtype=torch.bool)
+        flat_surv, cu = _pack_survivors(survivors, survivor_mask)
+
+        # No prefix; all target tokens as suffix
         output = decoder.forward_with_single_splice(
-            survivor_embeddings=survivors,
-            survivor_attention_mask=survivor_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=torch.zeros(batch_size, dtype=torch.long),
-            splice_lengths=torch.zeros(batch_size, dtype=torch.long),
+            survivor_embeddings=flat_surv,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long)] * batch_size,
+            suffix_ids=[target_ids[b] for b in range(batch_size)],
             return_hidden_states=True,
         )
 
-        assert output.hidden_states.shape == (batch_size, num_survivors + target_len, 64)
+        # Each sample has num_survivors + target_len tokens, packed as (1, N_total, D)
+        n_total = batch_size * (num_survivors + target_len)
+        assert output.hidden_states.shape == (1, n_total, 64)
 
     def test_padded_survivors(self, decoder):
-        """Should work with padded survivor attention mask."""
+        """Should work with variable survivor counts across batch."""
         batch_size = 2
         survivors = torch.randn(batch_size, 6, 64)
         target_ids = torch.randint(0, 1000, (batch_size, 8))
-        target_mask = torch.ones(batch_size, 8, dtype=torch.bool)
-        survivor_mask = torch.tensor([
-            [True, True, True, True, True, True],
-            [True, True, True, False, False, False],
-        ])
+        survivor_mask = torch.tensor(
+            [
+                [True, True, True, True, True, True],
+                [True, True, True, False, False, False],
+            ]
+        )
+        flat_surv, cu = _pack_survivors(survivors, survivor_mask)
 
         output = decoder.forward_with_single_splice(
-            survivor_embeddings=survivors,
-            survivor_attention_mask=survivor_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=torch.zeros(batch_size, dtype=torch.long),
-            splice_lengths=torch.zeros(batch_size, dtype=torch.long),
+            survivor_embeddings=flat_surv,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long)] * batch_size,
+            suffix_ids=[target_ids[b] for b in range(batch_size)],
             return_hidden_states=True,
         )
-        assert output.hidden_states.shape == (batch_size, 14, 64)
+        # Sample 0: 6 survivors + 8 suffix = 14; sample 1: 3 survivors + 8 suffix = 11; total = 25
+        assert output.hidden_states.shape[0] == 1
+        assert output.hidden_states.shape[2] == 64
 
     def test_gradient_flows_through_decoder(self, decoder):
         """Gradients should flow through decoder parameters."""
         survivors = torch.randn(1, 3, 64)
         target_ids = torch.randint(0, 1000, (1, 5))
-        target_mask = torch.ones(1, 5, dtype=torch.bool)
         survivor_mask = torch.ones(1, 3, dtype=torch.bool)
+        flat_surv, cu = _pack_survivors(survivors, survivor_mask)
 
         loss = decoder.forward_with_single_splice(
-            survivor_embeddings=survivors,
-            survivor_attention_mask=survivor_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=torch.zeros(1, dtype=torch.long),
-            splice_lengths=torch.zeros(1, dtype=torch.long),
+            survivor_embeddings=flat_surv,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long)],
+            suffix_ids=[target_ids[0]],
         )
         loss.backward()
 
@@ -130,16 +160,14 @@ class TestReconstructionDecoderSingleSplice:
         """Frozen survivor inputs should have no gradient."""
         survivors = torch.randn(1, 3, 64)  # no requires_grad
         target_ids = torch.randint(0, 1000, (1, 5))
-        target_mask = torch.ones(1, 5, dtype=torch.bool)
         survivor_mask = torch.ones(1, 3, dtype=torch.bool)
+        flat_surv, cu = _pack_survivors(survivors, survivor_mask)
 
         loss = decoder.forward_with_single_splice(
-            survivor_embeddings=survivors,
-            survivor_attention_mask=survivor_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=torch.zeros(1, dtype=torch.long),
-            splice_lengths=torch.zeros(1, dtype=torch.long),
+            survivor_embeddings=flat_surv,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long)],
+            suffix_ids=[target_ids[0]],
         )
         loss.backward()
 
@@ -149,33 +177,30 @@ class TestReconstructionDecoderSingleSplice:
         """Should work with batch_size=1."""
         survivors = torch.randn(1, 4, 64)
         target_ids = torch.randint(0, 1000, (1, 6))
-        target_mask = torch.ones(1, 6, dtype=torch.bool)
         survivor_mask = torch.ones(1, 4, dtype=torch.bool)
+        flat_surv, cu = _pack_survivors(survivors, survivor_mask)
 
         output = decoder.forward_with_single_splice(
-            survivor_embeddings=survivors,
-            survivor_attention_mask=survivor_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=torch.zeros(1, dtype=torch.long),
-            splice_lengths=torch.zeros(1, dtype=torch.long),
+            survivor_embeddings=flat_surv,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long)],
+            suffix_ids=[target_ids[0]],
             return_hidden_states=True,
         )
+        # 4 survivors + 6 suffix = 10, packed as (1, 10, 64)
         assert output.hidden_states.shape == (1, 10, 64)
 
     def test_loss_finite(self, decoder):
         """The single-splice loss should be finite."""
         survivors = torch.randn(2, 3, 64)
         target_ids = torch.randint(0, 1000, (2, 5))
-        target_mask = torch.ones(2, 5, dtype=torch.bool)
         survivor_mask = torch.ones(2, 3, dtype=torch.bool)
+        flat_surv, cu = _pack_survivors(survivors, survivor_mask)
 
         loss = decoder.forward_with_single_splice(
-            survivor_embeddings=survivors,
-            survivor_attention_mask=survivor_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=torch.zeros(2, dtype=torch.long),
-            splice_lengths=torch.zeros(2, dtype=torch.long),
+            survivor_embeddings=flat_surv,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long)] * 2,
+            suffix_ids=[target_ids[b] for b in range(2)],
         )
         assert torch.isfinite(loss)

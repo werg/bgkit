@@ -36,8 +36,7 @@ On DGX Spark, use the Docker setup (`docker/Dockerfile`) based on NGC containers
 
 ### Local FlashAttention-4 checkout
 
-BgKIT now prefers FlashAttention-4 automatically on DGX Spark when `flash_attn.cute`
-is importable; otherwise it falls back to `sdpa`. To use a local `flash-attention`
+BgKIT now requires FlashAttention-4 on DGX Spark. To use a local `flash-attention`
 checkout instead of a published package:
 
 ```bash
@@ -45,8 +44,7 @@ make install-gpu-local-fa4 FLASH_ATTN_DIR=../flash-attention
 ```
 
 This installs `../flash-attention/flash_attn/cute` into `.venv` in editable mode.
-You can force a hard failure if FA4 is missing with `BGKIT_ATTENTION_IMPL=flash_attention_4`;
-the default `attention_implementation: auto` prefers FA4 and falls back to `sdpa`.
+`attention_implementation: auto` is strict FA4-only and fails fast if FA4 is unavailable.
 The DGX Spark Docker stack also mounts the sibling `../flash-attention` checkout at
 `/workspace/flash-attention` and prefers it via `PYTHONPATH`, so the same local FA4
 tree is used in-container.

@@ -1,28 +1,54 @@
-"""Patch Qwen3.5 GatedDeltaNet to clamp per-step gate values for numerical stability.
+"""Patch Qwen3.5 GatedDeltaNet for numerical stability and packed (varlen) operation.
 
-The chunk_gated_delta_rule backward pass computes exp(g_cum[i] - g_cum[j]) for
-position pairs within each chunk (size 64). For non-causal pairs (j > i), these
-differences are positive and can overflow float32 (max ~3.4e38 = exp(88)) when
-per-step gate magnitudes are large, producing inf * 0 = NaN.
+Two concerns are addressed here:
 
-Pretrained Qwen3.5-0.8B-Base has heads with extreme A_log/dt_bias values that
-produce per-step g around -4.75, yielding cumulative g of -300+ over a chunk.
-This causes backward NaN at 83/128 sequence lengths in a single DeltaNet layer.
+1. Gate-clamping (numerical stability)
+   ====================================
+   The chunk_gated_delta_rule backward pass computes exp(g_cum[i] - g_cum[j]) for
+   position pairs within each chunk (size 64). For non-causal pairs (j > i), these
+   differences are positive and can overflow float32 (max ~3.4e38 = exp(88)) when
+   per-step gate magnitudes are large, producing inf * 0 = NaN.
 
-Fix: clamp per-step g to -(88 / (chunk_size - 1)) ≈ -1.4 so the max exp
-argument in the backward stays within float32 range. This only affects heads
-with extreme decay rates; semantically, exp(-1.4 * 64) ≈ 1.5e-39 is still
-effectively zero (complete state forgetting within a chunk).
+   Pretrained Qwen3.5-0.8B-Base has heads with extreme A_log/dt_bias values that
+   produce per-step g around -4.75, yielding cumulative g of -300+ over a chunk.
+   This causes backward NaN at 83/128 sequence lengths in a single DeltaNet layer.
 
-Known issue upstream:
-  - fla-org/flash-linear-attention#389 (closed without fix)
-  - fla-org/flash-linear-attention#104
-  - unslothai/unsloth#3155 (open, unresolved)
+   Fix: clamp per-step g to -(88 / (chunk_size - 1)) ≈ -1.4 so the max exp
+   argument in the backward stays within float32 range. This only affects heads
+   with extreme decay rates; semantically, exp(-1.4 * 64) ≈ 1.5e-39 is still
+   effectively zero (complete state forgetting within a chunk).
+
+   Known issue upstream:
+     - fla-org/flash-linear-attention#389 (closed without fix)
+     - fla-org/flash-linear-attention#104
+     - unslothai/unsloth#3155 (open, unresolved)
+
+2. Packed (varlen) path
+   =====================
+   Wave 1 of the FA4 packed-attention migration removes all padded attention paths.
+   DeltaNet layers now receive packed inputs: (1, N, H, D) tensors with cu_seqlens
+   marking segment boundaries. The gate reset at sample boundaries is handled by
+   fla-core when cu_seqlens is passed to chunk_gated_delta_rule.
+
+   The patched layer forward accepts two extra kwargs:
+     cu_seqlens : torch.LongTensor | None  — (B+1,) cumulative lengths; None = non-packed
+     position_ids : torch.Tensor | None    — (N,) per-sample position restart; consumed
+                                             by BidirectionalQwen35, not forwarded to fla
+
+   When cu_seqlens is not None, it is forwarded to chunk_gated_delta_rule so fla
+   handles the gate reset at sequence boundaries automatically.
 """
 
-import logging
+from __future__ import annotations
 
+import logging
+from typing import TYPE_CHECKING
+
+import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -34,41 +60,108 @@ DEFAULT_G_CLAMP_MIN = -1.3
 
 
 def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_MIN) -> None:
-    """Patch a single Qwen3_5GatedDeltaNet layer's chunk function to clamp g.
+    """Patch a single Qwen3_5GatedDeltaNet layer for stability and packed inputs.
 
-    Wraps the instance-level self.chunk_gated_delta_rule with g clamping.
+    Two changes applied:
+    1. Wraps self.chunk_gated_delta_rule with g clamping (existing behavior).
+    2. Wraps self.forward to accept and forward cu_seqlens to chunk_gated_delta_rule.
+
     Must be called after the layer is constructed (i.e., after model loading).
+    Idempotent: a second call replaces the previous patch (no double-wrapping).
     """
-    original_fn = getattr(layer, "chunk_gated_delta_rule", None)
-    if original_fn is None:
+    if not hasattr(layer, "chunk_gated_delta_rule"):
         return
+
+    # Unwrap any previous patch to stay idempotent.
+    original_fn = getattr(layer, "_unpatch_chunk_gdr", None) or layer.chunk_gated_delta_rule
+    original_forward = getattr(layer, "_unpatch_forward", None) or layer.forward
+
+    # ---- 1. Patch chunk_gated_delta_rule: clamp g + forward cu_seqlens ----
 
     def _clamped(*args, **kwargs):
         # chunk_gated_delta_rule signature: (q, k, v, g, beta, ...)
-        # HF calls with g= keyword, but handle positional too for robustness.
+        # HF calls with g= keyword; handle positional args too for robustness.
         if len(args) >= 4:
             args = list(args)
             args[3] = args[3].clamp(min=g_clamp_min)
             args = tuple(args)
         elif "g" in kwargs:
             kwargs["g"] = kwargs["g"].clamp(min=g_clamp_min)
+        # cu_seqlens injected by _packed_forward below; pass straight through.
         return original_fn(*args, **kwargs)
 
     layer.chunk_gated_delta_rule = _clamped
+    layer._unpatch_chunk_gdr = original_fn  # keep reference for idempotency
+
+    # ---- 2. Patch layer.forward to accept cu_seqlens / position_ids ----
+    # Wave 1.1 will call:
+    #   layer(hidden_states, pos_emb, cu_seqlens=cu_seqlens, position_ids=position_ids)
+    # The HF forward has signature:
+    #   forward(self, hidden_states, cache_params=None, attention_mask=None)
+    # We need to intercept cu_seqlens and inject it into the chunk_gated_delta_rule call.
+    # position_ids is consumed by the BidirectionalQwen35 rotary path; DeltaNet ignores it.
+
+    def _packed_forward(
+        hidden_states: torch.Tensor,
+        cache_params=None,
+        attention_mask=None,
+        *,
+        cu_seqlens: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+    ):
+        """Forward that injects cu_seqlens into chunk_gated_delta_rule.
+
+        cu_seqlens : (B+1,) int32/int64 cumulative sequence lengths for packed input.
+                     When provided, the input is (1, N, H, D) packed; fla's internal
+                     gate-reset-at-boundaries logic activates.
+        position_ids : consumed upstream by the RoPE / BidirectionalQwen35 wrapper;
+                       DeltaNet itself does not use positional embeddings here.
+        """
+        if cu_seqlens is None:
+            # Non-packed call — legacy path used during transition or single-sample gen.
+            return original_forward(hidden_states, cache_params, attention_mask)
+
+        # Packed path: temporarily monkey-patch chunk_gated_delta_rule on this instance
+        # to inject cu_seqlens, then call the original forward.
+        #
+        # We do this by wrapping _clamped (which is already layer.chunk_gated_delta_rule)
+        # rather than the original, so gate-clamping still applies.
+        clamped_fn = layer.chunk_gated_delta_rule  # = _clamped above
+
+        def _with_cu_seqlens(*args, **kwargs):
+            # Inject cu_seqlens if not already present (don't override explicit passing).
+            if "cu_seqlens" not in kwargs:
+                kwargs["cu_seqlens"] = cu_seqlens
+            return clamped_fn(*args, **kwargs)
+
+        layer.chunk_gated_delta_rule = _with_cu_seqlens
+        try:
+            # attention_mask is None in the packed regime — no padded mask.
+            out = original_forward(hidden_states, cache_params, None)
+        finally:
+            # Restore to _clamped so the layer is always in a consistent state.
+            layer.chunk_gated_delta_rule = clamped_fn
+
+        return out
+
+    layer.forward = _packed_forward
+    layer._unpatch_forward = original_forward  # keep reference for idempotency
 
 
 def patch_gated_delta_rule_numerics(
     model: nn.Module | None = None,
     g_clamp_min: float = DEFAULT_G_CLAMP_MIN,
 ) -> None:
-    """Patch GatedDeltaNet layers to clamp per-step g values.
+    """Patch GatedDeltaNet layers for stability and packed (varlen) operation.
 
     Two modes:
-    1. model=None: Patches the class __init__ so all future instances get clamped.
+    1. model=None: Patches the class __init__ so all future instances get patched.
     2. model=<nn.Module>: Patches existing DeltaNet layer instances in the model.
 
     For training, call with model=None early (before model loading) AND then
     call again with the loaded model to patch existing instances.
+
+    The patch is idempotent: repeated calls on the same model do not stack.
 
     Args:
         model: If provided, patch all DeltaNet layers in this model.
@@ -83,8 +176,10 @@ def patch_gated_delta_rule_numerics(
                 count += 1
         if count > 0:
             logger.info(
-                "GatedDeltaNet patched: %d layers, per-step g clamped to >= %.2f",
-                count, g_clamp_min,
+                "GatedDeltaNet patched: %d layers, per-step g clamped to >= %.2f, "
+                "cu_seqlens varlen path enabled",
+                count,
+                g_clamp_min,
             )
         return
 
@@ -109,6 +204,6 @@ def patch_gated_delta_rule_numerics(
 
     logger.info(
         "GatedDeltaNet class patched: per-step g will be clamped to >= %.2f "
-        "(prevents backward NaN from extreme decay rates)",
+        "(prevents backward NaN); cu_seqlens varlen path enabled",
         g_clamp_min,
     )

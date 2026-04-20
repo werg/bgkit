@@ -726,28 +726,30 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
             self.calls: list = []
 
         def __call__(self, **kwargs):
-            # Pass prompt mean through to output so the stub's result
-            # depends on the query.
+            # Packed form. Pass per-turn prompt mean through to output so
+            # the stub's result depends on the query.
             self.calls.append(kwargs)
-            content = kwargs["input_embeddings"]
-            prompt = kwargs["prompt_embeddings"]
-            prompt_mask = kwargs["prompt_attention_mask"]
-            prompt_mean = (
-                prompt * prompt_mask.unsqueeze(-1)
-            ).sum(dim=1) / prompt_mask.sum(dim=1, keepdim=True).clamp(min=1)
-            # Survivors = content + prompt_mean broadcast.
-            out_content = content + prompt_mean.unsqueeze(1)
-            # Derive attention mask from content attention_mask (all True
-            # for non-padded positions). target_ratio/level are accepted
-            # but not used by this stub.
-            attn_mask = kwargs.get("attention_mask")
-            if attn_mask is None:
-                attn_mask = torch.ones(
-                    content.size(0), content.size(1), dtype=torch.bool,
-                )
+            content = kwargs["content_embeddings"]        # (N_content, D)
+            content_cu = kwargs["content_cu_seqlens"]     # (B+1,)
+            prompt = kwargs["prompt_embeddings"]          # (N_query, D)
+            prompt_cu = kwargs["prompt_cu_seqlens"]       # (B+1,)
+            batch_size = int(content_cu.shape[0]) - 1
+            # Compute per-sample prompt mean and broadcast into the
+            # corresponding content rows.
+            out_content = content.clone()
+            for i in range(batch_size):
+                q_start = int(prompt_cu[i].item())
+                q_end = int(prompt_cu[i + 1].item())
+                if q_end > q_start:
+                    mean_i = prompt[q_start:q_end].mean(dim=0, keepdim=True)
+                    c_start = int(content_cu[i].item())
+                    c_end = int(content_cu[i + 1].item())
+                    out_content[c_start:c_end] = content[c_start:c_end] + mean_i
+            counts = (content_cu[1:] - content_cu[:-1]).to(torch.int64)
             return types.SimpleNamespace(
                 survivor_embeddings=out_content,
-                survivor_attention_mask=attn_mask,
+                survivor_cu_seqlens=content_cu,
+                survivor_counts=counts,
             )
 
     trainer = KRKBTrainer.__new__(KRKBTrainer)
@@ -790,13 +792,16 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
     trainer.ice = _IceStub()
 
     # Mock _l0_for_articles directly to skip the encoder-based L0 path.
+    # Packed form: return (flat_rows, cu_seqlens) with K=2 per article.
     def fake_l0(self, dataset, article_ids):
         n = len(article_ids)
-        batch = torch.arange(n * 2 * hidden_dim, dtype=torch.float32).reshape(
-            n, 2, hidden_dim,
+        k = 2
+        flat = torch.arange(n * k * hidden_dim, dtype=torch.float32).reshape(
+            n * k, hidden_dim,
         )
-        mask = torch.ones(n, 2, dtype=torch.bool)
-        return batch, mask
+        cu = torch.zeros(n + 1, dtype=torch.int32)
+        cu[1:] = torch.tensor([k] * n, dtype=torch.int32).cumsum(0)
+        return flat, cu
 
     trainer._l0_for_articles = types.MethodType(fake_l0, trainer)
 
@@ -866,23 +871,35 @@ def test_checkpointed_encoder_matches_plain_forward():
             self.linear = torch.nn.Linear(4, 4)
 
         def forward(self, **kwargs):
-            x = kwargs["input_embeddings"]
+            # Packed form: content_embeddings is (N, D).
+            x = kwargs["content_embeddings"]
+            cu = kwargs["content_cu_seqlens"]
             return types.SimpleNamespace(
                 survivor_embeddings=self.linear(x),
-                survivor_attention_mask=torch.ones(
-                    x.size(0), x.size(1), dtype=torch.bool,
-                ),
+                survivor_cu_seqlens=cu,
+                survivor_counts=(cu[1:] - cu[:-1]).to(torch.int64),
             )
 
     trainer.encoder = _FakeEncoder()
     trainer.encoder.train()
 
-    x = torch.randn(1, 3, 4, requires_grad=True)
+    # Packed (N, D) content with a trivial (B=1) cu_seqlens.
+    x = torch.randn(3, 4, requires_grad=True)
+    cu = torch.tensor([0, 3], dtype=torch.int32)
+    pos = torch.arange(3, dtype=torch.int64)
     # Plain forward reference
-    plain = trainer.encoder(input_embeddings=x).survivor_embeddings
+    plain = trainer.encoder(
+        content_embeddings=x,
+        content_cu_seqlens=cu,
+        content_position_ids=pos,
+    ).survivor_embeddings
 
     # Checkpointed forward
-    ckpt = trainer._checkpointed_encoder(input_embeddings=x).survivor_embeddings
+    ckpt = trainer._checkpointed_encoder(
+        content_embeddings=x,
+        content_cu_seqlens=cu,
+        content_position_ids=pos,
+    ).survivor_embeddings
     torch.testing.assert_close(ckpt, plain)
 
     # Gradient still flows through the checkpointed path
@@ -892,9 +909,13 @@ def test_checkpointed_encoder_matches_plain_forward():
     assert x.grad.abs().sum() > 0
 
     # With no grad-tracking input, checkpointed path falls back to plain.
-    x_nograd = torch.randn(1, 3, 4, requires_grad=False)
-    out_nograd = trainer._checkpointed_encoder(input_embeddings=x_nograd)
-    assert out_nograd.survivor_embeddings.shape == (1, 3, 4)
+    x_nograd = torch.randn(3, 4, requires_grad=False)
+    out_nograd = trainer._checkpointed_encoder(
+        content_embeddings=x_nograd,
+        content_cu_seqlens=cu,
+        content_position_ids=pos,
+    )
+    assert out_nograd.survivor_embeddings.shape == (3, 4)
 
 
 def test_trajectory_json_roundtrip():

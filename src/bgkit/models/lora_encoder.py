@@ -299,7 +299,7 @@ def _rewrap_base_key(key: str, target_names: Iterable[str]) -> str:
         if parts[i] in targets and parts[i + 1] in {"weight", "bias"}:
             # Only wrap if not already under base_layer.
             if i + 1 < len(parts) and parts[i + 1] != "base_layer":
-                new_parts = [*parts[:i + 1], "base_layer", *parts[i + 1:]]
+                new_parts = [*parts[: i + 1], "base_layer", *parts[i + 1 :]]
                 return ".".join(new_parts)
             break
     return key

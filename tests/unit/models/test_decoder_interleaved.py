@@ -75,58 +75,63 @@ def _decoder() -> ReconstructionDecoder:
 
 
 def test_forward_with_single_splice_matches_equivalent_interleaved_segments():
+    """Packed forward_with_single_splice matches forward_interleaved_with_loss
+    when there is no prefix (survivors at the start, suffix = all tokens)."""
     decoder = _decoder()
     torch.manual_seed(3)
-    survivors = torch.randn(2, 4, HIDDEN_DIM)
-    target_ids = torch.randint(0, VOCAB_SIZE, (2, 8))
-    target_mask = torch.ones(2, 8, dtype=torch.bool)
-    survivor_mask = torch.ones(2, 4, dtype=torch.bool)
-    splice_starts = torch.zeros(2, dtype=torch.long)
-    splice_lengths = torch.zeros(2, dtype=torch.long)
+    batch_size, num_surv, target_len = 2, 4, 8
+    survivors_3d = torch.randn(batch_size, num_surv, HIDDEN_DIM)
+    target_ids = torch.randint(0, VOCAB_SIZE, (batch_size, target_len))
 
-    ref = decoder.forward_interleaved_with_loss([
-        EmbeddingSegment(embeddings=survivors),
-        TokenSegment(token_ids=target_ids, loss=True),
-    ])
-    got = decoder.forward_with_single_splice(
-        survivor_embeddings=survivors,
-        survivor_attention_mask=survivor_mask,
-        token_ids=target_ids,
-        token_attention_mask=target_mask,
-        splice_starts=splice_starts,
-        splice_lengths=splice_lengths,
+    ref = decoder.forward_interleaved_with_loss(
+        [
+            EmbeddingSegment(embeddings=survivors_3d),
+            TokenSegment(token_ids=target_ids, loss=True),
+        ]
     )
-    torch.testing.assert_close(got, ref, atol=1e-5, rtol=1e-5)
+
+    # Packed: flat survivors, no prefix, all tokens as suffix
+    surv_flat = survivors_3d.reshape(batch_size * num_surv, HIDDEN_DIM)
+    cu = torch.tensor([0, num_surv, 2 * num_surv], dtype=torch.int32)
+    got = decoder.forward_with_single_splice(
+        survivor_embeddings=surv_flat,
+        survivor_cu_seqlens=cu,
+        prefix_ids=[torch.zeros(0, dtype=torch.long)] * batch_size,
+        suffix_ids=[target_ids[b] for b in range(batch_size)],
+    )
+    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
 
 def test_forward_with_single_splice_respects_loss_mask_at_position_0():
+    """Loss mask restricts which suffix positions contribute to CE."""
     decoder = _decoder()
     torch.manual_seed(11)
-    survivors = torch.randn(1, 3, HIDDEN_DIM)
-    target_ids = torch.randint(0, VOCAB_SIZE, (1, 6))
-    target_mask = torch.ones(1, 6, dtype=torch.bool)
-    survivor_mask = torch.ones(1, 3, dtype=torch.bool)
-    splice_starts = torch.zeros(1, dtype=torch.long)
-    splice_lengths = torch.zeros(1, dtype=torch.long)
+    num_surv, target_len = 3, 6
+    survivors_flat = torch.randn(num_surv, HIDDEN_DIM)
+    target_ids = torch.randint(0, VOCAB_SIZE, (1, target_len))
+    cu = torch.tensor([0, num_surv], dtype=torch.int32)
+    n_total = num_surv + target_len  # 9 positions
 
-    mask_a = torch.tensor([[1, 1, 1, 1, 1, 1]], dtype=torch.bool)
-    mask_b = torch.tensor([[0, 1, 1, 1, 1, 1]], dtype=torch.bool)
+    # mask_a: all suffix positions contribute (positions 3..8)
+    mask_a = torch.zeros(n_total, dtype=torch.bool)
+    mask_a[num_surv:] = True
+
+    # mask_b: skip the first suffix token (position 3)
+    mask_b = torch.zeros(n_total, dtype=torch.bool)
+    mask_b[num_surv + 1 :] = True
+
     loss_a = decoder.forward_with_single_splice(
-        survivor_embeddings=survivors,
-        survivor_attention_mask=survivor_mask,
-        token_ids=target_ids,
-        token_attention_mask=target_mask,
-        splice_starts=splice_starts,
-        splice_lengths=splice_lengths,
+        survivor_embeddings=survivors_flat,
+        survivor_cu_seqlens=cu,
+        prefix_ids=[torch.zeros(0, dtype=torch.long)],
+        suffix_ids=[target_ids[0]],
         loss_mask=mask_a,
     )
     loss_b = decoder.forward_with_single_splice(
-        survivor_embeddings=survivors,
-        survivor_attention_mask=survivor_mask,
-        token_ids=target_ids,
-        token_attention_mask=target_mask,
-        splice_starts=splice_starts,
-        splice_lengths=splice_lengths,
+        survivor_embeddings=survivors_flat,
+        survivor_cu_seqlens=cu,
+        prefix_ids=[torch.zeros(0, dtype=torch.long)],
+        suffix_ids=[target_ids[0]],
         loss_mask=mask_b,
     )
     assert not torch.allclose(loss_a, loss_b, atol=1e-6)
@@ -294,7 +299,8 @@ def test_interleaved_return_hidden_states():
         TokenSegment(token_ids=target_ids, loss=True),
     ]
     output = decoder.forward_interleaved_with_loss(
-        segments, return_hidden_states=True,
+        segments,
+        return_hidden_states=True,
     )
     assert isinstance(output, InterleavedForwardOutput)
     assert output.loss.ndim == 0

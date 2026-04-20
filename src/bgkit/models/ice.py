@@ -33,11 +33,13 @@ class ICE(nn.Module):
         layers: list[nn.Module] = []
         in_channels = input_dim
         for _ in range(num_layers):
-            layers.extend([
-                nn.Conv1d(in_channels, hidden_dim, kernel_size, padding=kernel_size // 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ])
+            layers.extend(
+                [
+                    nn.Conv1d(in_channels, hidden_dim, kernel_size, padding=kernel_size // 2),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                ]
+            )
             in_channels = hidden_dim
         self.backbone = nn.Sequential(*layers)
         self.head = nn.Conv1d(hidden_dim, 1, kernel_size=1)

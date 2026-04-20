@@ -1,19 +1,12 @@
 """Attention backend selection for BgKIT.
 
-Prefers FlashAttention-4 when it is importable in the current environment, but
-falls back to eager/SDPA for attention mask shapes that FA4 cannot represent.
+BgKIT uses the packed (varlen) attention regime exclusively. Query/key/value
+tensors are flat ``(N, H, D)`` where ``N = sum(L_i)`` over the batch. Sequence
+boundaries are communicated via ``cu_seqlens: (B+1,) int32`` and
+``max_seqlen: int``. There is no padded/masked fallback path.
 
-SM120 notes (GB10 / DGX Spark):
- - Our local flash-attention fork has tile/atom fixes for head_dim > 128
-   (see interface.py and flash_bwd.py) so MHA works up to head_dim=256.
- - Native GQA through FA4 (both `pack_gqa=True` and `pack_gqa=False` paths)
-   produces silently wrong gradients on sm_120 even after the tile fixes.
-   We sidestep that by repeat-interleaving K/V heads to match Q before
-   dispatch, turning GQA into MHA. Numerically identical to true GQA and
-   validated vs SDPA (dq/dk/dv max err ≤ 1e-2 at bf16, within bf16 noise).
-   Cost: `qhead_per_kvhead` × KV memory for the duration of the attention
-   call. Remove the broadcast once upstream FA4 sm_120 GQA produces
-   correct gradients.
+BgKIT is strict FlashAttention-only. On SM12x, training must run against an
+owned native backend, not PyTorch's aten bridge.
 """
 
 from __future__ import annotations
@@ -31,15 +24,14 @@ import torch
 # tries to `lazy_import_flash_attention`, which doesn't know about our custom backend.
 BGKIT_FA4_ATTENTION_IMPL = "bgkit_fa4"
 # Aliases let configs / env vars request FA4 by any reasonable synonym and get
-# our FA4-aware wrapper (with GQA broadcast and padding-mask fallback) rather
-# than transformers' native flash_attention_4 path.
+# our FA4-aware wrapper rather than transformers' native flash_attention_4 path.
 _FA4_ALIASES = frozenset({"fa4", "flash_attention_4", BGKIT_FA4_ATTENTION_IMPL})
 
 logger = logging.getLogger(__name__)
 
 
 def _sm12x_native_true_gqa_ready() -> bool:
-    """Return True when BG10 can use FA's native SM12x GQA path directly."""
+    """Return True when GB10 can use FA4's native SM12x GQA varlen path directly."""
     if not torch.cuda.is_available():
         return False
     major, _minor = torch.cuda.get_device_capability()
@@ -52,29 +44,37 @@ def _sm12x_native_true_gqa_ready() -> bool:
     return native_sm12x_owned_backend_available()
 
 
-def _attention_mask_to_padding_mask(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
-    """Convert supported mask layouts into the 2D padding mask FA4 expects."""
-    if attention_mask is None:
-        return None
+def require_sm12x_owned_backend() -> None:
+    """Fail fast when SM12x is present but BgKIT is not using an owned FA backend."""
+    if not torch.cuda.is_available():
+        return
+    major, minor = torch.cuda.get_device_capability()
+    if major != 12:
+        return
+    try:
+        from flash_attn.cute.native_sm12x import (
+            native_sm12x_backend_kind,
+            native_sm12x_owned_backend_available,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "BgKIT requires an owned FlashAttention SM12x backend on compute capability "
+            f"{major}.{minor}, but flash_attn.cute.native_sm12x could not be imported."
+        ) from exc
+    if not native_sm12x_owned_backend_available():
+        backend_kind = native_sm12x_backend_kind()
+        raise RuntimeError(
+            "BgKIT requires an owned FlashAttention SM12x backend on compute capability "
+            f"{major}.{minor}; got backend_kind={backend_kind!r}. "
+            "Build the repo-native flash_attn backend or the explicit "
+            "flash_attn.cute._sm12x_native extension. In Docker, ensure the "
+            "FlashAttention bootstrap path is enabled."
+        )
 
-    if attention_mask.ndim == 2:
-        if attention_mask.dtype == torch.bool:
-            return attention_mask
-        return attention_mask > 0
 
-    if attention_mask.ndim == 4 and attention_mask.shape[1] == 1 and attention_mask.shape[2] == 1:
-        row = attention_mask[:, 0, 0, :]
-        if row.dtype == torch.bool:
-            return row
-        return row == 0
-
-    return None
-
-
-def _qwen_eager_attention_forward(*args: Any, **kwargs: Any):
-    from transformers.models.qwen3_5.modeling_qwen3_5 import eager_attention_forward
-
-    return eager_attention_forward(*args, **kwargs)
+# ---------------------------------------------------------------------------
+# Core packed attention forward — FA4 path
+# ---------------------------------------------------------------------------
 
 
 def bgkit_flash_attention_4_forward(
@@ -82,105 +82,168 @@ def bgkit_flash_attention_4_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    dropout: float = 0.0,
-    scaling: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: int | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    position_ids: torch.Tensor | None = None,
+    is_causal: bool = False,
     sliding_window: int | None = None,
-    softcap: float | None = None,
-    is_causal: bool | None = None,
+    softcap: float = 0.0,
+    scale: float | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
-    """Use FA4 when the mask is compatible, else preserve Qwen eager semantics."""
+    """Packed varlen attention via FA4.
+
+    Parameters
+    ----------
+    module:
+        The attention module (used to read ``is_causal`` fallback).
+    query, key, value:
+        Flat packed tensors of shape ``(N, H, D)`` where ``N = sum(L_i)``.
+    cu_seqlens:
+        Cumulative sequence lengths, shape ``(B+1,)``, dtype ``int32``. Used for
+        BOTH queries and keys when Q/K have identical segmentation (encoder /
+        prefill forward). ``cu_seqlens[0] == 0``, ``cu_seqlens[-1] == N``.
+    max_seqlen:
+        Maximum sequence length in the batch (``max(L_i)``).  Used for both
+        Q and K when they share segmentation.
+    cu_seqlens_q, cu_seqlens_k:
+        Per-side cumulative sequence lengths.  Required during cached decoding
+        where Q has length 1 per step but K has length ``L_prefill + t``.
+        When supplied, they override ``cu_seqlens`` for the respective side.
+    max_seqlen_q, max_seqlen_k:
+        Per-side max sequence lengths (analogous to Q/K cu_seqlens).
+    position_ids:
+        Per-token position IDs, shape ``(N,)``, dtype ``int64``.  Unused by FA4
+        itself; carried through for Wave-1 RoPE integration.
+    is_causal:
+        Apply causal masking.  Defaults to ``False`` (encoder / bidirectional).
+    sliding_window:
+        Local attention window size (number of past tokens visible).
+        Mapped to FA4 ``window_size=(sliding_window, 0)`` for causal or
+        ``(sliding_window, sliding_window)`` for non-causal.
+        ``None`` means full attention.
+    softcap:
+        Logit softcapping value.  Note: not supported by the SM12x native varlen
+        path — callers on SM12x should leave this at 0.0.
+    scale:
+        Softmax scale.  Defaults to ``1 / sqrt(D)``.
+    **kwargs:
+        Remaining kwargs (e.g. ``output_attentions``) are checked and rejected
+        if unsupported.
+
+    Returns
+    -------
+    (attn_output, None)
+        ``attn_output`` has the same packed shape ``(N, H, D)`` as the inputs.
+        The second element is always ``None`` (no attention weights).
+    """
     if kwargs.get("output_attentions", False):
-        return _qwen_eager_attention_forward(
-            module,
-            query,
-            key,
-            value,
-            attention_mask,
-            dropout=dropout,
-            scaling=scaling,
-            **kwargs,
+        raise NotImplementedError(
+            "BgKIT is configured for strict packed attention only; "
+            "`output_attentions=True` is not supported by the BgKIT FA4 backend."
+        )
+    require_sm12x_owned_backend()
+
+    # HF's AttentionInterface dispatch forwards packed-attention kwargs
+    # under the TransformersKwargs / FlashAttentionKwargs names
+    # (``cu_seq_lens_q`` / ``max_length_q``). Our own call sites pass
+    # ``cu_seqlens`` (shared) OR ``cu_seqlens_q`` / ``cu_seqlens_k`` when
+    # Q and K have different segmentation (cached decode step). Normalize
+    # all of these into ``(cu_q, cu_k, max_q, max_k)`` for varlen dispatch.
+    hf_cu_q = kwargs.pop("cu_seq_lens_q", None)
+    hf_cu_k = kwargs.pop("cu_seq_lens_k", None)
+    hf_max_q = kwargs.pop("max_length_q", None)
+    hf_max_k = kwargs.pop("max_length_k", None)
+
+    cu_q = cu_seqlens_q if cu_seqlens_q is not None else (hf_cu_q or cu_seqlens)
+    cu_k = cu_seqlens_k if cu_seqlens_k is not None else (hf_cu_k or cu_seqlens)
+    m_q = max_seqlen_q if max_seqlen_q is not None else (hf_max_q or max_seqlen)
+    m_k = max_seqlen_k if max_seqlen_k is not None else (hf_max_k or max_seqlen)
+
+    if cu_q is None or cu_k is None or m_q is None or m_k is None:
+        raise TypeError(
+            "bgkit_flash_attention_4_forward requires packed sequence "
+            "metadata: ``cu_seqlens`` + ``max_seqlen`` (or the per-side "
+            "``cu_seqlens_q`` / ``cu_seqlens_k`` / ``max_seqlen_q`` / "
+            "``max_seqlen_k``, or HF aliases ``cu_seq_lens_q`` / "
+            "``max_length_q``). Required metadata was not supplied.",
         )
 
-    padding_mask = _attention_mask_to_padding_mask(attention_mask)
-    native_sm12x_gqa = (
-        key.shape[1] < query.shape[1]
-        and query.shape[1] % key.shape[1] == 0
-        and padding_mask is not None
-        and _sm12x_native_true_gqa_ready()
+    is_causal = is_causal if is_causal is not None else getattr(module, "is_causal", False)
+
+    # Build FA4 window_size tuple from the scalar sliding_window convention.
+    if sliding_window is not None:
+        window_size: tuple[int | None, int | None] = (
+            (sliding_window, 0) if is_causal else (sliding_window, sliding_window)
+        )
+    else:
+        window_size = (None, None)
+
+    # HF's attention dispatch passes q/k/v shaped ``(B, H, S, D)`` (with
+    # B == 1 in the packed case). FA4 varlen requires 3D
+    # ``(total_tokens, H, D)`` with ``total_tokens == cu_seqlens[-1]``.
+    # Normalize here so both dispatch paths land the same way.
+    reshaped_from_4d = False
+    if query.dim() == 4:
+        assert query.size(0) == 1, (
+            f"bgkit_flash_attention_4_forward expects (1, H, N, D) from HF "
+            f"but got query.shape={tuple(query.shape)}"
+        )
+        # (1, H, N, D) → (N, H, D)
+        query = query.squeeze(0).transpose(0, 1).contiguous()
+        key = key.squeeze(0).transpose(0, 1).contiguous()
+        value = value.squeeze(0).transpose(0, 1).contiguous()
+        reshaped_from_4d = True
+
+    from flash_attn.cute import flash_attn_varlen_func
+
+    attn_output = flash_attn_varlen_func(
+        q=query,
+        k=key,
+        v=value,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=m_q,
+        max_seqlen_k=m_k,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=window_size,
+        softcap=softcap if softcap else 0.0,
     )
-    # An all-valid padding mask is semantically equivalent to no mask at all.
-    # Clearing it here avoids routing through FA's varlen/unpadding path when
-    # there is nothing to pack, which is especially important on SM12x where the
-    # pointless varlen path is less stable than dense FA.
-    if padding_mask is not None and bool(torch.all(padding_mask)) and not native_sm12x_gqa:
-        padding_mask = None
-    if attention_mask is not None and padding_mask is None:
-        if _attention_mask_to_padding_mask(attention_mask) is None:
-            return _qwen_eager_attention_forward(
-                module,
-                query,
-                key,
-                value,
-                attention_mask,
-                dropout=dropout,
-                scaling=scaling,
-                **kwargs,
-            )
-        attention_mask = None
-
-    from transformers.integrations.flash_attention import get_target_dtype
-    from transformers.modeling_flash_attention_utils import _flash_attention_forward
-
-    # GQA → MHA via repeat_interleave remains the fallback for paths that do not
-    # go through the owned SM12x native backend yet.
-    num_q_heads = query.shape[1]
-    num_kv_heads = key.shape[1]
-    if num_kv_heads < num_q_heads and num_q_heads % num_kv_heads == 0 and not native_sm12x_gqa:
-        repeat = num_q_heads // num_kv_heads
-        key = key.repeat_interleave(repeat, dim=1)
-        value = value.repeat_interleave(repeat, dim=1)
-
-    query_length = query.shape[2]
-    query = query.transpose(1, 2)
-    key = key.transpose(1, 2)
-    value = value.transpose(1, 2)
-
-    target_dtype = get_target_dtype(query, module)
-    is_causal = is_causal if is_causal is not None else getattr(module, "is_causal", True)
-
-    if os.getenv("BGKIT_FA4_DEBUG_FIRST_CALL", "") == "1":
-        _fa4_debug_dump(query, key, value, padding_mask, query_length, is_causal, module=module)  # diag
-
-
-
-    attn_output = _flash_attention_forward(
-        query,
-        key,
-        value,
-        padding_mask,
-        query_length=query_length,
-        is_causal=is_causal,
-        dropout=dropout,
-        softmax_scale=scaling,
-        sliding_window=sliding_window,
-        softcap=softcap,
-        target_dtype=target_dtype,
-        attn_implementation="flash_attention_4",
-        **kwargs,
-    )
+    if isinstance(attn_output, tuple):
+        attn_output = attn_output[0]
+    if reshaped_from_4d:
+        # (N, H, D) → HF's expected (1, N, H, D) post-attention layout.
+        # Transformers attention modules reshape to (B, S, H*D) after this
+        # returns, so emit (1, N, H, D) to match the batched shape contract.
+        attn_output = attn_output.unsqueeze(0)
     return attn_output, None
 
+
+# ---------------------------------------------------------------------------
+# Debug dump (gated on BGKIT_FA4_DEBUG_FIRST_CALL=1)
+# ---------------------------------------------------------------------------
 
 _fa4_debug_n_dumped = 0
 
 
-def _fa4_debug_dump(q, k, v, padding_mask, query_length, is_causal, module=None):
-    """Diagnostic: log FA4 tensor shapes + mask summary + finiteness.
+def _fa4_debug_dump(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    is_causal: bool,
+    module: torch.nn.Module | None = None,
+) -> None:
+    """Diagnostic: log FA4 tensor shapes + cu_seqlens + finiteness.
 
-    Gated on env var BGKIT_FA4_DEBUG_FIRST_CALL=1. Logs up to
-    ``BGKIT_FA4_DEBUG_N`` calls (default 8) per process. Also syncs after
+    Gated on env var ``BGKIT_FA4_DEBUG_FIRST_CALL=1``.  Logs up to
+    ``BGKIT_FA4_DEBUG_N`` calls (default 8) per process.  Also syncs after
     logging so CUDA errors from prior kernels surface at this point.
     """
     global _fa4_debug_n_dumped
@@ -190,48 +253,55 @@ def _fa4_debug_dump(q, k, v, padding_mask, query_length, is_causal, module=None)
     _fa4_debug_n_dumped += 1
     idx = _fa4_debug_n_dumped
     import sys
+
     import torch as _t_mod
 
-    def _t(t):
+    def _t(t: torch.Tensor | None) -> str:
         if t is None:
             return "None"
         return f"shape={tuple(t.shape)} dtype={t.dtype} dev={t.device} contig={t.is_contiguous()}"
 
-    def _fin(t):
+    def _fin(t: torch.Tensor | None) -> str:
         if t is None:
             return "None"
         ft = t.detach().float()
-        return f"nan={int(_t_mod.isnan(ft).sum().item())} inf={int(_t_mod.isinf(ft).sum().item())} abs_max={ft.abs().max().item():.3e}"
+        return (
+            f"nan={int(_t_mod.isnan(ft).sum().item())} "
+            f"inf={int(_t_mod.isinf(ft).sum().item())} "
+            f"abs_max={ft.abs().max().item():.3e}"
+        )
 
     with _t_mod.no_grad():
-        mask_summary = "None"
-        if padding_mask is not None:
-            valid_per_row = padding_mask.detach().sum(dim=-1)
-            mask_summary = (
-                f"{_t(padding_mask)} valid_per_row.min={valid_per_row.min().item()} "
-                f"max={valid_per_row.max().item()} total_valid={int(valid_per_row.sum().item())}"
-            )
+        cu_str = cu_seqlens.tolist() if cu_seqlens is not None else "None"
         mod_id = ""
         if module is not None:
             layer_idx = getattr(module, "layer_idx", None)
             mod_id = f" layer_idx={layer_idx}"
-        # Sync so any pending async CUDA error surfaces here instead of later.
         try:
             _t_mod.cuda.synchronize()
-        except Exception as exc:  # noqa: BLE001 - we want the message
-            print(f"[fa4_debug #{idx}] PRE-CALL CUDA ERROR: {type(exc).__name__}: {exc}",
-                  file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(
+                f"[fa4_debug #{idx}] PRE-CALL CUDA ERROR: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
             raise
         print(
             f"[fa4_debug #{idx}]{mod_id} q={_t(q)} finQ:{_fin(q)} k={_t(k)} v={_t(v)} "
-            f"padding_mask={mask_summary} query_length={query_length} is_causal={is_causal}",
-            file=sys.stderr, flush=True,
+            f"cu_seqlens={cu_str} max_seqlen={max_seqlen} is_causal={is_causal}",
+            file=sys.stderr,
+            flush=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Backend registration + resolution
+# ---------------------------------------------------------------------------
 
 
 @lru_cache(maxsize=1)
 def install_bgkit_attention_backend() -> bool:
-    """Register BgKIT's FA4-aware attention backend when FA4 is importable."""
+    """Register BgKIT's FA4-aware packed attention backend when FA4 is importable."""
     if not torch.cuda.is_available():
         return False
 
@@ -250,19 +320,32 @@ def install_bgkit_attention_backend() -> bool:
 def resolve_attention_implementation(requested: str | None = None) -> str:
     """Resolve the attention implementation BgKIT should request from Transformers.
 
-    `auto` prefers BgKIT's FA4 backend when it is available, else falls back to
-    SDPA. Set `BGKIT_ATTENTION_IMPL` to override globally.
+    ``auto`` and FA4 aliases (``fa4``, ``flash_attention_4``, ``bgkit_fa4``)
+    require FA4 to be importable and, on SM12x, require an owned native backend.
+
+    The returned string is suitable for passing as ``attn_implementation`` to
+    :meth:`AutoModel.from_pretrained` (or the equivalent Transformers kwarg).
     """
     requested = requested or os.getenv("BGKIT_ATTENTION_IMPL", "auto")
 
     if requested == "auto":
-        return BGKIT_FA4_ATTENTION_IMPL if install_bgkit_attention_backend() else "sdpa"
+        if install_bgkit_attention_backend():
+            require_sm12x_owned_backend()
+            return BGKIT_FA4_ATTENTION_IMPL
+        raise RuntimeError(
+            "BgKIT is configured for strict FlashAttention-only execution, but "
+            "`flash_attn.cute` could not be imported."
+        )
 
     if requested in _FA4_ALIASES:
         if install_bgkit_attention_backend():
+            require_sm12x_owned_backend()
             return BGKIT_FA4_ATTENTION_IMPL
         raise RuntimeError(
             "FlashAttention-4 was requested for BgKIT but `flash_attn.cute` could not be imported."
         )
 
-    return requested
+    raise ValueError(
+        f"Unsupported attention implementation {requested!r}. "
+        "Valid values: 'auto', 'fa4', 'flash_attention_4', 'bgkit_fa4'."
+    )

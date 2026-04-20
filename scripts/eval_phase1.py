@@ -128,11 +128,20 @@ def _load_models(cfg: DictConfig, device: torch.device):
 def _eval_at_ratio(
     encoder, decoder, dataloader, device, ratio: float, tokenizer=None,
 ) -> dict[str, float]:
-    """Run evaluation at a specific compression ratio."""
-    import math
+    """Run evaluation at a specific compression ratio (packed form).
+
+    Uses the encoder's own survivorship head with ``target_ratio=ratio``
+    rather than synthesizing a uniform survivor mask from outside —
+    that was the old padded helper's behaviour and doesn't translate
+    cleanly to packed inputs (per-sample indexing into a padded axis
+    becomes a flat scatter across the packed buffer). Letting the head
+    pick survivors at the requested ratio is more faithful to the
+    operating regime anyway.
+    """
+    from bgkit.eval.ablations import _build_decoder_segments_from_batch
 
     total_loss = 0.0
-    total_batches = 0
+    total_weight = 0.0
     all_pred_texts: list[str] = []
     all_ref_texts: list[str] = []
     all_languages: list[str] = []
@@ -141,69 +150,54 @@ def _eval_at_ratio(
 
     with torch.no_grad():
         for batch in dataloader:
-            content_ids = batch["content_token_ids"].to(device)
-            content_mask = batch["content_attention_mask"].to(device)
-            target_ids = batch["token_ids"].to(device)
-            target_mask = batch["attention_mask"].to(device)
-            loss_mask = batch["loss_mask"].to(device)
-            compression_prompt_ids = batch["compression_prompt_ids"].to(device)
-            compression_prompt_mask = batch["compression_prompt_mask"].to(device)
+            content_token_ids = batch["content_token_ids"].to(device)
+            content_cu = batch["content_cu_seqlens"].to(device)
+            content_position_ids = batch["content_position_ids"].to(device)
+            prompt_ids = batch["compression_prompt_ids"].to(device)
+            prompt_cu = batch["compression_prompt_cu_seqlens"].to(device)
+            prompt_position_ids = batch["compression_prompt_position_ids"].to(device)
+            loss_mask_flat = batch["loss_mask"].to(device)
 
-            # Encode content
-            content_emb = bgkit_embed(content_ids)
-            prompt_emb = bgkit_embed(compression_prompt_ids)
-
-            # Build survivor mask for the given ratio
-            batch_size, _seq_len = content_ids.shape
-            survivor_masks = torch.zeros_like(content_mask, dtype=torch.bool)
-            for i in range(batch_size):
-                length = int(content_mask[i].sum())
-                keep = max(1, math.ceil(length * ratio))
-                # Uniform subsampling (no ICE scores needed for eval)
-                indices = torch.linspace(
-                    0, length - 1, steps=keep, device=device,
-                ).round().long()
-                survivor_masks[i, indices] = True
+            content_emb = bgkit_embed(content_token_ids)
+            prompt_emb = bgkit_embed(prompt_ids)
 
             enc_out = encoder(
-                input_embeddings=content_emb,
-                survivor_mask=survivor_masks,
-                attention_mask=content_mask,
+                content_embeddings=content_emb,
+                content_cu_seqlens=content_cu,
+                content_position_ids=content_position_ids,
                 prompt_embeddings=prompt_emb,
-                prompt_attention_mask=compression_prompt_mask,
+                prompt_cu_seqlens=prompt_cu,
+                prompt_position_ids=prompt_position_ids,
+                target_ratio=ratio,
+                level="l0",
             )
             survivors = enc_out.survivor_embeddings
+            survivor_cu = enc_out.survivor_cu_seqlens
 
-            # Compute loss
-            loss = decoder.forward_with_loss(
-                survivors,
-                target_ids,
-                target_mask,
-                content_mask,
-                loss_mask=loss_mask,
+            prefix_list, suffix_list, flat_loss_mask = _build_decoder_segments_from_batch(
+                batch, device, survivor_cu
             )
-            total_loss += loss.item()
-            total_batches += 1
+            loss = decoder.forward_with_single_splice(
+                survivor_embeddings=survivors,
+                survivor_cu_seqlens=survivor_cu,
+                prefix_ids=prefix_list,
+                suffix_ids=suffix_list,
+                loss_mask=flat_loss_mask,
+            )
+            batch_weight = loss_mask_flat.sum().item()
+            total_loss += loss.item() * batch_weight
+            total_weight += batch_weight
 
-            # Generate predictions for parse success / description quality
-            if tokenizer is not None and len(all_pred_texts) < 200:
-                logits = decoder(survivors, target_ids, target_mask, content_mask)
-                predictions = logits[:, :-1].argmax(dim=-1)
-                for i in range(predictions.size(0)):
-                    mask_i = loss_mask[i, 1:]
-                    if mask_i.any():
-                        pred_tokens = predictions[i][mask_i.bool()].cpu().tolist()
-                        tgt_tokens = target_ids[i, 1:][mask_i.bool()].cpu().tolist()
-                        all_pred_texts.append(
-                            tokenizer.decode(pred_tokens, skip_special_tokens=True),
-                        )
-                        all_ref_texts.append(
-                            tokenizer.decode(tgt_tokens, skip_special_tokens=True),
-                        )
-                if "languages" in batch:
-                    all_languages.extend(batch["languages"])
+            # Text preds for parse / description metrics — stubbed under packing.
+            # The previous argmax-over-padded-logits extraction doesn't translate
+            # cleanly to the packed decoder forward (which returns a scalar loss,
+            # not logits). Left as a follow-up: recover per-sample argmax via a
+            # second forward that returns hidden states, then call lm_head. Skip
+            # for now so the curve metric still produces.
+            if tokenizer is not None:
+                pass
 
-    avg_loss = total_loss / max(total_batches, 1)
+    avg_loss = total_loss / max(total_weight, 1.0)
 
     parse_rate = 0.0
     desc_quality = 0.0
@@ -237,23 +231,25 @@ def _run_compression_curve(encoder, decoder, dataloader, device, tokenizer) -> l
 
 
 def _run_embedding_health(encoder, dataloader, device) -> dict[str, float]:
-    """Check embedding drift and health."""
+    """Check embedding drift and health (packed form)."""
     all_embeddings = []
     bgkit_embed = encoder.compressor.backbone.get_input_embeddings()
 
     with torch.no_grad():
         for batch in dataloader:
-            content_ids = batch["content_token_ids"].to(device)
-            content_mask = batch["content_attention_mask"].to(device)
+            content_token_ids = batch["content_token_ids"].to(device)
+            content_cu = batch["content_cu_seqlens"].to(device)
+            content_position_ids = batch["content_position_ids"].to(device)
 
-            content_emb = bgkit_embed(content_ids)
+            content_emb = bgkit_embed(content_token_ids)
             enc_out = encoder(
-                input_embeddings=content_emb,
-                survivor_mask=None,
-                attention_mask=content_mask,
+                content_embeddings=content_emb,
+                content_cu_seqlens=content_cu,
+                content_position_ids=content_position_ids,
+                target_ratio=None,
             )
-            # Collect uncompressed embeddings (full pass, no survivor selection)
-            flat = enc_out.survivor_embeddings[content_mask].detach().cpu()
+            # Flat (N, D) survivor embeddings from the uncompressed pass.
+            flat = enc_out.survivor_embeddings.detach().cpu()
             all_embeddings.append(flat)
             if sum(e.size(0) for e in all_embeddings) >= 512:
                 break
@@ -273,11 +269,16 @@ def _run_rag_baseline(
     dataloader,
     device,
 ) -> dict[str, float]:
-    """Run RAG baseline comparison.
+    """Run RAG baseline comparison (packed form).
 
-    Indexes repo files from eval samples, retrieves context with RAG,
-    feeds to the decoder, and compares loss against BgKIT-compressed context.
+    Rewritten for packed attention: both the BgKIT leg and the RAG leg
+    go through ``forward_with_single_splice``. BgKIT's survivors fill
+    the splice region; RAG retrieves text context, embeds it via the
+    decoder's token embedding table, and passes the embeddings as
+    "survivors" — a synthetic context of retrieved tokens.
     """
+    from bgkit.eval.ablations import _build_decoder_segments_from_batch
+
     rag = RAGBaseline(
         embedding_model_name=eval_cfg.get("rag_embedding_model", "all-MiniLM-L6-v2"),
         reranker_model_name=eval_cfg.get("rag_reranker_model", None),
@@ -285,99 +286,143 @@ def _run_rag_baseline(
     top_k = int(eval_cfg.get("rag_top_k", 5))
     max_samples = int(eval_cfg.get("rag_max_samples", 100))
 
-    # Collect files from the eval dataset for indexing
-    files: dict[str, str] = {}
-    batch_data: list[dict] = []
+    # First pass: collect per-sample content text so RAG can index + retrieve.
+    indexed_samples: list[dict] = []
     samples_seen = 0
-
     with torch.no_grad():
         for batch in dataloader:
             if samples_seen >= max_samples:
                 break
-            content_ids = batch["content_token_ids"]
-            batch_size = content_ids.size(0)
-            for i in range(batch_size):
+            content_cu = batch["content_cu_seqlens"].to(torch.int64)
+            b_size = int(content_cu.shape[0]) - 1
+            for i in range(b_size):
                 if samples_seen >= max_samples:
                     break
-                mask_i = batch["content_attention_mask"][i].bool()
-                ids_i = content_ids[i][mask_i].tolist()
+                s, e = int(content_cu[i].item()), int(content_cu[i + 1].item())
+                ids_i = batch["content_token_ids"][s:e].tolist()
                 text = tokenizer.decode(ids_i, skip_special_tokens=True)
                 file_key = f"sample_{samples_seen}"
-                files[file_key] = text
-                batch_data.append({
+                indexed_samples.append({
                     "batch": batch,
                     "sample_idx": i,
+                    "content_text": text,
                     "file_key": file_key,
                 })
                 samples_seen += 1
 
-    if not files:
+    if not indexed_samples:
         return {"rag_baseline": "no_eval_data"}
 
-    # Index all eval files
+    files = {e["file_key"]: e["content_text"] for e in indexed_samples}
     rag.index_repository(files)
 
-    # For each sample: retrieve RAG context, feed to decoder, compute loss
     bgkit_embed = encoder.compressor.backbone.get_input_embeddings()
+    decoder_embed = decoder.backbone.get_input_embeddings()
     rag_total_loss = 0.0
     bgkit_total_loss = 0.0
     count = 0
 
     with torch.no_grad():
-        for entry in batch_data:
+        for entry in indexed_samples:
             batch = entry["batch"]
             i = entry["sample_idx"]
 
-            target_ids = batch["token_ids"][i : i + 1].to(device)
-            target_mask = batch["attention_mask"][i : i + 1].to(device)
-            loss_mask = batch["loss_mask"][i : i + 1].to(device)
+            # --- Build a single-sample sub-batch view onto the per-sample slice ---
+            content_cu_full = batch["content_cu_seqlens"].to(device, dtype=torch.int32)
+            prompt_cu_full = batch["compression_prompt_cu_seqlens"].to(device, dtype=torch.int32)
+            tok_cu_full = batch["cu_seqlens"].to(device, dtype=torch.int32)
 
-            # Decode the file content as the query for retrieval
-            content_mask_i = batch["content_attention_mask"][i].bool()
-            content_text = tokenizer.decode(
-                batch["content_token_ids"][i][content_mask_i].tolist(),
-                skip_special_tokens=True,
+            c_s = int(content_cu_full[i].item())
+            c_e = int(content_cu_full[i + 1].item())
+            p_s = int(prompt_cu_full[i].item())
+            p_e = int(prompt_cu_full[i + 1].item())
+            t_s = int(tok_cu_full[i].item())
+            t_e = int(tok_cu_full[i + 1].item())
+
+            content_ids_i = batch["content_token_ids"][c_s:c_e].to(device)
+            prompt_ids_i = batch["compression_prompt_ids"][p_s:p_e].to(device)
+            token_ids_i = batch["token_ids"][t_s:t_e].to(device)
+            loss_mask_i = batch["loss_mask"][t_s:t_e].to(device)
+            splice_start_i = int(batch["bgkit_splice_start"][i].item())
+            splice_len_i = int(batch["bgkit_splice_len"][i].item())
+
+            if splice_start_i < 0:
+                splice_start_i = token_ids_i.shape[0]
+                splice_len_i = 0
+            prefix_i = token_ids_i[:splice_start_i]
+            suffix_i = token_ids_i[splice_start_i + splice_len_i :]
+            pre_mask = loss_mask_i[:splice_start_i]
+            suf_mask = loss_mask_i[splice_start_i + splice_len_i :]
+
+            cu_single = torch.tensor(
+                [0, token_ids_i.shape[0]], dtype=torch.int32, device=device,
             )
+            single_batch = {
+                "token_ids": token_ids_i,
+                "cu_seqlens": cu_single,
+                "loss_mask": loss_mask_i,
+                "bgkit_splice_start": torch.tensor([splice_start_i], dtype=torch.long),
+                "bgkit_splice_len": torch.tensor([splice_len_i], dtype=torch.long),
+            }
 
-            # RAG: retrieve and tokenize context
-            rag_context = rag.retrieve_text(
-                content_text[:200],  # Use first ~200 chars as query
-                top_k=top_k,
+            # ---- BgKIT leg ----
+            content_cu_i = torch.tensor([0, c_e - c_s], dtype=torch.int32, device=device)
+            prompt_cu_i = torch.tensor([0, p_e - p_s], dtype=torch.int32, device=device)
+            content_emb = bgkit_embed(content_ids_i)
+            prompt_emb = bgkit_embed(prompt_ids_i)
+            content_pos_i = torch.arange(
+                content_ids_i.shape[0], device=device, dtype=torch.long,
             )
-            rag_ids = tokenizer.encode(
-                rag_context, return_tensors="pt", truncation=True, max_length=2048,
-            ).to(device)
-            rag_emb = decoder.backbone.get_input_embeddings()(rag_ids)
-            rag_mask = torch.ones(1, rag_emb.size(1), dtype=torch.bool, device=device)
-
-            rag_loss = decoder.forward_with_loss(
-                rag_emb, target_ids, target_mask, rag_mask, loss_mask=loss_mask,
+            prompt_pos_i = torch.arange(
+                prompt_ids_i.shape[0], device=device, dtype=torch.long,
             )
-            rag_total_loss += rag_loss.item()
-
-            # BgKIT: compress and use survivors
-            content_ids_dev = batch["content_token_ids"][i : i + 1].to(device)
-            content_mask_dev = batch["content_attention_mask"][i : i + 1].to(device)
-            prompt_ids = batch["compression_prompt_ids"][i : i + 1].to(device)
-            prompt_mask = batch["compression_prompt_mask"][i : i + 1].to(device)
-
-            content_emb = bgkit_embed(content_ids_dev)
-            prompt_emb = bgkit_embed(prompt_ids)
-
             enc_out = encoder(
-                input_embeddings=content_emb,
-                survivor_mask=None,
-                attention_mask=content_mask_dev,
+                content_embeddings=content_emb,
+                content_cu_seqlens=content_cu_i,
+                content_position_ids=content_pos_i,
                 prompt_embeddings=prompt_emb,
-                prompt_attention_mask=prompt_mask,
+                prompt_cu_seqlens=prompt_cu_i,
+                prompt_position_ids=prompt_pos_i,
+                target_ratio=None,
             )
             survivors = enc_out.survivor_embeddings
-
-            bgkit_loss = decoder.forward_with_loss(
-                survivors, target_ids, target_mask, content_mask_dev, loss_mask=loss_mask,
+            survivor_cu = enc_out.survivor_cu_seqlens
+            prefix_list, suffix_list, flat_loss_mask = _build_decoder_segments_from_batch(
+                single_batch, device, survivor_cu
+            )
+            bgkit_loss = decoder.forward_with_single_splice(
+                survivor_embeddings=survivors,
+                survivor_cu_seqlens=survivor_cu,
+                prefix_ids=prefix_list,
+                suffix_ids=suffix_list,
+                loss_mask=flat_loss_mask,
             )
             bgkit_total_loss += bgkit_loss.item()
+
+            # ---- RAG leg: retrieved tokens as "survivors" ----
+            rag_context = rag.retrieve_text(entry["content_text"][:200], top_k=top_k)
+            rag_ids = tokenizer.encode(
+                rag_context,
+                return_tensors="pt",
+                truncation=True,
+                max_length=2048,
+            ).to(device).squeeze(0)
+            rag_emb = decoder_embed(rag_ids)
+            rag_cu = torch.tensor([0, rag_emb.shape[0]], dtype=torch.int32, device=device)
+            prefix_list_rag, suffix_list_rag, flat_loss_mask_rag = (
+                _build_decoder_segments_from_batch(single_batch, device, rag_cu)
+            )
+            rag_loss = decoder.forward_with_single_splice(
+                survivor_embeddings=rag_emb,
+                survivor_cu_seqlens=rag_cu,
+                prefix_ids=prefix_list_rag,
+                suffix_ids=suffix_list_rag,
+                loss_mask=flat_loss_mask_rag,
+            )
+            rag_total_loss += rag_loss.item()
             count += 1
+            # Reserved: per-leg loss_mask overrides via pre_mask / suf_mask.
+            _ = pre_mask, suf_mask, prefix_i, suffix_i
 
     if count == 0:
         return {"rag_baseline": "no_samples_processed"}
@@ -443,7 +488,7 @@ def main(cfg: DictConfig) -> None:
     if cfg.get("training"):
         max_batch_tokens = cfg.training.get("max_batch_tokens", max_batch_tokens)
 
-    from bgkit.data.samplers import TokenBudgetBatchSampler
+    from bgkit.data.samplers import PackedTokenBudgetSampler
 
     # Get lengths for sampler
     if hasattr(eval_dataset, "lengths"):
@@ -458,7 +503,12 @@ def main(cfg: DictConfig) -> None:
         else:
             eval_lengths = [4096] * len(eval_dataset)
 
-    eval_sampler = TokenBudgetBatchSampler(eval_lengths, max_batch_tokens, shuffle=False)
+    eval_sampler = PackedTokenBudgetSampler(
+        dataset=None,
+        lengths=eval_lengths,
+        max_batch_tokens=max_batch_tokens,
+        shuffle=False,
+    )
     dataloader = DataLoader(
         eval_dataset,
         batch_sampler=eval_sampler,

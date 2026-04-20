@@ -334,50 +334,49 @@ class TestLengthProperties:
 
 
 class TestCollateChatRepro:
-    def test_pads_to_max_length(self, dataset):
-        """Batch should be padded to the longest sequence."""
+    def test_flat_packed_shape(self, dataset):
+        """Packed collator produces flat (N,) tensors with correct total length."""
         samples = [dataset[0], dataset[1]]
         batch = collate_chat_repro(samples)
 
-        max_len = max(len(s["token_ids"]) for s in samples)
-        assert batch["token_ids"].shape == (2, max_len)
-        assert batch["loss_mask"].shape == (2, max_len)
-        assert batch["attention_mask"].shape == (2, max_len)
+        N = sum(len(s["token_ids"]) for s in samples)
+        assert batch["token_ids"].shape == (N,)
+        assert batch["loss_mask"].shape == (N,)
 
-    def test_attention_mask_correct(self, dataset):
-        """Attention mask should be True for real tokens, False for padding."""
+    def test_no_attention_mask(self, dataset):
+        """Packed collator must not produce attention_mask or *_attention_mask keys."""
         samples = [dataset[0], dataset[1]]
         batch = collate_chat_repro(samples)
+        for key in list(batch.keys()):
+            assert "attention_mask" not in key, f"Unexpected key: {key}"
 
-        for i, s in enumerate(samples):
-            real_len = len(s["token_ids"])
-            assert batch["attention_mask"][i, :real_len].all()
-            if real_len < batch["attention_mask"].shape[1]:
-                assert not batch["attention_mask"][i, real_len:].any()
-
-    def test_loss_mask_padded_with_zeros(self, dataset):
-        """Loss mask padding positions should be 0."""
+    def test_cu_seqlens_invariants(self, dataset):
+        """cu_seqlens starts at 0, ends at N, has length B+1."""
         samples = [dataset[0], dataset[1]]
         batch = collate_chat_repro(samples)
-
-        for i, s in enumerate(samples):
-            real_len = len(s["token_ids"])
-            if real_len < batch["loss_mask"].shape[1]:
-                assert (batch["loss_mask"][i, real_len:] == 0).all()
+        cu = batch["cu_seqlens"]
+        B = 2
+        N = sum(len(s["token_ids"]) for s in samples)
+        assert cu[0].item() == 0
+        assert cu[-1].item() == N
+        assert cu.shape[0] == B + 1
 
     def test_all_expected_keys(self, dataset):
-        """Batch should contain all expected keys."""
+        """Batch should contain the packed keys."""
         samples = [dataset[0]]
         batch = collate_chat_repro(samples)
-        expected = {
-            "token_ids", "attention_mask", "loss_mask",
-            "content_token_ids", "content_attention_mask",
-            "compression_prompt_ids", "compression_prompt_mask",
-            "prefix_ids", "prefix_attention_mask",
+        required = {
+            "token_ids", "position_ids", "cu_seqlens", "max_seqlen",
+            "loss_mask",
+            "content_token_ids", "content_position_ids",
+            "content_cu_seqlens", "content_max_seqlen",
+            "compression_prompt_ids", "compression_prompt_cu_seqlens",
+            "prefix_ids", "prefix_cu_seqlens",
             "bgkit_splice_start", "bgkit_splice_len",
             "languages",
         }
-        assert set(batch.keys()) == expected
+        for k in required:
+            assert k in batch, f"Missing key: {k}"
 
     def test_splice_metadata_collated(self, dataset):
         samples = [dataset[0], dataset[1]]
@@ -385,34 +384,30 @@ class TestCollateChatRepro:
         assert batch["bgkit_splice_start"].shape == (2,)
         assert batch["bgkit_splice_len"].shape == (2,)
 
-    def test_content_token_ids_padded(self, dataset):
-        """Content token IDs should be padded to max content length."""
+    def test_content_flat_length(self, dataset):
+        """Content token IDs are flat with length == content_cu_seqlens[-1]."""
         samples = [dataset[0], dataset[1]]
         batch = collate_chat_repro(samples)
+        N_content = batch["content_cu_seqlens"][-1].item()
+        assert batch["content_token_ids"].shape == (N_content,)
 
-        max_content_len = max(len(s["content_token_ids"]) for s in samples)
-        assert batch["content_token_ids"].shape == (2, max_content_len)
-        assert batch["content_attention_mask"].shape == (2, max_content_len)
-
-    def test_prefix_ids_padded(self, dataset):
-        """Prefix IDs should be padded to max prefix length."""
+    def test_prefix_flat_length(self, dataset):
+        """Prefix IDs are flat with length == prefix_cu_seqlens[-1]."""
         samples = [dataset[0], dataset[1]]
         batch = collate_chat_repro(samples)
+        N_prefix = batch["prefix_cu_seqlens"][-1].item()
+        assert batch["prefix_ids"].shape == (N_prefix,)
 
-        max_prefix_len = max(len(s["prefix_ids"]) for s in samples)
-        assert batch["prefix_ids"].shape == (2, max_prefix_len)
-        assert batch["prefix_attention_mask"].shape == (2, max_prefix_len)
-
-    def test_prefix_attention_mask_correct(self, dataset):
-        """Prefix attention mask should be True for real tokens, False for padding."""
+    def test_position_ids_restart(self, dataset):
+        """position_ids restart to 0 at each sample boundary."""
         samples = [dataset[0], dataset[1]]
         batch = collate_chat_repro(samples)
-
-        for i, s in enumerate(samples):
-            real_len = len(s["prefix_ids"])
-            assert batch["prefix_attention_mask"][i, :real_len].all()
-            if real_len < batch["prefix_attention_mask"].shape[1]:
-                assert not batch["prefix_attention_mask"][i, real_len:].any()
+        cu = batch["cu_seqlens"]
+        pos = batch["position_ids"]
+        # Each sample's first position should be 0
+        for i in range(2):
+            start = cu[i].item()
+            assert pos[start].item() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -490,23 +485,25 @@ class TestCollateChatReproQAPositionMask:
         out = collate_chat_repro(batch)
         assert "answer_position_mask" in out
         m = out["answer_position_mask"]
-        assert m.shape == (2, 8)
+        # Packed: flat (N_content,) where N_content = 8 + 8 = 16
+        N_content = out["content_cu_seqlens"][-1].item()
+        assert m.shape == (N_content,)
         assert m.dtype == torch.bool
-        assert m[0, 1].item() and m[0, 3].item()
-        assert not m[0, 0].item() and not m[0, 2].item()
+        # First sample occupies positions 0..7; bit 1 and 3 of sample 0 are True
+        assert m[1].item() and m[3].item()
+        assert not m[0].item() and not m[2].item()
 
-    def test_padded_to_max_content_len(self):
-        # Different content lengths — collator pads content_token_ids to max,
-        # answer_position_mask must follow.
+    def test_packed_content_lengths(self):
+        # Different content lengths — packed concatenation, no padding.
         batch = [
             self._make_sample(content_len=4, with_position_mask=True),
             self._make_sample(content_len=10, with_position_mask=True),
         ]
         out = collate_chat_repro(batch)
-        assert out["content_token_ids"].size(1) == 10
-        assert out["answer_position_mask"].size(1) == 10
-        # Sample 0's mask was length 4; positions ≥ 4 must be False.
-        assert not out["answer_position_mask"][0, 4:].any()
+        N_content = out["content_cu_seqlens"][-1].item()
+        assert N_content == 4 + 10  # flat concatenation, no padding
+        assert out["content_token_ids"].shape == (N_content,)
+        assert out["answer_position_mask"].shape == (N_content,)
 
     def test_raises_on_partial_mask(self):
         batch = [

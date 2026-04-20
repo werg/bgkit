@@ -1,16 +1,20 @@
 """Pruned Qwen3.5 backbone: DeltaNet layers removed, lightweight conv1d added.
 
-Replaces the 24-layer [D,D,D,A]x6 architecture with a 13-layer structure:
+Packed FA4 form. Replaces the 24-layer [D,D,D,A]x6 architecture with a
+13-layer structure:
+
   5 complete PrunedBlocks: [ResidualConv1d, MLPOnly(D1), MLPOnly(D2), FullAttn]
   1 tail PrunedBlock:      [ResidualConv1d, MLPOnly(D21), MLPOnly(D22)]
 
 The 6th FullAttn layer (layer 23) is the ProjectionBlock, handled separately.
 
+All inputs are packed ``(N, D)`` with ``cu_seqlens`` / ``max_seqlen`` /
+``position_ids``. No ``attention_mask`` — segmentation lives in
+``cu_seqlens``. The padded mask composite is deleted.
+
 Two construction paths:
-- from_unpruned(bidi_model): destructive surgery on a loaded BidirectionalQwen35
-  checkpoint. Used by the distillation trainer for initial surgery.
+- from_unpruned(bidi_model): destructive surgery on a loaded BidirectionalQwen35.
 - from_text_model(text_model): fresh construction from raw HF Qwen3.5 layers.
-  Used by BgKITEncoder.from_pretrained(pruned=True).
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import torch
 import torch.nn as nn
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
+from bgkit.models.bidirectional_qwen35 import _packed_full_attention
 from bgkit.models.components.mlp_only_layer import MLPOnlyLayer
 from bgkit.models.components.residual_conv1d import ResidualConv1d
 
@@ -50,18 +55,43 @@ class PrunedBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        full_attn_mask: torch.Tensor | None = None,
-        position_embeddings: tuple | None = None,
+        position_embeddings: tuple | None,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        position_ids: torch.Tensor,
+        is_causal: bool,
         use_ckpt: bool = False,
     ) -> torch.Tensor:
-        hidden_states = self.conv(hidden_states)
+        """Run the pruned block on packed ``(N, D)`` hidden states.
+
+        The depthwise Conv1d inside ``ResidualConv1d`` and the MLP blocks
+        are per-token operations, so they tolerate flat ``(N, D)`` input
+        directly — except that the Conv1d needs a transpose to ``(N, D)
+        -> (1, D, N)``, which the existing ``ResidualConv1d.forward``
+        expects as ``(B, L, D)``. We reshape around the call.
+        """
+        # Add a leading singleton for ResidualConv1d (expects (B, L, D)).
+        # The conv is depthwise with symmetric padding and does NOT attend
+        # across segments. Since all samples sit in one flat row, the
+        # kernel spans sample boundaries only at the ``kernel_size // 2``
+        # boundary positions. This is a slight information leak between
+        # adjacent samples in a packed batch, matching how the padded
+        # form's symmetric-padding also didn't mask boundaries in
+        # within-batch row. It is preserved here for numerical parity.
+        hidden_states = self.conv(hidden_states.unsqueeze(0)).squeeze(0)
         hidden_states = self.mlp_retrained(hidden_states)
         hidden_states = self.mlp_frozen(hidden_states)
 
         if self.has_attention:
             hidden_states = _run_attn_layer(
-                self.full_attn_layer, hidden_states,
-                full_attn_mask, position_embeddings, use_ckpt,
+                self.full_attn_layer,
+                hidden_states,
+                position_embeddings=position_embeddings,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_ids=position_ids,
+                is_causal=is_causal,
+                use_ckpt=use_ckpt,
             )
         return hidden_states
 
@@ -69,30 +99,50 @@ class PrunedBlock(nn.Module):
 def _run_attn_layer(
     layer: nn.Module,
     hidden_states: torch.Tensor,
-    mask: torch.Tensor | None,
     position_embeddings: tuple | None,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    position_ids: torch.Tensor,
+    is_causal: bool,
     use_ckpt: bool,
 ) -> torch.Tensor:
-    """Run a full attention layer with optional gradient checkpointing."""
+    """Run a full attention layer with optional gradient checkpointing.
+
+    Replicates a single ``Qwen3_5DecoderLayer`` forward (full-attention
+    variant only — DeltaNet is elided by the pruning surgery) in packed
+    form. Layers retain HF-pretrained weights for ``input_layernorm``,
+    ``self_attn``, ``post_attention_layernorm``, ``mlp``.
+    """
+
+    def _forward(hh: torch.Tensor) -> torch.Tensor:
+        residual = hh
+        hh = layer.input_layernorm(hh)
+        hh = _packed_full_attention(
+            layer.self_attn,
+            hh,
+            position_embeddings,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            position_ids=position_ids,
+            is_causal=is_causal,
+        )
+        hh = residual + hh
+        residual = hh
+        hh = layer.post_attention_layernorm(hh)
+        hh = layer.mlp(hh)
+        hh = residual + hh
+        return hh
+
     if use_ckpt:
-        def _fwd(h):
-            out = layer(h, position_embeddings, attention_mask=mask, is_causal=False)
-            return out[0] if isinstance(out, tuple) else out
-        return torch.utils.checkpoint.checkpoint(_fwd, hidden_states, use_reentrant=False)
-    out = layer(hidden_states, position_embeddings, attention_mask=mask, is_causal=False)
-    return out[0] if isinstance(out, tuple) else out
+        return torch.utils.checkpoint.checkpoint(_forward, hidden_states, use_reentrant=False)
+    return _forward(hidden_states)
 
 
 class PrunedBidirectionalQwen35(nn.Module):
-    """Pruned Qwen3.5 backbone with DeltaNet layers removed.
+    """Pruned Qwen3.5 backbone (packed FA4 form).
 
-    Same API as BidirectionalQwen35: forward(inputs_embeds, attention_mask)
-    returns BaseModelOutputWithPast.
-
-    Contains:
-    - embed_tokens, norm, rotary_emb (from original model)
-    - 5 complete PrunedBlocks (with FullAttn) + 1 tail PrunedBlock (no FullAttn)
-    - Bidi warmup alpha-blending on FullAttn masks (same mechanism as original)
+    Same high-level API as :class:`BidirectionalQwen35` but with DeltaNet
+    layers replaced by ResidualConv1d + MLPOnlyLayer blocks.
     """
 
     def __init__(
@@ -107,9 +157,7 @@ class PrunedBidirectionalQwen35(nn.Module):
         super().__init__()
         self.embed_tokens = embed_tokens
         self.norm = norm
-        # Store rotary_emb as unregistered attribute (same pattern as BidirectionalQwen35)
         object.__setattr__(self, "_rotary_emb", rotary_emb)
-        # Store config as unregistered attribute (avoids state_dict pollution)
         object.__setattr__(self, "_config", config)
         self.blocks = blocks
 
@@ -122,7 +170,6 @@ class PrunedBidirectionalQwen35(nn.Module):
 
     @property
     def config(self):
-        """Proxy for HF config access (model_type, hidden_size, etc.)."""
         return self._config
 
     def get_input_embeddings(self):
@@ -143,74 +190,34 @@ class PrunedBidirectionalQwen35(nn.Module):
         return min(1.0, self._step.item() / self.bidi_warmup_steps)
 
     def _apply(self, fn):
-        """Propagate device/dtype moves to unregistered _rotary_emb."""
         super()._apply(fn)
         self._rotary_emb._apply(fn)
         return self
 
-    def _build_position_and_mask(
+    def _compute_rope(
         self,
         hidden: torch.Tensor,
-        attention_mask: torch.Tensor | None,
-    ) -> tuple[tuple, torch.Tensor | None]:
-        """Build (position_embeddings, full_attn_mask) for a forward pass.
-
-        Shared helper used by ``forward()`` and ``forward_from_block()`` to
-        guarantee identical position/mask construction across both paths.
-        """
-        seq_len = hidden.shape[1]
-        position_ids = torch.arange(seq_len, device=hidden.device).unsqueeze(0)
-        position_embeddings = self._rotary_emb(hidden, position_ids)
-
-        alpha = self.bidi_alpha
-        neg_inf = torch.finfo(hidden.dtype).min
-
-        pad_mask_4d = None
-        if attention_mask is not None:
-            pad_mask_4d = attention_mask[:, None, None, :].to(hidden.dtype)
-            pad_mask_4d = (1.0 - pad_mask_4d) * neg_inf
-
-        if alpha < 1.0:
-            causal = torch.triu(
-                torch.full(
-                    (seq_len, seq_len), neg_inf,
-                    device=hidden.device, dtype=hidden.dtype,
-                ),
-                diagonal=1,
-            )
-            causal = causal * (1.0 - alpha)
-            if pad_mask_4d is not None:
-                full_attn_mask = pad_mask_4d + causal[None, None, :, :]
-            else:
-                full_attn_mask = causal[None, None, :, :]
-        else:
-            full_attn_mask = pad_mask_4d
-
-        return position_embeddings, full_attn_mask
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pos_2d = position_ids.unsqueeze(0)
+        return self._rotary_emb(hidden, pos_2d)
 
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        position_ids: torch.Tensor,
         return_intermediates: bool = False,
         layer_hooks: dict[int, Callable[[torch.Tensor], torch.Tensor]] | None = None,
     ) -> BaseModelOutputWithPast:
-        """Run forward pass through pruned blocks.
-
-        Args:
-            inputs_embeds: (B, L, D) input embeddings.
-            attention_mask: (B, L) padding mask.
-            return_intermediates: Collect hidden states after each block.
-            layer_hooks: Optional dict mapping block indices to callables.
-                After block ``idx`` completes, if ``idx`` is in the dict,
-                ``layer_hooks[idx](hidden) -> hidden`` is called. Block 0
-                corresponds to original layers 0-3, block 1 to layers 4-7,
-                etc.
-        """
+        """Packed forward pass through pruned blocks."""
         return self.forward_from_block(
             hidden=inputs_embeds,
             start_block=0,
-            attention_mask=attention_mask,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            position_ids=position_ids,
             layer_hooks=layer_hooks,
             apply_final_norm=True,
             return_intermediates=return_intermediates,
@@ -220,39 +227,45 @@ class PrunedBidirectionalQwen35(nn.Module):
         self,
         hidden: torch.Tensor,
         start_block: int,
-        attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        position_ids: torch.Tensor,
         layer_hooks: dict[int, Callable[[torch.Tensor], torch.Tensor]] | None = None,
         apply_final_norm: bool = True,
         return_intermediates: bool = False,
     ) -> BaseModelOutputWithPast:
-        """Resume forward from ``start_block`` using ``hidden`` as input.
+        """Resume forward from ``start_block``.
 
-        Recomputes position embeddings + attention mask exactly as
-        ``forward()`` does. Iterates ``blocks[start_block:]``. Applies the
-        final norm if requested.
-
-        Used by the soft-attn forward to traverse blocks 2..end on
-        prob-gated layer-7 embeddings, so the head's gradient signal flows
-        through the FULL remaining encoder rather than skipping straight to
-        the projection block.
+        Recomputes position embeddings for the packed sequence. Iterates
+        ``blocks[start_block:]``. Applies the final norm if requested.
         """
         if start_block < 0 or start_block > len(self.blocks):
+            raise ValueError(f"start_block must be in [0, {len(self.blocks)}], got {start_block}")
+        if hidden.ndim != 2:
             raise ValueError(
-                f"start_block must be in [0, {len(self.blocks)}], got {start_block}"
+                f"PrunedBidirectionalQwen35 expects packed (N, D) hidden; got "
+                f"shape {tuple(hidden.shape)}"
             )
 
-        position_embeddings, full_attn_mask = self._build_position_and_mask(
-            hidden, attention_mask,
-        )
+        position_embeddings = self._compute_rope(hidden, position_ids)
+        alpha = self.bidi_alpha
+        full_is_causal = alpha < 1.0
         use_ckpt = getattr(self, "_gradient_checkpointing", False) and self.training
 
         intermediates = [] if return_intermediates else None
 
         for offset, block in enumerate(self.blocks[start_block:]):
             idx = start_block + offset
-            hidden = block(hidden, full_attn_mask, position_embeddings, use_ckpt)
+            hidden = block(
+                hidden,
+                position_embeddings=position_embeddings,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_ids=position_ids,
+                is_causal=full_is_causal,
+                use_ckpt=use_ckpt,
+            )
 
-            # Fire block hook after this block completes
             if layer_hooks and idx in layer_hooks:
                 hidden = layer_hooks[idx](hidden)
 
@@ -274,7 +287,6 @@ class PrunedBidirectionalQwen35(nn.Module):
         Stage 2: + frozen MLPs (now unfrozen)
         Stage 3: + everything else (FullAttn, embeddings, norms)
         """
-        # Start fully frozen
         self.requires_grad_(False)
 
         if stage >= 0:
@@ -290,7 +302,6 @@ class PrunedBidirectionalQwen35(nn.Module):
                 block.mlp_frozen.requires_grad_(True)
 
         if stage >= 3:
-            # Everything trainable
             self.requires_grad_(True)
 
     @classmethod
@@ -301,20 +312,7 @@ class PrunedBidirectionalQwen35(nn.Module):
         conv_kernel_size: int = 16,
         bidi_warmup_steps: int = 0,
     ) -> PrunedBidirectionalQwen35:
-        """Destructive surgery: consume a BidirectionalQwen35 and produce pruned model.
-
-        Layer mapping for complete blocks (x5, from layers [0-3, 4-7, 8-11, 12-15, 16-19]):
-        - Conv1d: new (kaiming init)
-        - MLP retrained: from D1 (layers 1, 5, 9, 13, 17)
-        - MLP frozen: from D2 (layers 2, 6, 10, 14, 18)
-        - FullAttn: layers 3, 7, 11, 15, 19 (intact)
-
-        Tail block (from layers [20, 21, 22]):
-        - Conv1d: new
-        - MLP retrained: from D21
-        - MLP frozen: from D22
-        - No FullAttn
-        """
+        """Destructive surgery: consume a BidirectionalQwen35 and produce pruned model."""
         layers = bidi_model.layers
         if len(layers) < 23:
             raise ValueError(
@@ -323,7 +321,6 @@ class PrunedBidirectionalQwen35(nn.Module):
             )
         blocks = nn.ModuleList()
 
-        # 5 complete blocks
         for i in range(5):
             base = i * 4
             conv = ResidualConv1d(hidden_dim, kernel_size=conv_kernel_size)
@@ -332,7 +329,6 @@ class PrunedBidirectionalQwen35(nn.Module):
             full_attn = layers[base + 3]
             blocks.append(PrunedBlock(conv, mlp_retrained, mlp_frozen, full_attn))
 
-        # Tail block (layers 20, 21, 22)
         conv = ResidualConv1d(hidden_dim, kernel_size=conv_kernel_size)
         mlp_retrained = MLPOnlyLayer.from_decoder_layer(layers[21])
         mlp_frozen = MLPOnlyLayer.from_decoder_layer(layers[22])
@@ -356,20 +352,7 @@ class PrunedBidirectionalQwen35(nn.Module):
         bidi_warmup_steps: int = 0,
         norm_override: nn.Module | None = None,
     ) -> PrunedBidirectionalQwen35:
-        """Construct pruned model from raw HF Qwen3.5 text model layers.
-
-        Used by BgKITEncoder.from_pretrained(pruned=True) for fresh construction
-        from HF weights. Skips BidirectionalQwen35 entirely. Expects the text
-        model to have 23 layers (layer 23 already popped as ProjectionBlock).
-
-        Args:
-            norm_override: If provided, use this as the backbone norm instead of
-                extracting from text_model. Callers that manage norms externally
-                (e.g. _from_pretrained_pruned) pass nn.Identity() here to avoid
-                shared references.
-
-        Layer mapping is identical to from_unpruned().
-        """
+        """Construct pruned model from raw HF Qwen3.5 text model layers."""
         layers = text_model.layers
         if len(layers) < 23:
             raise ValueError(
@@ -379,7 +362,6 @@ class PrunedBidirectionalQwen35(nn.Module):
 
         blocks = nn.ModuleList()
 
-        # 5 complete blocks from layers [0-3, 4-7, 8-11, 12-15, 16-19]
         for i in range(5):
             base = i * 4
             conv = ResidualConv1d(hidden_dim, kernel_size=conv_kernel_size)
@@ -388,7 +370,6 @@ class PrunedBidirectionalQwen35(nn.Module):
             full_attn = layers[base + 3]
             blocks.append(PrunedBlock(conv, mlp_retrained, mlp_frozen, full_attn))
 
-        # Tail block from layers [20, 21, 22]
         conv = ResidualConv1d(hidden_dim, kernel_size=conv_kernel_size)
         mlp_retrained = MLPOnlyLayer.from_decoder_layer(layers[21])
         mlp_frozen = MLPOnlyLayer.from_decoder_layer(layers[22])

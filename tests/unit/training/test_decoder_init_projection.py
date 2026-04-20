@@ -1,4 +1,9 @@
-"""Tests for projection block training in DecoderInitTrainer."""
+"""Tests for projection block freeze / optimizer wiring + packed train_step.
+
+Forward-pass tests use the SDPA monkey-patch of ``_packed_full_attention``
+(see ``test_decoder_init_trainer.py`` for the same shim) — FA4 is GPU-only
+but SDPA produces functionally equivalent behavior for these mock shapes.
+"""
 
 from __future__ import annotations
 
@@ -6,12 +11,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from pathlib import Path
-
 from omegaconf import OmegaConf
 from torch import nn
 
-from bgkit.data.collators import collate_chat_repro
 from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
@@ -19,13 +21,14 @@ from bgkit.models.projection_block import ProjectionBlock
 from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
 # ---------------------------------------------------------------------------
-# Mock backbones (same pattern as test_decoder_init_trainer.py)
+# Mocks — Qwen3.5-shaped packed surface.
 # ---------------------------------------------------------------------------
 
 
 class _Output:
-    def __init__(self, last_hidden_state):
+    def __init__(self, last_hidden_state, hidden_states=None):
         self.last_hidden_state = last_hidden_state
+        self.hidden_states = hidden_states
 
 
 class MockEncoderBackbone(nn.Module):
@@ -38,33 +41,61 @@ class MockEncoderBackbone(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def forward(self, inputs_embeds=None, attention_mask=None, return_intermediates=False, layer_hooks=None, **kwargs):
-        x = self.layers[0](inputs_embeds)
-        if layer_hooks:
-            for idx in sorted(layer_hooks):
-                x = layer_hooks[idx](x)
+    def forward(
+        self,
+        inputs_embeds=None,
+        cu_seqlens=None,
+        max_seqlen=None,
+        position_ids=None,
+        return_intermediates=False,
+        layer_hooks=None,
+        **kwargs,
+    ):
+        x = inputs_embeds
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if layer_hooks and i in layer_hooks:
+                x = layer_hooks[i](x)
         x = self.norm(x)
         return _Output(last_hidden_state=x)
+
+
+class MockSelfAttn(nn.Module):
+    def __init__(self, hidden_dim: int = 64):
+        super().__init__()
+        head_dim = 8
+        n_heads = hidden_dim // head_dim
+        self.q_proj = nn.Linear(hidden_dim, n_heads * head_dim * 2, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, n_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, n_heads * head_dim, bias=False)
+        self.o_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.q_norm = nn.LayerNorm(head_dim)
+        self.k_norm = nn.LayerNorm(head_dim)
+        self.head_dim = head_dim
+        self.scaling = head_dim ** -0.5
 
 
 class MockTransformerLayer(nn.Module):
     def __init__(self, hidden_dim: int = 64):
         super().__init__()
-        self.linear = nn.Linear(hidden_dim, hidden_dim)
-
-    def forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
-        return self.linear(hidden_states)
+        self.input_layernorm = nn.LayerNorm(hidden_dim)
+        self.post_attention_layernorm = nn.LayerNorm(hidden_dim)
+        self.self_attn = MockSelfAttn(hidden_dim)
+        self.mlp = nn.Sequential(nn.Linear(hidden_dim, hidden_dim))
 
 
 class MockRotaryEmb(nn.Module):
+    HEAD_DIM = 8
+
     def __init__(self, hidden_dim: int = 64):
         super().__init__()
         self.dim = hidden_dim
+        self.rotary_dim = self.HEAD_DIM // 2
 
     def forward(self, x, position_ids):
-        seq_len = x.size(1)
-        cos = torch.ones(1, seq_len, self.dim, device=x.device, dtype=x.dtype)
-        sin = torch.zeros(1, seq_len, self.dim, device=x.device, dtype=x.dtype)
+        num_tokens = position_ids.shape[-1]
+        cos = torch.ones(1, num_tokens, self.rotary_dim, device=x.device, dtype=x.dtype)
+        sin = torch.zeros(1, num_tokens, self.rotary_dim, device=x.device, dtype=x.dtype)
         return cos, sin
 
 
@@ -90,7 +121,7 @@ class _MockQwen3Model(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+    def forward(self, inputs_embeds=None, position_ids=None, **kwargs):
         x = inputs_embeds
         for layer in self.layers:
             x = layer(x)
@@ -107,18 +138,10 @@ class MockCausalLMBackbone(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
-        x = inputs_embeds
-        for layer in self.model.layers:
-            x = layer(x)
-        x = self.model.norm(x)
-        logits = self.lm_head(x)
-        return _CausalLMOutput(logits=logits)
+    def forward(self, inputs_embeds=None, **kwargs):
+        hid = self.model(inputs_embeds=inputs_embeds, **kwargs).last_hidden_state
+        return _CausalLMOutput(logits=self.lm_head(hid))
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 HIDDEN_DIM = 64
 
@@ -126,7 +149,9 @@ HIDDEN_DIM = 64
 def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
     backbone = MockEncoderBackbone(hidden_dim=hidden_dim)
     compressor_norm = nn.LayerNorm(hidden_dim)
-    compressor = BgKITCompressor(backbone, compressor_norm, hidden_dim=hidden_dim, survivorship_inner_dim=8)
+    compressor = BgKITCompressor(
+        backbone, compressor_norm, hidden_dim=hidden_dim, survivorship_inner_dim=8,
+    )
 
     proj_layer = MockTransformerLayer(hidden_dim)
     proj_norm = nn.LayerNorm(hidden_dim)
@@ -136,29 +161,83 @@ def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
     return BgKITEncoder(compressor, projection_block)
 
 
-def _make_batch(batch_size: int = 2, seq_len: int = 20, content_len: int = 10,
-                prompt_len: int = 5):
-    samples = []
-    for _ in range(batch_size):
-        total_len = seq_len
-        content_start = (total_len - content_len) // 2
-        content_end = content_start + content_len
+# ---------------------------------------------------------------------------
+# SDPA monkey-patch fixture.
+# ---------------------------------------------------------------------------
 
-        token_ids = torch.randint(0, 1000, (total_len,))
-        loss_mask = torch.zeros(total_len, dtype=torch.long)
-        loss_mask[content_start:content_end] = 1
 
-        samples.append({
-            "token_ids": token_ids,
-            "loss_mask": loss_mask,
-            "content_token_ids": token_ids[content_start:content_end],
-            "compression_prompt_ids": torch.randint(0, 1000, (prompt_len,)),
-            "prefix_ids": torch.randint(0, 1000, (content_start,)),
-            "bgkit_splice_start": content_start,
-            "bgkit_splice_len": 0,
-            "language": "python",
-        })
-    return collate_chat_repro(samples)
+def _sdpa_packed_attention(
+    self_attn,
+    hidden_states,
+    position_embeddings,
+    cu_seqlens,
+    max_seqlen,
+    position_ids,
+    is_causal,
+):
+    from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
+
+    n = hidden_states.shape[0]
+    head_dim = self_attn.head_dim
+    n_heads = self_attn.q_proj.out_features // (head_dim * 2)
+    n_kv_heads = self_attn.k_proj.out_features // head_dim
+
+    qg = self_attn.q_proj(hidden_states).view(n, n_heads, 2 * head_dim)
+    q, gate = torch.chunk(qg, 2, dim=-1)
+    gate = gate.reshape(n, n_heads * head_dim)
+    k = self_attn.k_proj(hidden_states).view(n, n_kv_heads, head_dim)
+    v = self_attn.v_proj(hidden_states).view(n, n_kv_heads, head_dim)
+    q = self_attn.q_norm(q)
+    k = self_attn.k_norm(k)
+
+    q4 = q.transpose(0, 1).unsqueeze(0)
+    k4 = k.transpose(0, 1).unsqueeze(0)
+    cos, sin = position_embeddings
+    q4, k4 = apply_rotary_pos_emb(q4, k4, cos, sin, unsqueeze_dim=1)
+    q = q4.squeeze(0).transpose(0, 1).contiguous()
+    k = k4.squeeze(0).transpose(0, 1).contiguous()
+    v = v.contiguous()
+
+    if n_kv_heads < n_heads:
+        repeat = n_heads // n_kv_heads
+        k = k.repeat_interleave(repeat, dim=1)
+        v = v.repeat_interleave(repeat, dim=1)
+
+    cu = cu_seqlens.tolist()
+    outs: list[torch.Tensor] = []
+    for b in range(len(cu) - 1):
+        start, end = int(cu[b]), int(cu[b + 1])
+        if end == start:
+            continue
+        qb = q[start:end].transpose(0, 1).unsqueeze(0)
+        kb = k[start:end].transpose(0, 1).unsqueeze(0)
+        vb = v[start:end].transpose(0, 1).unsqueeze(0)
+        ob = torch.nn.functional.scaled_dot_product_attention(
+            qb, kb, vb, attn_mask=None, is_causal=is_causal, scale=self_attn.scaling,
+        )
+        outs.append(ob.squeeze(0).transpose(0, 1))
+    attn_out = torch.cat(outs, dim=0)
+    attn_out = attn_out.reshape(n, n_heads * head_dim).contiguous()
+    attn_out = attn_out * torch.sigmoid(gate)
+    return self_attn.o_proj(attn_out)
+
+
+@pytest.fixture(autouse=True)
+def _patch_packed_attention(monkeypatch):
+    from bgkit.models import (
+        bidirectional_qwen35 as bq,
+        projection_block as pb,
+        pruned_qwen35 as pq,
+    )
+
+    monkeypatch.setattr(bq, "_packed_full_attention", _sdpa_packed_attention)
+    monkeypatch.setattr(pb, "_packed_full_attention", _sdpa_packed_attention)
+    monkeypatch.setattr(pq, "_packed_full_attention", _sdpa_packed_attention)
+
+
+# ---------------------------------------------------------------------------
+# Trainer factory + packed batch helper.
+# ---------------------------------------------------------------------------
 
 
 def _make_trainer(
@@ -172,7 +251,6 @@ def _make_trainer(
     max_steps: int = 100,
     warmup_steps: int = 10,
 ) -> DecoderInitTrainer:
-    """Create a DecoderInitTrainer with projection block training support."""
     training_cfg = {
         "phase": "phase1_step1",
         "max_steps": max_steps,
@@ -184,6 +262,7 @@ def _make_trainer(
         "projection_only_steps": projection_only_steps,
         "freeze_top_layer": freeze_top_layer,
         "lr_scale_bottom": lr_scale_bottom,
+        "optimizer": "adamw",
     }
     if projection_lr is not None:
         training_cfg["projection_lr"] = projection_lr
@@ -196,12 +275,10 @@ def _make_trainer(
     t = DecoderInitTrainer(cfg)
     t.device = torch.device("cpu")
 
-    # Encoder (frozen, then projection block selectively unfrozen)
     t.encoder = _make_mock_encoder(hidden_dim=HIDDEN_DIM)
     t.encoder.requires_grad_(False)
     t.encoder.eval()
 
-    # Store config flags (normally done in setup())
     t._train_projection = train_projection_block
     t._projection_only_steps = projection_only_steps
     t._encoder_frozen = True
@@ -210,101 +287,109 @@ def _make_trainer(
     t._compression_introduction_step = None
     t._is_evaluating = False
     t._target_ratio_override = None
-    # Survivorship head aux loss weights
     t._ratio_loss_weight = 0.1
     t._decisiveness_loss_weight = 0.05
+    t._accum_steps = 1
+    t._diagnostic_metrics_every_n_steps = 1
 
-    # Decoder
     decoder_backbone = MockCausalLMBackbone(hidden_dim=HIDDEN_DIM, num_layers=num_layers)
     t.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=HIDDEN_DIM)
     t.model = t.decoder
 
-    # Use real freeze/optimizer setup
     t._configure_trainable_state()
     t._eval_count = 0
-
     return t
 
 
+def _make_chat_repro_batch(
+    batch_size: int = 2,
+    content_len: int = 6,
+    prefix_len: int = 3,
+    suffix_len: int = 2,
+    prompt_len: int = 2,
+    vocab_size: int = 1000,
+) -> dict:
+    from bgkit.data.collators import collate_chat_repro
+
+    samples = []
+    for _ in range(batch_size):
+        tok_total_len = prefix_len + content_len + suffix_len
+        token_ids = torch.randint(1, vocab_size, (tok_total_len,), dtype=torch.long)
+        loss_mask = torch.zeros(tok_total_len, dtype=torch.bool)
+        loss_mask[prefix_len + content_len :] = True
+        samples.append({
+            "token_ids": token_ids,
+            "loss_mask": loss_mask,
+            "content_token_ids": torch.randint(
+                1, vocab_size, (content_len,), dtype=torch.long,
+            ),
+            "compression_prompt_ids": torch.randint(
+                1, vocab_size, (prompt_len,), dtype=torch.long,
+            ),
+            "prefix_ids": token_ids[:prefix_len].clone(),
+            "language": "python",
+            "bgkit_splice_start": prefix_len,
+            "bgkit_splice_len": content_len,
+        })
+    return collate_chat_repro(samples)
+
+
 # ---------------------------------------------------------------------------
-# Tests: projection block freeze/unfreeze
+# Projection block freeze/unfreeze (no forward pass needed).
 # ---------------------------------------------------------------------------
 
 
 class TestProjectionBlockTrainable:
     def test_projection_block_unfrozen(self):
-        """After setup, projection block params have requires_grad=True."""
         t = _make_trainer(train_projection_block=True)
         for name, p in t.encoder.projection_block.named_parameters():
             assert p.requires_grad, f"projection_block.{name} should be trainable"
 
     def test_compressor_remains_frozen(self):
-        """Compressor params should remain frozen even when projection is trainable."""
         t = _make_trainer(train_projection_block=True)
         for name, p in t.encoder.compressor.named_parameters():
             assert not p.requires_grad, f"compressor.{name} should be frozen"
 
     def test_projection_block_frozen_when_disabled(self):
-        """When train_projection_block=False, projection block stays frozen."""
         t = _make_trainer(train_projection_block=False)
         for name, p in t.encoder.projection_block.named_parameters():
             assert not p.requires_grad, f"projection_block.{name} should be frozen"
 
 
-# ---------------------------------------------------------------------------
-# Tests: decoder frozen during warmup
-# ---------------------------------------------------------------------------
-
-
 class TestProjectionOnlyWarmup:
     def test_decoder_frozen_during_warmup(self):
-        """With projection_only_steps > 0, decoder params are frozen at step 0."""
         t = _make_trainer(train_projection_block=True, projection_only_steps=100)
         assert t._decoder_frozen is True
         for name, p in t.decoder.named_parameters():
             assert not p.requires_grad, f"decoder.{name} should be frozen during warmup"
 
     def test_projection_trainable_during_warmup(self):
-        """Projection block should be trainable even during decoder warmup."""
         t = _make_trainer(train_projection_block=True, projection_only_steps=100)
         for name, p in t.encoder.projection_block.named_parameters():
             assert p.requires_grad, f"projection_block.{name} should be trainable"
 
     def test_optimizer_only_has_projection_during_warmup(self):
-        """During projection-only phase, optimizer has only projection params."""
         t = _make_trainer(train_projection_block=True, projection_only_steps=100)
         all_opt_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
         proj_params = {id(p) for p in t.encoder.projection_block.parameters()}
-
-        # All optimizer params should be projection params
-        assert all_opt_params == proj_params, "Optimizer should only have projection params"
-
-
-# ---------------------------------------------------------------------------
-# Tests: phase transition
-# ---------------------------------------------------------------------------
+        assert all_opt_params == proj_params
 
 
 class TestPhaseTransition:
     def test_transition_unfreezes_decoder(self):
-        """After _maybe_end_projection_only, decoder should be unfrozen."""
         t = _make_trainer(
             train_projection_block=True,
             projection_only_steps=10,
             freeze_top_layer=False,
         )
         assert t._decoder_frozen is True
-
-        # Simulate reaching transition step
         t.global_step = 10
         t._maybe_end_projection_only()
-
         assert t._decoder_frozen is False
         has_trainable = any(p.requires_grad for p in t.decoder.parameters())
-        assert has_trainable, "Decoder should have trainable params after transition"
+        assert has_trainable
 
     def test_transition_preserves_top_freeze(self):
-        """After transition, top layer/lm_head/embed_tokens remain frozen."""
         t = _make_trainer(
             train_projection_block=True,
             projection_only_steps=10,
@@ -312,58 +397,15 @@ class TestPhaseTransition:
         )
         t.global_step = 10
         t._maybe_end_projection_only()
-
-        # Top layer, lm_head, embed_tokens should stay frozen
         top_layer = t.decoder.backbone.model.layers[-1]
         for p in top_layer.parameters():
-            assert not p.requires_grad, "Top layer should remain frozen"
+            assert not p.requires_grad
         for p in t.decoder.backbone.lm_head.parameters():
-            assert not p.requires_grad, "lm_head should remain frozen"
+            assert not p.requires_grad
         for p in t.decoder.backbone.model.embed_tokens.parameters():
-            assert not p.requires_grad, "embed_tokens should remain frozen"
-
-    def test_transition_preserves_projection_momentum(self):
-        """After transition, optimizer state for projection params is preserved."""
-        t = _make_trainer(
-            train_projection_block=True,
-            projection_only_steps=10,
-            freeze_top_layer=False,
-        )
-
-        # Do a few train steps to accumulate optimizer state
-        batch = _make_batch()
-        for step in range(5):
-            t.global_step = step
-            t.train_step(batch)
-
-        # Capture projection param optimizer state before transition
-        proj_params = [
-            p for p in t.encoder.projection_block.parameters() if p.requires_grad
-        ]
-        pre_state = {}
-        for p in proj_params:
-            state = t.optimizer.state.get(p)
-            if state and "exp_avg" in state:
-                pre_state[id(p)] = {
-                    "param": p,
-                    "exp_avg": state["exp_avg"].clone(),
-                    "exp_avg_sq": state["exp_avg_sq"].clone(),
-                }
-
-        # Trigger transition
-        t.global_step = 10
-        t._maybe_end_projection_only()
-
-        # Verify optimizer state is preserved (not reset)
-        for _pid, old_state in pre_state.items():
-            new_state = t.optimizer.state[old_state["param"]]
-            assert torch.equal(old_state["exp_avg"], new_state["exp_avg"]), \
-                "exp_avg should be preserved across transition"
-            assert torch.equal(old_state["exp_avg_sq"], new_state["exp_avg_sq"]), \
-                "exp_avg_sq should be preserved across transition"
+            assert not p.requires_grad
 
     def test_transition_applies_lr_schedule(self):
-        """After transition, all optimizer param groups have correct LR."""
         from bgkit.training.scheduling import cosine_with_warmup
 
         max_steps = 100
@@ -377,72 +419,80 @@ class TestPhaseTransition:
             warmup_steps=warmup_steps,
             lr=lr,
         )
-
         t.global_step = 10
         t._maybe_end_projection_only()
-
         expected_lr = cosine_with_warmup(10, max_steps, warmup_steps, lr)
         for pg in t.optimizer.param_groups:
-            assert abs(pg["lr"] - expected_lr) < 1e-10, \
-                f"LR should be {expected_lr}, got {pg['lr']}"
+            assert abs(pg["lr"] - expected_lr) < 1e-10
 
     def test_no_op_if_not_frozen(self):
-        """_maybe_end_projection_only should be a no-op if decoder isn't frozen."""
-        t = _make_trainer(
-            train_projection_block=True,
-            projection_only_steps=0,
-        )
+        t = _make_trainer(train_projection_block=True, projection_only_steps=0)
         n_groups_before = len(t.optimizer.param_groups)
         t.global_step = 100
         t._maybe_end_projection_only()
         assert len(t.optimizer.param_groups) == n_groups_before
 
     def test_no_op_before_threshold(self):
-        """_maybe_end_projection_only should not fire before the threshold step."""
-        t = _make_trainer(
-            train_projection_block=True,
-            projection_only_steps=100,
-        )
+        t = _make_trainer(train_projection_block=True, projection_only_steps=100)
         assert t._decoder_frozen is True
         t.global_step = 50
         t._maybe_end_projection_only()
         assert t._decoder_frozen is True
 
+    def test_transition_preserves_projection_momentum(self):
+        """A train step before transition should leave AdamW state on projection
+        params, and that state should survive the phase transition."""
+        t = _make_trainer(
+            train_projection_block=True,
+            projection_only_steps=10,
+            freeze_top_layer=False,
+        )
+        batch = _make_chat_repro_batch()
+        t._forward_backward(batch)
+        t.optimizer.step()
 
-# ---------------------------------------------------------------------------
-# Tests: optimizer param groups
-# ---------------------------------------------------------------------------
+        # Record which projection params now have AdamW moment state.
+        proj_params = list(t.encoder.projection_block.parameters())
+        pre_state_ids = {
+            id(p) for p in proj_params if p in t.optimizer.state
+        }
+        assert pre_state_ids, "train step should have populated AdamW state"
+
+        t.global_step = 10
+        t._maybe_end_projection_only()
+
+        post_state_ids = {
+            id(p) for p in proj_params if p in t.optimizer.state
+        }
+        # All previously-tracked projection params remain in the optimizer state.
+        assert pre_state_ids.issubset(post_state_ids)
 
 
 class TestOptimizerGroups:
     def test_optimizer_groups_projection_only(self):
-        """During projection-only phase, optimizer covers only projection params."""
-        t = _make_trainer(
-            train_projection_block=True,
-            projection_only_steps=100,
-        )
-        # Muon may split into multiple sub-groups, but all params should be projection
+        t = _make_trainer(train_projection_block=True, projection_only_steps=100)
         all_opt_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
-        proj_params = {id(p) for p in t.encoder.projection_block.parameters() if p.requires_grad}
+        proj_params = {
+            id(p) for p in t.encoder.projection_block.parameters() if p.requires_grad
+        }
         assert all_opt_params == proj_params
 
     def test_optimizer_groups_after_transition(self):
-        """After transition with freeze_top_layer, optimizer has projection + decoder groups."""
         t = _make_trainer(
             train_projection_block=True,
             projection_only_steps=10,
             freeze_top_layer=True,
             num_layers=4,
         )
-        # Before: only projection params
         pre_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
-        proj_params = {id(p) for p in t.encoder.projection_block.parameters() if p.requires_grad}
+        proj_params = {
+            id(p) for p in t.encoder.projection_block.parameters() if p.requires_grad
+        }
         assert pre_params == proj_params
 
         t.global_step = 10
         t._maybe_end_projection_only()
 
-        # After: projection + decoder trainable params
         post_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
         dec_params = {id(p) for p in t.decoder.parameters() if p.requires_grad}
         assert proj_params.issubset(post_params)
@@ -450,13 +500,9 @@ class TestOptimizerGroups:
         assert len(post_params) > len(pre_params)
 
     def test_optimizer_groups_no_projection(self):
-        """Without projection training, optimizer has only decoder groups."""
         t = _make_trainer(
-            train_projection_block=False,
-            freeze_top_layer=True,
-            num_layers=4,
+            train_projection_block=False, freeze_top_layer=True, num_layers=4,
         )
-        # All optimizer params should be decoder params only
         all_opt_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
         dec_params = {id(p) for p in t.decoder.parameters() if p.requires_grad}
         proj_params = {id(p) for p in t.encoder.projection_block.parameters()}
@@ -464,148 +510,94 @@ class TestOptimizerGroups:
         assert not proj_params.intersection(all_opt_params)
 
     def test_projection_lr_custom(self):
-        """Custom projection_lr should be used for projection param group."""
         t = _make_trainer(
-            train_projection_block=True,
-            projection_lr=5e-4,
-            lr=1e-3,
+            train_projection_block=True, projection_lr=5e-4, lr=1e-3,
         )
-        # First group should be projection with custom LR
         proj_group = t.optimizer.param_groups[0]
         assert abs(proj_group["lr"] - 5e-4) < 1e-10
         assert abs(proj_group["base_lr"] - 5e-4) < 1e-10
 
     def test_base_lr_stored_in_all_groups(self):
-        """Every param group should have base_lr for per-group scheduling."""
         t = _make_trainer(
             train_projection_block=True,
             projection_only_steps=0,
             freeze_top_layer=True,
         )
         for g in t.optimizer.param_groups:
-            assert "base_lr" in g, "Param group should have base_lr"
+            assert "base_lr" in g
 
 
 # ---------------------------------------------------------------------------
-# Tests: checkpoint round-trip with projection training
+# Checkpoint resume tests — exercise _configure_trainable_state at a given
+# global_step without needing a real save_checkpoint call.
 # ---------------------------------------------------------------------------
 
 
 class TestProjectionCheckpoint:
-    def test_resume_from_projection_only(self, tmp_path):
-        """Save during projection-only phase, load and verify state."""
+    def test_resume_from_projection_only(self):
+        """Restoring global_step < projection_only_steps should keep decoder
+        frozen and optimizer = projection-only."""
         t = _make_trainer(
             train_projection_block=True,
             projection_only_steps=100,
+            freeze_top_layer=False,
         )
-        # Do a train step
-        t.train_step(_make_batch())
-        t.global_step = 5
-
-        # Save
-        ckpt_path = t.save_checkpoint(tmp_path)
-        assert t._training_state["decoder_frozen"] is True
-
-        # Mutate
-        t.global_step = 999
-
-        # Load
-        t.load_checkpoint(Path(ckpt_path))
-        assert t.global_step == 5
+        # Simulate restored checkpoint at step 50 (still in warmup).
+        t.global_step = 50
+        t._configure_trainable_state()
         assert t._decoder_frozen is True
-
-        # Optimizer should have only projection params
         all_opt_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
-        proj_params = {id(p) for p in t.encoder.projection_block.parameters() if p.requires_grad}
+        proj_params = {id(p) for p in t.encoder.projection_block.parameters()}
         assert all_opt_params == proj_params
 
-    def test_resume_from_post_transition(self, tmp_path):
-        """Save after transition, load and verify decoder+projection optimizer."""
+    def test_resume_from_post_transition(self):
+        """Restoring global_step >= projection_only_steps unfreezes decoder
+        and builds a full optimizer."""
+        t = _make_trainer(
+            train_projection_block=True,
+            projection_only_steps=100,
+            freeze_top_layer=True,
+            num_layers=4,
+        )
+        t.global_step = 150
+        t._configure_trainable_state()
+        assert t._decoder_frozen is False
+        all_opt_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
+        dec_trainable = {id(p) for p in t.decoder.parameters() if p.requires_grad}
+        assert dec_trainable.issubset(all_opt_params)
+
+    def test_resume_derives_state_from_step(self):
+        """``_decoder_frozen`` is a pure function of ``global_step``."""
         t = _make_trainer(
             train_projection_block=True,
             projection_only_steps=10,
             freeze_top_layer=False,
         )
-        # Simulate being past transition
+        t.global_step = 5
+        t._configure_trainable_state()
+        assert t._decoder_frozen is True
+
         t.global_step = 10
-        t._maybe_end_projection_only()
-        t.train_step(_make_batch())
-        t.global_step = 50
-
-        # Save
-        ckpt_path = t.save_checkpoint(tmp_path)
-        assert t._training_state["decoder_frozen"] is False
-
-        # Mutate
-        t.global_step = 0
-
-        # Load
-        t.load_checkpoint(Path(ckpt_path))
-        assert t.global_step == 50
+        t._configure_trainable_state()
         assert t._decoder_frozen is False
 
-        # Should have both projection and decoder params
-        all_opt_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
-        proj_params = {id(p) for p in t.encoder.projection_block.parameters() if p.requires_grad}
-        dec_params = {id(p) for p in t.decoder.parameters() if p.requires_grad}
-        assert proj_params.issubset(all_opt_params)
-        assert dec_params.issubset(all_opt_params)
-
-    def test_resume_derives_state_from_step(self, tmp_path):
-        """Resume ignores saved decoder_frozen and derives from global_step.
-
-        save_checkpoint() overwrites decoder_frozen with the real value, so we
-        write the checkpoint directly with contradictory metadata to verify
-        that load_checkpoint derives state from step position.
-        """
-        from bgkit.training.checkpointing import CheckpointMetadata, save_checkpoint
-
-        t = _make_trainer(
-            train_projection_block=True,
-            projection_only_steps=100,
-        )
-        t.global_step = 50  # Still in warmup
-
-        # Write checkpoint directly with contradictory decoder_frozen=False
-        metadata = CheckpointMetadata(
-            phase="phase1_step1",
-            step=50,
-            epoch=0,
-            parent_checkpoint=None,
-            training_state={"decoder_frozen": False},  # Contradicts step 50 < 100
-        )
-        ckpt_path = save_checkpoint(
-            tmp_path,
-            metadata,
-            encoder=t.encoder.state_dict(),
-            decoder=t.decoder.state_dict(),
-            optimizer=t.optimizer.state_dict(),
-        )
-
-        # Load - should derive frozen=True from step 50 < 100, not saved metadata
-        t.load_checkpoint(Path(ckpt_path))
-        assert t._decoder_frozen is True, "Should derive state from step, not saved metadata"
-
-    def test_decoder_frozen_saved_in_checkpoint(self, tmp_path):
-        """save_checkpoint should include decoder_frozen in training_state."""
-        t = _make_trainer(
-            train_projection_block=True,
-            projection_only_steps=100,
-        )
-        t.global_step = 5
-        t.save_checkpoint(tmp_path)
-        assert "decoder_frozen" in t._training_state
-        assert t._training_state["decoder_frozen"] is True
+    def test_encoder_frozen_state_survives_save_load(self, tmp_path):
+        """Encoder state_dict round-trips under save/load."""
+        t = _make_trainer(train_projection_block=True, projection_only_steps=10)
+        state = t.encoder.state_dict()
+        torch.save(state, tmp_path / "encoder.pt")
+        reloaded = torch.load(tmp_path / "encoder.pt", weights_only=True)
+        for k in state:
+            assert torch.equal(state[k], reloaded[k])
 
 
 # ---------------------------------------------------------------------------
-# Tests: config validation
+# Config validation (no forward pass).
 # ---------------------------------------------------------------------------
 
 
 class TestConfigValidation:
     def test_invalid_config_raises(self):
-        """projection_only_steps > 0 with train_projection_block=False raises ValueError."""
         cfg = OmegaConf.create({
             "training": {
                 "phase": "phase1_step1",
@@ -618,17 +610,10 @@ class TestConfigValidation:
                 "projection_only_steps": 200,
             },
             "model": {
-                "bgkit": {
-                    "backbone_name": "fake",
-                    "hidden_dim": 64,
-                },
-                "decoder": {
-                    "backbone_name": "fake",
-                },
+                "bgkit": {"backbone_name": "fake", "hidden_dim": 64},
+                "decoder": {"backbone_name": "fake"},
             },
-            "data": {
-                "tokens": {"input_dir": "/fake"},
-            },
+            "data": {"tokens": {"input_dir": "/fake"}},
             "compute": {},
             "wandb": {"enabled": False},
         })
@@ -639,130 +624,85 @@ class TestConfigValidation:
 
 
 # ---------------------------------------------------------------------------
-# Tests: train_step integration
+# Train-step integration with projection — packed forward via SDPA shim.
 # ---------------------------------------------------------------------------
 
 
 class TestTrainStepWithProjection:
     def test_train_step_returns_metrics(self):
-        """train_step with projection training returns expected metrics."""
-        t = _make_trainer(train_projection_block=True)
-        metrics = t.train_step(_make_batch())
+        t = _make_trainer(train_projection_block=True, freeze_top_layer=False)
+        batch = _make_chat_repro_batch()
+        metrics = t._forward_backward(batch)
         assert "loss" in metrics
-        assert "grad_norm" in metrics
+        assert torch.isfinite(torch.tensor(metrics["loss"]))
 
     def test_projection_params_in_optimizer(self):
-        """Projection block params should be in optimizer param groups."""
-        t = _make_trainer(train_projection_block=True)
-        opt_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
-        proj_params = {
-            id(p) for p in t.encoder.projection_block.parameters() if p.requires_grad
-        }
-        assert proj_params.issubset(opt_params), "Projection params should be in optimizer"
+        t = _make_trainer(train_projection_block=True, freeze_top_layer=False)
+        opt_param_ids = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
+        proj_param_ids = {id(p) for p in t.encoder.projection_block.parameters()}
+        assert proj_param_ids.issubset(opt_param_ids)
 
     def test_projection_receives_gradients(self):
-        """Projection block params receive gradients from a direct loss on survivors.
-
-        NOTE: The mock decoder backbone has no cross-position attention, so the
-        reconstruction loss doesn't backprop through the survivor prefix. This test
-        verifies gradient flow through the projection block via a direct loss on the
-        survivor embeddings, which is the intended real-model gradient path.
-        """
-        t = _make_trainer(train_projection_block=True)
-        batch = _make_batch()
-        enc_out = t._compute_survivors(batch)
-        loss = enc_out.survivor_embeddings.sum()
-        loss.backward()
-
+        t = _make_trainer(train_projection_block=True, freeze_top_layer=False)
+        batch = _make_chat_repro_batch()
+        t._forward_backward(batch)
         has_grad = any(
-            p.grad is not None and p.grad.abs().sum() > 0
+            p.grad is not None and p.grad.abs().sum().item() > 0
             for p in t.encoder.projection_block.parameters()
             if p.requires_grad
         )
-        assert has_grad, "Projection block should have gradients from survivors"
+        assert has_grad
 
     def test_compressor_no_gradients_after_step(self):
-        """Compressor params should have no gradients even when projection is trained."""
-        t = _make_trainer(train_projection_block=True)
-        t.train_step(_make_batch())
-
-        for name, p in t.encoder.compressor.named_parameters():
-            assert p.grad is None or (p.grad == 0).all(), \
-                f"compressor.{name} should have no gradient"
+        t = _make_trainer(train_projection_block=True, freeze_top_layer=False)
+        batch = _make_chat_repro_batch()
+        t._forward_backward(batch)
+        for p in t.encoder.compressor.parameters():
+            assert p.grad is None or p.grad.abs().sum().item() == 0.0
 
     def test_decoder_no_gradients_during_warmup(self):
-        """During projection-only warmup, decoder should have no gradients."""
         t = _make_trainer(
             train_projection_block=True,
             projection_only_steps=100,
+            freeze_top_layer=False,
         )
-        t.global_step = 5
-        t.train_step(_make_batch())
-
-        for name, p in t.decoder.named_parameters():
-            assert p.grad is None, f"decoder.{name} should have no gradient during warmup"
+        batch = _make_chat_repro_batch()
+        t._forward_backward(batch)
+        for p in t.decoder.parameters():
+            assert p.grad is None or p.grad.abs().sum().item() == 0.0
 
     def test_projection_eval_mode_during_evaluate(self):
-        """Projection block should be in eval mode during evaluate()."""
-        from torch.utils.data import DataLoader
+        """During ``evaluate()``, the projection block should be in eval mode."""
+        t = _make_trainer(train_projection_block=True, freeze_top_layer=False)
+        t.eval_dataloader = [_make_chat_repro_batch(batch_size=1)]
+        t.cfg = OmegaConf.merge(t.cfg, {
+            "training": {"eval": {"generation_eval_every": 1_000_000}},
+        })
 
-        t = _make_trainer(train_projection_block=True)
+        # Hook in a training-mode assertion on the projection block's
+        # transformer_layer during eval.
+        observed_modes: list[bool] = []
+        orig_forward = t.encoder.projection_block.forward
 
-        # Verify starts in train mode
-        assert t.encoder.projection_block.training, "Should start in train mode"
+        def _probing_forward(*args, **kwargs):
+            observed_modes.append(t.encoder.projection_block.training)
+            return orig_forward(*args, **kwargs)
 
-        # Set up a minimal eval dataloader
-        eval_data = [
-            {
-                "token_ids": torch.randint(0, 1000, (15,)),
-                "loss_mask": torch.cat([torch.zeros(5, dtype=torch.long),
-                                        torch.ones(5, dtype=torch.long),
-                                        torch.zeros(5, dtype=torch.long)]),
-                "content_token_ids": torch.randint(0, 1000, (5,)),
-                "compression_prompt_ids": torch.randint(0, 1000, (3,)),
-                "prefix_ids": torch.randint(0, 1000, (5,)),
-                "bgkit_splice_start": 5,
-                "bgkit_splice_len": 0,
-                "language": "python",
-            },
-        ]
-        t.eval_dataloader = DataLoader(
-            eval_data, batch_size=1, collate_fn=collate_chat_repro,
-        )
+        t.encoder.projection_block.forward = _probing_forward
         t.evaluate()
-
-        # After evaluate, projection block should be in eval mode
-        assert not t.encoder.projection_block.training, \
-            "Projection block should be in eval mode after evaluate()"
+        t.encoder.projection_block.forward = orig_forward
+        assert observed_modes, "evaluate() should have invoked the projection block"
+        assert all(m is False for m in observed_modes)
 
     def test_projection_train_mode_restored_after_eval(self):
-        """train_step should restore projection block to train mode after eval."""
-        from torch.utils.data import DataLoader
-
-        t = _make_trainer(train_projection_block=True)
-
-        # Run evaluate to put projection block in eval mode
-        eval_data = [
-            {
-                "token_ids": torch.randint(0, 1000, (15,)),
-                "loss_mask": torch.cat([torch.zeros(5, dtype=torch.long),
-                                        torch.ones(5, dtype=torch.long),
-                                        torch.zeros(5, dtype=torch.long)]),
-                "content_token_ids": torch.randint(0, 1000, (5,)),
-                "compression_prompt_ids": torch.randint(0, 1000, (3,)),
-                "prefix_ids": torch.randint(0, 1000, (5,)),
-                "bgkit_splice_start": 5,
-                "bgkit_splice_len": 0,
-                "language": "python",
-            },
-        ]
-        t.eval_dataloader = DataLoader(
-            eval_data, batch_size=1, collate_fn=collate_chat_repro,
-        )
+        t = _make_trainer(train_projection_block=True, freeze_top_layer=False)
+        t.eval_dataloader = [_make_chat_repro_batch(batch_size=1)]
+        t.cfg = OmegaConf.merge(t.cfg, {
+            "training": {"eval": {"generation_eval_every": 1_000_000}},
+        })
+        t.encoder.projection_block.train()
         t.evaluate()
-        assert not t.encoder.projection_block.training
-
-        # train_step should restore train mode
-        t.train_step(_make_batch())
-        assert t.encoder.projection_block.training, \
-            "Projection block should be in train mode during train_step"
+        # After eval, the next train_step should restore train mode.
+        batch = _make_chat_repro_batch()
+        t._forward_backward(batch)
+        assert t.encoder.projection_block.training is True

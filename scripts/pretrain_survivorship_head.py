@@ -22,7 +22,8 @@ targets drive raw logits into ~±3, tanh saturates lightly at ±0.99, which
 is the sweet spot for the θ ∈ (-0.99, 0.99) operator.
 
 What's saved:
-    A standalone sidecar checkpoint at ``$CHECKPOINT_DIR/survivorship_head_base_l0_YYYYMMDD_HHMMSS/``
+    A standalone sidecar checkpoint at
+    ``$CHECKPOINT_DIR/survivorship_head_base_l0_YYYYMMDD_HHMMSS/``
     containing ONLY head_base_l0 weights, loadable into a Step 3 encoder
     via a partial state-dict update. The encoder state dict from the Step 2
     checkpoint is NOT modified.
@@ -110,11 +111,12 @@ def main() -> int:
     from torch.utils.data import DataLoader, random_split
 
     from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
-    from bgkit.data.samplers import TokenBudgetBatchSampler
+    from bgkit.data.samplers import PackedTokenBudgetSampler
     from bgkit.models.encoder import BgKITEncoder
     from bgkit.models.ice_teacher import ICETeacher
     from bgkit.training.checkpointing import load_checkpoint
     from bgkit.utils.attention_backend import resolve_attention_implementation
+    from bgkit.utils.packing import position_ids_from_cu
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -181,32 +183,48 @@ def main() -> int:
     train_lengths = lengths_all[np.array(train_dataset.indices)]
     eval_lengths = lengths_all[np.array(eval_dataset.indices)]
 
-    train_sampler = TokenBudgetBatchSampler(
-        train_lengths, args.max_batch_tokens, shuffle=True, seed=args.seed,
+    train_sampler = PackedTokenBudgetSampler(
+        dataset=None,
+        lengths=train_lengths,
+        max_batch_tokens=args.max_batch_tokens,
+        shuffle=True,
+        seed=args.seed,
     )
-    eval_sampler = TokenBudgetBatchSampler(
-        eval_lengths, args.max_batch_tokens, shuffle=False,
+    eval_sampler = PackedTokenBudgetSampler(
+        dataset=None,
+        lengths=eval_lengths,
+        max_batch_tokens=args.max_batch_tokens,
+        shuffle=False,
     )
 
     def _collate(batch):
-        """Pad to longest in-batch for token_ids + attn_mask."""
-        ids_list = []
-        mask_list = []
+        """Pack samples into flat (N,) token_ids + (B+1,) cu_seqlens (FA4 varlen)."""
+        ids_list: list[torch.Tensor] = []
         for item in batch:
-            if isinstance(item, dict):
-                tid = item["token_ids"]
-            else:
-                tid = item
+            tid = item["token_ids"] if isinstance(item, dict) else item
             ids_list.append(tid)
-            mask_list.append(torch.ones_like(tid))
-        max_len = max(t.size(0) for t in ids_list)
-        padded_ids = torch.zeros(len(ids_list), max_len, dtype=ids_list[0].dtype)
-        padded_mask = torch.zeros(len(ids_list), max_len, dtype=torch.bool)
-        for i, (tid, m) in enumerate(zip(ids_list, mask_list, strict=True)):
-            n = tid.size(0)
-            padded_ids[i, :n] = tid
-            padded_mask[i, :n] = True
-        return {"token_ids": padded_ids, "attention_mask": padded_mask}
+        lengths = [int(t.size(0)) for t in ids_list]
+        n = sum(lengths)
+        if n == 0:
+            return {
+                "token_ids": torch.zeros(0, dtype=torch.long),
+                "cu_seqlens": torch.zeros(1, dtype=torch.int32),
+                "position_ids": torch.zeros(0, dtype=torch.long),
+                "max_seqlen": 0,
+            }
+        flat = torch.cat(ids_list, dim=0)
+        cu = torch.zeros(len(lengths) + 1, dtype=torch.int32)
+        running = 0
+        for i, seg_len in enumerate(lengths):
+            running += seg_len
+            cu[i + 1] = running
+        pos = position_ids_from_cu(cu, n)
+        return {
+            "token_ids": flat,
+            "cu_seqlens": cu,
+            "position_ids": pos,
+            "max_seqlen": max(lengths),
+        }
 
     train_loader = DataLoader(
         train_dataset,
@@ -237,55 +255,50 @@ def main() -> int:
     # head_base_l0 ourselves.
 
     def _run_one(batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute BCE loss + two diagnostic stats.
+        """Compute BCE loss + two diagnostic stats (packed).
 
-        Returns (loss, base_raw.detach(), teacher_mask.detach()).
+        Returns (loss, base_raw.detach(), teacher_mask.detach()) as flat (N,)
+        tensors in the FA4 varlen packed convention.
         """
-        token_ids = batch["token_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
+        token_ids = batch["token_ids"].to(device)  # (N,)
+        cu_seqlens = batch["cu_seqlens"].to(device)  # (B+1,)
+        position_ids = batch["position_ids"].to(device)  # (N,)
+        max_seqlen = int(batch["max_seqlen"])
 
-        # Teacher target (no grad).
+        # Teacher target (no grad), packed (N,).
         with torch.no_grad():
             teacher = ice_teacher.teacher_mask(
-                token_ids, attention_mask.int(), args.teacher_ratio,
+                token_ids, cu_seqlens, args.teacher_ratio,
             )
 
         # Run backbone up to block 1, then apply head_base_l0.
-        # Pruned backbone: block 1 output = hidden after 2nd block.
-        # Use return_intermediates to collect post-block states.
         bgkit_embed = embed_tokens
-        input_emb = bgkit_embed(token_ids)
+        input_emb = bgkit_embed(token_ids)  # (N, D)
 
         with torch.no_grad():
-            # target_ratio=None disables the hook; we need manual block-1 tap.
-            # PrunedBidirectionalQwen35.forward(...) with return_intermediates
-            # gives us hidden after each block.
             backbone = encoder.compressor.backbone
             backbone_out = backbone(
                 inputs_embeds=input_emb,
-                attention_mask=attention_mask,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_ids=position_ids,
                 return_intermediates=True,
             )
-            # intermediates[1] = hidden after block 1 (for pruned),
-            # which matches where the head hook fires.
             intermediates = backbone_out.hidden_states
             if intermediates is None or len(intermediates) < 2:
                 raise RuntimeError(
                     "backbone did not return enough intermediate states; "
                     f"got {len(intermediates) if intermediates is not None else 0}",
                 )
-            layer7 = intermediates[1]
+            layer7 = intermediates[1]  # (N, D)
 
-        # Ensure head input dtype matches head param dtype. Layer7 may be bf16.
         head_in = layer7.to(head.head[0].weight.dtype)
-        base_raw = head(head_in)  # (B, L)
+        base_raw = head(head_in)  # (N,)
 
-        # BCE (stable).
-        bce_per_pos = torch.nn.functional.binary_cross_entropy_with_logits(
-            base_raw.float(), teacher.float(), reduction="none",
+        # BCE over all packed positions (no padding in packed layout).
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            base_raw.float(), teacher.float(), reduction="mean",
         )
-        valid_f = attention_mask.float()
-        bce = (bce_per_pos * valid_f).sum() / valid_f.sum().clamp(min=1)
         return bce, base_raw.detach(), teacher.detach()
 
     def _run_eval() -> dict[str, float]:

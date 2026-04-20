@@ -1,129 +1,134 @@
-"""Custom data collators for variable-length sequences."""
+"""Packed data collators for FA4 varlen training.
+
+All collators produce flat ``(N,)`` tensors over samples with ``N = sum(L_i)``,
+``cu_seqlens`` of shape ``(B+1,)`` int32, and ``position_ids`` of shape
+``(N,)`` int64 that restart to 0 at each sample boundary.  No ``attention_mask``
+tensors are produced at the attention boundary -- segmentation lives in
+``cu_seqlens``.  Semantic masks (``loss_mask``, ``answer_position_mask``) remain
+as ``(N,)`` flat tensors.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 
+from bgkit.utils.packing import position_ids_from_cu
 
-@dataclass
-class CompressionBatch:
-    """A collated batch for compression training."""
-
-    input_ids: torch.Tensor  # (batch, max_seq_len)
-    attention_mask: torch.Tensor  # (batch, max_seq_len)
-    survivor_masks: torch.Tensor  # (batch, max_seq_len)
-    target_ids: torch.Tensor  # (batch, max_target_len) for decoder
-    target_attention_mask: torch.Tensor  # (batch, max_target_len)
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 
-@dataclass
-class QABatch:
-    """A collated batch for query-conditioned QA training."""
+def _make_cu_seqlens(lengths: list[int]) -> torch.Tensor:
+    """Build a cumulative sequence lengths tensor from a list of lengths.
 
-    content_token_ids: torch.Tensor
-    content_attention_mask: torch.Tensor
-    question_token_ids: torch.Tensor
-    question_attention_mask: torch.Tensor
-    answer_token_ids: torch.Tensor
-    answer_attention_mask: torch.Tensor
-    target_token_ids: torch.Tensor
-    target_attention_mask: torch.Tensor
-    target_loss_mask: torch.Tensor
-    compression_prompt_ids: torch.Tensor
-    compression_prompt_mask: torch.Tensor
-    prefix_ids: torch.Tensor
-    prefix_attention_mask: torch.Tensor
-    objectives: list[str]
-    dataset_names: list[str | None]
-    sample_ids: list[str | None]
-    document_ids: list[str | None]
-    tags: list[list[str]]
-    metadata: list[dict[str, object]]
-
-
-def pad_and_collate(
-    sequences: list[torch.Tensor],
-    pad_value: int = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pad variable-length sequences and create attention mask.
-
-    Args:
-        sequences: List of (seq_len_i,) tensors.
-        pad_value: Padding token value.
-
-    Returns:
-        (padded_sequences, attention_mask) both (batch, max_seq_len).
+    Returns
+    -------
+    Tensor
+        Shape ``(B+1,)`` int32 with ``cu[0] == 0`` and ``cu[-1] == sum(lengths)``.
     """
-    max_len = max(s.size(0) for s in sequences)
-    batch_size = len(sequences)
+    t = torch.zeros(len(lengths) + 1, dtype=torch.int32)
+    torch.cumsum(torch.tensor(lengths, dtype=torch.int32), dim=0, out=t[1:])
+    return t
 
-    padded = torch.full((batch_size, max_len), pad_value, dtype=sequences[0].dtype)
-    mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
 
-    for i, seq in enumerate(sequences):
-        length = seq.size(0)
-        padded[i, :length] = seq
-        mask[i, :length] = True
+def _cat_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Flat-concatenate a list of 1-D tensors."""
+    return torch.cat(tensors, dim=0)
 
-    return padded, mask
+
+# ---------------------------------------------------------------------------
+# Public collators
+# ---------------------------------------------------------------------------
 
 
 def collate_token_ids(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    """Collate variable-length token ID samples into a padded batch.
+    """Collate variable-length token ID samples into a packed batch.
 
     Args:
-        batch: List of dicts with "token_ids" (L,).
+        batch: List of dicts with ``"token_ids"`` key holding a ``(L,)`` int64
+               tensor.
 
     Returns:
-        Dict with padded "token_ids" (B, max_L) and "attention_mask" (B, max_L) bool.
+        Dict with keys:
+        - ``"input_ids"``: ``(N,)`` int64 flat concatenation.
+        - ``"position_ids"``: ``(N,)`` int64, per-sample restart.
+        - ``"cu_seqlens"``: ``(B+1,)`` int32.
+        - ``"max_seqlen"``: int.
     """
-    token_ids_list = [s["token_ids"] for s in batch]
-    padded, mask = pad_and_collate(token_ids_list, pad_value=0)
-    return {"token_ids": padded, "attention_mask": mask}
+    seqs = [s["token_ids"] for s in batch]
+    lengths = [int(s.size(0)) for s in seqs]
+    cu = _make_cu_seqlens(lengths)
+    total = int(cu[-1])
+    pos = position_ids_from_cu(cu, total)
+    return {
+        "input_ids": _cat_tensors(seqs),
+        "position_ids": pos,
+        "cu_seqlens": cu,
+        "max_seqlen": max(lengths) if lengths else 0,
+    }
 
 
 def collate_chat_repro(batch: list[dict]) -> dict:
-    """Collate chat-formatted reproduction samples into a padded batch.
+    """Collate chat-formatted reproduction samples into a packed batch.
 
     Args:
         batch: List of dicts with keys:
-            - "token_ids" (L,) — full chat-formatted sequence
-            - "loss_mask" (L,) — 1 for content tokens, 0 elsewhere
-            - "content_token_ids" (C,) — raw file tokens for BgKIT input
-            - "compression_prompt_ids" (P,) — tokenized compression prompt
-            - "prefix_ids" (X,) — chat template prefix tokens (for generation)
-            - "language" (str) — source language label
+            - ``"token_ids"`` (L,) -- full chat-formatted sequence.
+            - ``"loss_mask"`` (L,) -- 1 for content tokens, 0 elsewhere.
+            - ``"content_token_ids"`` (C,) -- raw file tokens for BgKIT input.
+            - ``"compression_prompt_ids"`` (P,) -- tokenised compression prompt.
+            - ``"prefix_ids"`` (X,) -- chat template prefix tokens.
+            - ``"language"`` str -- source language label.
+            - ``"bgkit_splice_start"`` int (optional).
+            - ``"bgkit_splice_len"`` int (optional).
+            - ``"answer_position_mask"`` (C,) bool (optional, QA-mode batches only).
 
     Returns:
-        Dict with padded tensors, attention masks, and language list.
+        Dict with packed flat tensors, per-sequence ``cu_seqlens``/``position_ids``,
+        per-sample scalars, and ``languages`` list.
     """
-    token_ids, attention_mask = pad_and_collate(
-        [s["token_ids"] for s in batch], pad_value=0,
-    )
-    loss_mask, _ = pad_and_collate(
-        [s["loss_mask"] for s in batch], pad_value=0,
-    )
-    content_token_ids, content_attention_mask = pad_and_collate(
-        [s["content_token_ids"] for s in batch], pad_value=0,
-    )
-    compression_prompt_ids, compression_prompt_mask = pad_and_collate(
-        [s["compression_prompt_ids"] for s in batch], pad_value=0,
-    )
-    prefix_ids, prefix_attention_mask = pad_and_collate(
-        [s["prefix_ids"] for s in batch], pad_value=0,
-    )
+    # --- main sequence ---
+    tok_seqs = [s["token_ids"] for s in batch]
+    tok_lengths = [int(t.size(0)) for t in tok_seqs]
+    tok_cu = _make_cu_seqlens(tok_lengths)
+    tok_total = int(tok_cu[-1])
+
+    # --- loss_mask (same segmentation as token_ids) ---
+    loss_seqs = [s["loss_mask"] for s in batch]
+
+    # --- content ---
+    content_seqs = [s["content_token_ids"] for s in batch]
+    content_lengths = [int(t.size(0)) for t in content_seqs]
+    content_cu = _make_cu_seqlens(content_lengths)
+    content_total = int(content_cu[-1])
+
+    # --- compression prompt ---
+    prompt_seqs = [s["compression_prompt_ids"] for s in batch]
+    prompt_lengths = [int(t.size(0)) for t in prompt_seqs]
+    prompt_cu = _make_cu_seqlens(prompt_lengths)
+
+    # --- prefix ---
+    prefix_seqs = [s["prefix_ids"] for s in batch]
+    prefix_lengths = [int(t.size(0)) for t in prefix_seqs]
+    prefix_cu = _make_cu_seqlens(prefix_lengths)
+
     out = {
-        "token_ids": token_ids,
-        "attention_mask": attention_mask,
-        "loss_mask": loss_mask,
-        "content_token_ids": content_token_ids,
-        "content_attention_mask": content_attention_mask,
-        "compression_prompt_ids": compression_prompt_ids,
-        "compression_prompt_mask": compression_prompt_mask,
-        "prefix_ids": prefix_ids,
-        "prefix_attention_mask": prefix_attention_mask,
+        "token_ids": _cat_tensors(tok_seqs),
+        "position_ids": position_ids_from_cu(tok_cu, tok_total),
+        "cu_seqlens": tok_cu,
+        "max_seqlen": max(tok_lengths) if tok_lengths else 0,
+        "loss_mask": _cat_tensors(loss_seqs),
+        "content_token_ids": _cat_tensors(content_seqs),
+        "content_position_ids": position_ids_from_cu(content_cu, content_total),
+        "content_cu_seqlens": content_cu,
+        "content_max_seqlen": max(content_lengths) if content_lengths else 0,
+        "compression_prompt_ids": _cat_tensors(prompt_seqs),
+        "compression_prompt_cu_seqlens": prompt_cu,
+        "compression_prompt_max_seqlen": max(prompt_lengths) if prompt_lengths else 0,
+        "prefix_ids": _cat_tensors(prefix_seqs),
+        "prefix_cu_seqlens": prefix_cu,
+        "prefix_max_seqlen": max(prefix_lengths) if prefix_lengths else 0,
         "bgkit_splice_start": torch.tensor(
             [int(s.get("bgkit_splice_start", -1)) for s in batch], dtype=torch.long,
         ),
@@ -133,11 +138,7 @@ def collate_chat_repro(batch: list[dict]) -> dict:
         "languages": [s["language"] for s in batch],
     }
 
-    # Optional QA answer-position mask. Present only on QA-mode batches
-    # produced by QAChatReproDataset; reconstruction batches omit it. The
-    # _InterleavingDataLoader keeps QA and reconstruction batches separate
-    # (interleaving happens at batch granularity), so we expect all-or-none
-    # within a single batch — fail loudly if that assumption breaks.
+    # Optional QA answer-position mask -- all-or-nothing within a batch.
     has_pos = ["answer_position_mask" in s for s in batch]
     if any(has_pos):
         if not all(has_pos):
@@ -146,25 +147,20 @@ def collate_chat_repro(batch: list[dict]) -> dict:
                 "answer_position_mask. Interleaving must operate at batch "
                 "granularity, not within a batch.",
             )
-        max_content_len = content_token_ids.size(1)
-        position_mask = torch.zeros(
-            len(batch), max_content_len, dtype=torch.bool,
+        # Flat over content positions; segmentation via content_cu_seqlens.
+        out["answer_position_mask"] = _cat_tensors(
+            [s["answer_position_mask"] for s in batch]
         )
-        for i, s in enumerate(batch):
-            m = s["answer_position_mask"]
-            n = min(m.size(0), max_content_len)
-            position_mask[i, :n] = m[:n]
-        out["answer_position_mask"] = position_mask
+
     return out
 
 
-def collate_compression(
-    batch: list,
-) -> dict:
-    """Collate compression samples into a padded batch.
+def collate_compression(batch: list) -> dict:
+    """Collate compression samples into a packed batch.
 
-    Handles both FileCompressionSample and RepoCompressionSample.
-    In practice, length-sorted batching means most batches are homogeneous.
+    Dispatches to :func:`_collate_file_samples` or
+    :func:`_collate_repo_samples` based on sample type.  Mixed batches
+    are split and returned under the ``"mixed"`` key.
     """
     from bgkit.data.datasets.compression_dataset import (
         FileCompressionSample,
@@ -175,13 +171,10 @@ def collate_compression(
     repo_samples = [s for s in batch if isinstance(s, RepoCompressionSample)]
 
     if file_samples and repo_samples:
-        # Mixed batch -- process each type separately and merge
-        file_batch = _collate_file_samples(file_samples)
-        repo_batch = _collate_repo_samples(repo_samples)
         return {
             "mixed": True,
-            "file_batch": file_batch,
-            "repo_batch": repo_batch,
+            "file_batch": _collate_file_samples(file_samples),
+            "repo_batch": _collate_repo_samples(repo_samples),
         }
 
     if file_samples:
@@ -190,37 +183,65 @@ def collate_compression(
 
 
 def _collate_file_samples(samples: list) -> dict:
-    """Collate FileCompressionSample list."""
-    content_ids, content_mask = pad_and_collate(
-        [s.content_token_ids for s in samples],
-    )
-    target_ids, target_mask = pad_and_collate(
-        [s.target_token_ids for s in samples],
-    )
-    loss_mask, _ = pad_and_collate(
-        [s.target_loss_mask for s in samples],
-    )
-    prefix_ids, prefix_mask = pad_and_collate(
-        [s.prefix_ids for s in samples],
-    )
-    prompt_ids, prompt_mask = pad_and_collate(
-        [s.compression_prompt_ids for s in samples],
-    )
+    """Collate FileCompressionSample list into a packed batch.
+
+    Returns a dict with keys:
+    - ``"sample_type"``: ``"file"``
+    - ``"content_token_ids"``: ``(N_content,)`` flat.
+    - ``"content_cu_seqlens"``: ``(B+1,)`` int32.
+    - ``"content_position_ids"``: ``(N_content,)`` int64.
+    - ``"content_max_seqlen"``: int.
+    - ``"target_token_ids"``: ``(N_target,)`` flat.
+    - ``"target_cu_seqlens"``: ``(B+1,)`` int32.
+    - ``"target_loss_mask"``: ``(N_target,)`` flat.
+    - ``"prefix_ids"``: ``(N_prefix,)`` flat.
+    - ``"prefix_cu_seqlens"``: ``(B+1,)`` int32.
+    - ``"compression_prompt_ids"``: ``(N_prompt,)`` flat.
+    - ``"prompt_cu_seqlens"``: ``(B+1,)`` int32.
+    - ``"compression_ratios"``: ``(B,)`` float.
+    - ``"compression_levels"``: ``(B,)`` long.
+    - ``"bgkit_splice_start"``: ``(B,)`` long.
+    - ``"bgkit_splice_len"``: ``(B,)`` long.
+    - ``"objectives"``: list[str].
+    """
+    content_seqs = [s.content_token_ids for s in samples]
+    content_lengths = [int(t.size(0)) for t in content_seqs]
+    content_cu = _make_cu_seqlens(content_lengths)
+    content_total = int(content_cu[-1])
+
+    target_seqs = [s.target_token_ids for s in samples]
+    target_lengths = [int(t.size(0)) for t in target_seqs]
+    target_cu = _make_cu_seqlens(target_lengths)
+
+    loss_seqs = [s.target_loss_mask for s in samples]
+
+    prefix_seqs = [s.prefix_ids for s in samples]
+    prefix_lengths = [int(t.size(0)) for t in prefix_seqs]
+    prefix_cu = _make_cu_seqlens(prefix_lengths)
+
+    prompt_seqs = [s.compression_prompt_ids for s in samples]
+    prompt_lengths = [int(t.size(0)) for t in prompt_seqs]
+    prompt_cu = _make_cu_seqlens(prompt_lengths)
 
     return {
         "sample_type": "file",
         "objectives": [s.objective for s in samples],
-        "content_token_ids": content_ids,
-        "content_attention_mask": content_mask,
+        "content_token_ids": _cat_tensors(content_seqs),
+        "content_cu_seqlens": content_cu,
+        "content_position_ids": position_ids_from_cu(content_cu, content_total),
+        "content_max_seqlen": max(content_lengths) if content_lengths else 0,
+        "target_token_ids": _cat_tensors(target_seqs),
+        "target_cu_seqlens": target_cu,
+        "target_max_seqlen": max(target_lengths) if target_lengths else 0,
+        "target_loss_mask": _cat_tensors(loss_seqs),
+        "prefix_ids": _cat_tensors(prefix_seqs),
+        "prefix_cu_seqlens": prefix_cu,
+        "compression_prompt_ids": _cat_tensors(prompt_seqs),
+        "prompt_cu_seqlens": prompt_cu,
         "compression_ratios": torch.tensor([s.compression_ratio for s in samples]),
-        "compression_levels": torch.tensor([s.compression_level for s in samples]),
-        "target_token_ids": target_ids,
-        "target_attention_mask": target_mask,
-        "target_loss_mask": loss_mask,
-        "prefix_ids": prefix_ids,
-        "prefix_attention_mask": prefix_mask,
-        "compression_prompt_ids": prompt_ids,
-        "compression_prompt_mask": prompt_mask,
+        "compression_levels": torch.tensor(
+            [s.compression_level for s in samples], dtype=torch.long,
+        ),
         "bgkit_splice_start": torch.tensor(
             [getattr(s, "bgkit_splice_start", -1) for s in samples], dtype=torch.long,
         ),
@@ -231,57 +252,95 @@ def _collate_file_samples(samples: list) -> dict:
 
 
 def _collate_repo_samples(samples: list) -> dict:
-    """Collate RepoCompressionSample list.
+    """Collate RepoCompressionSample list into a two-level packed batch.
 
-    Pads the inner file lists: max_files_in_batch x max_file_len_in_batch.
+    Two-level packing: each *repo* is a group of packed file-segments.
+
+    Fields
+    ------
+    ``content_token_ids`` : ``(N_content,)``
+        Flat over all files in all repos.
+    ``cu_file_seqlens`` : ``(total_files + 1,)`` int32
+        One cumulative-seqlen segment per file across all repos.
+    ``content_position_ids`` : ``(N_content,)`` int64
+        Per-file position restart; computed from ``cu_file_seqlens``.
+    ``content_max_seqlen`` : int
+    ``cu_repo_seqlens`` : ``(B + 1,)`` int32
+        Indices **into** ``cu_file_seqlens`` marking where each repo's files
+        end.  E.g. if repo 0 has 3 files, repo 1 has 2 files, repo 2 has 4
+        files: ``cu_repo_seqlens = [0, 3, 5, 9]``.
+    ``prompt_token_ids`` : ``(N_prompt,)``
+        Each repo's prompt is tiled ``n_files_i`` times; the flat buffer
+        contains ``n_files_i * prompt_len_i`` tokens for repo ``i``.
+    ``prompt_cu_seqlens`` : ``(total_files + 1,)`` int32
+        One prompt segment per file, aligned 1:1 with ``cu_file_seqlens``.
+    ``target_token_ids`` : ``(N_target,)``
+    ``target_cu_seqlens`` : ``(B + 1,)``
+    ``target_loss_mask`` : ``(N_target,)``
+    ``prefix_ids`` : ``(N_prefix,)``
+    ``prefix_cu_seqlens`` : ``(B + 1,)``
+    ``compression_ratios`` : ``(B,)``
+    ``compression_levels`` : ``(B,)``
+    ``bgkit_splice_start`` : ``(B,)``
+    ``bgkit_splice_len`` : ``(B,)``
+    ``objectives`` : list[str]
     """
-    max_files = max(len(s.file_token_ids) for s in samples)
-    max_file_len = max(
-        t.size(0) for s in samples for t in s.file_token_ids
-    ) if any(s.file_token_ids for s in samples) else 0
+    # --- two-level file packing ---
+    # For each repo collect its per-file token tensors.
+    all_file_seqs: list[torch.Tensor] = []
+    all_prompt_seqs: list[torch.Tensor] = []
+    file_lengths: list[int] = []
+    # cu_repo_seqlens values: index into cu_file_seqlens (i.e. file count boundaries)
+    repo_file_boundaries: list[int] = [0]
 
-    batch_size = len(samples)
+    for s in samples:
+        n_files = len(s.file_token_ids)
+        for f_ids in s.file_token_ids:
+            all_file_seqs.append(f_ids)
+            file_lengths.append(int(f_ids.size(0)))
+            # tile the prompt once per file
+            all_prompt_seqs.append(s.compression_prompt_ids)
+        repo_file_boundaries.append(repo_file_boundaries[-1] + n_files)
 
-    # Pad file token IDs to (batch, max_files, max_file_len)
-    file_ids = torch.zeros(batch_size, max_files, max_file_len, dtype=torch.long)
-    file_mask = torch.zeros(batch_size, max_files, max_file_len, dtype=torch.bool)
-    file_count = torch.tensor([len(s.file_token_ids) for s in samples])
+    cu_file = _make_cu_seqlens(file_lengths)
+    content_total = int(cu_file[-1])
 
-    for i, s in enumerate(samples):
-        for j, t in enumerate(s.file_token_ids):
-            length = t.size(0)
-            file_ids[i, j, :length] = t
-            file_mask[i, j, :length] = True
+    cu_repo = torch.tensor(repo_file_boundaries, dtype=torch.int32)
 
-    # Pad targets (same as file samples)
-    target_ids, target_mask = pad_and_collate(
-        [s.target_token_ids for s in samples],
-    )
-    loss_mask, _ = pad_and_collate(
-        [s.target_loss_mask for s in samples],
-    )
-    prefix_ids, prefix_mask = pad_and_collate(
-        [s.prefix_ids for s in samples],
-    )
-    prompt_ids, prompt_mask = pad_and_collate(
-        [s.compression_prompt_ids for s in samples],
-    )
+    prompt_lengths = [int(t.size(0)) for t in all_prompt_seqs]
+    prompt_cu = _make_cu_seqlens(prompt_lengths)
 
+    # --- per-repo target / prefix (one per repo, not per file) ---
+    target_seqs = [s.target_token_ids for s in samples]
+    target_lengths_list = [int(t.size(0)) for t in target_seqs]
+    target_cu = _make_cu_seqlens(target_lengths_list)
+    loss_seqs = [s.target_loss_mask for s in samples]
+
+    prefix_seqs = [s.prefix_ids for s in samples]
+    prefix_lengths_list = [int(t.size(0)) for t in prefix_seqs]
+    prefix_cu = _make_cu_seqlens(prefix_lengths_list)
+
+    empty_long = torch.zeros(0, dtype=torch.long)
     return {
         "sample_type": "repo",
         "objectives": [s.objective for s in samples],
-        "file_token_ids": file_ids,
-        "file_attention_masks": file_mask,
-        "file_count": file_count,
+        "content_token_ids": _cat_tensors(all_file_seqs) if all_file_seqs else empty_long,
+        "cu_file_seqlens": cu_file,
+        "content_position_ids": position_ids_from_cu(cu_file, content_total),
+        "content_max_seqlen": max(file_lengths) if file_lengths else 0,
+        "cu_repo_seqlens": cu_repo,
+        "prompt_token_ids": _cat_tensors(all_prompt_seqs) if all_prompt_seqs else empty_long,
+        "prompt_cu_seqlens": prompt_cu,
+        "target_token_ids": _cat_tensors(target_seqs),
+        "target_cu_seqlens": target_cu,
+        "target_max_seqlen": max(target_lengths_list) if target_lengths_list else 0,
+        "target_loss_mask": _cat_tensors(loss_seqs),
+        "prefix_ids": _cat_tensors(prefix_seqs),
+        "prefix_cu_seqlens": prefix_cu,
         "compression_ratios": torch.tensor([s.compression_ratio for s in samples]),
-        "compression_levels": torch.tensor([s.compression_level for s in samples]),
-        "target_token_ids": target_ids,
-        "target_attention_mask": target_mask,
-        "target_loss_mask": loss_mask,
-        "prefix_ids": prefix_ids,
-        "prefix_attention_mask": prefix_mask,
-        "compression_prompt_ids": prompt_ids,
-        "compression_prompt_mask": prompt_mask,
+        "compression_levels": torch.tensor(
+            [s.compression_level for s in samples], dtype=torch.long,
+        ),
         "bgkit_splice_start": torch.tensor(
             [getattr(s, "bgkit_splice_start", -1) for s in samples], dtype=torch.long,
         ),
@@ -292,7 +351,16 @@ def _collate_repo_samples(samples: list) -> dict:
 
 
 def collate_qa(batch: list) -> dict:
-    """Collate ``QASample`` objects into a padded Phase 2 batch."""
+    """Collate ``QASample`` objects into a packed Phase 2 batch.
+
+    Returns all fields from :func:`_collate_file_samples` plus:
+    - ``"question_token_ids"``: ``(N_q,)`` flat.
+    - ``"question_cu_seqlens"``: ``(B+1,)`` int32.
+    - ``"answer_token_ids"``: ``(N_a,)`` flat.
+    - ``"answer_cu_seqlens"``: ``(B+1,)`` int32.
+    - ``"objectives"``, ``"dataset_names"``, ``"sample_ids"``, ``"document_ids"``,
+      ``"tags"``, ``"metadata"``.
+    """
     from bgkit.data.datasets.qa_sample import QASample
 
     if not batch:
@@ -301,44 +369,26 @@ def collate_qa(batch: list) -> dict:
         types = sorted({type(sample).__name__ for sample in batch})
         raise TypeError(f"collate_qa() expects QASample items, got {types}")
 
-    content_ids, content_mask = pad_and_collate(
-        [s.content_token_ids for s in batch],
-    )
-    question_ids, question_mask = pad_and_collate(
-        [s.question_token_ids for s in batch],
-    )
-    answer_ids, answer_mask = pad_and_collate(
-        [s.answer_token_ids for s in batch],
-    )
-    target_ids, target_mask = pad_and_collate(
-        [s.target_token_ids for s in batch],
-    )
-    loss_mask, _ = pad_and_collate(
-        [s.target_loss_mask for s in batch],
-    )
-    prompt_ids, prompt_mask = pad_and_collate(
-        [s.compression_prompt_ids for s in batch],
-    )
-    prefix_ids, prefix_mask = pad_and_collate(
-        [s.prefix_ids for s in batch],
-    )
+    # Base file-compression fields (content / target / prefix / prompt).
+    base = _collate_file_samples(batch)
+
+    question_seqs = [s.question_token_ids for s in batch]
+    question_lengths = [int(t.size(0)) for t in question_seqs]
+    question_cu = _make_cu_seqlens(question_lengths)
+
+    answer_seqs = [s.answer_token_ids for s in batch]
+    answer_lengths = [int(t.size(0)) for t in answer_seqs]
+    answer_cu = _make_cu_seqlens(answer_lengths)
 
     return {
+        **base,
         "sample_type": "qa",
-        "content_token_ids": content_ids,
-        "content_attention_mask": content_mask,
-        "question_token_ids": question_ids,
-        "question_attention_mask": question_mask,
-        "answer_token_ids": answer_ids,
-        "answer_attention_mask": answer_mask,
-        "target_token_ids": target_ids,
-        "target_attention_mask": target_mask,
-        "target_loss_mask": loss_mask,
-        "compression_prompt_ids": prompt_ids,
-        "compression_prompt_mask": prompt_mask,
-        "prefix_ids": prefix_ids,
-        "prefix_attention_mask": prefix_mask,
-        "objectives": [s.objective for s in batch],
+        "question_token_ids": _cat_tensors(question_seqs),
+        "question_cu_seqlens": question_cu,
+        "question_max_seqlen": max(question_lengths) if question_lengths else 0,
+        "answer_token_ids": _cat_tensors(answer_seqs),
+        "answer_cu_seqlens": answer_cu,
+        "answer_max_seqlen": max(answer_lengths) if answer_lengths else 0,
         "dataset_names": [s.dataset_name for s in batch],
         "sample_ids": [s.sample_id for s in batch],
         "document_ids": [s.document_id for s in batch],

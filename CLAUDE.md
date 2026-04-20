@@ -142,6 +142,32 @@ Hard flag embeddings (survive/doomed) propagate the decision to subsequent layer
 **Known limitations**:
 - **Phase 2 KB ratio-conditioning regression** (pending separate design pass): removing the ratio embedding means the encoder backbone no longer adapts representation per ratio. For Phase 2 KB with per-query ratios in the Pareto sweep at [0.5, 0.1, 0.05, 0.02, 0.01], this likely hurts ablation numbers at extreme ratios. See `docs/survivorship_design.md §Phase 2 KB regression` for the constraint and possible mitigations.
 
+## Attention backend (FA4 packed-attention, 2026-04-20 migration)
+
+All encoder / decoder / DeltaNet attention runs via **FA4 varlen packed** on sm_121. No padded / `attention_mask` fallback exists — fallbacks were removed during the migration per the aggressive-removal directive.
+
+**Packed data shape** (FA4 varlen convention, invariant across encoder + decoder + DeltaNet + losses):
+- Flat `(N,)` or `(N, D)` over samples, `N = sum(L_i)`.
+- `cu_seqlens: (B+1,)` int32 cumulative sequence lengths (`cu_seqlens[0] == 0`, `cu_seqlens[-1] == N`).
+- `max_seqlen: int` for FA4 block selection.
+- `position_ids: (N,)` int64, per-sample restart (each sample's positions go 0, 1, …, L_i − 1).
+- No `attention_mask` at the attention boundary. Semantic masks (`loss_mask`, `valid_mask`) stay flat `(N,)`.
+- Repo-variant compression has **two-level packing**: `cu_file_seqlens` (one segment per file across all repos) + `cu_repo_seqlens: (B+1,)` (indices INTO `cu_file_seqlens` marking repo boundaries).
+
+**Helpers**: `src/bgkit/utils/packing.py` — `PackedBatch` + `segment_ids_from_cu`, `segment_mean`, `segment_sum`, `segment_max`, `lengths_from_cu`, `position_ids_from_cu`. Use these for any per-sample reduction on flat tensors.
+
+**Sampler**: `PackedTokenBudgetSampler` in `src/bgkit/data/samplers.py` with budget `sum(L_i²) ≤ max_batch_tokens × reference_seq_len` (quadratic — reflects that FA4 varlen attention cost is `sum(L_i²)`, not `B × max_len²`). `QueryAwareBatchSampler` (Phase 2) is preserved. Old `TokenBudgetBatchSampler` / `LengthSortedBatchSampler` are deleted.
+
+**Collators**: `src/bgkit/data/collators.py` — `collate_token_ids`, `collate_chat_repro`, `collate_compression` (dispatches to file / repo variants), `collate_qa`. Names unchanged from pre-migration; output dicts are packed.
+
+**FA4 SM12x native bootstrap**: `docker/entrypoint.sh::bootstrap_flash_attn_native()` detects `native_sm12x_owned_backend_available() = False` (aten-only, rejected by `require_sm12x_owned_backend()`), copies `/workspace/flash-attention` (bind-mount of `~/flash-attention` FA4 fork) to `${CHECKPOINT_DIR}/.flash-attn-native/repo`, runs `pip install -e . --no-build-isolation --user` inside container (one-time, ~10–30 min; cached by `find . -type f` SHA), and prepends the cache to `PYTHONPATH` so `flash_attn.flash_attn_interface` imports the rebuilt-against-container-libtorch FA2 .so. Confirmed working via `native_sm12x_backend_kind() = "flash_attn"`. **If the image is rebuilt, the bootstrap ships with it — verify by checking `$PYTHONPATH` starts with the cache repo path.**
+
+**Parity fixtures** (`tests/fixtures/`): 6 padded-reference fixtures (encoder, decoder, DeltaNet, survivorship losses, Phase 2 losses, Step 3 smoke microbatch) captured via `scripts/capture_parity_fixtures.py` before the migration. Consumed by parity tests at `tests/unit/models/test_*_packed.py` and `tests/unit/training/test_survivorship_helpers_packed.py` / `test_kr_kb_packed.py`.
+
+**Baseline for live validation** (`docs/baselines/phase1_step3_04_20_baseline.json`): 04-20 padded run `werg/bgkit/6wznpmwv` — step wall-clock 8.94 s/step, cuda_max_allocated 16.2 GB, final loss 0.24 at step 2599. Wave 4.5 validation compares packed runs against this.
+
+**Memory cap for profiler** (lessons learned from a host OOM): `docker/docker-compose.yaml` profile services (`profile-phase1-step3` etc.) apply `mem_limit: 80g` + `memswap_limit: 80g`. Any ad-hoc `docker compose run` of the profiler outside the capped services can still OOM the host on unified memory — use the named service.
+
 | Task | Command |
 |---|---|
 | Backfill registry | `make ckpt-backfill` or `.venv/bin/bgkit-ckpt backfill` |

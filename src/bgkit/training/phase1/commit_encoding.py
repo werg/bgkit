@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader, random_split
 
 from bgkit.data.collators import collate_compression
 from bgkit.data.datasets.commit_encoding_dataset import CommitEncodingDataset
-from bgkit.data.samplers import LengthSortedBatchSampler
+from bgkit.data.samplers import PackedTokenBudgetSampler
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
@@ -38,7 +38,19 @@ logger = structlog.get_logger()
 
 
 class CommitEncodingTrainer(BaseTrainer):
-    """Single-objective trainer for two-level commit encoding.
+    """Single-objective trainer for two-level commit encoding (packed).
+
+    Packed-attention pipeline (FA4 varlen). Each training step runs:
+      1. ONE packed L0 forward across every per-file diff in every
+         commit in the microbatch, segmented by ``cu_file_seqlens``.
+      2. Regroup the flat L0 survivors into per-commit groups using
+         ``cu_repo_seqlens`` (pure index shuffle on survivor_cu_seqlens).
+      3. ONE packed L1 forward across all commits in the microbatch.
+      4. ONE packed decoder call splicing each commit's L1 survivors
+         into its target sequence.
+
+    The previous per-sample L0 loop + per-group L1 loop is gone — packing
+    removes the quadratic-padding cost that motivated the serial path.
 
     Uses BaseTrainer.train() loop — no L1 introduction hook needed since
     both L0 and L1 are active from step 0. Overrides save_checkpoint()
@@ -226,6 +238,9 @@ class CommitEncodingTrainer(BaseTrainer):
 
         # --- Sampler + DataLoader ---
         max_batch_tokens = tcfg.get("max_batch_tokens", 65536)
+        # Eval has no backward — its packed budget can be larger than
+        # training's. Falls back to ``max_batch_tokens`` when unset.
+        max_batch_tokens_eval = tcfg.get("max_batch_tokens_eval", max_batch_tokens)
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
 
@@ -238,12 +253,12 @@ class CommitEncodingTrainer(BaseTrainer):
             for i in self.eval_dataset.indices
         ], dtype=np.int64)
 
-        self.train_sampler = LengthSortedBatchSampler(
+        self.train_sampler = PackedTokenBudgetSampler(
             self.train_dataset,
-            max_batch_tokens,
+            lengths=train_lengths,
+            max_batch_tokens=max_batch_tokens,
             shuffle=True,
             seed=seed,
-            lengths=train_lengths,
         )
         self.train_dataloader = DataLoader(
             self.train_dataset,
@@ -253,11 +268,11 @@ class CommitEncodingTrainer(BaseTrainer):
             pin_memory=pin_memory,
         )
 
-        eval_sampler = LengthSortedBatchSampler(
+        eval_sampler = PackedTokenBudgetSampler(
             self.eval_dataset,
-            max_batch_tokens,
-            shuffle=False,
             lengths=eval_lengths,
+            max_batch_tokens=max_batch_tokens_eval,
+            shuffle=False,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
@@ -502,750 +517,137 @@ class CommitEncodingTrainer(BaseTrainer):
         )
 
     # ------------------------------------------------------------------
-    # Compression pipeline: L0 per-file -> L1 cross-file
+    # Compression pipeline: packed L0 across files -> packed L1 per commit
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _compress_files_batched_pure(
-        compressor: torch.nn.Module,
-        all_f_emb: torch.Tensor,
-        all_f_mask: torch.Tensor,
-        prompt_emb: torch.Tensor,
-        prompt_mask: torch.Tensor,
-        target_ratio: float,
-    ) -> torch.Tensor:
-        """Batched L0 compression for checkpointing.
+    def _compress_repo_l0_packed(self, batch: dict):
+        """Single packed L0 forward across every file in every commit.
 
-        Returns concatenated survivors as (total_surv, D). Used by the
-        activation-checkpointing wrapper, where the CompressorOutput can't
-        cross the checkpoint boundary — losses/state accumulation happen
-        in the non-checkpointed path only.
+        Uses ``cu_file_seqlens`` (one segment per file) and per-file-tiled
+        ``prompt_token_ids`` from the repo collator.
         """
-        comp_out = compressor(
-            all_f_emb,
-            attention_mask=all_f_mask,
-            prompt_embeddings=prompt_emb,
-            prompt_attention_mask=prompt_mask,
-            target_ratio=target_ratio,
-            level="l0",
-        )
-        content_normed = comp_out.normed_embeddings[:, comp_out.content_slice, :]
-        survivor_mask = comp_out.survivor_mask
-        # Extract per-file survivors and auto_reproduce each (variable survivor count)
-        all_survivors = []
-        if survivor_mask is not None:
-            for f in range(all_f_emb.shape[0]):
-                surv = content_normed[f][survivor_mask[f]]
-                all_survivors.append(compressor.auto_reproduce(surv.unsqueeze(0))[0])
-        if all_survivors:
-            return torch.cat(all_survivors, dim=0)
-        return torch.zeros(
-            1, compressor.hidden_dim, device=all_f_emb.device, dtype=all_f_emb.dtype,
-        )
-
-    def _l0_loss_args(self) -> dict:
-        """Bundle per-level loss config for the checkpointed loss wrapper."""
-        return {
-            "weights": self._surv_l0,
-            "ice_cfg": self._ice_l0,
-            "ref_moments": self._ref_moments_l0,
-            "ice_teacher": self._ice_teacher,
-            "global_step": self.global_step,
-            "target_ratio": self._current_target_ratio(),
-        }
-
-    @staticmethod
-    def _compress_files_batched_with_loss(
-        compressor: torch.nn.Module,
-        all_f_emb: torch.Tensor,
-        all_f_mask: torch.Tensor,
-        prompt_emb: torch.Tensor,
-        prompt_mask: torch.Tensor,
-        target_ratio: float,
-        sub_file_ids: torch.Tensor,
-        loss_args: dict,
-        grad_capture: dict | None = None,
-        utility_grad_active: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        """Checkpointable: L0 compress + L0 survivorship loss in one region.
-
-        Returns ``(survivors, l0_loss, base_raw_for_util, post_head_content_values)``.
-        CompressorOutput stays inside the checkpoint region so its
-        activations can be recomputed on backward.
-        ``base_raw_for_util`` is ``head(content_hidden.detach())`` —
-        backward through it only touches head weights (subgraph fully
-        disjoint from the main backward). ``post_head_content_values``
-        is the detached forward-time stash used to form the
-        ``-(grad · value)`` utility teacher after the main backward.
-
-        When ``utility_grad_active=True``, ``grad_capture`` must be a
-        mutable dict held by the trainer; the compressor's backward hook
-        writes ``post_head_content_grad`` into it during the main
-        backward pass so the trainer can build the utility-grad teacher
-        after ``total_loss.backward()`` completes.
-        """
-        from bgkit.training.survivorship_helpers import compute_survivorship_losses
-
-        comp_out = compressor(
-            all_f_emb,
-            attention_mask=all_f_mask,
-            prompt_embeddings=prompt_emb,
-            prompt_attention_mask=prompt_mask,
-            target_ratio=target_ratio,
-            level="l0",
-            utility_grad_active=utility_grad_active,
-            utility_grad_capture=grad_capture,
-        )
-        content_normed = comp_out.normed_embeddings[:, comp_out.content_slice, :]
-        survivor_mask = comp_out.survivor_mask
-        all_survivors = []
-        if survivor_mask is not None:
-            for f in range(all_f_emb.shape[0]):
-                surv = content_normed[f][survivor_mask[f]]
-                all_survivors.append(compressor.auto_reproduce(surv.unsqueeze(0))[0])
-        if all_survivors:
-            survivors = torch.cat(all_survivors, dim=0)
-        else:
-            survivors = torch.zeros(
-                1, compressor.hidden_dim,
-                device=all_f_emb.device, dtype=all_f_emb.dtype,
-            )
-
-        l0_loss, _ = compute_survivorship_losses(
-            enc_out=comp_out,
-            level="l0",
-            weights=loss_args["weights"],
-            ice_cfg=loss_args["ice_cfg"],
-            ref_moments=loss_args["ref_moments"],
-            ice_teacher=loss_args["ice_teacher"],
-            global_step=loss_args["global_step"],
-            content_token_ids=sub_file_ids,
-            content_attn_mask=all_f_mask,
-            target_ratio=loss_args["target_ratio"],
-        )
-        return (
-            survivors,
-            l0_loss,
-            comp_out.base_raw_for_util,
-            comp_out.post_head_content_values,
-        )
-
-    @staticmethod
-    def _compress_files_batched_full(
-        compressor: torch.nn.Module,
-        all_f_emb: torch.Tensor,
-        all_f_mask: torch.Tensor,
-        prompt_emb: torch.Tensor,
-        prompt_mask: torch.Tensor,
-        target_ratio: float,
-        utility_grad_active: bool = False,
-    ) -> tuple[torch.Tensor, object]:
-        """Same as _compress_files_batched_pure but also returns CompressorOutput."""
-        comp_out = compressor(
-            all_f_emb,
-            attention_mask=all_f_mask,
-            prompt_embeddings=prompt_emb,
-            prompt_attention_mask=prompt_mask,
-            target_ratio=target_ratio,
-            level="l0",
-            utility_grad_active=utility_grad_active,
-        )
-        content_normed = comp_out.normed_embeddings[:, comp_out.content_slice, :]
-        survivor_mask = comp_out.survivor_mask
-        all_survivors = []
-        if survivor_mask is not None:
-            for f in range(all_f_emb.shape[0]):
-                surv = content_normed[f][survivor_mask[f]]
-                all_survivors.append(compressor.auto_reproduce(surv.unsqueeze(0))[0])
-        if all_survivors:
-            return torch.cat(all_survivors, dim=0), comp_out
-        return (
-            torch.zeros(
-                1, compressor.hidden_dim,
-                device=all_f_emb.device, dtype=all_f_emb.dtype,
-            ),
-            comp_out,
-        )
-
-    def _compress_l0_batched(
-        self,
-        file_ids: torch.Tensor,
-        file_masks: torch.Tensor,
-        n_files: int,
-        prompt_emb: torch.Tensor,
-        prompt_mask: torch.Tensor,
-        bgkit_embed: torch.nn.Module,
-        surv_loss_accum: list | None = None,
-        file_token_ids_l0: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Batched L0 per-file compression for one sample -> (total_surv, D).
-
-        Embeds all files at once, then runs a single batched compressor
-        forward with the survivorship head producing masks internally.
-        Uses selective activation checkpointing based on total token count.
-        """
-        from torch.utils.checkpoint import checkpoint as torch_checkpoint
-
         from bgkit.training.survivorship_helpers import LevelLossCfg
-        _default_surv_level = LevelLossCfg()
+        from bgkit.utils.packing import position_ids_from_cu
 
-        compressor = self.encoder.compressor
-        target_ratio = self._current_target_ratio()
+        device = self.device
+        file_ids = batch["content_token_ids"].to(device)
+        cu_file = batch["cu_file_seqlens"].to(device)
+        content_position_ids = batch["content_position_ids"].to(device)
+        prompt_ids = batch["prompt_token_ids"].to(device)
+        prompt_cu = batch["prompt_cu_seqlens"].to(device)
+        prompt_position_ids = position_ids_from_cu(prompt_cu, int(prompt_ids.shape[0]))
 
-        # 1. Embed all files at once
-        all_f_emb = bgkit_embed(file_ids[:n_files])          # (n_files, max_seq, D)
-        all_f_mask = file_masks[:n_files]                     # (n_files, max_seq)
-
-        # 2. Sort files by token count (descending) to reduce padding waste
-        token_counts = all_f_mask.sum(dim=1)
-        sorted_indices = token_counts.argsort(descending=True)
-        all_f_emb = all_f_emb[sorted_indices]
-        all_f_mask = all_f_mask[sorted_indices]
-
-        # 3. Sub-batch files to bound peak memory
-        max_files_per_sub = 8
-        checkpoint_threshold = 4096
-        all_survivors = []
-
-        for start in range(0, n_files, max_files_per_sub):
-            end = min(start + max_files_per_sub, n_files)
-            sub_emb = all_f_emb[start:end]
-            sub_f_mask = all_f_mask[start:end]
-            sub_size = end - start
-            sub_prompt_emb = prompt_emb.expand(sub_size, -1, -1)
-            sub_prompt_mask = prompt_mask.expand(sub_size, -1)
-
-            sub_tokens = sub_f_mask.sum().item()
-            sub_file_ids = (
-                file_token_ids_l0[start:end]
-                if file_token_ids_l0 is not None else None
-            )
-            util_active_l0 = getattr(
-                self, "_surv_l0", _default_surv_level,
-            ).utility_grad_loss_weight > 0.0
-            if sub_tokens > checkpoint_threshold:
-                if surv_loss_accum is not None and sub_file_ids is not None:
-                    # Checkpointed path with L0 loss: run a wrapper that
-                    # computes the loss INSIDE the checkpoint region (so
-                    # activations are recomputed on backward). The loss
-                    # scalar crosses the checkpoint boundary; the
-                    # CompressorOutput does NOT need to. For utility-grad
-                    # we also pass a mutable ``grad_capture`` dict: the
-                    # compressor's backward hook writes the captured
-                    # content-position gradient into it during the single
-                    # main backward (use_reentrant=False preserves the
-                    # closure binding across recompute + backward).
-                    grad_capture: dict = {}
-                    (
-                        sub_surv, sub_loss,
-                        sub_base_raw_for_util, sub_content_values,
-                    ) = torch_checkpoint(
-                        self._compress_files_batched_with_loss,
-                        compressor, sub_emb, sub_f_mask,
-                        sub_prompt_emb, sub_prompt_mask, target_ratio,
-                        sub_file_ids, self._l0_loss_args(),
-                        grad_capture, util_active_l0,
-                        use_reentrant=False,
-                    )
-                    # Also stash a metrics sentinel so the post-step
-                    # aggregation sees this sub-batch (microbatch state
-                    # accumulation happens in _apply_surv_losses). We
-                    # rebuild state from the loss-computing call inside
-                    # the checkpoint — so instead of going through
-                    # _apply_surv_losses, append the (already-scalar) loss
-                    # with a stage-B-style marker.
-                    surv_loss_accum.append((
-                        "ckpt_loss", sub_loss,
-                        sub_base_raw_for_util, sub_content_values,
-                        sub_f_mask, grad_capture,
-                    ))
-                else:
-                    sub_surv = torch_checkpoint(
-                        self._compress_files_batched_pure,
-                        compressor, sub_emb, sub_f_mask,
-                        sub_prompt_emb, sub_prompt_mask, target_ratio,
-                        use_reentrant=False,
-                    )
-            else:
-                if surv_loss_accum is not None and sub_file_ids is not None:
-                    sub_surv, sub_out = self._compress_files_batched_full(
-                        compressor, sub_emb, sub_f_mask,
-                        sub_prompt_emb, sub_prompt_mask, target_ratio,
-                        utility_grad_active=util_active_l0,
-                    )
-                    surv_loss_accum.append(
-                        ("full", sub_out, sub_file_ids, sub_f_mask)
-                    )
-                else:
-                    sub_surv = self._compress_files_batched_pure(
-                        compressor, sub_emb, sub_f_mask,
-                        sub_prompt_emb, sub_prompt_mask, target_ratio,
-                    )
-            all_survivors.append(sub_surv)
-
-        if all_survivors:
-            all_surv = torch.cat(all_survivors, dim=0)
-        else:
-            return torch.zeros(
-                1, compressor.hidden_dim,
-                device=self.device, dtype=torch.bfloat16,
-            )
-
-        if all_surv.shape[0] == 0:
-            return torch.zeros(
-                1, compressor.hidden_dim,
-                device=self.device, dtype=torch.bfloat16,
-            )
-        return all_surv
-
-    # ------------------------------------------------------------------
-    # Forward/backward
-    # ------------------------------------------------------------------
-
-    def _forward_backward(self, batch: dict) -> dict[str, float]:
-        """Grouped micro-batch forward + backward for efficient gradient accumulation.
-
-        Two-phase pipeline:
-        1. L0 per-file compression per sample (fast, ~3% of step time)
-        2. Group samples by L0 survivor count, batch L1 encoder + decoder + backward
-
-        Grouping amortizes backward through the 24-layer decoder + 14-layer encoder
-        across multiple samples, replacing batch=1 matmuls with batch=group_size.
-        """
-        self.encoder.train()
-        self.decoder.train()
-
-        file_ids = batch["file_token_ids"].to(self.device)
-        file_masks = batch["file_attention_masks"].to(self.device)
-        file_count = batch["file_count"]
-        prompt_ids = batch["compression_prompt_ids"].to(self.device)
-        prompt_mask = batch["compression_prompt_mask"].to(self.device)
-        target_ids = batch["target_token_ids"].to(self.device)
-        target_mask = batch["target_attention_mask"].to(self.device)
-        splice_start_batch = batch["bgkit_splice_start"].to(self.device)
-        splice_len_batch = batch["bgkit_splice_len"].to(self.device)
-        loss_mask_batch = batch.get("target_loss_mask")
-        if loss_mask_batch is not None:
-            loss_mask_batch = loss_mask_batch.to(self.device)
-
-        batch_size = file_ids.size(0)
         bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
-        hidden_dim = self.encoder.compressor.hidden_dim
-        group_size = 4  # micro-batch size for L1+decoder
-
-        total_loss = 0.0
-        total_survivors = 0
-        total_valid = 0
-        # Accumulators for per-level survivorship losses across all microbatches
-        # in this optimizer step. L0 losses are deferred until after backward
-        # through the decoder so the autograd graph is intact.
-        l0_surv_accum: list = []
-        aux_metrics: dict[str, float] = {}
-        # Utility-gradient BCE distillation bundles. L0 bundles are
-        # collected during Phase 1 (each sub-batch carries its own
-        # grad_capture dict that the main backward in Phase 2 writes to);
-        # L1 bundles are collected during Phase 2 for each group's L1
-        # forward. Both are drained post-backward to build BCE teachers
-        # from the captured ``-(grad · value)`` utility ranking.
-        util_l0_bundles: list[dict] = []
-        util_l1_bundles: list[dict] = []
-        from bgkit.training.survivorship_helpers import LevelLossCfg
-        _default_surv = LevelLossCfg()
-        util_w_l0 = getattr(
-            self, "_surv_l0", _default_surv,
-        ).utility_grad_loss_weight
-        util_w_l1 = getattr(
-            self, "_surv_l1", _default_surv,
-        ).utility_grad_loss_weight
-
-        # Profiling accumulators
-        if self._profile_enabled:
-            prof_l0 = 0.0
-            prof_l1 = 0.0
-            prof_dec = 0.0  # decoder + backward combined
-
-        # --- Phase 1: L0 compression per sample (fast, ~3% of step time) ---
-        l0_data = []  # list of (l0_surv, prompt_emb, sample_idx)
-        for b in range(batch_size):
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-                n_files = int(file_count[b].item())
-                prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
-
-                if self._profile_enabled:
-                    ev_l0_start = torch.cuda.Event(enable_timing=True)
-                    ev_l0_end = torch.cuda.Event(enable_timing=True)
-                    ev_l0_start.record()
-
-                # L0 per-file (batched with selective checkpointing). Pass
-                # per-sample accumulator so non-checkpointed sub-batches
-                # stash their CompressorOutput; L0 survivorship loss is
-                # backwarded immediately per sub-batch (no retain_graph)
-                # to free the encoder graph — each sub-batch has its own
-                # independent autograd graph since nothing downstream
-                # (decoder, L1) consumes the L0 sub-batch's compressor
-                # activations (only the auto-reproduce output flows
-                # forward, and its .grad path is already captured above).
-                per_sample_l0: list = []
-                l0_surv = self._compress_l0_batched(
-                    file_ids[b], file_masks[b], n_files,
-                    prompt_emb_b, prompt_mask[b:b + 1],
-                    bgkit_embed,
-                    surv_loss_accum=per_sample_l0,
-                    file_token_ids_l0=file_ids[b][:n_files],
-                )
-                scale = 1.0 / (batch_size * self._accum_steps)
-                for entry in per_sample_l0:
-                    if entry[0] == "ckpt_loss":
-                        # Checkpointed path: loss already computed inside
-                        # the checkpoint region. Just scale + backward.
-                        (
-                            _, sub_loss,
-                            sub_base_raw_for_util, sub_content_values,
-                            sub_mask, grad_capture,
-                        ) = entry
-                        if isinstance(sub_loss, torch.Tensor) and sub_loss.requires_grad:
-                            (sub_loss * scale).backward()
-                        if util_w_l0 > 0.0 and sub_content_values is not None:
-                            util_l0_bundles.append({
-                                "base_raw_for_util": sub_base_raw_for_util,
-                                "content_values": sub_content_values,
-                                "content_mask": sub_mask,
-                                "grad_capture": grad_capture,
-                                "enc_out": None,
-                            })
-                    else:
-                        # Non-checkpointed path: compute loss + accumulate
-                        # state from the live CompressorOutput.
-                        _, sub_out, sub_ids, sub_mask = entry
-                        l0_loss, l0_metrics = self._apply_surv_losses(
-                            sub_out, level="l0",
-                            content_token_ids=sub_ids,
-                            content_attn_mask=sub_mask,
-                        )
-                        if l0_metrics:
-                            aux_metrics.update(l0_metrics)
-                        if isinstance(l0_loss, torch.Tensor) and l0_loss.requires_grad:
-                            (l0_loss * scale).backward()
-                        if (
-                            util_w_l0 > 0.0
-                            and sub_out.post_head_content_values is not None
-                        ):
-                            util_l0_bundles.append({
-                                "base_raw_for_util": sub_out.base_raw_for_util,
-                                "content_values": sub_out.post_head_content_values,
-                                "content_mask": sub_mask,
-                                "grad_capture": None,
-                                "enc_out": sub_out,
-                            })
-                per_sample_l0.clear()
-
-                if self._profile_enabled:
-                    ev_l0_end.record()
-                    torch.cuda.synchronize()
-                    prof_l0 += ev_l0_start.elapsed_time(ev_l0_end)
-
-            total_valid += int(file_masks[b].sum().item())
-            l0_data.append((l0_surv, prompt_emb_b, b))
-
-        # --- Phase 2: Group L1 + decoder + backward ---
-        # Sort by survivor count for efficient padding within groups
-        l0_data.sort(key=lambda x: x[0].size(0))
-
-        for g_start in range(0, batch_size, group_size):
-            g_end = min(g_start + group_size, batch_size)
-            group = l0_data[g_start:g_end]
-            g_size = len(group)
-
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-                if self._profile_enabled:
-                    ev_l1_start = torch.cuda.Event(enable_timing=True)
-                    ev_l1_end = torch.cuda.Event(enable_timing=True)
-                    ev_l1_start.record()
-
-                # Check padding ratio to decide batched vs per-sample
-                surv_counts = [s.size(0) for s, _, _ in group]
-                min_sc = min(surv_counts)
-                max_sc = max(surv_counts)
-                batch_group = g_size > 1 and (min_sc == 0 or max_sc <= 2 * min_sc)
-
-                target_ratio = self._current_target_ratio()
-
-                if batch_group:
-                    # Pad L0 survivors to max in group
-                    l1_input = torch.zeros(
-                        g_size, max_sc, hidden_dim,
-                        device=self.device, dtype=torch.bfloat16,
-                    )
-                    l1_mask = torch.zeros(
-                        g_size, max_sc, dtype=torch.bool, device=self.device,
-                    )
-                    for j, (surv, _, _) in enumerate(group):
-                        sc = surv.size(0)
-                        l1_input[j, :sc] = surv
-                        l1_mask[j, :sc] = True
-
-                    # Batched L1 encoder + decoder forward
-                    prompt_embs = torch.cat([p for _, p, _ in group], dim=0)
-                    prompt_masks = torch.cat(
-                        [prompt_mask[b:b + 1] for _, _, b in group], dim=0,
-                    )
-                    l1_out = self.encoder(
-                        input_embeddings=l1_input,
-                        attention_mask=l1_mask,
-                        prompt_embeddings=prompt_embs,
-                        prompt_attention_mask=prompt_masks,
-                        target_ratio=target_ratio,
-                        level="l1",
-                        utility_grad_active=util_w_l1 > 0.0,
-                    )
-
-                    # L1 survivorship loss + state accumulation. Content
-                    # token_ids aren't meaningful at L1 (inputs are
-                    # compressed embeddings, not tokens), so BCE is
-                    # effectively disabled — plan sets L1 BCE off.
-                    l1_surv_loss, l1_metrics = self._apply_surv_losses(
-                        l1_out, level="l1",
-                        content_token_ids=None,
-                        content_attn_mask=l1_mask,
-                    )
-                    if l1_metrics:
-                        aux_metrics.update(l1_metrics)
-                    if (
-                        util_w_l1 > 0.0
-                        and l1_out.post_head_content_values is not None
-                    ):
-                        util_l1_bundles.append({
-                            "base_raw_for_util": l1_out.base_raw_for_util,
-                            "content_values": l1_out.post_head_content_values,
-                            "content_mask": l1_mask,
-                            "grad_capture": None,
-                            "enc_out": l1_out,
-                        })
-
-                    if self._profile_enabled:
-                        ev_l1_end.record()
-                        ev_dec_start = torch.cuda.Event(enable_timing=True)
-                        ev_dec_end = torch.cuda.Event(enable_timing=True)
-                        ev_dec_start.record()
-
-                    group_indices = [b for _, _, b in group]
-                    group_target_ids = target_ids[group_indices]
-                    group_target_mask = target_mask[group_indices]
-                    group_loss_mask = None
-                    if loss_mask_batch is not None:
-                        group_loss_mask = loss_mask_batch[group_indices]
-
-                    loss = self.decoder.forward_with_single_splice(
-                        survivor_embeddings=l1_out.survivor_embeddings,
-                        survivor_attention_mask=l1_out.survivor_attention_mask,
-                        token_ids=group_target_ids,
-                        token_attention_mask=group_target_mask,
-                        splice_starts=splice_start_batch[group_indices],
-                        splice_lengths=splice_len_batch[group_indices],
-                        loss_mask=group_loss_mask,
-                    )
-                    group_scale = g_size / (batch_size * self._accum_steps)
-                    total = loss * group_scale
-                    if isinstance(l1_surv_loss, torch.Tensor) and l1_surv_loss.requires_grad:
-                        total = total + l1_surv_loss * group_scale
-
-                    total.backward()
-
-                    total_loss += loss.item() * g_size
-                    total_survivors += int(
-                        l1_out.survivor_attention_mask.sum().item()
-                    )
-                else:
-                    # Per-sample fallback: high padding ratio
-                    if self._profile_enabled:
-                        ev_l1_end.record()
-                        ev_dec_start = torch.cuda.Event(enable_timing=True)
-                        ev_dec_end = torch.cuda.Event(enable_timing=True)
-                        ev_dec_start.record()
-
-                    scale = 1.0 / (batch_size * self._accum_steps)
-                    for surv, p_emb, b_idx in group:
-                        l1_in = surv.unsqueeze(0)
-                        l1_m = torch.ones(
-                            1, surv.size(0), dtype=torch.bool,
-                            device=self.device,
-                        )
-                        l1_o = self.encoder(
-                            input_embeddings=l1_in,
-                            attention_mask=l1_m,
-                            prompt_embeddings=p_emb,
-                            prompt_attention_mask=prompt_mask[b_idx:b_idx + 1],
-                            target_ratio=target_ratio,
-                            level="l1",
-                            utility_grad_active=util_w_l1 > 0.0,
-                        )
-                        l1_surv_loss, l1_metrics = self._apply_surv_losses(
-                            l1_o, level="l1",
-                            content_token_ids=None,
-                            content_attn_mask=l1_m,
-                        )
-                        if l1_metrics:
-                            aux_metrics.update(l1_metrics)
-                        if (
-                            util_w_l1 > 0.0
-                            and l1_o.post_head_content_values is not None
-                        ):
-                            util_l1_bundles.append({
-                                "base_raw_for_util": l1_o.base_raw_for_util,
-                                "content_values": l1_o.post_head_content_values,
-                                "content_mask": l1_m,
-                                "grad_capture": None,
-                                "enc_out": l1_o,
-                            })
-                        s_lm = (
-                            loss_mask_batch[b_idx:b_idx + 1]
-                            if loss_mask_batch is not None else None
-                        )
-                        loss = self.decoder.forward_with_single_splice(
-                            survivor_embeddings=l1_o.survivor_embeddings,
-                            survivor_attention_mask=l1_o.survivor_attention_mask,
-                            token_ids=target_ids[b_idx:b_idx + 1],
-                            token_attention_mask=target_mask[b_idx:b_idx + 1],
-                            splice_starts=splice_start_batch[b_idx:b_idx + 1],
-                            splice_lengths=splice_len_batch[b_idx:b_idx + 1],
-                            loss_mask=s_lm,
-                        )
-                        total = loss * scale
-                        if isinstance(l1_surv_loss, torch.Tensor) and l1_surv_loss.requires_grad:
-                            total = total + l1_surv_loss * scale
-                        total.backward()
-                        total_loss += loss.item()
-                        total_survivors += int(
-                            l1_o.survivor_attention_mask.sum().item()
-                        )
-
-                if self._profile_enabled:
-                    ev_dec_end.record()
-                    torch.cuda.synchronize()
-                    prof_l1 += ev_l1_start.elapsed_time(ev_l1_end)
-                    prof_dec += ev_dec_start.elapsed_time(ev_dec_end)
-
-        # --- Utility-gradient BCE distillation (post-backward) ---
-        # All Phase 1 + Phase 2 backwards have completed. For each level,
-        # rebuild the BCE teacher from the captured ``-(grad · value)``
-        # utility and run a small head-local backward.
-        self._apply_utility_grad_bce(
-            bundles=util_l0_bundles, level="l0",
-            weight=util_w_l0, batch_size=batch_size,
-            metrics=aux_metrics,
-        )
-        self._apply_utility_grad_bce(
-            bundles=util_l1_bundles, level="l1",
-            weight=util_w_l1, batch_size=batch_size,
-            metrics=aux_metrics,
-        )
-
-        if self._profile_enabled:
-            prof_total = prof_l0 + prof_l1 + prof_dec
-            logger.info(
-                "[PROFILE]",
-                step=self.global_step,
-                l0=f"{prof_l0:.0f}ms",
-                l1=f"{prof_l1:.0f}ms",
-                dec_bwd=f"{prof_dec:.0f}ms",
-                total=f"{prof_total:.0f}ms",
-                batch_size=batch_size,
-            )
+        content_emb = bgkit_embed(file_ids)
+        prompt_emb = bgkit_embed(prompt_ids)
 
         target_ratio = self._current_target_ratio()
-        actual_ratio = total_survivors / max(total_valid, 1)
+        util_active = getattr(
+            self, "_surv_l0", LevelLossCfg(),
+        ).utility_grad_loss_weight > 0.0
+        return self.encoder(
+            content_embeddings=content_emb,
+            content_cu_seqlens=cu_file,
+            content_position_ids=content_position_ids,
+            prompt_embeddings=prompt_emb,
+            prompt_cu_seqlens=prompt_cu,
+            prompt_position_ids=prompt_position_ids,
+            target_ratio=target_ratio,
+            level="l0",
+            utility_grad_active=util_active,
+        )
 
-        result = {
-            "loss": total_loss / batch_size,
-            "target_ratio": target_ratio,
-            "actual_ratio": actual_ratio,
-        }
-        result.update(aux_metrics)
+    @staticmethod
+    def _regroup_survivors_per_repo(
+        l0_survivors: torch.Tensor,
+        l0_survivor_cu: torch.Tensor,
+        cu_repo_seqlens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert per-file survivor groups into per-commit survivor groups.
 
-        # Release every CompressorOutput referenced by the bundles.
-        # Utility-grad BCE has already consumed everything it needs
-        # from them at this point. See ``CompressorOutput.release()``
-        # for the leak this mitigates.
-        for bundle in (*util_l0_bundles, *util_l1_bundles):
-            enc_out = bundle.get("enc_out")
-            if enc_out is not None and hasattr(enc_out, "release"):
-                enc_out.release()
-
-        return result
-
-    def _apply_utility_grad_bce(
-        self,
-        bundles: list[dict],
-        level: str,
-        weight: float,
-        batch_size: int,
-        metrics: dict[str, float],
-    ) -> None:
-        """Run utility-gradient BCE distillation for one level.
-
-        Runs after ALL main backwards (both the per-sub-batch L0
-        ``sub_loss.backward()`` and the per-group Phase 2
-        ``total.backward()``) have completed. The backward hook on
-        ``content_hidden`` fires on each backward that traverses it;
-        for a given sub-batch, the Phase 2 decoder backward is the
-        later one, so the final captured grad reflects the full
-        ``decoder_CE + aux`` composition flowing back through L0
-        (this is the signal we want for the utility-teacher ranking).
-
-        Each ``bundle`` carries either a ``grad_capture`` dict populated
-        by the compressor's backward hook (checkpointed L0 path) or a
-        live ``enc_out`` whose ``_utility_grad_state`` is populated.
-        ``base_raw_for_util`` is the detached-input head fork stashed at
-        compressor forward time — the BCE backward traverses only
-        ``util_loss → base_raw_for_util → head.weights``.
+        ``l0_survivor_cu`` has shape ``(total_files + 1,)``;
+        ``cu_repo_seqlens`` has shape ``(B + 1,)`` and holds indices
+        *into* the file axis. Since survivors are already emitted in
+        file-order, building the commit-level cu_seqlens is just a
+        gather over file boundaries — no tensor shuffle.
         """
-        if weight <= 0.0 or not bundles:
-            return
-        from bgkit.training.survivorship_helpers import utility_grad_bce_loss
+        cu_repo = cu_repo_seqlens.to(torch.int64)
+        cu_file = l0_survivor_cu.to(torch.int64)
+        survivor_cu_repo = cu_file[cu_repo]
+        return l0_survivors, survivor_cu_repo.to(torch.int32)
 
-        target_ratio = self._current_target_ratio()
-        scale = 1.0 / (batch_size * self._accum_steps)
-        total_grad_norm = 0.0
-        n_bundles_with_grad = 0
-        emitted_metric = False
-        for bundle in bundles:
-            grad_capture = bundle.get("grad_capture")
-            enc_out = bundle.get("enc_out")
-            if grad_capture is not None:
-                content_grad = grad_capture.get("post_head_content_grad")
-            elif enc_out is not None:
-                content_grad = enc_out.get_content_grad()
+    def _decoder_forward_single_splice(
+        self,
+        survivors: torch.Tensor,
+        survivor_cu_seqlens: torch.Tensor,
+        batch: dict,
+    ) -> torch.Tensor:
+        """Packed decoder forward + CE loss.
+
+        Splits flat ``target_token_ids`` at each sample's splice
+        boundaries to produce per-sample prefix/suffix lists, carries
+        the per-segment loss mask over the ``[prefix | survivors |
+        suffix]`` layout that ``forward_with_single_splice`` expects.
+        """
+        device = self.device
+        target_ids_flat = batch["target_token_ids"].to(device)
+        target_cu = batch["target_cu_seqlens"].to(device)
+        splice_start = batch["bgkit_splice_start"].to(device)
+        splice_len = batch["bgkit_splice_len"].to(device)
+        loss_mask_flat = batch.get("target_loss_mask")
+        if loss_mask_flat is not None:
+            loss_mask_flat = loss_mask_flat.to(device).to(torch.bool)
+
+        batch_size = int(target_cu.shape[0]) - 1
+        tok_cu_list = target_cu.to(torch.int64).tolist()
+        surv_cu_list = survivor_cu_seqlens.to(torch.int64).tolist()
+
+        prefix_ids: list[torch.Tensor] = []
+        suffix_ids: list[torch.Tensor] = []
+        per_segment_loss_masks: list[torch.Tensor] = []
+        for b in range(batch_size):
+            sample_start = int(tok_cu_list[b])
+            sample_end = int(tok_cu_list[b + 1])
+            sample_tokens = target_ids_flat[sample_start:sample_end]
+            splice_b_start = int(splice_start[b].item())
+            splice_b_len = int(splice_len[b].item())
+            if splice_b_start < 0:
+                splice_b_start = sample_tokens.shape[0]
+                splice_b_len = 0
+            pre = sample_tokens[:splice_b_start]
+            suf = sample_tokens[splice_b_start + splice_b_len :]
+            prefix_ids.append(pre)
+            suffix_ids.append(suf)
+
+            k_i = int(surv_cu_list[b + 1]) - int(surv_cu_list[b])
+            surv_mask = torch.zeros(k_i, dtype=torch.bool, device=device)
+            if loss_mask_flat is not None:
+                sample_loss = loss_mask_flat[sample_start:sample_end]
+                pre_mask = sample_loss[:splice_b_start]
+                suf_mask = sample_loss[splice_b_start + splice_b_len :]
             else:
-                content_grad = None
-            if content_grad is None:
-                continue
-            util_loss, util_metrics = utility_grad_bce_loss(
-                base_raw_for_util=bundle.get("base_raw_for_util"),
-                content_grad=content_grad,
-                content_values=bundle["content_values"],
-                valid_mask=bundle["content_mask"],
-                pinned_mask=None,
-                target_ratio=target_ratio,
-            )
-            if util_loss.requires_grad:
-                (util_loss * weight * scale).backward()
-            if not emitted_metric and util_metrics:
-                for k, v in util_metrics.items():
-                    metrics[f"{level}_{k}"] = v
-                emitted_metric = True
-            total_grad_norm += float(content_grad.norm().item())
-            n_bundles_with_grad += 1
-        if n_bundles_with_grad > 0:
-            metrics[f"{level}_content_grad_norm"] = (
-                total_grad_norm / n_bundles_with_grad
-            )
+                pre_mask = torch.zeros(pre.shape[0], dtype=torch.bool, device=device)
+                suf_mask = torch.ones(suf.shape[0], dtype=torch.bool, device=device)
+            per_segment_loss_masks.append(torch.cat([pre_mask, surv_mask, suf_mask], dim=0))
+
+        flat_loss_mask = (
+            torch.cat(per_segment_loss_masks, dim=0)
+            if per_segment_loss_masks else None
+        )
+        return self.decoder.forward_with_single_splice(
+            survivor_embeddings=survivors,
+            survivor_cu_seqlens=survivor_cu_seqlens,
+            prefix_ids=prefix_ids,
+            suffix_ids=suffix_ids,
+            loss_mask=flat_loss_mask,
+        )
 
     def _apply_surv_losses(
         self,
         enc_out,
         level: str,
         content_token_ids: torch.Tensor | None = None,
-        content_attn_mask: torch.Tensor | None = None,
+        content_cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute per-level survivorship loss + accumulate microbatch state."""
         from bgkit.training.survivorship_helpers import (
@@ -1284,14 +686,11 @@ class CommitEncodingTrainer(BaseTrainer):
             ice_teacher=getattr(self, "_ice_teacher", None),
             global_step=self.global_step,
             content_token_ids=content_token_ids,
-            content_attn_mask=content_attn_mask,
+            content_cu_seqlens=content_cu_seqlens,
             target_ratio=target_ratio,
         )
         accumulate(state, enc_out)
         out_metrics = {f"{level}_{k}": v for k, v in metrics.items()}
-        # Head-health diagnostics (organic-rate std, undecided fraction,
-        # floor/pinned/θ). Each read is a GPU→CPU sync; gate via the
-        # configured diagnostic cadence.
         diag_every_n = int(getattr(self, "_diagnostic_metrics_every_n_steps", 1) or 1)
         out_metrics.update(
             survivorship_diagnostics(
@@ -1300,6 +699,158 @@ class CommitEncodingTrainer(BaseTrainer):
             )
         )
         return loss, out_metrics
+
+    # ------------------------------------------------------------------
+    # Forward/backward
+    # ------------------------------------------------------------------
+
+    def _forward_backward(self, batch: dict) -> dict[str, float]:
+        """Packed forward + backward — single L0, single L1, single decoder.
+
+        See class docstring for the full flow.
+        """
+        from bgkit.training.survivorship_helpers import LevelLossCfg
+        from bgkit.utils.packing import position_ids_from_cu
+
+        self.encoder.train()
+        self.decoder.train()
+
+        device = self.device
+        cu_repo = batch["cu_repo_seqlens"].to(device)
+        batch_size = int(cu_repo.shape[0]) - 1
+        scale = 1.0 / (batch_size * self._accum_steps)
+        aux_metrics: dict[str, float] = {}
+
+        util_w_l0 = getattr(
+            self, "_surv_l0", LevelLossCfg(),
+        ).utility_grad_loss_weight
+        util_w_l1 = getattr(
+            self, "_surv_l1", LevelLossCfg(),
+        ).utility_grad_loss_weight
+
+        with torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
+        ):
+            # Step 1: packed L0 across all files in all commits.
+            l0_out = self._compress_repo_l0_packed(batch)
+            l0_surv_loss = None
+            if l0_out.logits_for_op is not None:
+                l0_surv_loss, l0_metrics = self._apply_surv_losses(
+                    l0_out, level="l0",
+                    content_token_ids=batch["content_token_ids"].to(device),
+                    content_cu_seqlens=batch["cu_file_seqlens"].to(device),
+                )
+                aux_metrics.update(l0_metrics)
+
+            # Step 2: regroup per-commit.
+            l1_input_flat, l1_input_cu = self._regroup_survivors_per_repo(
+                l0_out.survivor_embeddings,
+                l0_out.survivor_cu_seqlens,
+                cu_repo,
+            )
+            n_surv_total = int(l1_input_flat.shape[0])
+            l1_input_positions = position_ids_from_cu(l1_input_cu, n_surv_total)
+            empty_prompt_cu = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=device,
+            )
+            empty_prompt_emb = l1_input_flat.new_zeros(0, l1_input_flat.shape[-1])
+            empty_prompt_pos = torch.zeros(0, dtype=torch.int64, device=device)
+
+            # Step 3: packed L1 across all commits.
+            target_ratio = self._current_target_ratio()
+            l1_out = self.encoder(
+                content_embeddings=l1_input_flat,
+                content_cu_seqlens=l1_input_cu,
+                content_position_ids=l1_input_positions,
+                prompt_embeddings=empty_prompt_emb,
+                prompt_cu_seqlens=empty_prompt_cu,
+                prompt_position_ids=empty_prompt_pos,
+                target_ratio=target_ratio,
+                level="l1",
+                utility_grad_active=util_w_l1 > 0.0,
+            )
+            l1_surv_loss = None
+            if l1_out.logits_for_op is not None:
+                l1_surv_loss, l1_metrics = self._apply_surv_losses(
+                    l1_out, level="l1",
+                    content_token_ids=None,
+                    content_cu_seqlens=l1_input_cu,
+                )
+                aux_metrics.update(l1_metrics)
+
+            # Step 4: packed decoder.
+            loss = self._decoder_forward_single_splice(
+                l1_out.survivor_embeddings,
+                l1_out.survivor_cu_seqlens,
+                batch,
+            )
+
+            total_loss_t = loss
+            if l0_surv_loss is not None and l0_surv_loss.requires_grad:
+                total_loss_t = total_loss_t + l0_surv_loss
+            if l1_surv_loss is not None and l1_surv_loss.requires_grad:
+                total_loss_t = total_loss_t + l1_surv_loss
+
+        (total_loss_t * batch_size * scale).backward()
+
+        # Utility-gradient BCE (post-backward) for both levels.
+        if util_w_l0 > 0.0 and l0_out.post_head_content_values is not None:
+            from bgkit.training.survivorship_helpers import utility_grad_bce_loss
+
+            util_loss, util_metrics = utility_grad_bce_loss(
+                base_raw_for_util=l0_out.base_raw_for_util,
+                content_grad=l0_out.get_content_grad(),
+                content_values=l0_out.post_head_content_values,
+                valid_mask=None,
+                pinned_mask=None,
+                target_ratio=target_ratio,
+                content_cu_seqlens=batch["cu_file_seqlens"].to(device),
+            )
+            if util_loss.requires_grad:
+                (util_loss * util_w_l0 * batch_size * scale).backward()
+            for k, v in util_metrics.items():
+                aux_metrics[f"l0_{k}"] = v
+            if l0_out.get_content_grad() is not None:
+                aux_metrics["l0_content_grad_norm"] = float(
+                    l0_out.get_content_grad().norm().item(),
+                )
+
+        if util_w_l1 > 0.0 and l1_out.post_head_content_values is not None:
+            from bgkit.training.survivorship_helpers import utility_grad_bce_loss
+
+            util_loss, util_metrics = utility_grad_bce_loss(
+                base_raw_for_util=l1_out.base_raw_for_util,
+                content_grad=l1_out.get_content_grad(),
+                content_values=l1_out.post_head_content_values,
+                valid_mask=None,
+                pinned_mask=None,
+                target_ratio=target_ratio,
+                content_cu_seqlens=l1_input_cu,
+            )
+            if util_loss.requires_grad:
+                (util_loss * util_w_l1 * batch_size * scale).backward()
+            for k, v in util_metrics.items():
+                aux_metrics[f"l1_{k}"] = v
+            if l1_out.get_content_grad() is not None:
+                aux_metrics["l1_content_grad_norm"] = float(
+                    l1_out.get_content_grad().norm().item(),
+                )
+
+        total_survivors = int(l1_out.survivor_embeddings.shape[0])
+        total_valid = int(batch["content_token_ids"].shape[0])
+        actual_ratio = total_survivors / max(total_valid, 1)
+
+        result = {
+            "loss": float(loss.item()),
+            "target_ratio": target_ratio,
+            "actual_ratio": actual_ratio,
+        }
+        result.update(aux_metrics)
+
+        l0_out.release()
+        l1_out.release()
+
+        return result
 
     def _post_step(self, step: int) -> None:
         """Advance bidirectional warmup and run dual-ascent θ + EMA μ updates."""
@@ -1357,6 +908,9 @@ class CommitEncodingTrainer(BaseTrainer):
 
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
+        """Packed eval — same L0 → L1 → decoder algorithm, no backward."""
+        from bgkit.utils.packing import position_ids_from_cu
+
         self.encoder.eval()
         self.decoder.eval()
 
@@ -1365,78 +919,63 @@ class CommitEncodingTrainer(BaseTrainer):
             total_tokens = 0.0
             target_ratio = self._current_target_ratio()
 
+            device = self.device
             num_batches = len(self.eval_dataloader)
             for batch_idx, batch in enumerate(self.eval_dataloader):
                 if batch_idx % 100 == 0:
                     logger.info("eval_progress", batch=batch_idx, total=num_batches)
 
-                file_ids = batch["file_token_ids"].to(self.device)
-                file_masks = batch["file_attention_masks"].to(self.device)
-                file_count = batch["file_count"]
-                prompt_ids = batch["compression_prompt_ids"].to(self.device)
-                prompt_mask = batch["compression_prompt_mask"].to(self.device)
-                target_ids = batch["target_token_ids"].to(self.device)
-                target_mask = batch["target_attention_mask"].to(self.device)
-                splice_start_batch = batch["bgkit_splice_start"].to(self.device)
-                splice_len_batch = batch["bgkit_splice_len"].to(self.device)
-                loss_mask_batch = batch.get("target_loss_mask")
-                if loss_mask_batch is not None:
-                    loss_mask_batch = loss_mask_batch.to(self.device)
+                cu_repo = batch["cu_repo_seqlens"].to(device)
+                batch_size = int(cu_repo.shape[0]) - 1
 
-                batch_size = file_ids.size(0)
-                bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+                loss_mask_flat = batch.get("target_loss_mask")
+                if loss_mask_flat is not None:
+                    loss_mask_flat = loss_mask_flat.to(device).to(torch.bool)
 
-                # Per-sample eval, no grouping, minimal peak memory.
-                for b in range(batch_size):
-                    with torch.autocast(
-                        "cuda", dtype=torch.bfloat16,
-                        enabled=self.device.type == "cuda",
-                    ):
-                        n_files = int(file_count[b].item())
-                        prompt_emb_b = bgkit_embed(prompt_ids[b:b + 1])
+                with torch.autocast(
+                    "cuda", dtype=torch.bfloat16,
+                    enabled=self.device.type == "cuda",
+                ):
+                    l0_out = self._compress_repo_l0_packed(batch)
+                    l1_input_flat, l1_input_cu = self._regroup_survivors_per_repo(
+                        l0_out.survivor_embeddings,
+                        l0_out.survivor_cu_seqlens,
+                        cu_repo,
+                    )
+                    n_surv_total = int(l1_input_flat.shape[0])
+                    l1_input_positions = position_ids_from_cu(l1_input_cu, n_surv_total)
+                    empty_prompt_cu = torch.zeros(
+                        batch_size + 1, dtype=torch.int32, device=device,
+                    )
+                    empty_prompt_emb = l1_input_flat.new_zeros(
+                        0, l1_input_flat.shape[-1],
+                    )
+                    empty_prompt_pos = torch.zeros(0, dtype=torch.int64, device=device)
+                    l1_out = self.encoder(
+                        content_embeddings=l1_input_flat,
+                        content_cu_seqlens=l1_input_cu,
+                        content_position_ids=l1_input_positions,
+                        prompt_embeddings=empty_prompt_emb,
+                        prompt_cu_seqlens=empty_prompt_cu,
+                        prompt_position_ids=empty_prompt_pos,
+                        target_ratio=target_ratio,
+                        level="l1",
+                    )
+                    loss = self._decoder_forward_single_splice(
+                        l1_out.survivor_embeddings,
+                        l1_out.survivor_cu_seqlens,
+                        batch,
+                    )
 
-                        l0_surv = self._compress_l0_batched(
-                            file_ids[b], file_masks[b], n_files,
-                            prompt_emb_b, prompt_mask[b:b + 1],
-                            bgkit_embed,
-                        )
+                if loss_mask_flat is not None:
+                    batch_tokens = float(loss_mask_flat.sum().item())
+                else:
+                    batch_tokens = float(batch["target_token_ids"].shape[0])
+                total_loss += float(loss.item()) * batch_tokens
+                total_tokens += batch_tokens
 
-                        l1_input = l0_surv.unsqueeze(0)
-                        l1_mask = torch.ones(
-                            1, l0_surv.size(0), dtype=torch.bool, device=self.device,
-                        )
-
-                        l1_out = self.encoder(
-                            input_embeddings=l1_input,
-                            attention_mask=l1_mask,
-                            prompt_embeddings=prompt_emb_b,
-                            prompt_attention_mask=prompt_mask[b:b + 1],
-                            target_ratio=target_ratio,
-                            level="l1",
-                        )
-
-                        sample_loss_mask = (
-                            loss_mask_batch[b:b + 1]
-                            if loss_mask_batch is not None else None
-                        )
-
-                        loss = self.decoder.forward_with_single_splice(
-                            survivor_embeddings=l1_out.survivor_embeddings,
-                            survivor_attention_mask=l1_out.survivor_attention_mask,
-                            token_ids=target_ids[b:b + 1],
-                            token_attention_mask=target_mask[b:b + 1],
-                            splice_starts=splice_start_batch[b:b + 1],
-                            splice_lengths=splice_len_batch[b:b + 1],
-                            loss_mask=sample_loss_mask,
-                        )
-
-                        eval_loss_mask = batch.get("target_loss_mask")
-                        if eval_loss_mask is not None:
-                            sample_tokens = eval_loss_mask[b].sum().item()
-                        else:
-                            sample_tokens = batch["target_attention_mask"][b].sum().item()
-                        total_loss += loss.item() * sample_tokens
-                        total_tokens += sample_tokens
+                l0_out.release()
+                l1_out.release()
 
             avg_loss = total_loss / max(total_tokens, 1)
             perplexity = torch.exp(torch.tensor(avg_loss)).item()

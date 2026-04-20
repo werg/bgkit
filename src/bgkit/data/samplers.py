@@ -1,184 +1,250 @@
-"""Token-budget batch samplers for variable-length sequence training."""
+"""Token-budget batch samplers for variable-length sequence training.
+
+Deleted in Wave 0.2 of the FA4 packed-attention migration (2026-04-20):
+  - TokenBudgetBatchSampler
+  - LengthSortedBatchSampler
+  - _LengthBucketedBatchSampler
+
+These symbols are no longer importable.  Every callsite that referenced them
+must be updated to ``PackedTokenBudgetSampler`` as part of Wave 3.  Known
+callers at deletion time:
+  scripts/run_quality_gate.py
+  scripts/run_ablation.py
+  scripts/evaluate.py
+  scripts/eval_phase1.py
+  scripts/pretrain_survivorship_head.py
+  src/bgkit/training/phase1/commit_encoding.py
+  src/bgkit/training/joint_block_trainer.py
+  src/bgkit/training/phase1/projection_repair.py
+  src/bgkit/training/phase1/decoder_init.py
+  src/bgkit/training/distillation/pruning_distill.py
+  src/bgkit/training/phase1/compression.py
+  tests/unit/data/test_compression_dataset.py
+"""
 
 from __future__ import annotations
 
+import logging
 import random
 from collections.abc import Iterator, Sequence
-from typing import ClassVar
 
 import numpy as np
+import torch
 from torch.utils.data import Sampler
 
+logger = logging.getLogger(__name__)
 
-class _LengthBucketedBatchSampler(Sampler[list[int]]):
-    """Shared base: length-sorted batches under a quadratic memory budget.
 
-    Concrete subclasses call :meth:`_init_bucketed` from their
-    ``__init__`` with a precomputed ``lengths`` array.  All batching,
-    shuffling, and iteration logic lives here; subclasses only differ
-    in how they obtain the lengths (directly vs. via a dataset's
-    ``token_length`` method).
+class PackedTokenBudgetSampler(Sampler[list[int]]):
+    """Shuffled greedy-packing sampler under a quadratic token-budget.
 
-    Memory budget: ``(batch_size + 1) * max_len² <= max_batch_tokens
-    * reference_seq_len``. Attention memory scales quadratically with
-    sequence length, so a long-sample batch automatically has fewer
-    samples (memory stationary) and a short-sample batch has many
-    (compute stationary).  Set ``reference_seq_len`` to a
-    representative length (default 2048) and the effective budget
-    matches what the old linear ``max_batch_tokens × max_len``
-    produced at that length.
+    FA4 packed attention attends per segment, so memory/compute cost is
+    ``sum(L_i^2)`` for a packed batch rather than ``B x max_len^2``.  The
+    budget is therefore::
 
-    Batch order is reshuffled each epoch so memory load is
-    non-monotonic across the epoch and resume doesn't land in a
-    deterministic length regime.
+        sum(L_i^2) <= max_batch_tokens x reference_seq_len
 
-    Singleton overflow: a single sample whose length² exceeds
-    ``max_batch_tokens × reference_seq_len`` is still emitted as a
-    batch of 1.  If you need a hard memory cap, also cap
-    ``max_seq_len`` at the dataset level.
+    ``reference_seq_len`` converts ``max_batch_tokens`` from the old
+    linear-budget units into quadratic-budget units.  At exactly
+    ``reference_seq_len`` tokens the two budgets agree, so you can keep
+    the same numeric value of ``max_batch_tokens`` in your config and
+    only flip the sampler class.  The default is **2048** — a typical
+    "representative document length" for code/text corpora.
+
+    Algorithm:
+
+    1. Shuffle all indices (per epoch, deterministically when *seed* is
+       given via ``torch.Generator`` for cross-process reproducibility).
+    2. Greedily accumulate indices into the current microbatch while
+       ``sum(L_i²) + L_next²  ≤  budget``.
+    3. When adding the next index would overflow, emit the current
+       microbatch and start a new one with that index.
+    4. Singleton overflow: if a single sample has ``L² > budget`` it is
+       emitted as a batch of one, :attr:`oversized_count` is incremented,
+       and a warning is logged once.
+
+    Args:
+        dataset: Not used for length probing — retained for API parity with
+            legacy samplers.  May be ``None`` when ``lengths`` is given.
+        lengths: Per-sample token counts, aligned with dataset indices.
+        max_batch_tokens: Linear-equivalent token budget (same numeric
+            range as the old ``TokenBudgetBatchSampler``).
+        reference_seq_len: Converts the budget to quadratic units.
+            Defaults to 2048.
+        shuffle: Shuffle indices every epoch.  Set ``False`` for
+            deterministic evaluation passes.
+        seed: RNG seed for shuffling.  When ``None``, uses Python's
+            default randomness (non-deterministic across processes).
+        drop_last: Drop the trailing partial batch (if any).
+
+    Attributes:
+        oversized_count: Number of samples that exceeded the budget on
+            their own and were emitted as singleton batches.
     """
 
-    #: Reference sequence length used to convert ``max_batch_tokens``
-    #: from linear units into quadratic budget units.  At this length
-    #: the quadratic budget and the old linear budget produce the
-    #: same batch sizes.  Override via constructor arg if your typical
-    #: content length is very different.
-    DEFAULT_REFERENCE_SEQ_LEN: ClassVar[int] = 2048
-
-    def _init_bucketed(
+    def __init__(
         self,
+        dataset,  # kept for API parity; may be None when lengths provided
         lengths: Sequence[int] | np.ndarray,
         max_batch_tokens: int,
-        shuffle: bool,
-        seed: int,
-        reference_seq_len: int | None,
+        reference_seq_len: int = 2048,
+        shuffle: bool = True,
+        seed: int | None = None,
+        drop_last: bool = False,
     ) -> None:
-        self._lengths = np.asarray(lengths, dtype=np.int64)
-        self._max_batch_tokens = max_batch_tokens
-        self._shuffle = shuffle
-        self._seed = seed
-        self._epoch = 0
-        self._reference_seq_len = (
-            int(reference_seq_len)
-            if reference_seq_len is not None
-            else self.DEFAULT_REFERENCE_SEQ_LEN
-        )
-        self._batches: list[list[int]] = self._build_batches()
+        self._lengths: np.ndarray = np.asarray(lengths, dtype=np.int64)
+        self._max_batch_tokens: int = int(max_batch_tokens)
+        self._reference_seq_len: int = int(reference_seq_len)
+        self._shuffle: bool = shuffle
+        self._seed: int | None = seed
+        self._drop_last: bool = drop_last
+        self._epoch: int = 0
+        # Index of the next batch to yield in the current epoch.  Non-zero
+        # only on checkpoint resume: ``BaseTrainer`` calls
+        # :meth:`set_batch_cursor` before building the dataloader iterator
+        # so we skip directly to where training left off, instead of
+        # replaying skipped batches on CPU.  Reset to 0 on ``set_epoch``
+        # (the trainer resets ``_microbatches_in_epoch`` on epoch
+        # rollover) and after a full iteration completes.
+        self._batch_cursor: int = 0
+        self.oversized_count: int = 0
+        self._warned_oversized: bool = False
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    def set_epoch(self, epoch: int) -> None:
+        """Advance the epoch counter (changes shuffle order next iteration).
+
+        Resets the batch cursor to 0 — a fresh epoch always starts at
+        batch 0 regardless of any prior cursor state.
+        """
+        self._epoch = epoch
+        self._batch_cursor = 0
+
+    def set_batch_cursor(self, cursor: int) -> None:
+        """Resume the next iteration at batch index ``cursor``.
+
+        Called by the trainer on resume with the persisted logical
+        consumed-batch count.  The cursor is a logical position, not an
+        iterator-internal offset: it must be set **before** creating the
+        dataloader iterator so any ``_DevicePrefetcher`` wrapping sees
+        the adjusted start.
+        """
+        self._batch_cursor = max(0, int(cursor))
+
+    # ------------------------------------------------------------------
+    # Core packing
+    # ------------------------------------------------------------------
+
+    def _shuffled_indices(self) -> list[int]:
+        n = len(self._lengths)
+        if not self._shuffle:
+            return list(range(n))
+        if self._seed is not None:
+            # torch.Generator for reproducible cross-process behaviour
+            gen = torch.Generator()
+            gen.manual_seed(self._seed + self._epoch)
+            return torch.randperm(n, generator=gen).tolist()
+        indices = list(range(n))
+        random.shuffle(indices)
+        return indices
 
     def _build_batches(self) -> list[list[int]]:
-        lengths = self._lengths
-        if len(lengths) == 0:
-            return []
-        sorted_indices = np.argsort(lengths).tolist()
+        indices = self._shuffled_indices()
         budget = self._max_batch_tokens * self._reference_seq_len
         batches: list[list[int]] = []
         batch: list[int] = []
-        current_max = 0
-        for idx in sorted_indices:
-            seq_len = int(lengths[idx])
-            new_max = max(current_max, seq_len)
-            if batch and (len(batch) + 1) * new_max * new_max > budget:
+        running_sum: int = 0
+        oversized_count = 0
+
+        for idx in indices:
+            seq_len = int(self._lengths[idx])
+            sq = seq_len * seq_len
+
+            if not batch:
+                # Always admit the first sample into an empty batch.
+                if sq > budget:
+                    if not self._warned_oversized:
+                        logger.warning(
+                            "PackedTokenBudgetSampler: sample %d has L^2=%d which exceeds "
+                            "budget %d (max_batch_tokens=%d x reference_seq_len=%d). "
+                            "Emitting as singleton. Further oversized samples will not "
+                            "produce additional warnings.",
+                            idx,
+                            sq,
+                            budget,
+                            self._max_batch_tokens,
+                            self._reference_seq_len,
+                        )
+                        self._warned_oversized = True
+                    oversized_count += 1
+                batch = [idx]
+                running_sum = sq
+            elif running_sum + sq <= budget:
+                batch.append(idx)
+                running_sum += sq
+            else:
+                # Current batch is full — emit it and start a new one.
                 batches.append(batch)
                 batch = [idx]
-                current_max = seq_len
-            else:
-                batch.append(idx)
-                current_max = new_max
+                running_sum = sq
+                # Check if the new singleton is itself oversized.
+                if sq > budget:
+                    if not self._warned_oversized:
+                        logger.warning(
+                            "PackedTokenBudgetSampler: sample %d has L^2=%d which exceeds "
+                            "budget %d (max_batch_tokens=%d x reference_seq_len=%d). "
+                            "Emitting as singleton. Further oversized samples will not "
+                            "produce additional warnings.",
+                            idx,
+                            sq,
+                            budget,
+                            self._max_batch_tokens,
+                            self._reference_seq_len,
+                        )
+                        self._warned_oversized = True
+                    oversized_count += 1
+
         if batch:
             batches.append(batch)
+
+        if self._drop_last and len(batches) > 1:
+            batches = batches[:-1]
+
+        # Update the public counter to reflect this iteration.
+        self.oversized_count = oversized_count
         return batches
 
-    def set_epoch(self, epoch: int) -> None:
-        """Change RNG seed for per-epoch batch-order shuffling."""
-        self._epoch = epoch
+    # ------------------------------------------------------------------
+    # Sampler protocol
+    # ------------------------------------------------------------------
 
     def __iter__(self) -> Iterator[list[int]]:
-        if self._shuffle:
-            rng = random.Random(self._seed + self._epoch)
-            order = list(range(len(self._batches)))
-            rng.shuffle(order)
-            for i in order:
-                yield self._batches[i]
-        else:
-            yield from self._batches
+        batches = self._build_batches()
+        start = self._batch_cursor
+        if start >= len(batches):
+            # Cursor already past the end — resume fell on an epoch
+            # boundary.  Yield nothing; the trainer will hit
+            # StopIteration, roll the epoch, and reset the cursor.
+            self._batch_cursor = 0
+            return
+        for i in range(start, len(batches)):
+            self._batch_cursor = i + 1
+            yield batches[i]
+        self._batch_cursor = 0
 
     def __len__(self) -> int:
-        return len(self._batches)
+        """Approximate batch count.
 
-
-class TokenBudgetBatchSampler(_LengthBucketedBatchSampler):
-    """Length-bucketed sampler constructed from a precomputed lengths array.
-
-    See :class:`_LengthBucketedBatchSampler` for the batching and
-    shuffling semantics.  Used by trainers that already know the
-    per-sample token lengths without needing a dataset probe.
-    """
-
-    def __init__(
-        self,
-        lengths: Sequence[int] | np.ndarray,
-        max_batch_tokens: int,
-        shuffle: bool = True,
-        seed: int = 42,
-        reference_seq_len: int | None = None,
-    ):
-        self._init_bucketed(
-            lengths, max_batch_tokens, shuffle, seed, reference_seq_len,
-        )
-
-
-class LengthSortedBatchSampler(_LengthBucketedBatchSampler):
-    """Length-bucketed sampler with dataset-or-lengths construction.
-
-    See :class:`_LengthBucketedBatchSampler` for the batching and
-    shuffling semantics.  Accepts either a dataset with a
-    ``token_length(idx)`` method or a precomputed ``lengths``
-    array / sequence (the latter is used when the DataLoader wraps a
-    Subset — lengths must already be scoped to that Subset).
-
-    When ``lengths`` is provided, ``dataset`` is only used for ``len()``.
-    Supports :meth:`rebuild` to recompute batches after a curriculum
-    transition.
-    """
-
-    def __init__(
-        self,
-        dataset,
-        max_batch_tokens: int,
-        shuffle: bool = True,
-        seed: int = 42,
-        lengths: Sequence[int] | np.ndarray | None = None,
-        reference_seq_len: int | None = None,
-    ):
-        self._dataset = dataset
-        lengths_arr = self._resolve_lengths(lengths)
-        self._init_bucketed(
-            lengths_arr, max_batch_tokens, shuffle, seed, reference_seq_len,
-        )
-
-    def _resolve_lengths(
-        self, lengths: Sequence[int] | np.ndarray | None,
-    ) -> np.ndarray:
-        if lengths is not None:
-            return np.asarray(lengths, dtype=np.int64)
-        n = len(self._dataset)
-        if n == 0:
-            return np.empty(0, dtype=np.int64)
-        return np.array(
-            [self._dataset.token_length(i) for i in range(n)],
-            dtype=np.int64,
-        )
-
-    def rebuild(
-        self, lengths: Sequence[int] | np.ndarray | None = None,
-    ) -> None:
-        """Rebuild batches (call after a curriculum transition).
-
-        Optionally pass new lengths if the dataset/subset changed; when
-        omitted, re-probes the dataset.
+        Exact when ``shuffle=False``; may vary by ±1 across epochs when
+        ``shuffle=True`` due to different packing orders.  Callers should
+        treat this as an approximation for shuffled mode.
         """
-        self._lengths = self._resolve_lengths(lengths)
-        self._batches = self._build_batches()
+        if len(self._lengths) == 0:
+            return 0
+        return len(self._build_batches())
 
 
 class QueryAwareBatchSampler(Sampler[list[int]]):

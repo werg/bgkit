@@ -27,7 +27,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from bgkit.data.collators import collate_chat_repro
 from bgkit.data.datasets.chat_repro_dataset import ChatReproDataset
 from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
-from bgkit.data.samplers import TokenBudgetBatchSampler
+from bgkit.data.samplers import PackedTokenBudgetSampler
 from bgkit.eval.metrics.embedding_health import embedding_drift_metrics
 from bgkit.eval.metrics.reconstruction import parse_success_rate
 from bgkit.models.decoder import ReconstructionDecoder
@@ -85,6 +85,15 @@ class _InterleavingIterator:
         self._primary_samples = 0
         self._secondary_samples = 0
 
+    @staticmethod
+    def _batch_sample_count(batch: dict) -> int:
+        """Per-sample count from the packed cu_seqlens (shape B+1)."""
+        cu = batch.get("cu_seqlens")
+        if cu is not None:
+            return int(cu.shape[0]) - 1
+        # Fallback for legacy batches — shouldn't hit on the packed path.
+        return int(batch["token_ids"].size(0))
+
     def __next__(self):
         total = self._primary_samples + self._secondary_samples + 1
         current_ratio = self._secondary_samples / total
@@ -92,7 +101,7 @@ class _InterleavingIterator:
         if current_ratio < self._ratio:
             try:
                 batch = next(self._secondary_iter)
-                self._secondary_samples += batch["token_ids"].size(0)
+                self._secondary_samples += self._batch_sample_count(batch)
                 return batch
             except StopIteration:
                 # Secondary exhausted — restart it
@@ -101,7 +110,7 @@ class _InterleavingIterator:
 
         # Primary batch (or secondary was exhausted)
         batch = next(self._primary_iter)  # StopIteration propagates = epoch end
-        self._primary_samples += batch["token_ids"].size(0)
+        self._primary_samples += self._batch_sample_count(batch)
         return batch
 
 
@@ -446,6 +455,9 @@ class DecoderInitTrainer(BaseTrainer):
 
         # Token-budget batching (based on chat-formatted lengths)
         max_batch_tokens = tcfg.get("max_batch_tokens", 65536)
+        # Eval has no backward — its packed budget can be larger than
+        # training's. Falls back to ``max_batch_tokens`` when unset.
+        max_batch_tokens_eval = tcfg.get("max_batch_tokens_eval", max_batch_tokens)
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
         seed = self.cfg.get("seed", 42)
@@ -453,11 +465,18 @@ class DecoderInitTrainer(BaseTrainer):
         train_lengths = full_dataset.lengths[np.array(self.train_dataset.indices)]
         eval_lengths = full_dataset.lengths[np.array(self.eval_dataset.indices)]
 
-        self.train_sampler = TokenBudgetBatchSampler(
-            train_lengths, max_batch_tokens, shuffle=True, seed=seed,
+        self.train_sampler = PackedTokenBudgetSampler(
+            self.train_dataset,
+            lengths=train_lengths,
+            max_batch_tokens=max_batch_tokens,
+            shuffle=True,
+            seed=seed,
         )
-        eval_sampler = TokenBudgetBatchSampler(
-            eval_lengths, max_batch_tokens, shuffle=False,
+        eval_sampler = PackedTokenBudgetSampler(
+            self.eval_dataset,
+            lengths=eval_lengths,
+            max_batch_tokens=max_batch_tokens_eval,
+            shuffle=False,
         )
 
         self.train_dataloader = DataLoader(
@@ -504,11 +523,18 @@ class DecoderInitTrainer(BaseTrainer):
                     qa_train_lengths = qa_full.lengths[np.array(qa_train_ds.indices)]
                     qa_eval_lengths = qa_full.lengths[np.array(qa_eval_ds.indices)]
 
-                    qa_train_sampler = TokenBudgetBatchSampler(
-                        qa_train_lengths, max_batch_tokens, shuffle=True, seed=seed,
+                    qa_train_sampler = PackedTokenBudgetSampler(
+                        qa_train_ds,
+                        lengths=qa_train_lengths,
+                        max_batch_tokens=max_batch_tokens,
+                        shuffle=True,
+                        seed=seed,
                     )
-                    qa_eval_sampler = TokenBudgetBatchSampler(
-                        qa_eval_lengths, max_batch_tokens, shuffle=False,
+                    qa_eval_sampler = PackedTokenBudgetSampler(
+                        qa_eval_ds,
+                        lengths=qa_eval_lengths,
+                        max_batch_tokens=max_batch_tokens_eval,
+                        shuffle=False,
                     )
 
                     self._qa_train_dataloader = DataLoader(
@@ -1077,19 +1103,14 @@ class DecoderInitTrainer(BaseTrainer):
         enc_out,
         target_ratio: float,
         content_token_ids: torch.Tensor | None = None,
-        content_attention_mask: torch.Tensor | None = None,
+        content_cu_seqlens: torch.Tensor | None = None,
         level: str = "l0",
         answer_position_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Delegate to ``compute_survivorship_losses`` from the shared helpers.
 
-        Step 3 only consumes l0; level kwarg is forward-compatible for Step 4+.
-        BCE/moment-match consume base_raw directly (NOT logits_for_op) — base
-        is independently anchored to ICE; adapter is free to deviate.
-
-        ``answer_position_mask`` is forwarded only for QA batches (Phase 1
-        Step 3); reconstruction batches pass ``None`` and the QA-position
-        loss is inactive even if its weight is configured.
+        Packed inputs: ``content_token_ids`` is flat ``(N,)`` and
+        ``content_cu_seqlens`` encodes per-sample boundaries.
         """
         from bgkit.training.survivorship_helpers import (
             LevelICECfg,
@@ -1117,7 +1138,7 @@ class DecoderInitTrainer(BaseTrainer):
             ice_teacher=getattr(self, "_ice_teacher", None),
             global_step=self.global_step,
             content_token_ids=content_token_ids,
-            content_attn_mask=content_attention_mask,
+            content_cu_seqlens=content_cu_seqlens,
             target_ratio=target_ratio,
             answer_position_mask=answer_position_mask,
         )
@@ -1129,19 +1150,22 @@ class DecoderInitTrainer(BaseTrainer):
     def _compute_survivors(
         self, batch: dict[str, torch.Tensor],
     ):
-        """Run content through BgKIT encoder and return encoder output.
+        """Run content through BgKIT encoder (packed) and return encoder output.
 
-        Returns:
-            CompressionOutput from the encoder. Callers use
-            ``enc_out.survivor_embeddings`` and ``enc_out.survivor_attention_mask``
-            for the decoder, plus ``enc_out.base_raw`` / ``enc_out.base_raw_for_util``
-            / ``enc_out.get_content_grad()`` for the survivorship head's
-            auxiliary losses.
+        Inputs come from :func:`bgkit.data.collators.collate_chat_repro`:
+        flat ``content_token_ids`` / ``compression_prompt_ids`` with their
+        respective ``cu_seqlens``. The encoder is called in fully packed
+        form; no attention masks are constructed.
         """
-        content_token_ids = batch["content_token_ids"].to(self.device)
-        content_attention_mask = batch["content_attention_mask"].to(self.device)
-        compression_prompt_ids = batch["compression_prompt_ids"].to(self.device)
-        compression_prompt_mask = batch["compression_prompt_mask"].to(self.device)
+        from bgkit.utils.packing import position_ids_from_cu
+
+        device = self.device
+        content_token_ids = batch["content_token_ids"].to(device)
+        content_cu = batch["content_cu_seqlens"].to(device)
+        content_position_ids = batch["content_position_ids"].to(device)
+        prompt_ids = batch["compression_prompt_ids"].to(device)
+        prompt_cu = batch["compression_prompt_cu_seqlens"].to(device)
+        prompt_position_ids = position_ids_from_cu(prompt_cu, int(prompt_ids.shape[0]))
 
         target_ratio = self._current_target_ratio() if self._compression_active else None
         util_active = (
@@ -1174,24 +1198,30 @@ class DecoderInitTrainer(BaseTrainer):
         use_no_grad = self._encoder_frozen and not self._train_projection
 
         bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+        content_emb = bgkit_embed(content_token_ids)
+        prompt_emb = bgkit_embed(prompt_ids)
 
         if use_no_grad:
             with torch.no_grad():
                 enc_out = self.encoder(
-                    input_embeddings=bgkit_embed(content_token_ids),
-                    attention_mask=content_attention_mask,
-                    prompt_embeddings=bgkit_embed(compression_prompt_ids),
-                    prompt_attention_mask=compression_prompt_mask,
+                    content_embeddings=content_emb,
+                    content_cu_seqlens=content_cu,
+                    content_position_ids=content_position_ids,
+                    prompt_embeddings=prompt_emb,
+                    prompt_cu_seqlens=prompt_cu,
+                    prompt_position_ids=prompt_position_ids,
                     target_ratio=target_ratio,
                     level="l0",
                     min_per_sample=min_per_sample,
                 )
         else:
             enc_out = self.encoder(
-                input_embeddings=bgkit_embed(content_token_ids),
-                attention_mask=content_attention_mask,
-                prompt_embeddings=bgkit_embed(compression_prompt_ids),
-                prompt_attention_mask=compression_prompt_mask,
+                content_embeddings=content_emb,
+                content_cu_seqlens=content_cu,
+                content_position_ids=content_position_ids,
+                prompt_embeddings=prompt_emb,
+                prompt_cu_seqlens=prompt_cu,
+                prompt_position_ids=prompt_position_ids,
                 target_ratio=target_ratio,
                 level="l0",
                 min_per_sample=min_per_sample,
@@ -1200,6 +1230,63 @@ class DecoderInitTrainer(BaseTrainer):
 
         return enc_out
 
+    def _decoder_forward_packed(
+        self, batch: dict, enc_out,
+    ) -> torch.Tensor:
+        """Run the packed decoder forward from a chat-repro batch.
+
+        Splits the flat token_ids / loss_mask at each sample's
+        ``bgkit_splice_start`` into prefix/suffix lists, and builds the
+        per-segment loss mask over the assembled ``[prefix | survivors |
+        suffix]`` layout that ``forward_with_single_splice`` expects.
+        """
+        device = self.device
+        token_ids_flat = batch["token_ids"].to(device)
+        tok_cu = batch["cu_seqlens"].to(device)
+        splice_start = batch["bgkit_splice_start"].to(device)
+        splice_len = batch["bgkit_splice_len"].to(device)
+        loss_mask_flat = batch["loss_mask"].to(device).to(torch.bool)
+
+        survivors = enc_out.survivor_embeddings
+        survivor_cu = enc_out.survivor_cu_seqlens
+
+        batch_size = int(tok_cu.shape[0]) - 1
+        tok_cu_list = tok_cu.to(torch.int64).tolist()
+        surv_cu_list = survivor_cu.to(torch.int64).tolist()
+
+        prefix_ids: list[torch.Tensor] = []
+        suffix_ids: list[torch.Tensor] = []
+        per_segment_loss_masks: list[torch.Tensor] = []
+        for b in range(batch_size):
+            sample_start = int(tok_cu_list[b])
+            sample_end = int(tok_cu_list[b + 1])
+            sample_tokens = token_ids_flat[sample_start:sample_end]
+            sample_loss = loss_mask_flat[sample_start:sample_end]
+            splice_b_start = int(splice_start[b].item())
+            splice_b_len = int(splice_len[b].item())
+            if splice_b_start < 0:
+                splice_b_start = sample_tokens.shape[0]
+                splice_b_len = 0
+            pre = sample_tokens[:splice_b_start]
+            suf = sample_tokens[splice_b_start + splice_b_len :]
+            prefix_ids.append(pre)
+            suffix_ids.append(suf)
+
+            pre_mask = sample_loss[:splice_b_start]
+            suf_mask = sample_loss[splice_b_start + splice_b_len :]
+            k_i = int(surv_cu_list[b + 1]) - int(surv_cu_list[b])
+            surv_mask = torch.zeros(k_i, dtype=torch.bool, device=device)
+            per_segment_loss_masks.append(torch.cat([pre_mask, surv_mask, suf_mask], dim=0))
+
+        flat_loss_mask = torch.cat(per_segment_loss_masks, dim=0)
+        return self.decoder.forward_with_single_splice(
+            survivor_embeddings=survivors,
+            survivor_cu_seqlens=survivor_cu,
+            prefix_ids=prefix_ids,
+            suffix_ids=suffix_ids,
+            loss_mask=flat_loss_mask,
+        )
+
     def _forward_backward(self, batch) -> dict[str, float]:
         self.decoder.train()
         if self._train_projection:
@@ -1207,32 +1294,15 @@ class DecoderInitTrainer(BaseTrainer):
         if not self._encoder_frozen:
             self.encoder.compressor.train()
 
-        token_ids = batch["token_ids"].to(self.device)
-        attention_mask = batch["attention_mask"].to(self.device)
-        loss_mask = batch["loss_mask"].to(self.device)
-        splice_start = batch["bgkit_splice_start"].to(self.device)
-        splice_len = batch["bgkit_splice_len"].to(self.device)
-
         if self._encoder_frozen and not self._train_projection:
             with torch.no_grad():
                 enc_out = self._compute_survivors(batch)
         else:
             enc_out = self._compute_survivors(batch)
 
-        survivors = enc_out.survivor_embeddings
-        survivor_mask = enc_out.survivor_attention_mask
-
         # BF16 autocast for decoder forward + backward
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-            loss = self.decoder.forward_with_single_splice(
-                survivor_embeddings=survivors,
-                survivor_attention_mask=survivor_mask,
-                token_ids=token_ids,
-                token_attention_mask=attention_mask,
-                splice_starts=splice_start,
-                splice_lengths=splice_len,
-                loss_mask=loss_mask,
-            )
+            loss = self._decoder_forward_packed(batch, enc_out)
 
         total_loss = loss
 
@@ -1248,12 +1318,14 @@ class DecoderInitTrainer(BaseTrainer):
             target_ratio = self._current_target_ratio()
             answer_position_mask = batch.get("answer_position_mask")
             if answer_position_mask is not None:
-                answer_position_mask = answer_position_mask.to(self.device)
+                answer_position_mask = answer_position_mask.to(self.device).to(torch.bool)
+            content_token_ids = batch["content_token_ids"].to(self.device)
+            content_cu = batch["content_cu_seqlens"].to(self.device)
             surv_loss, surv_metrics = self._compute_survivorship_losses(
                 enc_out,
                 target_ratio,
-                content_token_ids=batch["content_token_ids"].to(self.device),
-                content_attention_mask=batch["content_attention_mask"].to(self.device),
+                content_token_ids=content_token_ids,
+                content_cu_seqlens=content_cu,
                 level="l0",
                 answer_position_mask=answer_position_mask,
             )
@@ -1272,11 +1344,11 @@ class DecoderInitTrainer(BaseTrainer):
                 diag_interval <= 1 or self.global_step % diag_interval == 0
             )
             if enc_out.survivor_mask is not None:
-                content_mask = batch["content_attention_mask"].to(self.device)
                 metrics["min_target_ratio"] = target_ratio
+                # Packed: all content positions are valid; valid count is N.
+                n_valid = int(content_token_ids.shape[0])
                 if emit_diag:
                     n_survivors = int(enc_out.survivor_mask.sum().item())
-                    n_valid = int(content_mask.sum().item())
                     metrics["actual_ratio"] = n_survivors / max(n_valid, 1)
                 # floor_trigger_rate / theta are zero-dim tensors on
                 # device; .item() at log time (still gated on emit_diag
@@ -1291,8 +1363,7 @@ class DecoderInitTrainer(BaseTrainer):
                     # Head health
                     if enc_out.base_raw is not None:
                         base = enc_out.base_raw.detach()
-                        n_v = max(int(content_mask.sum().item()), 1)
-                        base_norm = float(base.norm().item()) / max(n_v ** 0.5, 1.0)
+                        base_norm = float(base.norm().item()) / max(n_valid ** 0.5, 1.0)
                         metrics["base_norm"] = base_norm
                     if enc_out.logits_for_op is not None:
                         logits = enc_out.logits_for_op.detach()
@@ -1328,15 +1399,16 @@ class DecoderInitTrainer(BaseTrainer):
             and self._surv_l0.utility_grad_loss_weight > 0.0
             and enc_out.post_head_content_values is not None
         ):
-            content_mask = batch["content_attention_mask"].to(self.device)
+            content_cu = batch["content_cu_seqlens"].to(self.device)
             content_grad = enc_out.get_content_grad()
             util_loss, util_metrics = utility_grad_bce_loss(
                 base_raw_for_util=enc_out.base_raw_for_util,
                 content_grad=content_grad,
                 content_values=enc_out.post_head_content_values,
-                valid_mask=content_mask,
+                valid_mask=None,
                 pinned_mask=None,
                 target_ratio=self._current_target_ratio(),
+                content_cu_seqlens=content_cu,
             )
             if util_loss.requires_grad:
                 w = self._surv_l0.utility_grad_loss_weight
@@ -1378,28 +1450,14 @@ class DecoderInitTrainer(BaseTrainer):
             for batch_idx, batch in enumerate(self.eval_dataloader):
                 if batch_idx % 100 == 0:
                     logger.info("eval_progress", batch=batch_idx, total=num_batches)
-                token_ids = batch["token_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
                 loss_mask = batch["loss_mask"].to(self.device)
-                splice_start = batch["bgkit_splice_start"].to(self.device)
-                splice_len = batch["bgkit_splice_len"].to(self.device)
 
                 enc_out = self._compute_survivors(batch)
-                survivors = enc_out.survivor_embeddings
-                survivor_mask = enc_out.survivor_attention_mask
 
                 with torch.autocast(
                     "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"
                 ):
-                    loss = self.decoder.forward_with_single_splice(
-                        survivor_embeddings=survivors,
-                        survivor_attention_mask=survivor_mask,
-                        token_ids=token_ids,
-                        token_attention_mask=attention_mask,
-                        splice_starts=splice_start,
-                        splice_lengths=splice_len,
-                        loss_mask=loss_mask,
-                    )
+                    loss = self._decoder_forward_packed(batch, enc_out)
 
                 batch_content_tokens = loss_mask.sum().item()
                 total_loss += loss.item() * batch_content_tokens
@@ -1407,8 +1465,8 @@ class DecoderInitTrainer(BaseTrainer):
 
                 if self._compression_active and enc_out.survivor_mask is not None:
                     total_survivors += int(enc_out.survivor_mask.sum().item())
-                    content_mask = batch["content_attention_mask"].to(self.device)
-                    total_content += int(content_mask.sum().item())
+                    # Packed: all content positions are valid.
+                    total_content += int(batch["content_token_ids"].shape[0])
 
                 # Drop per-iteration encoder output so it doesn't linger
                 # in the allocator until the next iteration overwrites
@@ -1432,25 +1490,12 @@ class DecoderInitTrainer(BaseTrainer):
             if qa_eval_loader is not None and qa_dataset is not None:
                 qa_loss, qa_tokens = 0.0, 0.0
                 for batch in qa_eval_loader:
-                    token_ids = batch["token_ids"].to(self.device)
-                    attention_mask = batch["attention_mask"].to(self.device)
                     loss_mask = batch["loss_mask"].to(self.device)
-                    splice_start = batch["bgkit_splice_start"].to(self.device)
-                    splice_len = batch["bgkit_splice_len"].to(self.device)
-
                     enc_out = self._compute_survivors(batch)
                     with torch.autocast(
                         "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"
                     ):
-                        loss = self.decoder.forward_with_single_splice(
-                            survivor_embeddings=enc_out.survivor_embeddings,
-                            survivor_attention_mask=enc_out.survivor_attention_mask,
-                            token_ids=token_ids,
-                            token_attention_mask=attention_mask,
-                            splice_starts=splice_start,
-                            splice_lengths=splice_len,
-                            loss_mask=loss_mask,
-                        )
+                        loss = self._decoder_forward_packed(batch, enc_out)
                     bt = loss_mask.sum().item()
                     qa_loss += loss.item() * bt
                     qa_tokens += bt
@@ -1486,7 +1531,12 @@ class DecoderInitTrainer(BaseTrainer):
 
     @torch.no_grad()
     def _run_generation_eval(self) -> dict[str, float]:
-        """Run generation-based eval metrics on a small subset."""
+        """Run generation-based eval metrics on a small subset (packed path).
+
+        ``generate_with_single_splice`` is a custom B=1 per-sample loop on
+        the packed decoder, so we drive it one sample at a time using the
+        per-sample survivor slices from ``survivor_cu_seqlens``.
+        """
         tcfg = self.cfg.training
         max_gen_samples = tcfg.get("eval", {}).get("generation_samples", 50)
 
@@ -1502,41 +1552,48 @@ class DecoderInitTrainer(BaseTrainer):
             if samples_seen >= max_gen_samples:
                 break
 
-            prefix_ids = batch["prefix_ids"].to(self.device)
-            prefix_attention_mask = batch["prefix_attention_mask"].to(self.device)
+            prefix_ids_flat = batch["prefix_ids"].to(self.device)
+            prefix_cu = batch["prefix_cu_seqlens"].to(self.device)
 
             enc_out = self._compute_survivors(batch)
             survivors = enc_out.survivor_embeddings
-            survivor_mask = enc_out.survivor_attention_mask
+            survivor_cu = enc_out.survivor_cu_seqlens
+
+            batch_size = int(survivor_cu.shape[0]) - 1
+            surv_cu_list = survivor_cu.to(torch.int64).tolist()
+            pre_cu_list = prefix_cu.to(torch.int64).tolist()
 
             # Collect survivors for embedding health (subsample to ~512 vectors)
             total_vecs = sum(s.size(0) for s in all_survivors)
             if total_vecs < 512:
-                flat = survivors[survivor_mask].detach()
                 remaining = 512 - total_vecs
-                all_survivors.append(flat[:remaining])
+                all_survivors.append(survivors[:remaining].detach())
 
-            # Generate
-            gen_output = self.decoder.generate_with_single_splice(
-                survivor_embeddings=survivors,
-                survivor_attention_mask=survivor_mask,
-                prefix_ids=prefix_ids,
-                prefix_attention_mask=prefix_attention_mask,
-                splice_starts=batch["bgkit_splice_start"].to(self.device),
-                splice_lengths=batch["bgkit_splice_len"].to(self.device),
-                suffix_ids=suffix_ids,
-                tokenizer=self.tokenizer,
-                max_new_tokens=2048,
-                temperature=0.0,
-            )
-            generated_texts.extend(gen_output.content_text)
-            generated_languages.extend(batch["languages"])
-            samples_seen += survivors.size(0)
-            # Drop the encoder output + survivors references; the KV
-            # cache inside ``gen_output`` is already released by
-            # generate().  Leaves only ``content_text`` (Python strings)
-            # to accumulate across iterations.
-            del survivors, survivor_mask, gen_output
+            # Per-sample generation.
+            for b in range(batch_size):
+                if samples_seen >= max_gen_samples:
+                    break
+                k_start, k_end = surv_cu_list[b], surv_cu_list[b + 1]
+                pre_start, pre_end = pre_cu_list[b], pre_cu_list[b + 1]
+                surv_slice = survivors[k_start:k_end]
+                cu_single = torch.tensor(
+                    [0, k_end - k_start], dtype=torch.int32, device=self.device,
+                )
+                gen_output = self.decoder.generate_with_single_splice(
+                    survivor_embeddings=surv_slice,
+                    survivor_cu_seqlens=cu_single,
+                    prefix_ids=prefix_ids_flat[pre_start:pre_end],
+                    suffix_ids=suffix_ids,
+                    tokenizer=self.tokenizer,
+                    max_new_tokens=2048,
+                    temperature=0.0,
+                )
+                generated_texts.extend(gen_output.content_text)
+                generated_languages.append(batch["languages"][b])
+                samples_seen += 1
+                del gen_output
+
+            del survivors
             enc_out.release()
 
         # Parse success rate

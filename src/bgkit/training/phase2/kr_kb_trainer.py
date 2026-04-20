@@ -58,6 +58,13 @@ from bgkit.models.lora_encoder import (
 from bgkit.models.topic_embeddings import TopicEmbeddingModule
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.utils.attention_backend import resolve_attention_implementation
+from bgkit.utils.packing import (
+    lengths_from_cu,
+    position_ids_from_cu,
+    segment_ids_from_cu,
+    segment_mean,
+    segment_sum,
+)
 
 logger = structlog.get_logger()
 
@@ -1163,10 +1170,12 @@ class KRKBTrainer(BaseTrainer):
     # Canonical positional argument order for the encoder forward. Must
     # match ``BgKITEncoder.forward``'s kwarg-or-positional signature.
     _ENCODER_ARG_ORDER = (
-        "input_embeddings",
-        "attention_mask",
+        "content_embeddings",
+        "content_cu_seqlens",
+        "content_position_ids",
         "prompt_embeddings",
-        "prompt_attention_mask",
+        "prompt_cu_seqlens",
+        "prompt_position_ids",
         "pinned_positions",
         "target_ratio",
         "level",
@@ -1264,28 +1273,42 @@ class KRKBTrainer(BaseTrainer):
         the single-doc Phase 2 datasets read from, so there is no duplicate
         token store to maintain.
 
-        The survivorship head inside the encoder produces the survivor mask
-        internally based on the target retention ratio.
+        Packed-attention form: every article's token sequence is concatenated
+        into a flat ``(N_content,)`` buffer with per-article ``cu_seqlens``.
+        No padding tokens are constructed. The survivorship head inside the
+        encoder produces the survivor mask internally based on the target
+        retention ratio.
 
-        Returns ``(out, content_mask)`` where ``out`` is the full
-        CompressionOutput (carrying ``base_raw_for_util`` /
-        ``post_head_content_values`` / ``_utility_grad_state``) and
-        ``content_mask`` is the pre-compression token attention mask
-        required by utility-grad BCE's ``valid_mask`` (which must match
-        the shape of ``post_head_content_values``, not the post-
-        selection ``survivor_attention_mask``).
+        Returns ``(out, content_cu_seqlens)`` where ``out`` is the full
+        :class:`CompressionOutput` (carrying flat head outputs +
+        ``base_raw_for_util`` / ``post_head_content_values`` /
+        ``_utility_grad_state``) and ``content_cu_seqlens`` marks the
+        per-article boundaries inside the flat buffer, so downstream aux
+        losses can do segment-aware reductions without repacking.
         """
         if self._token_store is None:
             raise RuntimeError(
                 "_live_l0_encode called but ArticleTokenStore is unset; "
                 "this path is only valid when live_l0=True."
             )
-        tokens_batch, mask_batch = self._token_store.get_batch(dataset, article_ids)
-        tokens_batch = tokens_batch.to(self.device)
-        mask_batch = mask_batch.to(self.device)
+        # Pull variable-length token sequences one article at a time and
+        # concatenate flat. The ArticleTokenStore exposes ``get()`` for
+        # single-article access (and its ``get_batch`` would pad — which
+        # we don't want).
+        token_seqs = [
+            self._token_store.get(dataset, aid).to(self.device)
+            for aid in article_ids
+        ]
+        lengths = [int(seq.size(0)) for seq in token_seqs]
+        tokens_flat = torch.cat(token_seqs, dim=0)  # (N_content,)
+        cu_seqlens = torch.zeros(len(lengths) + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens[1:] = torch.tensor(
+            lengths, dtype=torch.int32, device=self.device,
+        ).cumsum(0)
+        position_ids = position_ids_from_cu(cu_seqlens, int(tokens_flat.shape[0]))
 
         embed_tokens = self.encoder.compressor.backbone.get_input_embeddings()
-        input_embeddings = embed_tokens(tokens_batch)
+        input_embeddings = embed_tokens(tokens_flat)  # (N_content, D)
 
         ratio = self._l0_retention_for(dataset)
         from bgkit.training.survivorship_helpers import LevelLossCfg as _LLC
@@ -1295,8 +1318,9 @@ class KRKBTrainer(BaseTrainer):
         grad_capture: dict | None = {} if util_active else None
 
         out = self._checkpointed_encoder(
-            input_embeddings=input_embeddings,
-            attention_mask=mask_batch,
+            content_embeddings=input_embeddings,
+            content_cu_seqlens=cu_seqlens,
+            content_position_ids=position_ids,
             target_ratio=ratio,
             level="l0",
             utility_grad_active=util_active,
@@ -1304,45 +1328,66 @@ class KRKBTrainer(BaseTrainer):
         )
         if grad_capture is not None:
             out._l0_grad_capture = grad_capture  # type: ignore[attr-defined]
-        return out, mask_batch
+        return out, cu_seqlens
 
     def _l0_for_articles(
         self, dataset: str, article_ids: list[str],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (l0_rows, mask) for each article.
+        """Return packed L0 survivors for each article.
 
-        ``l0_rows``: (N_articles, max_K, D), ``mask``: (N_articles, max_K).
-        In the cached path the rows come from :class:`L0Cache`; in the live
-        path they come from :meth:`_live_l0_encode`.
+        Packed form:
+
+        - ``l0_flat``: ``(N_survivors, D)`` flat concatenation of per-article
+          L0 survivor rows. ``N_survivors = sum(K_i)``.
+        - ``cu_seqlens``: ``(B+1,)`` int32, per-article boundaries in the
+          flat buffer. ``cu_seqlens[i+1] - cu_seqlens[i] == K_i``.
+
+        In the cached path the rows come from :class:`L0Cache`
+        (variable-length per article, concatenated flat); in the live path
+        they come from :meth:`_live_l0_encode` and we keep the encoder's
+        own ``survivor_cu_seqlens`` unchanged.
 
         When the live path runs, the encoder output is appended to
-        ``self._pending_l0_outputs`` so the trainer can apply survivorship
-        auxiliary losses and soft attention after the main forward.
+        ``self._pending_l0_outputs`` with the pre-compression
+        ``content_cu_seqlens`` so the trainer can apply survivorship
+        auxiliary losses (aggregate ratio, decisiveness, min-survivors,
+        utility-grad BCE) after the main forward.
         """
         if self._live_l0:
-            out, content_mask = self._live_l0_encode(dataset, article_ids)
-            survivors = out.survivor_embeddings
-            # Use the real survivor attention mask from the encoder so
-            # padded positions (from variable-length batch) are not treated
-            # as valid L0 survivors downstream at L1.
-            mask = out.survivor_attention_mask
-            # Stash output for aux loss computation (if training). The
-            # ``content_mask`` is the pre-compression token attention
-            # mask — utility-grad BCE's ``valid_mask`` must match the
-            # shape of ``post_head_content_values``, not the post-
-            # selection ``survivor_attention_mask``.
+            out, content_cu = self._live_l0_encode(dataset, article_ids)
+            survivors = out.survivor_embeddings  # (N_survivors, D)
+            cu_seqlens = out.survivor_cu_seqlens  # (B+1,)
             if self.encoder.training and hasattr(self, "_pending_l0_outputs"):
                 self._pending_l0_outputs.append({
                     "dataset": dataset,
                     "enc_out": out,
                     "ratio": self._l0_retention_for(dataset),
-                    "content_mask": content_mask,
+                    # Packed pre-compression content cu_seqlens so aux
+                    # losses can do segment-aware reductions.
+                    "cu_seqlens": content_cu,
                 })
-            return survivors, mask
+            return survivors, cu_seqlens
         if self._l0_cache is None:
             raise RuntimeError("L0 cache is None but live_l0 is False")
-        batch, mask = self._l0_cache.get_batch(dataset, article_ids)
-        return batch.to(self.device, dtype=torch.bfloat16), mask.to(self.device)
+        # Cached path: pull each article's variable-length rows from the
+        # on-disk cache and pack them into a single flat buffer with
+        # per-article cu_seqlens.
+        rows_list: list[torch.Tensor] = [
+            self._l0_cache.get(dataset, aid) for aid in article_ids
+        ]
+        lengths = [int(r.size(0)) for r in rows_list]
+        if sum(lengths) == 0:
+            hidden = self.encoder.compressor.hidden_dim
+            flat = torch.zeros((0, hidden), dtype=torch.bfloat16, device=self.device)
+        else:
+            flat = torch.cat(rows_list, dim=0).to(self.device, dtype=torch.bfloat16)
+        cu_seqlens = torch.zeros(
+            len(lengths) + 1, dtype=torch.int32, device=self.device,
+        )
+        cu_seqlens[1:] = torch.tensor(
+            lengths, dtype=torch.int32, device=self.device,
+        ).cumsum(0)
+        return flat, cu_seqlens
 
     # ------------------------------------------------------------------
     # L1 — query-conditioned with ID pinning
@@ -1602,14 +1647,21 @@ class KRKBTrainer(BaseTrainer):
         self, dataset: str, tag_or_article_ids: list[str], query: str,
         distractor_ids: list[str] | None = None,
     ) -> dict | None:
-        """Build per-turn content + query tensors without running the encoder.
+        """Build per-turn packed content + query tensors without running the encoder.
 
-        Returns a dict with keys ``content`` (L, D), ``pinned`` (L,) bool,
-        ``relevance_mask`` (L,) bool, and ``query_emb`` (Q, D), or ``None``
-        if the turn has no articles (the caller emits an empty L1 output).
+        Returns a dict with fields:
 
-        ``relevance_mask`` is True for positions from gold (relevant) articles
-        and False for distractor positions. Used by the relevance margin loss.
+        - ``content``: ``(L_content, D)`` flat concatenation of pinned-id
+          + L0-survivor blocks across all resolved articles (gold +
+          distractors, in that order).
+        - ``pinned``: ``(L_content,)`` bool marking positions that must
+          survive the L1 head (pinned-ID tokens of gold articles).
+        - ``relevance_mask``: ``(L_content,)`` bool — True inside gold
+          articles, False inside distractors. Drives the relevance loss.
+        - ``query_emb``: ``(L_query, D)`` flat query embeddings.
+
+        Returns ``None`` if the turn has no articles (the caller emits an
+        empty L1 output).
 
         The survivor mask is produced internally by the encoder's
         survivorship head based on ``target_ratio`` and ``pinned_positions``.
@@ -1639,7 +1691,9 @@ class KRKBTrainer(BaseTrainer):
             [True] * len(article_ids) + [False] * len(distractor_ids)
         )
 
-        l0_batch, l0_mask = self._l0_for_articles(dataset, all_ids)
+        # Packed L0 survivors for all articles in this turn.
+        l0_flat, l0_cu = self._l0_for_articles(dataset, all_ids)
+        l0_lengths = lengths_from_cu(l0_cu).tolist()
 
         rev_maps = getattr(self, "_doc_id_to_title", None) or {}
         doc_to_title = rev_maps.get(dataset, {}) if rev_maps else {}
@@ -1665,18 +1719,19 @@ class KRKBTrainer(BaseTrainer):
             # not pinned so the head can learn to drop them.
             pin_these = is_relevant
             id_ids = torch.tensor(aid_tokens, dtype=torch.long, device=self.device)
-            id_emb = embed_tokens(id_ids).to(l0_batch.dtype)
+            id_emb = embed_tokens(id_ids).to(l0_flat.dtype)
             pieces.append(id_emb)
             pinned_list.extend([pin_these] * len(aid_tokens))
             relevance_list.extend([is_relevant] * len(aid_tokens))
 
-            n_surv = int(l0_mask[i].sum())
-            if n_surv > 0:
-                pieces.append(l0_batch[i, :n_surv].to(l0_batch.dtype))
-                pinned_list.extend([False] * n_surv)
-                relevance_list.extend([is_relevant] * n_surv)
+            k_i = int(l0_lengths[i]) if i < len(l0_lengths) else 0
+            if k_i > 0:
+                start = int(l0_cu[i].item())
+                pieces.append(l0_flat[start : start + k_i].to(l0_flat.dtype))
+                pinned_list.extend([False] * k_i)
+                relevance_list.extend([is_relevant] * k_i)
 
-        content = torch.cat(pieces, dim=0)  # (L, D)
+        content = torch.cat(pieces, dim=0)  # (L_content, D)
         pinned = torch.tensor(pinned_list, dtype=torch.bool, device=self.device)
         relevance_mask = torch.tensor(
             relevance_list, dtype=torch.bool, device=self.device,
@@ -1687,7 +1742,7 @@ class KRKBTrainer(BaseTrainer):
         if not q_ids:
             q_ids = [0]
         q_tensor = torch.tensor(q_ids, dtype=torch.long, device=self.device)
-        q_emb = embed_tokens(q_tensor).to(content.dtype)  # (Q, D)
+        q_emb = embed_tokens(q_tensor).to(content.dtype)  # (L_query, D)
 
         return {
             "content": content,
@@ -1697,11 +1752,13 @@ class KRKBTrainer(BaseTrainer):
         }
 
     def _run_l1_batch(self, prepared: list[dict | None]) -> list[torch.Tensor]:
-        """Run a batched encoder forward for every non-None turn in ``prepared``.
+        """Run a packed encoder forward for every non-None turn in ``prepared``.
 
-        All turns from one sample get padded to the same content/query length
-        and run as one encoder call with ``level="l1"``. Each turn's
-        per-sample survivors are extracted back from the batched output.
+        All turns from one sample (or one bucket when called from
+        :meth:`_forward_backward`) are packed into a single flat
+        ``(N_content, D)`` content buffer + ``(N_query, D)`` query buffer.
+        Per-turn segmentation is encoded in ``cu_seqlens``; no padding
+        tokens appear anywhere in the flat buffers.
 
         The survivor mask is produced internally by the encoder's
         survivorship head based on ``target_ratio`` and ``pinned_positions``.
@@ -1720,38 +1777,34 @@ class KRKBTrainer(BaseTrainer):
 
         target_dtype = non_null[0]["content"].dtype
         batch_size = len(non_null)
-        max_content = max(int(t["content"].size(0)) for t in non_null)
-        max_query = max(int(t["query_emb"].size(0)) for t in non_null)
 
-        padded_content = torch.zeros(
-            (batch_size, max_content, hidden_dim),
-            device=self.device, dtype=target_dtype,
-        )
-        content_mask = torch.zeros(
-            (batch_size, max_content), dtype=torch.bool, device=self.device,
-        )
-        padded_pinned = torch.zeros(
-            (batch_size, max_content), dtype=torch.bool, device=self.device,
-        )
-        padded_query = torch.zeros(
-            (batch_size, max_query, hidden_dim),
-            device=self.device, dtype=target_dtype,
-        )
-        query_mask = torch.zeros(
-            (batch_size, max_query), dtype=torch.bool, device=self.device,
-        )
+        # Pack all turns' content + query flat, with per-turn cu_seqlens.
+        content_pieces: list[torch.Tensor] = [t["content"] for t in non_null]
+        query_pieces: list[torch.Tensor] = [t["query_emb"] for t in non_null]
+        pinned_pieces: list[torch.Tensor] = [t["pinned"] for t in non_null]
+        relevance_pieces: list[torch.Tensor] = [
+            t["relevance_mask"].to(self.device) for t in non_null
+        ]
 
-        for i, turn in enumerate(non_null):
-            content = turn["content"]
-            pinned = turn["pinned"]
-            query_emb = turn["query_emb"]
-            n_content = int(content.size(0))
-            n_query = int(query_emb.size(0))
-            padded_content[i, :n_content] = content
-            content_mask[i, :n_content] = True
-            padded_pinned[i, :n_content] = pinned
-            padded_query[i, :n_query] = query_emb
-            query_mask[i, :n_query] = True
+        content_lengths = [int(c.size(0)) for c in content_pieces]
+        query_lengths = [int(q.size(0)) for q in query_pieces]
+
+        content_flat = torch.cat(content_pieces, dim=0).to(target_dtype)
+        query_flat = torch.cat(query_pieces, dim=0).to(target_dtype)
+        pinned_flat = torch.cat(pinned_pieces, dim=0).to(self.device)
+        relevance_flat = torch.cat(relevance_pieces, dim=0)
+
+        content_cu = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
+        content_cu[1:] = torch.tensor(
+            content_lengths, dtype=torch.int32, device=self.device,
+        ).cumsum(0)
+        query_cu = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
+        query_cu[1:] = torch.tensor(
+            query_lengths, dtype=torch.int32, device=self.device,
+        ).cumsum(0)
+
+        content_pos_ids = position_ids_from_cu(content_cu, int(content_flat.shape[0]))
+        query_pos_ids = position_ids_from_cu(query_cu, int(query_flat.shape[0]))
 
         from bgkit.training.survivorship_helpers import LevelLossCfg as _LLC
         util_active_l1 = getattr(
@@ -1759,11 +1812,13 @@ class KRKBTrainer(BaseTrainer):
         ).utility_grad_loss_weight > 0.0
         l1_grad_capture: dict | None = {} if util_active_l1 else None
         out = self._checkpointed_encoder(
-            input_embeddings=padded_content,
-            attention_mask=content_mask,
-            prompt_embeddings=padded_query,
-            prompt_attention_mask=query_mask,
-            pinned_positions=padded_pinned,
+            content_embeddings=content_flat,
+            content_cu_seqlens=content_cu,
+            content_position_ids=content_pos_ids,
+            prompt_embeddings=query_flat,
+            prompt_cu_seqlens=query_cu,
+            prompt_position_ids=query_pos_ids,
+            pinned_positions=pinned_flat,
             target_ratio=self._l1_retention,
             level="l1",
             utility_grad_active=util_active_l1,
@@ -1773,39 +1828,29 @@ class KRKBTrainer(BaseTrainer):
             out._l1_grad_capture = l1_grad_capture  # type: ignore[attr-defined]
 
         # Stash encoder output for aux loss computation (when training).
-        # Carry through content_mask and relevance/pinned info so the
-        # aux losses can mask properly and the relevance loss can separate
-        # relevant vs distractor positions.
+        # Everything is flat: relevance_mask and pinned are flat (N_content,)
+        # bool, cu_seqlens is the per-turn segmentation of the flat buffer.
         if self.encoder.training and hasattr(self, "_pending_l1_outputs"):
-            # Build a per-turn relevance mask aligned with the padded content.
-            padded_relevance = torch.zeros(
-                (batch_size, max_content), dtype=torch.bool, device=self.device,
-            )
-            for i, turn in enumerate(non_null):
-                rel = turn.get("relevance_mask")
-                if rel is not None:
-                    n_content = int(rel.size(0))
-                    padded_relevance[i, :n_content] = rel.to(self.device)
             self._pending_l1_outputs.append({
                 "enc_out": out,
-                "content_mask": content_mask,
-                "pinned": padded_pinned,
-                "relevance_mask": padded_relevance,
+                "cu_seqlens": content_cu,
+                "pinned": pinned_flat,
+                "relevance_mask": relevance_flat,
                 "ratio": self._l1_retention,
-                "non_null_preps": non_null,
-                "batch_size": batch_size,
             })
 
-        # Extract per-turn survivors from the batched output. Padded turns
-        # have False in survivor_attention_mask so we just slice by it.
+        # Extract per-turn survivors from the packed output. The encoder
+        # returns flat survivor_embeddings (N_surv_total, D) with per-turn
+        # boundaries in survivor_cu_seqlens.
+        surv_cu = out.survivor_cu_seqlens.to(torch.int64).tolist()
         per_turn: list[torch.Tensor] = []
         for i in range(batch_size):
-            mask_i = out.survivor_attention_mask[i]
-            n_i = int(mask_i.sum().item())
-            if n_i == 0:
+            start = int(surv_cu[i])
+            end = int(surv_cu[i + 1])
+            if end <= start:
                 per_turn.append(zero_fallback)
             else:
-                per_turn.append(out.survivor_embeddings[i, :n_i])
+                per_turn.append(out.survivor_embeddings[start:end])
 
         # Re-interleave with None fallbacks
         results: list[torch.Tensor] = []
@@ -2307,23 +2352,37 @@ class KRKBTrainer(BaseTrainer):
         """Compute aux survivorship losses over all L0 and L1 encoder outputs
         accumulated during the current train step.
 
+        Packed-input convention (FA4 varlen):
+          - L0 entries: ``logits_for_op`` is flat ``(N_l0,)``;
+            ``cu_seqlens`` is ``(B_l0+1,) int32`` marking per-article
+            boundaries in the flat buffer.  All positions are valid —
+            no padding tokens exist in the packed layout.
+          - L1 entries: ``logits_for_op`` is flat ``(N_l1,)``;
+            ``cu_seqlens`` is ``(B_l1+1,) int32``; ``relevance_mask``
+            is flat ``(N_l1,) bool`` identifying gold vs. distractor
+            positions.  No ``content_mask`` filtering is needed because
+            every flat position is a real token.
+
         Losses:
-          - Aggregate ratio: (mean(probs) - target_ratio)^2, per level
-          - Decisiveness: mean(4 * p * (1-p)), pushes probs toward {0,1}
-          - Relevance (L1 only): margin ranking on non-pinned positions
-            (relevant article probs > distractor probs)
+          - Aggregate ratio: segment-mean(probs) minus target per article,
+            then mean over articles.
+          - Decisiveness: segment-mean(4*p*(1-p)).
+          - Relevance (L1 only): flat gold-group mean vs. flat
+            distractor-group mean, both compared against boost/damp
+            targets.
+          - Min-survivors: per-article soft-survivor count hinge via
+            segment_sum.
 
         Returns (total_weighted_loss, metrics_dict).
         """
         metrics: dict[str, float] = {}
         total = torch.zeros((), device=self.device, dtype=torch.float32)
 
-        # Ratio / decisiveness / relevance are operator-side shape losses.
-        # Single-head architecture (post-2026-04-16): probs are recomputed
-        # from the attached ``logits_for_op`` (= tanh(base_raw / T)) + θ so
-        # gradient flows directly into the head. This mirrors
-        # compute_survivorship_losses in survivorship_helpers.py but runs
-        # over accumulated per-turn encoder outputs.
+        # ----------------------------------------------------------------
+        # L0: ratio + decisiveness
+        # Each entry is one _l0_for_articles call.  Packed: logits_for_op
+        # is flat (N_l0,) with cu_seqlens marking per-article segments.
+        # ----------------------------------------------------------------
         l0_ratio_losses: list[torch.Tensor] = []
         l0_decisive_losses: list[torch.Tensor] = []
         for entry in self._pending_l0_outputs:
@@ -2331,6 +2390,9 @@ class KRKBTrainer(BaseTrainer):
             logits_for_op = enc_out.logits_for_op
             if logits_for_op is None:
                 continue
+            # Flatten (1, L) → (L,) if the encoder still returns a
+            # single-sample batch tensor; packed encoders emit (L,) directly.
+            logits_for_op = logits_for_op.reshape(-1)
             theta_t = getattr(enc_out, "theta_tensor", None)
             if theta_t is None:
                 legacy = getattr(enc_out, "theta_value", 0.0)
@@ -2338,13 +2400,28 @@ class KRKBTrainer(BaseTrainer):
                     float(legacy), dtype=torch.float32,
                     device=logits_for_op.device,
                 )
-            probs = torch.sigmoid(
+            cu_seqlens = entry.get("cu_seqlens")
+            probs_f = torch.sigmoid(
                 logits_for_op.float() - theta_t.to(logits_for_op.device).float()
-            ).to(logits_for_op.dtype)
+            )
             target_ratio = entry["ratio"]
-            mean_prob = probs.float().mean()
-            l0_ratio_losses.append((mean_prob - target_ratio) ** 2)
-            l0_decisive_losses.append((4 * probs.float() * (1 - probs.float())).mean())
+            if cu_seqlens is not None:
+                # Segment-aware mean: (B_articles,)
+                n_articles = int(cu_seqlens.shape[0]) - 1
+                seg_ids = segment_ids_from_cu(cu_seqlens, int(probs_f.shape[0]))
+                mean_probs = segment_mean(probs_f, seg_ids, n_articles)  # (B,)
+                l0_ratio_losses.append(((mean_probs - target_ratio) ** 2).mean())
+                decisive = segment_mean(
+                    4.0 * probs_f * (1.0 - probs_f), seg_ids, n_articles,
+                )
+                l0_decisive_losses.append(decisive.mean())
+            else:
+                # Single segment (legacy / un-batched L0 call).
+                mean_prob = probs_f.mean()
+                l0_ratio_losses.append((mean_prob - target_ratio) ** 2)
+                l0_decisive_losses.append(
+                    (4.0 * probs_f * (1.0 - probs_f)).mean()
+                )
 
         if l0_ratio_losses:
             l0_ratio_loss = torch.stack(l0_ratio_losses).mean()
@@ -2357,10 +2434,10 @@ class KRKBTrainer(BaseTrainer):
             metrics["l0_ratio_loss"] = l0_ratio_loss.item()
             metrics["l0_decisiveness_loss"] = l0_decisive_loss.item()
 
-        # --- L0 min-survivors loss ---
-        # Mirrors the helper in survivorship_helpers.compute_survivorship_losses
-        # but runs over Phase 2's per-article enc_outs. Uses the larger
-        # min_survivors_tau so gradient flows through tanh saturation.
+        # ----------------------------------------------------------------
+        # L0 min-survivors loss
+        # Packed: segment_sum over flat soft-gates per article.
+        # ----------------------------------------------------------------
         if self._surv_l0.min_survivors_loss_weight > 0.0 and self._pending_l0_outputs:
             l0_min_surv_losses: list[torch.Tensor] = []
             for entry in self._pending_l0_outputs:
@@ -2368,6 +2445,7 @@ class KRKBTrainer(BaseTrainer):
                 logits_for_op = enc_out.logits_for_op
                 if logits_for_op is None:
                     continue
+                logits_for_op = logits_for_op.reshape(-1)
                 theta_t = getattr(enc_out, "theta_tensor", None)
                 if theta_t is None:
                     legacy = getattr(enc_out, "theta_value", 0.0)
@@ -2377,14 +2455,24 @@ class KRKBTrainer(BaseTrainer):
                     )
                 tau = max(1e-3, self._surv_l0.min_survivors_tau)
                 soft_gates = torch.sigmoid(
-                    (logits_for_op.float() - theta_t.to(logits_for_op.device).float()) / tau,
+                    (logits_for_op.float() - theta_t.to(logits_for_op.device).float())
+                    / tau,
                 )
-                # (B, L_content); Phase 2 L0 is per-article, no padding ->
-                # all positions valid. sum over L to get per-article count.
-                soft_count = soft_gates.sum(dim=-1)  # (B,)
-                content_len = torch.full_like(
-                    soft_count, float(logits_for_op.shape[-1]),
-                )
+                cu_seqlens = entry.get("cu_seqlens")
+                if cu_seqlens is not None:
+                    n_articles = int(cu_seqlens.shape[0]) - 1
+                    seg_ids = segment_ids_from_cu(cu_seqlens, int(soft_gates.shape[0]))
+                    soft_count = segment_sum(soft_gates, seg_ids, n_articles)  # (B,)
+                    content_len = lengths_from_cu(cu_seqlens).to(
+                        dtype=soft_count.dtype, device=soft_count.device,
+                    )
+                else:
+                    # Single segment.
+                    soft_count = soft_gates.sum().unsqueeze(0)
+                    content_len = torch.tensor(
+                        [float(logits_for_op.shape[0])],
+                        dtype=soft_count.dtype, device=soft_count.device,
+                    )
                 target_min = torch.clamp(
                     torch.ceil(content_len * self._surv_l0.min_survivors_floor_ratio),
                     min=float(self._surv_l0.min_survivors_absolute_min),
@@ -2396,9 +2484,12 @@ class KRKBTrainer(BaseTrainer):
                 total = total + self._surv_l0.min_survivors_loss_weight * l0_min_surv_loss
                 metrics["l0_min_survivors_loss"] = l0_min_surv_loss.item()
 
-        # --- L1 aux losses (ratio + decisiveness + relevance) ---
-        # Same single-head pattern as L0: attached ``logits_for_op`` + θ
-        # drives probs; gradient flows into the L1 head directly.
+        # ----------------------------------------------------------------
+        # L1: ratio + decisiveness + relevance
+        # Packed: logits_for_op is flat (N_l1,); relevance_mask is flat
+        # (N_l1,) bool; cu_seqlens marks per-article segment boundaries.
+        # No content_mask filtering: every flat position is a real token.
+        # ----------------------------------------------------------------
         l1_ratio_losses: list[torch.Tensor] = []
         l1_decisive_losses: list[torch.Tensor] = []
         l1_relevance_losses: list[torch.Tensor] = []
@@ -2407,6 +2498,10 @@ class KRKBTrainer(BaseTrainer):
             logits_for_op = enc_out.logits_for_op
             if logits_for_op is None:
                 continue
+            # Flatten potential (B, L) padded tensors that may still arrive
+            # during the Wave 3.4 transition; once Wave 3.4 lands this
+            # reshape is a no-op.
+            logits_for_op = logits_for_op.reshape(-1)
             theta_t = getattr(enc_out, "theta_tensor", None)
             if theta_t is None:
                 legacy = getattr(enc_out, "theta_value", 0.0)
@@ -2414,21 +2509,34 @@ class KRKBTrainer(BaseTrainer):
                     float(legacy), dtype=torch.float32,
                     device=logits_for_op.device,
                 )
-            probs = torch.sigmoid(
+            probs_f = torch.sigmoid(
                 logits_for_op.float() - theta_t.to(logits_for_op.device).float()
-            ).to(logits_for_op.dtype)
+            )
             target_ratio = entry["ratio"]
-            content_mask = entry["content_mask"]
-            pinned = entry["pinned"]
-            relevance = entry["relevance_mask"]
+            relevance = entry["relevance_mask"]  # (N_l1,) bool, flat
 
-            # Mask to valid (non-padding) positions for ratio/decisiveness
-            valid_probs = probs[content_mask].float()
-            if valid_probs.numel() == 0:
-                continue
-            mean_prob = valid_probs.mean()
-            l1_ratio_losses.append((mean_prob - target_ratio) ** 2)
-            l1_decisive_losses.append((4 * valid_probs * (1 - valid_probs)).mean())
+            # Packed: all positions are valid.  Segment-aware per-article
+            # reductions for ratio and decisiveness.
+            cu_seqlens = entry.get("cu_seqlens")
+            if cu_seqlens is not None:
+                n_arts = int(cu_seqlens.shape[0]) - 1
+                seg_ids = segment_ids_from_cu(cu_seqlens, int(probs_f.shape[0]))
+                mean_probs = segment_mean(probs_f, seg_ids, n_arts)  # (B,)
+                if mean_probs.numel() == 0:
+                    continue
+                l1_ratio_losses.append(((mean_probs - target_ratio) ** 2).mean())
+                decisive = segment_mean(
+                    4.0 * probs_f * (1.0 - probs_f), seg_ids, n_arts,
+                )
+                l1_decisive_losses.append(decisive.mean())
+            else:
+                # Single-segment fallback.
+                if probs_f.numel() == 0:
+                    continue
+                l1_ratio_losses.append((probs_f.mean() - target_ratio) ** 2)
+                l1_decisive_losses.append(
+                    (4.0 * probs_f * (1.0 - probs_f)).mean()
+                )
 
             # Relevance loss: two per-group aggregate-ratio targets.
             # - Gold positions (including pinned ID tokens) should survive
@@ -2438,20 +2546,21 @@ class KRKBTrainer(BaseTrainer):
             #   not pinned) should survive at ~distractor_damp * target_ratio
             #   (downsample but don't suppress to zero — distractor IDs may
             #   still be referenced in later bgkit calls).
-            gold_target = min(1.0, target_ratio * self._relevance_gold_boost)
-            distractor_target = max(0.0, target_ratio * self._relevance_distractor_damp)
-
-            gold_mask = content_mask & relevance
-            distractor_mask_v = content_mask & ~relevance
-            per_group_losses: list[torch.Tensor] = []
-            if gold_mask.any():
-                gold_mean = probs[gold_mask].float().mean()
-                per_group_losses.append((gold_mean - gold_target) ** 2)
-            if distractor_mask_v.any():
-                distractor_mean = probs[distractor_mask_v].float().mean()
-                per_group_losses.append((distractor_mean - distractor_target) ** 2)
-            if per_group_losses:
-                l1_relevance_losses.append(torch.stack(per_group_losses).mean())
+            # relevance is flat (N_l1,) bool — unchanged if already flat.
+            if relevance is not None:
+                relevance_flat = relevance.reshape(-1)
+                gold_target = min(1.0, target_ratio * self._relevance_gold_boost)
+                distractor_target = max(0.0, target_ratio * self._relevance_distractor_damp)
+                per_group_losses: list[torch.Tensor] = []
+                if relevance_flat.any():
+                    gold_mean = probs_f[relevance_flat].mean()
+                    per_group_losses.append((gold_mean - gold_target) ** 2)
+                distractor_mask = ~relevance_flat
+                if distractor_mask.any():
+                    distractor_mean = probs_f[distractor_mask].mean()
+                    per_group_losses.append((distractor_mean - distractor_target) ** 2)
+                if per_group_losses:
+                    l1_relevance_losses.append(torch.stack(per_group_losses).mean())
 
         if l1_ratio_losses:
             l1_ratio_loss = torch.stack(l1_ratio_losses).mean()
@@ -2464,10 +2573,10 @@ class KRKBTrainer(BaseTrainer):
             metrics["l1_ratio_loss"] = l1_ratio_loss.item()
             metrics["l1_decisiveness_loss"] = l1_decisive_loss.item()
 
-        # --- L1 min-survivors loss ---
-        # Same logic as L0 min-survivors, masked to valid positions via
-        # content_mask since L1 enc_out has padding across multiple
-        # gathered articles.
+        # ----------------------------------------------------------------
+        # L1 min-survivors loss
+        # Packed: segment_sum over flat soft-gates per article.
+        # ----------------------------------------------------------------
         if self._surv_l1.min_survivors_loss_weight > 0.0 and self._pending_l1_outputs:
             l1_min_surv_losses: list[torch.Tensor] = []
             for entry in self._pending_l1_outputs:
@@ -2475,9 +2584,7 @@ class KRKBTrainer(BaseTrainer):
                 logits_for_op = enc_out.logits_for_op
                 if logits_for_op is None:
                     continue
-                content_mask = entry["content_mask"]
-                if content_mask.sum() == 0:
-                    continue
+                logits_for_op = logits_for_op.reshape(-1)
                 theta_t = getattr(enc_out, "theta_tensor", None)
                 if theta_t is None:
                     legacy = getattr(enc_out, "theta_value", 0.0)
@@ -2487,11 +2594,27 @@ class KRKBTrainer(BaseTrainer):
                     )
                 tau = max(1e-3, self._surv_l1.min_survivors_tau)
                 soft_gates = torch.sigmoid(
-                    (logits_for_op.float() - theta_t.to(logits_for_op.device).float()) / tau,
+                    (logits_for_op.float() - theta_t.to(logits_for_op.device).float())
+                    / tau,
                 )
-                valid_f = content_mask.to(soft_gates.dtype)
-                soft_count = (soft_gates * valid_f).sum(dim=-1)  # (B,)
-                content_len = valid_f.sum(dim=-1)  # (B,)
+                cu_seqlens = entry.get("cu_seqlens")
+                if cu_seqlens is not None:
+                    n_arts = int(cu_seqlens.shape[0]) - 1
+                    seg_ids = segment_ids_from_cu(cu_seqlens, int(soft_gates.shape[0]))
+                    soft_count = segment_sum(soft_gates, seg_ids, n_arts)  # (B,)
+                    content_len = lengths_from_cu(cu_seqlens).to(
+                        dtype=soft_count.dtype, device=soft_count.device,
+                    )
+                    if content_len.sum() == 0:
+                        continue
+                else:
+                    soft_count = soft_gates.sum().unsqueeze(0)
+                    content_len = torch.tensor(
+                        [float(logits_for_op.shape[0])],
+                        dtype=soft_count.dtype, device=soft_count.device,
+                    )
+                    if content_len[0] == 0:
+                        continue
                 target_min = torch.clamp(
                     torch.ceil(content_len * self._surv_l1.min_survivors_floor_ratio),
                     min=float(self._surv_l1.min_survivors_absolute_min),
@@ -2547,20 +2670,19 @@ class KRKBTrainer(BaseTrainer):
                     else enc_out.get_content_grad()
                 )
                 content_values = enc_out.post_head_content_values
-                content_mask = entry.get("content_mask")
-                if (
-                    content_grad is None
-                    or content_values is None
-                    or content_mask is None
-                ):
+                if content_grad is None or content_values is None:
                     continue
                 util_loss, _ = utility_grad_bce_loss(
                     base_raw_for_util=enc_out.base_raw_for_util,
                     content_grad=content_grad,
                     content_values=content_values,
-                    valid_mask=content_mask.bool(),
+                    # Packed form: every content position is valid (no
+                    # padding). Pass ``None`` so the helper short-circuits
+                    # to an all-True mask.
+                    valid_mask=None,
                     pinned_mask=None,
                     target_ratio=float(entry.get("ratio", self._l1_retention)),
+                    content_cu_seqlens=entry.get("cu_seqlens"),
                 )
                 if util_loss.requires_grad:
                     (util_loss * w_l0 / self._accum_steps).backward()
@@ -2589,9 +2711,11 @@ class KRKBTrainer(BaseTrainer):
                     base_raw_for_util=enc_out.base_raw_for_util,
                     content_grad=content_grad,
                     content_values=content_values,
-                    valid_mask=entry["content_mask"].bool(),
+                    # Packed form: no padding.
+                    valid_mask=None,
                     pinned_mask=entry.get("pinned"),
                     target_ratio=float(entry.get("ratio", self._l1_retention)),
+                    content_cu_seqlens=entry.get("cu_seqlens"),
                 )
                 if util_loss.requires_grad:
                     (util_loss * w_l1 / self._accum_steps).backward()

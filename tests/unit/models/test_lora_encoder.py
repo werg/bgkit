@@ -30,7 +30,8 @@ class _MockAttn(nn.Module):
 def test_install_wraps_target_linears():
     m = _MockAttn()
     router = LoRARouter.install(
-        m, target_names=("q_proj", "k_proj", "v_proj", "o_proj"),
+        m,
+        target_names=("q_proj", "k_proj", "v_proj", "o_proj"),
         levels={"l0": 4, "l1": 4},
     )
     assert len(router._wrappers) == 4
@@ -119,7 +120,8 @@ def test_lora_install_save_load_roundtrip():
     # Simulate a "fresh base + LoRA install" workflow
     m1 = _MockAttn()
     router1 = LoRARouter.install(
-        m1, target_names=("q_proj", "k_proj", "v_proj", "o_proj"),
+        m1,
+        target_names=("q_proj", "k_proj", "v_proj", "o_proj"),
         levels={"l0": 4, "l1": 4},
     )
     LoRARouter.bind(router1)
@@ -141,7 +143,8 @@ def test_lora_install_save_load_roundtrip():
     # Fresh encoder → install LoRA → load saved state → verify
     m2 = _MockAttn()
     router2 = LoRARouter.install(
-        m2, target_names=("q_proj", "k_proj", "v_proj", "o_proj"),
+        m2,
+        target_names=("q_proj", "k_proj", "v_proj", "o_proj"),
         levels={"l0": 4, "l1": 4},
     )
     missing, unexpected = m2.load_state_dict(saved_state, strict=True)
@@ -152,10 +155,12 @@ def test_lora_install_save_load_roundtrip():
         assert torch.allclose(w1.base_layer.weight, w2.base_layer.weight)
         for level in ("l0", "l1"):
             assert torch.allclose(
-                w1.adapters[level].lora_A, w2.adapters[level].lora_A,
+                w1.adapters[level].lora_A,
+                w2.adapters[level].lora_A,
             )
             assert torch.allclose(
-                w1.adapters[level].lora_B, w2.adapters[level].lora_B,
+                w1.adapters[level].lora_B,
+                w2.adapters[level].lora_B,
             )
 
     # Now bootstrap case: pretend we have a pre-LoRA checkpoint and want to
@@ -165,7 +170,8 @@ def test_lora_install_save_load_roundtrip():
     m3 = _MockAttn()
     pre_lora_state = m3.state_dict()  # pre-LoRA key shape
     LoRARouter.install(
-        m3, target_names=("q_proj", "k_proj", "v_proj", "o_proj"),
+        m3,
+        target_names=("q_proj", "k_proj", "v_proj", "o_proj"),
         levels={"l0": 4, "l1": 4},
     )
     remapped = remap_base_keys_to_lora(

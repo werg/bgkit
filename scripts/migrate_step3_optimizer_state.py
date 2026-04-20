@@ -96,6 +96,9 @@ def main(ckpt_dir: Path) -> None:
 
     from bgkit.models.decoder import ReconstructionDecoder
     from bgkit.models.encoder import BgKITEncoder
+    from bgkit.utils.attention_backend import resolve_attention_implementation
+
+    attention_impl = resolve_attention_implementation("auto")
 
     # -------- Encoder --------
     encoder_sd = torch.load(enc_path, map_location="cpu", weights_only=True)
@@ -106,7 +109,7 @@ def main(ckpt_dir: Path) -> None:
         hidden_dim=1024,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="sdpa",
+        attn_implementation=attention_impl,
         bidi_warmup_steps=0,
     )
 
@@ -115,7 +118,7 @@ def main(ckpt_dir: Path) -> None:
         "Qwen/Qwen3.5-0.8B",
         dtype=torch.bfloat16,
         trust_remote_code=True,
-        attn_implementation="sdpa",
+        attn_implementation=attention_impl,
     )
     decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=1024)
     decoder.apply_lora(

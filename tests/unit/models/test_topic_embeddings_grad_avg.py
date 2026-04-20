@@ -51,11 +51,13 @@ def test_record_batch_usage_counts_distinct_samples_per_tag():
     tax = _toy_taxonomy()
     mod = TopicEmbeddingModule(tax, positions_per_tag=2, hidden_dim=4)
     # Three samples; "global" is on all of them, flask is on one.
-    mod.record_batch_usage([
-        ["global/python/numpy"],
-        ["global/python/flask"],
-        ["global/rust/serde"],
-    ])
+    mod.record_batch_usage(
+        [
+            ["global/python/numpy"],
+            ["global/python/flask"],
+            ["global/rust/serde"],
+        ]
+    )
     counts = mod._batch_tag_counts
     assert counts["global"] == 3
     assert counts["global/python"] == 2
@@ -104,5 +106,6 @@ def test_apply_gradient_averaging_noop_when_no_batch_recorded():
     mod.embeddings[mod._key("global")].grad = torch.ones(2, 4)
     mod.apply_gradient_averaging()
     assert torch.allclose(
-        mod.embeddings[mod._key("global")].grad, torch.ones(2, 4),
+        mod.embeddings[mod._key("global")].grad,
+        torch.ones(2, 4),
     )

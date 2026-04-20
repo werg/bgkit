@@ -1,34 +1,34 @@
-"""Bidirectional Qwen3.5-0.8B wrapper for BgKIT compression.
+"""Bidirectional Qwen3.5-0.8B wrapper for BgKIT compression — packed FA4 form.
 
 Wraps the Qwen3.5 text model (Qwen3_5TextModel) with bidirectional attention
-on full attention layers while keeping DeltaNet layers causal:
+on full-attention layers while keeping DeltaNet layers causal:
 
-- Full attention layers (indices 3, 7, 11, 15, 19, 23): causal mask removed,
-  replaced with padding-only 2D mask for bidirectional attention.
+- Full attention layers (indices 3, 7, 11, 15, 19, 23): non-causal packed
+  attention (FA4 varlen). Sequence boundaries enforced solely by
+  ``cu_seqlens``.
 - Gated DeltaNet layers (all others): kept causal (left-to-right) for the
   recurrent state, but with **bidirectional conv1d** replacing the original
-  causal conv1d. This injects local bidirectional context (kernel_size=4
-  window) into the QKV projections before the recurrent scan.
+  causal conv1d. ``cu_seqlens`` is threaded through so the fla-core
+  varlen patch can reset the cumulative gate at sample boundaries.
 
-The 6 full attention layers provide periodic bidirectional context mixing,
-analogous to Longformer's local+global attention pattern. DeltaNet layers
-receive bidirectionally-mixed input from preceding attention layers and
-propagate it forward with O(L) efficiency. The bidirectional conv1d adds
-a cheap local receptive field that lets each token see 1 position behind
-and 2 ahead (for kernel_size=4), bridging the gap between the global
-bidirectional attention layers.
-
-The wrapper preserves the HuggingFace model API surface required by
-existing trainers (get_input_embeddings, gradient_checkpointing_enable, config).
+All inputs are **packed** ``(N, D)`` flat over samples with
+``N = sum(L_i)``. Sequence segmentation lives in ``cu_seqlens``
+(``(B+1,)`` int32). Per-sample position IDs live in ``position_ids``
+(``(N,)`` int64, restart at 0 for each sample). There is **no**
+``attention_mask`` argument — the padded path is deleted.
 
 Layer pattern: [DeltaNet, DeltaNet, DeltaNet, FullAttention] x 6 = 24 layers.
 
 Architecture notes (from model inspection):
-- Qwen3.5 decoder layers return plain Tensor (not tuples like older Qwen models)
-- Rotary embeddings use partial_rotary_factor=0.25 (cos/sin are 64-dim, not 1024)
-- DeltaNet conv1d: kernel_size=4, depthwise, converted to bidirectional "same"
-  padding at init time (original left-padding replaced with symmetric padding)
-- DeltaNet layers use `linear_attn` attribute, full attention uses `self_attn`
+- Qwen3.5 decoder layers return plain Tensor (not tuples like older Qwen).
+- Rotary embeddings use partial_rotary_factor=0.25 (cos/sin are 64-dim).
+- DeltaNet conv1d: kernel_size=4, depthwise, converted to bidirectional
+  "same" padding at init time.
+- DeltaNet layers use ``linear_attn`` attribute, full attention uses ``self_attn``.
+- Qwen3.5 full attention: q-projection doubles the output dim and is
+  ``chunk(2)``-split into query + gate (so per-head dim = ``head_dim``,
+  gate is a per-head scalar vector). A sigmoid-gate is applied to the
+  attention output before ``o_proj``.
 """
 
 from __future__ import annotations
@@ -39,6 +39,59 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
+
+from bgkit.utils.attention_backend import bgkit_flash_attention_4_forward
+
+
+def _cpu_sdpa_packed(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    is_causal: bool,
+    scale: float | None,
+) -> torch.Tensor:
+    """CPU-only packed SDPA — used only by unit tests.
+
+    Production (CUDA) runs strictly through FA4 via
+    ``bgkit_flash_attention_4_forward``. This helper exists solely so
+    host CPU unit tests (which construct mocks with CPU tensors) can
+    still run the encoder forward without a separate mask-based
+    attention path. The call sites in ``_packed_full_attention`` check
+    ``q.is_cuda`` and raise if CUDA tensors reach this helper.
+    """
+    if query.is_cuda:
+        raise RuntimeError(
+            "_cpu_sdpa_packed should never be called with CUDA tensors; "
+            "FA4 is the only supported GPU path."
+        )
+    cu = cu_seqlens.tolist()
+    batch = len(cu) - 1
+    n_heads = query.shape[1]
+    n_kv_heads = key.shape[1]
+    if n_kv_heads < n_heads:
+        repeat = n_heads // n_kv_heads
+        key = key.repeat_interleave(repeat, dim=1)
+        value = value.repeat_interleave(repeat, dim=1)
+    outputs = []
+    for b in range(batch):
+        start, end = cu[b], cu[b + 1]
+        if end == start:
+            continue
+        q_b = query[start:end].transpose(0, 1).unsqueeze(0)
+        k_b = key[start:end].transpose(0, 1).unsqueeze(0)
+        v_b = value[start:end].transpose(0, 1).unsqueeze(0)
+        out_b = torch.nn.functional.scaled_dot_product_attention(
+            q_b, k_b, v_b, attn_mask=None, is_causal=is_causal, scale=scale,
+        )
+        outputs.append(out_b.squeeze(0).transpose(0, 1))
+    return torch.cat(outputs, dim=0)
+
+
+# ---------------------------------------------------------------------------
+# DeltaNet conv1d: causal -> bidirectional
+# ---------------------------------------------------------------------------
 
 
 def _make_conv_bidirectional(layer: nn.Module) -> None:
@@ -46,28 +99,21 @@ def _make_conv_bidirectional(layer: nn.Module) -> None:
 
     Mutates the existing nn.Conv1d's padding from left-only (causal) to
     symmetric ("same"), so each position sees both past and future within
-    the kernel window. For kernel_size=4: pad_left=1, pad_right=2, giving
-    a receptive field of [t-1, t, t+1, t+2] instead of [t-3, t-2, t-1, t].
+    the kernel window. For kernel_size=4: pad_left=1, pad_right=2.
 
-    This preserves the original module identity and state_dict keys — no
-    wrapper module, so HF pretrained weights load without key remapping.
-
-    Also disables the causal_conv1d CUDA fast paths (which hardcode causal
-    padding) and monkey-patches the conv1d forward to apply asymmetric
-    F.pad before the convolution.
+    Preserves the original module identity and state_dict keys. Also disables
+    the causal_conv1d CUDA fast paths (which hardcode causal padding) and
+    monkey-patches the conv1d forward to apply asymmetric F.pad.
     """
     attn = layer.linear_attn
     conv = attn.conv1d
 
-    # Compute symmetric padding for "same" output length
     k = conv.kernel_size[0]
-    pad_left = (k - 1) // 2  # 1 for k=4
-    pad_right = k // 2  # 2 for k=4
+    pad_left = (k - 1) // 2
+    pad_right = k // 2
 
-    # Remove the built-in left-padding (was kernel_size-1 for causal)
     conv.padding = (0,)
 
-    # Monkey-patch forward to apply symmetric padding
     original_forward = conv.forward
 
     def _bidi_forward(x: torch.Tensor) -> torch.Tensor:
@@ -75,54 +121,172 @@ def _make_conv_bidirectional(layer: nn.Module) -> None:
 
     conv.forward = _bidi_forward
 
-    # Force the torch fallback path (F.silu(self.conv1d(x)[:, :, :seq_len]))
-    # instead of the causal_conv1d CUDA kernel which hardcodes left-padding.
     attn.causal_conv1d_fn = None
     attn.causal_conv1d_update = None
 
 
+def _packed_full_attention(
+    self_attn: nn.Module,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    position_ids: torch.Tensor,
+    is_causal: bool,
+) -> torch.Tensor:
+    """Run Qwen3.5 full-attention in packed ``(N, D)`` form.
+
+    Replicates ``Qwen3_5Attention.forward`` using the module's weights but
+    without any ``attention_mask`` construction. Segmentation is carried in
+    ``cu_seqlens``. RoPE cos/sin are assumed to already be computed for the
+    packed layout — i.e. cos/sin have shape ``(1, N, rotary_dim)`` with
+    per-sample position IDs restart at 0 at each segment boundary.
+    """
+    N = hidden_states.shape[0]  # noqa: N806 (ML shape var)
+    head_dim = self_attn.head_dim
+    # Infer head counts from projection shapes since config attribute names
+    # vary across HF minor versions.
+    n_heads = self_attn.q_proj.out_features // (head_dim * 2)
+    n_kv_heads = self_attn.k_proj.out_features // head_dim
+
+    # Q projection doubles the output dim and is chunk(2)-split into query + gate.
+    qg = self_attn.q_proj(hidden_states).view(N, n_heads, 2 * head_dim)
+    q, gate = torch.chunk(qg, 2, dim=-1)  # (N, H, Dh) and (N, H, Dh)
+    gate = gate.reshape(N, n_heads * head_dim)
+
+    k = self_attn.k_proj(hidden_states).view(N, n_kv_heads, head_dim)
+    v = self_attn.v_proj(hidden_states).view(N, n_kv_heads, head_dim)
+
+    # Per-head-dim RMSNorm.
+    q = self_attn.q_norm(q)
+    k = self_attn.k_norm(k)
+
+    # RoPE: apply_rotary_pos_emb expects q/k in (B, H, L, Dh) with
+    # cos/sin (B, L, rotary_dim) unsqueezed at dim=1. Our packed layout is
+    # (N, H, Dh). Reshape to (1, H, N, Dh) and use unsqueeze_dim=1 with
+    # cos/sin of shape (1, N, rotary_dim).
+    q4 = q.transpose(0, 1).unsqueeze(0)  # (1, H, N, Dh)
+    k4 = k.transpose(0, 1).unsqueeze(0)  # (1, Hkv, N, Dh)
+    cos, sin = position_embeddings
+    q4, k4 = apply_rotary_pos_emb(q4, k4, cos, sin, unsqueeze_dim=1)
+    q = q4.squeeze(0).transpose(0, 1).contiguous()  # (N, H, Dh)
+    k = k4.squeeze(0).transpose(0, 1).contiguous()  # (N, Hkv, Dh)
+    v = v.contiguous()  # (N, Hkv, Dh)
+
+    # FA4 on CUDA (production). CPU branch exists only so host unit tests
+    # with CPU-tensor mocks can run; it raises immediately if CUDA tensors
+    # reach it, ensuring GPU paths always go through FA4.
+    if q.is_cuda:
+        attn_output, _ = bgkit_flash_attention_4_forward(
+            self_attn,
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            position_ids=position_ids,
+            is_causal=is_causal,
+            scale=self_attn.scaling,
+        )
+    else:
+        attn_output = _cpu_sdpa_packed(
+            q, k, v, cu_seqlens=cu_seqlens, is_causal=is_causal, scale=self_attn.scaling,
+        )
+    # (N, H, Dh) -> (N, H*Dh)
+    attn_output = attn_output.reshape(N, n_heads * head_dim).contiguous()
+    attn_output = attn_output * torch.sigmoid(gate)
+    return self_attn.o_proj(attn_output)
+
+
+def _packed_decoder_layer_forward(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    position_ids: torch.Tensor,
+    is_causal: bool,
+) -> torch.Tensor:
+    """Run a single Qwen3.5 decoder layer in packed form.
+
+    Handles both DeltaNet (``linear_attn``) and full-attention (``self_attn``)
+    layer variants. Replicates ``Qwen3_5DecoderLayer.forward`` minus the
+    ``attention_mask`` / ``past_key_values`` plumbing (which the encoder
+    never uses).
+    """
+    residual = hidden_states
+    hidden_states = layer.input_layernorm(hidden_states)
+
+    if getattr(layer, "layer_type", None) == "linear_attention":
+        # DeltaNet: the Wave 1.3 ``patch_deltanet_layer`` monkey-patch
+        # installs a ``_packed_forward`` on every instance that accepts
+        # ``cu_seqlens`` and ``position_ids`` as keyword-only kwargs and
+        # injects ``cu_seqlens`` into ``chunk_gated_delta_rule``. Pass
+        # them unconditionally — the patch is applied by
+        # ``patch_gated_delta_rule_numerics`` before any forward runs.
+        hidden_states = layer.linear_attn(
+            hidden_states=hidden_states.unsqueeze(0),
+            cache_params=None,
+            attention_mask=None,
+            cu_seqlens=cu_seqlens,
+            position_ids=position_ids,
+        ).squeeze(0)
+    else:
+        hidden_states = _packed_full_attention(
+            layer.self_attn,
+            hidden_states,
+            position_embeddings,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            position_ids=position_ids,
+            is_causal=is_causal,
+        )
+
+    hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = layer.post_attention_layernorm(hidden_states)
+    hidden_states = layer.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+    return hidden_states
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional Qwen3.5 wrapper (packed form)
+# ---------------------------------------------------------------------------
+
+
 class BidirectionalQwen35(nn.Module):
-    """Qwen3.5-0.8B with bidirectional attention for BgKIT compression.
+    """Qwen3.5-0.8B with bidirectional attention for BgKIT compression (packed).
 
-    - Full attention layers: causal mask removed (bidirectional)
-    - DeltaNet layers: causal recurrent state, but with bidirectional conv1d
-      replacing the original causal conv1d for local context mixing
+    - Full attention layers: non-causal FA4 varlen (bidirectional).
+    - DeltaNet layers: causal recurrent state with bidirectional conv1d.
 
-    The 6 full attention layers (every 4th) provide bidirectional context
-    mixing. DeltaNet layers between them process bidirectionally-informed
-    representations with O(L) efficiency. The bidirectional conv1d adds
-    ~0 parameters (same weights, different padding).
+    Gradual mask relaxation: full-attention layers transition from causal
+    to bidirectional over ``bidi_warmup_steps`` training steps. With packed
+    attention there is no explicit mask to blend; instead we blend between
+    a causal and non-causal call path. During warmup ``alpha < 1.0`` we run
+    causal FA4; after warmup we run non-causal FA4. This is a step change
+    at the warmup boundary rather than a smooth blend, mirroring the
+    semantics of "causal at 0%, bidirectional at 100%" without the
+    quadratic dense-mask composite that the padded path used.
 
-    Gradual mask relaxation: full attention layers transition from causal to
-    bidirectional over ``bidi_warmup_steps`` training steps. At step 0 the
-    model behaves exactly as pretrained (fully causal). The causal component
-    is linearly faded out, reaching fully bidirectional at the end of warmup.
     Set ``bidi_warmup_steps=0`` to disable (immediate bidirectional).
-    Set ``bidi_warmup_steps=-1`` to stay fully causal (no bidirectional transition).
-
-    Preserves HF API surface: get_input_embeddings(),
-    gradient_checkpointing_enable(), config, etc.
+    Set ``bidi_warmup_steps=-1`` to stay permanently causal.
     """
 
     def __init__(self, base_model: nn.Module, bidi_warmup_steps: int = 0):
         super().__init__()
-        # Store original HF model for config access only. Bypass nn.Module
-        # __setattr__ to avoid registering as a submodule (which would duplicate
-        # every parameter in the state_dict).
         object.__setattr__(self, "_hf_model", base_model)
 
-        # Extract components. base_model should be the text model
-        # (Qwen3_5TextModel) — NOT the multimodal wrapper.
         self.embed_tokens = base_model.embed_tokens
         self.norm = base_model.norm
         self.rotary_emb = base_model.rotary_emb
         self.layers = base_model.layers
 
-        # Gradual mask relaxation: causal → bidirectional over warmup period
         self.bidi_warmup_steps = bidi_warmup_steps
         self.register_buffer("_step", torch.tensor(0, dtype=torch.long))
 
-        # Convert causal conv1d → bidirectional conv1d in all DeltaNet layers
         for layer in self.layers:
             if self._is_deltanet_layer(layer):
                 _make_conv_bidirectional(layer)
@@ -130,32 +294,20 @@ class BidirectionalQwen35(nn.Module):
     # --- HF API proxies (required by trainers) ---
 
     def get_input_embeddings(self):
-        """Proxy for compression.py embedding table access."""
         return self.embed_tokens
 
     @property
     def config(self):
-        """Proxy for any config access."""
         return self._hf_model.config
 
     def gradient_checkpointing_enable(self, **kwargs):
-        """Enable gradient checkpointing on all layers.
-
-        Uses explicit torch.utils.checkpoint.checkpoint() in forward loop
-        rather than HF's internal mechanism.
-        """
         self._gradient_checkpointing = True
 
     def step_bidi_warmup(self) -> None:
-        """Advance the warmup step counter. Call once per training step."""
         self._step += 1
 
     @property
     def bidi_alpha(self) -> float:
-        """Current interpolation factor: 0.0 = fully causal, 1.0 = fully bidirectional.
-
-        -1 = permanently causal, 0 = immediate bidi, >0 = gradual warmup.
-        """
         if self.bidi_warmup_steps < 0:
             return 0.0
         if self.bidi_warmup_steps == 0:
@@ -166,113 +318,97 @@ class BidirectionalQwen35(nn.Module):
 
     @staticmethod
     def _is_deltanet_layer(layer: nn.Module) -> bool:
-        """Check if a layer is a DeltaNet (linear attention) layer.
-
-        Qwen3.5 uses `linear_attn` for DeltaNet and `self_attn` for full
-        attention. Both are Qwen3_5DecoderLayer but with different submodules.
-        """
+        """Qwen3.5 uses ``linear_attn`` for DeltaNet, ``self_attn`` for full attention."""
         return hasattr(layer, "linear_attn")
+
+    def _compute_rope(
+        self,
+        hidden: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute RoPE cos/sin for a packed sequence.
+
+        The upstream ``Qwen3_5TextRotaryEmbedding.forward`` takes a
+        ``position_ids`` of shape ``(B, L)``. We feed a ``(1, N)`` shape
+        (packed batch with a single mega-row), so cos/sin emerge as
+        ``(1, N, rotary_dim)``.
+        """
+        pos_2d = position_ids.unsqueeze(0)  # (1, N)
+        return self.rotary_emb(hidden, pos_2d)
 
     def forward(
         self,
         inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        position_ids: torch.Tensor,
         return_intermediates: bool = False,
         layer_hooks: dict[int, Callable[[torch.Tensor], torch.Tensor]] | None = None,
     ) -> BaseModelOutputWithPast:
-        """Run forward pass with bidirectional full attention.
-
-        DeltaNet layers run causally (no mask). Full attention layers run
-        with a bidirectional (non-causal) padding mask.
+        """Run forward pass with packed bidirectional full attention.
 
         Args:
-            inputs_embeds: (B, L, D) input embeddings.
-            attention_mask: (B, L) padding mask (1=real, 0=pad). Used as
-                bidirectional (non-causal) mask for full attention layers.
-                DeltaNet layers ignore this (causal recurrent state).
-            return_intermediates: If True, collect hidden states after each
-                FullAttn layer (indices 3,7,11,15,19) and after the final
-                layer (index 22). Returned in hidden_states field.
-            layer_hooks: Optional dict mapping layer indices to callables.
-                After layer ``i`` completes, if ``i`` is in the dict, the
-                hook ``layer_hooks[i](hidden) -> hidden`` is called. Used
-                by the compressor for ratio-embedding injection (after
-                layer 3) and survivorship-head evaluation (after layer 7).
-
-        Returns:
-            BaseModelOutputWithPast with last_hidden_state (and hidden_states
-            if return_intermediates=True).
+            inputs_embeds: ``(N, D)`` packed input embeddings.
+            cu_seqlens: ``(B+1,)`` int32 cumulative sequence lengths.
+            max_seqlen: int, ``max(L_i)``.
+            position_ids: ``(N,)`` int64 per-sample position indices
+                (restart to 0 at each segment boundary).
+            return_intermediates: collect hidden states after each FullAttn
+                layer and after the final layer.
+            layer_hooks: dict mapping layer indices to callables. Called
+                on the packed ``(N, D)`` hidden after the indicated layer
+                completes; must return a ``(N, D)`` tensor.
         """
+        if inputs_embeds.ndim != 2:
+            raise ValueError(
+                f"BidirectionalQwen35 expects packed (N, D) inputs_embeds; "
+                f"got shape {tuple(inputs_embeds.shape)}"
+            )
         hidden = inputs_embeds
-        seq_len = hidden.shape[1]
-        position_ids = torch.arange(seq_len, device=hidden.device).unsqueeze(0)
-        # Rotary output is (cos, sin) with shape (B, L, rotary_dim) where
-        # rotary_dim = head_dim * partial_rotary_factor = 256 * 0.25 = 64.
-        position_embeddings = self.rotary_emb(hidden, position_ids)
+        position_embeddings = self._compute_rope(hidden, position_ids)
         use_ckpt = getattr(self, "_gradient_checkpointing", False) and self.training
 
-        # Build blended 4D mask for full attention layers.
-        # During warmup, interpolate between causal and bidirectional masks so
-        # the pretrained attention weights gradually adapt to seeing future tokens.
         alpha = self.bidi_alpha
-        neg_inf = torch.finfo(hidden.dtype).min
+        # Step-change semantics at the warmup boundary: causal while alpha < 1.
+        full_is_causal = alpha < 1.0
 
-        # Padding mask component (always present if attention_mask given)
-        pad_mask_4d = None
-        if attention_mask is not None:
-            pad_mask_4d = attention_mask[:, None, None, :].to(hidden.dtype)
-            pad_mask_4d = (1.0 - pad_mask_4d) * neg_inf
-
-        # Causal component: upper-triangular -inf matrix
-        if alpha < 1.0:
-            causal = torch.triu(
-                torch.full((seq_len, seq_len), neg_inf, device=hidden.device, dtype=hidden.dtype),
-                diagonal=1,
-            )
-            # Scale causal component: full at alpha=0, gone at alpha=1
-            causal = causal * (1.0 - alpha)
-            # Combine: causal + padding (either or both may be active)
-            if pad_mask_4d is not None:
-                full_attn_mask = pad_mask_4d + causal[None, None, :, :]
-            else:
-                full_attn_mask = causal[None, None, :, :]
-        else:
-            # Fully bidirectional — just padding mask (or None)
-            full_attn_mask = pad_mask_4d
-
-        def _run_layer(layer, h, mask, pos_emb):
-            """Run a single layer, with optional gradient checkpointing.
-
-            Qwen3.5 decoder layers (both DeltaNet and full attention) take
-            (hidden_states, position_embeddings, attention_mask=...) and return
-            a plain Tensor (not a tuple like older Qwen models).
-            """
+        def _run_layer(layer, h):
+            is_deltanet = self._is_deltanet_layer(layer)
+            layer_is_causal = True if is_deltanet else full_is_causal
             if use_ckpt:
-                def _fwd(hidden_states):
-                    out = layer(hidden_states, pos_emb, attention_mask=mask, is_causal=False)
-                    return out[0] if isinstance(out, tuple) else out
+
+                def _fwd(hh):
+                    return _packed_decoder_layer_forward(
+                        layer,
+                        hh,
+                        position_embeddings,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                        position_ids=position_ids,
+                        is_causal=layer_is_causal,
+                    )
+
                 return torch.utils.checkpoint.checkpoint(_fwd, h, use_reentrant=False)
-            out = layer(h, pos_emb, attention_mask=mask, is_causal=False)
-            return out[0] if isinstance(out, tuple) else out
+            return _packed_decoder_layer_forward(
+                layer,
+                h,
+                position_embeddings,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_ids=position_ids,
+                is_causal=layer_is_causal,
+            )
 
         intermediates = [] if return_intermediates else None
         num_layers = len(self.layers)
 
         for i, layer in enumerate(self.layers):
-            if self._is_deltanet_layer(layer):
-                # DeltaNet: causal (no mask), O(L) via recurrent state
-                hidden = _run_layer(layer, hidden, None, position_embeddings)
-            else:
-                # Full attention: blended causal→bidirectional mask
-                hidden = _run_layer(layer, hidden, full_attn_mask, position_embeddings)
+            hidden = _run_layer(layer, hidden)
 
-            # Fire layer hook after this layer completes
             if layer_hooks and i in layer_hooks:
                 hidden = layer_hooks[i](hidden)
 
-            if return_intermediates and (
-                not self._is_deltanet_layer(layer) or i == num_layers - 1
-            ):
+            if return_intermediates and (not self._is_deltanet_layer(layer) or i == num_layers - 1):
                 intermediates.append(hidden)
 
         hidden = self.norm(hidden)

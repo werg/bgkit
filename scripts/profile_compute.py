@@ -7,7 +7,7 @@ Validates:
 1. All models load within 128GB unified memory
 2. Forward + backward pass completes at target seq_len
 3. Peak memory and throughput measurements
-4. SDPA attention dispatches correctly (not falling back to math backend)
+4. FlashAttention dispatches correctly on the target hardware
 """
 
 from __future__ import annotations
@@ -41,13 +41,13 @@ def profile_phase2() -> dict[str, float]:
     raise NotImplementedError
 
 
-def verify_sdpa() -> bool:
-    """Verify PyTorch SDPA dispatches to cuDNN backend (not math fallback)."""
-    print("=== SDPA Verification ===")
+def verify_flash_attention() -> bool:
+    """Verify FlashAttention dispatches correctly on the target hardware."""
+    print("=== FlashAttention Verification ===")
     if not torch.cuda.is_available():
-        print("CUDA not available, skipping SDPA verification")
+        print("CUDA not available, skipping FlashAttention verification")
         return False
-    # TODO: Run SDPA with profiling, check backend
+    # TODO: Run FlashAttention with profiling, check backend
     raise NotImplementedError
 
 
@@ -63,7 +63,7 @@ def main():
     print(f"Total memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
     print()
 
-    verify_sdpa()
+    verify_flash_attention()
     profile_phase1()
     profile_phase2()
 

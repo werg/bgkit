@@ -31,13 +31,13 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from bgkit.data.datasets.swe_trajectory_dataset import SWETrajectoryDataset
+from bgkit.data.samplers import PackedTokenBudgetSampler
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.utils.attention_backend import resolve_attention_implementation
+from bgkit.utils.packing import position_ids_from_cu
 
 logger = structlog.get_logger()
-
-_DISTILL_BGKIT_SENTINEL = "<<<BGKIT_DISTILL_CONTEXT_0d4e61f9>>>"
 
 
 def _load_manifest(parquet_path: Path) -> list[dict]:
@@ -58,6 +58,13 @@ def _load_survivors_from_path(npy_path: str) -> torch.Tensor | None:
     if arr.ndim == 1:
         arr = arr[:, None]
     return torch.from_numpy(arr.copy())
+
+
+def _make_cu_seqlens(lengths: list[int]) -> torch.Tensor:
+    """Build cumulative sequence lengths tensor from a list of lengths."""
+    t = torch.zeros(len(lengths) + 1, dtype=torch.int32)
+    torch.cumsum(torch.tensor(lengths, dtype=torch.int32), dim=0, out=t[1:])
+    return t
 
 
 class _ContextSourceCache:
@@ -139,11 +146,6 @@ class DistillationTrainer(BaseTrainer):
             dtype=torch.long,
             device=self.device,
         )
-        self._distill_bgkit_sentinel_ids = torch.tensor(
-            self.tokenizer.encode(_DISTILL_BGKIT_SENTINEL, add_special_tokens=False),
-            dtype=torch.long,
-            device=self.device,
-        )
         self._distill_bgkit_suffix_ids = torch.tensor(
             self.tokenizer.encode("\n</tool_response>\n", add_special_tokens=False),
             dtype=torch.long,
@@ -215,18 +217,62 @@ class DistillationTrainer(BaseTrainer):
             self.dataset, [train_size, eval_size], generator=generator,
         )
 
-        batch_size = int(self.cfg.get("batch_size", 1))
+        max_batch_tokens = int(self.cfg.training.get("max_batch_tokens", 16384))
+        # Eval has no backward — its packed budget can be larger than
+        # training's. Falls back to ``max_batch_tokens`` when unset.
+        max_batch_tokens_eval = int(
+            self.cfg.training.get("max_batch_tokens_eval", max_batch_tokens),
+        )
+        seed = int(self.cfg.get("seed", 42))
+
+        # Build per-sample token lengths (trajectory + issue)
+        def _sample_length(idx: int) -> int:
+            sample = self.dataset[idx]
+            traj_len = (
+                int(sample["trajectory_token_ids"].size(0))
+                if "trajectory_token_ids" in sample else 0
+            )
+            issue_len = (
+                int(sample["issue_token_ids"].size(0))
+                if "issue_token_ids" in sample else 0
+            )
+            # Add prefix/suffix token overhead
+            extra = (
+                self._distill_bgkit_prefix_ids.size(0)
+                + self._distill_bgkit_suffix_ids.size(0)
+            )
+            return traj_len + issue_len + extra
+
+        train_indices = list(self.train_dataset.indices)
+        eval_indices = list(self.eval_dataset.indices)
+
+        train_lengths = [_sample_length(i) for i in train_indices]
+        eval_lengths = [_sample_length(i) for i in eval_indices]
+
+        train_sampler = PackedTokenBudgetSampler(
+            dataset=self.train_dataset,
+            lengths=train_lengths,
+            max_batch_tokens=max_batch_tokens,
+            shuffle=True,
+            seed=seed,
+        )
+        eval_sampler = PackedTokenBudgetSampler(
+            dataset=self.eval_dataset,
+            lengths=eval_lengths,
+            max_batch_tokens=max_batch_tokens_eval,
+            shuffle=False,
+            seed=seed,
+        )
+
         self.train_dataloader = DataLoader(
             self.train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
+            batch_sampler=train_sampler,
             num_workers=0,
             collate_fn=self._collate,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
-            batch_size=batch_size,
-            shuffle=False,
+            batch_sampler=eval_sampler,
             num_workers=0,
             collate_fn=self._collate,
         )
@@ -263,9 +309,11 @@ class DistillationTrainer(BaseTrainer):
             self.encoder.requires_grad_(False)
 
     def _collate(self, batch: list[dict]) -> dict:
-        """Collate trajectory samples."""
-        from bgkit.data.collators import pad_and_collate
+        """Collate trajectory samples into packed format.
 
+        Produces flat tensors with cu_seqlens for trajectory and issue sequences.
+        No padding tokens; segmentation lives in cu_seqlens.
+        """
         result = {
             "instance_ids": [s["instance_id"] for s in batch],
             "repos": [s["repo"] for s in batch],
@@ -274,18 +322,24 @@ class DistillationTrainer(BaseTrainer):
         }
 
         if "trajectory_token_ids" in batch[0]:
-            traj_ids, traj_mask = pad_and_collate(
-                [s["trajectory_token_ids"] for s in batch],
-            )
-            result["trajectory_token_ids"] = traj_ids
-            result["trajectory_attention_mask"] = traj_mask
+            traj_seqs = [s["trajectory_token_ids"] for s in batch]
+            traj_lengths = [int(t.size(0)) for t in traj_seqs]
+            traj_cu = _make_cu_seqlens(traj_lengths)
+            traj_total = int(traj_cu[-1])
+            result["trajectory_token_ids"] = torch.cat(traj_seqs, dim=0)
+            result["trajectory_cu_seqlens"] = traj_cu
+            result["trajectory_position_ids"] = position_ids_from_cu(traj_cu, traj_total)
+            result["trajectory_max_seqlen"] = max(traj_lengths) if traj_lengths else 0
 
         if "issue_token_ids" in batch[0]:
-            issue_ids, issue_mask = pad_and_collate(
-                [s["issue_token_ids"] for s in batch],
-            )
-            result["issue_token_ids"] = issue_ids
-            result["issue_attention_mask"] = issue_mask
+            issue_seqs = [s["issue_token_ids"] for s in batch]
+            issue_lengths = [int(t.size(0)) for t in issue_seqs]
+            issue_cu = _make_cu_seqlens(issue_lengths)
+            issue_total = int(issue_cu[-1])
+            result["issue_token_ids"] = torch.cat(issue_seqs, dim=0)
+            result["issue_cu_seqlens"] = issue_cu
+            result["issue_position_ids"] = position_ids_from_cu(issue_cu, issue_total)
+            result["issue_max_seqlen"] = max(issue_lengths) if issue_lengths else 0
 
         return result
 
@@ -334,7 +388,7 @@ class DistillationTrainer(BaseTrainer):
     def _get_bgkit_context(
         self, batch: dict,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Assemble multi-source BgKIT context for the batch.
+        """Assemble multi-source BgKIT context for the batch — packed format.
 
         For each sample, concatenates survivors from up to 3 sources:
         1. Compressed filesystem at (repo, base_commit)
@@ -342,7 +396,9 @@ class DistillationTrainer(BaseTrainer):
         3. Prior agentic session embeddings for repo (ordered before base_commit)
 
         Returns:
-            (context, mask) tensors padded across the batch, or None if no
+            ``(flat_embeddings, survivor_cu_seqlens)`` where
+            ``flat_embeddings`` is ``(K_total, D)`` float and
+            ``survivor_cu_seqlens`` is ``(B+1,)`` int32, or None if no
             context is available for any sample.
         """
         repos = batch.get("repos", [])
@@ -351,7 +407,7 @@ class DistillationTrainer(BaseTrainer):
             return None
 
         batch_size = len(repos)
-        per_sample: list[torch.Tensor] = []
+        per_sample: list[torch.Tensor | None] = []
         any_found = False
 
         for i in range(batch_size):
@@ -382,95 +438,148 @@ class DistillationTrainer(BaseTrainer):
                 per_sample.append(combined)
                 any_found = True
             else:
-                # Placeholder — will be masked out
-                per_sample.append(torch.empty(0))
+                per_sample.append(None)
 
         if not any_found:
             return None
 
-        # Determine hidden dim from a non-empty sample
+        # Determine hidden dim from a non-None sample
         hidden_dim = 0
         for s in per_sample:
-            if s.numel() > 0:
+            if s is not None and s.numel() > 0:
                 hidden_dim = s.size(-1)
                 break
         if hidden_dim == 0:
             return None
 
-        # Pad to batch
-        max_len = max((s.size(0) if s.numel() > 0 else 0) for s in per_sample)
-        if max_len == 0:
-            return None
+        # Build flat survivors + cu_seqlens; empty samples contribute 0 survivors
+        flat_parts: list[torch.Tensor] = []
+        lengths: list[int] = []
 
-        padded = torch.zeros(batch_size, max_len, hidden_dim)
-        mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
-        for i, s in enumerate(per_sample):
-            if s.numel() > 0:
-                length = s.size(0)
-                # Ensure 2D
+        dummy = torch.zeros(0, hidden_dim)
+        for s in per_sample:
+            if s is not None and s.numel() > 0:
+                # Ensure 2D (K_i, D)
                 if s.ndim == 1:
-                    s = s.unsqueeze(-1)
-                padded[i, :length] = s[:length]
-                mask[i, :length] = True
+                    s = s.unsqueeze(-1).expand(-1, hidden_dim)
+                flat_parts.append(s)
+                lengths.append(s.size(0))
+            else:
+                flat_parts.append(dummy)
+                lengths.append(0)
 
-        return padded.to(self.device), mask.to(self.device)
+        flat_embeddings = torch.cat(flat_parts, dim=0).to(self.device)  # (K_total, D)
+        survivor_cu = _make_cu_seqlens(lengths).to(self.device)  # (B+1,) int32
 
-    def _build_decoder_targets(
+        return flat_embeddings, survivor_cu
+
+    def _build_decoder_inputs(
         self,
-        trajectory_ids: torch.Tensor,
-        trajectory_mask: torch.Tensor,
-        issue_ids: torch.Tensor | None = None,
-        issue_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Build a decoder target batch with a fixed BgKIT tool-response slot."""
-        batch_size = trajectory_ids.size(0)
-        target_rows: list[torch.Tensor] = []
-        loss_rows: list[torch.Tensor] = []
-        splice_starts: list[int] = []
-        splice_lens: list[int] = []
+        batch: dict,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[tuple[int, int, torch.Tensor]]]:
+        """Build per-sample prefix_ids, suffix_ids, and loss_mask parts for the decoder.
+
+        ``forward_with_single_splice`` lays out each sample as
+        ``[prefix_i | survivors_i | suffix_i]``.  We map:
+
+        - ``prefix_ids[i]`` = ``[issue_i | bgkit_tool_prefix]``
+        - survivors inserted here as raw embeddings (no placeholder token)
+        - ``suffix_ids[i]`` = ``[bgkit_tool_suffix | trajectory_i]``
+
+        Loss is computed only on trajectory tokens (the bgkit wrapper tokens
+        inside the suffix are masked out).
+
+        Returns
+        -------
+        prefix_ids : list[Tensor]
+            Length-B list of 1-D int64 tensors.
+        suffix_ids : list[Tensor]
+            Length-B list of 1-D int64 tensors.
+        loss_mask_parts : list[tuple[int, int, Tensor]]
+            Per-sample ``(pre_len, suf_len, lm_suf)`` tuples consumed by
+            :meth:`_make_flat_loss_mask`.
+        """
+        has_issue = "issue_token_ids" in batch
+        has_traj = "trajectory_token_ids" in batch
+
+        batch_size = len(batch["repos"])
+        prefix_ids: list[torch.Tensor] = []
+        suffix_ids: list[torch.Tensor] = []
+        loss_mask_parts: list[tuple[int, int, torch.Tensor]] = []
+
+        bgkit_suffix_len = int(self._distill_bgkit_suffix_ids.size(0))
+
+        issue_cu = batch["issue_cu_seqlens"].tolist() if has_issue else None
+        traj_cu = batch["trajectory_cu_seqlens"].tolist() if has_traj else None
+
+        prefix_token = self._distill_bgkit_prefix_ids  # (P_pre,)
+        suffix_token = self._distill_bgkit_suffix_ids  # (P_suf,)
 
         for b in range(batch_size):
-            issue = torch.empty(0, dtype=torch.long, device=self.device)
-            if issue_ids is not None and issue_mask is not None:
-                issue_len = int(issue_mask[b].sum().item())
-                issue = issue_ids[b, :issue_len]
-            traj_len = int(trajectory_mask[b].sum().item())
-            traj = trajectory_ids[b, :traj_len]
+            # Issue tokens for this sample (may be empty)
+            if has_issue and issue_cu is not None:
+                i_start, i_end = int(issue_cu[b]), int(issue_cu[b + 1])
+                issue_i = batch["issue_token_ids"][i_start:i_end].to(self.device)
+            else:
+                issue_i = torch.empty(0, dtype=torch.long, device=self.device)
 
-            prefix = self._distill_bgkit_prefix_ids
-            sentinel = self._distill_bgkit_sentinel_ids
-            suffix = self._distill_bgkit_suffix_ids
-            seq = torch.cat([issue, prefix, sentinel, suffix, traj], dim=0)
-            loss = torch.cat([
-                torch.zeros(
-                    issue.size(0) + prefix.size(0) + sentinel.size(0) + suffix.size(0),
-                    dtype=torch.bool,
-                    device=self.device,
-                ),
-                torch.ones(traj.size(0), dtype=torch.bool, device=self.device),
-            ], dim=0)
-            target_rows.append(seq)
-            loss_rows.append(loss)
-            splice_starts.append(int(issue.size(0) + prefix.size(0)))
-            splice_lens.append(int(sentinel.size(0)))
+            # Trajectory tokens for this sample
+            if has_traj and traj_cu is not None:
+                t_start, t_end = int(traj_cu[b]), int(traj_cu[b + 1])
+                traj_i = batch["trajectory_token_ids"][t_start:t_end].to(self.device)
+            else:
+                traj_i = torch.empty(0, dtype=torch.long, device=self.device)
 
-        max_len = max(int(row.size(0)) for row in target_rows)
-        target_ids = torch.zeros(batch_size, max_len, dtype=torch.long, device=self.device)
-        target_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=self.device)
-        loss_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=self.device)
-        for b, (seq, loss) in enumerate(zip(target_rows, loss_rows, strict=True)):
-            slen = int(seq.size(0))
-            target_ids[b, :slen] = seq
-            target_mask[b, :slen] = True
-            loss_mask[b, :slen] = loss
+            # prefix: [issue | bgkit_prefix] — survivors are inserted after this
+            pre = torch.cat([issue_i, prefix_token], dim=0)
+            # suffix: [bgkit_suffix | traj] — follows the survivors
+            suf = torch.cat([suffix_token, traj_i], dim=0)
 
-        return (
-            target_ids,
-            target_mask,
-            loss_mask,
-            torch.tensor(splice_starts, dtype=torch.long, device=self.device),
-            torch.tensor(splice_lens, dtype=torch.long, device=self.device),
-        )
+            prefix_ids.append(pre)
+            suffix_ids.append(suf)
+
+            # Loss mask for suffix: False for bgkit wrapper tokens, True for traj
+            pre_len = pre.size(0)
+            suf_len = suf.size(0)
+            lm_suf = torch.zeros(suf_len, dtype=torch.bool, device=self.device)
+            lm_suf[bgkit_suffix_len:] = True  # trajectory positions only
+            loss_mask_parts.append((pre_len, suf_len, lm_suf))
+
+        return prefix_ids, suffix_ids, loss_mask_parts
+
+    def _make_flat_loss_mask(
+        self,
+        loss_mask_parts: list[tuple[int, int, torch.Tensor]],
+        survivor_cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build the flat (N_total,) loss mask for forward_with_single_splice.
+
+        forward_with_single_splice lays out each sample as
+        [prefix_i | survivors_i | suffix_i].  This helper mirrors that layout
+        and marks only the trajectory sub-tokens inside each suffix as True.
+
+        Parameters
+        ----------
+        loss_mask_parts:
+            Per-sample ``(pre_len, suf_len, lm_suf)`` tuples from
+            ``_build_decoder_inputs``.
+        survivor_cu_seqlens:
+            ``(B+1,)`` int32 survivor counts, or a zeros tensor when context
+            is absent.
+
+        Returns
+        -------
+        Tensor
+            ``(N_total,)`` bool.
+        """
+        surv_counts = (survivor_cu_seqlens[1:] - survivor_cu_seqlens[:-1]).tolist()
+        all_parts: list[torch.Tensor] = []
+        for b, (pre_len, _suf_len, lm_suf) in enumerate(loss_mask_parts):
+            k_i = int(surv_counts[b])
+            pre_zeros = torch.zeros(pre_len, dtype=torch.bool, device=self.device)
+            surv_zeros = torch.zeros(k_i, dtype=torch.bool, device=self.device)
+            all_parts.extend([pre_zeros, surv_zeros, lm_suf])
+        return torch.cat(all_parts, dim=0)
 
     def _forward_backward(self, batch) -> dict[str, float]:
         """Distillation forward pass with multi-source context and issue tokens.
@@ -481,61 +590,37 @@ class DistillationTrainer(BaseTrainer):
         """
         inject = random.random() > self._no_injection_fraction
 
-        trajectory_ids = batch["trajectory_token_ids"].to(self.device)
-        trajectory_mask = batch["trajectory_attention_mask"].to(self.device)
-        batch_size = trajectory_ids.size(0)
+        batch_size = len(batch["repos"])
+        issue_len = int(batch["issue_cu_seqlens"][-1]) if "issue_cu_seqlens" in batch else 0
 
-        has_issue = "issue_token_ids" in batch
-
-        if has_issue:
-            issue_ids = batch["issue_token_ids"].to(self.device)
-            issue_mask = batch["issue_attention_mask"].to(self.device)
-            issue_len = issue_ids.size(1)
-        else:
-            issue_len = 0
-
-        # Determine BgKIT context
+        # Determine BgKIT context (packed)
         bgkit_context = self._get_bgkit_context(batch) if inject else None
 
-        target_ids, target_mask, loss_mask, splice_starts, splice_lens = (
-            self._build_decoder_targets(
-                trajectory_ids,
-                trajectory_mask,
-                issue_ids if has_issue else None,
-                issue_mask if has_issue else None,
-            )
-        )
+        prefix_ids, suffix_ids, loss_mask_parts = self._build_decoder_inputs(batch)
 
-        context_sources = 0
         if bgkit_context is not None:
-            context_embeds, context_mask = bgkit_context
-            context_sources = int(context_mask.any(dim=-1).sum().item())
-            loss = self.decoder.forward_with_single_splice(
-                survivor_embeddings=context_embeds,
-                survivor_attention_mask=context_mask,
-                token_ids=target_ids,
-                token_attention_mask=target_mask,
-                splice_starts=splice_starts,
-                splice_lengths=splice_lens,
-                loss_mask=loss_mask,
+            flat_embeddings, survivor_cu = bgkit_context
+            context_sources = int(
+                (survivor_cu[1:] - survivor_cu[:-1]).gt(0).sum().item()
             )
         else:
-            # Preserve the same in-sequence geometry even when context is absent.
-            empty_context = torch.zeros(
-                batch_size, 1, self.decoder.hidden_dim,
-                dtype=self.decoder.backbone.get_input_embeddings().weight.dtype,
-                device=self.device,
-            )
-            empty_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=self.device)
-            loss = self.decoder.forward_with_single_splice(
-                survivor_embeddings=empty_context,
-                survivor_attention_mask=empty_mask,
-                token_ids=target_ids,
-                token_attention_mask=target_mask,
-                splice_starts=splice_starts,
-                splice_lengths=splice_lens,
-                loss_mask=loss_mask,
-            )
+            # Empty survivors: zero-length for every sample
+            zero_lengths = [0] * batch_size
+            survivor_cu = _make_cu_seqlens(zero_lengths).to(self.device)
+            embed_dtype = self.decoder.backbone.get_input_embeddings().weight.dtype
+            flat_embeddings = torch.zeros(0, self.decoder.hidden_dim, dtype=embed_dtype,
+                                          device=self.device)
+            context_sources = 0
+
+        flat_loss_mask = self._make_flat_loss_mask(loss_mask_parts, survivor_cu)
+
+        loss = self.decoder.forward_with_single_splice(
+            survivor_embeddings=flat_embeddings,
+            survivor_cu_seqlens=survivor_cu,
+            prefix_ids=prefix_ids,
+            suffix_ids=suffix_ids,
+            loss_mask=flat_loss_mask,
+        )
 
         (loss / self._accum_steps).backward()
         return {
@@ -554,53 +639,38 @@ class DistillationTrainer(BaseTrainer):
         batches_no_ctx = 0
 
         for batch in self.eval_dataloader:
-            trajectory_ids = batch["trajectory_token_ids"].to(self.device)
-            trajectory_mask = batch["trajectory_attention_mask"].to(self.device)
-            batch_size = trajectory_ids.size(0)
+            batch_size = len(batch["repos"])
 
-            has_issue = "issue_token_ids" in batch
-            if has_issue:
-                issue_ids = batch["issue_token_ids"].to(self.device)
-                issue_mask = batch["issue_attention_mask"].to(self.device)
-            else:
-                issue_ids = None
-                issue_mask = None
-            target_ids, target_mask, loss_mask, splice_starts, splice_lens = (
-                self._build_decoder_targets(
-                    trajectory_ids, trajectory_mask, issue_ids, issue_mask,
-                )
-            )
+            prefix_ids, suffix_ids, loss_mask_parts = self._build_decoder_inputs(batch)
 
             # Eval with context
             bgkit_context = self._get_bgkit_context(batch)
             if bgkit_context is not None:
-                context_embeds, context_mask = bgkit_context
+                flat_embeddings, survivor_cu = bgkit_context
+                flat_loss_mask = self._make_flat_loss_mask(loss_mask_parts, survivor_cu)
                 loss_ctx = self.decoder.forward_with_single_splice(
-                    survivor_embeddings=context_embeds,
-                    survivor_attention_mask=context_mask,
-                    token_ids=target_ids,
-                    token_attention_mask=target_mask,
-                    splice_starts=splice_starts,
-                    splice_lengths=splice_lens,
-                    loss_mask=loss_mask,
+                    survivor_embeddings=flat_embeddings,
+                    survivor_cu_seqlens=survivor_cu,
+                    prefix_ids=prefix_ids,
+                    suffix_ids=suffix_ids,
+                    loss_mask=flat_loss_mask,
                 )
                 total_loss_with_ctx += loss_ctx.item()
                 batches_with_ctx += 1
             else:
-                empty_context = torch.zeros(
-                    batch_size, 1, self.decoder.hidden_dim,
-                    dtype=self.decoder.backbone.get_input_embeddings().weight.dtype,
-                    device=self.device,
+                zero_lengths = [0] * batch_size
+                survivor_cu = _make_cu_seqlens(zero_lengths).to(self.device)
+                embed_dtype = self.decoder.backbone.get_input_embeddings().weight.dtype
+                flat_embeddings = torch.zeros(
+                    0, self.decoder.hidden_dim, dtype=embed_dtype, device=self.device,
                 )
-                empty_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=self.device)
+                flat_loss_mask = self._make_flat_loss_mask(loss_mask_parts, survivor_cu)
                 loss_no = self.decoder.forward_with_single_splice(
-                    survivor_embeddings=empty_context,
-                    survivor_attention_mask=empty_mask,
-                    token_ids=target_ids,
-                    token_attention_mask=target_mask,
-                    splice_starts=splice_starts,
-                    splice_lengths=splice_lens,
-                    loss_mask=loss_mask,
+                    survivor_embeddings=flat_embeddings,
+                    survivor_cu_seqlens=survivor_cu,
+                    prefix_ids=prefix_ids,
+                    suffix_ids=suffix_ids,
+                    loss_mask=flat_loss_mask,
                 )
                 total_loss_no_ctx += loss_no.item()
                 batches_no_ctx += 1

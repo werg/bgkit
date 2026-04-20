@@ -54,11 +54,33 @@ def test_phase2_dataset_loads_and_builds_targets(tmp_path):
     assert sample.tags == ["a/b", "c"]
 
 
-def test_collate_qa_pads_question_answer_and_target(tmp_path):
+def test_collate_qa_packed_shapes(tmp_path):
+    """Packed collator produces flat (N,) tensors with cu_seqlens, no padding."""
     ds = Phase2QADataset(str(_write_phase2_artifacts(tmp_path / "qa")))
     batch = collate_qa([ds[0], ds[1]])
-    assert batch["content_token_ids"].shape == (2, 3)
-    assert batch["question_token_ids"].shape == (2, 2)
-    assert batch["answer_token_ids"].shape == (2, 3)
-    assert batch["target_token_ids"].shape == (2, 5)
-    assert batch["target_loss_mask"][1].tolist() == [False, True, False, False, False]
+
+    # content: sample 0 has 3 tokens, sample 1 has 2 tokens → N=5
+    N_content = batch["content_cu_seqlens"][-1].item()
+    assert batch["content_token_ids"].shape == (N_content,)
+    assert N_content == 3 + 2
+
+    # question: sample 0 has 2 tokens, sample 1 has 1 token → N=3
+    N_q = batch["question_cu_seqlens"][-1].item()
+    assert batch["question_token_ids"].shape == (N_q,)
+    assert N_q == 2 + 1
+
+    # answer: sample 0 has 3 tokens, sample 1 has 1 token → N=4
+    N_a = batch["answer_cu_seqlens"][-1].item()
+    assert batch["answer_token_ids"].shape == (N_a,)
+    assert N_a == 3 + 1
+
+    # target: sample 0 has 5 tokens, sample 1 has 2 tokens → N=7
+    N_t = batch["target_cu_seqlens"][-1].item()
+    assert batch["target_token_ids"].shape == (N_t,)
+    assert batch["target_loss_mask"].shape == (N_t,)
+
+    # cu_seqlens invariants
+    cu = batch["content_cu_seqlens"]
+    assert cu[0].item() == 0
+    assert cu.shape[0] == 3  # B+1 = 2+1
+    assert "attention_mask" not in batch

@@ -24,8 +24,21 @@ lr: 2.0e-4               # base LR (encoder gets this)
 decoder_lr: 1.0e-5        # decoder LoRA LR (low — LoRA concentrates gradients)
 encoder_lr: 2.0e-4        # encoder LR (higher — pruned encoder needs to adapt)
 warmup_steps: 500
-max_batch_tokens: 32768
-gradient_accumulation_steps: 2
+# Packed-attention migration (Wave 4, 2026-04-20 sweep):
+# Profile data (profile_packed_memory_phase1_step3_20260420_175933, at
+# gradient_checkpointing=false) shows CUDA peak at 65536 tokens =
+# 28.6 GB, at 98304 = 36.6 GB — both well under the 85 GB safety rail
+# with ≥ 15 GB headroom for eval + gen. 65536 is chosen as the working
+# budget because (a) the 98304 sample count jumped 30 → 28 and wall
+# time jumped 17s → 72s, suggesting allocator-level overhead past
+# 65536; (b) 65536 matches the pre-migration effective batch (8192*8)
+# exactly, so gradient dynamics don't shift. Eval doubled to 131072
+# (no backward → bigger pack fine). grad_accum = 1 (budget already
+# reaches the effective-batch target).
+max_batch_tokens: 65536
+max_batch_tokens_eval: 131072
+gradient_accumulation_steps: 1
+gradient_checkpointing: false
 max_eval_samples: 500
 eval_every: 500
 save_every: 500

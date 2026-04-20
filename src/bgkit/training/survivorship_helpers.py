@@ -1,4 +1,4 @@
-"""Shared survivorship-loss + dual-ascent helpers.
+"""Shared survivorship-loss + dual-ascent helpers (packed-only).
 
 Five trainers (Step 1, Step 3 via decoder_init.py; Step 2 via pruning_distill.py;
 Step 4 via commit_encoding.py; Step 5 via compression.py; Phase 2 via
@@ -11,6 +11,16 @@ Each trainer imports and calls the helpers; per-trainer specialization happens
 via per-level config (``cfg.survivorship[level]``, ``cfg.ice_distillation[level]``,
 ``cfg.moment_match_reference[level]``).
 
+Packed-batch convention
+-----------------------
+All tensors follow the FA4 varlen packed convention (see
+``bgkit.utils.packing``): flat axis ``(N,)`` with no padding tokens,
+sample boundaries encoded in ``cu_seqlens: (B+1,) int32`` where
+``cu_seqlens[0] == 0`` and ``cu_seqlens[-1] == N``. Any per-sample
+reductions use :func:`bgkit.utils.packing.segment_sum` /
+:func:`bgkit.utils.packing.segment_mean`. ``attention_mask`` parameters
+are gone — every packed position is a real token.
+
 ICE is NOT called online after BCE warmup. Reference moments are pre-computed
 offline by ``scripts/probe_ice_distribution.py`` and loaded as fixed floats.
 The trained model has zero runtime ICE dependency — ICE can be freed via
@@ -20,14 +30,21 @@ The trained model has zero runtime ICE dependency — ICE can be freed via
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+
+from bgkit.utils.packing import lengths_from_cu, position_ids_from_cu
 import torch.nn.functional as F
 from torch import Tensor
 
 from bgkit.models.components.selection import moment_match_loss
+from bgkit.utils.packing import (
+    lengths_from_cu,
+    segment_ids_from_cu,
+    segment_sum,
+)
 
 
 @dataclass
@@ -39,6 +56,18 @@ class MicrobatchAggState:
     true global mean at optimizer-step time, NOT mean-of-means (which is biased
     when microbatch sizes differ).
 
+    **Shape-agnostic / packed-mode compatible.** This class operates purely on
+    zero-dim ``(sum, count)`` scalars produced by the encoder operator — it
+    has no knowledge of, and no dependency on, how those scalars were derived.
+    Under the FA4 packed-attention migration, valid positions are the ``N``
+    real tokens in a flat ``(N,)`` buffer (padding is absent), so the
+    ``organic_count`` / ``controllable_count`` that the operator records are
+    simply counts over flat positions rather than over a ``(B, L)`` grid
+    with a boolean mask. The ``(sum, count)`` reduction is identical in both
+    cases — only the counting primitive changes. This class therefore remains
+    the integration point for dual-ascent θ updates under both padded and
+    packed encoder conventions.
+
     Fields start as Python ints/floats so ``init_state()`` remains fully
     Python-side and cheap. On the first ``accumulate()`` call they upgrade
     to zero-dim tensors on the encoder's device; further accumulations are
@@ -46,9 +75,9 @@ class MicrobatchAggState:
     point per optimizer step is in ``apply_post_step_updates``.
     """
 
-    organic_count_sum: "int | torch.Tensor" = 0
-    controllable_count_sum: "int | torch.Tensor" = 0
-    controllable_empty_count: "int | torch.Tensor" = 0
+    organic_count_sum: int | torch.Tensor = 0
+    controllable_count_sum: int | torch.Tensor = 0
+    controllable_empty_count: int | torch.Tensor = 0
 
 
 def init_state() -> MicrobatchAggState:
@@ -62,9 +91,24 @@ def _is_tensor(x) -> bool:
 def accumulate(state: MicrobatchAggState, enc_out) -> None:
     """Append per-microbatch (sum, count) tuples — never pre-divide.
 
-    Keeps accumulators on-device as zero-dim tensors after the first
-    accumulate call. No .item() is called here, so there is no GPU→CPU
-    sync per microbatch.
+    Consumes zero-dim ``organic_count`` / ``controllable_count`` /
+    ``valid_count`` tensors off ``enc_out``. These scalars are produced by
+    the encoder operator's compression step, where:
+
+    - In **padded** mode: ``controllable_count = valid_positions - pinned``,
+      counted over a ``(B, L)`` masked tensor.
+    - In **packed** mode (FA4 varlen): ``controllable_count = N_packed - pinned``,
+      counted over a flat ``(N,)`` buffer with no padding tokens.
+      ``N_packed = lengths_from_cu(cu_seqlens).sum()`` for the controllable
+      subset. Because every packed position is a real token there is no mask
+      — the counting arithmetic is equivalent, only the iteration domain changes.
+
+    Either way the value arriving here is a zero-dim integer tensor. The
+    ``(sum, count)`` accumulation is identical, so ``accumulate`` is correct
+    under both conventions without modification.
+
+    Keeps accumulators on-device as zero-dim tensors after the first call.
+    No ``.item()`` is called here, so there is no GPU→CPU sync per microbatch.
     """
     if enc_out.controllable_count is None or enc_out.valid_count is None:
         # No compression in this microbatch (e.g. target_ratio=None).
@@ -215,24 +259,22 @@ def survivorship_diagnostics(
     as floats for logging. Each read forces a GPU→CPU sync, so the caller
     gates on ``every_n_steps`` (default 1 = every step).
 
+    In the packed world ``survivor_mask`` is a flat ``(N,)`` bool tensor
+    and ``content_cu_seqlens`` (optional ``(B+1,)`` int32) encodes
+    sample boundaries. When ``content_cu_seqlens`` is absent we fall back
+    to treating the whole flat buffer as one sample (useful for unit
+    tests); the resulting per-sample survivor counts are degenerate but
+    still produce a sensible scalar.
+
     Emits:
 
     - ``{level}_organic_rate_std``: std of per-sample organic keep rates.
-      Near-zero means the head is compressing at a near-constant rate
-      regardless of content — a collapse mode invisible to the aggregate
-      mean rate + θ. Expected to be meaningfully > 0 at a healthy L1.
     - ``{level}_undecided_fraction``: fraction of ``survive_probs`` in
-      [0.2, 0.8] (the "uncommitted middle"). Low = head is committing to
-      binary decisions (healthy); high = head is refusing to decide
-      (utility-grad BCE not yet providing signal, or decisiveness curriculum
-      needs more weight).
+      [0.2, 0.8].
     - ``{level}_floor_trigger_rate``, ``{level}_num_pinned``,
-      ``{level}_theta``: existing per-level operator diagnostics pulled
-      through the same gate so all head-health metrics emit on the same
-      cadence.
-
-    Returns an empty dict when the gate is closed or when compression
-    is disabled on this ``enc_out``.
+      ``{level}_theta``: per-level operator diagnostics.
+    - ``{level}_zero_survivor_rate``, ``{level}_low_survivor_rate_lt5``,
+      ``{level}_median_survivors``: per-sample survivor-count tails.
     """
     if every_n_steps <= 1:
         should_emit = True
@@ -265,7 +307,19 @@ def survivorship_diagnostics(
     # cadence so we can track the min_survivors_loss's effect over time.
     surv_mask = getattr(enc_out, "survivor_mask", None)
     if surv_mask is not None:
-        hard_counts = surv_mask.sum(dim=1).float()
+        cu = getattr(enc_out, "content_cu_seqlens", None)
+        if cu is not None and surv_mask.ndim == 1:
+            # Packed flat mask: per-sample counts via segment_sum.
+            seg_ids = segment_ids_from_cu(cu, surv_mask.shape[0])
+            hard_counts = segment_sum(
+                surv_mask.to(torch.float32), seg_ids, int(cu.shape[0] - 1),
+            )
+        elif surv_mask.ndim == 2:
+            # Padded legacy mask — kept for test-shim compatibility.
+            hard_counts = surv_mask.sum(dim=1).float()
+        else:
+            # Flat mask, no cu_seqlens: treat as a single sample.
+            hard_counts = surv_mask.to(torch.float32).sum().unsqueeze(0)
         metrics[f"{prefix}_zero_survivor_rate"] = float(
             (hard_counts == 0).float().mean().item(),
         )
@@ -278,7 +332,7 @@ def survivorship_diagnostics(
     return metrics
 
 
-def _effective_decisiveness_weight(weights: "LevelLossCfg", global_step: int) -> float:
+def _effective_decisiveness_weight(weights: LevelLossCfg, global_step: int) -> float:
     """Linear-anneal decisiveness weight from ``decisiveness_warmup_weight``
     at step 0 to ``decisiveness_loss_weight`` at ``decisiveness_warmup_steps``.
 
@@ -317,11 +371,18 @@ def compute_survivorship_losses(
     ice_teacher,
     global_step: int,
     content_token_ids: Tensor | None,
-    content_attn_mask: Tensor | None,
+    content_cu_seqlens: Tensor | None,
     target_ratio: float,
     answer_position_mask: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, float]]:
     """Compose ratio + decisiveness + moment_match + bce_warmup losses.
+
+    All tensors are packed: ``base_raw`` and ``logits_for_op`` on
+    ``enc_out`` are flat ``(N,)``; ``content_token_ids`` is flat
+    ``(N,)`` or ``None``; ``content_cu_seqlens`` is the packed-batch
+    ``(B+1,)`` int32 boundary tensor; ``answer_position_mask`` is a flat
+    ``(N,)`` bool tensor or ``None``. There is no ``attention_mask`` —
+    every packed position is a valid token.
 
     Gradient routing (per the design doc):
 
@@ -336,6 +397,10 @@ def compute_survivorship_losses(
       dual-ascent θ and decisiveness is usually the L1 cold-start signal
       only. A warning fires if ratio_loss_weight > 0.
 
+    - **Min-survivors** is per-sample: ``segment_sum`` of soft gates gives
+      soft survivor count per sample; the relative-deficit hinge is mean'd
+      over samples.
+
     - **Utility-gradient BCE** is NOT in this composition. It requires
       a post-main-backward step (the compressor's backward hook captures
       ``grad · value``) and is therefore added directly in the trainer's
@@ -347,7 +412,13 @@ def compute_survivorship_losses(
     can be freed via ice_teacher.unload() after warmup.
     """
     metrics: dict[str, float] = {}
-    device = enc_out.base_raw.device if enc_out.base_raw is not None else torch.device("cpu")
+    base_raw = enc_out.base_raw
+    logits_for_op = enc_out.logits_for_op
+    device = (
+        base_raw.device if base_raw is not None
+        else logits_for_op.device if logits_for_op is not None
+        else torch.device("cpu")
+    )
     total = torch.tensor(0.0, device=device)
 
     # Guard: ratio loss competes with the dual-ascent θ controller. The
@@ -366,33 +437,28 @@ def compute_survivorship_losses(
             stacklevel=2,
         )
 
-    base_raw = enc_out.base_raw
-    logits_for_op = enc_out.logits_for_op
     # Early-return only if BOTH are missing — ratio/decisiveness only need
     # logits_for_op; BCE/moment-match only need base_raw.
     if base_raw is None and logits_for_op is None:
         return total, metrics
 
-    # Build valid mask in content-space. Shape from whichever of base_raw
-    # or logits_for_op is available.
+    # All packed positions are valid tokens. Keep a scalar count for guard
+    # conditions.
     shape_ref = base_raw if base_raw is not None else logits_for_op
-    if content_attn_mask is not None:
-        valid = content_attn_mask.bool()
-    else:
-        valid = torch.ones(shape_ref.shape[:2], dtype=torch.bool, device=device)
-    valid_count = int(valid.sum().item())
+    n_valid = int(shape_ref.shape[0]) if shape_ref.ndim >= 1 else 0
 
     # Ratio + decisiveness are operator-side losses — they consume the
-    # ATTACHED logits_for_op (gradient flows into the operator = base + adapter
-    # composition). Must NOT read survive_probs_metrics, which is detached
-    # and would silently produce constant-valued losses that train nothing.
-    # Recompute probs from logits_for_op + θ using the controller's fp32 view
-    # so the probability construction matches the operator exactly.
-    logits_for_op = enc_out.logits_for_op
+    # ATTACHED logits_for_op (gradient flows into the operator = base +
+    # adapter composition). Must NOT read survive_probs_metrics, which is
+    # detached and would silently produce constant-valued losses that train
+    # nothing. Recompute probs from logits_for_op + θ using the controller's
+    # fp32 view so the probability construction matches the operator exactly.
     need_probs = (
-        (weights.ratio_loss_weight > 0.0 or weights.decisiveness_loss_weight > 0.0)
+        (weights.ratio_loss_weight > 0.0 or weights.decisiveness_loss_weight > 0.0
+         or (weights.decisiveness_warmup_weight > 0.0
+             and weights.decisiveness_warmup_steps > 0))
         and logits_for_op is not None
-        and valid_count > 0
+        and n_valid > 0
     )
     probs_op: torch.Tensor | None = None
     if need_probs:
@@ -411,129 +477,135 @@ def compute_survivorship_losses(
         ).to(logits_for_op.dtype)
 
     # Aggregate ratio loss (operator-side): (mean(σ(logits_for_op − θ)) − target)²
+    # In packed form every position is valid, so the global mean is just
+    # probs_op.mean().
     if weights.ratio_loss_weight > 0.0 and probs_op is not None:
-        valid_f = valid.to(probs_op.dtype)
-        mean_prob = (probs_op * valid_f).sum() / valid_f.sum().clamp(min=1)
+        mean_prob = probs_op.float().mean()
         ratio_loss = (mean_prob - target_ratio) ** 2
         metrics["ratio_loss"] = float(ratio_loss.item())
         metrics["mean_survive_prob"] = float(mean_prob.item())
-        total = total + weights.ratio_loss_weight * ratio_loss
+        total = total + weights.ratio_loss_weight * ratio_loss.to(total.dtype)
 
     # Decisiveness loss (operator-side): mean(4 · p · (1 − p)) penalizes p≈0.5.
     # With warmup configured, hold ``decisiveness_warmup_weight`` at step 0
     # and linearly anneal down to the steady-state ``decisiveness_loss_weight``
-    # over ``decisiveness_warmup_steps``. Used at L1 cold-start — a strong
-    # early bimodal push breaks symmetry before utility-grad BCE is strong
-    # enough to do so on its own; annealing out avoids fighting utility-grad
-    # BCE once it
-    # has taken over.
+    # over ``decisiveness_warmup_steps``.
     effective_decisiveness_weight = _effective_decisiveness_weight(weights, global_step)
     if effective_decisiveness_weight > 0.0 and probs_op is not None:
-        valid_f = valid.to(probs_op.dtype)
-        decisive = ((4.0 * probs_op * (1.0 - probs_op)) * valid_f).sum() / valid_f.sum().clamp(min=1)
+        decisive = (4.0 * probs_op.float() * (1.0 - probs_op.float())).mean()
         metrics["decisiveness_loss"] = float(decisive.item())
         metrics["decisiveness_weight"] = effective_decisiveness_weight
-        total = total + effective_decisiveness_weight * decisive
+        total = total + effective_decisiveness_weight * decisive.to(total.dtype)
 
-    # Minimum-survivors loss (operator-side). Relative squared hinge on
-    # a per-sample soft survivor count, with larger-tau sigmoid to get
-    # gradient through tanh saturation (the head's zero-survivor mode).
-    # N_min_per_sample = max(absolute_min, ceil(floor_ratio * content_len))
-    # deficit = max(0, 1 - soft_count / N_min); loss = mean(deficit^2)
-    # Loss is bounded in [0, 1] and scale-invariant in content length.
+    # Minimum-survivors loss (operator-side, per-sample). Relative squared
+    # hinge on the soft survivor count. Requires cu_seqlens to produce
+    # per-sample counts — without it we fall back to treating the whole
+    # flat buffer as one sample.
     if (
         weights.min_survivors_loss_weight > 0.0
         and logits_for_op is not None
-        and valid_count > 0
+        and n_valid > 0
     ):
         theta_t_ms = getattr(enc_out, "theta_tensor", None)
         if theta_t_ms is None:
             theta_t_ms = torch.tensor(0.0, device=logits_for_op.device)
         tau = max(1e-3, weights.min_survivors_tau)
         # Soft gate per position, NaN-safe with larger tau to survive
-        # tanh saturation: sigmoid'(x) is non-negligible where the
-        # operator's own sigmoid gradient vanishes.
+        # tanh saturation.
         soft_gates = torch.sigmoid(
             (logits_for_op.float() - theta_t_ms.to(logits_for_op.device).float()) / tau,
         )
-        valid_f_ms = valid.to(soft_gates.dtype)
-        soft_count_per_sample = (soft_gates * valid_f_ms).sum(dim=1)  # (B,)
-        content_len_per_sample = valid_f_ms.sum(dim=1)  # (B,)
+        if content_cu_seqlens is not None:
+            num_segs = int(content_cu_seqlens.shape[0] - 1)
+            seg_ids = segment_ids_from_cu(
+                content_cu_seqlens.to(logits_for_op.device),
+                soft_gates.shape[0],
+            )
+            soft_count_per_sample = segment_sum(soft_gates, seg_ids, num_segs)
+            content_len_per_sample = lengths_from_cu(
+                content_cu_seqlens.to(logits_for_op.device),
+            ).to(soft_gates.dtype)
+        else:
+            # Single-sample fallback: whole flat buffer is one sample.
+            soft_count_per_sample = soft_gates.sum().unsqueeze(0)
+            content_len_per_sample = torch.tensor(
+                [float(soft_gates.shape[0])], dtype=soft_gates.dtype,
+                device=soft_gates.device,
+            )
         target_min = torch.clamp(
             torch.ceil(content_len_per_sample * weights.min_survivors_floor_ratio),
             min=float(weights.min_survivors_absolute_min),
         )
-        # Relative deficit in [0, 1]. Guard against zero-length samples.
         denom = target_min.clamp(min=1.0)
         deficit = (1.0 - soft_count_per_sample / denom).clamp(min=0.0)
         min_surv_loss = (deficit ** 2).mean()
         metrics["min_survivors_loss"] = float(min_surv_loss.item())
         metrics["min_survivors_target_mean"] = float(target_min.float().mean().item())
-        metrics["min_survivors_soft_count_mean"] = float(soft_count_per_sample.mean().item())
+        metrics["min_survivors_soft_count_mean"] = float(
+            soft_count_per_sample.float().mean().item(),
+        )
         total = total + weights.min_survivors_loss_weight * min_surv_loss.to(total.dtype)
 
     # Moment match (base-side): standardized 3rd+4th moments of base_raw
     # vs fixed reference. Anchors base distribution shape to ICE.
     #
-    # Gated on global_step >= moment_match_start_step. Rationale: at step 0
-    # base_raw has near-zero std (fresh head), so standardized 3rd/4th
-    # moments are numerically unstable and can produce enormous loss values
-    # that dominate training and corrupt the encoder before BCE has installed
-    # any ranking. Delay until BCE has grown base_norm enough that
-    # standardization is well-conditioned.
+    # In packed form every position is valid, so the valid_mask passed to
+    # ``moment_match_loss`` is all-ones. (``moment_match_loss`` itself is
+    # shape-agnostic — it just standardizes across ``head_logits[valid_mask]``.)
     mm_active = (
         weights.moment_match_weight > 0.0
         and ref_moments is not None
-        and valid_count > 0
+        and base_raw is not None
+        and n_valid > 0
         and global_step >= weights.moment_match_start_step
     )
     if mm_active:
         ref_skew, ref_kurt = ref_moments
-        mm = moment_match_loss(base_raw, valid, ref_skew=ref_skew, ref_kurt=ref_kurt)
+        valid_all = torch.ones(
+            base_raw.shape[:1], dtype=torch.bool, device=base_raw.device,
+        )
+        mm = moment_match_loss(base_raw, valid_all, ref_skew=ref_skew, ref_kurt=ref_kurt)
         metrics["moment_match_loss"] = float(mm.item())
         total = total + weights.moment_match_weight * mm
 
-    # QA position supervision (base-side, Phase 1 Step 3 primary signal).
-    # BCE-with-logits on base_raw with target = 1 at answer-grounded
-    # positions and target = qa_non_answer_target at all other valid
-    # positions. Direct gradient on the head — does not depend on the
-    # decoder picking up the signal indirectly.
+    # QA position supervision (base-side). BCE-with-logits on base_raw with
+    # target = 1 at answer-grounded positions and
+    # target = qa_non_answer_target elsewhere. Direct gradient on the head
+    # — does not depend on the decoder picking up the signal indirectly.
     qa_active = (
         weights.qa_position_loss_weight > 0.0
         and answer_position_mask is not None
         and base_raw is not None
-        and valid_count > 0
+        and n_valid > 0
     )
     if qa_active:
-        # Align mask to base_raw shape; tolerate length mismatch from
-        # post-collation truncation by clipping to the shorter dimension.
         am = answer_position_mask.to(device=base_raw.device, dtype=torch.bool)
-        if am.shape != base_raw.shape:
-            min_b = min(am.size(0), base_raw.size(0))
-            min_l = min(am.size(1), base_raw.size(1))
-            am = am[:min_b, :min_l]
-            base_for_qa = base_raw[:min_b, :min_l]
-            valid_for_qa = valid[:min_b, :min_l]
+        # Clip to base_raw length for defensive alignment; a well-formed
+        # packed batch has am.shape == base_raw.shape already.
+        if am.shape[0] != base_raw.shape[0]:
+            min_n = min(am.shape[0], base_raw.shape[0])
+            am = am[:min_n]
+            base_for_qa = base_raw[:min_n]
         else:
             base_for_qa = base_raw
-            valid_for_qa = valid
         target = torch.where(
             am,
-            torch.ones_like(base_for_qa),
-            torch.full_like(base_for_qa, weights.qa_non_answer_target),
+            torch.ones_like(base_for_qa, dtype=torch.float32),
+            torch.full_like(base_for_qa, weights.qa_non_answer_target, dtype=torch.float32),
         )
-        bce_per_pos = torch.nn.functional.binary_cross_entropy_with_logits(
-            base_for_qa.float(), target.float(), reduction="none",
+        bce_per_pos = F.binary_cross_entropy_with_logits(
+            base_for_qa.float(), target, reduction="none",
         )
-        valid_f = valid_for_qa.to(bce_per_pos.dtype)
-        denom = valid_f.sum().clamp(min=1)
-        qa_loss = (bce_per_pos * valid_f).sum() / denom
+        qa_loss = bce_per_pos.mean()
         metrics["qa_position_loss"] = float(qa_loss.item())
-        metrics["qa_position_grounded_count"] = float((am & valid_for_qa).sum().item())
+        metrics["qa_position_grounded_count"] = float(am.sum().item())
         total = total + weights.qa_position_loss_weight * qa_loss.to(total.dtype)
 
     # BCE warmup (base-side): direct ICE-teacher supervision on base_raw.
     # Cuts off hard at bce_warmup_steps. ICE can be unloaded after.
+    # Teacher is produced per-sample by ICE; in packed form the teacher
+    # function receives flat content ids + cu_seqlens and returns a flat
+    # (N,) target tensor.
     bce_active = (
         ice_cfg.enabled
         and ice_teacher is not None
@@ -541,20 +613,16 @@ def compute_survivorship_losses(
         and global_step < ice_cfg.bce_warmup_steps
         and ice_cfg.bce_warmup_weight > 0.0
         and content_token_ids is not None
-        and content_attn_mask is not None
     )
     if bce_active:
         teacher = ice_teacher.teacher_mask(
-            content_token_ids, content_attn_mask, ice_cfg.teacher_ratio,
+            content_token_ids, content_cu_seqlens, ice_cfg.teacher_ratio,
         )
-        # BCE on base_raw → probs via sigmoid (with stable formulation).
-        # Use bce_with_logits-style: log σ(x) = -softplus(-x); log(1-σ(x)) = -softplus(x).
         x = base_raw.float()
-        bce_per_pos = torch.nn.functional.binary_cross_entropy_with_logits(
-            x, teacher, reduction="none",
+        bce_per_pos = F.binary_cross_entropy_with_logits(
+            x, teacher.float(), reduction="none",
         )
-        valid_f = content_attn_mask.float()
-        bce = (bce_per_pos * valid_f).sum() / valid_f.sum().clamp(min=1)
+        bce = bce_per_pos.mean()
         metrics["bce_warmup_loss"] = float(bce.item())
         metrics["bce_warmup_weight"] = ice_cfg.bce_warmup_weight
         total = total + ice_cfg.bce_warmup_weight * bce.to(total.dtype)
@@ -563,18 +631,18 @@ def compute_survivorship_losses(
 
 
 def _default_batch_to_content(batch):
-    """Default content extractor for Phase 1 trainers whose batches carry
-    ``content_token_ids`` + ``content_attention_mask`` tensors directly.
-    Returns ``(token_ids, attention_mask)`` or ``None`` if the batch
-    doesn't match that schema.
+    """Default content extractor for Phase 1 trainers whose packed batches
+    carry ``content_token_ids`` + ``content_cu_seqlens`` tensors directly.
+    Returns ``(token_ids, cu_seqlens)`` or ``None`` if the batch doesn't
+    match that schema.
     """
     if not isinstance(batch, dict):
         return None
     ids = batch.get("content_token_ids")
-    mask = batch.get("content_attention_mask")
-    if ids is None or mask is None:
+    cu = batch.get("content_cu_seqlens")
+    if ids is None or cu is None:
         return None
-    return ids, mask
+    return ids, cu
 
 
 @torch.no_grad()
@@ -598,27 +666,17 @@ def calibrate_head_tanh_temperature(
     from L0's, so sharing a single T under-uses L1's range).
 
     Runs a fresh backbone forward with ``return_intermediates=True`` to
-    get the layer-7 tap, applies the level's head to get ``base_raw``,
-    and averages std across ``n_probe_batches`` batches. Clamped to
-    ``t_floor`` to avoid a vanishing T on a near-constant fresh head.
-
-    Called at trainer startup for each level the trainer will train.
-    Returns the calibrated T (or None if the probe could not run).
-
-    Uses layer-7 activations from raw content as a stand-in for L1's
-    true input (L0 survivors). For a freshly-initialized L1 head the
-    difference is small: the output std is dominated by init scale and
-    hidden-dim, not by the modest distribution shift between raw content
-    and L0-compressed content. The result is a T within a factor of ~2
-    of the ideal, which keeps tanh in its linear region — the same
-    precision we get at the L0 sidecar-load probe.
+    get the layer-7 tap (packed), applies the level's head to get
+    ``base_raw`` as a flat ``(N,)`` tensor, and averages std across
+    ``n_probe_batches`` batches. Clamped to ``t_floor`` to avoid a
+    vanishing T on a near-constant fresh head.
 
     ``batch_to_content`` lets callers whose batches aren't plain dicts
-    with ``content_token_ids`` + ``content_attention_mask`` (e.g. Phase 2
-    KB, which batches ``KBSample`` objects) plug in their own extractor.
-    The callable receives a batch and returns
-    ``(token_ids: LongTensor, attention_mask: BoolTensor)`` or ``None``
-    to skip that batch. Defaults to the Phase 1 dict-based extractor.
+    with ``content_token_ids`` + ``content_cu_seqlens`` plug in their
+    own extractor. The callable receives a batch and returns
+    ``(token_ids: LongTensor (N,), cu_seqlens: IntTensor (B+1,))`` or
+    ``None`` to skip that batch. Defaults to the Phase 1 dict-based
+    extractor.
     """
     if level not in {"l0", "l1"}:
         raise ValueError(f"Unknown level: {level!r}")
@@ -639,14 +697,20 @@ def calibrate_head_tanh_temperature(
             extracted = batch_to_content(batch)
             if extracted is None:
                 continue
-            content_token_ids, content_mask = extracted
+            content_token_ids, content_cu_seqlens = extracted
             content_token_ids = content_token_ids.to(device)
-            content_mask = content_mask.to(device).bool()
+            content_cu_seqlens = content_cu_seqlens.to(device)
+            max_seqlen = int(lengths_from_cu(content_cu_seqlens).max().item())
+            position_ids = position_ids_from_cu(
+                content_cu_seqlens, int(content_token_ids.shape[0])
+            )
             embed_tokens = backbone.get_input_embeddings()
             inputs_embeds = embed_tokens(content_token_ids)
             backbone_out = backbone(
                 inputs_embeds=inputs_embeds,
-                attention_mask=content_mask,
+                cu_seqlens=content_cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_ids=position_ids,
                 return_intermediates=True,
             )
             intermediates = getattr(backbone_out, "hidden_states", None)
@@ -654,10 +718,9 @@ def calibrate_head_tanh_temperature(
                 return None
             layer7 = intermediates[1]
             base_raw = head(layer7.to(dtype=head.head[0].weight.dtype))
-            valid_f = content_mask.float()
-            denom = valid_f.sum().clamp(min=1)
-            mean = (base_raw.float() * valid_f).sum() / denom
-            var = (((base_raw.float() - mean) ** 2) * valid_f).sum() / denom
+            # Flat (N,) — every position is valid.
+            mean = base_raw.float().mean()
+            var = (base_raw.float() - mean).pow(2).mean()
             stds.append(float(var.clamp(min=1e-8).sqrt().item()))
             probed += 1
     finally:
@@ -729,13 +792,7 @@ def maybe_unload_ice(
     global_step: int,
     max_warmup_step: int,
 ) -> bool:
-    """If past warmup and ICE still loaded, unload it. Idempotent.
-
-    Trainers should call this once per optimizer step (cheap; the inner
-    ``unload`` is also idempotent). After warmup ends across all levels, ICE
-    is freed. The trained model has zero runtime ICE dependency post-warmup —
-    consistent with reference moments being pre-computed offline.
-    """
+    """If past warmup and ICE still loaded, unload it. Idempotent."""
     if ice_teacher is None:
         return False
     if not getattr(ice_teacher, "is_loaded", True):
@@ -770,44 +827,43 @@ def utility_grad_bce_loss(
     base_raw_for_util: Tensor | None,
     content_grad: Tensor | None,
     content_values: Tensor,
-    valid_mask: Tensor,
+    valid_mask: Tensor | None,
     pinned_mask: Tensor | None,
     target_ratio: float,
+    content_cu_seqlens: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, float]]:
     """Utility-gradient BCE distillation loss on the survivorship head.
 
-    Builds a binary top-k teacher over controllable positions by ranking
-    ``util_i = -(grad · value)_i`` (higher utility = position whose
-    value contributes more to *reducing* total loss), then BCE-with-logits
-    against the compressor-stashed ``base_raw_for_util`` (which was
-    computed as ``head(content_hidden.detach())`` inside the encoder's
-    LoRA context — so any active LoRA adapter is applied and receives
-    the utility-grad BCE backward).
+    Packed inputs (FA4 varlen). ``base_raw_for_util`` is flat ``(N,)``,
+    ``content_grad`` and ``content_values`` are flat ``(N, D)``,
+    ``valid_mask`` and ``pinned_mask`` are flat ``(N,)`` bool (or None
+    for "all valid" / "none pinned"), and ``content_cu_seqlens`` is the
+    packed-batch ``(B+1,)`` int32 boundary tensor.
+
+    In a well-formed packed batch ``valid_mask`` is typically ``None``
+    or all-True (padding is already absent from the flat buffer). The
+    parameter is kept so callers can exclude a handful of positions
+    post-hoc (e.g. content positions that the trainer classifies as
+    ignored) without repacking the buffer.
+
+    Segment-aware top-k. Within each sample the function:
+
+    1. Computes ``util_i = -(grad · value)_i`` over the sample's flat
+       positions.
+    2. Masks out non-controllable positions (``-inf``).
+    3. Picks the top ``k_i = max(1, ceil(ctrl_i * target_ratio))``
+       positions by utility.
+    4. Scatters ``True`` into a flat ``(N,)`` teacher at those
+       offset-adjusted indices.
+
+    The per-sample loop is O(B) and B is tiny (≤32) in typical
+    microbatches, so Python overhead is negligible.
 
     The ``base_raw_for_util`` subgraph is fully disjoint from the main
     backward path because its input is detached at the head boundary;
     ``total_loss.backward()`` does not free its activations, so
     ``util_loss.backward()`` traverses a clean, intact subgraph with no
     retain_graph needed.
-
-    Args:
-        base_raw_for_util: ``(B, L_content)`` head output from the
-            detached-input fork computed during the compressor forward.
-            When None (util-grad inactive on this forward), returns a
-            zero-loss scalar.
-        content_grad: ``(B, L_content, D)`` gradient on ``content_hidden``
-            captured by the compressor's backward hook during the main
-            backward. When None (backward hook didn't fire), returns a
-            zero-loss scalar.
-        content_values: ``(B, L_content, D)`` forward-time detached
-            stash of ``content_hidden``.
-        valid_mask: ``(B, L_content)`` bool mask of valid (non-padding)
-            content positions.
-        pinned_mask: optional ``(B, L_content)`` bool mask of positions
-            that are always-kept by the operator (excluded from teacher
-            and loss so they don't waste teacher capacity).
-        target_ratio: fraction of controllable positions that should
-            survive — drives the per-sample top-k count.
 
     Returns ``(loss, metrics)``.
     """
@@ -818,49 +874,58 @@ def utility_grad_bce_loss(
             {},
         )
 
+    N = base_raw_for_util.shape[0]
+    if valid_mask is None:
+        valid_mask = torch.ones(N, dtype=torch.bool, device=device)
+    else:
+        valid_mask = valid_mask.to(device=device, dtype=torch.bool)
     if pinned_mask is None:
         controllable = valid_mask
     else:
+        pinned_mask = pinned_mask.to(device=device, dtype=torch.bool)
         controllable = valid_mask & ~pinned_mask
 
-    if not controllable.any():
+    if not bool(controllable.any().item()):
         return (
             torch.zeros((), device=device, dtype=base_raw_for_util.dtype),
             {},
         )
 
-    # util_i = -(grad · value)_i. Computed in fp32 for numerical
-    # headroom — grad magnitudes can be small under bf16.
-    util = -(content_grad.float() * content_values.float()).sum(dim=-1)
-    # Mask out non-controllable positions with -inf so topk picks
-    # only from the controllable set.
+    # util_i = -(grad · value)_i. Computed in fp32 for numerical headroom.
+    util = -(content_grad.float() * content_values.float()).sum(dim=-1)  # (N,)
     util_masked = util.masked_fill(~controllable, float("-inf"))
 
-    # Per-sample top-k count = ceil(controllable_count * target_ratio),
-    # at least 1 so a fully controllable sample always produces a teacher
-    # positive.
-    ctrl_counts = controllable.sum(dim=-1)  # (B,)
-    ks = torch.clamp(
-        torch.ceil(ctrl_counts.float() * target_ratio).long(),
-        min=1,
+    # Build teacher via a segment-aware loop. Micro-batch count is small
+    # (≤32) so Python overhead is negligible; a vectorized alternative
+    # (torch.topk with per-segment offsets and scatter) buys nothing and
+    # is harder to read.
+    teacher = torch.zeros(N, dtype=torch.bool, device=device)
+    cu_list = (
+        [0, N] if content_cu_seqlens is None
+        else content_cu_seqlens.to(torch.int64).tolist()
     )
-    max_k = int(ks.max().item())
 
-    # torch.topk with a per-sample k isn't a native op — emulate via a
-    # single topk at max_k and then mask with a per-sample length.
-    _, top_indices = torch.topk(util_masked, k=max_k, dim=-1)
-    teacher = torch.zeros_like(base_raw_for_util, dtype=torch.bool)
-    # Build a (B, max_k) mask: column j is "j < k[sample]".
-    col = torch.arange(max_k, device=device).unsqueeze(0)  # (1, max_k)
-    within_k = col < ks.unsqueeze(-1)  # (B, max_k)
-    # Scatter True into teacher at top positions gated by within_k.
-    teacher.scatter_(
-        dim=-1, index=top_indices,
-        src=within_k,
-    )
-    # Also ensure no teacher positive landed on a non-controllable slot
-    # (defensive — the -inf fill should prevent this already, except when
-    # controllable_count < max_k and topk falls back to -inf positions).
+    num_segs = len(cu_list) - 1
+    for b in range(num_segs):
+        start = int(cu_list[b])
+        end = int(cu_list[b + 1])
+        if end <= start:
+            continue
+        ctrl_slice = controllable[start:end]
+        ctrl_count = int(ctrl_slice.sum().item())
+        if ctrl_count == 0:
+            continue
+        k = max(1, int(torch.ceil(torch.tensor(
+            ctrl_count * target_ratio, dtype=torch.float32)).item()))
+        k = min(k, ctrl_count)  # never exceed controllable positions
+        util_slice = util_masked[start:end]
+        # Within-sample top-k.
+        _, top_idx = torch.topk(util_slice, k=k)
+        # Scatter offset-adjusted flat indices.
+        teacher[start + top_idx] = True
+
+    # Guard: scatter respected controllable masks since we picked from
+    # ``util_masked`` with ``-inf`` fill; but re-apply to be defensive.
     teacher = teacher & controllable
 
     ctrl_f = controllable.to(base_raw_for_util.dtype)
@@ -869,11 +934,17 @@ def utility_grad_bce_loss(
         teacher.to(base_raw_for_util.dtype).float(),
         reduction="none",
     )
-    loss = (bce_per_pos * ctrl_f.float()).sum() / ctrl_f.float().sum().clamp(min=1.0)
+    denom = ctrl_f.float().sum().clamp(min=1.0)
+    loss = (bce_per_pos * ctrl_f.float()).sum() / denom
     loss = loss.to(base_raw_for_util.dtype)
 
     metrics = {
         "utility_grad_bce": float(loss.item()),
+        # Teacher rate is fraction of FLAT positions selected as teacher
+        # positives. In packed form this is ``teacher_positives / N`` —
+        # slightly different from the padded convention's
+        # ``teacher_positives / (B * L_max)`` because packed has no pad
+        # slots. This is the correct packed semantic.
         "utility_grad_teacher_rate": float(teacher.float().mean().item()),
     }
     return loss, metrics

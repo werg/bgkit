@@ -23,6 +23,12 @@ This script reuses the canonical Phase 2 token store via
 :class:`bgkit.data.article_token_store.ArticleTokenStore`. There is no
 sidecar ``{dataset}_tokens.parquet`` — tokens come from the same mmap
 files that the single-doc Phase 2 trainers consume.
+
+Packed-attention migration (Wave 4.4): the script now calls the packed
+encoder forward — flat ``(N_content, D)`` content embeddings with
+``content_cu_seqlens`` + per-article ``position_ids`` — and extracts
+survivors per article via ``survivor_cu_seqlens`` into the variable-length
+on-disk cache format.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ from bgkit.data.l0_cache import (
     write_cache_manifest,
 )
 from bgkit.models.lora_encoder import DEFAULT_LORA_TARGETS, LoRARouter
+from bgkit.utils.packing import position_ids_from_cu
 
 
 def _load_encoder_and_lora(
@@ -48,7 +55,7 @@ def _load_encoder_and_lora(
     stage_a_checkpoint: Path | None,
     lora_rank: int,
     lora_alpha: float | None,
-) -> tuple[torch.nn.Module, torch.nn.Module, LoRARouter | None]:
+) -> tuple[torch.nn.Module, LoRARouter | None]:
     """Load Phase 1 encoder, optionally install and load a Stage A LoRA.
 
     When ``stage_a_checkpoint`` is provided we install the same LoRA router
@@ -120,6 +127,31 @@ def alpha_or_default(alpha: float | None, rank: int) -> float:
     return float(alpha) if alpha is not None else 2.0 * rank
 
 
+def _pack_batch(
+    tokens_list: list[torch.Tensor],
+    embed_tokens: torch.nn.Module,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Concatenate per-article token tensors into a packed batch.
+
+    Returns ``(input_embeds, cu_seqlens, position_ids)`` where
+    ``input_embeds`` is ``(N, D)`` bf16-able, ``cu_seqlens`` is ``(B+1,)``
+    int32, and ``position_ids`` is ``(N,)`` int64.
+    """
+    lengths = torch.tensor(
+        [int(t.size(0)) for t in tokens_list], dtype=torch.int32,
+    )
+    cu_seqlens = torch.zeros(len(tokens_list) + 1, dtype=torch.int32)
+    cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
+    flat_tokens = torch.cat(
+        [t.to(device=device, dtype=torch.long) for t in tokens_list], dim=0,
+    )
+    input_embeds = embed_tokens(flat_tokens)
+    cu_seqlens = cu_seqlens.to(device)
+    position_ids = position_ids_from_cu(cu_seqlens, int(flat_tokens.size(0)))
+    return input_embeds, cu_seqlens, position_ids
+
+
 def _encode_and_write_batch(
     *,
     pending_ids: list[str],
@@ -134,31 +166,41 @@ def _encode_and_write_batch(
 ) -> int:
     """Encode + write a batch. Returns the number of articles actually
     written to the shard (excludes missing articles and zero-survivor rows).
+
+    Uses the packed encoder forward: all articles in the batch are packed
+    into one flat ``(N, D)`` buffer with per-article ``cu_seqlens``; the
+    encoder's varlen attention keeps articles from attending across their
+    boundaries. Survivors come out flat; ``survivor_cu_seqlens`` marks the
+    per-article boundaries for the on-disk cache.
     """
     if not pending_ids:
         return 0
     present = [aid for aid in pending_ids if token_store.has(dataset, aid)]
     if not present:
         return 0
-    tokens, mask = token_store.get_batch(dataset, present)
-    tokens = tokens.to(device)
-    mask = mask.to(device)
+    # Pull raw per-article token tensors (skip the padded batch API).
+    tokens_list = [token_store.get(dataset, aid) for aid in present]
     with torch.no_grad():
-        input_embeds = embed_tokens(tokens)
+        input_embeds, cu_seqlens, position_ids = _pack_batch(
+            tokens_list, embed_tokens, device,
+        )
         out = encoder(
-            input_embeddings=input_embeds,
-            attention_mask=mask,
+            content_embeddings=input_embeds,
+            content_cu_seqlens=cu_seqlens,
+            content_position_ids=position_ids,
             target_ratio=retention_ratio,
             level="l0",
         )
-        survivors = out.survivor_embeddings.cpu().float().numpy()
-        survivor_mask_cpu = out.survivor_attention_mask.cpu().numpy()
+        survivors_flat = out.survivor_embeddings.cpu().float().numpy()
+        survivor_cu = out.survivor_cu_seqlens.cpu().to(torch.int64).numpy()
     n_written = 0
     for i, aid in enumerate(present):
-        n = int(survivor_mask_cpu[i].sum())
+        start = int(survivor_cu[i])
+        end = int(survivor_cu[i + 1])
+        n = end - start
         if n == 0:
             continue
-        row = survivors[i, :n]
+        row = survivors_flat[start:end]
         writer.add(aid, row)
         index_rows.append((aid, len(index_rows)))
         n_written += 1
@@ -251,7 +293,6 @@ def main() -> None:
                     dataset=dataset,
                     token_store=token_store,
                     encoder=encoder,
-
                     embed_tokens=embed_tokens,
                     device=device,
                     retention_ratio=ratio,
@@ -280,7 +321,6 @@ def main() -> None:
                 dataset=dataset,
                 token_store=token_store,
                 encoder=encoder,
-                ice=ice,
                 embed_tokens=embed_tokens,
                 device=device,
                 retention_ratio=ratio,

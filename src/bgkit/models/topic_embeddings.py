@@ -118,12 +118,14 @@ class TopicEmbeddingModule(nn.Module):
             key = self._key(tag)
             freq = max(self.taxonomy.frequency(tag), 1)
             scale = math.sqrt(median_freq / freq)
-            groups.append({
-                "params": [self.embeddings[key]],
-                "lr": base_lr * scale,
-                "weight_decay": weight_decay,
-                "tag": tag,
-            })
+            groups.append(
+                {
+                    "params": [self.embeddings[key]],
+                    "lr": base_lr * scale,
+                    "weight_decay": weight_decay,
+                    "tag": tag,
+                }
+            )
         return groups
 
     # ------------------------------------------------------------------

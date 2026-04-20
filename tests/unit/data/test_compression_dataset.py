@@ -20,7 +20,7 @@ from bgkit.data.datasets.compression_dataset import (
     FileCompressionSample,
     RepoCompressionSample,
 )
-from bgkit.data.samplers import LengthSortedBatchSampler
+from bgkit.data.samplers import PackedTokenBudgetSampler
 
 # ---------------------------------------------------------------------------
 # Mock sub-datasets
@@ -318,8 +318,15 @@ class TestCompressionDataset:
 
 
 class TestCollateCompression:
+    """Packed-schema collator tests.
+
+    Wave 0.4 rewrote ``collate_compression`` to emit flat ``(N,)`` tensors
+    with ``cu_seqlens`` segmentation, replacing the old padded
+    ``(B, L_max)`` outputs. These tests assert the packed contract.
+    """
+
     def test_collate_file_samples(self):
-        """Collating FileCompressionSample should produce correct batch dict."""
+        """Collating FileCompressionSample yields flat content with cu_seqlens."""
         samples = [
             MockFileSubset(5, base_length=100, objective="data_reconstruction")[i]
             for i in range(3)
@@ -328,17 +335,21 @@ class TestCollateCompression:
 
         assert batch["sample_type"] == "file"
         assert len(batch["objectives"]) == 3
-        assert batch["content_token_ids"].shape[0] == 3
-        assert batch["content_attention_mask"].shape == batch["content_token_ids"].shape
-        assert batch["target_token_ids"].shape[0] == 3
+        # Packed: content is flat over all 3 samples.
+        n_content = batch["content_token_ids"].shape[0]
+        assert batch["content_cu_seqlens"].shape == (4,)
+        assert int(batch["content_cu_seqlens"][-1].item()) == n_content
+        assert batch["content_position_ids"].shape == (n_content,)
+        # Target / prefix / prompt are also flat with their own cu_seqlens.
+        assert batch["target_cu_seqlens"].shape == (4,)
         assert batch["target_loss_mask"].shape == batch["target_token_ids"].shape
-        assert batch["prefix_ids"].shape[0] == 3
-        assert batch["compression_prompt_ids"].shape[0] == 3
+        assert batch["prefix_cu_seqlens"].shape == (4,)
+        assert batch["prompt_cu_seqlens"].shape == (4,)
         assert batch["compression_ratios"].shape == (3,)
         assert batch["compression_levels"].shape == (3,)
 
     def test_collate_repo_samples(self):
-        """Collating RepoCompressionSample should produce 3D file tensor."""
+        """Repo samples yield two-level packing: cu_file_seqlens + cu_repo_seqlens."""
         samples = [
             MockRepoSubset(5, base_length=200, objective="commit_reproduction")[i]
             for i in range(3)
@@ -347,10 +358,16 @@ class TestCollateCompression:
 
         assert batch["sample_type"] == "repo"
         assert len(batch["objectives"]) == 3
-        assert batch["file_token_ids"].dim() == 3  # (batch, max_files, max_len)
-        assert batch["file_attention_masks"].shape == batch["file_token_ids"].shape
-        assert batch["file_count"].shape == (3,)
-        assert batch["target_token_ids"].shape[0] == 3
+        # Packed repo: content is flat over all files in all repos.
+        total_files = int(batch["cu_file_seqlens"].shape[0]) - 1
+        # cu_repo_seqlens has B+1 entries (3 repos → 4).
+        assert batch["cu_repo_seqlens"].shape == (4,)
+        assert int(batch["cu_repo_seqlens"][-1].item()) == total_files
+        # Prompt is tiled per file: prompt_cu_seqlens aligned 1:1 with cu_file_seqlens.
+        assert batch["prompt_cu_seqlens"].shape[0] == total_files + 1
+        # Per-repo target / prefix (B+1).
+        assert batch["target_cu_seqlens"].shape == (4,)
+        assert batch["prefix_cu_seqlens"].shape == (4,)
 
     def test_collate_mixed_batch(self):
         """Mixed batch should produce both file_batch and repo_batch."""
@@ -365,13 +382,14 @@ class TestCollateCompression:
         assert batch["repo_batch"]["sample_type"] == "repo"
 
     def test_collate_variable_lengths(self):
-        """Collator should pad shorter sequences to max length in batch."""
+        """Variable per-sample content lengths preserved in flat buffer + cu_seqlens."""
+        lengths = [50, 100, 75]
         samples = [
             FileCompressionSample(
                 objective="test",
                 content_token_ids=torch.ones(length, dtype=torch.long),
                 content_attention_mask=torch.ones(length, dtype=torch.bool),
-                        compression_ratio=0.2,
+                compression_ratio=0.2,
                 compression_level=0,
                 target_token_ids=torch.ones(30, dtype=torch.long),
                 target_attention_mask=torch.ones(30, dtype=torch.bool),
@@ -379,25 +397,30 @@ class TestCollateCompression:
                 prefix_ids=torch.ones(10, dtype=torch.long),
                 compression_prompt_ids=torch.ones(5, dtype=torch.long),
             )
-            for length in [50, 100, 75]
+            for length in lengths
         ]
         batch = collate_compression(samples)
 
-        # Content should be padded to max length (100)
-        assert batch["content_token_ids"].shape == (3, 100)
-        # Attention mask should reflect actual lengths
-        assert batch["content_attention_mask"][0].sum() == 50
-        assert batch["content_attention_mask"][1].sum() == 100
-        assert batch["content_attention_mask"][2].sum() == 75
+        # Content flat length == sum(lengths).
+        assert batch["content_token_ids"].shape == (sum(lengths),)
+        # cu_seqlens cumulative matches lengths.
+        cu = batch["content_cu_seqlens"].tolist()
+        assert cu == [0, 50, 150, 225]
+        # Per-sample length recoverable as cu[i+1] - cu[i].
+        per_sample_lengths = [cu[i + 1] - cu[i] for i in range(len(lengths))]
+        assert per_sample_lengths == lengths
+        # content_max_seqlen is a scalar int (largest per-sample length).
+        assert batch["content_max_seqlen"] == 100
 
     def test_collate_variable_file_counts(self):
-        """Repo samples with different file counts should be padded correctly."""
+        """Repo samples with different file counts: file segments preserved in cu_file_seqlens."""
+        file_counts = [2, 4, 3]
         samples = [
             RepoCompressionSample(
                 objective="test",
                 file_token_ids=[torch.ones(50, dtype=torch.long)] * n_files,
                 file_attention_masks=[torch.ones(50, dtype=torch.bool)] * n_files,
-                    compression_ratio=0.15,
+                compression_ratio=0.15,
                 compression_level=1,
                 target_token_ids=torch.ones(30, dtype=torch.long),
                 target_attention_mask=torch.ones(30, dtype=torch.bool),
@@ -405,135 +428,47 @@ class TestCollateCompression:
                 prefix_ids=torch.ones(10, dtype=torch.long),
                 compression_prompt_ids=torch.ones(5, dtype=torch.long),
             )
-            for n_files in [2, 4, 3]
+            for n_files in file_counts
         ]
         batch = collate_compression(samples)
 
-        # File dim should be padded to max (4)
-        assert batch["file_token_ids"].shape[1] == 4
-        assert batch["file_count"].tolist() == [2, 4, 3]
-        # Extra file slots should be zero-masked
-        assert batch["file_attention_masks"][0, 3].sum() == 0  # sample 0 has 2 files
+        total_files = sum(file_counts)
+        # cu_file_seqlens covers every file segment.
+        assert batch["cu_file_seqlens"].shape[0] == total_files + 1
+        assert int(batch["cu_file_seqlens"][-1].item()) == total_files * 50
+        # cu_repo_seqlens indexes into cu_file_seqlens at repo boundaries.
+        assert batch["cu_repo_seqlens"].tolist() == [0, 2, 6, 9]
+        # Each repo's file count recoverable as cu_repo[i+1] - cu_repo[i].
+        recovered = [
+            int(batch["cu_repo_seqlens"][i + 1].item())
+            - int(batch["cu_repo_seqlens"][i].item())
+            for i in range(len(file_counts))
+        ]
+        assert recovered == file_counts
 
 
 # ---------------------------------------------------------------------------
-# LengthSortedBatchSampler tests
+# LengthSortedBatchSampler tests — REMOVED.
+#
+# ``LengthSortedBatchSampler`` was deleted in Wave 0.2 of the FA4 packed-
+# attention migration. Its replacement, ``PackedTokenBudgetSampler``, is
+# covered by ``tests/unit/data/test_samplers.py``. The former class-level
+# behaviours (length-bucketing, batch-sort-within) no longer exist: packed
+# attention has a flat quadratic budget per microbatch so neither sorting
+# nor bucketing is needed.
 # ---------------------------------------------------------------------------
 
 
-class TestLengthSortedBatchSampler:
-    def test_all_indices_yielded_once(self):
-        """Every index should appear exactly once."""
-        ds = MockFileSubset(50, base_length=100)
-        sampler = LengthSortedBatchSampler(ds, max_batch_tokens=500, shuffle=False)
-
-        all_indices = []
-        for batch in sampler:
-            all_indices.extend(batch)
-
-        assert sorted(all_indices) == list(range(50))
-
-    def test_all_indices_yielded_once_with_shuffle(self):
-        """Shuffled sampler should still yield all indices exactly once."""
-        ds = MockFileSubset(50, base_length=100)
-        sampler = LengthSortedBatchSampler(ds, max_batch_tokens=500, shuffle=True)
-
-        all_indices = []
-        for batch in sampler:
-            all_indices.extend(batch)
-
-        assert sorted(all_indices) == list(range(50))
-
-    def test_respects_token_budget(self):
-        """No batch should exceed max_batch_tokens (except singleton overflow)."""
-        ds = MockFileSubset(50, base_length=100)
-        sampler = LengthSortedBatchSampler(ds, max_batch_tokens=500, shuffle=False)
-
-        for batch in sampler:
-            max_len = max(ds.token_length(i) for i in batch)
-            # Either within budget, or singleton overflow
-            assert len(batch) * max_len <= 500 or len(batch) == 1
-
-    def test_sorted_within_batches(self):
-        """Samples within a batch should be sorted by length (no shuffle)."""
-        ds = MockFileSubset(50, base_length=100)
-        sampler = LengthSortedBatchSampler(ds, max_batch_tokens=1000, shuffle=False)
-
-        for batch in sampler:
-            lengths = [ds.token_length(i) for i in batch]
-            assert lengths == sorted(lengths)
-
-    def test_shuffle_changes_batch_order(self):
-        """Different epochs should produce different batch orderings."""
-        ds = MockFileSubset(100, base_length=50)
-        sampler = LengthSortedBatchSampler(ds, max_batch_tokens=500, shuffle=True)
-
-        sampler.set_epoch(0)
-        batches_0 = [b[:] for b in sampler]
-
-        sampler.set_epoch(1)
-        batches_1 = [b[:] for b in sampler]
-
-        # Batch contents should be the same, but order may differ
-        assert sorted(tuple(b) for b in batches_0) == sorted(tuple(b) for b in batches_1)
-
-        # With enough samples, order should differ
-        flat_0 = [idx for b in batches_0 for idx in b]
-        flat_1 = [idx for b in batches_1 for idx in b]
-        if len(batches_0) > 1:
-            assert flat_0 != flat_1, "Epoch shuffle should change batch order"
-
-    def test_rebuild(self):
-        """Rebuild should recompute batches."""
-        ds = MockFileSubset(20, base_length=100)
-        sampler = LengthSortedBatchSampler(ds, max_batch_tokens=500, shuffle=False)
-        original_batches = len(sampler)
-
-        # Rebuild should produce same result for unchanged dataset
-        sampler.rebuild()
-        assert len(sampler) == original_batches
-
-    def test_len_matches_actual(self):
-        """len() should match actual number of batches yielded."""
-        ds = MockFileSubset(100, base_length=50)
-        sampler = LengthSortedBatchSampler(ds, max_batch_tokens=500, shuffle=False)
-        assert len(sampler) == len(list(sampler))
-
-    def test_empty_dataset(self):
-        """Empty dataset should yield no batches."""
-        ds = MockFileSubset(0)
-        sampler = LengthSortedBatchSampler(ds, max_batch_tokens=500)
-        assert len(sampler) == 0
-        assert list(sampler) == []
-
-    def test_single_sample(self):
-        """Single sample should yield one batch."""
-        ds = MockFileSubset(1, base_length=100)
-        sampler = LengthSortedBatchSampler(ds, max_batch_tokens=500)
-        batches = list(sampler)
-        assert len(batches) == 1
-        assert batches[0] == [0]
-
-    def test_singleton_overflow(self):
-        """A sample exceeding budget should be emitted as a batch of 1."""
-
-        class BigSmallDataset(Dataset):
-            def token_length(self, idx):
-                return 10000 if idx == 0 else 100
-
-            def __len__(self):
-                return 5
-
-        ds = BigSmallDataset()
-        sampler = LengthSortedBatchSampler(ds, max_batch_tokens=500, shuffle=False)
-
-        found_overflow = False
-        for batch in sampler:
-            if 0 in batch:
-                assert len(batch) == 1, "Overflow sample should be singleton"
-                found_overflow = True
-
-        assert found_overflow
+def test_packed_token_budget_sampler_importable():
+    """Smoke test: the replacement sampler should import and construct."""
+    lengths = [100, 200, 50, 400]
+    sampler = PackedTokenBudgetSampler(
+        dataset=None, lengths=lengths, max_batch_tokens=500, shuffle=False,
+    )
+    batches = list(sampler)
+    # All indices must be emitted exactly once.
+    flat = [i for b in batches for i in b]
+    assert sorted(flat) == list(range(len(lengths)))
 
 
 # ---------------------------------------------------------------------------

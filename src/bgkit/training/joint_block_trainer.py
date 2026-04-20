@@ -1,8 +1,11 @@
-"""Joint block pretraining trainer.
+"""Joint block pretraining trainer — packed FA4 form.
 
 Jointly pretrains the penultimate compressor layer (for auto-reproduction)
 and the projection block (for decoder alignment). Two-objective training
 loop where gradients flow freely between both objectives.
+
+All inputs are packed: flat ``(N,)`` token IDs, ``cu_seqlens`` for
+segmentation, ``position_ids`` for per-sample RoPE. No ``attention_mask``.
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import structlog
@@ -26,20 +30,27 @@ from bgkit.data.chat_template import (
 )
 from bgkit.data.collators import collate_token_ids
 from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
-from bgkit.data.samplers import TokenBudgetBatchSampler
-from bgkit.models.components.auto_reproduction import auto_reproduction_loss
+from bgkit.data.samplers import PackedTokenBudgetSampler
 from bgkit.models.encoder import BgKITEncoder, _resolve_layers
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpointing import CheckpointMetadata, save_checkpoint
 from bgkit.training.gradient_utils import enable_gradient_checkpointing
 from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.model_utils import count_parameters, slerp_merge
+from bgkit.utils.packing import position_ids_from_cu
 
 logger = structlog.get_logger()
 
 
 def joint_block_collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    """Pad variable-length token ID samples into a batch."""
+    """Collate variable-length token ID samples into a packed batch.
+
+    Returns a dict with packed flat tensors:
+    - ``"input_ids"``: ``(N,)`` int64 flat concatenation.
+    - ``"position_ids"``: ``(N,)`` int64 per-sample restart.
+    - ``"cu_seqlens"``: ``(B+1,)`` int32.
+    - ``"max_seqlen"``: int.
+    """
     return collate_token_ids(batch)
 
 
@@ -47,10 +58,9 @@ def joint_block_collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, to
 class _ForwardResult:
     """Intermediate forward pass results for both objectives."""
 
-    comp_out: object  # CompressorOutput
-    auto_repro_pred: torch.Tensor  # content-only slice
-    proj_out: object  # ProjectionOutput
-    proj_content: torch.Tensor  # content-only slice of projected embeddings
+    comp_out: object  # CompressionOutput
+    auto_repro_pred: torch.Tensor  # (N_content, D) flat
+    proj_content: torch.Tensor  # (N_content, D) flat projected embeddings
     loss_repro: torch.Tensor
     loss_proj: torch.Tensor
     loss: torch.Tensor
@@ -59,7 +69,7 @@ class _ForwardResult:
 class JointBlockTrainer(BaseTrainer):
     """Trainer for joint block pretraining: auto-repro + decoder alignment."""
 
-    LIVE_CONFIG_FIELDS = {
+    LIVE_CONFIG_FIELDS: ClassVar[dict] = {
         "w_repro": "w_repro",
         "w_proj": "w_proj",
     }
@@ -187,17 +197,20 @@ class JointBlockTrainer(BaseTrainer):
         )
 
         max_batch_tokens = tcfg.get("max_batch_tokens", 65536)
+        # Eval has no backward — its packed budget can be larger than
+        # training's. Falls back to ``max_batch_tokens`` when unset.
+        max_batch_tokens_eval = tcfg.get("max_batch_tokens_eval", max_batch_tokens)
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
 
         train_lengths = full_dataset.lengths[np.array(self.train_dataset.indices)]
         eval_lengths = full_dataset.lengths[np.array(self.eval_dataset.indices)]
 
-        self.train_sampler = TokenBudgetBatchSampler(
-            train_lengths, max_batch_tokens, shuffle=True, seed=self.cfg.get("seed", 42),
+        self.train_sampler = PackedTokenBudgetSampler(
+            None, train_lengths, max_batch_tokens, shuffle=True, seed=self.cfg.get("seed", 42),
         )
-        eval_sampler = TokenBudgetBatchSampler(
-            eval_lengths, max_batch_tokens, shuffle=False,
+        eval_sampler = PackedTokenBudgetSampler(
+            None, eval_lengths, max_batch_tokens_eval, shuffle=False,
         )
 
         self.train_dataloader = DataLoader(
@@ -262,9 +275,10 @@ class JointBlockTrainer(BaseTrainer):
             prefix_ids = build_encoder_user_only_prefix_ids(tokenizer).to(device)
             logger.info("encoder_chatml_prefix", prefix_len=prefix_ids.size(0))
 
-        # Pre-compute and freeze the prompt embeddings (1, prefix_len, hidden_dim)
+        # Pre-compute and freeze the prompt embeddings (prefix_len, hidden_dim)
         with torch.no_grad():
-            self._prompt_embeddings = self._get_input_embeddings(prefix_ids.unsqueeze(0))
+            self._prompt_embeddings = self._get_input_embeddings(prefix_ids)
+            self._prompt_len = int(prefix_ids.size(0))
 
         logger.info(
             "joint_block_trainer_setup",
@@ -276,7 +290,14 @@ class JointBlockTrainer(BaseTrainer):
         )
 
     def _get_input_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Get input embeddings from the compressor's backbone embedding layer."""
+        """Get input embeddings from the compressor's backbone embedding layer.
+
+        Args:
+            token_ids: ``(L,)`` or ``(N,)`` int64 token IDs (flat, 1-D).
+
+        Returns:
+            ``(L, D)`` or ``(N, D)`` float embeddings.
+        """
         return self.encoder.compressor.backbone.get_input_embeddings()(token_ids)
 
     def _sync_epoch(self, epoch: int) -> None:
@@ -291,7 +312,8 @@ class JointBlockTrainer(BaseTrainer):
             self._tokenizer, variant["compression_prompt"]
         ).to(self.device)
         with torch.no_grad():
-            self._prompt_embeddings = self._get_input_embeddings(prefix_ids.unsqueeze(0))
+            self._prompt_embeddings = self._get_input_embeddings(prefix_ids)
+            self._prompt_len = int(prefix_ids.size(0))
         logger.info(
             "epoch_prompt_rotation",
             epoch=epoch,
@@ -305,53 +327,95 @@ class JointBlockTrainer(BaseTrainer):
         return nullcontext()
 
     def _get_prompt_embeddings(self) -> torch.Tensor | None:
-        """Return cached ChatML prefix embeddings (1, prefix_len, hidden_dim)."""
+        """Return cached ChatML prefix embeddings (prefix_len, D), or None."""
         return getattr(self, "_prompt_embeddings", None)
+
+    def _build_prompt_pack(
+        self, num_samples: int, device: torch.device
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Build packed prompt tensors tiled for B samples.
+
+        Returns:
+            Tuple of (prompt_embeddings, prompt_cu_seqlens, prompt_position_ids)
+            each ready for BgKITEncoder.forward, or (None, None, None) if no prompt.
+        """
+        prompt_emb = self._get_prompt_embeddings()
+        if prompt_emb is None:
+            return None, None, None
+
+        # prompt_emb: (prefix_len, D) — tile num_samples times into flat buffer
+        prefix_len = prompt_emb.size(0)
+        prompt_flat = (
+            prompt_emb.unsqueeze(0)
+            .expand(num_samples, -1, -1)
+            .reshape(num_samples * prefix_len, -1)
+        )
+
+        # cu_seqlens: [0, p, 2p, ..., num_samples*p]
+        lengths = torch.full((num_samples,), prefix_len, dtype=torch.int32, device=device)
+        prompt_cu = torch.zeros(num_samples + 1, dtype=torch.int32, device=device)
+        torch.cumsum(lengths, dim=0, out=prompt_cu[1:])
+
+        # position_ids: per-sample restart [0..p-1, 0..p-1, ...]
+        prompt_pos = position_ids_from_cu(prompt_cu, num_samples * prefix_len)
+
+        return prompt_flat.to(device), prompt_cu, prompt_pos
 
     def _forward_both(
         self,
-        input_embeddings: torch.Tensor,
-        attention_mask: torch.Tensor,
+        input_ids: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        position_ids: torch.Tensor,
         target_repro: torch.Tensor,
         target_proj: torch.Tensor,
     ) -> _ForwardResult:
-        """Run both forward passes and compute losses."""
-        prompt_emb = self._get_prompt_embeddings()
-        if prompt_emb is not None:
-            # Expand to batch size
-            prompt_emb = prompt_emb.expand(input_embeddings.size(0), -1, -1)
+        """Run both forward passes and compute losses (packed).
 
-        comp_out = self.encoder.compressor(
-            input_embeddings, attention_mask=attention_mask,
+        Args:
+            input_ids: ``(N,)`` int64 flat token IDs.
+            cu_seqlens: ``(B+1,)`` int32.
+            max_seqlen: int.
+            position_ids: ``(N,)`` int64 per-sample positions.
+            target_repro: ``(N, D)`` target for auto-repro objective.
+            target_proj: ``(N, D)`` target for projection objective.
+
+        Returns:
+            :class:`_ForwardResult` with losses and metric tensors.
+        """
+        num_samples = int(cu_seqlens.shape[0]) - 1
+        content_embeddings = self._get_input_embeddings(input_ids)
+
+        prompt_emb, prompt_cu, prompt_pos = self._build_prompt_pack(
+            num_samples, input_ids.device
+        )
+
+        comp_out = self.encoder(
+            content_embeddings=content_embeddings,
+            content_cu_seqlens=cu_seqlens,
+            content_position_ids=position_ids,
             prompt_embeddings=prompt_emb,
+            prompt_cu_seqlens=prompt_cu,
+            prompt_position_ids=prompt_pos,
+            target_ratio=None,  # no compression in joint-block pretraining
         )
 
-        auto_repro_pred_full = self.encoder.compressor.auto_reproduce(
-            comp_out.normed_embeddings,
-        )
-        # Slice to content-only positions (targets don't include prefix)
-        cs = comp_out.content_slice
-        auto_repro_pred = auto_repro_pred_full[:, cs, :]
-        loss_repro = auto_reproduction_loss(
-            auto_repro_pred, target_repro, mask=attention_mask.float(),
-        )
+        # auto_repro_pred: (N_content, D) — flat over all content tokens
+        auto_repro_pred = self.encoder.auto_reproduce(comp_out.all_embeddings)
 
-        proj_out = self.encoder.projection_block(
-            comp_out.raw_embeddings,
-            attention_mask=comp_out.attention_mask,
-            survivor_mask=None,
-        )
-        proj_content = proj_out.projected_embeddings[:, cs, :]
-        loss_proj = auto_reproduction_loss(
-            proj_content, target_proj, mask=attention_mask.float(),
-        )
+        # proj_content: (N_content, D) — survivor_embeddings when no compression
+        # equals all content positions (survivor_cu_seqlens == content_cu_seqlens)
+        proj_content = comp_out.survivor_embeddings
+
+        # MSE losses over flat positions — no mask needed (no padding)
+        loss_repro = F.mse_loss(auto_repro_pred, target_repro)
+        loss_proj = F.mse_loss(proj_content, target_proj)
 
         loss = self.w_repro * loss_repro + self.w_proj * loss_proj
 
         return _ForwardResult(
             comp_out=comp_out,
             auto_repro_pred=auto_repro_pred,
-            proj_out=proj_out,
             proj_content=proj_content,
             loss_repro=loss_repro,
             loss_proj=loss_proj,
@@ -364,40 +428,38 @@ class JointBlockTrainer(BaseTrainer):
     def _forward_backward(self, batch) -> dict[str, float]:
         self.encoder.train()
 
-        token_ids = batch["token_ids"].to(self.device)
-        attention_mask = batch["attention_mask"].to(self.device)
+        input_ids = batch["input_ids"].to(self.device)
+        cu_seqlens = batch["cu_seqlens"].to(self.device)
+        max_seqlen = int(batch["max_seqlen"])
+        position_ids = batch["position_ids"].to(self.device)
 
         # Input embeddings -- targets are detached copies
-        input_embeddings = self._get_input_embeddings(token_ids)
-        target_repro = input_embeddings.detach()
-        target_proj = self.decoder_embed(token_ids).detach()
+        content_embeddings = self._get_input_embeddings(input_ids)
+        target_repro = content_embeddings.detach()
+        target_proj = self.decoder_embed(input_ids).detach()
 
         with self._amp_context():
-            fwd = self._forward_both(input_embeddings, attention_mask, target_repro, target_proj)
+            fwd = self._forward_both(
+                input_ids, cu_seqlens, max_seqlen, position_ids, target_repro, target_proj,
+            )
 
         # Scaled backward (for gradient accumulation)
         (fwd.loss / self._accum_steps).backward()
 
-        # Cosine similarity metrics (content-only, matching targets)
-        # Return detached tensors — .item() is deferred to _average_metrics
-        # to avoid GPU sync between micro-batches in the accumulation loop.
+        # Cosine similarity metrics (flat, no padding to mask)
         with torch.no_grad():
-            mask_f = attention_mask.float()
-            cos_repro = F.cosine_similarity(fwd.auto_repro_pred, target_repro, dim=-1)
-            cos_repro_avg = (cos_repro * mask_f).sum() / mask_f.sum().clamp(min=1)
-
-            cos_proj = F.cosine_similarity(fwd.proj_content, target_proj, dim=-1)
-            cos_proj_avg = (cos_proj * mask_f).sum() / mask_f.sum().clamp(min=1)
+            cos_repro = F.cosine_similarity(fwd.auto_repro_pred, target_repro, dim=-1).mean()
+            cos_proj = F.cosine_similarity(fwd.proj_content, target_proj, dim=-1).mean()
 
         metrics = {
             "loss": fwd.loss.detach(),
             "loss_repro": fwd.loss_repro.detach(),
             "loss_proj": fwd.loss_proj.detach(),
-            "cosine_sim_repro": cos_repro_avg.detach(),
-            "cosine_sim_proj": cos_proj_avg.detach(),
+            "cosine_sim_repro": cos_repro.detach(),
+            "cosine_sim_proj": cos_proj.detach(),
         }
 
-        # Drop CompressorOutput tensor refs per release() contract.
+        # Drop CompressionOutput tensor refs per release() contract.
         fwd.comp_out.release()
 
         return metrics
@@ -416,39 +478,37 @@ class JointBlockTrainer(BaseTrainer):
         for batch_idx, batch in enumerate(self.eval_dataloader):
             if batch_idx % 100 == 0:
                 logger.info("eval_progress", batch=batch_idx, total=num_batches)
-            token_ids = batch["token_ids"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
 
-            input_embeddings = self._get_input_embeddings(token_ids)
-            target_repro = input_embeddings.detach()
-            target_proj = self.decoder_embed(token_ids).detach()
+            input_ids = batch["input_ids"].to(self.device)
+            cu_seqlens = batch["cu_seqlens"].to(self.device)
+            max_seqlen = int(batch["max_seqlen"])
+            position_ids = batch["position_ids"].to(self.device)
+
+            content_embeddings = self._get_input_embeddings(input_ids)
+            target_repro = content_embeddings.detach()
+            target_proj = self.decoder_embed(input_ids).detach()
 
             with self._amp_context():
                 fwd = self._forward_both(
-                    input_embeddings, attention_mask, target_repro, target_proj,
+                    input_ids, cu_seqlens, max_seqlen, position_ids, target_repro, target_proj,
                 )
 
-            mask_f = attention_mask.float()
-            batch_n = mask_f.sum().item()
-            n += batch_n
+            # Accumulate over flat tokens (num_tokens per batch)
+            n += float(input_ids.size(0))
 
-            # MSE
-            mse_repro = F.mse_loss(
-                fwd.auto_repro_pred, target_repro, reduction="none",
-            ).mean(dim=-1)
-            total_mse_repro += (mse_repro * mask_f).sum().item()
+            mse_repro = F.mse_loss(fwd.auto_repro_pred, target_repro, reduction="none").mean(
+                dim=-1
+            )
+            total_mse_repro += mse_repro.sum().item()
 
-            mse_proj = F.mse_loss(
-                fwd.proj_content, target_proj, reduction="none",
-            ).mean(dim=-1)
-            total_mse_proj += (mse_proj * mask_f).sum().item()
+            mse_proj = F.mse_loss(fwd.proj_content, target_proj, reduction="none").mean(dim=-1)
+            total_mse_proj += mse_proj.sum().item()
 
-            # Cosine similarity
             cos_repro = F.cosine_similarity(fwd.auto_repro_pred, target_repro, dim=-1)
-            total_cosine_repro += (cos_repro * mask_f).sum().item()
+            total_cosine_repro += cos_repro.sum().item()
 
             cos_proj = F.cosine_similarity(fwd.proj_content, target_proj, dim=-1)
-            total_cosine_proj += (cos_proj * mask_f).sum().item()
+            total_cosine_proj += cos_proj.sum().item()
 
         return {
             "mse_repro": total_mse_repro / max(n, 1),

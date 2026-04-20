@@ -21,36 +21,58 @@ from bgkit.models.encoder import BgKITEncoder
 logger = structlog.get_logger()
 
 
-def _resolve_splice_metadata(
+def _split_packed_segments(
+    flat: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Split a flat packed ``(N, ...)`` tensor into per-sample slices."""
+    cu_list = cu_seqlens.to(torch.int64).tolist()
+    return [flat[cu_list[i] : cu_list[i + 1]] for i in range(len(cu_list) - 1)]
+
+
+def _build_decoder_segments_from_batch(
     batch: dict,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``(splice_starts, splice_lengths)`` for decoder injection.
+    survivor_cu_seqlens: torch.Tensor,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
+    """Derive ``(prefix_ids, suffix_ids, flat_loss_mask)`` from a packed chat-repro batch.
 
-    Chat-formatted phase-1 data carries explicit splice metadata.
-    Simpler QA-style datasets do not, but their ``prefix_ids`` correspond to
-    the token prefix before the answer-bearing region, so a zero-width splice
-    at ``len(prefix_ids)`` preserves the intended geometry.
+    The flat ``loss_mask`` is laid out over the assembled
+    ``[prefix_b | survivors_b | suffix_b]`` segments that
+    ``ReconstructionDecoder.forward_with_single_splice`` expects. Survivor
+    positions receive loss_mask=False (decoder cannot predict embeddings).
     """
-    if "bgkit_splice_start" in batch and "bgkit_splice_len" in batch:
-        return (
-            batch["bgkit_splice_start"].to(device),
-            batch["bgkit_splice_len"].to(device),
-        )
-    prefix_mask = batch.get("prefix_attention_mask")
-    if prefix_mask is not None:
-        starts = prefix_mask.to(device).sum(dim=1, dtype=torch.long)
-        lengths = torch.zeros_like(starts)
-        return starts, lengths
-    prefix_ids = batch.get("prefix_ids")
-    if prefix_ids is not None:
-        starts = torch.full(
-            (prefix_ids.size(0),), prefix_ids.size(1),
-            dtype=torch.long, device=device,
-        )
-        lengths = torch.zeros_like(starts)
-        return starts, lengths
-    raise ValueError("Batch does not provide BgKIT splice metadata or prefix_ids")
+    token_ids_flat = batch["token_ids"].to(device)
+    tok_cu = batch["cu_seqlens"].to(device)
+    loss_mask_flat = batch["loss_mask"].to(device).to(torch.bool)
+    splice_start = batch["bgkit_splice_start"].to(device)
+    splice_len = batch["bgkit_splice_len"].to(device)
+
+    batch_size = int(tok_cu.shape[0]) - 1
+    tok_cu_list = tok_cu.to(torch.int64).tolist()
+    surv_cu_list = survivor_cu_seqlens.to(torch.int64).tolist()
+
+    prefix_ids: list[torch.Tensor] = []
+    suffix_ids: list[torch.Tensor] = []
+    per_segment: list[torch.Tensor] = []
+    for b in range(batch_size):
+        sample_tokens = token_ids_flat[tok_cu_list[b] : tok_cu_list[b + 1]]
+        sample_loss = loss_mask_flat[tok_cu_list[b] : tok_cu_list[b + 1]]
+        ss = int(splice_start[b].item())
+        sl = int(splice_len[b].item())
+        if ss < 0:
+            ss = sample_tokens.shape[0]
+            sl = 0
+        prefix_ids.append(sample_tokens[:ss])
+        suffix_ids.append(sample_tokens[ss + sl :])
+
+        pre_mask = sample_loss[:ss]
+        suf_mask = sample_loss[ss + sl :]
+        k_i = surv_cu_list[b + 1] - surv_cu_list[b]
+        surv_mask = torch.zeros(k_i, dtype=torch.bool, device=device)
+        per_segment.append(torch.cat([pre_mask, surv_mask, suf_mask], dim=0))
+
+    return prefix_ids, suffix_ids, torch.cat(per_segment, dim=0)
 
 
 class AblationCondition(Enum):
@@ -137,70 +159,78 @@ def run_ablation_suite(
             if examples_seen >= max_examples:
                 break
 
-            token_ids = batch["token_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            loss_mask = batch["loss_mask"].to(device)
+            # --- packed batch contents ---
             content_token_ids = batch["content_token_ids"].to(device)
-            content_attention_mask = batch["content_attention_mask"].to(device)
-            compression_prompt_ids = batch["compression_prompt_ids"].to(device)
-            compression_prompt_mask = batch["compression_prompt_mask"].to(device)
+            content_cu = batch["content_cu_seqlens"].to(device)
+            content_position_ids = batch["content_position_ids"].to(device)
+            prompt_ids = batch["compression_prompt_ids"].to(device)
+            prompt_cu = batch["compression_prompt_cu_seqlens"].to(device)
+            prompt_position_ids = batch["compression_prompt_position_ids"].to(device)
+            loss_mask_flat = batch["loss_mask"].to(device)
 
-            # Compute survivors via BgKIT encoder
             bgkit_embed = encoder.compressor.backbone.get_input_embeddings()
             content_emb = bgkit_embed(content_token_ids)
-            prompt_emb = bgkit_embed(compression_prompt_ids)
+            prompt_emb = bgkit_embed(prompt_ids)
 
             with torch.no_grad():
                 enc_out = encoder(
-                    input_embeddings=content_emb,
-                    survivor_mask=None,
-                    attention_mask=content_attention_mask,
+                    content_embeddings=content_emb,
+                    content_cu_seqlens=content_cu,
+                    content_position_ids=content_position_ids,
                     prompt_embeddings=prompt_emb,
-                    prompt_attention_mask=compression_prompt_mask,
+                    prompt_cu_seqlens=prompt_cu,
+                    prompt_position_ids=prompt_position_ids,
+                    target_ratio=None,
                 )
                 survivors = enc_out.survivor_embeddings
+                survivor_cu = enc_out.survivor_cu_seqlens
 
-                # Apply ablation modification
+                # Apply ablation modification.
                 survivors = _modify_survivors(survivors, condition)
 
-                # Teacher-forced loss
+                # Teacher-forced loss.
+                prefix_list, suffix_list, flat_loss_mask = _build_decoder_segments_from_batch(
+                    batch, device, survivor_cu
+                )
+                batch_size = int(content_cu.shape[0]) - 1
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                    splice_starts, splice_lengths = _resolve_splice_metadata(batch, device)
                     loss = decoder.forward_with_single_splice(
                         survivor_embeddings=survivors,
-                        survivor_attention_mask=content_attention_mask,
-                        token_ids=token_ids,
-                        token_attention_mask=attention_mask,
-                        splice_starts=splice_starts,
-                        splice_lengths=splice_lengths,
-                        loss_mask=loss_mask,
+                        survivor_cu_seqlens=survivor_cu,
+                        prefix_ids=prefix_list,
+                        suffix_ids=suffix_list,
+                        loss_mask=flat_loss_mask,
                     )
 
-                batch_tokens = loss_mask.sum().item()
+                batch_tokens = loss_mask_flat.sum().item()
                 total_loss += loss.item() * batch_tokens
                 total_tokens += batch_tokens
 
-                # Optional generation metrics
+                # Optional generation metrics.
                 if include_generation_metrics and suffix_ids is not None:
-                    prefix_ids = batch["prefix_ids"].to(device)
-                    prefix_attention_mask = batch["prefix_attention_mask"].to(device)
-                    splice_starts, splice_lengths = _resolve_splice_metadata(batch, device)
-                    gen_output = decoder.generate_with_single_splice(
-                        survivor_embeddings=survivors,
-                        survivor_attention_mask=content_attention_mask,
-                        prefix_ids=prefix_ids,
-                        prefix_attention_mask=prefix_attention_mask,
-                        splice_starts=splice_starts,
-                        splice_lengths=splice_lengths,
-                        suffix_ids=suffix_ids.to(device),
-                        tokenizer=tokenizer,
-                        max_new_tokens=2048,
-                        temperature=0.0,
-                    )
-                    generated_texts.extend(gen_output.content_text)
-                    generated_languages.extend(batch["languages"])
+                    # For generation we need per-sample prefix_ids and a
+                    # constant suffix terminator. Here we take prefix_list
+                    # (sample 0) since the decoder only processes one
+                    # sample per call under sequential generation.
+                    for b in range(batch_size):
+                        k_start = int(survivor_cu[b].item())
+                        k_end = int(survivor_cu[b + 1].item())
+                        surv_b = survivors[k_start:k_end]
+                        cu_b = torch.tensor([0, k_end - k_start], dtype=torch.int32, device=device)
+                        gen_output = decoder.generate_with_single_splice(
+                            survivor_embeddings=surv_b,
+                            survivor_cu_seqlens=cu_b,
+                            prefix_ids=prefix_list[b],
+                            suffix_ids=suffix_ids.to(device),
+                            tokenizer=tokenizer,
+                            max_new_tokens=2048,
+                            temperature=0.0,
+                        )
+                        generated_texts.extend(gen_output.content_text)
+                    if "languages" in batch:
+                        generated_languages.extend(batch["languages"])
 
-            examples_seen += token_ids.size(0)
+            examples_seen += batch_size
 
         avg_loss = total_loss / max(total_tokens, 1)
         perplexity = torch.exp(torch.tensor(avg_loss)).item()

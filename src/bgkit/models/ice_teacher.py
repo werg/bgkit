@@ -4,13 +4,20 @@ Loads a trained ICE CNN checkpoint (from the pre-survivorship-head era) plus
 a reference to the encoder's own input-embedding table (ICE was trained on
 Qwen3.5-0.8B-Base embeddings, which is the same backbone BgKITEncoder uses,
 so no separate embedding model is needed). Produces per-position importance
-scores for a batch of content token ids, then derives a top-k teacher mask
-at the configured target compression ratio.
+scores for a packed batch of content token ids, then derives a top-k teacher
+mask at the configured target compression ratio.
 
 The student (SurvivorshipHead) is trained to match this mask via BCE during
 the early phase of Phase-1 Step-3 so it gets discriminative per-position
 signal from day one instead of collapsing to the aggregate-ratio solution
 (all probs near target, none above 0.5 → empty survivor set).
+
+Packed signatures
+-----------------
+``score(token_ids, cu_seqlens)`` and ``teacher_mask(token_ids, cu_seqlens, ratio)``
+both consume a flat ``(N,)`` token-id tensor and a ``(B+1,)`` int32
+``cu_seqlens`` boundary tensor (FA4 varlen convention) and return flat
+``(N,)`` float32 tensors.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ import torch
 import torch.nn as nn
 
 from bgkit.models.ice import ICE
+from bgkit.utils.packing import lengths_from_cu
 
 
 class ICETeacher(nn.Module):
@@ -92,52 +100,80 @@ class ICETeacher(nn.Module):
     def score(
         self,
         token_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
+        cu_seqlens: torch.Tensor,
     ) -> torch.Tensor:
         """Per-position ICE importance score (predicted CE under Qwen3.5-0.8B-Base).
 
+        Runs the ICE CNN per segment (kernel convolutions do not cross segment
+        boundaries), then concatenates back into a flat ``(N,)`` tensor.
+
         Args:
-            token_ids: (B, L) content token ids.
-            attention_mask: (B, L) 1 for real positions, 0 for padding.
+            token_ids: ``(N,)`` packed content token ids (int64).
+            cu_seqlens: ``(B+1,)`` int32 cumulative segment boundaries.
         Returns:
-            (B, L) float32 scores with padded positions set to -inf so they
-            will never be selected by top-k.
+            ``(N,)`` float32 scores.
         """
         self._check_loaded()
-        embs = self._embed_tokens(token_ids).float()
-        scores = self.ice(embs)
-        scores = scores.masked_fill(attention_mask == 0, float("-inf"))
-        return scores
+        if token_ids.ndim != 1:
+            raise ValueError(
+                f"ICETeacher.score expects packed (N,) token_ids; got shape "
+                f"{tuple(token_ids.shape)}",
+            )
+        lengths = lengths_from_cu(cu_seqlens.to(torch.int64))
+        # Per-segment forward. ICE is a tiny 1D CNN and ICE.forward expects
+        # (batch, seq_len, input_dim), so we unsqueeze batch=1 per segment.
+        scores_list: list[torch.Tensor] = []
+        offsets = cu_seqlens.to(torch.int64).tolist()
+        for i, seg_len in enumerate(lengths.tolist()):
+            if seg_len == 0:
+                continue
+            start = offsets[i]
+            end = offsets[i + 1]
+            seg_ids = token_ids[start:end]
+            embs = self._embed_tokens(seg_ids).float().unsqueeze(0)  # (1, L, D)
+            seg_scores = self.ice(embs).squeeze(0)  # (L,)
+            scores_list.append(seg_scores)
+        if not scores_list:
+            return torch.zeros(0, dtype=torch.float32, device=token_ids.device)
+        return torch.cat(scores_list, dim=0)
 
     @torch.no_grad()
     def teacher_mask(
         self,
         token_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
+        cu_seqlens: torch.Tensor,
         target_ratio: float,
     ) -> torch.Tensor:
-        """Top-k teacher mask per sequence at the given ratio.
+        """Top-k teacher mask per segment at the given ratio (packed).
 
         Args:
-            token_ids: (B, L).
-            attention_mask: (B, L).
+            token_ids: ``(N,)`` packed content token ids.
+            cu_seqlens: ``(B+1,)`` int32 cumulative segment boundaries.
             target_ratio: fraction of valid positions to keep (e.g. 0.1).
         Returns:
-            (B, L) float32 mask in {0.0, 1.0}. Exactly
-            ``ceil(target_ratio * valid_len)`` positions are 1 per sequence.
+            ``(N,)`` float32 mask in {0.0, 1.0}. Exactly
+            ``ceil(target_ratio * L_i)`` positions are 1 per segment ``i``
+            (clamped to at least 1).
         """
         self._check_loaded()
-        scores = self.score(token_ids, attention_mask)
-        valid_lens = attention_mask.sum(dim=1).clamp(min=1)
-        k_per_seq = torch.ceil(valid_lens.float() * target_ratio).long().clamp(min=1)
+        if token_ids.ndim != 1:
+            raise ValueError(
+                f"ICETeacher.teacher_mask expects packed (N,) token_ids; "
+                f"got shape {tuple(token_ids.shape)}",
+            )
+        scores = self.score(token_ids, cu_seqlens)
         mask = torch.zeros_like(scores, dtype=torch.float32)
-        # Per-row top-k (k varies) — gather via argsort on descending scores.
-        order = scores.argsort(dim=1, descending=True)
-        k_max = int(k_per_seq.max().item())
-        topk_idx = order[:, :k_max]
-        # Positional index grid for comparison with per-row k.
-        col = torch.arange(k_max, device=scores.device).unsqueeze(0)
-        keep = col < k_per_seq.unsqueeze(1)
-        rows = torch.arange(scores.size(0), device=scores.device).unsqueeze(1).expand_as(topk_idx)
-        mask[rows[keep], topk_idx[keep]] = 1.0
+        lengths = lengths_from_cu(cu_seqlens.to(torch.int64))
+        offsets = cu_seqlens.to(torch.int64).tolist()
+        for i, seg_len in enumerate(lengths.tolist()):
+            if seg_len == 0:
+                continue
+            start = offsets[i]
+            end = offsets[i + 1]
+            seg_scores = scores[start:end]
+            k = max(1, int(-(-seg_len * target_ratio // 1)))  # ceil
+            # Clamp k within segment length.
+            k = min(k, seg_len)
+            top = torch.topk(seg_scores, k, largest=True).indices
+            mask[start:end].index_fill_(0, top, 1.0)
         return mask

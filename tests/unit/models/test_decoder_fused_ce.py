@@ -39,9 +39,7 @@ class _MockInnerModel(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int, num_layers: int = 2):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size, hidden_dim)
-        self.layers = nn.ModuleList(
-            [nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)]
-        )
+        self.layers = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)])
         self.norm = nn.LayerNorm(hidden_dim)
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -80,91 +78,128 @@ VOCAB_SIZE = 256
 HIDDEN_DIM = 32
 
 
+def _make_packed_inputs(batch_size=2, num_survivors=4, target_len=20):
+    """Build packed inputs for forward_with_single_splice.
+
+    No prefix; survivors at the start, suffix = all target tokens.
+    Equivalent to EmbeddingSegment([survivors]) + TokenSegment([targets]).
+    """
+    survivors = torch.randn(batch_size * num_survivors, HIDDEN_DIM)
+    lengths = [num_survivors] * batch_size
+    cu = torch.tensor([0] + [sum(lengths[: i + 1]) for i in range(batch_size)], dtype=torch.int32)
+    target_ids = torch.randint(0, VOCAB_SIZE, (batch_size, target_len))
+    return survivors, cu, target_ids
+
+
+def _make_interleaved_inputs(batch_size=2, num_survivors=4, target_len=20):
+    """Build inputs for forward_interleaved_with_loss (padded B, K, D form)."""
+    survivors = torch.randn(batch_size, num_survivors, HIDDEN_DIM)
+    target_ids = torch.randint(0, VOCAB_SIZE, (batch_size, target_len))
+    return survivors, target_ids
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 
 class TestForwardWithLossNumericalEquivalence:
-    """forward_with_single_splice() should match explicit interleaved CE."""
+    """forward_with_single_splice() should match explicit interleaved CE
+    when there is no prefix and survivors are at the start."""
 
     @pytest.fixture()
     def decoder(self):
         backbone = MockCausalLMBackbone(VOCAB_SIZE, HIDDEN_DIM)
         return ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
 
-    def _make_inputs(self, batch_size=2, num_survivors=4, target_len=20):
-        survivors = torch.randn(batch_size, num_survivors, HIDDEN_DIM)
-        target_ids = torch.randint(0, VOCAB_SIZE, (batch_size, target_len))
-        target_mask = torch.ones(batch_size, target_len, dtype=torch.bool)
-        survivor_mask = torch.ones(batch_size, num_survivors, dtype=torch.bool)
-        return survivors, target_ids, target_mask, survivor_mask
-
     def test_matches_forward_plus_ce(self, decoder):
-        """Single-splice loss matches explicit interleaved loss."""
-        survivors, target_ids, target_mask, survivor_mask = self._make_inputs()
+        """Single-splice packed loss matches explicit interleaved loss (no prefix)."""
+        torch.manual_seed(0)
+        batch_size, num_survivors, target_len = 2, 4, 20
+        surv_3d, target_ids = _make_interleaved_inputs(batch_size, num_survivors, target_len)
 
-        ref_loss = decoder.forward_interleaved_with_loss([
-            EmbeddingSegment(embeddings=survivors),
-            TokenSegment(token_ids=target_ids, loss=True),
-        ])
+        # Reference: interleaved with EmbeddingSegment + TokenSegment
+        ref_loss = decoder.forward_interleaved_with_loss(
+            [
+                EmbeddingSegment(embeddings=surv_3d),
+                TokenSegment(token_ids=target_ids, loss=True),
+            ]
+        )
 
+        # Packed form: flat survivors + per-sample suffix lists
+        surv_flat = surv_3d.reshape(batch_size * num_survivors, HIDDEN_DIM)
+        cu = torch.tensor([0, num_survivors, 2 * num_survivors], dtype=torch.int32)
         fused_loss = decoder.forward_with_single_splice(
-            survivor_embeddings=survivors,
-            survivor_attention_mask=survivor_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=torch.zeros(target_ids.size(0), dtype=torch.long),
-            splice_lengths=torch.zeros(target_ids.size(0), dtype=torch.long),
+            survivor_embeddings=surv_flat,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long)] * batch_size,
+            suffix_ids=[target_ids[b] for b in range(batch_size)],
         )
 
         torch.testing.assert_close(fused_loss, ref_loss, atol=1e-4, rtol=1e-4)
 
     def test_matches_with_loss_mask(self, decoder):
-        """Fused loss matches reference when loss_mask restricts content tokens."""
-        survivors, target_ids, target_mask, survivor_mask = self._make_inputs(
-            target_len=30,
+        """Fused packed loss matches reference when loss_mask restricts content tokens."""
+        torch.manual_seed(1)
+        batch_size, num_survivors, target_len = 2, 4, 30
+        surv_3d, target_ids = _make_interleaved_inputs(batch_size, num_survivors, target_len)
+
+        # Mask out first 10 and last 5 positions (only middle contributes).
+        # In packed layout: per-sample suffix starts after survivors.
+        # The loss_mask for the whole packed sequence (B * (K + L)):
+        # positions 0..K-1 are survivors (no loss), K..K+L-1 are tokens.
+        # We want target positions 10..24 (of each suffix) to contribute.
+        n_per_sample = num_survivors + target_len
+        n_total = batch_size * n_per_sample
+        loss_mask_flat = torch.zeros(n_total, dtype=torch.bool)
+        for b in range(batch_size):
+            offset = b * n_per_sample + num_survivors  # start of suffix in flat layout
+            loss_mask_flat[offset + 10 : offset + 25] = True
+
+        # Reference uses per-segment loss_mask on token segment.
+        tok_loss_mask = torch.zeros_like(target_ids, dtype=torch.bool)
+        tok_loss_mask[:, 10:25] = True
+
+        ref_loss = decoder.forward_interleaved_with_loss(
+            [
+                EmbeddingSegment(embeddings=surv_3d),
+                TokenSegment(token_ids=target_ids, loss_mask=tok_loss_mask),
+            ]
         )
-        # Mask out first 10 and last 5 positions (only middle contributes)
-        loss_mask = torch.zeros_like(target_mask, dtype=torch.bool)
-        loss_mask[:, 10:25] = True
 
-        ref_loss = decoder.forward_interleaved_with_loss([
-            EmbeddingSegment(embeddings=survivors),
-            TokenSegment(token_ids=target_ids, loss_mask=loss_mask),
-        ])
-
+        surv_flat = surv_3d.reshape(batch_size * num_survivors, HIDDEN_DIM)
+        cu = torch.tensor([0, num_survivors, 2 * num_survivors], dtype=torch.int32)
         fused_loss = decoder.forward_with_single_splice(
-            survivor_embeddings=survivors,
-            survivor_attention_mask=survivor_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=torch.zeros(target_ids.size(0), dtype=torch.long),
-            splice_lengths=torch.zeros(target_ids.size(0), dtype=torch.long),
-            loss_mask=loss_mask,
+            survivor_embeddings=surv_flat,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long)] * batch_size,
+            suffix_ids=[target_ids[b] for b in range(batch_size)],
+            loss_mask=loss_mask_flat,
         )
 
         torch.testing.assert_close(fused_loss, ref_loss, atol=1e-4, rtol=1e-4)
 
     def test_matches_with_small_chunk(self, decoder):
         """Fused loss matches reference with small chunk_size (multi-chunk)."""
-        survivors, target_ids, target_mask, survivor_mask = self._make_inputs(
-            target_len=40,
+        torch.manual_seed(2)
+        batch_size, num_survivors, target_len = 2, 4, 40
+        surv_3d, target_ids = _make_interleaved_inputs(batch_size, num_survivors, target_len)
+
+        ref_loss = decoder.forward_interleaved_with_loss(
+            [
+                EmbeddingSegment(embeddings=surv_3d),
+                TokenSegment(token_ids=target_ids, loss=True),
+            ],
+            chunk_size=8,
         )
 
-        ref_loss = decoder.forward_interleaved_with_loss([
-            EmbeddingSegment(embeddings=survivors),
-            TokenSegment(token_ids=target_ids, loss=True),
-        ], chunk_size=8)
-
-        # chunk_size=8 forces multiple chunks for 40-token sequence
+        surv_flat = surv_3d.reshape(batch_size * num_survivors, HIDDEN_DIM)
+        cu = torch.tensor([0, num_survivors, 2 * num_survivors], dtype=torch.int32)
         fused_loss = decoder.forward_with_single_splice(
-            survivor_embeddings=survivors,
-            survivor_attention_mask=survivor_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=torch.zeros(target_ids.size(0), dtype=torch.long),
-            splice_lengths=torch.zeros(target_ids.size(0), dtype=torch.long),
+            survivor_embeddings=surv_flat,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long)] * batch_size,
+            suffix_ids=[target_ids[b] for b in range(batch_size)],
             chunk_size=8,
         )
 
@@ -172,22 +207,24 @@ class TestForwardWithLossNumericalEquivalence:
 
     def test_single_sample(self, decoder):
         """Works with batch_size=1."""
-        survivors, target_ids, target_mask, survivor_mask = self._make_inputs(
-            batch_size=1, target_len=12,
+        torch.manual_seed(3)
+        batch_size, num_survivors, target_len = 1, 4, 12
+        surv_3d, target_ids = _make_interleaved_inputs(batch_size, num_survivors, target_len)
+
+        ref_loss = decoder.forward_interleaved_with_loss(
+            [
+                EmbeddingSegment(embeddings=surv_3d),
+                TokenSegment(token_ids=target_ids, loss=True),
+            ]
         )
 
-        ref_loss = decoder.forward_interleaved_with_loss([
-            EmbeddingSegment(embeddings=survivors),
-            TokenSegment(token_ids=target_ids, loss=True),
-        ])
-
+        surv_flat = surv_3d.reshape(batch_size * num_survivors, HIDDEN_DIM)
+        cu = torch.tensor([0, num_survivors], dtype=torch.int32)
         fused_loss = decoder.forward_with_single_splice(
-            survivor_embeddings=survivors,
-            survivor_attention_mask=survivor_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=torch.zeros(target_ids.size(0), dtype=torch.long),
-            splice_lengths=torch.zeros(target_ids.size(0), dtype=torch.long),
+            survivor_embeddings=surv_flat,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long)] * batch_size,
+            suffix_ids=[target_ids[b] for b in range(batch_size)],
         )
 
         torch.testing.assert_close(fused_loss, ref_loss, atol=1e-4, rtol=1e-4)
@@ -200,19 +237,16 @@ class TestForwardWithLossGradients:
         return ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
 
     def test_gradients_flow(self, decoder):
-        """Fused path should produce gradients on decoder parameters."""
-        survivors = torch.randn(1, 3, HIDDEN_DIM)
+        """Packed path should produce gradients on decoder parameters."""
+        surv_flat = torch.randn(3, HIDDEN_DIM)
+        cu = torch.tensor([0, 3], dtype=torch.int32)
         target_ids = torch.randint(0, VOCAB_SIZE, (1, 10))
-        target_mask = torch.ones(1, 10, dtype=torch.bool)
-        survivor_mask = torch.ones(1, 3, dtype=torch.bool)
 
         loss = decoder.forward_with_single_splice(
-            survivor_embeddings=survivors,
-            survivor_attention_mask=survivor_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=torch.zeros(1, dtype=torch.long),
-            splice_lengths=torch.zeros(1, dtype=torch.long),
+            survivor_embeddings=surv_flat,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long)],
+            suffix_ids=[target_ids[0]],
         )
         loss.backward()
 
@@ -225,18 +259,16 @@ class TestForwardWithLossGradients:
             assert layer.weight.grad.abs().sum() > 0
 
     def test_loss_is_finite(self, decoder):
-        survivors = torch.randn(2, 4, HIDDEN_DIM)
-        target_ids = torch.randint(0, VOCAB_SIZE, (2, 15))
-        target_mask = torch.ones(2, 15, dtype=torch.bool)
-        survivor_mask = torch.ones(2, 4, dtype=torch.bool)
+        batch_size = 2
+        surv_flat = torch.randn(batch_size * 4, HIDDEN_DIM)
+        cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+        target_ids = torch.randint(0, VOCAB_SIZE, (batch_size, 15))
 
         loss = decoder.forward_with_single_splice(
-            survivor_embeddings=survivors,
-            survivor_attention_mask=survivor_mask,
-            token_ids=target_ids,
-            token_attention_mask=target_mask,
-            splice_starts=torch.zeros(2, dtype=torch.long),
-            splice_lengths=torch.zeros(2, dtype=torch.long),
+            survivor_embeddings=surv_flat,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long)] * batch_size,
+            suffix_ids=[target_ids[b] for b in range(batch_size)],
         )
         assert torch.isfinite(loss)
 
@@ -272,8 +304,14 @@ class TestIgnoreIndex:
         assert loss_masked[0, 3].item() == 0.0
         # Other positions should match
         torch.testing.assert_close(
-            loss_masked[0, :2], loss_valid[0, :2], atol=1e-6, rtol=1e-6,
+            loss_masked[0, :2],
+            loss_valid[0, :2],
+            atol=1e-6,
+            rtol=1e-6,
         )
         torch.testing.assert_close(
-            loss_masked[0, 4:], loss_valid[0, 4:], atol=1e-6, rtol=1e-6,
+            loss_masked[0, 4:],
+            loss_valid[0, 4:],
+            atol=1e-6,
+            rtol=1e-6,
         )

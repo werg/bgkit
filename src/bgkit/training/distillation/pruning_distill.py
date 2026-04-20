@@ -23,13 +23,14 @@ from torch.utils.data import DataLoader, random_split
 from bgkit.data.collators import collate_chat_repro
 from bgkit.data.datasets.chat_repro_dataset import ChatReproDataset
 from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
-from bgkit.data.samplers import TokenBudgetBatchSampler
-from bgkit.models.encoder import BgKITEncoder, _expand_survivor_mask
+from bgkit.data.samplers import PackedTokenBudgetSampler
+from bgkit.models.encoder import BgKITEncoder
 from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import enable_gradient_checkpointing
 from bgkit.utils.attention_backend import resolve_attention_implementation
+from bgkit.utils.packing import position_ids_from_cu
 
 logger = structlog.get_logger()
 
@@ -188,6 +189,9 @@ class PruningDistillTrainer(BaseTrainer):
         )
 
         max_batch_tokens = tcfg.get("max_batch_tokens", 16384)
+        # Eval has no backward — its packed budget can be larger than
+        # training's. Falls back to ``max_batch_tokens`` when unset.
+        max_batch_tokens_eval = tcfg.get("max_batch_tokens_eval", max_batch_tokens)
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
         seed = self.cfg.get("seed", 42)
@@ -195,11 +199,11 @@ class PruningDistillTrainer(BaseTrainer):
         train_lengths = full_dataset.lengths[np.array(self.train_dataset.indices)]
         eval_lengths = full_dataset.lengths[np.array(self.eval_dataset.indices)]
 
-        self.train_sampler = TokenBudgetBatchSampler(
-            train_lengths, max_batch_tokens, shuffle=True, seed=seed,
+        self.train_sampler = PackedTokenBudgetSampler(
+            None, train_lengths, max_batch_tokens, shuffle=True, seed=seed,
         )
-        eval_sampler = TokenBudgetBatchSampler(
-            eval_lengths, max_batch_tokens, shuffle=False,
+        eval_sampler = PackedTokenBudgetSampler(
+            None, eval_lengths, max_batch_tokens_eval, shuffle=False,
         )
 
         self.train_dataloader = DataLoader(
@@ -368,7 +372,13 @@ class PruningDistillTrainer(BaseTrainer):
         teacher_final: torch.Tensor,
         student_final: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute weighted distillation loss."""
+        """Compute weighted distillation loss.
+
+        All tensor arguments are flat ``(N, D)`` over tokens (packed form).
+        MSE and cosine losses reduce globally over the flat token dimension —
+        no per-sample accumulation is needed because each token is equally
+        weighted and the batch is a single packed flat buffer.
+        """
         # Boundary MSE: average across block boundaries
         n_boundaries = min(len(teacher_intermediates), len(student_intermediates))
         boundary_loss = torch.tensor(0.0, device=teacher_final.device)
@@ -385,9 +395,10 @@ class PruningDistillTrainer(BaseTrainer):
         proj_loss = F.mse_loss(student_proj, teacher_proj.detach())
 
         # Cosine similarity loss on final compressor output
+        # teacher_final / student_final: (N_content, D) flat packed
         cos_sim = F.cosine_similarity(
-            student_final.flatten(0, 1),
-            teacher_final.detach().flatten(0, 1),
+            student_final,
+            teacher_final.detach(),
             dim=-1,
         )
         cosine_loss = (1.0 - cos_sim).mean()
@@ -408,92 +419,124 @@ class PruningDistillTrainer(BaseTrainer):
         }
         return total, metrics
 
+    def _run_encoder_forward(
+        self,
+        encoder: BgKITEncoder,
+        content_token_ids: torch.Tensor,
+        content_cu_seqlens: torch.Tensor,
+        content_position_ids: torch.Tensor,
+        compression_prompt_ids: torch.Tensor,
+        prompt_cu_seqlens: torch.Tensor,
+        prompt_position_ids: torch.Tensor,
+        target_ratio: float,
+    ):
+        """Run compressor + projection block for one encoder (teacher or student).
+
+        Returns ``(comp_out, proj_out)`` where:
+        - ``comp_out`` is a ``CompressorOutput`` with packed fields.
+        - ``proj_out`` is a ``ProjectionOutput``.
+
+        Both teacher and student go through the same code path; the caller
+        wraps with ``torch.no_grad()`` for the teacher.
+        """
+        embed = encoder.compressor.backbone.get_input_embeddings()
+        content_emb = embed(content_token_ids)  # (N_content, D)
+        prompt_emb = embed(compression_prompt_ids)  # (N_prompt, D)
+
+        comp_out = encoder.compressor(
+            content_emb,
+            content_cu_seqlens=content_cu_seqlens,
+            content_position_ids=content_position_ids,
+            prompt_embeddings=prompt_emb,
+            prompt_cu_seqlens=prompt_cu_seqlens,
+            target_ratio=target_ratio,
+            level="l0",
+            return_intermediates=True,
+        )
+
+        # Map the content-only survivor mask into the combined pack for the
+        # projection block, mirroring BgKITEncoder.forward.
+        content_mask_combined = comp_out.content_position_mask  # (N_total,)
+        survivor_mask_content = comp_out.survivor_mask  # (N_content,) or None
+        if survivor_mask_content is not None:
+            survivor_mask_combined = torch.zeros_like(content_mask_combined)
+            content_indices = torch.nonzero(content_mask_combined, as_tuple=False).squeeze(-1)
+            survivor_mask_combined[content_indices] = survivor_mask_content
+        else:
+            survivor_mask_combined = None
+
+        proj_out = encoder.projection_block(
+            comp_out.raw_embeddings,
+            cu_seqlens=comp_out.combined_cu_seqlens,
+            max_seqlen=comp_out.combined_max_seqlen,
+            position_ids=comp_out.combined_position_ids,
+            survivor_mask=survivor_mask_combined,
+        )
+
+        return comp_out, proj_out
+
     def _forward_backward(self, batch) -> dict[str, float]:
         self.student_encoder.train()
 
         content_token_ids = batch["content_token_ids"].to(self.device)
-        content_attention_mask = batch["content_attention_mask"].to(self.device)
+        content_cu_seqlens = batch["content_cu_seqlens"].to(self.device)
+        content_position_ids = batch["content_position_ids"].to(self.device)
+
         compression_prompt_ids = batch["compression_prompt_ids"].to(self.device)
-        compression_prompt_mask = batch["compression_prompt_mask"].to(self.device)
+        prompt_cu_seqlens = batch["compression_prompt_cu_seqlens"].to(self.device)
+        prompt_position_ids = position_ids_from_cu(
+            prompt_cu_seqlens, int(prompt_cu_seqlens[-1]),
+        ).to(self.device)
 
         target_ratio = self._current_target_ratio()
 
         # --- Teacher forward (fully frozen) ---
         with torch.no_grad():
-            teacher_embed = self.teacher_encoder.compressor.backbone.get_input_embeddings()
-            content_emb = teacher_embed(content_token_ids)
-            prompt_emb = teacher_embed(compression_prompt_ids)
-
-            # Teacher compressor with intermediates (survivorship head produces mask)
-            teacher_comp = self.teacher_encoder.compressor(
-                content_emb,
-                attention_mask=content_attention_mask,
-                prompt_embeddings=prompt_emb,
-                prompt_attention_mask=compression_prompt_mask,
-                target_ratio=target_ratio,
-                level="l0",
-                return_intermediates=True,
+            teacher_comp, teacher_proj_out = self._run_encoder_forward(
+                self.teacher_encoder,
+                content_token_ids,
+                content_cu_seqlens,
+                content_position_ids,
+                compression_prompt_ids,
+                prompt_cu_seqlens,
+                prompt_position_ids,
+                target_ratio,
             )
-
-            # Teacher auto-repro
-            content_slice = teacher_comp.content_slice
-            teacher_normed_content = teacher_comp.normed_embeddings[:, content_slice, :]
+            # Content-only normed embeddings for auto-repro
+            teacher_normed_content = teacher_comp.normed_embeddings[
+                teacher_comp.content_position_mask
+            ]
             teacher_repro = self.teacher_encoder.compressor.auto_reproduce(
                 teacher_normed_content,
             )
-
-            # Teacher projection
-            full_raw = teacher_comp.raw_embeddings
-            full_mask = teacher_comp.attention_mask
-            survivor_mask = teacher_comp.survivor_mask
-            if survivor_mask is not None:
-                full_survivor_mask = _expand_survivor_mask(
-                    survivor_mask, content_slice, full_raw.size(1),
-                )
-            else:
-                full_survivor_mask = None
-            teacher_proj_out = self.teacher_encoder.projection_block(
-                full_raw, full_mask, survivor_mask=full_survivor_mask,
-            )
+            # Content-only raw embeddings for cosine loss
+            teacher_content_raw = teacher_comp.raw_embeddings[
+                teacher_comp.content_position_mask
+            ]
 
         # --- Student forward ---
-        student_embed = self.student_encoder.compressor.backbone.get_input_embeddings()
-        student_content_emb = student_embed(content_token_ids)
-        student_prompt_emb = student_embed(compression_prompt_ids)
-
-        # Student compressor with intermediates (uses same target_ratio; its own
-        # survivorship head produces a mask independently)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-            student_comp = self.student_encoder.compressor(
-                student_content_emb,
-                attention_mask=content_attention_mask,
-                prompt_embeddings=student_prompt_emb,
-                prompt_attention_mask=compression_prompt_mask,
-                target_ratio=target_ratio,
-                level="l0",
-                return_intermediates=True,
+            student_comp, student_proj_out = self._run_encoder_forward(
+                self.student_encoder,
+                content_token_ids,
+                content_cu_seqlens,
+                content_position_ids,
+                compression_prompt_ids,
+                prompt_cu_seqlens,
+                prompt_position_ids,
+                target_ratio,
             )
-
-            # Student auto-repro
-            student_normed_content = student_comp.normed_embeddings[:, content_slice, :]
+            # Content-only normed embeddings for auto-repro
+            student_normed_content = student_comp.normed_embeddings[
+                student_comp.content_position_mask
+            ]
             student_repro = self.student_encoder.compressor.auto_reproduce(
                 student_normed_content,
             )
-
-            # Student projection
-            student_full_raw = student_comp.raw_embeddings
-            student_full_mask = student_comp.attention_mask
-            student_survivor_mask = student_comp.survivor_mask
-            if student_survivor_mask is not None:
-                student_full_survivor_mask = _expand_survivor_mask(
-                    student_survivor_mask, content_slice, student_full_raw.size(1),
-                )
-            else:
-                student_full_survivor_mask = None
-            student_proj_out = self.student_encoder.projection_block(
-                student_full_raw, student_full_mask,
-                survivor_mask=student_full_survivor_mask,
-            )
+            # Content-only raw embeddings for cosine loss
+            student_content_raw = student_comp.raw_embeddings[
+                student_comp.content_position_mask
+            ]
 
             # Compute distillation loss
             loss, metrics = self._compute_distillation_loss(
@@ -503,22 +546,20 @@ class PruningDistillTrainer(BaseTrainer):
                 student_repro=student_repro,
                 teacher_proj=teacher_proj_out.projected_embeddings,
                 student_proj=student_proj_out.projected_embeddings,
-                teacher_final=teacher_comp.raw_embeddings[:, content_slice, :],
-                student_final=student_comp.raw_embeddings[:, content_slice, :],
+                teacher_final=teacher_content_raw,
+                student_final=student_content_raw,
             )
 
         (loss / self._accum_steps).backward()
 
         # Track compression stats
+        survivor_mask = student_comp.survivor_mask  # (N_content,) bool or None
         n_survivors = int(survivor_mask.sum().item()) if survivor_mask is not None else 0
-        n_valid = int(content_attention_mask.sum().item())
-        metrics["actual_ratio"] = n_survivors / max(n_valid, 1)
+        n_content = int(content_cu_seqlens[-1].item())
+        metrics["actual_ratio"] = n_survivors / max(n_content, 1)
         metrics["stage"] = self._current_stage
 
-        # Drop compressor-output tensor refs (teacher + student) per
-        # ``CompressorOutput.release()`` contract. Pruning distillation
-        # doesn't activate the utility-grad path so no hook leak in
-        # practice, but the call standardises the per-step cleanup.
+        # Drop compressor-output tensor refs per CompressorOutput.release() contract.
         teacher_comp.release()
         student_comp.release()
 
@@ -598,75 +639,65 @@ class PruningDistillTrainer(BaseTrainer):
 
             for batch in self.eval_dataloader:
                 content_token_ids = batch["content_token_ids"].to(self.device)
-                content_attention_mask = batch["content_attention_mask"].to(self.device)
+                content_cu_seqlens = batch["content_cu_seqlens"].to(self.device)
+                content_position_ids = batch["content_position_ids"].to(self.device)
+
                 compression_prompt_ids = batch["compression_prompt_ids"].to(self.device)
-                compression_prompt_mask = batch["compression_prompt_mask"].to(self.device)
+                prompt_cu_seqlens = batch["compression_prompt_cu_seqlens"].to(self.device)
+                prompt_position_ids = position_ids_from_cu(
+                    prompt_cu_seqlens, int(prompt_cu_seqlens[-1]),
+                ).to(self.device)
 
                 # Teacher forward
-                teacher_embed = self.teacher_encoder.compressor.backbone.get_input_embeddings()
-                content_emb = teacher_embed(content_token_ids)
-                prompt_emb = teacher_embed(compression_prompt_ids)
-
-                teacher_comp = self.teacher_encoder.compressor(
-                    content_emb,
-                    attention_mask=content_attention_mask,
-                    prompt_embeddings=prompt_emb,
-                    prompt_attention_mask=compression_prompt_mask,
-                    target_ratio=target_ratio,
-                    level="l0",
-                    return_intermediates=True,
+                teacher_comp, teacher_proj_out = self._run_encoder_forward(
+                    self.teacher_encoder,
+                    content_token_ids,
+                    content_cu_seqlens,
+                    content_position_ids,
+                    compression_prompt_ids,
+                    prompt_cu_seqlens,
+                    prompt_position_ids,
+                    target_ratio,
                 )
-                content_slice = teacher_comp.content_slice
-                teacher_normed = teacher_comp.normed_embeddings[:, content_slice, :]
-                teacher_repro = self.teacher_encoder.compressor.auto_reproduce(teacher_normed)
-                teacher_survivor_mask = teacher_comp.survivor_mask
-                if teacher_survivor_mask is not None:
-                    teacher_full_survivor_mask = _expand_survivor_mask(
-                        teacher_survivor_mask, content_slice,
-                        teacher_comp.raw_embeddings.size(1),
-                    )
-                else:
-                    teacher_full_survivor_mask = None
-                teacher_proj = self.teacher_encoder.projection_block(
-                    teacher_comp.raw_embeddings, teacher_comp.attention_mask,
-                    survivor_mask=teacher_full_survivor_mask,
+                teacher_normed_content = teacher_comp.normed_embeddings[
+                    teacher_comp.content_position_mask
+                ]
+                teacher_repro = self.teacher_encoder.compressor.auto_reproduce(
+                    teacher_normed_content,
                 )
+                teacher_content_raw = teacher_comp.raw_embeddings[
+                    teacher_comp.content_position_mask
+                ]
 
                 # Student forward
-                student_embed = self.student_encoder.compressor.backbone.get_input_embeddings()
-                s_content = student_embed(content_token_ids)
-                s_prompt = student_embed(compression_prompt_ids)
-                student_comp = self.student_encoder.compressor(
-                    s_content,
-                    attention_mask=content_attention_mask,
-                    prompt_embeddings=s_prompt,
-                    prompt_attention_mask=compression_prompt_mask,
-                    target_ratio=target_ratio,
-                    level="l0",
-                    return_intermediates=True,
+                student_comp, student_proj_out = self._run_encoder_forward(
+                    self.student_encoder,
+                    content_token_ids,
+                    content_cu_seqlens,
+                    content_position_ids,
+                    compression_prompt_ids,
+                    prompt_cu_seqlens,
+                    prompt_position_ids,
+                    target_ratio,
                 )
-                student_normed = student_comp.normed_embeddings[:, content_slice, :]
-                student_repro = self.student_encoder.compressor.auto_reproduce(student_normed)
-                student_survivor_mask = student_comp.survivor_mask
-                if student_survivor_mask is not None:
-                    student_full_survivor_mask = _expand_survivor_mask(
-                        student_survivor_mask, content_slice,
-                        student_comp.raw_embeddings.size(1),
-                    )
-                else:
-                    student_full_survivor_mask = None
-                student_proj = self.student_encoder.projection_block(
-                    student_comp.raw_embeddings, student_comp.attention_mask,
-                    survivor_mask=student_full_survivor_mask,
+                student_normed_content = student_comp.normed_embeddings[
+                    student_comp.content_position_mask
+                ]
+                student_repro = self.student_encoder.compressor.auto_reproduce(
+                    student_normed_content,
                 )
+                student_content_raw = student_comp.raw_embeddings[
+                    student_comp.content_position_mask
+                ]
 
                 _, batch_metrics = self._compute_distillation_loss(
                     teacher_comp.intermediates or [],
                     student_comp.intermediates or [],
                     teacher_repro, student_repro,
-                    teacher_proj.projected_embeddings, student_proj.projected_embeddings,
-                    teacher_comp.raw_embeddings[:, content_slice, :],
-                    student_comp.raw_embeddings[:, content_slice, :],
+                    teacher_proj_out.projected_embeddings,
+                    student_proj_out.projected_embeddings,
+                    teacher_content_raw,
+                    student_content_raw,
                 )
 
                 for k, v in batch_metrics.items():
