@@ -34,7 +34,12 @@ gpu = [
     "bitsandbytes>=0.49",
     "einops>=0.8",
     "flash-attn-4[cu13]>=4.0.0b9",
-    "flash-linear-attention>=0.4.2",
+    # Pinned to fla main commit 1d4d88ff (2026-04-21) for post-0.4.2
+    # improvements: GDN backward kernel optimization (PR #849/#823),
+    # varlen cu_seqlens path fixes (#839, #842, #844), fused_recurrent
+    # gate-activation fusion (#848). chunk_gated_delta_rule signature
+    # is unchanged from 0.4.2, so our deltanet_patch.py still works.
+    "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@1d4d88ff2dd3f6df3560d502a0ad3a34472f1ee5",
     "liger-kernel>=0.7",
 ]
 dev = [
