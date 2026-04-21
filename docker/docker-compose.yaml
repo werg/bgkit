@@ -13,6 +13,14 @@ x-gpu-common: &gpu-common
   # Added 2026-04-20 after an unsupervised profiler run crashed the host.
   mem_limit: 80g
   memswap_limit: 80g
+  # Stop grace period: the emergency-save handler serializes encoder + decoder
+  # + optimizer state on SIGTERM. For a 500M-param Muon-trained model on
+  # the external spinning-disk checkpoint dir, that's 20-60 s. Docker
+  # Compose's default 10 s is not enough — SIGKILL lands mid-save and the
+  # emergency checkpoint is lost. Raised to 180 s on 2026-04-21 after a
+  # phase1_step3 stop at step ~4250 lost ~250 steps because the save
+  # didn't finish before SIGKILL.
+  stop_grace_period: 180s
   deploy:
     resources:
       reservations:
@@ -151,7 +159,7 @@ services:
     # (eval/loss 0.38, the 04-20 run before the crash). Override here
     # until a packed-trained checkpoint naturally becomes the newest.
     command: ["scripts/train.py", "+experiment=phase1_step3",
-              "++resume_checkpoint=/workspace/checkpoints/phase1_step3_step2545_20260420_211940"]
+              "++resume_checkpoint=/workspace/checkpoints/phase1_step3_step4000_20260421_092939"]
 
   train-phase1-step4:
     <<: *gpu-common
