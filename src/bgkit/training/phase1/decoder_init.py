@@ -1538,11 +1538,24 @@ class DecoderInitTrainer(BaseTrainer):
                 int(getattr(self, "_generation_eval_every", gen_every_default)),
             )
             if self._eval_count % gen_every == 0:
-                with memory_budget_scope(
-                    "gen_eval", cap_gb=self._scope_cap("gen_eval"),
-                ):
-                    gen_metrics = self._run_generation_eval()
-                metrics.update(gen_metrics)
+                # Defense-in-depth: gen_eval is optional observability, not a
+                # training-correctness path. On failure (OOM in gen scope,
+                # transient FA4 quirk, tokenizer edge case, etc.) skip the
+                # metrics and keep training rather than tearing down the run.
+                try:
+                    with memory_budget_scope(
+                        "gen_eval", cap_gb=self._scope_cap("gen_eval"),
+                    ):
+                        gen_metrics = self._run_generation_eval()
+                    metrics.update(gen_metrics)
+                except Exception as exc:
+                    logger.warning(
+                        "gen_eval_failed",
+                        error=str(exc),
+                        exc_type=type(exc).__name__,
+                        step=self.step,
+                        eval_count=self._eval_count,
+                    )
 
         finally:
             self._is_evaluating = False
