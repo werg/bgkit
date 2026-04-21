@@ -100,6 +100,45 @@ def main(cfg: DictConfig) -> None:
 
     if _torch.cuda.is_available():
         _frac = float(_os.environ.get("BGKIT_CUDA_MEM_FRACTION", "0.65"))
+
+        # Peer-container safety check: on unified-memory systems,
+        # ``set_per_process_memory_fraction`` is per-process, not per-host.
+        # Two containers each claiming 65% of the 128 GB pool can push total
+        # allocation past the pool, triggering kernel page-thrash and host
+        # death — this bit us twice already. Query current CUDA usage before
+        # configuring our fraction; if existing usage + our ask would exceed
+        # 90% of the pool (leaving 10% for OS + driver), refuse to start.
+        # Set BGKIT_ALLOW_PEER_CUDA=1 to bypass (auto-shrink instead).
+        _free_bytes, _total_bytes = _torch.cuda.mem_get_info()
+        _total_gb = _total_bytes / 1e9
+        _used_by_peers_gb = (_total_bytes - _free_bytes) / 1e9
+        _our_ask_gb = _frac * _total_gb
+        _safe_ceiling_gb = 0.90 * _total_gb
+        _allow_peer = _os.environ.get("BGKIT_ALLOW_PEER_CUDA", "0") == "1"
+
+        if _used_by_peers_gb + _our_ask_gb > _safe_ceiling_gb:
+            _max_safe_frac = max(0.05, (_safe_ceiling_gb - _used_by_peers_gb) / _total_gb)
+            _msg = (
+                f"[cuda-mem-guard] peer CUDA usage = {_used_by_peers_gb:.1f} GB / "
+                f"{_total_gb:.1f} GB pool. Our requested fraction {_frac:.2f} "
+                f"({_our_ask_gb:.1f} GB) would push total past the 90% host "
+                f"safety ceiling ({_safe_ceiling_gb:.1f} GB). "
+            )
+            if _allow_peer:
+                print(
+                    f"{_msg}BGKIT_ALLOW_PEER_CUDA=1 set — auto-shrinking to "
+                    f"fraction {_max_safe_frac:.3f} ({_max_safe_frac * _total_gb:.1f} GB).",
+                    flush=True,
+                )
+                _frac = _max_safe_frac
+            else:
+                raise SystemExit(
+                    f"{_msg}Refusing to start to avoid host OOM. "
+                    f"Options: (a) stop peer CUDA containers, (b) set "
+                    f"BGKIT_CUDA_MEM_FRACTION={_max_safe_frac:.2f} or lower, "
+                    f"(c) set BGKIT_ALLOW_PEER_CUDA=1 to auto-shrink."
+                )
+
         _torch.cuda.set_per_process_memory_fraction(_frac)
 
     print(OmegaConf.to_yaml(cfg))
