@@ -125,6 +125,10 @@ class DecoderInitTrainer(BaseTrainer):
         "encoder_unfreeze_step": "_encoder_unfreeze_step",
         # Flow-control scalars (all cheap to change mid-run):
         "diagnostic_metrics_every_n_steps": "_diagnostic_metrics_every_n_steps",
+        # Generation-eval frequency (eval_every / save_every are live-tunable
+        # in BaseTrainer directly). gen_eval has a separate cadence since it
+        # runs only every Nth eval to amortize the KV-cache cost.
+        "generation_eval_every": "_generation_eval_every",
     }
 
     LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
@@ -353,6 +357,12 @@ class DecoderInitTrainer(BaseTrainer):
         # Diagnostic metrics gating — live-tunable via control.json.
         self._diagnostic_metrics_every_n_steps = int(
             tcfg.get("diagnostic_metrics_every_n_steps", 10),
+        )
+        # Generation-eval cadence (runs every N evaluate() calls). Promoted to
+        # an instance attribute so the live-config path can mutate it at
+        # runtime (see LIVE_CONFIG_FIELDS).
+        self._generation_eval_every = int(
+            tcfg.get("eval", {}).get("generation_eval_every", 4),
         )
 
         # Floor knobs for the operator (passed to encoder.forward).
@@ -1515,8 +1525,18 @@ class DecoderInitTrainer(BaseTrainer):
             # Scoped separately from outer ``evaluate`` because the KV
             # cache under ``max_new_tokens`` is a different memory regime
             # than CE-only eval and deserves its own budget contract.
-            tcfg = self.cfg.training
-            gen_every = tcfg.get("eval", {}).get("generation_eval_every", 4)
+            # Cadence is live-tunable via ``_generation_eval_every`` —
+            # control.json can bump it up/down without restart.
+            # Fall back to the config value when setup() hasn't populated the
+            # instance attr yet (light-weight test fixtures that bypass
+            # ``setup`` still construct the trainer directly).
+            gen_every_default = self.cfg.training.get("eval", {}).get(
+                "generation_eval_every", 4,
+            )
+            gen_every = max(
+                1,
+                int(getattr(self, "_generation_eval_every", gen_every_default)),
+            )
             if self._eval_count % gen_every == 0:
                 with memory_budget_scope(
                     "gen_eval", cap_gb=self._scope_cap("gen_eval"),
