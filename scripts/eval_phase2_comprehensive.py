@@ -60,6 +60,10 @@ def _generate_predictions(
 ) -> tuple[list[str], list[str], list[dict]]:
     """Generate text predictions from the trainer's eval dataloader.
 
+    Iterates KBSample objects (packed-attention convention); each sample is
+    passed through ``_build_decoder_segments`` + ``forward_interleaved_with_loss``
+    with ``return_hidden_states=True`` so we can greedy-decode the answer span.
+
     Returns:
         (predictions, references, metadata_list)
     """
@@ -73,42 +77,43 @@ def _generate_predictions(
         for batch in trainer.eval_dataloader:
             if samples_seen >= max_samples:
                 break
-
-            prompt, prompt_mask = trainer._compose_prompt(batch)
-            target_ids = batch["target_token_ids"].to(trainer.device)
-            target_attention_mask = batch["target_attention_mask"].to(trainer.device)
-            target_loss_mask = batch["target_loss_mask"].to(trainer.device)
-
-            logits = trainer.decoder(
-                prompt,
-                target_ids,
-                target_attention_mask,
-                prompt_mask,
-            )
-            shifted_logits = logits[:, :-1]
-            pred_ids = shifted_logits.argmax(dim=-1)
-            shifted_mask = target_loss_mask[:, 1:]
-            shifted_labels = target_ids[:, 1:]
-
-            for i in range(pred_ids.size(0)):
+            for sample in batch:
                 if samples_seen >= max_samples:
                     break
-                mask_i = shifted_mask[i].bool()
+
+                segments, _trace = trainer._build_decoder_segments_with_trace(sample)
+                output = trainer.decoder.forward_interleaved_with_loss(
+                    segments, return_hidden_states=True,
+                )
+
+                token_ids_full = output.token_ids  # (1, S)
+                loss_mask_full = output.loss_mask  # (1, S) bool
+                preds = output.argmax_predictions()  # (1, S-1)
+
+                # Shift: preds[i] predicts token[i+1]
+                shift_labels = token_ids_full[:, 1:]  # (1, S-1)
+                shift_mask = loss_mask_full[:, 1:]  # (1, S-1)
+
+                mask_i = shift_mask[0].bool()
                 if not mask_i.any():
+                    samples_seen += 1
                     continue
+
                 pred_text = tokenizer.decode(
-                    pred_ids[i][mask_i].cpu().tolist(), skip_special_tokens=True,
+                    preds[0][mask_i].cpu().tolist(), skip_special_tokens=True,
                 )
                 ref_text = tokenizer.decode(
-                    shifted_labels[i][mask_i].cpu().tolist(), skip_special_tokens=True,
+                    shift_labels[0][mask_i].cpu().tolist(), skip_special_tokens=True,
                 )
                 predictions.append(pred_text)
                 references.append(ref_text)
-                meta = {}
-                if "dataset_names" in batch and i < len(batch["dataset_names"]):
-                    meta["dataset_name"] = batch["dataset_names"][i]
-                if "metadata" in batch and i < len(batch["metadata"]):
-                    meta.update(batch["metadata"][i])
+                meta: dict = {}
+                if hasattr(sample, "dataset_name"):
+                    meta["dataset_name"] = sample.dataset_name
+                if hasattr(sample, "gold_answer") and sample.gold_answer:
+                    meta["gold_answer"] = sample.gold_answer
+                if hasattr(sample, "document_id"):
+                    meta["document_id"] = sample.document_id
                 metadata_list.append(meta)
                 samples_seen += 1
 
@@ -241,8 +246,10 @@ def _run_ablation_suite(
 ) -> dict:
     """Run survivors present/zeroed/noise ablation.
 
-    For each condition, modifies the compressed prompt before decoding
-    and measures the change in answer quality.
+    Uses the trainer's set_ablation_mode() to modify the compressed prompt
+    before decoding, then measures change in next-token accuracy over
+    loss-bearing positions. Packed-attention form: each sample is processed
+    via _build_decoder_segments + forward_interleaved_with_loss.
     """
     max_samples = int(eval_cfg.get("ablation_samples", 200))
     conditions = ["present", "zeroed", "noise"]
@@ -257,49 +264,43 @@ def _run_ablation_suite(
         total_batches = 0
         samples_seen = 0
 
+        # Apply ablation condition via trainer's set_ablation_mode
+        ablation_mode = (
+            None if condition == "present"
+            else trainer.ABLATION_ZEROED if condition == "zeroed"
+            else trainer.ABLATION_NOISE
+        )
+        trainer.set_ablation_mode(ablation_mode)
+
         with torch.no_grad():
             for batch in trainer.eval_dataloader:
                 if samples_seen >= max_samples:
                     break
+                for sample in batch:
+                    if samples_seen >= max_samples:
+                        break
 
-                prompt, prompt_mask = trainer._compose_prompt(batch)
-                target_ids = batch["target_token_ids"].to(trainer.device)
-                target_attention_mask = batch["target_attention_mask"].to(trainer.device)
-                target_loss_mask = batch["target_loss_mask"].to(trainer.device)
+                    segments, _trace = trainer._build_decoder_segments(sample)
+                    output = trainer.decoder.forward_interleaved_with_loss(
+                        segments, return_hidden_states=True,
+                    )
 
-                # Apply ablation condition to the prompt embeddings
-                if condition == "zeroed":
-                    prompt = torch.zeros_like(prompt)
-                elif condition == "noise":
-                    prompt = torch.randn_like(prompt) * prompt.std()
-                # "present" uses the prompt as-is
+                    token_ids_full = output.token_ids   # (1, S)
+                    loss_mask_full = output.loss_mask   # (1, S) bool
+                    preds = output.argmax_predictions()  # (1, S-1)
+                    shift_labels = token_ids_full[:, 1:]
+                    shift_mask = loss_mask_full[:, 1:]
 
-                loss = trainer.decoder.forward_with_loss(
-                    prompt,
-                    target_ids,
-                    target_attention_mask,
-                    prompt_mask,
-                    loss_mask=target_loss_mask,
-                )
+                    answer_tokens = int(shift_mask.sum().item())
+                    correct = int(((preds == shift_labels) & shift_mask).sum().item())
 
-                logits = trainer.decoder(
-                    prompt,
-                    target_ids,
-                    target_attention_mask,
-                    prompt_mask,
-                )
-                shifted_logits = logits[:, :-1]
-                shifted_labels = target_ids[:, 1:]
-                shifted_mask = target_loss_mask[:, 1:]
-                preds = shifted_logits.argmax(dim=-1)
-                correct = ((preds == shifted_labels) & shifted_mask).sum().item()
-                answer_tokens = shifted_mask.sum().item()
-
-                total_correct += correct
-                total_tokens += answer_tokens
-                total_loss += loss.item()
-                total_batches += 1
-                samples_seen += target_ids.size(0)
+                    # Reconstruct CE loss from the trainer-computed output
+                    if hasattr(output, "loss") and output.loss is not None:
+                        total_loss += float(output.loss.item())
+                    total_correct += correct
+                    total_tokens += answer_tokens
+                    total_batches += 1
+                    samples_seen += 1
 
         results[condition] = {
             "loss": total_loss / max(total_batches, 1),
@@ -307,6 +308,8 @@ def _run_ablation_suite(
             "n_batches": total_batches,
         }
 
+    # Restore no-ablation mode
+    trainer.set_ablation_mode(None)
     trainer.model.train()
     return results
 
@@ -316,7 +319,11 @@ def _run_compression_pareto(
     tokenizer,
     eval_cfg: DictConfig,
 ) -> dict:
-    """Evaluate at multiple retention ratios to build a Pareto frontier."""
+    """Evaluate at multiple retention ratios to build a Pareto frontier.
+
+    For each ratio, monkey-patches trainer._target_ratio so the encoder's
+    DualThresholdController sees the overridden ratio. Packed-attention form.
+    """
     ratios = list(eval_cfg.get("pareto_ratios", [0.50, 0.10, 0.05, 0.02, 0.01]))
     max_samples = int(eval_cfg.get("pareto_samples", 200))
 
@@ -351,38 +358,30 @@ def _run_compression_pareto(
             for batch in trainer.eval_dataloader:
                 if samples_seen >= max_samples:
                     break
+                for sample in batch:
+                    if samples_seen >= max_samples:
+                        break
 
-                prompt, prompt_mask = trainer._compose_prompt(batch)
-                target_ids = batch["target_token_ids"].to(trainer.device)
-                target_attention_mask = batch["target_attention_mask"].to(trainer.device)
-                target_loss_mask = batch["target_loss_mask"].to(trainer.device)
+                    segments, _trace = trainer._build_decoder_segments(sample)
+                    output = trainer.decoder.forward_interleaved_with_loss(
+                        segments, return_hidden_states=True,
+                    )
 
-                loss = trainer.decoder.forward_with_loss(
-                    prompt,
-                    target_ids,
-                    target_attention_mask,
-                    prompt_mask,
-                    loss_mask=target_loss_mask,
-                )
+                    token_ids_full = output.token_ids   # (1, S)
+                    loss_mask_full = output.loss_mask   # (1, S) bool
+                    preds = output.argmax_predictions()  # (1, S-1)
+                    shift_labels = token_ids_full[:, 1:]
+                    shift_mask = loss_mask_full[:, 1:]
 
-                logits = trainer.decoder(
-                    prompt,
-                    target_ids,
-                    target_attention_mask,
-                    prompt_mask,
-                )
-                shifted_logits = logits[:, :-1]
-                shifted_labels = target_ids[:, 1:]
-                shifted_mask = target_loss_mask[:, 1:]
-                preds = shifted_logits.argmax(dim=-1)
-                correct = ((preds == shifted_labels) & shifted_mask).sum().item()
-                answer_tokens = shifted_mask.sum().item()
+                    answer_tokens = int(shift_mask.sum().item())
+                    correct = int(((preds == shift_labels) & shift_mask).sum().item())
 
-                total_correct += correct
-                total_tokens += answer_tokens
-                total_loss += loss.item()
-                total_batches += 1
-                samples_seen += target_ids.size(0)
+                    if hasattr(output, "loss") and output.loss is not None:
+                        total_loss += float(output.loss.item())
+                    total_correct += correct
+                    total_tokens += answer_tokens
+                    total_batches += 1
+                    samples_seen += 1
 
         results_by_ratio[str(ratio)] = {
             "ratio": ratio,
@@ -435,12 +434,23 @@ def _run_baseline_comparison(
         if samples_seen >= max_samples:
             break
         sample = inner_dataset[idx]
-        doc_id = sample.document_id or str(idx)
-        doc_text = tokenizer.decode(sample.content_token_ids.tolist(), skip_special_tokens=True)
-        question_text = tokenizer.decode(
-            sample.question_token_ids.tolist(), skip_special_tokens=True,
-        )
-        answer_text = tokenizer.decode(sample.answer_token_ids.tolist(), skip_special_tokens=True)
+        doc_id = getattr(sample, "document_id", None) or str(idx)
+        # Decode content / question / answer using the trainer's tokenizer
+        content_ids = getattr(sample, "content_token_ids", None)
+        question_ids = getattr(sample, "question_token_ids", None)
+        answer_ids = getattr(sample, "answer_token_ids", None)
+        if content_ids is not None:
+            doc_text = tokenizer.decode(content_ids.tolist(), skip_special_tokens=True)
+        else:
+            doc_text = ""
+        if question_ids is not None:
+            question_text = tokenizer.decode(question_ids.tolist(), skip_special_tokens=True)
+        else:
+            question_text = getattr(sample, "gold_answer", "") or ""
+        if answer_ids is not None:
+            answer_text = tokenizer.decode(answer_ids.tolist(), skip_special_tokens=True)
+        else:
+            answer_text = getattr(sample, "gold_answer", "") or ""
         documents[doc_id] = doc_text
         questions.append(question_text)
         ref_answers.append(answer_text)
@@ -527,7 +537,7 @@ def main(cfg: DictConfig) -> None:
     logger.info("phase2_loading_models")
     trainer = _load_trainer(cfg)
 
-    decoder_name = trainer._resolve_decoder_backbone_name()
+    decoder_name = trainer.cfg.model.decoder.backbone_name
     tokenizer = AutoTokenizer.from_pretrained(decoder_name, trust_remote_code=True)
 
     report = {
