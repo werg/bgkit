@@ -39,8 +39,8 @@ warmup_steps: 500
 # Step 3's shape. 32768 OOM'd at the 79 GB per-process allocator cap
 # on the first forward. 24576 keeps effective batch close to
 # baseline (49152 tokens/step vs Step 3's 65536) with headroom.
-max_batch_tokens: 24576
-gradient_accumulation_steps: 2
+max_batch_tokens: 16384
+gradient_accumulation_steps: 4
 max_eval_samples: 500
 eval_every: 500
 save_every: 500
