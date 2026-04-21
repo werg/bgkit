@@ -42,7 +42,7 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
     ``sum(L_i^2)`` for a packed batch rather than ``B x max_len^2``.  The
     budget is therefore::
 
-        sum(L_i^2) <= max_batch_tokens x reference_seq_len
+        sum((L_i * cost_multiplier)^2) <= max_batch_tokens * reference_seq_len
 
     ``reference_seq_len`` converts ``max_batch_tokens`` from the old
     linear-budget units into quadratic-budget units.  At exactly
@@ -51,17 +51,34 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
     only flip the sampler class.  The default is **2048** — a typical
     "representative document length" for code/text corpora.
 
-    Algorithm:
+    **Length-bucketed packing** (``bucket_mode="quantile"``): rather than
+    shuffling all indices together and greedy-packing (which produces a
+    long right tail where a single long sample consumes most of the
+    budget alone), samples are partitioned into length-quantile buckets.
+    Each epoch we:
 
-    1. Shuffle all indices (per epoch, deterministically when *seed* is
-       given via ``torch.Generator`` for cross-process reproducibility).
-    2. Greedily accumulate indices into the current microbatch while
-       ``sum(L_i²) + L_next²  ≤  budget``.
-    3. When adding the next index would overflow, emit the current
-       microbatch and start a new one with that index.
-    4. Singleton overflow: if a single sample has ``L² > budget`` it is
-       emitted as a batch of one, :attr:`oversized_count` is incremented,
-       and a warning is logged once.
+    1. Shuffle each bucket's internal order independently.
+    2. Optionally shuffle the bucket visit order (``bucket_shuffle``).
+    3. Greedy-pack microbatches *within* each bucket; a new bucket
+       always starts a fresh microbatch.
+
+    The asymptotic distribution over the epoch remains uniform (each
+    sample seen exactly once) but per-microbatch length variance is
+    dramatically reduced, which kills the wall-clock spikes caused by
+    long-tail microbatches.  See ``docs/wall_clock_investigation``.
+
+    **Decoder-aware budgeting** (``cost_multiplier``): the decoder runs
+    on ``[prefix | survivors | suffix]`` ≈ ``cost_multiplier * L`` tokens.
+    When the decoder's backward is the dominant cost, set
+    ``cost_multiplier=2.0`` so the budget reflects true decoder work.
+    The formula is quadratic, so setting ``cost_multiplier=2`` reduces
+    effective per-microbatch sample count by ~4x.  Default is 1.0
+    (preserves legacy behavior).
+
+    **Oversized singleton overflow**: if a single sample has
+    ``(L * cost_multiplier)^2 > budget`` it is emitted as a batch of
+    one, :attr:`oversized_count` is incremented, and a warning is
+    logged once.
 
     Args:
         dataset: Not used for length probing — retained for API parity with
@@ -76,6 +93,18 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
         seed: RNG seed for shuffling.  When ``None``, uses Python's
             default randomness (non-deterministic across processes).
         drop_last: Drop the trailing partial batch (if any).
+        bucket_mode: Either ``"none"`` (single global shuffled pool —
+            legacy behavior) or ``"quantile"`` (length-quantile buckets
+            shuffled independently).  Default ``"none"``.
+        num_buckets: Number of quantile buckets when
+            ``bucket_mode="quantile"``.  Ignored otherwise.  Default 8.
+        bucket_shuffle: Shuffle the bucket visit order per epoch when
+            ``bucket_mode="quantile"``.  Default True.  Set False for
+            ascending-length traversal (useful for diagnostics).
+        cost_multiplier: Per-sample length multiplier applied before
+            squaring in the budget formula.  Default 1.0.  Set to 2.0
+            to model decoder expansion on ``[prefix | survivors |
+            suffix]``.  Values <= 0 are clamped to 1.0.
 
     Attributes:
         oversized_count: Number of samples that exceeded the budget on
@@ -91,6 +120,11 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
         shuffle: bool = True,
         seed: int | None = None,
         drop_last: bool = False,
+        *,
+        bucket_mode: str = "none",
+        num_buckets: int = 8,
+        bucket_shuffle: bool = True,
+        cost_multiplier: float = 1.0,
     ) -> None:
         self._lengths: np.ndarray = np.asarray(lengths, dtype=np.int64)
         self._max_batch_tokens: int = int(max_batch_tokens)
@@ -109,6 +143,53 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
         self._batch_cursor: int = 0
         self.oversized_count: int = 0
         self._warned_oversized: bool = False
+
+        # Bucket mode + cost multiplier.
+        if bucket_mode not in ("none", "quantile"):
+            raise ValueError(
+                f"bucket_mode must be 'none' or 'quantile', got {bucket_mode!r}"
+            )
+        self._bucket_mode: str = bucket_mode
+        self._num_buckets: int = max(1, int(num_buckets))
+        self._bucket_shuffle: bool = bool(bucket_shuffle)
+        # Clamp non-positive multipliers to 1.0 — a zero or negative
+        # multiplier would collapse the budget math, which is never what
+        # the caller meant.
+        self._cost_multiplier: float = (
+            float(cost_multiplier)
+            if cost_multiplier and cost_multiplier > 0
+            else 1.0
+        )
+
+        # Precompute bucket assignments once.  For a 1.5M-sample dataset
+        # this is a single numpy.quantile + digitize — well under 1s.
+        self._bucket_assignments: np.ndarray | None = None
+        if self._bucket_mode == "quantile" and len(self._lengths) > 0:
+            self._bucket_assignments = self._assign_buckets(self._lengths, self._num_buckets)
+
+    # ------------------------------------------------------------------
+    # Bucket construction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _assign_buckets(lengths: np.ndarray, num_buckets: int) -> np.ndarray:
+        """Assign each length to a quantile bucket 0..num_buckets-1.
+
+        Uses interior quantile boundaries (``1/K, 2/K, …, (K-1)/K``) and
+        ``np.digitize``.  Degenerate distributions (many ties) may leave
+        some buckets empty — that's fine; empty buckets are skipped in
+        iteration.
+        """
+        if num_buckets <= 1:
+            return np.zeros(len(lengths), dtype=np.int64)
+        qs = np.linspace(0.0, 1.0, num_buckets + 1)[1:-1]  # interior edges
+        # np.quantile on int64 returns float; that's fine for boundary cmp
+        boundaries = np.quantile(lengths, qs)
+        # np.digitize: returns 0..num_buckets inclusive; right=False means
+        # edges belong to the left bucket (a value at boundary[i] goes to
+        # bucket i, not i+1).  Sufficient given we only need stable
+        # bucket-ness, not exact-quantile fidelity.
+        return np.digitize(lengths, boundaries, right=False).astype(np.int64)
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -138,77 +219,182 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
     # Core packing
     # ------------------------------------------------------------------
 
+    def _epoch_generator(self) -> torch.Generator | None:
+        """Build a torch.Generator seeded from ``seed + epoch``, or None."""
+        if self._seed is None:
+            return None
+        gen = torch.Generator()
+        gen.manual_seed(self._seed + self._epoch)
+        return gen
+
     def _shuffled_indices(self) -> list[int]:
+        """Global shuffle (legacy ``bucket_mode='none'`` path)."""
         n = len(self._lengths)
         if not self._shuffle:
             return list(range(n))
-        if self._seed is not None:
-            # torch.Generator for reproducible cross-process behaviour
-            gen = torch.Generator()
-            gen.manual_seed(self._seed + self._epoch)
+        gen = self._epoch_generator()
+        if gen is not None:
             return torch.randperm(n, generator=gen).tolist()
         indices = list(range(n))
         random.shuffle(indices)
         return indices
 
+    def _bucketed_index_stream(self) -> list[int]:
+        """Produce the per-epoch index stream for ``bucket_mode='quantile'``.
+
+        Bucket visit order is determined first (optionally shuffled), then
+        indices *within* each bucket are shuffled (if ``shuffle=True``).
+        The returned flat list is the order in which samples will be fed
+        to the greedy packer — with the crucial invariant that
+        ``_build_batches`` must *not* pack across a bucket boundary.
+        That boundary constraint is enforced by embedding bucket IDs
+        alongside the indices; see :meth:`_build_batches`.
+
+        Returns a flat list of indices; bucket boundaries are
+        reconstructed from :attr:`_bucket_assignments` by the caller.
+        """
+        n = len(self._lengths)
+        if n == 0:
+            return []
+        assert self._bucket_assignments is not None
+        gen = self._epoch_generator()
+
+        # Group indices by bucket id.  Using numpy argsort here would be
+        # faster but the Python path is fine for up to a few million
+        # samples (a one-pass list iteration).
+        buckets: list[list[int]] = [[] for _ in range(self._num_buckets)]
+        for i, b in enumerate(self._bucket_assignments):
+            buckets[int(b)].append(i)
+
+        # Shuffle within each bucket.
+        if self._shuffle:
+            for b_idx in range(self._num_buckets):
+                bucket = buckets[b_idx]
+                if not bucket:
+                    continue
+                if gen is not None:
+                    perm = torch.randperm(len(bucket), generator=gen).tolist()
+                    buckets[b_idx] = [bucket[p] for p in perm]
+                else:
+                    random.shuffle(bucket)
+
+        # Determine bucket visit order.
+        bucket_order = list(range(self._num_buckets))
+        if self._bucket_shuffle and self._shuffle:
+            if gen is not None:
+                # Fresh permutation from the same generator — deterministic
+                # for (seed, epoch).  Note: we've already consumed some
+                # randomness from this generator above in the within-bucket
+                # shuffles, so the bucket order depends on bucket sizes.
+                # That's fine: what matters is reproducibility given
+                # (seed, epoch), not analytic independence.
+                perm = torch.randperm(self._num_buckets, generator=gen).tolist()
+                bucket_order = perm
+            else:
+                random.shuffle(bucket_order)
+
+        self._epoch_bucket_order = bucket_order  # for diagnostics / tests
+        return bucket_order, buckets  # type: ignore[return-value]
+
+    def _effective_sq(self, seq_len: int) -> int:
+        """Cost-multiplied squared length used in the budget inequality.
+
+        Kept integer-valued for cheap comparisons: we round the scaled
+        length to the nearest int before squaring.  The small rounding
+        error (<= 1 token) is immaterial against the quadratic cost
+        ``(L * mult)^2``.
+        """
+        if self._cost_multiplier == 1.0:
+            return int(seq_len) * int(seq_len)
+        scaled = round(seq_len * self._cost_multiplier)
+        return scaled * scaled
+
     def _build_batches(self) -> list[list[int]]:
-        indices = self._shuffled_indices()
+        """Build all microbatches for the current epoch.
+
+        Dispatches on :attr:`_bucket_mode`:
+
+        - ``"none"``: single global greedy pass over shuffled indices.
+          Matches the 2026-04-20 behavior exactly (seed-aligned).
+        - ``"quantile"``: greedy-pack within each bucket independently.
+          Bucket boundaries are *not* crossed by a microbatch — this is
+          the property that kills the long-tail mixing (and gives the
+          length-bucketed sampler its name).
+
+        Under either mode the budget inequality is::
+
+            sum((L_i * cost_multiplier)^2) <= max_batch_tokens * reference_seq_len
+
+        Oversized singletons (``(L * mult)^2 > budget``) are emitted
+        alone and counted via :attr:`oversized_count`.
+        """
         budget = self._max_batch_tokens * self._reference_seq_len
         batches: list[list[int]] = []
-        batch: list[int] = []
-        running_sum: int = 0
         oversized_count = 0
 
-        for idx in indices:
-            seq_len = int(self._lengths[idx])
-            sq = seq_len * seq_len
+        if self._bucket_mode == "none":
+            # Single global sequence; one greedy pass.
+            index_sequences: list[list[int]] = [self._shuffled_indices()]
+        else:
+            bucket_order, bucket_groups = self._bucketed_index_stream()
+            index_sequences = [bucket_groups[b] for b in bucket_order if bucket_groups[b]]
 
-            if not batch:
-                # Always admit the first sample into an empty batch.
-                if sq > budget:
-                    if not self._warned_oversized:
-                        logger.warning(
-                            "PackedTokenBudgetSampler: sample %d has L^2=%d which exceeds "
-                            "budget %d (max_batch_tokens=%d x reference_seq_len=%d). "
-                            "Emitting as singleton. Further oversized samples will not "
-                            "produce additional warnings.",
-                            idx,
-                            sq,
-                            budget,
-                            self._max_batch_tokens,
-                            self._reference_seq_len,
-                        )
-                        self._warned_oversized = True
-                    oversized_count += 1
-                batch = [idx]
-                running_sum = sq
-            elif running_sum + sq <= budget:
-                batch.append(idx)
-                running_sum += sq
-            else:
-                # Current batch is full — emit it and start a new one.
+        for seq in index_sequences:
+            batch: list[int] = []
+            running_sum: int = 0
+            for idx in seq:
+                seq_len = int(self._lengths[idx])
+                sq = self._effective_sq(seq_len)
+
+                if not batch:
+                    if sq > budget:
+                        if not self._warned_oversized:
+                            logger.warning(
+                                "PackedTokenBudgetSampler: sample %d has effective L^2=%d "
+                                "(cost_multiplier=%.2f) which exceeds budget %d "
+                                "(max_batch_tokens=%d x reference_seq_len=%d). "
+                                "Emitting as singleton. Further oversized samples will not "
+                                "produce additional warnings.",
+                                idx,
+                                sq,
+                                self._cost_multiplier,
+                                budget,
+                                self._max_batch_tokens,
+                                self._reference_seq_len,
+                            )
+                            self._warned_oversized = True
+                        oversized_count += 1
+                    batch = [idx]
+                    running_sum = sq
+                elif running_sum + sq <= budget:
+                    batch.append(idx)
+                    running_sum += sq
+                else:
+                    batches.append(batch)
+                    batch = [idx]
+                    running_sum = sq
+                    if sq > budget:
+                        if not self._warned_oversized:
+                            logger.warning(
+                                "PackedTokenBudgetSampler: sample %d has effective L^2=%d "
+                                "(cost_multiplier=%.2f) which exceeds budget %d "
+                                "(max_batch_tokens=%d x reference_seq_len=%d). "
+                                "Emitting as singleton. Further oversized samples will not "
+                                "produce additional warnings.",
+                                idx,
+                                sq,
+                                self._cost_multiplier,
+                                budget,
+                                self._max_batch_tokens,
+                                self._reference_seq_len,
+                            )
+                            self._warned_oversized = True
+                        oversized_count += 1
+            # End-of-bucket (or end-of-global-sequence): flush the
+            # in-flight batch.  Bucket boundaries are thus never
+            # crossed — this is the core invariant of bucketed packing.
+            if batch:
                 batches.append(batch)
-                batch = [idx]
-                running_sum = sq
-                # Check if the new singleton is itself oversized.
-                if sq > budget:
-                    if not self._warned_oversized:
-                        logger.warning(
-                            "PackedTokenBudgetSampler: sample %d has L^2=%d which exceeds "
-                            "budget %d (max_batch_tokens=%d x reference_seq_len=%d). "
-                            "Emitting as singleton. Further oversized samples will not "
-                            "produce additional warnings.",
-                            idx,
-                            sq,
-                            budget,
-                            self._max_batch_tokens,
-                            self._reference_seq_len,
-                        )
-                        self._warned_oversized = True
-                    oversized_count += 1
-
-        if batch:
-            batches.append(batch)
 
         if self._drop_last and len(batches) > 1:
             batches = batches[:-1]

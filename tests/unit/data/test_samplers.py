@@ -360,6 +360,274 @@ class TestPackedTokenBudgetSampler:
 
 
 # ---------------------------------------------------------------------------
+# bucket_mode="quantile" + cost_multiplier
+# ---------------------------------------------------------------------------
+
+
+class TestBucketedSampler:
+    """Length-bucketed quantile mode + cost_multiplier coverage."""
+
+    # ---- none-mode backward compat ----------------------------------------
+
+    def test_bucket_mode_none_matches_legacy(self):
+        """bucket_mode='none' (default) produces identical output to today's sampler."""
+        rng = random.Random(0)
+        lengths = [rng.randint(10, 500) for _ in range(120)]
+
+        # Default (no kwargs) and explicit bucket_mode='none' must agree bit-for-bit.
+        a = list(_make_sampler(lengths, shuffle=True, seed=42))
+        b = list(_make_sampler(lengths, shuffle=True, seed=42, bucket_mode="none"))
+        assert a == b
+
+    # ---- coverage ----------------------------------------------------------
+
+    def test_quantile_covers_every_sample_once(self):
+        rng = random.Random(1)
+        lengths = [rng.randint(10, 500) for _ in range(250)]
+        sampler = _make_sampler(
+            lengths, shuffle=True, seed=3,
+            bucket_mode="quantile", num_buckets=8,
+        )
+        seen = [i for b in sampler for i in b]
+        assert sorted(seen) == list(range(250))
+
+    def test_quantile_no_duplicates_across_epochs(self):
+        rng = random.Random(2)
+        lengths = [rng.randint(10, 500) for _ in range(200)]
+        sampler = _make_sampler(
+            lengths, shuffle=True, seed=11,
+            bucket_mode="quantile", num_buckets=6,
+        )
+        for epoch in range(3):
+            sampler.set_epoch(epoch)
+            seen = [i for b in sampler for i in b]
+            assert sorted(seen) == list(range(200))
+
+    # ---- intra-bucket length homogeneity ----------------------------------
+
+    def test_quantile_batches_are_length_homogeneous(self):
+        """Inside a bucket the max/min length ratio should be tightly bounded."""
+        rng = random.Random(4)
+        # Heavy-tailed distribution — the kind of distribution where
+        # bucketing actually matters.
+        lengths = [int(rng.expovariate(1 / 200)) + 10 for _ in range(500)]
+        sampler = _make_sampler(
+            lengths, shuffle=True, seed=17,
+            bucket_mode="quantile", num_buckets=8,
+            max_batch_tokens=8192,
+        )
+        batches = list(sampler)
+        # Drop singleton batches (no variance) before computing ratio.
+        ratios = []
+        for batch in batches:
+            if len(batch) < 2:
+                continue
+            batch_lens = [lengths[i] for i in batch]
+            ratios.append(max(batch_lens) / max(1, min(batch_lens)))
+        # With 8 quantile buckets we expect most non-singleton batches
+        # to have a max/min ratio below ~2.5; allow some slack at bucket
+        # edges (digitize uses interior edges).  Median is the robust
+        # statistic here.
+        assert ratios, "Need at least one multi-sample batch"
+        ratios.sort()
+        median = ratios[len(ratios) // 2]
+        assert median <= 2.5, f"Median length ratio inside bucket too wide: {median}"
+
+    # ---- bucket-order shuffle ---------------------------------------------
+
+    def test_bucket_shuffle_changes_order_across_epochs(self):
+        rng = random.Random(5)
+        lengths = [rng.randint(10, 500) for _ in range(200)]
+        sampler = _make_sampler(
+            lengths, shuffle=True, seed=21,
+            bucket_mode="quantile", num_buckets=8, bucket_shuffle=True,
+        )
+        sampler.set_epoch(0)
+        list(sampler)
+        order0 = list(sampler._epoch_bucket_order)
+        sampler.set_epoch(1)
+        list(sampler)
+        order1 = list(sampler._epoch_bucket_order)
+        assert order0 != order1
+
+    def test_bucket_shuffle_false_keeps_ascending_order(self):
+        lengths = [i * 10 for i in range(1, 81)]  # strictly ascending
+        sampler = _make_sampler(
+            lengths, shuffle=True, seed=1,
+            bucket_mode="quantile", num_buckets=4, bucket_shuffle=False,
+        )
+        list(sampler)
+        assert sampler._epoch_bucket_order == [0, 1, 2, 3]
+
+    # ---- cost_multiplier --------------------------------------------------
+
+    def test_cost_multiplier_shrinks_microbatches(self):
+        """cost_multiplier=2 should produce roughly 4x fewer samples per batch."""
+        lengths = [100] * 200
+        base = _make_sampler(
+            lengths, max_batch_tokens=10, reference_seq_len=10_001,
+            shuffle=False, cost_multiplier=1.0,
+        )
+        scaled = _make_sampler(
+            lengths, max_batch_tokens=10, reference_seq_len=10_001,
+            shuffle=False, cost_multiplier=2.0,
+        )
+        base_batches = list(base)
+        scaled_batches = list(scaled)
+
+        avg_base = sum(len(b) for b in base_batches) / len(base_batches)
+        avg_scaled = sum(len(b) for b in scaled_batches) / len(scaled_batches)
+
+        # cost_multiplier=2 → each sample's sq-cost multiplied by 4,
+        # so per-batch sample count ≈ /4.  Allow slack for edge effects.
+        ratio = avg_base / avg_scaled
+        assert 3.0 <= ratio <= 5.5, f"Expected ~4x ratio, got {ratio:.2f}"
+
+    def test_cost_multiplier_budget_respected(self):
+        rng = random.Random(6)
+        lengths = [rng.randint(10, 300) for _ in range(150)]
+        mult = 1.7
+        sampler = _make_sampler(
+            lengths, max_batch_tokens=4096, shuffle=True, seed=5,
+            cost_multiplier=mult,
+        )
+        budget = _budget(4096)
+        for batch in sampler:
+            total_eff_sq = sum(round(lengths[i] * mult) ** 2 for i in batch)
+            if len(batch) == 1:
+                continue  # oversized-singleton exempt
+            assert total_eff_sq <= budget, (
+                f"Batch {batch} total_eff_sq={total_eff_sq} > budget={budget}"
+            )
+
+    def test_cost_multiplier_default_is_one(self):
+        """Default cost_multiplier=1.0 leaves behavior unchanged."""
+        rng = random.Random(7)
+        lengths = [rng.randint(10, 200) for _ in range(90)]
+        a = list(_make_sampler(lengths, shuffle=True, seed=3))
+        b = list(_make_sampler(lengths, shuffle=True, seed=3, cost_multiplier=1.0))
+        assert a == b
+
+    def test_cost_multiplier_zero_or_negative_clamped(self):
+        """Non-positive cost_multiplier is silently clamped to 1.0 (defensive)."""
+        lengths = [100] * 20
+        a = list(_make_sampler(lengths, shuffle=False, cost_multiplier=0.0))
+        b = list(_make_sampler(lengths, shuffle=False, cost_multiplier=-1.5))
+        c = list(_make_sampler(lengths, shuffle=False, cost_multiplier=1.0))
+        assert a == c
+        assert b == c
+
+    # ---- budget math under bucket_mode -----------------------------------
+
+    def test_quantile_budget_respected(self):
+        rng = random.Random(8)
+        lengths = [rng.randint(10, 400) for _ in range(150)]
+        sampler = _make_sampler(
+            lengths, max_batch_tokens=4096, shuffle=True, seed=9,
+            bucket_mode="quantile", num_buckets=6,
+        )
+        budget = _budget(4096)
+        for batch in sampler:
+            if len(batch) == 1:
+                continue
+            total_sq = sum(lengths[i] ** 2 for i in batch)
+            assert total_sq <= budget
+
+    # ---- drop_last -------------------------------------------------------
+
+    def test_quantile_drop_last_drops_one(self):
+        rng = random.Random(9)
+        lengths = [rng.randint(10, 100) for _ in range(80)]
+        keep = list(_make_sampler(
+            lengths, max_batch_tokens=1, reference_seq_len=10_001,
+            shuffle=False, bucket_mode="quantile", num_buckets=4, drop_last=False,
+        ))
+        drop = list(_make_sampler(
+            lengths, max_batch_tokens=1, reference_seq_len=10_001,
+            shuffle=False, bucket_mode="quantile", num_buckets=4, drop_last=True,
+        ))
+        assert len(drop) == len(keep) - 1
+
+    # ---- cursor preservation under bucket_mode ----------------------------
+
+    def test_quantile_cursor_resume(self):
+        rng = random.Random(10)
+        lengths = [rng.randint(10, 400) for _ in range(150)]
+        full = list(_make_sampler(
+            lengths, max_batch_tokens=10, reference_seq_len=10_001,
+            shuffle=True, seed=31,
+            bucket_mode="quantile", num_buckets=6,
+        ))
+        assert len(full) > 5
+        sampler = _make_sampler(
+            lengths, max_batch_tokens=10, reference_seq_len=10_001,
+            shuffle=True, seed=31,
+            bucket_mode="quantile", num_buckets=6,
+        )
+        sampler.set_batch_cursor(4)
+        resumed = list(sampler)
+        assert resumed == full[4:]
+
+    def test_quantile_set_epoch_resets_cursor(self):
+        rng = random.Random(11)
+        lengths = [rng.randint(10, 400) for _ in range(100)]
+        sampler = _make_sampler(
+            lengths, shuffle=True, seed=41,
+            bucket_mode="quantile", num_buckets=5,
+        )
+        sampler.set_batch_cursor(5)
+        sampler.set_epoch(2)
+        yielded = list(sampler)
+
+        fresh = _make_sampler(
+            lengths, shuffle=True, seed=41,
+            bucket_mode="quantile", num_buckets=5,
+        )
+        fresh.set_epoch(2)
+        expected = list(fresh)
+        assert yielded == expected
+
+    # ---- parity fuzz ------------------------------------------------------
+
+    def test_fuzz_no_sample_lost_or_duplicated(self):
+        """100 random seeds x 100-sample datasets: each sample visited exactly once."""
+        for seed in range(100):
+            rng = random.Random(seed)
+            lengths = [rng.randint(10, 400) for _ in range(100)]
+            sampler = _make_sampler(
+                lengths, shuffle=True, seed=seed,
+                bucket_mode="quantile", num_buckets=8,
+            )
+            seen = [i for b in sampler for i in b]
+            assert sorted(seen) == list(range(100)), f"seed={seed} lost/duplicated samples"
+
+    # ---- construction --------------------------------------------------
+
+    def test_invalid_bucket_mode_raises(self):
+        import pytest
+        with pytest.raises(ValueError, match="bucket_mode"):
+            _make_sampler([10, 20, 30], bucket_mode="invalid")
+
+    def test_construction_on_large_dataset_fast(self):
+        """Construction on a 1.5M-sample dataset must complete in <1s."""
+        import time
+        n = 1_500_000
+        # Skip if numpy creation itself takes too long (it shouldn't).
+        lengths = np.random.default_rng(0).integers(10, 2048, size=n, dtype=np.int64)
+        t0 = time.perf_counter()
+        sampler = _make_sampler(
+            lengths, shuffle=True, seed=7,
+            bucket_mode="quantile", num_buckets=8,
+        )
+        dt = time.perf_counter() - t0
+        # Separately from iteration (which is O(N)); this is just construction.
+        assert dt < 1.0, f"Construction took {dt:.2f}s for {n} samples"
+        # Bucket assignments were computed.
+        assert sampler._bucket_assignments is not None
+        assert len(sampler._bucket_assignments) == n
+
+
+# ---------------------------------------------------------------------------
 # QueryAwareBatchSampler — kept intact (Phase 2, not a variable-length concern)
 # ---------------------------------------------------------------------------
 
