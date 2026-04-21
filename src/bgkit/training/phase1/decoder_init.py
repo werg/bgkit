@@ -205,8 +205,19 @@ class DecoderInitTrainer(BaseTrainer):
                 bidi_warmup_steps=bidi_warmup,
                 threshold_controller_cfg=threshold_controller_cfg,
             )
-            # Also load decoder weights if present (step 2 checkpoints include it)
-            self._bgkit_decoder_state = bgkit_state_dicts.get("decoder", None)
+            # Also load decoder weights if present (step 2+ checkpoints include them).
+            # Prefer "decoder_merged" over "decoder" when both are present: the
+            # former is the base-Qwen-shaped state_dict produced by peft's
+            # merge_and_unload after LoRA training (Step 3 / Step 4), while
+            # "decoder" carries the LoRA-wrapped key prefixes (``base_model.model.*``)
+            # that don't match a fresh base-Qwen decoder's state_dict. The fresh
+            # decoder applied LoRA LATER in setup (see line ~285), so the target
+            # at load time is always the base shape. Step 2 checkpoints only
+            # carry "decoder" (no LoRA trained yet) so the fallback is correct.
+            self._bgkit_decoder_state = (
+                bgkit_state_dicts.get("decoder_merged")
+                or bgkit_state_dicts.get("decoder")
+            )
             # Optional: load a pre-distilled head_base_l0 sidecar as a warm
             # start. Produced by scripts/pretrain_survivorship_head.py.
             sidecar_path = self.cfg.training.get(
