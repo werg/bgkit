@@ -48,8 +48,14 @@ x-gpu-common: &gpu-common
     # captures from being active when fla compiles new kernel variants.
     - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
     - TORCH_COMPILE_DISABLE=1
-    # TMA broken on sm_121 in fla; explicit disable as defensive measure
-    - FLA_USE_TMA=0
+    # TMA on sm_121: the original "broken on sm_121" defensive disable is
+    # stale per the 2026-04-21 fla fork review — fla 0.4.2 in Triton 3.6
+    # runs TMA fwd+bwd correctly on GB10. Re-enabled 2026-04-21 to
+    # reclaim the Blackwell bulk-async memory-transfer speedup on DeltaNet
+    # kernels (3 of 4 layers in Qwen3.5). If numerical / correctness drift
+    # appears in training, revert to FLA_USE_TMA=0 and document what
+    # triggered it. See docs/fla_fork_review_2026_04_21.md.
+    - FLA_USE_TMA=1
     # Build FlashAttention's native CUDA backend inside the container when the
     # mounted host checkout doesn't provide a container-compatible binary.
     - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=1
