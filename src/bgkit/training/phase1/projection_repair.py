@@ -58,7 +58,7 @@ from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
-from bgkit.training.gradient_utils import enable_gradient_checkpointing
+from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
 from bgkit.utils.attention_backend import resolve_attention_implementation
 
 logger = structlog.get_logger()
@@ -145,7 +145,7 @@ class ProjectionRepairTrainer(BaseTrainer):
             # so the unfrozen blocks' activations are recomputed rather
             # than stored — the frozen blocks don't need activations for
             # backward, but PyTorch still allocates them without ckpt.
-            enable_gradient_checkpointing(backbone)
+            maybe_enable_gradient_checkpointing(backbone, self.cfg)
             logger.info(
                 "compressor_final_blocks_unfrozen",
                 n_unfrozen=n_unfreeze,

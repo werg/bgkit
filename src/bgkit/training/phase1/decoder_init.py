@@ -35,7 +35,7 @@ from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
-from bgkit.training.gradient_utils import enable_gradient_checkpointing
+from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
 from bgkit.training.scheduling import cosine_with_warmup
 from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.memory_budget import memory_budget_scope
@@ -284,7 +284,7 @@ class DecoderInitTrainer(BaseTrainer):
             self.decoder.apply_lora(lora_cfg)
             self._decoder_lora = True
 
-        enable_gradient_checkpointing(self.decoder.backbone)
+        maybe_enable_gradient_checkpointing(self.decoder.backbone, self.cfg)
 
         # Optional Liger Kernel fused kernels (RMSNorm / SwiGLU / RoPE +
         # fused linear+CE). Gated on ``training.use_liger`` (default True);
@@ -842,7 +842,9 @@ class DecoderInitTrainer(BaseTrainer):
         if not self._encoder_frozen:
             self.encoder.compressor.requires_grad_(True)
             self.encoder.compressor.train()
-            enable_gradient_checkpointing(self.encoder.compressor.backbone)
+            maybe_enable_gradient_checkpointing(
+                self.encoder.compressor.backbone, self.cfg,
+            )
         else:
             self.encoder.compressor.requires_grad_(False)
             self.encoder.compressor.eval()
@@ -923,7 +925,9 @@ class DecoderInitTrainer(BaseTrainer):
         # Unfreeze compressor backbone
         self.encoder.compressor.requires_grad_(True)
         self.encoder.compressor.train()
-        enable_gradient_checkpointing(self.encoder.compressor.backbone)
+        maybe_enable_gradient_checkpointing(
+            self.encoder.compressor.backbone, self.cfg,
+        )
         self._encoder_frozen = False
 
         # Add compressor params to optimizer (projection block already there)

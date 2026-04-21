@@ -31,7 +31,7 @@ from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
-from bgkit.training.gradient_utils import enable_gradient_checkpointing
+from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
 from bgkit.utils.attention_backend import resolve_attention_implementation
 
 logger = structlog.get_logger()
@@ -121,7 +121,9 @@ class CommitEncodingTrainer(BaseTrainer):
 
         self.encoder.requires_grad_(True)
         self.encoder.train()
-        enable_gradient_checkpointing(self.encoder.compressor.backbone)
+        maybe_enable_gradient_checkpointing(
+            self.encoder.compressor.backbone, self.cfg,
+        )
 
         # --- Decoder (trainable) ---
         decoder_cfg = self.cfg.model.decoder
@@ -165,7 +167,7 @@ class CommitEncodingTrainer(BaseTrainer):
         # Bypassing the validation check isn't enough — the internal handle
         # mapping also breaks. Needs upstream TE fix.
 
-        enable_gradient_checkpointing(self.decoder.backbone)
+        maybe_enable_gradient_checkpointing(self.decoder.backbone, self.cfg)
 
         # torch.compile disabled: sm_121 shared memory (101 KB) is too small for
         # inductor-generated Triton kernels (need ~148 KB). "reduce-overhead" and
