@@ -250,7 +250,13 @@ def _load_bgkit_context(
     bgkit_cache_dir: str | None,
     device,
 ):
-    """Load pre-computed BgKIT context for an instance."""
+    """Load pre-computed BgKIT context for an instance.
+
+    Returns:
+        ``(flat_survivors, survivor_cu_seqlens)`` where ``flat_survivors`` is
+        ``(K, D)`` float and ``survivor_cu_seqlens`` is ``(2,)`` int32 with
+        ``[0, K]``, or ``(None, None)`` if unavailable.
+    """
     if not bgkit_cache_dir:
         return None, None
 
@@ -264,10 +270,11 @@ def _load_bgkit_context(
         from bgkit.data.datasets.precomputed_l0_cache import PrecomputedL0Cache
 
         cache = PrecomputedL0Cache(str(cache_path))
-        survivors = cache.get_survivors(instance_id)
-        survivors = survivors.unsqueeze(0).to(device)  # (1, K, D)
-        mask = torch.ones(1, survivors.size(1), dtype=torch.bool, device=device)
-        return survivors, mask
+        survivors = cache.get_survivors(instance_id)  # (K, D)
+        survivors = survivors.to(device)
+        k = survivors.size(0)
+        survivor_cu = torch.tensor([0, k], dtype=torch.int32, device=device)
+        return survivors, survivor_cu
     except (KeyError, FileNotFoundError):
         return None, None
 
@@ -346,8 +353,8 @@ def generate_prediction(
                 "error": f"checkout failed: {base_commit}",
             }
 
-        # Load BgKIT context
-        bgkit_survivors, bgkit_mask = _load_bgkit_context(
+        # Load BgKIT context (flat (K, D) survivors + (2,) int32 cu_seqlens)
+        bgkit_survivors, _bgkit_cu = _load_bgkit_context(
             instance_id, bgkit_cache_dir, device,
         )
 
@@ -368,15 +375,15 @@ def generate_prediction(
             with torch.no_grad():
                 if bgkit_survivors is not None:
                     # Prefix injection: [bgkit_context | input_tokens]
-                    input_embeds = model.get_input_embeddings()(input_ids)
-                    combined_embeds = torch.cat([bgkit_survivors, input_embeds], dim=1)
-                    combined_mask = torch.cat([
-                        bgkit_mask,
-                        torch.ones_like(input_ids, dtype=torch.bool),
-                    ], dim=1)
+                    # bgkit_survivors is flat (K, D); unsqueeze batch dim for generate.
+                    surv_embeds = bgkit_survivors.unsqueeze(0)  # (1, K, D)
+                    input_embeds = model.get_input_embeddings()(input_ids)  # (1, L, D)
+                    combined_embeds = torch.cat([surv_embeds, input_embeds], dim=1)
+                    # B=1 prefix-only generation — no attention_mask needed; all
+                    # positions are valid and the FA4 backend synthesises
+                    # cu_seqlens from the query shape.
                     output_ids = model.generate(
                         inputs_embeds=combined_embeds,
-                        attention_mask=combined_mask,
                         max_new_tokens=max_new_tokens,
                         do_sample=False,
                         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,

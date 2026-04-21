@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import sys
 import time
 from collections import defaultdict
@@ -39,6 +38,14 @@ import pyarrow.parquet as pq
 import torch
 
 from bgkit.data.repo_processing import looks_minified
+from bgkit.utils.packing import position_ids_from_cu
+
+
+def _make_cu_seqlens(lengths: list[int]) -> torch.Tensor:
+    """Build a cumulative sequence lengths tensor from a list of lengths."""
+    t = torch.zeros(len(lengths) + 1, dtype=torch.int32)
+    torch.cumsum(torch.tensor(lengths, dtype=torch.int32), dim=0, out=t[1:])
+    return t
 
 
 def _load_encoder(checkpoint_path: str, device: torch.device):
@@ -211,32 +218,31 @@ def encode_swe_repos(
                     if not batch_texts:
                         continue
 
-                    # Pad and encode
-                    max_len = max(len(t) for t in batch_texts)
-                    padded = np.zeros((len(batch_texts), max_len), dtype=np.int64)
-                    masks = np.zeros((len(batch_texts), max_len), dtype=np.bool_)
-                    for i, t in enumerate(batch_texts):
-                        padded[i, : len(t)] = t
-                        masks[i, : len(t)] = True
+                    # Encode each blob independently using packed (varlen) format.
+                    embed_tokens = encoder.compressor.backbone.get_input_embeddings()
 
                     with torch.no_grad():
-                        token_tensor = torch.from_numpy(padded).to(device)
-                        mask_tensor = torch.from_numpy(masks).to(device)
-                        embed_tokens = encoder.compressor.backbone.get_input_embeddings()
-                        embeddings = embed_tokens(token_tensor)
+                        for sha, tokens in zip(valid_shas, batch_texts, strict=True):
+                            length = len(tokens)
+                            token_tensor = torch.tensor(
+                                tokens, dtype=torch.long, device=device,
+                            )
+                            content_emb = embed_tokens(token_tensor)  # (L, D)
 
-                        for i, sha in enumerate(valid_shas):
+                            # Build single-sample packed metadata (B=1).
+                            cu = _make_cu_seqlens([length]).to(device)
+                            pos = position_ids_from_cu(cu, length).to(device)
+
                             output = encoder(
-                                input_embeddings=embeddings[i : i + 1],
-                                attention_mask=mask_tensor[i : i + 1],
+                                content_embeddings=content_emb,
+                                content_cu_seqlens=cu,
+                                content_position_ids=pos,
                                 target_ratio=retention_ratio,
                                 level="l0",
                             )
-                            # Drop padding from survivors
-                            surv_mask = output.survivor_attention_mask[0]
+                            # survivor_embeddings is flat (K, D); no mask needed.
                             survivors = (
-                                output.survivor_embeddings[0][surv_mask]
-                                .cpu().to(torch.float16).numpy()
+                                output.survivor_embeddings.cpu().to(torch.float16).numpy()
                             )
                             blob_cache[sha] = survivors
                             total_blobs_encoded += 1
