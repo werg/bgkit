@@ -49,6 +49,11 @@ def _generate_predictions(
 ) -> tuple[list[str], list[str], list[dict]]:
     """Generate text predictions from the trainer's eval dataloader.
 
+    Iterates KBSample objects (packed-attention convention); each sample is
+    passed through ``_build_decoder_segments_with_trace`` +
+    ``forward_interleaved_with_loss`` with ``return_hidden_states=True``
+    so we can greedy-decode the answer span.
+
     Returns:
         (predictions, references, metadata_list) where each prediction is
         the decoded model answer, each reference is the decoded gold answer,
@@ -64,47 +69,43 @@ def _generate_predictions(
         for batch in trainer.eval_dataloader:
             if samples_seen >= max_samples:
                 break
-
-            prompt, prompt_mask = trainer._compose_prompt(batch)
-            target_ids = batch["target_token_ids"].to(trainer.device)
-            target_attention_mask = batch["target_attention_mask"].to(trainer.device)
-            target_loss_mask = batch["target_loss_mask"].to(trainer.device)
-
-            # Generate logits and decode to text
-            logits = trainer.decoder(
-                prompt,
-                target_ids,
-                target_attention_mask,
-                prompt_mask,
-            )
-            # Greedy decode: take argmax over vocab dimension
-            shifted_logits = logits[:, :-1]
-            pred_ids = shifted_logits.argmax(dim=-1)  # (B, L-1)
-
-            # Extract predicted answer tokens (where loss_mask is True)
-            shifted_mask = target_loss_mask[:, 1:]
-            shifted_labels = target_ids[:, 1:]
-            batch_size = pred_ids.size(0)
-
-            for i in range(batch_size):
+            for sample in batch:
                 if samples_seen >= max_samples:
                     break
-                mask_i = shifted_mask[i].bool()
+
+                segments, _trace = trainer._build_decoder_segments_with_trace(sample)
+                output = trainer.decoder.forward_interleaved_with_loss(
+                    segments, return_hidden_states=True,
+                )
+
+                token_ids_full = output.token_ids  # (1, S)
+                loss_mask_full = output.loss_mask  # (1, S) bool
+                preds = output.argmax_predictions()  # (1, S-1)
+
+                # Shift: preds[i] predicts token[i+1]
+                shift_labels = token_ids_full[:, 1:]  # (1, S-1)
+                shift_mask = loss_mask_full[:, 1:]    # (1, S-1) bool
+
+                mask_i = shift_mask[0].bool()
                 if not mask_i.any():
+                    samples_seen += 1
                     continue
-                pred_tokens = pred_ids[i][mask_i].cpu().tolist()
-                ref_tokens = shifted_labels[i][mask_i].cpu().tolist()
+
+                pred_tokens = preds[0][mask_i].cpu().tolist()
+                ref_tokens = shift_labels[0][mask_i].cpu().tolist()
                 pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=True)
                 ref_text = tokenizer.decode(ref_tokens, skip_special_tokens=True)
                 predictions.append(pred_text)
                 references.append(ref_text)
 
                 # Collect metadata for this sample
-                meta = {}
-                if "dataset_names" in batch and i < len(batch["dataset_names"]):
-                    meta["dataset_name"] = batch["dataset_names"][i]
-                if "metadata" in batch and i < len(batch["metadata"]):
-                    meta.update(batch["metadata"][i])
+                meta: dict = {}
+                if hasattr(sample, "dataset_name"):
+                    meta["dataset_name"] = sample.dataset_name
+                if hasattr(sample, "gold_answer") and sample.gold_answer:
+                    meta["gold_answer"] = sample.gold_answer
+                if hasattr(sample, "document_id"):
+                    meta["document_id"] = sample.document_id
                 metadata_list.append(meta)
                 samples_seen += 1
 
@@ -209,10 +210,6 @@ def _run_benchmark(
 
             # LongMemEval requires a judge_fn; fall back to token-F1 scoring
             # when no external judge is available.
-            question_types = [
-                meta.get("answer_type", meta.get("task_name", "single-session-user"))
-                for meta in metadata_list
-            ]
             refs_flat = references
             # Use token-F1 as a deterministic stand-in for judge scoring
             f1_scores = [token_f1(p, [r]) for p, r in zip(predictions, refs_flat, strict=True)]
@@ -273,7 +270,7 @@ def main(cfg: DictConfig) -> None:
     metrics = trainer.evaluate()
 
     # Get tokenizer for decoding predictions
-    decoder_name = trainer._resolve_decoder_backbone_name()
+    decoder_name = trainer.cfg.model.decoder.backbone_name
     tokenizer = AutoTokenizer.from_pretrained(decoder_name, trust_remote_code=True)
 
     # Generate predictions for benchmark scoring
