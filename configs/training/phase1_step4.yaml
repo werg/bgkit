@@ -54,9 +54,15 @@ bidi_warmup_steps: 0       # already bidirectional from step 2
 # already at the intended operating point (reached during Step 3's
 # curriculum) so the head's selection decisions translate directly to
 # what the decoder will see at later steps.
+#
+# 2026-04-21 alignment: pulled down from 0.10 → 0.08 to match Step 3's
+# terminal ratio (target_ratio_end=0.08). Option (a) from the alignment
+# task — continuing the compression regime Step 3 establishes rather than
+# immediately tightening, which avoids a head+decoder cold-start at the
+# Step 3→4 handoff. See docs/wall_clock_investigation_2026_04_21.md.
 compression_introduction_step: 0
-target_ratio_start: 0.10
-target_ratio_end: 0.10
+target_ratio_start: 0.08
+target_ratio_end: 0.08
 target_ratio_ramp_steps: 1
 
 use_liger: true
