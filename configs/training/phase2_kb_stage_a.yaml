@@ -9,6 +9,12 @@
 # **One epoch only** — no data repetition. Stage A's data is small
 # enough that one pass shapes L0 sufficiently; Stage B picks up on the
 # much larger cached corpus afterwards.
+#
+# Memory safety: container runs with mem_limit: 80g + memswap_limit: 80g
+# (docker/docker-compose.yaml gpu-common anchor), and the peer-CUDA
+# safety check in BaseTrainer refuses to start if total CUDA usage
+# would exceed 90% of BGKIT_CUDA_MEM_FRACTION (default 0.65 = 83 GB).
+# Together these prevent host OOM on the 128 GB unified-memory DGX Spark.
 phase: phase2_kb
 stage: A
 optimizer: adamw
@@ -23,6 +29,16 @@ save_every: 2000
 # The trainer interprets ``max_steps: null`` as "one epoch over the train
 # split". Set explicitly to override.
 max_steps: null
+
+# Phase 2 trajectory batches are far heavier per sample than Phase 1
+# packed-token batches: each KBSample triggers 3-4 encoder bucket
+# forwards + a per-sample decoder forward. The root config.yaml default
+# of 32 is designed for Phase 1 token-budget samplers and will OOM here.
+# batch_size=4 is a conservative baseline pending a profiler run with
+# the profile-phase2-kb-stage-a compose service (mem_limit: 80g).
+# Raise to 8 once Phase 2 data prerequisites are ready and profiler
+# confirms headroom (target: CUDA peak < 60 GB at batch_size=4).
+batch_size: 4
 
 datasets:
   - pubmedqa

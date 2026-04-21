@@ -5,6 +5,12 @@
 # survivors come from a pre-computed cache built by
 # scripts/precompute_l0_subset.py with --stage-a-checkpoint pointing at
 # the trained Stage A checkpoint.
+#
+# Memory safety: container runs with mem_limit: 80g + memswap_limit: 80g
+# (docker/docker-compose.yaml gpu-common anchor), and the peer-CUDA
+# safety check in BaseTrainer refuses to start if total CUDA usage
+# would exceed 90% of BGKIT_CUDA_MEM_FRACTION (default 0.65 = 83 GB).
+# Together these prevent host OOM on the 128 GB unified-memory DGX Spark.
 phase: phase2_kb
 stage: B
 optimizer: adamw
@@ -15,6 +21,18 @@ decoder_lr: 5.0e-5
 l1_lr: 2.0e-4
 eval_every: 1000
 save_every: 5000
+
+# Phase 2 trajectory batches are far heavier per sample than Phase 1
+# packed-token batches: each KBSample triggers 3-4 encoder bucket
+# forwards + a per-sample decoder forward. The root config.yaml default
+# of 32 is designed for Phase 1 token-budget samplers and will OOM here.
+# Stage B has a larger corpus and cached L0 (no live encoder forward for
+# L0) — slightly cheaper per step than Stage A — but the L1 encoder
+# forward + decoder forward profile is similar.
+# batch_size=4 is a conservative baseline pending a profiler run with
+# the profile-phase2-kb-stage-b compose service (mem_limit: 80g).
+# Raise to 8 once Stage A profiler confirms headroom.
+batch_size: 4
 
 datasets:
   - kilt_wikipedia
