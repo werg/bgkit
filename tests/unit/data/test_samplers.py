@@ -369,15 +369,26 @@ class TestBucketedSampler:
 
     # ---- none-mode backward compat ----------------------------------------
 
-    def test_bucket_mode_none_matches_legacy(self):
-        """bucket_mode='none' (default) produces identical output to today's sampler."""
+    def test_bucket_mode_none_is_deterministic_and_legacy_preserving(self):
+        """bucket_mode='none' is the pre-2026-04-21 legacy path — deterministic
+        given seed, and still available as an opt-in after the default flip to
+        'quantile'. Two explicit 'none' calls with the same seed must agree."""
         rng = random.Random(0)
         lengths = [rng.randint(10, 500) for _ in range(120)]
 
-        # Default (no kwargs) and explicit bucket_mode='none' must agree bit-for-bit.
-        a = list(_make_sampler(lengths, shuffle=True, seed=42))
+        a = list(_make_sampler(lengths, shuffle=True, seed=42, bucket_mode="none"))
         b = list(_make_sampler(lengths, shuffle=True, seed=42, bucket_mode="none"))
         assert a == b
+
+    def test_default_mode_is_quantile(self):
+        """The default has flipped to 'quantile' (2026-04-21) — a default-
+        constructed sampler must NOT match an explicit 'none' sampler."""
+        rng = random.Random(0)
+        lengths = [rng.randint(10, 500) for _ in range(120)]
+
+        default = list(_make_sampler(lengths, shuffle=True, seed=42))
+        none = list(_make_sampler(lengths, shuffle=True, seed=42, bucket_mode="none"))
+        assert default != none
 
     # ---- coverage ----------------------------------------------------------
 

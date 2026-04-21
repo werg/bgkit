@@ -93,9 +93,14 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
         seed: RNG seed for shuffling.  When ``None``, uses Python's
             default randomness (non-deterministic across processes).
         drop_last: Drop the trailing partial batch (if any).
-        bucket_mode: Either ``"none"`` (single global shuffled pool —
-            legacy behavior) or ``"quantile"`` (length-quantile buckets
-            shuffled independently).  Default ``"none"``.
+        bucket_mode: Either ``"none"`` (single global shuffled pool) or
+            ``"quantile"`` (length-quantile buckets shuffled independently).
+            Default ``"quantile"`` — flattens the right-tail microbatch
+            cost distribution by grouping similar-length samples into a
+            bucket, at the cost of slightly more structured gradient
+            noise across consecutive optimizer steps (averaged out per
+            epoch). Pass ``"none"`` to recover the pre-2026-04-21 legacy
+            behavior (a single global shuffled pool).
         num_buckets: Number of quantile buckets when
             ``bucket_mode="quantile"``.  Ignored otherwise.  Default 8.
         bucket_shuffle: Shuffle the bucket visit order per epoch when
@@ -121,7 +126,7 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
         seed: int | None = None,
         drop_last: bool = False,
         *,
-        bucket_mode: str = "none",
+        bucket_mode: str = "quantile",
         num_buckets: int = 8,
         bucket_shuffle: bool = True,
         cost_multiplier: float = 1.0,
@@ -255,7 +260,7 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
         """
         n = len(self._lengths)
         if n == 0:
-            return []
+            return [], []
         assert self._bucket_assignments is not None
         gen = self._epoch_generator()
 
