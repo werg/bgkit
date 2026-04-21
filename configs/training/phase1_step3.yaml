@@ -24,17 +24,20 @@ lr: 2.0e-4               # base LR (encoder gets this)
 decoder_lr: 1.0e-5        # decoder LoRA LR (low — LoRA concentrates gradients)
 encoder_lr: 2.0e-4        # encoder LR (higher — pruned encoder needs to adapt)
 warmup_steps: 500
-# Packed-attention migration (Wave 4, 2026-04-20 sweep):
-# 24576/grad_accum=2 validated live at step 2545 (reached ~25% memory
-# utilization). Bumped to 65536/grad_accum=1 to match the pre-migration
-# effective batch (8192*8=65536) exactly and lift memory utilization
-# toward the 50-85 GB target window. Profile predicted 28.6 GB peak at
-# this budget without Muon state; live peak expected in the 35-45 GB
-# range after optimizer state populates. Still well under the
-# torch.cuda.set_per_process_memory_fraction(0.65) cap (~83 GB).
-max_batch_tokens: 65536
-max_batch_tokens_eval: 131072
-gradient_accumulation_steps: 1
+# Packed-attention migration (Wave 4, 2026-04-20 sweep + wall-clock
+# investigation 2026-04-21):
+# Reverted to 32768/grad_accum=2 — the pre-migration baseline used the
+# SAME values (not 8192/grad_accum=8 as the baseline README stated; see
+# commit ce3afb2^:configs/training/phase1_step3.yaml). At 65536/grad_accum=1
+# tail microbatches (8 samples × L≈4096) hit 35 s/step wall-clock due to
+# decoder attention cost on the [prefix|survivors|suffix] sequence (~2×
+# content length). 32768/grad_accum=2 keeps effective batch at 65k tokens
+# while flattening the right-tail latency distribution.
+# See docs/wall_clock_investigation_2026_04_21.md for the full tokens/FLOPs
+# analysis.
+max_batch_tokens: 32768
+max_batch_tokens_eval: 65536
+gradient_accumulation_steps: 2
 # gradient_checkpointing: set training.gradient_checkpointing (overrides) or
 # compute.gradient_checkpointing (canonical, hardware-scoped). Default True.
 # Gated by bgkit.training.gradient_utils.maybe_enable_gradient_checkpointing

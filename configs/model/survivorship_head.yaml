@@ -13,9 +13,18 @@ threshold_controller:
   # target_ratio initial keep-rate. The trainer computes this from
   # target_ratio_start at setup and overrides the value below.
   init_theta: -0.9            # default for target_ratio_start=0.95
-  lr: 0.02                    # tanh-space lr (was 0.1 in unbounded logit space)
+  # lr raised 0.02 → 0.05 on 2026-04-21: the 0.02 value was under-damped
+  # for active-ramp tracking (docs/theta_controller_investigation_2026_04_21.md).
+  # Steady-state tracking lag was |target_rate|/(lr·k) ≈ 0.1 with k ≈ −0.25;
+  # 2.5× gain reduces lag proportionally.
+  lr: 0.05                    # tanh-space lr
   momentum: 0.0               # tune up if θ sawtooths
-  clamp: 0.99                 # ±clamp within tanh's domain
+  # clamp raised 0.99 → 1.5 on 2026-04-21: at 0.99, θ pins on clamp when the
+  # target is infeasible (bf16 tanh saturates hard at ±1, so positions at the
+  # −1 floor can't survive any θ > −1). Allowing θ past ±1 lets the controller
+  # saturate cleanly (θ ≫ 1 → nothing survives, θ ≪ −1 → all survive) instead
+  # of pinning. The > comparison degrades gracefully outside tanh's range.
+  clamp: 1.5                  # ±clamp past tanh's range to allow clean saturation
   min_per_sample_during_warmup: 1   # floor active during BCE warmup only
   min_per_sample_post_warmup: 0     # disabled; accept zero-survivor samples as
                                     # legitimate signal at full compression.
