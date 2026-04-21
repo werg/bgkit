@@ -207,6 +207,17 @@ Example control file (one block per active phase):
 
 **Memory cap for profiler** (lessons learned from a host OOM): `docker/docker-compose.yaml` profile services (`profile-phase1-step3` etc.) apply `mem_limit: 80g` + `memswap_limit: 80g`. Any ad-hoc `docker compose run` of the profiler outside the capped services can still OOM the host on unified memory — use the named service.
 
+## flash-linear-attention (fla) on sm_121
+
+Stock PyPI `fla==0.4.2` is installed in the training container via `pip install ".[gpu]"`. The local fork at `/home/werg/flash-linear-attention/` (branch `blackwell-sm121-compat`, commit `f11bc2f`) replaced three Triton kernels with torch fallbacks on an older Triton. Triton 3.6.0 in NGC 26.03 fixes the underlying codegen bugs; the fork is **not bind-mounted or installed**. See `docs/fla_fork_review_2026_04_21.md` for the full audit.
+
+Runtime patches that remain:
+- `src/bgkit/utils/deltanet_patch.py` — clamps per-step gate to `>= -1.3` to prevent backward NaN on Qwen3.5 heads with extreme `A_log`/`dt_bias`, and wires `cu_seqlens` into `Qwen3_5GatedDeltaNet.forward`. No upstream replacement.
+- `src/bgkit/utils/triton_patch.py` — sm_121-scoped autotuner `_bench` error catcher + `CompiledKernel._init_handles` retry. Defensive; low cost.
+- `FLA_USE_TMA=0` in compose — matches fla 0.4.2 default (fla#609 fixed); kept as defensive pin. TMA verified to work on sm_121 if enabled.
+
+Gotcha: fla's `IS_NVIDIA_BLACKWELL = (capability[0] == 10)` does **not** match sm_121 (capability (12, 1)). Blackwell-specific workarounds in fla `8b05e2f` / `02af88e` / `27c2022` are therefore inactive on DGX Spark. Not currently a problem because Triton 3.6 emits correct code on sm_121 without them, but worth filing upstream as a Blackwell-detection broadening.
+
 | Task | Command |
 |---|---|
 | Backfill registry | `make ckpt-backfill` or `.venv/bin/bgkit-ckpt backfill` |

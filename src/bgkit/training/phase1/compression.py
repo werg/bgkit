@@ -310,9 +310,9 @@ class CompressionTrainer(BaseTrainer):
         # full dataset.  Subset[i] maps to compression_dataset[subset.indices[i]],
         # so lengths must be gathered for the Subset's own index space.
         max_batch_tokens = tcfg.get("max_batch_tokens", 65536)
-        # Eval has no backward — its packed budget can be larger than
-        # training's. Falls back to ``max_batch_tokens`` when unset.
-        max_batch_tokens_eval = tcfg.get("max_batch_tokens_eval", max_batch_tokens)
+        # Eval defaults to 2× train budget (no backward → lower peak at
+        # same budget). Overridable via training.max_batch_tokens_eval.
+        max_batch_tokens_eval = self._resolve_eval_batch_budget(tcfg, max_batch_tokens)
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
 

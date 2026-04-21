@@ -44,12 +44,31 @@ def _sm12x_native_true_gqa_ready() -> bool:
     return native_sm12x_owned_backend_available()
 
 
+# Once the owned backend has been confirmed available in this process, subsequent
+# calls to ``require_sm12x_owned_backend`` short-circuit. This is a per-forward
+# hot-path — the eager version was a CUDA capability query plus a submodule import
+# plus two attribute lookups on every attention layer (48 calls/step on Qwen3.5).
+# Failure results are NOT cached so tests / debugging runs that monkey-patch the
+# backend state mid-process still see a live error.
+_sm12x_owned_backend_ok: bool = False
+
+
 def require_sm12x_owned_backend() -> None:
-    """Fail fast when SM12x is present but BgKIT is not using an owned FA backend."""
+    """Fail fast when SM12x is present but BgKIT is not using an owned FA backend.
+
+    After the first successful probe in a process, subsequent invocations are a
+    single attribute read. The probe involves a CUDA capability query and a
+    submodule import, which at ~8 us/call x 48 attention layers/step were
+    showing up as measurable (~400 us/step) in the hot path.
+    """
+    global _sm12x_owned_backend_ok
+    if _sm12x_owned_backend_ok:
+        return
     if not torch.cuda.is_available():
         return
     major, minor = torch.cuda.get_device_capability()
     if major != 12:
+        _sm12x_owned_backend_ok = True
         return
     try:
         from flash_attn.cute.native_sm12x import (
@@ -70,6 +89,7 @@ def require_sm12x_owned_backend() -> None:
             "flash_attn.cute._sm12x_native extension. In Docker, ensure the "
             "FlashAttention bootstrap path is enabled."
         )
+    _sm12x_owned_backend_ok = True
 
 
 # ---------------------------------------------------------------------------

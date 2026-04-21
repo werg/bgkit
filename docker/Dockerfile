@@ -33,10 +33,32 @@ RUN mkdir -p src/bgkit && \
     pip uninstall -y bgkit && \
     rm -rf src/
 
-# fla (flash-linear-attention): no patches needed — Triton codegen bugs (triton#3017, fla#607,
-# fla#734) are fixed in Triton 3.6.0+ (bundled with NGC pytorch 26.x containers).
-# Remaining numerical issue (backward NaN from extreme gate values) is handled at runtime
-# by bgkit.utils.deltanet_patch.
+# fla (flash-linear-attention): stock PyPI fla 0.4.2 is installed via [gpu] extra.
+#
+# Triton codegen bugs that motivated the one-time local fork at
+# /home/werg/flash-linear-attention (branch blackwell-sm121-compat, commit f11bc2f:
+# "Replace broken Triton kernels with torch fallbacks for Blackwell sm_121") —
+# specifically triton-lang/triton#3017 (tl.cumsum+tl.sum), fla#607, fla#734
+# (tl.dot(x, tl.trans(x)) codegen) — are FIXED in Triton 3.6.0+ bundled with
+# NGC pytorch 26.x. Re-verified on 2026-04-21: all three kernels pass on sm_121
+# end-to-end; the fork is not bind-mounted or installed. See
+# docs/fla_fork_review_2026_04_21.md for the audit.
+#
+# NOTE: fla's IS_NVIDIA_BLACKWELL = (capability[0] == 10) DOES NOT MATCH sm_121 =
+# capability (12, 1). The Blackwell-specific workarounds upstream added in
+# 8b05e2f / 02af88e / 27c2022 are therefore inactive on DGX Spark. This is
+# fine today because Triton 3.6 emits correct code on sm_121 without those
+# workarounds; would need upstream to broaden IS_NVIDIA_BLACKWELL to cover us.
+#
+# Runtime patches still applied (see docs/fla_fork_review_2026_04_21.md §Audit):
+#   - bgkit.utils.deltanet_patch: gate clamp (-1.3) to prevent backward NaN from
+#     Qwen3.5 heads with extreme A_log/dt_bias values; plus cu_seqlens varlen
+#     wiring. No upstream replacement exists.
+#   - bgkit.utils.triton_patch: sm_121-scoped autotuner _bench error catcher and
+#     _init_handles retry. Defensive; low cost; no upstream replacement.
+#   - FLA_USE_TMA=0: matches upstream default since fla 0.4.2 fixed fla#609 logic
+#     inversion; kept as defensive pin. TMA is verified to work on sm_121 when
+#     explicitly enabled — leaving it off is a perf conservatism we can revisit.
 
 # causal-conv1d: pre-built aarch64 wheel from GitHub Releases.
 # PyPI source builds fail on aarch64 (setup.py hardcodes linux_x86_64).

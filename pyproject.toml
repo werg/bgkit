@@ -72,6 +72,11 @@ bgkit-ckpt = "bgkit.training.checkpoint_cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/bgkit"]
 
+# Allow git+https direct references in dependencies (e.g. the fla pin
+# to a specific upstream commit for GDN backward kernel optimizations).
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.ruff]
 line-length = 100
 src = ["src"]

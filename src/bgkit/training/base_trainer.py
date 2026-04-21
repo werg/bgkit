@@ -901,6 +901,26 @@ class BaseTrainer(ABC):
             new=new_budget,
         )
 
+    @staticmethod
+    def _resolve_eval_batch_budget(tcfg, max_batch_tokens: int) -> int:
+        """Resolve the eval-sampler token budget with a principled default.
+
+        Packed eval has no backward pass, so its CUDA peak at a given
+        ``max_batch_tokens`` is roughly half that of training at the same
+        budget. When a phase config does not override ``max_batch_tokens_eval``,
+        default to ``2 * max_batch_tokens`` — this keeps eval's CUDA peak
+        comparable to training's while letting eval pack more samples per
+        microbatch (faster eval, better statistics, same memory headroom).
+
+        A phase can still set an explicit ``max_batch_tokens_eval`` in its
+        training config to pin a specific value (e.g., a phase with eval on
+        a different dataset distribution or at a tighter budget for testing).
+        """
+        explicit = tcfg.get("max_batch_tokens_eval", None)
+        if explicit is not None:
+            return int(explicit)
+        return 2 * int(max_batch_tokens)
+
     def _handle_max_batch_tokens(self, val) -> None:
         """Live-config handler for ``max_batch_tokens``.
 

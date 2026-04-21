@@ -16,10 +16,24 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.nn as nn
 
 from bgkit.utils import attention_backend as ab
+
+
+@pytest.fixture(autouse=True)
+def _reset_sm12x_owned_backend_flag():
+    """Reset the per-process owned-backend success cache between tests.
+
+    ``require_sm12x_owned_backend`` memoizes its success result so the hot
+    per-attention-layer dispatch path is a single attribute read. Tests that
+    monkey-patch the backend state need to force a re-probe each call.
+    """
+    ab._sm12x_owned_backend_ok = False
+    yield
+    ab._sm12x_owned_backend_ok = False
 
 
 # ---------------------------------------------------------------------------
