@@ -109,7 +109,7 @@ def bgkit_flash_attention_4_forward(
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
     position_ids: torch.Tensor | None = None,
-    is_causal: bool = False,
+    is_causal: bool | None = None,
     sliding_window: int | None = None,
     softcap: float = 0.0,
     scale: float | None = None,

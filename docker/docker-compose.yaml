@@ -145,21 +145,14 @@ services:
 
   train-phase1-step3:
     <<: *gpu-common
-    # Packed-attention migration: configs/training/phase1_step3.yaml is
-    # the single source of truth for batch/accumulation values under
-    # the packed path. Previous ++training.max_batch_tokens /
-    # ++training.gradient_accumulation_steps overrides (8192 * 8) were
-    # for the pre-migration padded checkpoint and have been dropped —
-    # any resume from a padded-trained checkpoint needs a fresh start
-    # anyway under the packed forward.
-    #
-    # Explicit resume_checkpoint: the registry's latest() picks by step
-    # number and would return phase1_step3_step4000_20260419_080641
-    # (older, eval/loss 0.92) over phase1_step3_step2500_20260420_111321
-    # (eval/loss 0.38, the 04-20 run before the crash). Override here
-    # until a packed-trained checkpoint naturally becomes the newest.
+    # resume_checkpoint=none forces a fresh Step 3 run, initializing the
+    # encoder/projection from Step 2.5 (via bgkit_checkpoint: auto) and a
+    # fresh HF decoder. Post-2026-04-20 Step 3 checkpoints were
+    # compromised by a non-causal decoder attention bug
+    # (FA4 is_causal signature default False instead of None) and have
+    # been archived under compromised_fa4_causal_bug/.
     command: ["scripts/train.py", "+experiment=phase1_step3",
-              "++resume_checkpoint=/workspace/checkpoints/phase1_step3_step4000_20260421_092939"]
+              "++resume_checkpoint=none"]
 
   train-phase1-step4:
     <<: *gpu-common
