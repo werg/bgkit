@@ -98,6 +98,8 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 
 **Auto-resolution**: Set checkpoint paths to `auto` in experiment configs to automatically resolve the best checkpoint from the registry. Backfill runs first to catch any on-disk checkpoints not yet registered.
 
+**Live hyperparameter control**: Write to `${CHECKPOINT_DIR}/control.json` while training runs to adjust LR, batch budget, compression ratio, eval cadence, and more — no restart required. See the full key table in the "Attention backend" section below.
+
 | Dependency | Config Key | Source Phase | Target Phase | Metric |
 |---|---|---|---|---|
 | Joint Block → Step 1 | `bgkit_checkpoint` | `joint_block_pretrain` | `phase1_step1` | `eval/mse_repro` |
@@ -157,6 +159,43 @@ All encoder / decoder / DeltaNet attention runs via **FA4 varlen packed** on sm_
 **Helpers**: `src/bgkit/utils/packing.py` — `PackedBatch` + `segment_ids_from_cu`, `segment_mean`, `segment_sum`, `segment_max`, `lengths_from_cu`, `position_ids_from_cu`. Use these for any per-sample reduction on flat tensors.
 
 **Sampler**: `PackedTokenBudgetSampler` in `src/bgkit/data/samplers.py` with budget `sum(L_i²) ≤ max_batch_tokens × reference_seq_len` (quadratic — reflects that FA4 varlen attention cost is `sum(L_i²)`, not `B × max_len²`). `QueryAwareBatchSampler` (Phase 2) is preserved. Old `TokenBudgetBatchSampler` / `LengthSortedBatchSampler` are deleted.
+
+**Live tuning via `${CHECKPOINT_DIR}/control.json`**: Write a namespaced JSON file to adjust hyperparameters while training runs, without restarting. The trainer polls this file every step. Source of truth: `src/bgkit/training/live_config.py` + each trainer's `LIVE_CONFIG_FIELDS` / `LIVE_CONFIG_HANDLERS`. Keys handled in `BaseTrainer` (inherited by all trainers) are in the table below; trainer-specific keys are declared in each trainer's class dict.
+
+Example control file (one block per active phase):
+```json
+{
+  "phase1_step3": {
+    "target_ratio": 0.15,
+    "max_batch_tokens": 32768,
+    "eval_every": 250
+  },
+  "phase1_step6": {
+    "lr": 3e-5
+  }
+}
+```
+
+| Key | Trainer(s) | Effect |
+|---|---|---|
+| `lr` | All | Scales all param-group base LRs proportionally |
+| `max_steps` | All | Extends the training horizon (must be > current step) |
+| `warmup_steps` | All | Adjusts cosine-warmup window |
+| `eval_every` | All | Changes eval cadence (steps) |
+| `save_every` | All | Changes checkpoint cadence (steps) |
+| `early_stopping_patience` | All | Adjusts early-stopping patience |
+| `max_batch_tokens` | All Phase 1 + Phase 3 | Rebuilds `PackedTokenBudgetSampler` + train dataloader; preserves epoch cursor |
+| `max_batch_tokens_eval` | All Phase 1 + Phase 3 | Rebuilds eval dataloader with new budget |
+| `target_ratio` | DecoderInit, Compression, CommitEncoding | Override compression ratio (null to resume ramp) |
+| `target_ratio_start` | DecoderInit, Compression, CommitEncoding | Ramp start value |
+| `target_ratio_end` | DecoderInit, Compression, CommitEncoding | Ramp end value |
+| `target_ratio_ramp_steps` | DecoderInit, Compression, CommitEncoding | Ramp length |
+| `compression_introduction_step` | DecoderInit | Step at which compression is first enabled |
+| `encoder_unfreeze_step` | DecoderInit | Step at which encoder unfreezes |
+| `diagnostic_metrics_every_n_steps` | DecoderInit, Compression | Survivorship diagnostic cadence |
+| `generation_eval_every` | DecoderInit | Generation-eval cadence (every Nth eval) |
+
+`max_batch_tokens` / `max_batch_tokens_eval` rebuild is implemented in `BaseTrainer._rebuild_train_dataloader_with_budget` / `_rebuild_eval_dataloader_with_budget`. Trainers that support it stash `_train_lengths`, `_eval_lengths`, `_train_collate_fn`, `_num_workers`, `_pin_memory` in `setup()`. Phase 2 `KRKBTrainer` uses `QueryAwareBatchSampler` — not `PackedTokenBudgetSampler` — so it does not support `max_batch_tokens` live tuning.
 
 **Collators**: `src/bgkit/data/collators.py` — `collate_token_ids`, `collate_chat_repro`, `collate_compression` (dispatches to file / repo variants), `collate_qa`. Names unchanged from pre-migration; output dicts are packed.
 
