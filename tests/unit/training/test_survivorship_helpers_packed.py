@@ -800,6 +800,162 @@ def test_apply_post_step_updates_skip_flags_for_frozen_level():
 
 
 # ----------------------------------------------------------------------
+# Dual-ascent convergence / tracking behaviour (2026-04-21 investigation)
+# ----------------------------------------------------------------------
+
+
+class _SimCompressor:
+    """Bare-bones compressor shim for simulating controller dynamics.
+
+    Owns two DualThresholdControllers so ``apply_post_step_updates``
+    finds ``threshold_l0`` / ``threshold_l1``. Default clamp=1.5 lets
+    θ saturate cleanly past tanh's (−1, 1) range; tests can override.
+    """
+
+    def __init__(self, init_theta: float = 0.0, lr: float = 0.05, clamp: float = 1.5):
+        from bgkit.models.components.selection import DualThresholdController
+
+        self.threshold_l0 = DualThresholdController(
+            init_theta=init_theta, lr=lr, clamp=clamp,
+        )
+        self.threshold_l1 = DualThresholdController(
+            init_theta=init_theta, lr=lr, clamp=clamp,
+        )
+
+
+def _feed_rate(compressor, rate: float, N: int = 1000) -> None:
+    """Drive one optimizer step with a single-microbatch (organic=rate·N,
+    controllable=N) and apply θ update for level l0."""
+    state = init_state()
+    state.organic_count_sum = torch.tensor(int(rate * N))
+    state.controllable_count_sum = torch.tensor(N)
+    state.controllable_empty_count = torch.tensor(0)
+    return state
+
+
+def test_dual_ascent_converges_on_static_target():
+    """Controller must converge to |rate − target| < 0.02 within 200
+    iterations against a monotone linear rate(θ) model for three
+    different target values. Covers: (a) sign direction, (b) aggregation
+    correctness, (c) init_state / accumulate / apply_post_step_updates
+    plumbing.
+    """
+
+    def rate_of_theta(theta: float) -> float:
+        return max(0.0, min(1.0, 0.5 - 0.25 * (theta + 0.5)))
+
+    for target in [0.3, 0.5, 0.7]:
+        comp = _SimCompressor(init_theta=-0.5, lr=0.05, clamp=1.5)
+        N = 1000
+        for _ in range(200):
+            theta = float(comp.threshold_l0.theta.item())
+            rate = rate_of_theta(theta)
+            state = _feed_rate(comp, rate, N)
+            apply_post_step_updates(
+                comp, state, target_ratio=target, level="l0",
+            )
+        final_theta = float(comp.threshold_l0.theta.item())
+        final_rate = rate_of_theta(final_theta)
+        assert abs(final_rate - target) < 0.02, (
+            f"target={target}: final rate={final_rate:.3f}, "
+            f"θ={final_theta:.3f}"
+        )
+
+
+def test_dual_ascent_sign_is_correct():
+    """Regression guard for the θ update sign: when actual > target, θ
+    MUST rise (raising the threshold → fewer survivors → actual drops).
+    Conversely actual < target ⇒ θ falls.
+    """
+    comp = _SimCompressor(init_theta=0.0, lr=0.1, clamp=1.5)
+    initial_theta = float(comp.threshold_l0.theta.item())
+
+    # actual=0.7 vs target=0.3 → gap=+0.4 → θ should rise.
+    state = _feed_rate(comp, rate=0.7, N=1000)
+    apply_post_step_updates(comp, state, target_ratio=0.3, level="l0")
+    after_positive_gap = float(comp.threshold_l0.theta.item())
+    assert after_positive_gap > initial_theta
+
+    # Reset and test the other direction.
+    comp2 = _SimCompressor(init_theta=0.0, lr=0.1, clamp=1.5)
+    state = _feed_rate(comp2, rate=0.1, N=1000)
+    apply_post_step_updates(comp2, state, target_ratio=0.5, level="l0")
+    after_negative_gap = float(comp2.threshold_l0.theta.item())
+    assert after_negative_gap < 0.0
+
+
+def test_dual_ascent_tracks_ramping_target():
+    """Target ramps from 0.5 → 0.1 over 500 steps; after the ramp ends,
+    θ should catch up so |rate − target| < 0.05 within 100 extra steps.
+    This catches the "controller can't keep up with the ramp" symptom
+    observed in the 2026-04-21 packed run: under-damped tracking error
+    proportional to ramp rate / controller gain. A sign flip would
+    make the error grow unbounded.
+    """
+
+    def rate_of_theta(theta: float) -> float:
+        return max(0.0, min(1.0, 0.5 - 0.4 * theta))
+
+    comp = _SimCompressor(init_theta=0.0, lr=0.05, clamp=1.5)
+    N = 1000
+    for step in range(800):
+        target = max(0.1, 0.5 - 0.4 * (step / 500.0))
+        theta = float(comp.threshold_l0.theta.item())
+        rate = rate_of_theta(theta)
+        state = _feed_rate(comp, rate, N)
+        apply_post_step_updates(
+            comp, state, target_ratio=target, level="l0",
+        )
+    # After the ramp (step ≥ 500 target is pinned at 0.1), controller
+    # should have converged within tolerance.
+    final_theta = float(comp.threshold_l0.theta.item())
+    final_rate = rate_of_theta(final_theta)
+    assert abs(final_rate - 0.1) < 0.05, (
+        f"after-ramp rate={final_rate:.3f}, θ={final_theta:.3f}"
+    )
+
+
+def test_dual_ascent_clamp_saturates_cleanly_on_infeasible_target():
+    """Regression guard for the 2026-04-21 'stuck at clamp' symptom.
+
+    Simulates a head distribution whose achievable keep-rate ceiling is
+    0.85 (e.g. due to tanh-saturated positions at the ``logits = −1``
+    floor that can never be 'above' any θ > −1). When the controller is
+    pointed at target=0.95 (infeasible), it should drive θ to the lower
+    clamp and stay there — the ACTUAL rate is then the feasibility
+    ceiling, not the target, and that's the best the controller can do.
+
+    With clamp=0.99 (the pre-fix value) this test would also pass with
+    θ pegged at −0.99, but the test's point is: raising clamp past ±1
+    must not break saturation semantics. Included to lock the
+    contract in place.
+    """
+
+    def rate_of_theta(theta: float) -> float:
+        # Ceiling at 0.85: no matter how low θ goes, some positions can
+        # never be organic-selected (mimics tanh saturation floor).
+        if theta <= -1.0:
+            return 0.85
+        return max(0.0, min(1.0, 0.5 - 0.4 * theta))
+
+    comp = _SimCompressor(init_theta=0.0, lr=0.1, clamp=1.5)
+    N = 1000
+    for _ in range(300):
+        theta = float(comp.threshold_l0.theta.item())
+        rate = rate_of_theta(theta)
+        state = _feed_rate(comp, rate, N)
+        apply_post_step_updates(
+            comp, state, target_ratio=0.95, level="l0",
+        )
+    final_theta = float(comp.threshold_l0.theta.item())
+    # θ should have saturated at the lower clamp.
+    assert final_theta == pytest.approx(-1.5, abs=1e-2)
+    # And the actual rate is the infeasibility ceiling (0.85), NOT 0.95.
+    final_rate = rate_of_theta(final_theta)
+    assert abs(final_rate - 0.85) < 1e-3
+
+
+# ----------------------------------------------------------------------
 # maybe_unload_ice
 # ----------------------------------------------------------------------
 
