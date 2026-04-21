@@ -76,8 +76,13 @@ data:
   max_files_per_commit: 16
   max_message_tokens: 256
 
-max_batch_tokens: 65536
-gradient_accumulation_steps: 1
+# Packed-attention migration (wall-clock investigation 2026-04-21):
+# Same fix as Step 3 — 32768/grad_accum=2 keeps effective batch at 65k tokens
+# while flattening right-tail latency from tail microbatches (8 samples × L≈4096
+# → 35 s/step at 65536/grad_accum=1 due to decoder splice ≈ 2× content length).
+# See docs/wall_clock_investigation_2026_04_21.md.
+max_batch_tokens: 32768
+gradient_accumulation_steps: 2
 
 eval_every: 1000
 save_every: 5000
