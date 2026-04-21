@@ -231,6 +231,28 @@ services:
       "+experiment=phase1_step6",
     ]
 
+  # Phase 2 KB-scale memory profiler.  Hard memory cap (80g) prevents
+  # unified-memory OOM from cascading to the host, same as Phase 1.
+  # Invoke via:
+  #   docker compose -f docker/docker-compose.yaml run --rm profile-phase2-kb-stage-a
+  profile-phase2-kb-stage-a:
+    <<: *gpu-common
+    mem_limit: 80g
+    memswap_limit: 80g
+    command: [
+      "scripts/profile_packed_memory_phase2.py",
+      "+experiment=phase2_kb_stage_a",
+    ]
+
+  profile-phase2-kb-stage-b:
+    <<: *gpu-common
+    mem_limit: 80g
+    memswap_limit: 80g
+    command: [
+      "scripts/profile_packed_memory_phase2.py",
+      "+experiment=phase2_kb_stage_b",
+    ]
+
   preprocess:
     build:
       context: ..
