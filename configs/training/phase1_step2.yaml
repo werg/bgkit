@@ -8,8 +8,14 @@ optimizer: muon
 max_steps: 40000
 lr: 5.0e-5
 warmup_steps: 500
-max_batch_tokens: 16384
-gradient_accumulation_steps: 4
+# Packed-attention migration (wall-clock investigation 2026-04-21):
+# Bumped to 32768/grad_accum=2 — effective batch stays at 65k tokens.
+# No explicit memory-pressure comment in config; teacher encoder is frozen
+# (no backward), so peak memory is teacher activations + student fwd+bwd,
+# comparable to Step 3's decoder+encoder. Same rationale as Step 3/5/6.
+# See docs/wall_clock_investigation_2026_04_21.md.
+max_batch_tokens: 32768
+gradient_accumulation_steps: 2
 max_eval_samples: 2000
 eval_every: 500
 save_every: 500
