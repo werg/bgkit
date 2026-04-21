@@ -76,7 +76,12 @@ compression_introduction_step: 0
 # hundred steps to learn on lightly-compressed inputs before the head
 # has to commit to aggressive selection.
 target_ratio_start: 0.95
-target_ratio_end: 0.10
+# Terminal ratio set to 0.08 (down from 0.10) to match Step 4's operating
+# point and eliminate the discontinuity where Step 4 immediately applies
+# a harder compression regime than Step 3 trained for. Keeping compression
+# consistent across the handoff avoids a cold-start in the head + decoder
+# at Step 4 onset. See docs/wall_clock_investigation_2026_04_21.md.
+target_ratio_end: 0.08
 target_ratio_ramp_steps: 1000
 
 # Liger kernels: SwiGLU + RoPE + fused linear-CE are enabled. LigerRMSNorm
@@ -177,13 +182,6 @@ early_stopping:
 qa_ratio: 0.0
 eval:
   generation_samples: 50
-  # Temporarily disabled (2026-04-20): the Wave 1.2 custom B=1 decode loop
-  # in ``generate_with_single_splice`` crashes at the first DeltaNet layer
-  # when inner_model is called with ``cu_seq_lens_q/k`` kwargs — HF's
-  # Qwen3.5 forward reshapes hidden_states to 4D for the packed-attention
-  # prep, and DeltaNet's ``batch_size, seq_len, _ = hidden_states.shape``
-  # chokes. Fix requires either (a) routing DeltaNet through a non-packed
-  # per-step code path while keeping full-attention packed, or (b) passing
-  # ``cu_seqlens`` through to the patched DeltaNet layer in generation
-  # mode. Disable here so training can proceed; track the fix separately.
-  generation_eval_every: 999999
+  # Re-enabled (2026-04-21): the DeltaNet gen-eval crash (cu_seq_lens_q/k
+  # shape mismatch in generation mode) was fixed in commit 4ab9063.
+  generation_eval_every: 4
