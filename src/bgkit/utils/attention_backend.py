@@ -159,10 +159,17 @@ def bgkit_flash_attention_4_forward(
     hf_max_q = kwargs.pop("max_length_q", None)
     hf_max_k = kwargs.pop("max_length_k", None)
 
-    cu_q = cu_seqlens_q if cu_seqlens_q is not None else (hf_cu_q or cu_seqlens)
-    cu_k = cu_seqlens_k if cu_seqlens_k is not None else (hf_cu_k or cu_seqlens)
-    m_q = max_seqlen_q if max_seqlen_q is not None else (hf_max_q or max_seqlen)
-    m_k = max_seqlen_k if max_seqlen_k is not None else (hf_max_k or max_seqlen)
+    # Explicit ``is not None`` chains — ``a or b`` evaluates ``bool(a)`` and
+    # blows up on multi-element Tensors ("Boolean value of Tensor with more
+    # than one value is ambiguous").
+    cu_q = cu_seqlens_q
+    if cu_q is None:
+        cu_q = hf_cu_q if hf_cu_q is not None else cu_seqlens
+    cu_k = cu_seqlens_k
+    if cu_k is None:
+        cu_k = hf_cu_k if hf_cu_k is not None else cu_seqlens
+    m_q = max_seqlen_q if max_seqlen_q is not None else (hf_max_q if hf_max_q is not None else max_seqlen)
+    m_k = max_seqlen_k if max_seqlen_k is not None else (hf_max_k if hf_max_k is not None else max_seqlen)
 
     if cu_q is None or cu_k is None or m_q is None or m_k is None:
         raise TypeError(

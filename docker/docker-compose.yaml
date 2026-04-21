@@ -5,6 +5,14 @@ x-gpu-common: &gpu-common
   # Run as host user so files written to bind mounts (checkpoints, HF cache)
   # are owned by the host user, not root.
   user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+  # Hard memory cap: DGX Spark has 128 GB unified (CPU+GPU share one pool). A
+  # runaway CUDA alloc OOM-kills host processes (including the Claude Code
+  # harness). The cap bounds the container; anything above this limit gets
+  # container-scoped OOM'd rather than taking down the host. 80 GB leaves
+  # ~48 GB headroom for the OS, harness, and any concurrent Docker services.
+  # Added 2026-04-20 after an unsupervised profiler run crashed the host.
+  mem_limit: 80g
+  memswap_limit: 80g
   deploy:
     resources:
       reservations:
@@ -130,7 +138,14 @@ services:
     # for the pre-migration padded checkpoint and have been dropped —
     # any resume from a padded-trained checkpoint needs a fresh start
     # anyway under the packed forward.
-    command: ["scripts/train.py", "+experiment=phase1_step3"]
+    #
+    # Explicit resume_checkpoint: the registry's latest() picks by step
+    # number and would return phase1_step3_step4000_20260419_080641
+    # (older, eval/loss 0.92) over phase1_step3_step2500_20260420_111321
+    # (eval/loss 0.38, the 04-20 run before the crash). Override here
+    # until a packed-trained checkpoint naturally becomes the newest.
+    command: ["scripts/train.py", "+experiment=phase1_step3",
+              "++resume_checkpoint=/workspace/checkpoints/phase1_step3_step2545_20260420_211940"]
 
   train-phase1-step4:
     <<: *gpu-common

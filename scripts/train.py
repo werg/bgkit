@@ -88,6 +88,20 @@ def main(cfg: DictConfig) -> None:
     setup_logging()
     set_seed(cfg.seed)
 
+    # Hard-cap the PyTorch CUDA allocator on unified-memory systems. Docker's
+    # mem_limit only accounts for cgroup CPU memory; CUDA allocations via
+    # nvidia-container-runtime bypass it, so on DGX Spark a runaway alloc can
+    # drag the 128 GB unified pool into page-thrash and stall the host before
+    # any OOM-killer fires. The fraction-of-total cap lets PyTorch raise a
+    # clean OOMError instead. Override with BGKIT_CUDA_MEM_FRACTION.
+    import os as _os
+
+    import torch as _torch
+
+    if _torch.cuda.is_available():
+        _frac = float(_os.environ.get("BGKIT_CUDA_MEM_FRACTION", "0.65"))
+        _torch.cuda.set_per_process_memory_fraction(_frac)
+
     print(OmegaConf.to_yaml(cfg))
 
     retry_cfg = cfg.get("retry", {})

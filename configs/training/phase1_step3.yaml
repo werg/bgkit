@@ -25,20 +25,19 @@ decoder_lr: 1.0e-5        # decoder LoRA LR (low — LoRA concentrates gradients
 encoder_lr: 2.0e-4        # encoder LR (higher — pruned encoder needs to adapt)
 warmup_steps: 500
 # Packed-attention migration (Wave 4, 2026-04-20 sweep):
-# Profile data (profile_packed_memory_phase1_step3_20260420_175933, at
-# gradient_checkpointing=false) shows CUDA peak at 65536 tokens =
-# 28.6 GB, at 98304 = 36.6 GB — both well under the 85 GB safety rail
-# with ≥ 15 GB headroom for eval + gen. 65536 is chosen as the working
-# budget because (a) the 98304 sample count jumped 30 → 28 and wall
-# time jumped 17s → 72s, suggesting allocator-level overhead past
-# 65536; (b) 65536 matches the pre-migration effective batch (8192*8)
-# exactly, so gradient dynamics don't shift. Eval doubled to 131072
-# (no backward → bigger pack fine). grad_accum = 1 (budget already
-# reaches the effective-batch target).
+# 24576/grad_accum=2 validated live at step 2545 (reached ~25% memory
+# utilization). Bumped to 65536/grad_accum=1 to match the pre-migration
+# effective batch (8192*8=65536) exactly and lift memory utilization
+# toward the 50-85 GB target window. Profile predicted 28.6 GB peak at
+# this budget without Muon state; live peak expected in the 35-45 GB
+# range after optimizer state populates. Still well under the
+# torch.cuda.set_per_process_memory_fraction(0.65) cap (~83 GB).
 max_batch_tokens: 65536
 max_batch_tokens_eval: 131072
 gradient_accumulation_steps: 1
-gradient_checkpointing: false
+# gradient_checkpointing flag here is ignored by the trainer code —
+# decoder_init.py::setup unconditionally calls enable_gradient_checkpointing
+# on the decoder backbone. Documented here as a reminder; fix separately.
 max_eval_samples: 500
 eval_every: 500
 save_every: 500
@@ -174,4 +173,13 @@ early_stopping:
 qa_ratio: 0.0
 eval:
   generation_samples: 50
-  generation_eval_every: 4
+  # Temporarily disabled (2026-04-20): the Wave 1.2 custom B=1 decode loop
+  # in ``generate_with_single_splice`` crashes at the first DeltaNet layer
+  # when inner_model is called with ``cu_seq_lens_q/k`` kwargs — HF's
+  # Qwen3.5 forward reshapes hidden_states to 4D for the packed-attention
+  # prep, and DeltaNet's ``batch_size, seq_len, _ = hidden_states.shape``
+  # chokes. Fix requires either (a) routing DeltaNet through a non-packed
+  # per-step code path while keeping full-attention packed, or (b) passing
+  # ``cu_seqlens`` through to the patched DeltaNet layer in generation
+  # mode. Disable here so training can proceed; track the fix separately.
+  generation_eval_every: 999999
