@@ -242,10 +242,11 @@ def live_verify(
     import torch.nn as nn
     from transformers import AutoModelForCausalLM
 
-    from bgkit.models.decoder import ReconstructionDecoder
+    from bgkit.models.decoder import EmbeddingSegment, ReconstructionDecoder, TokenSegment
     from bgkit.models.encoder import BgKITEncoder
     from bgkit.models.lora_encoder import DEFAULT_LORA_TARGETS, LoRARouter
     from bgkit.utils.attention_backend import resolve_attention_implementation
+    from bgkit.utils.packing import position_ids_from_cu
 
     if not torch.cuda.is_available():
         print("\n[live] CUDA unavailable — skipping live verification.")
@@ -309,118 +310,139 @@ def live_verify(
     print(f"[live] After model + optimizer construction: "
           f"{_gb(weights_alloc):.2f} GB allocated")
 
-    # Synthetic L0 forward
-    B_l0 = articles_per_bgkit
-    L_l0 = doc_length
+    # Synthetic L0 forward — packed FA4 varlen form.
+    # Build a flat (N_content, D) buffer with per-article cu_seqlens.
+    n_articles = articles_per_bgkit
+    article_len = doc_length
     token_embeds = encoder.compressor.backbone.get_input_embeddings()
     vocab_size = token_embeds.num_embeddings
-    input_ids = torch.randint(0, vocab_size, (B_l0, L_l0), device=device)
-    input_emb = token_embeds(input_ids)
-    attention_mask = torch.ones((B_l0, L_l0), dtype=torch.bool, device=device)
-    # Synthetic survivor mask: keep every other position
-    keep = max(1, int(L_l0 * 0.20))
-    survivor_mask = torch.zeros((B_l0, L_l0), dtype=torch.bool, device=device)
-    topk = torch.topk(
-        torch.rand(B_l0, L_l0, device=device), k=keep, dim=-1,
-    ).indices
-    survivor_mask.scatter_(1, topk, True)
 
-    print(f"[live] L0 forward: B={B_l0}, L={L_l0}, keep={keep} ...")
+    # All articles have the same length in this synthetic test; construct
+    # flat content buffer and per-article cu_seqlens.
+    input_ids_flat = torch.randint(0, vocab_size, (n_articles * article_len,), device=device)
+    content_flat = token_embeds(input_ids_flat)  # (N_content, D)
+    lengths_l0 = [article_len] * n_articles
+    l0_cu = torch.zeros(n_articles + 1, dtype=torch.int32, device=device)
+    l0_cu[1:] = torch.tensor(lengths_l0, dtype=torch.int32, device=device).cumsum(0)
+    l0_pos = position_ids_from_cu(l0_cu, int(content_flat.shape[0]))
+
+    # L0 retention ratio — survivorship head will select this fraction.
+    l0_retention = 0.20
+
+    print(f"[live] L0 forward: B={n_articles}, L={article_len}, "
+          f"retention={l0_retention} ...")
     with router.active("l0"):
         if activation_checkpointing:
             from torch.utils.checkpoint import checkpoint
 
-            def _run_l0(ie, sm, am, _enc=encoder):
+            def _run_l0(c, cu, pos, _enc=encoder):
                 return _enc(
-                    input_embeddings=ie,
-                    survivor_mask=sm,
-                    attention_mask=am,
-                    lora_level="l0",
+                    content_embeddings=c,
+                    content_cu_seqlens=cu,
+                    content_position_ids=pos,
+                    target_ratio=l0_retention,
+                    level="l0",
                 )
 
             l0_out = checkpoint(
-                _run_l0, input_emb, survivor_mask, attention_mask,
+                _run_l0, content_flat, l0_cu, l0_pos,
                 use_reentrant=False,
             )
         else:
             l0_out = encoder(
-                input_embeddings=input_emb,
-                survivor_mask=survivor_mask,
-                attention_mask=attention_mask,
-                lora_level="l0",
+                content_embeddings=content_flat,
+                content_cu_seqlens=l0_cu,
+                content_position_ids=l0_pos,
+                target_ratio=l0_retention,
+                level="l0",
             )
 
-    # Concatenate L0 survivors into an L1 input: (1, K_total, D)
-    l0_surv = l0_out.survivor_embeddings  # (B_l0, K, D)
-    k_total = l0_surv.size(0) * l0_surv.size(1)
-    l1_content = l0_surv.reshape(1, k_total, 1024)
-    l1_attn_mask = torch.ones((1, k_total), dtype=torch.bool, device=device)
-    l1_survivor_mask = torch.ones((1, k_total), dtype=torch.bool, device=device)
-    l1_pinned = torch.zeros((1, k_total), dtype=torch.bool, device=device)
-    l1_pinned[0, :min(8, k_total)] = True  # fake 8 pinned positions
+    # L0 survivors — flat (N_survivors, D) with per-article boundaries in
+    # survivor_cu_seqlens.  Treat all articles' survivors as a single L1
+    # content sequence (one "bgkit turn").
+    l0_surv_flat = l0_out.survivor_embeddings  # (N_survivors, D)
+    k_total = int(l0_surv_flat.shape[0])
 
-    # Synthetic query
+    # L1 content: all L0 survivors packed as one sample.
+    l1_cu = torch.tensor([0, k_total], dtype=torch.int32, device=device)
+    l1_pos = position_ids_from_cu(l1_cu, k_total)
+
+    # Synthetic per-token pinned flags: pin the first 8 positions (article IDs).
+    l1_pinned = torch.zeros(k_total, dtype=torch.bool, device=device)
+    l1_pinned[:min(8, k_total)] = True
+
+    # Synthetic query (32 tokens).
     query_len = 32
-    query_ids = torch.randint(0, vocab_size, (1, query_len), device=device)
-    query_emb = token_embeds(query_ids)
-    query_mask = torch.ones((1, query_len), dtype=torch.bool, device=device)
+    query_ids_flat = torch.randint(0, vocab_size, (query_len,), device=device)
+    query_emb = token_embeds(query_ids_flat)  # (N_query, D)
+    query_cu = torch.tensor([0, query_len], dtype=torch.int32, device=device)
+    query_pos = position_ids_from_cu(query_cu, query_len)
 
+    l1_retention = 0.50
     print(f"[live] L1 forward: K_total={k_total}, query_len={query_len} ...")
     with router.active("l1"):
         if activation_checkpointing:
             from torch.utils.checkpoint import checkpoint
 
-            def _run_l1(c, sm, am, qe, qm, pp, _enc=encoder):
+            def _run_l1(c, c_cu, c_pos, qe, q_cu, q_pos, pp, _enc=encoder):
                 return _enc(
-                    input_embeddings=c,
-                    survivor_mask=sm,
-                    attention_mask=am,
+                    content_embeddings=c,
+                    content_cu_seqlens=c_cu,
+                    content_position_ids=c_pos,
                     prompt_embeddings=qe,
-                    prompt_attention_mask=qm,
+                    prompt_cu_seqlens=q_cu,
+                    prompt_position_ids=q_pos,
                     pinned_positions=pp,
-                    lora_level="l1",
+                    target_ratio=l1_retention,
+                    level="l1",
                 )
 
             l1_out = checkpoint(
-                _run_l1, l1_content, l1_survivor_mask, l1_attn_mask,
-                query_emb, query_mask, l1_pinned,
+                _run_l1, l0_surv_flat, l1_cu, l1_pos,
+                query_emb, query_cu, query_pos, l1_pinned,
                 use_reentrant=False,
             )
         else:
             l1_out = encoder(
-                input_embeddings=l1_content,
-                survivor_mask=l1_survivor_mask,
-                attention_mask=l1_attn_mask,
+                content_embeddings=l0_surv_flat,
+                content_cu_seqlens=l1_cu,
+                content_position_ids=l1_pos,
                 prompt_embeddings=query_emb,
-                prompt_attention_mask=query_mask,
+                prompt_cu_seqlens=query_cu,
+                prompt_position_ids=query_pos,
                 pinned_positions=l1_pinned,
-                lora_level="l1",
+                target_ratio=l1_retention,
+                level="l1",
             )
 
-    l1_survivors = l1_out.survivor_embeddings  # (1, K1, D)
+    l1_survivors = l1_out.survivor_embeddings  # (K1, D) flat
 
-    # Decoder forward: synthetic inputs_embeds of decoder_context length with
-    # l1_survivors spliced in the middle.
+    # Decoder forward: synthetic token context of decoder_context length with
+    # l1_survivors spliced in the middle via the interleaved segment API.
     dec_embed = decoder_backbone.get_input_embeddings()
-    dec_token_ids = torch.randint(
-        0, dec_embed.weight.shape[0], (1, decoder_context), device=device,
-    )
-    dec_tok_emb = dec_embed(dec_token_ids).to(torch.bfloat16)
-    # Splice in l1 survivors at a fixed midpoint (replace 1 token with K1)
+    vocab_dec = dec_embed.weight.shape[0]
     mid = decoder_context // 2
-    dec_inputs_embeds = torch.cat([
-        dec_tok_emb[:, :mid], l1_survivors, dec_tok_emb[:, mid + 1:],
-    ], dim=1)
-    dec_labels = torch.randint(
-        0, dec_embed.weight.shape[0], (1, dec_inputs_embeds.size(1)), device=device,
-    )
 
-    print(f"[live] Decoder forward: L={dec_inputs_embeds.size(1)} ...")
-    dec_out = decoder_backbone(
-        inputs_embeds=dec_inputs_embeds,
-        labels=dec_labels,
-    )
-    loss = dec_out.loss
+    pre_ids = torch.randint(0, vocab_dec, (1, mid), device=device)
+    post_ids = torch.randint(0, vocab_dec, (1, decoder_context - mid - 1), device=device)
+
+    # Use the interleaved-segment decoder API (same as KRKBTrainer).
+    segments = [
+        TokenSegment(
+            token_ids=pre_ids,
+            loss_mask=torch.ones(1, mid, dtype=torch.bool, device=device),
+        ),
+        EmbeddingSegment(
+            embeddings=l1_survivors.unsqueeze(0),  # (1, K1, D)
+        ),
+        TokenSegment(
+            token_ids=post_ids,
+            loss_mask=torch.ones(1, decoder_context - mid - 1, dtype=torch.bool, device=device),
+        ),
+    ]
+    total_len = mid + int(l1_survivors.shape[0]) + (decoder_context - mid - 1)
+    print(f"[live] Decoder forward: L={total_len} ...")
+    loss = decoder.forward_interleaved_with_loss(segments)
     print(f"[live] Decoder loss: {loss.item():.4f}")
 
     print("[live] Backward ...")
