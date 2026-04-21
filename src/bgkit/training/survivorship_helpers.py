@@ -580,21 +580,25 @@ def compute_survivorship_losses(
     )
     if qa_active:
         am = answer_position_mask.to(device=base_raw.device, dtype=torch.bool)
-        # Clip to base_raw length for defensive alignment; a well-formed
-        # packed batch has am.shape == base_raw.shape already.
+        # Hard contract: answer_position_mask must match base_raw exactly.
+        # Packed collator concatenates per-sample masks into a flat (N,) tensor
+        # aligned 1:1 with content positions; any mismatch is a bug in the
+        # collator, dataset, or encoder path and should fail loud.
         if am.shape[0] != base_raw.shape[0]:
-            min_n = min(am.shape[0], base_raw.shape[0])
-            am = am[:min_n]
-            base_for_qa = base_raw[:min_n]
-        else:
-            base_for_qa = base_raw
+            raise ValueError(
+                "QA position loss: answer_position_mask shape "
+                f"{tuple(am.shape)} does not match base_raw shape "
+                f"{tuple(base_raw.shape)}. This indicates a collator / "
+                "encoder alignment bug — mask and base_raw must be flat "
+                "(N_content,) tensors."
+            )
         target = torch.where(
             am,
-            torch.ones_like(base_for_qa, dtype=torch.float32),
-            torch.full_like(base_for_qa, weights.qa_non_answer_target, dtype=torch.float32),
+            torch.ones_like(base_raw, dtype=torch.float32),
+            torch.full_like(base_raw, weights.qa_non_answer_target, dtype=torch.float32),
         )
         bce_per_pos = F.binary_cross_entropy_with_logits(
-            base_for_qa.float(), target, reduction="none",
+            base_raw.float(), target, reduction="none",
         )
         qa_loss = bce_per_pos.mean()
         metrics["qa_position_loss"] = float(qa_loss.item())
