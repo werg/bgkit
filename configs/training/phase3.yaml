@@ -1,0 +1,75 @@
+# Phase 3: SWE-bench teacher trajectory distillation
+#
+# Distills teacher agent trajectories (OpenHands / Llama-70B / Claude Sonnet)
+# into the student (Qwen3.5-0.8B + BgKIT context). Three context sources
+# assembled per sample: compressed filesystem, git history commit chains,
+# and prior agentic sessions ordered by base_commit.
+#
+# Gate: Phase 2 Stage B checkpoint + encoded SWE-bench repos
+# (scripts/encode_swe_repos.py → $DATA_DIR/swe_embeddings/)
+#
+# Layout (per DistillationTrainer._forward_backward):
+#   [issue tokens | <tool_call>bgkit</tool_call>\n<tool_response>\n |
+#    survivor embeddings | \n</tool_response>\n | teacher trajectory]
+# Loss: CE on trajectory tokens only (wrapper tokens masked out).
+# ~30% examples without BgKIT injection (no_injection_fraction) to
+# preserve baseline decoder capability on code tasks without context.
+#
+# Wall-clock recommendation (2026-04-21): 32768/grad_accum=2 — same
+# effective batch as Phase 1, same right-tail latency mitigation.
+# The decoder runs over [issue | survivors | trajectory] ≈ 2-3× trajectory
+# length; 65536/grad_accum=1 would spike tail microbatches.
+# See docs/wall_clock_investigation_2026_04_21.md.
+phase: phase3
+optimizer: muon
+max_steps: 100000          # TODO: calibrate once Phase 3 data volume is known (~200K trajectories)
+lr: 3.0e-5                 # TODO: tune; start conservative on a large distillation corpus
+decoder_lr: 3.0e-5         # decoder and encoder share lr here (encoder frozen)
+warmup_steps: 2000         # TODO: 2k steps ~= 2% of 100k, matches typical SFT ramp
+max_batch_tokens: 32768
+gradient_accumulation_steps: 2
+eval_every: 2000
+save_every: 5000
+diagnostic_metrics_every_n_steps: 100
+
+# Fraction of training examples where BgKIT context is withheld entirely.
+# 30% baseline-preservation matches Phase 3 design doc; lower if the model
+# leans too hard on context, higher if it ignores context completely.
+no_injection_fraction: 0.30
+
+# Phase 2 checkpoint to load encoder weights from (auto = registry best).
+# If null, the encoder is not loaded and context injection is disabled.
+# TODO: set to 'auto' once Phase 2 Stage B has a registered checkpoint.
+phase2_checkpoint: auto
+
+# Pre-computed BgKIT cache directory (from scripts/encode_swe_repos.py).
+# Layout: $bgkit_cache_dir/{filesystem,git_history,prior_sessions}/manifest.parquet
+# TODO: set DATA_DIR/swe_embeddings once encode_swe_repos.py has run.
+bgkit_cache_dir: ${oc.env:DATA_DIR}/swe_embeddings
+
+# LoRA on decoder for parameter efficiency (same config as Phase 1 Step 3+).
+decoder_lora:
+  enabled: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+# Liger kernels: same pattern as Phase 1. LigerRMSNorm pinned OFF (Qwen3.5
+# backward corruption; see phase1_step3.yaml note).
+use_liger: true
+use_liger_rmsnorm: false
+
+reset_wandb: true
+
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+
+early_stopping:
+  enabled: false
+  patience: 10
+  min_delta: 0.001
+  metric: eval/loss
