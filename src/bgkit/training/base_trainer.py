@@ -12,6 +12,7 @@ import math
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 
 import structlog
 import torch
@@ -31,6 +32,8 @@ from bgkit.training.live_config import LiveConfig
 from bgkit.training.scheduling import cosine_with_warmup
 from bgkit.utils.memory_budget import (
     collect_memory_diagnostics as _collect_memory_diagnostics,
+)
+from bgkit.utils.memory_budget import (
     memory_budget_scope,
 )
 
@@ -147,13 +150,16 @@ class BaseTrainer(ABC):
       training loop starts. Use for resume-time rebuilds.
     """
 
-    LIVE_CONFIG_FIELDS: dict[str, str] = {}
+    LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {}
 
     #: Registry of live-config handler methods for keys that need custom
     #: validation (e.g. nullable fields, range checks).  Maps control-file
     #: key → unbound method name on ``self``.  Merged across the MRO so
     #: subclasses add handlers without rewriting ``apply_live_config``.
-    LIVE_CONFIG_HANDLERS: dict[str, str] = {}
+    LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
+        "max_batch_tokens": "_handle_max_batch_tokens",
+        "max_batch_tokens_eval": "_handle_max_batch_tokens_eval",
+    }
 
     #: Steps between structured log messages. Override in subclass.
     _log_every: int = 10
@@ -789,6 +795,149 @@ class BaseTrainer(ABC):
             value=val,
             expected="None or float in (0, 1)",
         )
+
+    def _rebuild_train_dataloader_with_budget(self, new_budget: int) -> None:
+        """Rebuild the train dataloader with a new token budget.
+
+        Subclasses must have set ``_train_lengths``, ``_train_collate_fn``,
+        ``_num_workers``, and ``_pin_memory`` in their ``setup()`` method,
+        and must expose ``train_dataset`` and ``train_sampler`` attributes.
+        The method preserves the current ``_microbatches_in_epoch`` cursor
+        so the next step continues from the same logical position in the epoch.
+        Invalidates the dataloader iterator via ``_dataloader_invalidated``.
+
+        No-op if any required attribute is missing (trainer was set up without
+        the caching pattern — logs a warning instead).
+        """
+        required = ("_train_lengths", "_train_collate_fn", "_num_workers", "_pin_memory",
+                    "train_dataset", "train_sampler")
+        for attr in required:
+            if not hasattr(self, attr):
+                logger.warning(
+                    "live_max_batch_tokens_rebuild_skipped",
+                    reason=f"missing attribute {attr!r}",
+                    trainer=type(self).__name__,
+                )
+                return
+
+        from torch.utils.data import DataLoader
+
+        from bgkit.data.samplers import PackedTokenBudgetSampler
+
+        old_budget = getattr(self.train_sampler, "_max_batch_tokens", None)
+        cursor = self._microbatches_in_epoch
+
+        seed = getattr(self.train_sampler, "_seed", None)
+        epoch = getattr(self.train_sampler, "_epoch", 0)
+        self.train_sampler = PackedTokenBudgetSampler(
+            self.train_dataset,
+            lengths=self._train_lengths,
+            max_batch_tokens=new_budget,
+            shuffle=True,
+            seed=seed,
+        )
+        # Restore epoch so shuffle order is deterministic on resume.
+        self.train_sampler.set_epoch(epoch)
+        # Preserve cursor so the next step continues from the same position.
+        self.train_sampler.set_batch_cursor(cursor)
+
+        self.train_dataloader = DataLoader(
+            self.train_dataset,
+            batch_sampler=self.train_sampler,
+            collate_fn=self._train_collate_fn,
+            num_workers=self._num_workers,
+            pin_memory=self._pin_memory,
+        )
+        self._dataloader_invalidated = True
+
+        logger.info(
+            "live_max_batch_tokens_update",
+            old=old_budget,
+            new=new_budget,
+            cursor_preserved=cursor,
+        )
+
+    def _rebuild_eval_dataloader_with_budget(self, new_budget: int) -> None:
+        """Rebuild the eval dataloader with a new token budget.
+
+        Subclasses must have set ``_eval_lengths``, ``_train_collate_fn`` (reused
+        for eval), ``_num_workers``, and ``_pin_memory`` in their ``setup()``
+        method, and must expose ``eval_dataset`` attribute.
+
+        No-op if any required attribute is missing.
+        """
+        required = ("_eval_lengths", "_train_collate_fn", "_num_workers", "_pin_memory",
+                    "eval_dataset", "_max_batch_tokens_eval")
+        for attr in required:
+            if not hasattr(self, attr):
+                logger.warning(
+                    "live_max_batch_tokens_eval_rebuild_skipped",
+                    reason=f"missing attribute {attr!r}",
+                    trainer=type(self).__name__,
+                )
+                return
+
+        from torch.utils.data import DataLoader
+
+        from bgkit.data.samplers import PackedTokenBudgetSampler
+
+        old_budget = self._max_batch_tokens_eval
+        eval_sampler = PackedTokenBudgetSampler(
+            self.eval_dataset,
+            lengths=self._eval_lengths,
+            max_batch_tokens=new_budget,
+            shuffle=False,
+        )
+        self.eval_dataloader = DataLoader(
+            self.eval_dataset,
+            batch_sampler=eval_sampler,
+            collate_fn=self._train_collate_fn,
+            num_workers=self._num_workers,
+            pin_memory=self._pin_memory,
+        )
+        logger.info(
+            "live_max_batch_tokens_eval_update",
+            old=old_budget,
+            new=new_budget,
+        )
+
+    def _handle_max_batch_tokens(self, val) -> None:
+        """Live-config handler for ``max_batch_tokens``.
+
+        Validates the value, updates ``_max_batch_tokens``, and triggers a
+        train-dataloader rebuild via :meth:`_rebuild_train_dataloader_with_budget`.
+        """
+        if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+            logger.warning(
+                "live_max_batch_tokens_invalid",
+                value=val,
+                expected="positive int",
+            )
+            return
+        old = getattr(self, "_max_batch_tokens", None)
+        if old == val:
+            return
+        self._max_batch_tokens = val
+        self._rebuild_train_dataloader_with_budget(val)
+
+    def _handle_max_batch_tokens_eval(self, val) -> None:
+        """Live-config handler for ``max_batch_tokens_eval``.
+
+        Validates the value, updates ``_max_batch_tokens_eval``, and triggers an
+        eval-dataloader rebuild via :meth:`_rebuild_eval_dataloader_with_budget`.
+        """
+        if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+            logger.warning(
+                "live_max_batch_tokens_eval_invalid",
+                value=val,
+                expected="positive int",
+            )
+            return
+        old = getattr(self, "_max_batch_tokens_eval", None)
+        if old == val:
+            return
+        self._max_batch_tokens_eval = val
+        self._rebuild_eval_dataloader_with_budget(val)
 
     # ------------------------------------------------------------------
     # Memory accounting: everything comes from ``compute.memory`` — a

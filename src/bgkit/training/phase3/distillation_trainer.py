@@ -249,7 +249,16 @@ class DistillationTrainer(BaseTrainer):
         train_lengths = [_sample_length(i) for i in train_indices]
         eval_lengths = [_sample_length(i) for i in eval_indices]
 
-        train_sampler = PackedTokenBudgetSampler(
+        # Stash for live-tunable budget rebuild (see BaseTrainer._handle_max_batch_tokens)
+        self._train_lengths = train_lengths
+        self._eval_lengths = eval_lengths
+        self._train_collate_fn = self._collate
+        self._num_workers = 0
+        self._pin_memory = False
+        self._max_batch_tokens = max_batch_tokens
+        self._max_batch_tokens_eval = max_batch_tokens_eval
+
+        self.train_sampler = PackedTokenBudgetSampler(
             dataset=self.train_dataset,
             lengths=train_lengths,
             max_batch_tokens=max_batch_tokens,
@@ -266,7 +275,7 @@ class DistillationTrainer(BaseTrainer):
 
         self.train_dataloader = DataLoader(
             self.train_dataset,
-            batch_sampler=train_sampler,
+            batch_sampler=self.train_sampler,
             num_workers=0,
             collate_fn=self._collate,
         )

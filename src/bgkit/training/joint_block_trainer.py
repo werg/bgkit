@@ -206,6 +206,15 @@ class JointBlockTrainer(BaseTrainer):
         train_lengths = full_dataset.lengths[np.array(self.train_dataset.indices)]
         eval_lengths = full_dataset.lengths[np.array(self.eval_dataset.indices)]
 
+        # Stash for live-tunable budget rebuild (see BaseTrainer._handle_max_batch_tokens)
+        self._train_lengths = train_lengths
+        self._eval_lengths = eval_lengths
+        self._train_collate_fn = joint_block_collate_fn
+        self._num_workers = num_workers
+        self._pin_memory = pin_memory
+        self._max_batch_tokens = max_batch_tokens
+        self._max_batch_tokens_eval = max_batch_tokens_eval
+
         self.train_sampler = PackedTokenBudgetSampler(
             None, train_lengths, max_batch_tokens, shuffle=True, seed=self.cfg.get("seed", 42),
         )
