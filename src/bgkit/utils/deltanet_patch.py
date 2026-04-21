@@ -108,6 +108,7 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
         *,
         cu_seqlens: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        **_unused_kwargs,
     ):
         """Forward that injects cu_seqlens into chunk_gated_delta_rule.
 
@@ -116,10 +117,27 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
                      gate-reset-at-boundaries logic activates.
         position_ids : consumed upstream by the RoPE / BidirectionalQwen35 wrapper;
                        DeltaNet itself does not use positional embeddings here.
+        **_unused_kwargs: absorbs TransformersKwargs (cu_seq_lens_q/k, max_length_q/k,
+                         etc.) that HF threads through decoder_layer.forward via
+                         `**kwargs`. DeltaNet does not consume them, but they must be
+                         accepted gracefully so the stock HF decoder loop can pass
+                         them unconditionally.
         """
+        # Defensive: if hidden_states arrives with 4D shape (a known shape mismatch
+        # observed during packed decode), squeeze the singleton batch dimension so
+        # the stock HF `batch_size, seq_len, _ = hidden_states.shape` unpack still
+        # works. Tracks whether we squeezed so we can restore the shape after.
+        _restore_4d = False
+        if hidden_states.dim() == 4 and hidden_states.shape[0] == 1:
+            hidden_states = hidden_states.squeeze(0)
+            _restore_4d = True
+
         if cu_seqlens is None:
             # Non-packed call — legacy path used during transition or single-sample gen.
-            return original_forward(hidden_states, cache_params, attention_mask)
+            out = original_forward(hidden_states, cache_params, attention_mask)
+            if _restore_4d:
+                out = out.unsqueeze(0)
+            return out
 
         # Packed path: temporarily monkey-patch chunk_gated_delta_rule on this instance
         # to inject cu_seqlens, then call the original forward.
@@ -142,6 +160,8 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
             # Restore to _clamped so the layer is always in a consistent state.
             layer.chunk_gated_delta_rule = clamped_fn
 
+        if _restore_4d:
+            out = out.unsqueeze(0)
         return out
 
     layer.forward = _packed_forward

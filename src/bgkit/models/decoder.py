@@ -1095,6 +1095,23 @@ class ReconstructionDecoder(nn.Module):
             stopped = eos_id is not None and first_token.item() == eos_id
 
             # Decode loop: one step at a time.
+            #
+            # NOTE: We deliberately do NOT forward ``cu_seq_lens_q/k`` or
+            # ``max_length_q/k`` through HF's TransformersKwargs path during
+            # cached decode. Those kwargs are consumed by *every* decoder
+            # layer via ``**kwargs``, and on Qwen3.5's hybrid stack the
+            # DeltaNet (``linear_attn``) layers propagate their input shape
+            # through the stock HF forward, which unpacks
+            # ``batch_size, seq_len, _ = hidden_states.shape`` — passing the
+            # packed kwargs disturbs that invariant on the B=1 single-step
+            # case. Instead, we let HF's cached-generation path drive each
+            # layer normally: DeltaNet uses its recurrent state from
+            # ``cache_params``, and full-attention layers receive
+            # ``(1, H, Lq, D)`` / ``(1, H, Lk, D)`` q/k with the extended
+            # K coming from ``past_key_values``. Our FA4 backend
+            # (``bgkit_flash_attention_4_forward``) synthesizes single-sample
+            # cu_seqlens from the 4D q/k shapes when no packed kwargs are
+            # supplied — see the fallback in ``attention_backend.py``.
             for t in range(1, max_new_tokens):
                 if stopped:
                     break
@@ -1102,25 +1119,12 @@ class ReconstructionDecoder(nn.Module):
                 cur_id = generated[-1].unsqueeze(0)  # (1,)
                 cur_id_2d = cur_id.unsqueeze(0)  # (1, 1)
                 pos = torch.tensor([[l_prefill + t - 1]], device=device, dtype=torch.long)
-                # Cached decode: Q has length 1 for this step, but K has
-                # length L_prefill + t (the prefill + all previously generated
-                # tokens held in past_key_values). FA4 varlen needs the
-                # correct per-side cu_seqlens so each Q row attends to the
-                # full K history, not just the current token.
-                # k_len = prefill_len + (t-1 prior decode tokens) + 1 current token.
-                k_len = l_prefill + t
-                cu_q = torch.tensor([0, 1], dtype=torch.int32, device=device)
-                cu_k = torch.tensor([0, k_len], dtype=torch.int32, device=device)
 
                 step_out = inner_model(
                     input_ids=cur_id_2d,
                     position_ids=pos,
                     past_key_values=past_kv,
                     use_cache=True,
-                    cu_seq_lens_q=cu_q,
-                    cu_seq_lens_k=cu_k,
-                    max_length_q=1,
-                    max_length_k=k_len,
                 )
                 past_kv = step_out.past_key_values
 

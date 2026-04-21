@@ -172,13 +172,34 @@ def bgkit_flash_attention_4_forward(
     m_k = max_seqlen_k if max_seqlen_k is not None else (hf_max_k if hf_max_k is not None else max_seqlen)
 
     if cu_q is None or cu_k is None or m_q is None or m_k is None:
-        raise TypeError(
-            "bgkit_flash_attention_4_forward requires packed sequence "
-            "metadata: ``cu_seqlens`` + ``max_seqlen`` (or the per-side "
-            "``cu_seqlens_q`` / ``cu_seqlens_k`` / ``max_seqlen_q`` / "
-            "``max_seqlen_k``, or HF aliases ``cu_seq_lens_q`` / "
-            "``max_length_q``). Required metadata was not supplied.",
-        )
+        # Fallback for B=1 cached decode: HF's generation path calls the
+        # attention interface with (B=1, H, Lq, D) query / (B=1, H, Lk, D)
+        # key-value (Lk grows via past_key_values) but no TransformersKwargs
+        # packed metadata. Derive the single-sample cu_seqlens directly from
+        # the Q/K shapes so we can still dispatch through FA4 varlen.
+        if (
+            query.dim() == 4
+            and key.dim() == 4
+            and query.size(0) == 1
+            and key.size(0) == 1
+        ):
+            lq = int(query.size(2))
+            lk = int(key.size(2))
+            device = query.device
+            synth_cu_q = torch.tensor([0, lq], dtype=torch.int32, device=device)
+            synth_cu_k = torch.tensor([0, lk], dtype=torch.int32, device=device)
+            cu_q = cu_q if cu_q is not None else synth_cu_q
+            cu_k = cu_k if cu_k is not None else synth_cu_k
+            m_q = m_q if m_q is not None else lq
+            m_k = m_k if m_k is not None else lk
+        else:
+            raise TypeError(
+                "bgkit_flash_attention_4_forward requires packed sequence "
+                "metadata: ``cu_seqlens`` + ``max_seqlen`` (or the per-side "
+                "``cu_seqlens_q`` / ``cu_seqlens_k`` / ``max_seqlen_q`` / "
+                "``max_seqlen_k``, or HF aliases ``cu_seq_lens_q`` / "
+                "``max_length_q``). Required metadata was not supplied.",
+            )
 
     is_causal = is_causal if is_causal is not None else getattr(module, "is_causal", False)
 

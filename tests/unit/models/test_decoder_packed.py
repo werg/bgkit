@@ -653,16 +653,23 @@ class _RecorderCausalLM(nn.Module):
 
 
 class TestDecodeLoopKLengthMetadata:
-    """Regression for Finding #2: decode step must pass K-length = L_prefill + t.
+    """The decode-loop forward contract on Qwen3.5's hybrid stack.
 
-    Bug was: both cu_seq_lens_q and cu_seq_lens_k were set to [0, 1]
-    during decode, which told the attention backend that K had length 1
-    instead of L_prefill + t. This test records the kwargs actually
-    passed to the inner model on each call and verifies the correct
-    K-length metadata is sent.
+    Prefill MUST carry packed metadata via TransformersKwargs
+    (``cu_seq_lens_q/k`` + ``max_length_q/k``) so the FA4 backend dispatches
+    to varlen on the single multi-token prefill.
+
+    Decode steps MUST NOT forward those kwargs: on Qwen3.5 the DeltaNet
+    (``linear_attn``) layers are fed the same ``**kwargs`` as full-attention
+    layers and their stock HF forward unpacks ``hidden_states.shape`` assuming
+    3D ``(B, L, D)``. The single-step decode case crashes when the packed
+    kwargs disturb the invariant. Our FA4 backend synthesizes cu_seqlens
+    from the 4D q/k shapes when the kwargs are absent (see
+    ``bgkit_flash_attention_4_forward``), so cached decode works without the
+    HF-threaded packed metadata.
     """
 
-    def test_decode_step_sends_correct_k_length(self):
+    def test_prefill_carries_packed_kwargs_decode_does_not(self):
         torch.manual_seed(17)
         backbone = _RecorderCausalLM(VOCAB_SIZE, HIDDEN_DIM)
         dec = ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
@@ -686,23 +693,25 @@ class TestDecodeLoopKLengthMetadata:
             )
 
         calls = backbone.model.calls
-        # First call is prefill with Q = K = L_prefill.
+        # Prefill carries packed metadata with Q = K = L_prefill.
         assert calls[0]["cu_q"] == [0, l_prefill]
         assert calls[0]["cu_k"] == [0, l_prefill]
         assert calls[0]["max_q"] == l_prefill
         assert calls[0]["max_k"] == l_prefill
 
-        # Subsequent calls are decode steps: Q has length 1, K grows.
+        # Decode steps do NOT forward the packed kwargs — the FA4 backend
+        # derives single-sample cu_seqlens from the Q/K tensor shapes.
         for t, call in enumerate(calls[1:], start=1):
-            expected_k = l_prefill + t
-            assert call["cu_q"] == [0, 1], (
-                f"decode step {t}: cu_seq_lens_q should be [0, 1], got {call['cu_q']}"
+            assert call["cu_q"] is None, (
+                f"decode step {t}: cu_seq_lens_q must not be forwarded through "
+                f"TransformersKwargs (DeltaNet layers break on the extra kwarg); "
+                f"got {call['cu_q']}"
             )
-            assert call["cu_k"] == [0, expected_k], (
-                f"decode step {t}: cu_seq_lens_k should be [0, {expected_k}], got {call['cu_k']}"
-            )
-            assert call["max_q"] == 1
-            assert call["max_k"] == expected_k
+            assert call["cu_k"] is None
+            assert call["max_q"] is None
+            assert call["max_k"] is None
+            # Sanity: decode input is single-token.
+            assert call["q_len"] == 1
 
     def test_attention_backend_accepts_per_side_metadata(self):
         """Unit-level: bgkit_flash_attention_4_forward accepts cu_seqlens_q != cu_seqlens_k.
@@ -721,3 +730,148 @@ class TestDecodeLoopKLengthMetadata:
         assert "cu_seqlens_k" in params
         assert "max_seqlen_q" in params
         assert "max_seqlen_k" in params
+
+    def test_attention_backend_synthesizes_cu_seqlens_from_4d_shape(self):
+        """The FA4 backend derives packed metadata from (1, H, Lq, D) shape
+        when no TransformersKwargs packed metadata is supplied — this is the
+        cached-decode fallback that lets HF's generation path call the
+        backend without threading ``cu_seq_lens_q/k`` through DeltaNet
+        layers. We can't invoke real FA4 on CPU; the requirement we verify
+        here is that the backend does NOT raise the ``packed sequence
+        metadata`` TypeError when q/k arrive as B=1 4D tensors.
+        """
+        from bgkit.utils import attention_backend as ab
+
+        # Stub out the SM12x ownership check + FA4 call so we can exercise
+        # the metadata-synthesis code path on CPU.
+        orig_require = ab.require_sm12x_owned_backend
+
+        calls: dict = {}
+
+        def _fake_require():
+            pass
+
+        def _fake_varlen(**kwargs):
+            calls.update(kwargs)
+            # Return a tensor with expected shape so the post-call reshape
+            # path is exercised too.
+            q = kwargs["q"]
+            return torch.zeros_like(q)
+
+        ab.require_sm12x_owned_backend = _fake_require
+        # Inject a fake flash_attn.cute module.
+        import sys
+        import types
+
+        fake_cute = types.ModuleType("flash_attn.cute")
+        fake_cute.flash_attn_varlen_func = _fake_varlen
+        saved_cute = sys.modules.get("flash_attn.cute")
+        saved_flash_attn = sys.modules.get("flash_attn")
+        fake_flash_attn = sys.modules.setdefault("flash_attn", types.ModuleType("flash_attn"))
+        sys.modules["flash_attn.cute"] = fake_cute
+        fake_flash_attn.cute = fake_cute
+
+        try:
+            q = torch.randn(1, 4, 1, 16, dtype=torch.float32)
+            k = torch.randn(1, 4, 7, 16, dtype=torch.float32)
+            v = torch.randn(1, 4, 7, 16, dtype=torch.float32)
+            module = type("M", (), {"is_causal": False})()
+            out, _ = ab.bgkit_flash_attention_4_forward(module, q, k, v)
+        finally:
+            ab.require_sm12x_owned_backend = orig_require
+            if saved_cute is None:
+                sys.modules.pop("flash_attn.cute", None)
+            else:
+                sys.modules["flash_attn.cute"] = saved_cute
+            if saved_flash_attn is None:
+                sys.modules.pop("flash_attn", None)
+            else:
+                sys.modules["flash_attn"] = saved_flash_attn
+
+        # Synthesized metadata: cu_seqlens_q=[0,1], cu_seqlens_k=[0,7].
+        assert calls["cu_seqlens_q"].tolist() == [0, 1]
+        assert calls["cu_seqlens_k"].tolist() == [0, 7]
+        assert calls["max_seqlen_q"] == 1
+        assert calls["max_seqlen_k"] == 7
+        # Output was re-promoted to 4D shape for HF's post-attention reshape.
+        assert out.dim() == 4
+        assert out.shape[0] == 1
+
+
+@pytest.mark.gpu
+class TestDecodeLoopRealQwen35:
+    """End-to-end decode-loop smoke test against a real Qwen3.5-0.8B backbone.
+
+    Exercises the hybrid [DeltaNet, DeltaNet, DeltaNet, FullAttention] layer
+    stack with cached generation — regression for the ``batch_size, seq_len, _
+    = hidden_states.shape`` unpack crash that triggered when packed-attention
+    TransformersKwargs were threaded through the decode step.
+
+    Host CI skips this via the ``gpu`` marker; runs inside the training
+    container via ``make test-gpu``.
+    """
+
+    def test_decode_with_deltanet_bearing_backbone(self):
+        import os
+
+        if not torch.cuda.is_available():
+            pytest.skip("requires CUDA")
+        # Host runs may have CUDA present but cannot load Qwen3_5 without the
+        # NGC container's transformers + fla stack; gate on BGKIT_RUN_GPU_TESTS
+        # (set inside the container by `make test-gpu`).
+        if not os.environ.get("BGKIT_RUN_GPU_TESTS"):
+            pytest.skip(
+                "real-Qwen3.5 GPU test — set BGKIT_RUN_GPU_TESTS=1 inside the "
+                "training container to enable",
+            )
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from bgkit.models.decoder import ReconstructionDecoder
+        from bgkit.utils.attention_backend import (
+            BGKIT_FA4_ATTENTION_IMPL,
+            install_bgkit_attention_backend,
+        )
+        from bgkit.utils.deltanet_patch import patch_gated_delta_rule_numerics
+
+        # Install FA4 backend + DeltaNet patches (mirror the training bootstrap).
+        install_bgkit_attention_backend()
+        patch_gated_delta_rule_numerics(model=None)
+
+        model_name = "Qwen/Qwen3.5-0.8B"
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        backbone = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=torch.bfloat16,
+            trust_remote_code=True,
+            attn_implementation=BGKIT_FA4_ATTENTION_IMPL,
+        ).to("cuda")
+        # Re-patch existing DeltaNet instances now that the model is loaded.
+        patch_gated_delta_rule_numerics(model=backbone)
+
+        hidden_dim = backbone.config.hidden_size
+        dec = ReconstructionDecoder(backbone, hidden_dim=hidden_dim)
+
+        num_surv = 4
+        surv = torch.randn(num_surv, hidden_dim, device="cuda", dtype=torch.bfloat16)
+        cu = torch.tensor([0, num_surv], dtype=torch.int32, device="cuda")
+        pre = torch.tensor(
+            tokenizer.encode("Hello ", add_special_tokens=False),
+            dtype=torch.long,
+            device="cuda",
+        )
+        suf = torch.zeros(0, dtype=torch.long, device="cuda")
+
+        with torch.no_grad():
+            out = dec.generate_with_single_splice(
+                survivor_embeddings=surv,
+                survivor_cu_seqlens=cu,
+                prefix_ids=pre,
+                suffix_ids=suf,
+                tokenizer=tokenizer,
+                max_new_tokens=8,
+                temperature=0.0,
+            )
+        # No crash and we produced something.
+        assert len(out.full_ids) == 1
+        assert out.full_ids[0].numel() >= 1
