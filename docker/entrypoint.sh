@@ -21,7 +21,7 @@ bootstrap_flash_attn_native() {
         return
     fi
 
-    local probe rc cache_root cache_repo hash_file current_hash cached_hash
+    local probe rc cache_root cache_repo hash_file current_hash cached_hash capability backend_kind
     probe="$(python - <<'PY'
 import sys
 try:
@@ -49,7 +49,11 @@ PY
 )" || rc=$?
     rc="${rc:-0}"
     echo "$probe"
-    if [ "$rc" -eq 0 ]; then
+    capability="$(printf '%s\n' "$probe" | sed -n 's/^capability://p' | tail -n1)"
+    backend_kind="$(printf '%s\n' "$probe" | sed -n 's/^backend_kind://p' | tail -n1)"
+    if [ "$capability" = "12.1" ] || [ "$capability" = "12.0" ] || [ "${capability%%.*}" = "12" ]; then
+        :
+    elif [ "$rc" -eq 0 ]; then
         return
     fi
 
@@ -82,9 +86,57 @@ PY
             python -m pip install -e . --no-build-isolation --user
         )
         printf '%s' "$current_hash" > "$hash_file"
+    elif [ ! -d "$cache_repo" ]; then
+        cp -a /workspace/flash-attention "$cache_repo"
     fi
 
     export PYTHONPATH="${cache_repo}:${PYTHONPATH:-}"
+    if python - <<'PY'
+import sys
+import torch
+
+if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+    raise SystemExit(1)
+try:
+    import flash_attn.cute._sm12x_native  # noqa: F401
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+    then
+        :
+    else
+        echo "Bootstrapping FlashAttention SM12x extension in container cache..."
+        (
+            cd "${cache_repo}/flash_attn/cute"
+            FLASH_ATTENTION_BUILD_SM12X_NATIVE=1 \
+            TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}" \
+            FLASH_ATTN_HEAD_DIMS="${FLASH_ATTN_HEAD_DIMS:-256}" \
+            FLASH_ATTN_DTYPES="${FLASH_ATTN_DTYPES:-bf16}" \
+            FLASH_ATTN_INCLUDE_SPLIT="${FLASH_ATTN_INCLUDE_SPLIT:-0}" \
+            MAX_JOBS="${MAX_JOBS:-2}" \
+            python -m pip install -e . --no-build-isolation --user
+        )
+    fi
+
+    if [ -z "${FLASH_ATTENTION_SM12X_USE_EXTENSION+x}" ]; then
+        if python - <<'PY'
+import torch
+
+if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12:
+    raise SystemExit(1)
+try:
+    import flash_attn.cute._sm12x_native  # noqa: F401
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+        then
+            export FLASH_ATTENTION_SM12X_USE_EXTENSION=1
+            echo "FlashAttention SM12x extension detected; preferring extension backend."
+        fi
+    fi
+
     python - <<'PY'
 from flash_attn.cute.native_sm12x import native_sm12x_backend_kind, native_sm12x_owned_backend_available
 kind = native_sm12x_backend_kind()
