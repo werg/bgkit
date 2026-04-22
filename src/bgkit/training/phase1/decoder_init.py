@@ -1595,7 +1595,9 @@ class DecoderInitTrainer(BaseTrainer):
         per-sample survivor slices from ``survivor_cu_seqlens``.
         """
         tcfg = self.cfg.training
-        max_gen_samples = tcfg.get("eval", {}).get("generation_samples", 50)
+        eval_cfg = tcfg.get("eval", {})
+        max_gen_samples = eval_cfg.get("generation_samples", 50)
+        gen_max_new_tokens = int(eval_cfg.get("generation_max_new_tokens", 256))
 
         gen_metrics: dict[str, float] = {}
         generated_texts: list[str] = []
@@ -1642,7 +1644,7 @@ class DecoderInitTrainer(BaseTrainer):
                     prefix_ids=prefix_ids_flat[pre_start:pre_end],
                     suffix_ids=suffix_ids,
                     tokenizer=self.tokenizer,
-                    max_new_tokens=2048,
+                    max_new_tokens=gen_max_new_tokens,
                     temperature=0.0,
                 )
                 generated_texts.extend(gen_output.content_text)

@@ -185,7 +185,12 @@ early_stopping:
   enabled: false
 qa_ratio: 0.0
 eval:
-  generation_samples: 50
+  # Gen-eval is observability (does the decoder produce coherent output
+  # from survivors?); it is NOT a training-correctness signal. Small
+  # sample counts and short generations are sufficient to spot major
+  # regressions and are cheap enough to run regularly.
+  generation_samples: 10
+  generation_max_new_tokens: 256
   # Re-enabled (2026-04-21): the DeltaNet gen-eval crash (cu_seq_lens_q/k
   # shape mismatch in generation mode) was fixed in commit 4ab9063.
   generation_eval_every: 4
