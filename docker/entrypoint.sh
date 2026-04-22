@@ -62,10 +62,22 @@ PY
     hash_file="${cache_root}/source_hash"
     mkdir -p "$cache_root"
 
+    # Include build-affecting env vars in the hash so that changing a flag
+    # (e.g. FLASH_ATTN_INCLUDE_SPLIT) invalidates the cached .so. Source SHA
+    # alone would miss env-var flips and silently reuse a stale binary.
+    build_env_fingerprint="$(
+        printf 'FLASH_ATTN_CUDA_ARCHS=%s\n' "${FLASH_ATTN_CUDA_ARCHS:-120}"
+        printf 'FLASH_ATTN_DTYPES=%s\n' "${FLASH_ATTN_DTYPES:-bf16}"
+        printf 'FLASH_ATTN_HEAD_DIMS=%s\n' "${FLASH_ATTN_HEAD_DIMS:-256}"
+        printf 'FLASH_ATTN_INCLUDE_SPLIT=%s\n' "${FLASH_ATTN_INCLUDE_SPLIT:-1}"
+    )"
     current_hash="$(
-        find /workspace/flash-attention \
-            \( -name '*.py' -o -name '*.cu' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name 'setup.py' -o -name 'pyproject.toml' \) \
-            -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-16
+        {
+            find /workspace/flash-attention \
+                \( -name '*.py' -o -name '*.cu' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' -o -name 'setup.py' -o -name 'pyproject.toml' \) \
+                -type f -print0 | sort -z | xargs -0 sha256sum
+            printf '%s' "$build_env_fingerprint"
+        } | sha256sum | cut -c1-16
     )"
     cached_hash=""
     if [ -f "$hash_file" ]; then
@@ -80,7 +92,7 @@ PY
             cd "$cache_repo"
             FLASH_ATTN_CUDA_ARCHS="${FLASH_ATTN_CUDA_ARCHS:-120}" \
             FLASH_ATTN_DTYPES="${FLASH_ATTN_DTYPES:-bf16}" \
-            FLASH_ATTN_INCLUDE_SPLIT="${FLASH_ATTN_INCLUDE_SPLIT:-0}" \
+            FLASH_ATTN_INCLUDE_SPLIT="${FLASH_ATTN_INCLUDE_SPLIT:-1}" \
             MAX_JOBS="${MAX_JOBS:-2}" \
             NVCC_THREADS="${NVCC_THREADS:-1}" \
             python -m pip install -e . --no-build-isolation --user
@@ -113,7 +125,7 @@ PY
             TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}" \
             FLASH_ATTN_HEAD_DIMS="${FLASH_ATTN_HEAD_DIMS:-256}" \
             FLASH_ATTN_DTYPES="${FLASH_ATTN_DTYPES:-bf16}" \
-            FLASH_ATTN_INCLUDE_SPLIT="${FLASH_ATTN_INCLUDE_SPLIT:-0}" \
+            FLASH_ATTN_INCLUDE_SPLIT="${FLASH_ATTN_INCLUDE_SPLIT:-1}" \
             MAX_JOBS="${MAX_JOBS:-2}" \
             python -m pip install -e . --no-build-isolation --user
         )
