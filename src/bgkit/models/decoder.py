@@ -1116,8 +1116,19 @@ class ReconstructionDecoder(nn.Module):
                 if stopped:
                     break
 
-                cur_id = generated[-1].unsqueeze(0)  # (1,)
-                cur_id_2d = cur_id.unsqueeze(0)  # (1, 1)
+                # generated[-1] is shape (1,) (from either argmax().unsqueeze(0)
+                # in the greedy path or multinomial(...).squeeze(0) in the sample
+                # path). The backbone expects (B=1, L=1) int64 ids, so we need a
+                # single .unsqueeze(0) to add the batch dim. A prior version
+                # called .unsqueeze(0) twice and produced a (1,1,1) tensor, which
+                # then embedded to (1,1,1,D) — Qwen3.5 full-attn layers went on
+                # to write 5D key/value states into the KV cache, and the second
+                # decode step crashed in cache_utils.update when concatenating a
+                # (now consistent) 5D stored tensor with incoming 5D. The
+                # DeltaNet layers also crash earlier on 4D hidden_states via
+                # ``batch_size, seq_len, _ = hidden_states.shape``. Either way,
+                # the second unsqueeze was the root cause.
+                cur_id_2d = generated[-1].unsqueeze(0)  # (1,) → (1, 1)
                 pos = torch.tensor([[l_prefill + t - 1]], device=device, dtype=torch.long)
 
                 step_out = inner_model(
