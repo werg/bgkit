@@ -277,11 +277,19 @@ def memory_budget_scope(
             ),
         )
 
-        if cap_gb is not None and stats.cuda_peak_gb > cap_gb:
+        # Delta-peak semantics: how much NEW memory did this scope allocate
+        # above its entry baseline. Absolute-peak semantics blamed the scope
+        # for pre-existing training state resident at scope entry (e.g.,
+        # gen_eval entering with 30 GB of training state already on GPU
+        # trivially exceeded any sane scope cap even when the scope itself
+        # allocated 240 MB). The cap now measures scope-local cost.
+        cuda_delta_gb = stats.cuda_peak_gb - stats.cuda_pre_gb
+        if cap_gb is not None and cuda_delta_gb > cap_gb:
             raise MemoryBudgetExceeded(
-                f"scope={name!r} blew cuda-peak budget: "
-                f"peak={stats.cuda_peak_gb:.2f} GB > cap={cap_gb:.2f} GB "
+                f"scope={name!r} blew cuda-delta budget: "
+                f"delta={cuda_delta_gb:.2f} GB > cap={cap_gb:.2f} GB "
                 f"(pre={stats.cuda_pre_gb:.2f} GB, "
+                f"peak={stats.cuda_peak_gb:.2f} GB, "
                 f"system_pre={stats.system_pre_gb:.2f} GB, "
                 f"system_post={stats.system_post_gb:.2f} GB). "
                 f"Either raise the cap, shrink the operation, or "

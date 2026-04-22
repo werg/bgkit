@@ -60,6 +60,12 @@ memory:
     # 2× training). Eval has no backward so it packs bigger for the
     # same CUDA peak. Gen eval caps lowered: sequential B=1 per-sample
     # generation peaks well below batched.
+    # 2026-04-22: budget semantics switched from absolute-peak to delta-peak.
+    # Caps now measure how much new memory a scope allocates above its entry
+    # baseline, not the absolute CUDA peak. Old absolute caps blamed scopes
+    # for pre-existing resident state (e.g., gen_eval entering with 30 GB
+    # of training state trivially tripped a 15 GB absolute cap even when it
+    # allocated ~0.24 GB of new memory).
     evaluate_gb: 40           # packed eval at 2× training budget, no backward
-    gen_eval_gb: 15           # sequential B=1 generation + KV cache
-    save_checkpoint_gb: 40    # post-2026-04-22: LoRA merge_and_unload clones the decoder on GPU (bf16) for decoder_merged, so save CUDA peak ≈ training baseline + decoder size. Observed 34.58 GB at step 500 of fresh Step 3.
+    gen_eval_gb: 15           # sequential B=1 generation + KV cache delta
+    save_checkpoint_gb: 15    # LoRA merge_and_unload clones decoder transiently; delta ~2 GB
