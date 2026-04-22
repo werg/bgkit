@@ -67,12 +67,13 @@ x-gpu-common: &gpu-common
     # Build FlashAttention's native CUDA backend inside the container when the
     # mounted host checkout doesn't provide a container-compatible binary.
     - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=1
-    # Auto-shrink memory fraction when peer CUDA processes (MCP servers, page
-    # cache accounted as GPU-used on unified memory) reduce headroom. Without
-    # this, the startup guard refuses to start if peer usage > ~15% of the
-    # 130 GB pool. Added 2026-04-22 after OS page cache from prior training
-    # runs tripped the guard on restart.
-    - BGKIT_ALLOW_PEER_CUDA=1
+    # BGKIT_ALLOW_PEER_CUDA is deliberately NOT a template default. Unified
+    # memory on DGX Spark is shared CPU+GPU (128 GB total); two GPU jobs
+    # racing for CUDA can OOM the host without warning. The startup guard
+    # refuses to start when peer CUDA usage would push us past the host
+    # safety ceiling — enable ``BGKIT_ALLOW_PEER_CUDA=1`` per-invocation
+    # only when you've deliberately chosen to coexist with another GPU job
+    # and accept the auto-shrunk fraction.
   volumes:
     - ${DATA_DIR}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
