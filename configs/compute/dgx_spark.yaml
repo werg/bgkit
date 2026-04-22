@@ -62,4 +62,4 @@ memory:
     # generation peaks well below batched.
     evaluate_gb: 40           # packed eval at 2× training budget, no backward
     gen_eval_gb: 15           # sequential B=1 generation + KV cache
-    save_checkpoint_gb: 15    # torch.save is host-side; CUDA peak stays near baseline
+    save_checkpoint_gb: 40    # post-2026-04-22: LoRA merge_and_unload clones the decoder on GPU (bf16) for decoder_merged, so save CUDA peak ≈ training baseline + decoder size. Observed 34.58 GB at step 500 of fresh Step 3.
