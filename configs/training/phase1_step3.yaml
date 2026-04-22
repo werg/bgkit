@@ -35,9 +35,13 @@ warmup_steps: 500
 # while flattening the right-tail latency distribution.
 # See docs/wall_clock_investigation_2026_04_21.md for the full tokens/FLOPs
 # analysis.
-max_batch_tokens: 32768
+#
+# 2026-04-22: Halved from 32768/grad_accum=2 to 16384/grad_accum=4 after
+# fresh-decoder Step 3 (post-is_causal fix in 94bec17) hit allocator OOM
+# at 32768. Effective batch (tokens/optimizer-step) unchanged: 16384×4 = 65536.
+max_batch_tokens: 16384
 max_batch_tokens_eval: 65536
-gradient_accumulation_steps: 2
+gradient_accumulation_steps: 4
 # gradient_checkpointing: set training.gradient_checkpointing (overrides) or
 # compute.gradient_checkpointing (canonical, hardware-scoped). Default True.
 # Gated by bgkit.training.gradient_utils.maybe_enable_gradient_checkpointing

@@ -30,7 +30,10 @@ optimizer: adamw
 #      final full-attention block) for more rotation capacity. Resume
 #      from step 1400 (cos_sim=0.22, on-disk best — step 1000's peak
 #      was pruned).
-max_steps: 6000
+# Extended from 6000 on 2026-04-22. Previous plateau at step 11999:
+# eval/anchor_mse ≈ 3.69e-4. Reached step 17999 with final eval/anchor_mse
+# ≈ 2.68e-4 (27% improvement), confirming continued convergence past plateau.
+max_steps: 18000
 lr: 3.0e-4
 projection_lr: 3.0e-4
 # Compressor blocks share projection's LR. The initial run #3 used
