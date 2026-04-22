@@ -21,7 +21,7 @@ phase: phase1_step3
 optimizer: muon
 max_steps: 15000
 lr: 2.0e-4               # base LR (encoder gets this)
-decoder_lr: 1.0e-5        # decoder LoRA LR (low — LoRA concentrates gradients)
+decoder_lr: 5.0e-6        # decoder LR for full FT (lower than LoRA 1e-5; gradients now spread across 759 M params instead of 6 M)
 encoder_lr: 2.0e-4        # encoder LR (higher — pruned encoder needs to adapt)
 warmup_steps: 500
 # Packed-attention migration (Wave 4, 2026-04-20 sweep + wall-clock
@@ -162,13 +162,18 @@ moment_match_reference:
   l1:
     path: null                       # unused at L1
 
-# LoRA config for decoder — small adapter, fast adaptation
+# Full-parameter decoder fine-tuning (2026-04-22). LoRA was the wrong
+# tool for Step 3's objective: we WANT the decoder to fully re-adapt to
+# the Step 2.5-repaired projection manifold. A rank-16 adapter gates
+# decoder changes to a 6 M-param subspace (0.8 % of the decoder), plus
+# the PEFT wrapping creates graph-break overhead and made torch.compile
+# unusable (see 2026-04-22 compile benchmark). Full FT removes the
+# wrapper, trains all 759 M decoder params, and simplifies saving (no
+# merge_and_unload transient). Memory headroom is ample at current
+# batch sizes; optimizer state scales with trainable params, but the
+# Muon optimizer doesn't materialize per-param m/v buffers like AdamW.
 decoder_lora:
-  enabled: true
-  r: 16
-  alpha: 32
-  dropout: 0.05
-  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  enabled: false
 
 # Do NOT freeze top layer — LoRA handles parameter efficiency
 freeze_top_layer: false

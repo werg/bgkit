@@ -1828,7 +1828,13 @@ class DecoderInitTrainer(BaseTrainer):
         # Listed here only for trainers where it becomes a separate module.
 
     def _restore_model_state(self, state_dicts: dict) -> None:
-        """Restore encoder (with legacy-key tolerance) + decoder."""
+        """Restore encoder (with legacy-key tolerance) + decoder.
+
+        Prefers ``decoder_merged`` (plain HF keys) when LoRA is not
+        enabled; falls back to ``decoder`` (PEFT-wrapper keys) when it is.
+        This lets a checkpoint trained under LoRA be resumed as a full
+        fine-tune by flipping ``training.decoder_lora.enabled: false``.
+        """
         if "encoder" not in state_dicts:
             raise ValueError(
                 f"Resume checkpoint missing 'encoder' key. Found: {list(state_dicts.keys())}"
@@ -1840,7 +1846,21 @@ class DecoderInitTrainer(BaseTrainer):
                 keys=result.missing_keys,
                 hint="Expected for new survivorship head components",
             )
-        self.decoder.load_state_dict(state_dicts["decoder"])
+        if self._decoder_lora:
+            if "decoder" not in state_dicts:
+                raise ValueError(
+                    "Resume checkpoint missing 'decoder' key but LoRA is enabled. "
+                    "Cannot load plain-HF ('decoder_merged') weights into a PEFT-wrapped decoder."
+                )
+            self.decoder.load_state_dict(state_dicts["decoder"])
+        else:
+            decoder_state = state_dicts.get("decoder_merged") or state_dicts.get("decoder")
+            if decoder_state is None:
+                raise ValueError(
+                    f"Resume checkpoint missing 'decoder'/'decoder_merged'. "
+                    f"Found: {list(state_dicts.keys())}"
+                )
+            self.decoder.load_state_dict(decoder_state)
 
     def _restore_training_state(self, training_state: dict) -> None:
         self._target_ratio_override = training_state.get("target_ratio_override")
