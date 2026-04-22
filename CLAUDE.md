@@ -207,6 +207,8 @@ Example control file (one block per active phase):
 
 **Memory cap for profiler** (lessons learned from a host OOM): `docker/docker-compose.yaml` profile services (`profile-phase1-step3` etc.) apply `mem_limit: 80g` + `memswap_limit: 80g`. Any ad-hoc `docker compose run` of the profiler outside the capped services can still OOM the host on unified memory — use the named service.
 
+**Memory budget scope semantics** (as of 2026-04-22): `memory_budget_scope` cap checks use **delta-peak semantics** (cuda_peak_gb − cuda_pre_gb), not absolute peak. Cap values in `configs/compute/dgx_spark.yaml` now measure scope-local new allocation, not total allocation at scope exit. Prior absolute-peak caps trivially tripped when a scope entered with training state resident; the new delta semantics match the caps' intent and prevent false positives (commit `872c290`).
+
 ## flash-linear-attention (fla) on sm_121
 
 Stock PyPI `fla==0.4.2` is installed in the training container via `pip install ".[gpu]"`. The local fork at `/home/werg/flash-linear-attention/` (branch `blackwell-sm121-compat`, commit `f11bc2f`) replaced three Triton kernels with torch fallbacks on an older Triton. Triton 3.6.0 in NGC 26.03 fixes the underlying codegen bugs; the fork is **not bind-mounted or installed**. See `docs/fla_fork_review_2026_04_21.md` for the full audit.
