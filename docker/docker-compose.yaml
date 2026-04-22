@@ -67,6 +67,12 @@ x-gpu-common: &gpu-common
     # Build FlashAttention's native CUDA backend inside the container when the
     # mounted host checkout doesn't provide a container-compatible binary.
     - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=1
+    # Auto-shrink memory fraction when peer CUDA processes (MCP servers, page
+    # cache accounted as GPU-used on unified memory) reduce headroom. Without
+    # this, the startup guard refuses to start if peer usage > ~15% of the
+    # 130 GB pool. Added 2026-04-22 after OS page cache from prior training
+    # runs tripped the guard on restart.
+    - BGKIT_ALLOW_PEER_CUDA=1
   volumes:
     - ${DATA_DIR}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
@@ -145,14 +151,12 @@ services:
 
   train-phase1-step3:
     <<: *gpu-common
-    # resume_checkpoint=none forces a fresh Step 3 run, initializing the
-    # encoder/projection from Step 2.5 (via bgkit_checkpoint: auto) and a
-    # fresh HF decoder. Post-2026-04-20 Step 3 checkpoints were
-    # compromised by a non-causal decoder attention bug
-    # (FA4 is_causal signature default False instead of None) and have
-    # been archived under compromised_fa4_causal_bug/.
-    command: ["scripts/train.py", "+experiment=phase1_step3",
-              "++resume_checkpoint=none"]
+    # Auto-resume to the latest on-disk Step 3 checkpoint via the
+    # registry. Compromised pre-2026-04-22 Step 3 checkpoints (trained
+    # under a bidirectional decoder due to the FA4 is_causal default
+    # bug) are archived under compromised_fa4_causal_bug/ so auto-resume
+    # only sees the post-fix step_500+ saves.
+    command: ["scripts/train.py", "+experiment=phase1_step3"]
 
   train-phase1-step4:
     <<: *gpu-common

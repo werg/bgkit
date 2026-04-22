@@ -12,8 +12,7 @@ run_name: phase1_step2p5
 # Ignored on resume (the checkpoint being resumed from takes over).
 bgkit_checkpoint: auto
 
-# Explicit resume from step2000 (best post-unfreeze snapshot — cos 0.19,
-# norm essentially perfect at 0.998). Continues with compressor_lr
-# bumped from 3e-5 to 3e-4. Resume warmup re-ramps both param groups
-# gently to avoid a step-change shock on the compressor.
-resume_checkpoint: /workspace/checkpoints/phase1_step2p5_step2000_20260417_192527
+# Auto-resume to the latest in-progress step2p5 checkpoint; fall back to
+# the earlier step2000 snapshot (cos 0.19, norm essentially perfect at
+# 0.998) only when no completed checkpoint is registered.
+resume_checkpoint: null

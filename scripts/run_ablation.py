@@ -113,7 +113,12 @@ def main(cfg: DictConfig) -> None:
     decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
     decoder.to(device)
     decoder.eval()
-    decoder.load_state_dict(state_dicts["decoder"])
+    decoder_state = state_dicts.get("decoder_merged") or state_dicts.get("decoder")
+    if decoder_state is None:
+        raise ValueError(
+            f"Checkpoint missing 'decoder'/'decoder_merged': {checkpoint_path}"
+        )
+    decoder.load_state_dict(decoder_state)
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(

@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 from bgkit.eval.metrics.reconstruction import parse_success_rate
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
+from bgkit.utils.packing import position_ids_from_cu
 
 logger = structlog.get_logger()
 
@@ -165,7 +166,9 @@ def run_ablation_suite(
             content_position_ids = batch["content_position_ids"].to(device)
             prompt_ids = batch["compression_prompt_ids"].to(device)
             prompt_cu = batch["compression_prompt_cu_seqlens"].to(device)
-            prompt_position_ids = batch["compression_prompt_position_ids"].to(device)
+            prompt_position_ids = position_ids_from_cu(
+                prompt_cu, int(prompt_cu[-1].item())
+            ).to(device)
             loss_mask_flat = batch["loss_mask"].to(device)
 
             bgkit_embed = encoder.compressor.backbone.get_input_embeddings()
