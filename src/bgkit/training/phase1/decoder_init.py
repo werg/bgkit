@@ -1577,7 +1577,7 @@ class DecoderInitTrainer(BaseTrainer):
                         "gen_eval_failed",
                         error=str(exc),
                         exc_type=type(exc).__name__,
-                        step=self.step,
+                        step=self.global_step,
                         eval_count=self._eval_count,
                     )
 
