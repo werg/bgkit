@@ -95,6 +95,29 @@ PY
         # a rebuild. Keep everything else cp -a'd so setup.py's path
         # resolution (and symlinks) stay intact.
         find "$cache_repo" -name '*.so' -type f -delete
+        # flash_attn/cute/setup.py emits source paths as ``../../csrc/...``.
+        # setuptools' build_ext mirrors source paths into build_temp,
+        # and the ``../..`` segments cause the mirror to escape build_temp
+        # (e.g. /tmp/<build_temp>/../../csrc → /csrc, unwritable).
+        # Absolute paths aren't accepted (setuptools rejects them).
+        # Fix: symlink csrc into flash_attn/cute/ and rewrite sources to
+        # local-relative paths, so the mirror stays inside build_temp.
+        ln -sfn ../../csrc "${cache_repo}/flash_attn/cute/csrc"
+        python3 - "$cache_repo" <<'PY'
+import pathlib, sys
+cache = pathlib.Path(sys.argv[1])
+p = cache / "flash_attn" / "cute" / "setup.py"
+s = p.read_text()
+new = s.replace(
+    'sources = [str(Path("..") / ".." / src) for src in _sm12x_native_sources()]',
+    'sources = list(_sm12x_native_sources())',
+)
+if new != s:
+    p.write_text(new)
+    print(f"patched {p}: sources → local (via csrc/ symlink)")
+else:
+    print(f"NOTE: {p} source-path patch did not match expected string — upstream may have changed")
+PY
         (
             cd "$cache_repo"
             FLASH_ATTN_CUDA_ARCHS="${FLASH_ATTN_CUDA_ARCHS:-120}" \
