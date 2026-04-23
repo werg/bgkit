@@ -87,7 +87,13 @@ PY
     if [ "$cached_hash" != "$current_hash" ] || [ ! -f "${cache_repo}/flash_attn_2_cuda.cpython-312-aarch64-linux-gnu.so" ]; then
         echo "Bootstrapping FlashAttention native backend in container cache..."
         rm -rf "$cache_repo"
-        cp -a /workspace/flash-attention "$cache_repo"
+        # Exclude prebuilt .so binaries from the host checkout. They were
+        # compiled against different env (including FLASH_ATTN_INCLUDE_SPLIT)
+        # and would otherwise land in the cache and satisfy downstream
+        # import-based gates without a rebuild. Source-only copy forces
+        # both FA2 and SM12x-extension rebuilds to fire.
+        mkdir -p "$cache_repo"
+        tar -C /workspace/flash-attention --exclude='*.so' -cf - . | tar -C "$cache_repo" -xf -
         (
             cd "$cache_repo"
             FLASH_ATTN_CUDA_ARCHS="${FLASH_ATTN_CUDA_ARCHS:-120}" \
@@ -99,7 +105,9 @@ PY
         )
         printf '%s' "$current_hash" > "$hash_file"
     elif [ ! -d "$cache_repo" ]; then
-        cp -a /workspace/flash-attention "$cache_repo"
+        # Same .so-exclusion rationale as the fresh-build branch above.
+        mkdir -p "$cache_repo"
+        tar -C /workspace/flash-attention --exclude='*.so' -cf - . | tar -C "$cache_repo" -xf -
     fi
 
     export PYTHONPATH="${cache_repo}:${PYTHONPATH:-}"
