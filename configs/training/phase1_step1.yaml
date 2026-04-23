@@ -91,7 +91,7 @@ moment_match_reference:
     path: null
 
 # Fresh wandb run for new training regime
-reset_wandb: true
+reset_wandb: false
 
 checkpoint_pruning:
   enabled: true

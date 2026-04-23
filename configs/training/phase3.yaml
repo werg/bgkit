@@ -60,7 +60,7 @@ decoder_lora:
 use_liger: true
 use_liger_rmsnorm: false
 
-reset_wandb: true
+reset_wandb: false
 
 checkpoint_pruning:
   enabled: true

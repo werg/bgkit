@@ -174,7 +174,11 @@ decoder_lora:
 freeze_top_layer: false
 lr_scale_bottom: 1.0
 
-reset_wandb: true
+# Resume the prior wandb run when the checkpoint has a wandb_run_id and
+# we're actually continuing (is_resuming=True). Gives continuous graphs
+# across restarts instead of forking a new run on every bounce. A cold
+# start (no resume checkpoint) still creates a new run.
+reset_wandb: false
 
 checkpoint_pruning:
   enabled: true

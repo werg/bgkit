@@ -58,7 +58,7 @@ loss_weights:
   cosine: 0.2
 
 # Fresh wandb run
-reset_wandb: true
+reset_wandb: false
 
 checkpoint_pruning:
   enabled: true

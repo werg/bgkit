@@ -74,7 +74,7 @@ norm_weight: 0.2
 # copying dec_emb(id) exactly.
 ce_weight: 0.0
 
-reset_wandb: true
+reset_wandb: false
 
 checkpoint_pruning:
   enabled: true

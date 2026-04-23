@@ -141,7 +141,7 @@ decoder_lora:
 freeze_top_layer: false
 lr_scale_bottom: 1.0
 
-reset_wandb: true
+reset_wandb: false
 
 checkpoint_pruning:
   enabled: true
