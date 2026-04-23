@@ -36,6 +36,11 @@ from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
+from bgkit.training.ratio_sampling import (
+    build_ratio_sampler_config,
+    resolve_anchor_grid,
+    sample_ratio,
+)
 from bgkit.training.scheduling import cosine_with_warmup
 from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.memory_budget import memory_budget_scope
@@ -172,9 +177,7 @@ class DecoderInitTrainer(BaseTrainer):
         # Config init_theta wins if set explicitly (e.g., to tune the warmup
         # bias); otherwise it's computed.
         model_cfg = self.cfg.model
-        ctrl_src = model_cfg.get("threshold_controller", {}) if hasattr(
-            model_cfg, "get",
-        ) else {}
+        ctrl_src = model_cfg.get("threshold_controller", {})
         target_ratio_start = float(tcfg.get("target_ratio_start", 0.10))
         threshold_controller_cfg = {
             "init_theta": float(
@@ -183,6 +186,10 @@ class DecoderInitTrainer(BaseTrainer):
             "lr": float(ctrl_src.get("lr", 0.02)),
             "momentum": float(ctrl_src.get("momentum", 0.0)),
             "clamp": float(ctrl_src.get("clamp", 0.99)),
+            "anchor_ratios": list(ctrl_src.get("anchor_ratios", [])) or None,
+            "ratio_space": str(ctrl_src.get("ratio_space", "log")),
+            "init_target_ratio": target_ratio_start,
+            "default_query_ratio": target_ratio_start,
         }
         # Load BgKIT from checkpoint if available (auto-detects pruned architecture)
         bgkit_checkpoint = self._resolve_bgkit_checkpoint()
@@ -377,9 +384,7 @@ class DecoderInitTrainer(BaseTrainer):
         )
 
         # Floor knobs for the operator (passed to encoder.forward).
-        ctrl_cfg = self.cfg.model.get("threshold_controller", {}) if hasattr(
-            self.cfg.model, "get",
-        ) else {}
+        ctrl_cfg = self.cfg.model.get("threshold_controller", {})
         self._floor_warmup = int(ctrl_cfg.get("min_per_sample_during_warmup", 1))
         self._floor_post_warmup = int(ctrl_cfg.get("min_per_sample_post_warmup", 0))
 
@@ -667,6 +672,39 @@ class DecoderInitTrainer(BaseTrainer):
         self._target_ratio_end = tcfg.get("target_ratio_end", 0.10)
         self._target_ratio_ramp_steps = tcfg.get("target_ratio_ramp_steps", 1)
         self._target_ratio_override: float | None = None
+        anchor_grid = resolve_anchor_grid(
+            self.cfg.model,
+            self._target_ratio_start,
+            getattr(
+                self.encoder.compressor.threshold_l0,
+                "anchor_ratios",
+                torch.tensor([self._target_ratio_start], dtype=torch.float32),
+            ).tolist(),
+        )
+        self._target_ratio_sampler_cfg = build_ratio_sampler_config(
+            {
+                "enabled": tcfg.get("sample_target_ratio_during_training", False),
+                "mode": tcfg.get("target_ratio_sampling_mode", "window"),
+                "sampling_max": tcfg.get("target_ratio_sampling_max", max(
+                    self._target_ratio_start,
+                    max(anchor_grid) if anchor_grid else self._target_ratio_start,
+                )),
+                "anchor_sampling_prob": tcfg.get(
+                    "target_ratio_anchor_sampling_prob", 0.30,
+                ),
+                "jitter_abs": tcfg.get("target_ratio_jitter_abs", 0.0),
+                "jitter_rel": tcfg.get("target_ratio_jitter_rel", 0.0),
+            },
+            anchor_grid=anchor_grid,
+            default_ratio=self._target_ratio_start,
+            enabled_default=False,
+            mode_default="window",
+        )
+        import random
+
+        self._target_ratio_rng = random.Random(int(self.cfg.get("seed", 42)))
+        self._last_sampled_target_ratio: float | None = None
+        self._warned_floor_past_anchor_grid = False
 
         # Runtime state (set by _configure_trainable_state or transitions)
         self._encoder_frozen = True
@@ -1132,6 +1170,34 @@ class DecoderInitTrainer(BaseTrainer):
         t = max(steps_since_intro, 0) / max(self._target_ratio_ramp_steps, 1)
         return self._target_ratio_start + t * (self._target_ratio_end - self._target_ratio_start)
 
+    def _sample_target_ratio(self) -> float:
+        """Sample a requested ratio using the configured window or jitter policy."""
+        floor = self._current_target_ratio()
+        anchor_max = (
+            max(self._target_ratio_sampler_cfg.anchor_grid)
+            if self._target_ratio_sampler_cfg.anchor_grid else 0.95
+        )
+        if (
+            self._target_ratio_sampler_cfg.mode == "window"
+            and floor > anchor_max + 1e-8
+            and not self._warned_floor_past_anchor_grid
+        ):
+            logger.warning(
+                "target_ratio_floor_past_anchor_grid",
+                floor=round(floor, 4),
+                anchor_max=round(anchor_max, 4),
+                hint="Threshold curve has no calibrated anchors for ratios "
+                     "this high; θ(r) saturates to the top-anchor value.",
+            )
+            self._warned_floor_past_anchor_grid = True
+        return sample_ratio(
+            rng=self._target_ratio_rng,
+            config=self._target_ratio_sampler_cfg,
+            base_ratio=floor,
+            is_evaluating=self._is_evaluating,
+            override_active=self._target_ratio_override is not None,
+        )
+
     def _compute_survivorship_losses(
         self,
         enc_out,
@@ -1182,7 +1248,10 @@ class DecoderInitTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     def _compute_survivors(
-        self, batch: dict[str, torch.Tensor],
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        target_ratio: float | None = None,
     ):
         """Run content through BgKIT encoder (packed) and return encoder output.
 
@@ -1201,7 +1270,8 @@ class DecoderInitTrainer(BaseTrainer):
         prompt_cu = batch["compression_prompt_cu_seqlens"].to(device)
         prompt_position_ids = position_ids_from_cu(prompt_cu, int(prompt_ids.shape[0]))
 
-        target_ratio = self._current_target_ratio() if self._compression_active else None
+        if target_ratio is None and self._compression_active:
+            target_ratio = self._current_target_ratio()
         util_active = (
             self._compression_active
             and not self._encoder_frozen
@@ -1328,11 +1398,12 @@ class DecoderInitTrainer(BaseTrainer):
         if not self._encoder_frozen:
             self.encoder.compressor.train()
 
+        target_ratio = self._sample_target_ratio() if self._compression_active else None
         if self._encoder_frozen and not self._train_projection:
             with torch.no_grad():
-                enc_out = self._compute_survivors(batch)
+                enc_out = self._compute_survivors(batch, target_ratio=target_ratio)
         else:
-            enc_out = self._compute_survivors(batch)
+            enc_out = self._compute_survivors(batch, target_ratio=target_ratio)
 
         # BF16 autocast for decoder forward + backward
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
@@ -1349,7 +1420,7 @@ class DecoderInitTrainer(BaseTrainer):
         if self._compression_active and enc_out.logits_for_op is not None:
             from bgkit.training.survivorship_helpers import accumulate
 
-            target_ratio = self._current_target_ratio()
+            self._last_sampled_target_ratio = target_ratio
             answer_position_mask = batch.get("answer_position_mask")
             if answer_position_mask is not None:
                 answer_position_mask = answer_position_mask.to(self.device).to(torch.bool)
@@ -1368,7 +1439,7 @@ class DecoderInitTrainer(BaseTrainer):
 
             # Aggregate per-microbatch (sum, count) for true-mean θ/μ updates
             # at the optimizer-step boundary.
-            accumulate(self._surv_state_l0, enc_out)
+            accumulate(self._surv_state_l0, enc_out, target_ratio=target_ratio)
 
             # Logging metrics (all detached to avoid retaining autograd graph).
             # Heavy diagnostic metrics require .item() syncs; gate them on
@@ -1379,6 +1450,7 @@ class DecoderInitTrainer(BaseTrainer):
             )
             if enc_out.survivor_mask is not None:
                 metrics["min_target_ratio"] = target_ratio
+                metrics["sampled_target_ratio"] = target_ratio
                 # Packed: all content positions are valid; valid count is N.
                 n_valid = int(content_token_ids.shape[0])
                 if emit_diag:
@@ -1702,13 +1774,12 @@ class DecoderInitTrainer(BaseTrainer):
                 maybe_unload_ice,
             )
 
-            target_ratio = self._current_target_ratio()
             state_l0 = getattr(self, "_surv_state_l0", None)
             if state_l0 is not None:
                 update_metrics = apply_post_step_updates(
                     self.encoder.compressor,
                     state_l0,
-                    target_ratio=target_ratio,
+                    target_ratio=None,
                     level="l0",
                 )
                 self._last_post_step_metrics = update_metrics
@@ -1732,6 +1803,8 @@ class DecoderInitTrainer(BaseTrainer):
             metrics["bidi_alpha"] = self._get_bidi_alpha()
         if self._compression_active:
             metrics["target_ratio"] = self._current_target_ratio()
+        if self._last_sampled_target_ratio is not None:
+            metrics["sampled_target_ratio"] = self._last_sampled_target_ratio
         post = getattr(self, "_last_post_step_metrics", None)
         if post is not None:
             # Merge without clobbering base metrics (grad_norm, loss, etc).
@@ -1762,6 +1835,11 @@ class DecoderInitTrainer(BaseTrainer):
             "encoder_frozen": self._encoder_frozen,
             "compression_active": self._compression_active,
             "target_ratio_override": self._target_ratio_override,
+            # Round-trip the ratio-sampling RNG so resume continues the
+            # same pseudo-random sequence of requested ratios.
+            # ``random.Random.getstate()`` returns a tuple that's safely
+            # pickled by torch.save.
+            "target_ratio_rng_state": self._target_ratio_rng.getstate(),
         })
         return state
 
@@ -1833,7 +1911,13 @@ class DecoderInitTrainer(BaseTrainer):
             raise ValueError(
                 f"Resume checkpoint missing 'encoder' key. Found: {list(state_dicts.keys())}"
             )
-        result = self.encoder.load_state_dict(state_dicts["encoder"], strict=False)
+        from bgkit.models.encoder import migrate_legacy_threshold_controller_state_dict
+
+        enc_state = migrate_legacy_threshold_controller_state_dict(
+            state_dicts["encoder"],
+            self.encoder,
+        )
+        result = self.encoder.load_state_dict(enc_state, strict=False)
         if result.missing_keys:
             logger.info(
                 "encoder_missing_keys",
@@ -1844,8 +1928,20 @@ class DecoderInitTrainer(BaseTrainer):
 
     def _restore_training_state(self, training_state: dict) -> None:
         self._target_ratio_override = training_state.get("target_ratio_override")
+        rng_state = training_state.get("target_ratio_rng_state")
+        if rng_state is not None:
+            try:
+                self._target_ratio_rng.setstate(tuple(rng_state))
+            except (TypeError, ValueError):
+                # Incompatible state shape (e.g. Python random internals
+                # changed across versions). Warn and keep the freshly
+                # seeded RNG rather than crashing the resume.
+                logger.warning(
+                    "target_ratio_rng_state_restore_failed",
+                    hint="Keeping freshly seeded RNG — ratio sampling sequence "
+                         "will diverge from the pre-restart run",
+                )
 
     def _post_weight_load_hook(self) -> None:
         # Recompute freeze state + rebuild optimizer from restored global_step.
         self._configure_trainable_state()
-

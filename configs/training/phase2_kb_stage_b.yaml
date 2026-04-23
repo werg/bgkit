@@ -66,6 +66,20 @@ l0_retention:
 # real compression. Tightened from 0.50 historical default.
 l1_retention: 0.15
 
+l0_retention_jitter:
+  enabled: false
+  mode: jitter
+  jitter_abs: 0.01
+  jitter_rel: 0.10
+  anchor_sampling_prob: 0.30
+
+l1_retention_jitter:
+  enabled: true
+  mode: jitter
+  jitter_abs: 0.01
+  jitter_rel: 0.10
+  anchor_sampling_prob: 0.30
+
 lora:
   l0_rank: 32
   l1_rank: 32

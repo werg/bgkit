@@ -307,12 +307,27 @@ class DistillationTrainer(BaseTrainer):
             for k, v in model_state.items() if k.startswith("encoder.")
         }
         if encoder_state:
+            ctrl_src = self.cfg.model.get("threshold_controller", {})
+            default_ratio = 0.10
+            threshold_controller_cfg = {
+                "init_theta": float(
+                    ctrl_src.get("init_theta", 1.0 - 2.0 * default_ratio),
+                ),
+                "lr": float(ctrl_src.get("lr", 0.02)),
+                "momentum": float(ctrl_src.get("momentum", 0.0)),
+                "clamp": float(ctrl_src.get("clamp", 0.99)),
+                "anchor_ratios": list(ctrl_src.get("anchor_ratios", [])) or None,
+                "ratio_space": str(ctrl_src.get("ratio_space", "log")),
+                "init_target_ratio": default_ratio,
+                "default_query_ratio": default_ratio,
+            }
             self.encoder = BgKITEncoder.from_pretrained_with_state_dict(
                 self.cfg.model.get("encoder", {}).get(
                     "backbone_name", "Qwen/Qwen3.5-0.8B-Base",
                 ),
                 encoder_state,
                 hidden_dim=1024,
+                threshold_controller_cfg=threshold_controller_cfg,
             )
             self.encoder.to(self.device).eval()
             self.encoder.requires_grad_(False)

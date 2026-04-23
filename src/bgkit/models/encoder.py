@@ -95,6 +95,60 @@ def is_pruned_encoder_state_dict(state_dict: dict) -> bool:
     return any(k.startswith("compressor.backbone.blocks.") for k in state_dict)
 
 
+def migrate_legacy_threshold_controller_state_dict(
+    state_dict: dict,
+    encoder: "BgKITEncoder",
+) -> dict:
+    """Expand legacy scalar-threshold controller state into curve anchors.
+
+    Older checkpoints stored:
+
+    - ``compressor.threshold_l{0,1}.theta_param`` (scalar)
+    - ``compressor.threshold_l{0,1}._velocity`` (scalar)
+
+    The threshold-curve controller now stores anchor vectors. When loading an
+    old checkpoint, replicate the scalar threshold / velocity across every
+    anchor so resume keeps the operating point instead of silently
+    reinitializing the controller.
+    """
+    migrated = dict(state_dict)
+    for level in ("l0", "l1"):
+        controller = getattr(encoder.compressor, f"threshold_{level}", None)
+        if controller is None:
+            continue
+        prefix = f"compressor.threshold_{level}"
+        anchor_key = f"{prefix}.anchor_thetas"
+        velocity_key = f"{prefix}._anchor_velocity"
+        last_target_key = f"{prefix}._last_target_rate"
+        legacy_theta_key = f"{prefix}.theta_param"
+        legacy_velocity_key = f"{prefix}._velocity"
+
+        if anchor_key not in migrated and legacy_theta_key in migrated:
+            legacy_theta = migrated.pop(legacy_theta_key)
+            theta_value = float(
+                legacy_theta.item() if hasattr(legacy_theta, "item") else legacy_theta
+            )
+            migrated[anchor_key] = torch.full_like(
+                controller.anchor_thetas,
+                theta_value,
+            ).cpu()
+
+        if velocity_key not in migrated and legacy_velocity_key in migrated:
+            legacy_velocity = migrated.pop(legacy_velocity_key)
+            velocity_value = float(
+                legacy_velocity.item() if hasattr(legacy_velocity, "item") else legacy_velocity
+            )
+            migrated[velocity_key] = torch.full_like(
+                controller._anchor_velocity,
+                velocity_value,
+            ).cpu()
+
+        if last_target_key not in migrated:
+            migrated[last_target_key] = controller._last_target_rate.detach().cpu().clone()
+
+    return migrated
+
+
 class BgKITEncoder(nn.Module):
     """Full BgKIT encoder: compressor + projection block (packed)."""
 
@@ -446,6 +500,10 @@ class BgKITEncoder(nn.Module):
                 else float(legacy_value),
             )
 
+        filtered_state_dict = migrate_legacy_threshold_controller_state_dict(
+            filtered_state_dict,
+            encoder,
+        )
         result = encoder.load_state_dict(filtered_state_dict, strict=False)
         if result.missing_keys:
             logger.info(

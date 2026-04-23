@@ -12,6 +12,10 @@ bidi_warmup_steps: 0       # already bidirectional from previous steps
 target_ratio_start: 0.10
 target_ratio_end: 0.10
 target_ratio_ramp_steps: 1
+sample_target_ratio_during_training: true
+target_ratio_sampling_mode: window
+target_ratio_sampling_max: 0.95
+target_ratio_anchor_sampling_prob: 0.30
 
 # Survivorship head losses, per level. Step 4 is where L1 first activates.
 # L0 head is trained from Step 3 (no BCE re-warmup); L1 cold-starts here

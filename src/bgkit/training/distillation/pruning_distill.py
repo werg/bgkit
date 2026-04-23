@@ -67,6 +67,22 @@ class PruningDistillTrainer(BaseTrainer):
         bgkit_cfg = self.cfg.model.bgkit
         backbone_name = bgkit_cfg.backbone_name
         hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
+        model_cfg = self.cfg.model
+        ctrl_src = model_cfg.get("threshold_controller", {})
+        compression_cfg = tcfg.get("compression", {})
+        target_ratio_min = float(compression_cfg.get("target_ratio_min", 0.10))
+        threshold_controller_cfg = {
+            "init_theta": float(
+                ctrl_src.get("init_theta", 1.0 - 2.0 * target_ratio_min),
+            ),
+            "lr": float(ctrl_src.get("lr", 0.02)),
+            "momentum": float(ctrl_src.get("momentum", 0.0)),
+            "clamp": float(ctrl_src.get("clamp", 0.99)),
+            "anchor_ratios": list(ctrl_src.get("anchor_ratios", [])) or None,
+            "ratio_space": str(ctrl_src.get("ratio_space", "log")),
+            "init_target_ratio": target_ratio_min,
+            "default_query_ratio": target_ratio_min,
+        }
 
         # --- Resolve step1 checkpoint ---
         step1_checkpoint = self._resolve_step1_checkpoint()
@@ -86,6 +102,7 @@ class PruningDistillTrainer(BaseTrainer):
             revision=bgkit_cfg.get("backbone_revision", None),
             attn_implementation=attention_impl,
             bidi_warmup_steps=0,  # teacher is already bidirectional
+            threshold_controller_cfg=threshold_controller_cfg,
         )
         _, teacher_state = load_checkpoint(Path(step1_checkpoint))
         self.teacher_encoder.load_state_dict(teacher_state["encoder"])
@@ -103,6 +120,7 @@ class PruningDistillTrainer(BaseTrainer):
             revision=bgkit_cfg.get("backbone_revision", None),
             attn_implementation=attention_impl,
             bidi_warmup_steps=tcfg.get("bidi_warmup_steps", 0),
+            threshold_controller_cfg=threshold_controller_cfg,
         )
         _, student_state = load_checkpoint(Path(step1_checkpoint))
         student_encoder_full.load_state_dict(student_state["encoder"])

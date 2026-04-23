@@ -71,6 +71,11 @@ compression_introduction_step: 0
 target_ratio_start: 0.08
 target_ratio_end: 0.08
 target_ratio_ramp_steps: 1
+sample_target_ratio_during_training: true
+target_ratio_sampling_mode: jitter
+target_ratio_jitter_abs: 0.01
+target_ratio_jitter_rel: 0.10
+target_ratio_anchor_sampling_prob: 0.30
 
 use_liger: true
 use_liger_rmsnorm: false

@@ -28,6 +28,7 @@ from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.training.phase1.compression import CompressionTrainer
+from bgkit.training.ratio_sampling import build_ratio_sampler_config
 from bgkit.training.survivorship_helpers import LevelLossCfg, init_state
 
 # ---------------------------------------------------------------------------
@@ -319,6 +320,23 @@ def trainer():
     t._surv_state_l0 = init_state()
     t._surv_state_l1 = init_state()
     t._last_post_step_metrics = {}
+
+    # Ratio-sampling state — _sample_target_ratio delegates to the shared
+    # helper which needs both an rng and a RatioSamplerConfig. The real
+    # setup() path populates these; tests that skip setup() populate them
+    # here with sampling disabled so _sample_target_ratio just returns
+    # the curriculum floor.
+    import random as _stdlib_random
+
+    t._target_ratio_sampler_cfg = build_ratio_sampler_config(
+        {"enabled": False, "mode": "window"},
+        anchor_grid=(float(t._target_ratio_start),),
+        default_ratio=float(t._target_ratio_start),
+        enabled_default=False,
+        mode_default="window",
+    )
+    t._target_ratio_rng = _stdlib_random.Random(42)
+    t._last_sampled_target_ratio = None
 
     return t
 

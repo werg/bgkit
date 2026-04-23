@@ -72,6 +72,20 @@ l0_retention:
 # Was 0.50 historically; tightened to 0.15.
 l1_retention: 0.15
 
+l0_retention_jitter:
+  enabled: true
+  mode: jitter
+  jitter_abs: 0.01
+  jitter_rel: 0.10
+  anchor_sampling_prob: 0.30
+
+l1_retention_jitter:
+  enabled: true
+  mode: jitter
+  jitter_abs: 0.01
+  jitter_rel: 0.10
+  anchor_sampling_prob: 0.30
+
 lora:
   l0_rank: 32
   l1_rank: 32

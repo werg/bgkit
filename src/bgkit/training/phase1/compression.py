@@ -32,6 +32,11 @@ from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
+from bgkit.training.ratio_sampling import (
+    build_ratio_sampler_config,
+    resolve_anchor_grid,
+    sample_ratio,
+)
 from bgkit.training.objectives.commit_reproduction import commit_reproduction_loss
 from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
 from bgkit.training.objectives.description_generation import description_generation_loss
@@ -94,6 +99,21 @@ class CompressionTrainer(BaseTrainer):
         backbone_revision = bgkit_cfg.get("backbone_revision", None)
         hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
         bidi_warmup = self.cfg.training.get("bidi_warmup_steps", 1000)
+        model_cfg = self.cfg.model
+        ctrl_src = model_cfg.get("threshold_controller", {})
+        target_ratio_start = float(tcfg.get("target_ratio_start", 0.30))
+        threshold_controller_cfg = {
+            "init_theta": float(
+                ctrl_src.get("init_theta", 1.0 - 2.0 * target_ratio_start),
+            ),
+            "lr": float(ctrl_src.get("lr", 0.02)),
+            "momentum": float(ctrl_src.get("momentum", 0.0)),
+            "clamp": float(ctrl_src.get("clamp", 0.99)),
+            "anchor_ratios": list(ctrl_src.get("anchor_ratios", [])) or None,
+            "ratio_space": str(ctrl_src.get("ratio_space", "log")),
+            "init_target_ratio": target_ratio_start,
+            "default_query_ratio": target_ratio_start,
+        }
 
         step1_checkpoint = self._resolve_step1_checkpoint()
         step1_state_dicts: dict | None = None
@@ -124,6 +144,7 @@ class CompressionTrainer(BaseTrainer):
                 revision=backbone_revision,
                 attn_implementation=attention_impl,
                 bidi_warmup_steps=bidi_warmup,
+                threshold_controller_cfg=threshold_controller_cfg,
             )
         else:
             logger.info(
@@ -138,6 +159,7 @@ class CompressionTrainer(BaseTrainer):
                 revision=backbone_revision,
                 attn_implementation=attention_impl,
                 bidi_warmup_steps=bidi_warmup,
+                threshold_controller_cfg=threshold_controller_cfg,
             )
         self.encoder.to(device)
         gc.collect()
@@ -376,6 +398,34 @@ class CompressionTrainer(BaseTrainer):
         self._target_ratio_end = tcfg.get("target_ratio_end", 0.15)
         self._target_ratio_ramp_steps = tcfg.get("target_ratio_ramp_steps", 100000)
         self._target_ratio_override: float | None = None
+        anchor_grid = resolve_anchor_grid(
+            self.cfg.model,
+            float(self._target_ratio_start),
+            getattr(self.encoder.compressor.threshold_l0, "anchor_ratios", None),
+        )
+        self._target_ratio_sampler_cfg = build_ratio_sampler_config(
+            {
+                "enabled": tcfg.get("sample_target_ratio_during_training", False),
+                "mode": tcfg.get("target_ratio_sampling_mode", "window"),
+                "sampling_max": tcfg.get(
+                    "target_ratio_sampling_max",
+                    max(float(self._target_ratio_start), max(anchor_grid)),
+                ),
+                "anchor_sampling_prob": tcfg.get(
+                    "target_ratio_anchor_sampling_prob", 0.30,
+                ),
+                "jitter_abs": tcfg.get("target_ratio_jitter_abs", 0.0),
+                "jitter_rel": tcfg.get("target_ratio_jitter_rel", 0.0),
+            },
+            anchor_grid=anchor_grid,
+            default_ratio=float(self._target_ratio_start),
+            enabled_default=False,
+            mode_default="window",
+        )
+        import random
+
+        self._target_ratio_rng = random.Random(int(self.cfg.get("seed", 42)))
+        self._last_sampled_target_ratio: float | None = None
 
         # Live curriculum values
         self._l1_enabled = False
@@ -557,6 +607,49 @@ class CompressionTrainer(BaseTrainer):
         t = step / max(self._target_ratio_ramp_steps, 1)
         return self._target_ratio_start + t * (self._target_ratio_end - self._target_ratio_start)
 
+    def _sample_target_ratio(self) -> float:
+        """Sample a requested ratio for the current microbatch."""
+        if not hasattr(self, "_target_ratio_sampler_cfg"):
+            tcfg = self.cfg.training
+            model_cfg = getattr(self.cfg, "model", {})
+            anchor_grid = resolve_anchor_grid(
+                model_cfg,
+                float(self._target_ratio_start),
+                getattr(self.encoder.compressor.threshold_l0, "anchor_ratios", None),
+            )
+            self._target_ratio_sampler_cfg = build_ratio_sampler_config(
+                {
+                    "enabled": tcfg.get("sample_target_ratio_during_training", False),
+                    "mode": tcfg.get("target_ratio_sampling_mode", "window"),
+                    "sampling_max": tcfg.get(
+                        "target_ratio_sampling_max",
+                        max(float(self._target_ratio_start), max(anchor_grid)),
+                    ),
+                    "anchor_sampling_prob": tcfg.get(
+                        "target_ratio_anchor_sampling_prob", 0.30,
+                    ),
+                    "jitter_abs": tcfg.get("target_ratio_jitter_abs", 0.0),
+                    "jitter_rel": tcfg.get("target_ratio_jitter_rel", 0.0),
+                },
+                anchor_grid=anchor_grid,
+                default_ratio=float(self._target_ratio_start),
+                enabled_default=False,
+                mode_default="window",
+            )
+        if not hasattr(self, "_target_ratio_rng"):
+            import random
+
+            self._target_ratio_rng = random.Random(int(self.cfg.get("seed", 42)))
+        if not hasattr(self, "_last_sampled_target_ratio"):
+            self._last_sampled_target_ratio = None
+        return sample_ratio(
+            rng=self._target_ratio_rng,
+            config=self._target_ratio_sampler_cfg,
+            base_ratio=self._current_target_ratio(),
+            is_evaluating=self._is_evaluating,
+            override_active=self._target_ratio_override is not None,
+        )
+
     def _perform_l1_rebuild(self) -> None:
         """Rebuild dataset and dataloader for L1 phase."""
         import numpy as np
@@ -670,7 +763,7 @@ class CompressionTrainer(BaseTrainer):
             content_cu_seqlens=content_cu_seqlens,
             target_ratio=target_ratio,
         )
-        accumulate(state, enc_out)
+        accumulate(state, enc_out, target_ratio=target_ratio)
         out_metrics = {f"{level}_{k}": v for k, v in metrics.items()}
         diag_every_n = int(getattr(self, "_diagnostic_metrics_every_n_steps", 1) or 1)
         out_metrics.update(
@@ -686,7 +779,7 @@ class CompressionTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     def _compress_file_batch(
-        self, batch: dict,
+        self, batch: dict, target_ratio: float,
     ):
         """Run L0 compression on a packed FileCompressionSample batch.
 
@@ -708,7 +801,6 @@ class CompressionTrainer(BaseTrainer):
         content_emb = bgkit_embed(content_ids)
         prompt_emb = bgkit_embed(prompt_ids)
 
-        target_ratio = self._current_target_ratio()
         util_active = getattr(
             self, "_surv_l0", LevelLossCfg(),
         ).utility_grad_loss_weight > 0.0
@@ -724,7 +816,7 @@ class CompressionTrainer(BaseTrainer):
             utility_grad_active=util_active,
         )
 
-    def _compress_repo_l0_packed(self, batch: dict):
+    def _compress_repo_l0_packed(self, batch: dict, target_ratio: float):
         """Single packed L0 forward across every file in every repo.
 
         Uses ``cu_file_seqlens`` (one segment per file) for encoder
@@ -747,7 +839,6 @@ class CompressionTrainer(BaseTrainer):
         content_emb = bgkit_embed(file_ids)
         prompt_emb = bgkit_embed(prompt_ids)
 
-        target_ratio = self._current_target_ratio()
         util_active = getattr(
             self, "_surv_l0", LevelLossCfg(),
         ).utility_grad_loss_weight > 0.0
@@ -893,12 +984,14 @@ class CompressionTrainer(BaseTrainer):
             return self._forward_backward_mixed(batch)
 
         sample_type = batch["sample_type"]
+        target_ratio = self._sample_target_ratio()
+        self._last_sampled_target_ratio = target_ratio
 
         if sample_type == "file":
             with torch.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
             ):
-                enc_out = self._compress_file_batch(batch)
+                enc_out = self._compress_file_batch(batch, target_ratio=target_ratio)
                 survivors = enc_out.survivor_embeddings
                 survivor_cu = enc_out.survivor_cu_seqlens
                 loss = self._decoder_forward_single_splice(survivors, survivor_cu, batch)
@@ -909,7 +1002,7 @@ class CompressionTrainer(BaseTrainer):
             surv_metrics: dict[str, float] = {}
             if enc_out.logits_for_op is not None:
                 surv_loss, surv_metrics = self._compute_survivorship_losses(
-                    enc_out, self._current_target_ratio(),
+                    enc_out, target_ratio,
                     level="l0",
                     content_token_ids=batch["content_token_ids"].to(self.device),
                     content_cu_seqlens=batch["content_cu_seqlens"].to(self.device),
@@ -933,7 +1026,7 @@ class CompressionTrainer(BaseTrainer):
                     content_values=enc_out.post_head_content_values,
                     valid_mask=None,
                     pinned_mask=None,
-                    target_ratio=self._current_target_ratio(),
+                    target_ratio=target_ratio,
                     content_cu_seqlens=batch["content_cu_seqlens"].to(self.device),
                 )
                 if util_loss.requires_grad:
@@ -956,16 +1049,17 @@ class CompressionTrainer(BaseTrainer):
             # Repo batches: packed L0 across all files, then packed L1
             # per repo. See ``_forward_backward_repo_packed``.
             total_loss, n_survivors, n_valid, repo_surv_metrics = (
-                self._forward_backward_repo_packed(batch)
+                self._forward_backward_repo_packed(batch, target_ratio=target_ratio)
             )
             surv_metrics = repo_surv_metrics
 
-        target_ratio = self._current_target_ratio()
+        min_target_ratio = self._current_target_ratio()
         actual_ratio = n_survivors / max(n_valid, 1)
         metrics = {
             "loss": total_loss,
             "sample_type": sample_type,
-            "min_target_ratio": target_ratio,
+            "min_target_ratio": min_target_ratio,
+            "sampled_target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
             "l1_enabled": float(self._l1_enabled),
         }
@@ -975,6 +1069,7 @@ class CompressionTrainer(BaseTrainer):
     def _forward_backward_repo_packed(
         self,
         batch: dict,
+        target_ratio: float,
         scale_override: float | None = None,
     ) -> tuple[float, int, int, dict[str, float]]:
         """Packed repo-batch forward + backward (no per-sample loop).
@@ -1019,7 +1114,7 @@ class CompressionTrainer(BaseTrainer):
             "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
         ):
             # --- Step 1: packed L0 across all files in all repos ---
-            l0_out = self._compress_repo_l0_packed(batch)
+            l0_out = self._compress_repo_l0_packed(batch, target_ratio=target_ratio)
             l0_survivors = l0_out.survivor_embeddings  # (N_surv_l0_total, D)
             l0_survivor_cu = l0_out.survivor_cu_seqlens  # (total_files + 1,)
 
@@ -1027,7 +1122,7 @@ class CompressionTrainer(BaseTrainer):
             l0_surv_loss = None
             if l0_out.logits_for_op is not None:
                 loss_v, l0_metrics = self._compute_survivorship_losses(
-                    l0_out, self._current_target_ratio(),
+                    l0_out, target_ratio,
                     level="l0",
                     content_token_ids=batch["content_token_ids"].to(device),
                     content_cu_seqlens=batch["cu_file_seqlens"].to(device),
@@ -1052,7 +1147,6 @@ class CompressionTrainer(BaseTrainer):
             empty_prompt_emb = l1_input_flat.new_zeros(0, l1_input_flat.shape[-1])
             empty_prompt_pos = torch.zeros(0, dtype=torch.int64, device=device)
 
-            target_ratio = self._current_target_ratio()
             util_w_l1 = getattr(
                 self, "_surv_l1", LevelLossCfg(),
             ).utility_grad_loss_weight
@@ -1157,12 +1251,16 @@ class CompressionTrainer(BaseTrainer):
         n_file_samples = int(file_batch["content_cu_seqlens"].shape[0]) - 1
         n_repo_samples = int(repo_batch["cu_repo_seqlens"].shape[0]) - 1
         total_samples = n_file_samples + n_repo_samples
+        target_ratio = self._sample_target_ratio()
+        self._last_sampled_target_ratio = target_ratio
 
         # --- File portion (packed forward + backward) ---
         with torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
         ):
-            file_enc_out = self._compress_file_batch(file_batch)
+            file_enc_out = self._compress_file_batch(
+                file_batch, target_ratio=target_ratio,
+            )
             file_loss = self._decoder_forward_single_splice(
                 file_enc_out.survivor_embeddings,
                 file_enc_out.survivor_cu_seqlens,
@@ -1176,6 +1274,7 @@ class CompressionTrainer(BaseTrainer):
         avg_repo_loss, repo_survivors, n_valid_repo, _ = (
             self._forward_backward_repo_packed(
                 repo_batch,
+                target_ratio=target_ratio,
                 scale_override=repo_scale,
             )
         )
@@ -1192,11 +1291,11 @@ class CompressionTrainer(BaseTrainer):
         n_valid_file = int(file_batch["content_token_ids"].shape[0])
         actual_ratio = total_survivors / max(n_valid_file + n_valid_repo, 1)
 
-        target_ratio = self._current_target_ratio()
         metrics = {
             "loss": combined_loss,
             "sample_type": "mixed",
-            "min_target_ratio": target_ratio,
+            "min_target_ratio": self._current_target_ratio(),
+            "sampled_target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
             "l1_enabled": float(self._l1_enabled),
         }
@@ -1235,7 +1334,6 @@ class CompressionTrainer(BaseTrainer):
             maybe_unload_ice,
         )
 
-        target_ratio = self._current_target_ratio()
         merged: dict[str, float] = {}
         for level, state_attr in (("l0", "_surv_state_l0"), ("l1", "_surv_state_l1")):
             state = getattr(self, state_attr, None)
@@ -1243,7 +1341,7 @@ class CompressionTrainer(BaseTrainer):
                 continue
             update_metrics = apply_post_step_updates(
                 self.encoder.compressor, state,
-                target_ratio=target_ratio, level=level,
+                target_ratio=None, level=level,
             )
             merged.update(update_metrics)
             setattr(self, state_attr, init_state())
@@ -1260,6 +1358,8 @@ class CompressionTrainer(BaseTrainer):
     def _add_step_metrics(self, metrics: dict[str, float]) -> None:
         """Add compression-specific metrics (without clobbering base keys)."""
         metrics["bidi_alpha"] = self._get_bidi_alpha()
+        if self._last_sampled_target_ratio is not None:
+            metrics.setdefault("sampled_target_ratio", self._last_sampled_target_ratio)
         post = getattr(self, "_last_post_step_metrics", None)
         if post:
             for k, v in post.items():
@@ -1460,7 +1560,9 @@ class CompressionTrainer(BaseTrainer):
                 "cuda", dtype=torch.bfloat16,
                 enabled=self.device.type == "cuda",
             ):
-                enc_out = self._compress_file_batch(sub_batch)
+                enc_out = self._compress_file_batch(
+                    sub_batch, target_ratio=self._current_target_ratio(),
+                )
                 loss = self._decoder_forward_single_splice(
                     enc_out.survivor_embeddings,
                     enc_out.survivor_cu_seqlens,
@@ -1498,7 +1600,8 @@ class CompressionTrainer(BaseTrainer):
         with torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
         ):
-            l0_out = self._compress_repo_l0_packed(batch)
+            target_ratio = self._current_target_ratio()
+            l0_out = self._compress_repo_l0_packed(batch, target_ratio=target_ratio)
             l1_input_flat, l1_input_cu = self._regroup_survivors_per_repo(
                 l0_out.survivor_embeddings,
                 l0_out.survivor_cu_seqlens,
@@ -1519,7 +1622,7 @@ class CompressionTrainer(BaseTrainer):
                 prompt_embeddings=empty_prompt_emb,
                 prompt_cu_seqlens=empty_prompt_cu,
                 prompt_position_ids=empty_prompt_pos,
-                target_ratio=self._current_target_ratio(),
+                target_ratio=target_ratio,
                 level="l1",
             )
             loss = self._decoder_forward_single_splice(
@@ -1588,7 +1691,13 @@ class CompressionTrainer(BaseTrainer):
 
     def _restore_model_state(self, state_dicts: dict) -> None:
         if "encoder" in state_dicts:
-            result = self.encoder.load_state_dict(state_dicts["encoder"], strict=False)
+            from bgkit.models.encoder import migrate_legacy_threshold_controller_state_dict
+
+            enc_state = migrate_legacy_threshold_controller_state_dict(
+                state_dicts["encoder"],
+                self.encoder,
+            )
+            result = self.encoder.load_state_dict(enc_state, strict=False)
             if result.missing_keys:
                 logger.info(
                     "encoder_missing_keys",
@@ -1603,4 +1712,3 @@ class CompressionTrainer(BaseTrainer):
         self._l1_transitioned = training_state.get("l1_transitioned", False)
         self._l1_rebuild_pending = training_state.get("l1_rebuild_pending", False)
         self._target_ratio_override = training_state.get("target_ratio_override")
-

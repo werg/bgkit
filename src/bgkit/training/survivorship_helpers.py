@@ -78,6 +78,7 @@ class MicrobatchAggState:
     organic_count_sum: int | torch.Tensor = 0
     controllable_count_sum: int | torch.Tensor = 0
     controllable_empty_count: int | torch.Tensor = 0
+    target_ratio_mass_sum: float | torch.Tensor = 0.0
 
 
 def init_state() -> MicrobatchAggState:
@@ -88,7 +89,12 @@ def _is_tensor(x) -> bool:
     return isinstance(x, torch.Tensor)
 
 
-def accumulate(state: MicrobatchAggState, enc_out) -> None:
+def accumulate(
+    state: MicrobatchAggState,
+    enc_out,
+    *,
+    target_ratio: float | None = None,
+) -> None:
     """Append per-microbatch (sum, count) tuples — never pre-divide.
 
     Consumes zero-dim ``organic_count`` / ``controllable_count`` /
@@ -107,6 +113,12 @@ def accumulate(state: MicrobatchAggState, enc_out) -> None:
     ``(sum, count)`` accumulation is identical, so ``accumulate`` is correct
     under both conventions without modification.
 
+    ``target_ratio`` optionally carries the requested retention for this
+    microbatch. When provided, we accumulate ``target_ratio * controllable``
+    so the post-step update can compare the true aggregate organic rate
+    against the true aggregate requested rate even when batches sampled
+    different target ratios.
+
     Keeps accumulators on-device as zero-dim tensors after the first call.
     No ``.item()`` is called here, so there is no GPU→CPU sync per microbatch.
     """
@@ -124,6 +136,7 @@ def accumulate(state: MicrobatchAggState, enc_out) -> None:
         state.organic_count_sum = torch.zeros((), dtype=torch.long, device=device)
         state.controllable_count_sum = torch.zeros((), dtype=torch.long, device=device)
         state.controllable_empty_count = torch.zeros((), dtype=torch.long, device=device)
+        state.target_ratio_mass_sum = torch.zeros((), dtype=torch.float32, device=device)
 
     # All ops below are device-side tensor ops (no sync). We encode
     # "was this microbatch's controllable_count == 0?" as a 0/1 mask.
@@ -136,6 +149,11 @@ def accumulate(state: MicrobatchAggState, enc_out) -> None:
     state.controllable_count_sum = (
         state.controllable_count_sum + cc.to(torch.long) * non_empty_mask
     )
+    if target_ratio is not None:
+        state.target_ratio_mass_sum = (
+            state.target_ratio_mass_sum
+            + cc.to(torch.float32) * non_empty_mask.to(torch.float32) * float(target_ratio)
+        )
 
 
 def _ddp_all_reduce_sums(state: MicrobatchAggState) -> MicrobatchAggState:
@@ -163,12 +181,14 @@ def _ddp_all_reduce_sums(state: MicrobatchAggState) -> MicrobatchAggState:
         state.organic_count_sum.to(torch.float64),
         state.controllable_count_sum.to(torch.float64),
         state.controllable_empty_count.to(torch.float64),
+        state.target_ratio_mass_sum.to(torch.float64),
     ]).to(device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     return MicrobatchAggState(
         organic_count_sum=tensor[0].to(torch.long),
         controllable_count_sum=tensor[1].to(torch.long),
         controllable_empty_count=tensor[2].to(torch.long),
+        target_ratio_mass_sum=tensor[3].to(torch.float32),
     )
 
 
@@ -744,7 +764,7 @@ def calibrate_head_tanh_temperature(
 def apply_post_step_updates(
     compressor,
     state: MicrobatchAggState,
-    target_ratio: float,
+    target_ratio: float | None,
     level: str,
     *,
     skip_threshold_step: bool = False,
@@ -777,6 +797,7 @@ def apply_post_step_updates(
     empty_count = float(_to_python(state.controllable_empty_count))
     controllable_sum = int(_to_python(state.controllable_count_sum))
     organic_sum = int(_to_python(state.organic_count_sum))
+    target_ratio_mass_sum = float(_to_python(state.target_ratio_mass_sum))
 
     metrics: dict[str, float] = {
         "controllable_empty_microbatches": empty_count,
@@ -784,9 +805,21 @@ def apply_post_step_updates(
 
     if not skip_threshold_step and controllable_sum > 0:
         mean_rate = organic_sum / controllable_sum
-        controller.step(current_rate=mean_rate, target_rate=target_ratio)
+        effective_target_ratio = (
+            target_ratio_mass_sum / controllable_sum
+            if target_ratio is None
+            else float(target_ratio)
+        )
+        controller.step(current_rate=mean_rate, target_rate=effective_target_ratio)
         metrics["mean_rate"] = float(mean_rate)
-    metrics[f"theta_{level}"] = float(controller.theta.item())
+        metrics["aggregate_target_ratio"] = float(effective_target_ratio)
+    else:
+        effective_target_ratio = (
+            float(target_ratio)
+            if target_ratio is not None
+            else float(getattr(controller, "_last_target_rate", 0.10))
+        )
+    metrics[f"theta_{level}"] = float(controller.theta_for_ratio(effective_target_ratio).item())
 
     return metrics
 

@@ -598,6 +598,12 @@ class ProjectionRepairTrainer(BaseTrainer):
 
     def _restore_model_state(self, state_dicts: dict) -> None:
         if "encoder" in state_dicts:
-            self.encoder.load_state_dict(state_dicts["encoder"], strict=False)
+            from bgkit.models.encoder import migrate_legacy_threshold_controller_state_dict
+
+            enc_state = migrate_legacy_threshold_controller_state_dict(
+                state_dicts["encoder"],
+                self.encoder,
+            )
+            self.encoder.load_state_dict(enc_state, strict=False)
         if "decoder" in state_dicts:
             self._decoder_state_dict = state_dicts["decoder"]

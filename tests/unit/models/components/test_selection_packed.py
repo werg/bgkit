@@ -138,7 +138,14 @@ def test_select_organic_rate_std_nontrivial():
 
 
 def test_dual_ascent_moves_theta_toward_gap():
-    ctrl = DualThresholdController(init_theta=0.0, lr=0.1, momentum=0.0, clamp=5.0)
+    ctrl = DualThresholdController(
+        init_theta=0.0,
+        lr=0.1,
+        momentum=0.0,
+        clamp=5.0,
+        init_target_ratio=0.5,
+        default_query_ratio=0.5,
+    )
     ctrl.step(current_rate=0.7, target_rate=0.5)  # gap = +0.2
     assert ctrl.theta.item() == pytest.approx(0.02)
     ctrl.step(current_rate=0.3, target_rate=0.5)  # gap = -0.2
@@ -152,7 +159,12 @@ def test_dual_ascent_respects_clamp():
 
 
 def test_dual_ascent_nan_guard():
-    ctrl = DualThresholdController(init_theta=0.1, lr=0.1)
+    ctrl = DualThresholdController(
+        init_theta=0.1,
+        lr=0.1,
+        init_target_ratio=0.5,
+        default_query_ratio=0.5,
+    )
     ctrl.step(current_rate=float("nan"), target_rate=0.5)
     assert ctrl.theta.item() == pytest.approx(0.1)
 
@@ -160,9 +172,26 @@ def test_dual_ascent_nan_guard():
 def test_dual_ascent_fp32_preserved_across_bf16_cast():
     ctrl = DualThresholdController(init_theta=0.123456, lr=0.01)
     ctrl.to(dtype=torch.bfloat16)
-    # Buffer must still be fp32 (matches padded-era behaviour).
-    assert ctrl.theta_param.dtype == torch.float32
+    # Curve state must stay fp32 across bf16 casts.
+    assert ctrl.anchor_thetas.dtype == torch.float32
+    assert ctrl.anchor_ratios.dtype == torch.float32
     assert ctrl.theta.dtype == torch.float32
+
+
+def test_threshold_curve_remains_monotone_after_updates():
+    ctrl = DualThresholdController(
+        init_theta=0.0,
+        lr=0.2,
+        clamp=5.0,
+        anchor_ratios=[0.1, 0.2, 0.4, 0.8],
+        default_query_ratio=0.1,
+        init_target_ratio=0.1,
+    )
+    ctrl.step(current_rate=0.9, target_rate=0.75)
+    ctrl.step(current_rate=0.2, target_rate=0.15)
+    ctrl.step(current_rate=0.7, target_rate=0.25)
+    vals = [float(ctrl.theta_for_ratio(r).item()) for r in [0.1, 0.2, 0.4, 0.8]]
+    assert vals[0] >= vals[1] >= vals[2] >= vals[3]
 
 
 # ----------------------------------------------------------------------

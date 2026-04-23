@@ -57,6 +57,11 @@ from bgkit.models.lora_encoder import (
 )
 from bgkit.models.topic_embeddings import TopicEmbeddingModule
 from bgkit.training.base_trainer import BaseTrainer
+from bgkit.training.ratio_sampling import (
+    build_ratio_sampler_config,
+    resolve_anchor_grid,
+    sample_ratio,
+)
 from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.packing import (
     lengths_from_cu,
@@ -346,6 +351,31 @@ class KRKBTrainer(BaseTrainer):
             else:
                 self._l0_retention[str(k)] = dict(v)
         self._l1_retention = float(self.step_cfg.get("l1_retention", 0.15))
+        anchor_grid = resolve_anchor_grid(
+            self.cfg.model,
+            float(self._l1_retention),
+            getattr(self.encoder.compressor.threshold_l0, "anchor_ratios", None),
+        )
+        self._l0_ratio_sampler_cfg = build_ratio_sampler_config(
+            self.step_cfg.get("l0_retention_jitter", {}) or {},
+            anchor_grid=anchor_grid,
+            default_ratio=float(self.step_cfg.get("default_l0_retention", 0.10)),
+            enabled_default=False,
+            mode_default="jitter",
+        )
+        self._l1_ratio_sampler_cfg = build_ratio_sampler_config(
+            self.step_cfg.get("l1_retention_jitter", {}) or {},
+            anchor_grid=anchor_grid,
+            default_ratio=float(self._l1_retention),
+            enabled_default=False,
+            mode_default="jitter",
+        )
+        import random as _random
+
+        self._l0_ratio_rng = _random.Random(int(self.cfg.get("seed", 42)) + 101)
+        self._l1_ratio_rng = _random.Random(int(self.cfg.get("seed", 42)) + 202)
+        self._step_sampled_l0_ratios: list[float] = []
+        self._step_sampled_l1_ratios: list[float] = []
 
         # --- Survivorship head aux losses ---
         # Phase 2 layers per-level config on top of the legacy trainer-scope
@@ -1261,6 +1291,32 @@ class KRKBTrainer(BaseTrainer):
         t = min(1.0, self.global_step / ramp)
         return start + (end - start) * t
 
+    def _sample_l0_retention_for(self, dataset: str) -> float:
+        """Sample an L0 retention ratio around the dataset's current base rate."""
+        ratio = sample_ratio(
+            rng=self._l0_ratio_rng,
+            config=self._l0_ratio_sampler_cfg,
+            base_ratio=self._l0_retention_for(dataset),
+            is_evaluating=not self.encoder.training,
+            override_active=False,
+        )
+        if self.encoder.training:
+            self._step_sampled_l0_ratios.append(float(ratio))
+        return float(ratio)
+
+    def _sample_l1_retention(self) -> float:
+        """Sample an L1 retention ratio around the configured base rate."""
+        ratio = sample_ratio(
+            rng=self._l1_ratio_rng,
+            config=self._l1_ratio_sampler_cfg,
+            base_ratio=self._l1_retention,
+            is_evaluating=not self.encoder.training,
+            override_active=False,
+        )
+        if self.encoder.training:
+            self._step_sampled_l1_ratios.append(float(ratio))
+        return float(ratio)
+
     def _live_l0_encode(
         self,
         dataset: str,
@@ -1279,7 +1335,7 @@ class KRKBTrainer(BaseTrainer):
         encoder produces the survivor mask internally based on the target
         retention ratio.
 
-        Returns ``(out, content_cu_seqlens)`` where ``out`` is the full
+        Returns ``(out, content_cu_seqlens, ratio)`` where ``out`` is the full
         :class:`CompressionOutput` (carrying flat head outputs +
         ``base_raw_for_util`` / ``post_head_content_values`` /
         ``_utility_grad_state``) and ``content_cu_seqlens`` marks the
@@ -1310,7 +1366,7 @@ class KRKBTrainer(BaseTrainer):
         embed_tokens = self.encoder.compressor.backbone.get_input_embeddings()
         input_embeddings = embed_tokens(tokens_flat)  # (N_content, D)
 
-        ratio = self._l0_retention_for(dataset)
+        ratio = self._sample_l0_retention_for(dataset)
         from bgkit.training.survivorship_helpers import LevelLossCfg as _LLC
         util_active = getattr(
             self, "_surv_l0", _LLC(),
@@ -1328,7 +1384,7 @@ class KRKBTrainer(BaseTrainer):
         )
         if grad_capture is not None:
             out._l0_grad_capture = grad_capture  # type: ignore[attr-defined]
-        return out, cu_seqlens
+        return out, cu_seqlens, ratio
 
     def _l0_for_articles(
         self, dataset: str, article_ids: list[str],
@@ -1354,14 +1410,14 @@ class KRKBTrainer(BaseTrainer):
         utility-grad BCE) after the main forward.
         """
         if self._live_l0:
-            out, content_cu = self._live_l0_encode(dataset, article_ids)
+            out, content_cu, ratio = self._live_l0_encode(dataset, article_ids)
             survivors = out.survivor_embeddings  # (N_survivors, D)
             cu_seqlens = out.survivor_cu_seqlens  # (B+1,)
             if self.encoder.training and hasattr(self, "_pending_l0_outputs"):
                 self._pending_l0_outputs.append({
                     "dataset": dataset,
                     "enc_out": out,
-                    "ratio": self._l0_retention_for(dataset),
+                    "ratio": ratio,
                     # Packed pre-compression content cu_seqlens so aux
                     # losses can do segment-aware reductions.
                     "cu_seqlens": content_cu,
@@ -1751,7 +1807,11 @@ class KRKBTrainer(BaseTrainer):
             "query_emb": q_emb,
         }
 
-    def _run_l1_batch(self, prepared: list[dict | None]) -> list[torch.Tensor]:
+    def _run_l1_batch(
+        self,
+        prepared: list[dict | None],
+        target_ratio: float | None = None,
+    ) -> list[torch.Tensor]:
         """Run a packed encoder forward for every non-None turn in ``prepared``.
 
         All turns from one sample (or one bucket when called from
@@ -1811,6 +1871,8 @@ class KRKBTrainer(BaseTrainer):
             self, "_surv_l1", _LLC(),
         ).utility_grad_loss_weight > 0.0
         l1_grad_capture: dict | None = {} if util_active_l1 else None
+        if target_ratio is None:
+            target_ratio = self._sample_l1_retention()
         out = self._checkpointed_encoder(
             content_embeddings=content_flat,
             content_cu_seqlens=content_cu,
@@ -1819,7 +1881,7 @@ class KRKBTrainer(BaseTrainer):
             prompt_cu_seqlens=query_cu,
             prompt_position_ids=query_pos_ids,
             pinned_positions=pinned_flat,
-            target_ratio=self._l1_retention,
+            target_ratio=target_ratio,
             level="l1",
             utility_grad_active=util_active_l1,
             utility_grad_capture=l1_grad_capture,
@@ -1836,7 +1898,7 @@ class KRKBTrainer(BaseTrainer):
                 "cu_seqlens": content_cu,
                 "pinned": pinned_flat,
                 "relevance_mask": relevance_flat,
-                "ratio": self._l1_retention,
+                "ratio": target_ratio,
             })
 
         # Extract per-turn survivors from the packed output. The encoder
@@ -2743,6 +2805,8 @@ class KRKBTrainer(BaseTrainer):
         # Reset per-step accumulators for survivorship aux losses
         self._pending_l0_outputs: list[dict] = []
         self._pending_l1_outputs: list[dict] = []
+        self._step_sampled_l0_ratios = []
+        self._step_sampled_l1_ratios = []
 
         # Stamp per-batch tag usage so the topic embeddings can divide
         # each tag parameter's gradient by the number of batch members
@@ -2857,6 +2921,14 @@ class KRKBTrainer(BaseTrainer):
             "l1_turns_per_sample": float(n_turns_total / n_samples),
             "l1_buckets_per_step": float(len(buckets)),
         }
+        if self._step_sampled_l0_ratios:
+            metrics_out["sampled_l0_ratio_mean"] = float(
+                sum(self._step_sampled_l0_ratios) / len(self._step_sampled_l0_ratios),
+            )
+        if self._step_sampled_l1_ratios:
+            metrics_out["sampled_l1_ratio_mean"] = float(
+                sum(self._step_sampled_l1_ratios) / len(self._step_sampled_l1_ratios),
+            )
         metrics_out.update(aux_metrics)
         metrics_out.update(util_metrics)
 
@@ -2959,19 +3031,28 @@ class KRKBTrainer(BaseTrainer):
         # the sum/count accumulator.
         l0_target_num = 0.0
         l0_target_den = 0.0
+        l1_target_num = 0.0
+        l1_target_den = 0.0
         for entry in getattr(self, "_pending_l0_outputs", []):
             enc_out = entry.get("enc_out")
             if enc_out is None:
                 continue
-            accumulate(self._surv_state_l0, enc_out)
+            ratio = float(entry.get("ratio", self._l1_retention))
+            accumulate(self._surv_state_l0, enc_out, target_ratio=ratio)
             if enc_out.controllable_count is not None:
                 cc = int(enc_out.controllable_count.item())
-                l0_target_num += float(entry.get("ratio", self._l1_retention)) * cc
+                l0_target_num += ratio * cc
                 l0_target_den += cc
         for entry in getattr(self, "_pending_l1_outputs", []):
             enc_out = entry.get("enc_out")
-            if enc_out is not None:
-                accumulate(self._surv_state_l1, enc_out)
+            if enc_out is None:
+                continue
+            ratio = float(entry.get("ratio", self._l1_retention))
+            accumulate(self._surv_state_l1, enc_out, target_ratio=ratio)
+            if enc_out.controllable_count is not None:
+                cc = int(enc_out.controllable_count.item())
+                l1_target_num += ratio * cc
+                l1_target_den += cc
 
         if l0_target_den > 0:
             target_l0 = l0_target_num / l0_target_den
@@ -2982,7 +3063,10 @@ class KRKBTrainer(BaseTrainer):
             # across configured datasets.
             vals = [float(v) for v in self._l0_retention.values()] if self._l0_retention else []
             target_l0 = sum(vals) / len(vals) if vals else 0.10
-        target_l1 = float(self._l1_retention)
+        if l1_target_den > 0:
+            target_l1 = l1_target_num / l1_target_den
+        else:
+            target_l1 = float(self._l1_retention)
 
         merged: dict[str, float] = {}
         # L0 update: skip if Stage B (cached L0, L0 LoRA frozen).

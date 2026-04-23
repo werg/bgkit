@@ -379,7 +379,18 @@ class BgKITCompressor(nn.Module):
 
         ctrl_cfg = threshold_controller_cfg or {}
         ctrl_kwargs = {
-            k: v for k, v in ctrl_cfg.items() if k in {"init_theta", "lr", "momentum", "clamp"}
+            k: v
+            for k, v in ctrl_cfg.items()
+            if k in {
+                "init_theta",
+                "lr",
+                "momentum",
+                "clamp",
+                "anchor_ratios",
+                "ratio_space",
+                "init_target_ratio",
+                "default_query_ratio",
+            }
         }
         self.threshold_l0 = DualThresholdController(**ctrl_kwargs)
         self.threshold_l1 = DualThresholdController(**ctrl_kwargs)
@@ -506,7 +517,7 @@ class BgKITCompressor(nn.Module):
             # handled separately.
             valid = torch.ones_like(base_raw, dtype=torch.bool)
 
-            theta = controller.theta.to(base_raw.device)
+            theta = controller.theta_for_ratio(float(target_ratio)).to(base_raw.device)
             sel = adaptive_threshold_select(
                 logits=logits_for_op,
                 valid_mask=valid,

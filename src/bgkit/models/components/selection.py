@@ -1,19 +1,24 @@
-"""Adaptive-threshold selection + dual-ascent threshold + moment-match — packed form.
+"""Adaptive-threshold selection + threshold-curve control + moment-match.
 
 Rate-distortion framing for the survivorship head (packed FA4 varlen):
 
-- Per-position decision: ``s_i > theta`` against a single global threshold logit
-  ``theta``. ``theta`` is a learned scalar (a dual variable, not a parameter)
-  updated externally by gradient ascent against an aggregate-rate constraint.
+- Per-position decision remains ``s_i > theta(r)`` against a threshold in logit
+  space, but the threshold is now a **monotone curve over requested retention
+  ratio** rather than a single scalar.
+- The head therefore continues to learn absolute salience / information
+  content, while the requested ratio only changes the cutoff. Denser samples
+  naturally keep more survivors because more positions clear the same
+  ratio-conditioned threshold.
 - :func:`adaptive_threshold_select` returns a flat ``(N,)`` bool mask only.
   There is no straight-through estimator; head gradient flows only through
   BCE + moment-match + utility-grad paths, NEVER through the hard mask.
-- ``DualThresholdController`` owns an fp32 scalar θ buffer and exposes a
-  ``.theta`` property that always returns an fp32 view (so ``encoder.to(bf16)``
-  casts are tolerated cheaply: reads recast every time).
-- :func:`moment_match_loss` standardizes raw head logits over all valid positions
-  in the micro-batch (one global mean + std) and matches their 3rd + 4th moments
-  to fixed reference targets pre-computed offline from ICE.
+- :class:`ThresholdCurveController` owns fp32 threshold anchors and updates the
+  nearby anchors by dual ascent against the aggregate keep-rate error at the
+  requested ratio. A post-update isotonic projection enforces monotonicity:
+  stricter ratios always map to higher thresholds.
+- :func:`moment_match_loss` standardizes raw head logits over all valid
+  positions in the micro-batch (one global mean + std) and matches their 3rd +
+  4th moments to fixed reference targets pre-computed offline from ICE.
 
 Packing conventions: all tensors are flat over samples with ``N = sum(L_i)``.
 Sample segmentation is carried in ``cu_seqlens`` (``(B+1,) int32``) — see
@@ -23,6 +28,7 @@ Sample segmentation is carried in ``cu_seqlens`` (``(B+1,) int32``) — see
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn as nn
@@ -79,6 +85,62 @@ class SelectionOut:
         if den_v == 0:
             return float("nan")
         return float(num.item()) / den_v
+
+
+def _validate_anchor_ratios(anchor_ratios: list[float]) -> list[float]:
+    if len(anchor_ratios) < 2:
+        raise ValueError("anchor_ratios must contain at least 2 ratios")
+    cleaned = [float(r) for r in anchor_ratios]
+    prev = -float("inf")
+    for r in cleaned:
+        if not 0.0 < r < 1.0:
+            raise ValueError(
+                f"anchor ratios must lie strictly in (0, 1); got {r}",
+            )
+        if r <= prev:
+            raise ValueError(
+                "anchor_ratios must be strictly increasing; "
+                f"got {cleaned}",
+            )
+        prev = r
+    return cleaned
+
+
+def _pava_nonincreasing(values: list[float]) -> list[float]:
+    """Project ``values`` onto the non-increasing cone with PAVA.
+
+    The projection minimizes squared error subject to
+    ``out[0] >= out[1] >= ... >= out[n-1]``.
+    """
+    if not values:
+        return []
+
+    # Convert non-increasing constraint into non-decreasing by negation.
+    blocks: list[dict[str, float | int]] = []
+    for idx, value in enumerate(values):
+        blocks.append({"sum": -float(value), "weight": 1, "start": idx, "end": idx})
+        while len(blocks) >= 2:
+            prev = blocks[-2]
+            cur = blocks[-1]
+            prev_mean = float(prev["sum"]) / int(prev["weight"])
+            cur_mean = float(cur["sum"]) / int(cur["weight"])
+            if prev_mean <= cur_mean:
+                break
+            merged = {
+                "sum": float(prev["sum"]) + float(cur["sum"]),
+                "weight": int(prev["weight"]) + int(cur["weight"]),
+                "start": int(prev["start"]),
+                "end": int(cur["end"]),
+            }
+            blocks[-2:] = [merged]
+
+    projected = [0.0] * len(values)
+    for block in blocks:
+        mean = float(block["sum"]) / int(block["weight"])
+        out_val = -mean
+        for idx in range(int(block["start"]), int(block["end"]) + 1):
+            projected[idx] = out_val
+    return projected
 
 
 def _segment_topk_mask(
@@ -277,20 +339,26 @@ def adaptive_threshold_select(
     )
 
 
-class DualThresholdController(nn.Module):
-    """Owns a scalar threshold ``θ`` updated by dual ascent on an aggregate rate.
+class ThresholdCurveController(nn.Module):
+    """Monotone threshold curve ``θ(r)`` updated by local dual ascent.
 
-    Update rule (per optimizer step):
-
-        θ ← clamp(θ + lr · (current_rate - target_rate), -clamp, +clamp)
-
-    fp32 preservation: the buffer is stored as fp32 and ALWAYS read via
-    ``.float()`` inside the controller and at call sites. If the encoder's
-    ``.to(dtype=bf16)`` casts the buffer, reads still get fp32 because the
-    ``.float()`` recast happens every time. Cheap and robust — no ``_apply``
-    override needed in principle, but we still override to restore fp32
-    storage after an accidental cast.
+    The curve is represented by threshold anchors at fixed requested-retention
+    ratios. Queries interpolate linearly in a transformed ratio space
+    (``log`` by default, which gives extra resolution at aggressive
+    compression). Each optimization-step update touches only the neighboring
+    anchors around the requested ratio, then projects the full curve back onto
+    the monotone cone so stricter ratios always imply higher thresholds.
     """
+
+    DEFAULT_ANCHOR_RATIOS = (
+        0.02,
+        0.04,
+        0.08,
+        0.16,
+        0.32,
+        0.64,
+        0.95,
+    )
 
     def __init__(
         self,
@@ -298,59 +366,216 @@ class DualThresholdController(nn.Module):
         lr: float = 0.02,
         momentum: float = 0.0,
         clamp: float = 0.99,
+        anchor_ratios: list[float] | tuple[float, ...] | None = None,
+        ratio_space: str = "log",
+        init_target_ratio: float | None = None,
+        default_query_ratio: float = 0.10,
     ):
         super().__init__()
         self.lr = float(lr)
         self.momentum = float(momentum)
         self.clamp_val = float(clamp)
+        self.ratio_space = str(ratio_space).lower()
+        if self.ratio_space not in {"linear", "log", "logit"}:
+            raise ValueError(
+                f"Unsupported ratio_space={ratio_space!r}; expected "
+                "'linear', 'log', or 'logit'",
+            )
+        anchor_vals = _validate_anchor_ratios(
+            list(anchor_ratios) if anchor_ratios is not None
+            else list(self.DEFAULT_ANCHOR_RATIOS),
+        )
+        self.default_query_ratio = float(default_query_ratio)
+        if not 0.0 < self.default_query_ratio < 1.0:
+            raise ValueError(
+                f"default_query_ratio must lie in (0, 1); got {default_query_ratio}",
+            )
+        self.init_target_ratio = (
+            None if init_target_ratio is None else float(init_target_ratio)
+        )
+        if (
+            self.init_target_ratio is not None
+            and not 0.0 < self.init_target_ratio < 1.0
+        ):
+            raise ValueError(
+                f"init_target_ratio must lie in (0, 1); got {init_target_ratio}",
+            )
+
+        if self.init_target_ratio is None:
+            anchor_thetas = [self._clamp_theta(float(init_theta)) for _ in anchor_vals]
+        else:
+            anchor_thetas = [
+                self._clamp_theta(self._affine_theta(r))
+                for r in anchor_vals
+            ]
         self.register_buffer(
-            "theta_param",
-            torch.tensor(float(init_theta), dtype=torch.float32),
+            "anchor_ratios",
+            torch.tensor(anchor_vals, dtype=torch.float32),
         )
         self.register_buffer(
-            "_velocity",
-            torch.tensor(0.0, dtype=torch.float32),
+            "anchor_thetas",
+            torch.tensor(anchor_thetas, dtype=torch.float32),
         )
+        self.register_buffer(
+            "_anchor_velocity",
+            torch.zeros(len(anchor_vals), dtype=torch.float32),
+        )
+        self.register_buffer(
+            "_last_target_rate",
+            torch.tensor(float(self.default_query_ratio), dtype=torch.float32),
+        )
+        if self.init_target_ratio is not None:
+            base_theta = float(self.theta_for_ratio(self.init_target_ratio).item())
+            offset = float(init_theta) - base_theta
+            if abs(offset) > 0.0:
+                shifted = [
+                    self._clamp_theta(float(v) + offset)
+                    for v in self.anchor_thetas.detach().cpu().tolist()
+                ]
+                self.anchor_thetas.copy_(
+                    torch.tensor(
+                        shifted,
+                        dtype=torch.float32,
+                        device=self.anchor_thetas.device,
+                    ),
+                )
+                self._project_monotone_()
 
     def _apply(self, fn, recurse: bool = True):
-        """Preserve fp32 on θ/velocity across ``.to(bf16)``."""
-        old_theta = self.theta_param
-        old_velocity = self._velocity
+        """Preserve fp32 on curve state across ``.to(bf16)``."""
+        old_anchor_ratios = self.anchor_ratios
+        old_anchor_thetas = self.anchor_thetas
+        old_velocity = self._anchor_velocity
+        old_last_target = self._last_target_rate
         result = super()._apply(fn, recurse)
-        if self.theta_param.dtype != torch.float32:
-            self.theta_param = old_theta.to(
-                device=self.theta_param.device,
+        if self.anchor_ratios.dtype != torch.float32:
+            self.anchor_ratios = old_anchor_ratios.to(
+                device=self.anchor_ratios.device,
                 dtype=torch.float32,
             )
-        if self._velocity.dtype != torch.float32:
-            self._velocity = old_velocity.to(
-                device=self._velocity.device,
+        if self.anchor_thetas.dtype != torch.float32:
+            self.anchor_thetas = old_anchor_thetas.to(
+                device=self.anchor_thetas.device,
+                dtype=torch.float32,
+            )
+        if self._anchor_velocity.dtype != torch.float32:
+            self._anchor_velocity = old_velocity.to(
+                device=self._anchor_velocity.device,
+                dtype=torch.float32,
+            )
+        if self._last_target_rate.dtype != torch.float32:
+            self._last_target_rate = old_last_target.to(
+                device=self._last_target_rate.device,
                 dtype=torch.float32,
             )
         return result
 
+    @staticmethod
+    def _affine_theta(ratio: float) -> float:
+        return 1.0 - 2.0 * float(ratio)
+
+    def _clamp_theta(self, value: float) -> float:
+        return max(-self.clamp_val, min(self.clamp_val, float(value)))
+
+    def _transform_ratio(self, ratio: float | Tensor) -> float | Tensor:
+        eps = 1e-6
+        if isinstance(ratio, torch.Tensor):
+            r = ratio.float().clamp(min=eps, max=1.0 - eps)
+            if self.ratio_space == "linear":
+                return r
+            if self.ratio_space == "log":
+                return torch.log(r)
+            return torch.log(r / (1.0 - r))
+        r = min(max(float(ratio), eps), 1.0 - eps)
+        if self.ratio_space == "linear":
+            return r
+        if self.ratio_space == "log":
+            return math.log(r)
+        return math.log(r / (1.0 - r))
+
+    def _interpolation_state(self, target_rate: float) -> tuple[int, int, float, float]:
+        ratios = self.anchor_ratios.float()
+        target_t = torch.tensor(
+            float(self._transform_ratio(target_rate)),
+            dtype=torch.float32,
+            device=ratios.device,
+        )
+        anchor_t = self._transform_ratio(ratios)
+        if float(target_t.item()) <= float(anchor_t[0].item()):
+            return 0, 0, 1.0, 0.0
+        last = int(anchor_t.shape[0] - 1)
+        if float(target_t.item()) >= float(anchor_t[last].item()):
+            return last, last, 1.0, 0.0
+
+        right = int(torch.bucketize(target_t, anchor_t).item())
+        left = right - 1
+        left_t = float(anchor_t[left].item())
+        right_t = float(anchor_t[right].item())
+        span = max(right_t - left_t, 1e-12)
+        right_w = (float(target_t.item()) - left_t) / span
+        left_w = 1.0 - right_w
+        return left, right, left_w, right_w
+
+    def theta_for_ratio(self, target_rate: float) -> Tensor:
+        """Return the fp32 threshold for the requested retention ratio."""
+        left, right, left_w, right_w = self._interpolation_state(target_rate)
+        theta = self.anchor_thetas[left]
+        if right != left:
+            theta = theta * left_w + self.anchor_thetas[right] * right_w
+        return theta.float()
+
+    def _project_monotone_(self) -> None:
+        projected = _pava_nonincreasing([
+            self._clamp_theta(float(v))
+            for v in self.anchor_thetas.detach().cpu().tolist()
+        ])
+        self.anchor_thetas.copy_(
+            torch.tensor(
+                projected,
+                dtype=torch.float32,
+                device=self.anchor_thetas.device,
+            ),
+        )
+
     @torch.no_grad()
     def step(self, current_rate: float, target_rate: float) -> None:
-        """Apply one dual-ascent update."""
+        """Apply one dual-ascent update to the local anchors around ``target_rate``."""
         if current_rate != current_rate:  # NaN guard
             return
+        target_rate = float(target_rate)
+        self._last_target_rate.fill_(target_rate)
         gap = float(current_rate) - float(target_rate)
-        if self.momentum > 0.0:
-            new_velocity = (
-                self.momentum * float(self._velocity.item()) + (1.0 - self.momentum) * gap
-            )
-            self._velocity.fill_(new_velocity)
-            delta = self.lr * new_velocity
-        else:
-            delta = self.lr * gap
-        new_theta = float(self.theta_param.item()) + delta
-        new_theta = max(-self.clamp_val, min(self.clamp_val, new_theta))
-        self.theta_param.fill_(new_theta)
+        left, right, left_w, right_w = self._interpolation_state(target_rate)
+        updates = [(left, left_w)]
+        if right != left:
+            updates.append((right, right_w))
+        denom = sum(weight * weight for _, weight in updates)
+        if denom <= 0.0:
+            denom = 1.0
+
+        for idx, weight in updates:
+            if weight <= 0.0:
+                continue
+            scaled_gap = gap * (weight / denom)
+            if self.momentum > 0.0:
+                prev_v = float(self._anchor_velocity[idx].item())
+                new_velocity = self.momentum * prev_v + (1.0 - self.momentum) * scaled_gap
+                self._anchor_velocity[idx].fill_(new_velocity)
+                delta = self.lr * new_velocity
+            else:
+                delta = self.lr * scaled_gap
+            new_theta = self._clamp_theta(float(self.anchor_thetas[idx].item()) + delta)
+            self.anchor_thetas[idx].fill_(new_theta)
+
+        self._project_monotone_()
 
     @property
     def theta(self) -> Tensor:
-        """fp32 view of the current threshold."""
-        return self.theta_param.float()
+        """Compatibility view: threshold at the most recently updated ratio."""
+        return self.theta_for_ratio(float(self._last_target_rate.item()))
+
+
+DualThresholdController = ThresholdCurveController
 
 
 def moment_match_loss(

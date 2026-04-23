@@ -87,6 +87,14 @@ target_ratio_start: 0.95
 # at Step 4 onset. See docs/wall_clock_investigation_2026_04_21.md.
 target_ratio_end: 0.08
 target_ratio_ramp_steps: 1000
+# Train the threshold curve over a *range* of requested ratios instead of
+# only the current curriculum floor. Most batches sample uniformly from the
+# active window [target_ratio_floor, target_ratio_sampling_max]; a minority
+# hit the controller's anchor grid directly so every part of the curve keeps
+# getting refreshed as the floor moves.
+sample_target_ratio_during_training: true
+target_ratio_sampling_max: 0.95
+target_ratio_anchor_sampling_prob: 0.30
 
 # Liger kernels: SwiGLU + RoPE + fused linear-CE are enabled. LigerRMSNorm
 # is pinned OFF due to a silent backward-pass corruption on Qwen3.5 in

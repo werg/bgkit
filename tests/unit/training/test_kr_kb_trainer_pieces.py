@@ -769,6 +769,20 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
     trainer._l1_retention = 1.0
     trainer._live_l0 = True
 
+    # Ratio-sampling state for the l1 path — tests skip setup() so wire
+    # up a disabled sampler + rng directly.
+    import random as _stdlib_random
+    from bgkit.training.ratio_sampling import build_ratio_sampler_config
+    trainer._l1_ratio_sampler_cfg = build_ratio_sampler_config(
+        {"enabled": False, "mode": "jitter"},
+        anchor_grid=(trainer._l1_retention,),
+        default_ratio=float(trainer._l1_retention),
+        enabled_default=False,
+        mode_default="jitter",
+    )
+    trainer._l1_ratio_rng = _stdlib_random.Random(42)
+    trainer._step_sampled_l1_ratios = []
+
     # Fake L0 for the single article — a deterministic (1, K, D) tensor
     class _TokenStore:
         def has(self, dataset, aid):

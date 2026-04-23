@@ -32,6 +32,11 @@ from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
+from bgkit.training.ratio_sampling import (
+    build_ratio_sampler_config,
+    resolve_anchor_grid,
+    sample_ratio,
+)
 from bgkit.utils.attention_backend import resolve_attention_implementation
 
 logger = structlog.get_logger()
@@ -83,6 +88,24 @@ class CommitEncodingTrainer(BaseTrainer):
         backbone_revision = bgkit_cfg.get("backbone_revision", None)
         hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
         bidi_warmup = tcfg.get("bidi_warmup_steps", 500)
+        model_cfg = self.cfg.model
+        ctrl_src = model_cfg.get("threshold_controller", {})
+        curriculum = tcfg.get("curriculum", {})
+        target_ratio_start = float(
+            curriculum.get("target_ratio_start", tcfg.get("target_ratio_start", 0.50)),
+        )
+        threshold_controller_cfg = {
+            "init_theta": float(
+                ctrl_src.get("init_theta", 1.0 - 2.0 * target_ratio_start),
+            ),
+            "lr": float(ctrl_src.get("lr", 0.02)),
+            "momentum": float(ctrl_src.get("momentum", 0.0)),
+            "clamp": float(ctrl_src.get("clamp", 0.99)),
+            "anchor_ratios": list(ctrl_src.get("anchor_ratios", [])) or None,
+            "ratio_space": str(ctrl_src.get("ratio_space", "log")),
+            "init_target_ratio": target_ratio_start,
+            "default_query_ratio": target_ratio_start,
+        }
 
         step1_checkpoint = self._resolve_step1_checkpoint()
         step1_state_dicts: dict | None = None
@@ -106,6 +129,7 @@ class CommitEncodingTrainer(BaseTrainer):
                 revision=backbone_revision,
                 attn_implementation=attention_impl,
                 bidi_warmup_steps=bidi_warmup,
+                threshold_controller_cfg=threshold_controller_cfg,
             )
         else:
             self.encoder = BgKITEncoder.from_pretrained(
@@ -116,6 +140,7 @@ class CommitEncodingTrainer(BaseTrainer):
                 revision=backbone_revision,
                 attn_implementation=attention_impl,
                 bidi_warmup_steps=bidi_warmup,
+                threshold_controller_cfg=threshold_controller_cfg,
             )
         self.encoder.to(device)
 
@@ -308,6 +333,34 @@ class CommitEncodingTrainer(BaseTrainer):
             "target_ratio_ramp_steps", tcfg.get("target_ratio_ramp_steps", 30000),
         )
         self._target_ratio_override: float | None = None
+        anchor_grid = resolve_anchor_grid(
+            self.cfg.model,
+            float(self._target_ratio_start),
+            getattr(self.encoder.compressor.threshold_l0, "anchor_ratios", None),
+        )
+        self._target_ratio_sampler_cfg = build_ratio_sampler_config(
+            {
+                "enabled": tcfg.get("sample_target_ratio_during_training", False),
+                "mode": tcfg.get("target_ratio_sampling_mode", "window"),
+                "sampling_max": tcfg.get(
+                    "target_ratio_sampling_max",
+                    max(float(self._target_ratio_start), max(anchor_grid)),
+                ),
+                "anchor_sampling_prob": tcfg.get(
+                    "target_ratio_anchor_sampling_prob", 0.30,
+                ),
+                "jitter_abs": tcfg.get("target_ratio_jitter_abs", 0.0),
+                "jitter_rel": tcfg.get("target_ratio_jitter_rel", 0.0),
+            },
+            anchor_grid=anchor_grid,
+            default_ratio=float(self._target_ratio_start),
+            enabled_default=False,
+            mode_default="window",
+        )
+        import random
+
+        self._target_ratio_rng = random.Random(int(self.cfg.get("seed", 42)))
+        self._last_sampled_target_ratio: float | None = None
 
         # --- Survivorship head config (per-level) ---
         # Step 4 is where L1 first activates — L0 head is trained from Step 3
@@ -527,11 +580,60 @@ class CommitEncodingTrainer(BaseTrainer):
             self._target_ratio_end - self._target_ratio_start
         )
 
+    def _sample_target_ratio(self) -> float:
+        """Sample a requested ratio for the current packed batch."""
+        if not hasattr(self, "_target_ratio_sampler_cfg"):
+            tcfg = self.cfg.training
+            curriculum = tcfg.get("curriculum", {})
+            model_cfg = getattr(self.cfg, "model", {})
+            anchor_grid = resolve_anchor_grid(
+                model_cfg,
+                float(self._target_ratio_start),
+                getattr(self.encoder.compressor.threshold_l0, "anchor_ratios", None),
+            )
+            self._target_ratio_sampler_cfg = build_ratio_sampler_config(
+                {
+                    "enabled": tcfg.get("sample_target_ratio_during_training", False),
+                    "mode": tcfg.get("target_ratio_sampling_mode", "window"),
+                    "sampling_max": tcfg.get(
+                        "target_ratio_sampling_max",
+                        max(float(self._target_ratio_start), max(anchor_grid)),
+                    ),
+                    "anchor_sampling_prob": tcfg.get(
+                        "target_ratio_anchor_sampling_prob", 0.30,
+                    ),
+                    "jitter_abs": tcfg.get("target_ratio_jitter_abs", 0.0),
+                    "jitter_rel": tcfg.get("target_ratio_jitter_rel", 0.0),
+                },
+                anchor_grid=anchor_grid,
+                default_ratio=float(
+                    curriculum.get(
+                        "target_ratio_start",
+                        tcfg.get("target_ratio_start", self._target_ratio_start),
+                    ),
+                ),
+                enabled_default=False,
+                mode_default="window",
+            )
+        if not hasattr(self, "_target_ratio_rng"):
+            import random
+
+            self._target_ratio_rng = random.Random(int(self.cfg.get("seed", 42)))
+        if not hasattr(self, "_last_sampled_target_ratio"):
+            self._last_sampled_target_ratio = None
+        return sample_ratio(
+            rng=self._target_ratio_rng,
+            config=self._target_ratio_sampler_cfg,
+            base_ratio=self._current_target_ratio(),
+            is_evaluating=not self.encoder.training,
+            override_active=self._target_ratio_override is not None,
+        )
+
     # ------------------------------------------------------------------
     # Compression pipeline: packed L0 across files -> packed L1 per commit
     # ------------------------------------------------------------------
 
-    def _compress_repo_l0_packed(self, batch: dict):
+    def _compress_repo_l0_packed(self, batch: dict, target_ratio: float):
         """Single packed L0 forward across every file in every commit.
 
         Uses ``cu_file_seqlens`` (one segment per file) and per-file-tiled
@@ -552,7 +654,6 @@ class CommitEncodingTrainer(BaseTrainer):
         content_emb = bgkit_embed(file_ids)
         prompt_emb = bgkit_embed(prompt_ids)
 
-        target_ratio = self._current_target_ratio()
         util_active = getattr(
             self, "_surv_l0", LevelLossCfg(),
         ).utility_grad_loss_weight > 0.0
@@ -657,6 +758,7 @@ class CommitEncodingTrainer(BaseTrainer):
         self,
         enc_out,
         level: str,
+        target_ratio: float,
         content_token_ids: torch.Tensor | None = None,
         content_cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
@@ -687,7 +789,6 @@ class CommitEncodingTrainer(BaseTrainer):
                 state = init_state()
                 self._surv_state_l1 = state
 
-        target_ratio = self._current_target_ratio()
         loss, metrics = compute_survivorship_losses(
             enc_out=enc_out,
             level=level,
@@ -700,7 +801,7 @@ class CommitEncodingTrainer(BaseTrainer):
             content_cu_seqlens=content_cu_seqlens,
             target_ratio=target_ratio,
         )
-        accumulate(state, enc_out)
+        accumulate(state, enc_out, target_ratio=target_ratio)
         out_metrics = {f"{level}_{k}": v for k, v in metrics.items()}
         diag_every_n = int(getattr(self, "_diagnostic_metrics_every_n_steps", 1) or 1)
         out_metrics.update(
@@ -727,6 +828,8 @@ class CommitEncodingTrainer(BaseTrainer):
         self.decoder.train()
 
         device = self.device
+        target_ratio = self._sample_target_ratio()
+        self._last_sampled_target_ratio = target_ratio
         cu_repo = batch["cu_repo_seqlens"].to(device)
         batch_size = int(cu_repo.shape[0]) - 1
         scale = 1.0 / (batch_size * self._accum_steps)
@@ -743,11 +846,11 @@ class CommitEncodingTrainer(BaseTrainer):
             "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
         ):
             # Step 1: packed L0 across all files in all commits.
-            l0_out = self._compress_repo_l0_packed(batch)
+            l0_out = self._compress_repo_l0_packed(batch, target_ratio=target_ratio)
             l0_surv_loss = None
             if l0_out.logits_for_op is not None:
                 l0_surv_loss, l0_metrics = self._apply_surv_losses(
-                    l0_out, level="l0",
+                    l0_out, level="l0", target_ratio=target_ratio,
                     content_token_ids=batch["content_token_ids"].to(device),
                     content_cu_seqlens=batch["cu_file_seqlens"].to(device),
                 )
@@ -768,7 +871,6 @@ class CommitEncodingTrainer(BaseTrainer):
             empty_prompt_pos = torch.zeros(0, dtype=torch.int64, device=device)
 
             # Step 3: packed L1 across all commits.
-            target_ratio = self._current_target_ratio()
             l1_out = self.encoder(
                 content_embeddings=l1_input_flat,
                 content_cu_seqlens=l1_input_cu,
@@ -783,7 +885,7 @@ class CommitEncodingTrainer(BaseTrainer):
             l1_surv_loss = None
             if l1_out.logits_for_op is not None:
                 l1_surv_loss, l1_metrics = self._apply_surv_losses(
-                    l1_out, level="l1",
+                    l1_out, level="l1", target_ratio=target_ratio,
                     content_token_ids=None,
                     content_cu_seqlens=l1_input_cu,
                 )
@@ -853,7 +955,8 @@ class CommitEncodingTrainer(BaseTrainer):
 
         result = {
             "loss": float(loss.item()),
-            "target_ratio": target_ratio,
+            "target_ratio": self._current_target_ratio(),
+            "sampled_target_ratio": target_ratio,
             "actual_ratio": actual_ratio,
         }
         result.update(aux_metrics)
@@ -873,7 +976,6 @@ class CommitEncodingTrainer(BaseTrainer):
             maybe_unload_ice,
         )
 
-        target_ratio = self._current_target_ratio()
         merged: dict[str, float] = {}
         for level, state_attr in (("l0", "_surv_state_l0"), ("l1", "_surv_state_l1")):
             state = getattr(self, state_attr, None)
@@ -882,7 +984,7 @@ class CommitEncodingTrainer(BaseTrainer):
             update_metrics = apply_post_step_updates(
                 self.encoder.compressor,
                 state,
-                target_ratio=target_ratio,
+                target_ratio=None,
                 level=level,
             )
             merged.update(update_metrics)
@@ -908,6 +1010,8 @@ class CommitEncodingTrainer(BaseTrainer):
 
     def _add_step_metrics(self, metrics: dict[str, float]) -> None:
         """Attach post-step θ/μ updates (without clobbering base metrics)."""
+        if self._last_sampled_target_ratio is not None:
+            metrics.setdefault("sampled_target_ratio", self._last_sampled_target_ratio)
         post = getattr(self, "_last_post_step_metrics", None)
         if post:
             for k, v in post.items():
@@ -947,7 +1051,9 @@ class CommitEncodingTrainer(BaseTrainer):
                     "cuda", dtype=torch.bfloat16,
                     enabled=self.device.type == "cuda",
                 ):
-                    l0_out = self._compress_repo_l0_packed(batch)
+                    l0_out = self._compress_repo_l0_packed(
+                        batch, target_ratio=target_ratio,
+                    )
                     l1_input_flat, l1_input_cu = self._regroup_survivors_per_repo(
                         l0_out.survivor_embeddings,
                         l0_out.survivor_cu_seqlens,
@@ -1045,10 +1151,15 @@ class CommitEncodingTrainer(BaseTrainer):
 
     def _restore_model_state(self, state_dicts: dict) -> None:
         if "encoder" in state_dicts:
-            self.encoder.load_state_dict(state_dicts["encoder"])
+            from bgkit.models.encoder import migrate_legacy_threshold_controller_state_dict
+
+            enc_state = migrate_legacy_threshold_controller_state_dict(
+                state_dicts["encoder"],
+                self.encoder,
+            )
+            self.encoder.load_state_dict(enc_state)
         if "decoder" in state_dicts:
             self.decoder.load_state_dict(state_dicts["decoder"])
 
     def _restore_training_state(self, training_state: dict) -> None:
         self._target_ratio_override = training_state.get("target_ratio_override")
-
