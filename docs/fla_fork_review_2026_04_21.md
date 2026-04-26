@@ -1,5 +1,19 @@
 # flash-linear-attention fork review — 2026-04-21
 
+> **⚠️ STALE — superseded by 2026-04-26 work.** This doc reflected the
+> state of `blackwell-sm121-compat` at HEAD `f11bc2f` before:
+> - The cherry-pick of `8b05e2f` (PR #825) that **broadens
+>   `IS_NVIDIA_BLACKWELL`** to `>= 10`, so sm_121 (capability 12.x)
+>   *does* qualify as Blackwell. The "not applicable" claims below for
+>   `8b05e2f`, `02af88e`, `27c2022` are wrong as of cherry-pick.
+> - The 2026-04-26 rebase onto upstream `761fc0b` (PR #798 — autotune
+>   cache) and addition of sm_121-tuned autotune configs.
+> - The audit dropping configs that hit the `(num_warps > num_stages > 1)`
+>   trap from issue [#790](https://github.com/fla-org/flash-linear-attention/issues/790).
+>
+> See `plans/deltanet-custom-kernel.md` for the current state and roadmap.
+> The historical content below is preserved for context, not as guidance.
+
 Investigation of whether the local fla fork at `/home/werg/flash-linear-attention/`
 (branch `blackwell-sm121-compat`) is still needed given stock `fla==0.4.2` +
 Triton 3.6.0 in the NGC 26.03 training container.
