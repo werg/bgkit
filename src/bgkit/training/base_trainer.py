@@ -597,6 +597,17 @@ class BaseTrainer(ABC):
         self, checkpoint_dir: Path, metrics: dict[str, float] | None = None
     ) -> Path:
         """Save checkpoint with phase metadata and lineage."""
+        # Capture per-param-group base_lrs into schedule_params so they
+        # survive restart. Without this, live `lr` bumps that scale per-
+        # group base_lrs (encoder vs decoder) are lost on restart — the
+        # optimizer is rebuilt from yaml in setup() and the live handler
+        # then no-ops because new == saved-global. See 04-26 perf notes.
+        opt = getattr(self, "optimizer", None)
+        if opt is not None and self._schedule_params is not None:
+            self._schedule_params["per_group_base_lrs"] = [
+                float(pg.get("base_lr", self._schedule_params.get("base_lr", 0.0)))
+                for pg in opt.param_groups
+            ]
         metadata = CheckpointMetadata(
             phase=self.cfg.training.phase,
             step=self.global_step,
@@ -1305,6 +1316,32 @@ class BaseTrainer(ABC):
             if tcfg.max_steps > max_steps:
                 max_steps = tcfg.max_steps
                 logger.info("max_steps_extended", max_steps=max_steps)
+            # Restore per-param-group base_lrs if saved (preserves live `lr`
+            # ratio scaling across restarts — e.g. encoder vs decoder LoRA
+            # rates that diverge from the global base_lr).
+            saved_per_group = self._schedule_params.get("per_group_base_lrs")
+            if saved_per_group is not None:
+                opt = getattr(self, "optimizer", None)
+                if opt is None:
+                    logger.warning(
+                        "schedule_per_group_base_lr_skip",
+                        reason="optimizer_not_yet_built",
+                    )
+                elif len(saved_per_group) != len(opt.param_groups):
+                    logger.warning(
+                        "schedule_per_group_base_lr_count_mismatch",
+                        saved=len(saved_per_group),
+                        current=len(opt.param_groups),
+                        action="ignored — likely yaml param-group structure changed",
+                    )
+                else:
+                    for pg, lr in zip(opt.param_groups, saved_per_group, strict=True):
+                        pg["base_lr"] = float(lr)
+                    logger.info(
+                        "schedule_per_group_base_lr_restored",
+                        count=len(saved_per_group),
+                        values=[round(v, 6) for v in saved_per_group],
+                    )
         else:
             max_steps = tcfg.max_steps
             base_lr = tcfg.lr
@@ -1317,7 +1354,10 @@ class BaseTrainer(ABC):
                     warmup_steps=warmup_steps,
                 )
 
-        # Store schedule params for checkpointing
+        # Store schedule params for checkpointing. per_group_base_lrs is
+        # populated in save_checkpoint() right before serialization so we
+        # capture the latest live-scaled values without needing to track
+        # them every step.
         self._schedule_params = {
             "max_steps": max_steps,
             "base_lr": base_lr,
