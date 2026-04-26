@@ -73,6 +73,7 @@ class CommitEncodingTrainer(BaseTrainer):
         "target_ratio": "_handle_target_ratio",
         "target_ratio_sampling_window_above": "_handle_ratio_sampling_window_above",
         "sample_target_ratio_during_training": "_handle_ratio_sampling_enabled",
+        "target_ratio_anchor_sampling_prob": "_handle_ratio_sampling_anchor_prob",
     }
 
     def setup(self) -> None:

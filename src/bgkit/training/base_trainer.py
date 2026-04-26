@@ -862,6 +862,37 @@ class BaseTrainer(ABC):
                 new=new_val,
             )
 
+    def _handle_ratio_sampling_anchor_prob(self, val: float | int) -> None:
+        """Live-config handler for ``target_ratio_anchor_sampling_prob``.
+
+        Probability per microbatch of trying anchor-grid sampling
+        (snap to one of ``RatioSamplerConfig.anchor_grid``) instead of
+        uniform sampling within the window. Only effective when at least
+        one anchor falls inside ``[floor, floor + window_above]`` —
+        otherwise the anchor branch is a no-op and the ratio is sampled
+        uniformly anyway.
+        """
+        if not isinstance(val, (int, float)) or not 0.0 <= float(val) <= 1.0:
+            logger.warning(
+                "live_ratio_anchor_sampling_prob_invalid",
+                value=val,
+                expected="float in [0, 1]",
+            )
+            return
+        new_val = float(val)
+        for attr in self.RATIO_SAMPLER_CFG_ATTRS:
+            cfg = getattr(self, attr, None)
+            if cfg is None:
+                continue
+            old = cfg.anchor_sampling_prob
+            setattr(self, attr, dataclasses.replace(cfg, anchor_sampling_prob=new_val))
+            logger.info(
+                "live_ratio_anchor_sampling_prob_update",
+                attr=attr,
+                old=old,
+                new=new_val,
+            )
+
     def _rebuild_train_dataloader_with_budget(self, new_budget: int) -> None:
         """Rebuild the train dataloader with a new token budget.
 

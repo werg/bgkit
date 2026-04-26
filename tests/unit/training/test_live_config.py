@@ -277,3 +277,31 @@ def test_sampling_enabled_live_update_rejects_non_bool():
     t = _SamplingEnabledStub()
     t.apply_live_config({"sample_target_ratio_during_training": "yes"})
     assert t._target_ratio_sampler_cfg.enabled is True  # unchanged
+
+
+# --- Tests for the shared anchor-sampling-prob live handler ---
+
+
+class _AnchorProbStub(_SamplerStubTrainer):
+    LIVE_CONFIG_HANDLERS = {
+        "target_ratio_anchor_sampling_prob": "_handle_ratio_sampling_anchor_prob",
+    }
+
+
+def test_anchor_prob_live_update_changes_field():
+    t = _AnchorProbStub()
+    assert t._target_ratio_sampler_cfg.anchor_sampling_prob == 0.30
+    t.apply_live_config({"target_ratio_anchor_sampling_prob": 0.5})
+    assert t._target_ratio_sampler_cfg.anchor_sampling_prob == 0.5
+    t.apply_live_config({"target_ratio_anchor_sampling_prob": 0.0})
+    assert t._target_ratio_sampler_cfg.anchor_sampling_prob == 0.0
+
+
+def test_anchor_prob_live_update_rejects_out_of_range():
+    t = _AnchorProbStub()
+    t.apply_live_config({"target_ratio_anchor_sampling_prob": 1.5})
+    assert t._target_ratio_sampler_cfg.anchor_sampling_prob == 0.30  # unchanged
+    t.apply_live_config({"target_ratio_anchor_sampling_prob": -0.1})
+    assert t._target_ratio_sampler_cfg.anchor_sampling_prob == 0.30  # unchanged
+    t.apply_live_config({"target_ratio_anchor_sampling_prob": "half"})
+    assert t._target_ratio_sampler_cfg.anchor_sampling_prob == 0.30  # unchanged
