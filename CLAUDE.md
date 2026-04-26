@@ -211,14 +211,26 @@ Example control file (one block per active phase):
 
 ## flash-linear-attention (fla) on sm_121
 
-Stock PyPI `fla==0.4.2` is installed in the training container via `pip install ".[gpu]"`. The local fork at `/home/werg/flash-linear-attention/` (branch `blackwell-sm121-compat`, commit `f11bc2f`) replaced three Triton kernels with torch fallbacks on an older Triton. Triton 3.6.0 in NGC 26.03 fixes the underlying codegen bugs; the fork is **not bind-mounted or installed**. See `docs/fla_fork_review_2026_04_21.md` for the full audit.
+Stock PyPI `fla==0.4.2` is installed in the training container via `pip install ".[gpu]"`, **but the local fork at `/home/werg/flash-linear-attention/` (branch `blackwell-sm121-compat`, HEAD `845bcb2`) is bind-mounted into all GPU services** at `/workspace/fla:ro` and prepended to `PYTHONPATH`, so `import fla` resolves to the fork (not dist-packages). The fork carries:
 
-Runtime patches that remain:
+1. **Broadened `IS_NVIDIA_BLACKWELL`** (`fla/utils.py`, commit `89d38ea`): widened from `capability[0] == 10` to `>= 10` so sm_121 (capability (12, 1) on DGX Spark) qualifies as Blackwell. Activates the `global_scratch` allocator (a NullAllocator-deadlock fix on autotuned kernels) and any future Blackwell-gated paths.
+2. **sm_121 autotune configs** (commit `5addcb1`): adds Blackwell-only Triton autotune candidates across `chunk_delta_h`, `chunk_o`, and `wy_fast` — `num_stages={3,4,5}`, `num_warps=8`, larger `BLOCK_K`/`BLOCK_V`. Append-only, gated on `IS_NVIDIA_BLACKWELL` so non-Blackwell arches are bit-identical. **This commit is the actual perf win**: phase1_step3 dropped from ~70 s/step to ~14 s/step (~5×) on the 04-26 measurement.
+3. **Opt-in `chunk_fwd_o_sm121` custom kernel** (commit `845bcb2`): default-off via `FLA_USE_SM121_CUSTOM_KERNEL=1`. UNVERIFIED — has no GPU parity test passed yet. Leave off unless deliberately experimenting.
+4. **WY-fast torch fallbacks** (commit `f11bc2f`, pre-existing): replaced three older Triton kernels with torch fallbacks on Triton ≤ 3.4. Obsolete on Triton 3.6 in NGC 26.03 but kept on the branch.
+
+Runtime patches that remain (in bgkit, not fla):
 - `src/bgkit/utils/deltanet_patch.py` — clamps per-step gate to `>= -1.3` to prevent backward NaN on Qwen3.5 heads with extreme `A_log`/`dt_bias`, and wires `cu_seqlens` into `Qwen3_5GatedDeltaNet.forward`. No upstream replacement.
 - `src/bgkit/utils/triton_patch.py` — sm_121-scoped autotuner `_bench` error catcher + `CompiledKernel._init_handles` retry. Defensive; low cost.
-- `FLA_USE_TMA=0` in compose — matches fla 0.4.2 default (fla#609 fixed); kept as defensive pin. TMA verified to work on sm_121 if enabled.
+- `FLA_USE_TMA=1` in compose — TMA verified to work on sm_121 with Triton 3.6 (was defensively pinned to 0; re-enabled 2026-04-21).
 
-Gotcha: fla's `IS_NVIDIA_BLACKWELL = (capability[0] == 10)` does **not** match sm_121 (capability (12, 1)). Blackwell-specific workarounds in fla `8b05e2f` / `02af88e` / `27c2022` are therefore inactive on DGX Spark. Not currently a problem because Triton 3.6 emits correct code on sm_121 without them, but worth filing upstream as a Blackwell-detection broadening.
+After restart with the bind-mount, verify the fork is loaded:
+```
+docker exec <container> python -c \
+  "import fla; from fla.utils import IS_NVIDIA_BLACKWELL; print(fla.__file__, IS_NVIDIA_BLACKWELL)"
+# Expect: /workspace/fla/fla/__init__.py True
+```
+
+The fork is in-memory autotune only (no persistent cache); first ~50 steps after restart pay autotune-benchmarking cost as Triton tries each new config, then the winner is cached for the process lifetime.
 
 | Task | Command |
 |---|---|
