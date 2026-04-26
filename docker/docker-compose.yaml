@@ -42,6 +42,16 @@ x-gpu-common: &gpu-common
     # Triton autotuner crash on sm_121 is handled by bgkit.utils.triton_patch
     # Persist torch.compile cache across container restarts
     - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+    # Triton autotune cache. Default is ~/.triton/cache (= /workspace/.triton
+    # under HOME=/workspace), which is in the container's writable layer and
+    # gets wiped by ``docker compose rm``. Point it at the bind-mounted
+    # CHECKPOINT_DIR so the autotune.json files persist across container
+    # removal — meaning each (kernel, shape) signature is autotuned ONCE
+    # ever, not once per container life. Eliminates the ~50-step JIT-warmup
+    # tail after each restart. (PR #798's `fla/configs/` mechanism is the
+    # static, ship-with-fork variant; this is the live, grow-during-training
+    # variant. They coexist.)
+    - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
     # PYTHONPATH override: prepend the local flash-linear-attention fork so
     # `import fla` resolves to the bind-mounted blackwell-sm121-compat
     # branch (sm_121 detection + global_scratch allocator) instead of the
