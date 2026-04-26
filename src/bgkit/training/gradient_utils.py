@@ -48,11 +48,95 @@ def maybe_enable_gradient_checkpointing(model: nn.Module, cfg: Any) -> bool:
     Returns True if checkpointing was enabled. Use this at every call site
     that currently hardcodes ``enable_gradient_checkpointing(model)`` so the
     ``compute.gradient_checkpointing: false`` knob actually takes effect.
+
+    When ``cfg.training.gradient_checkpointing`` (or ``cfg.compute....``) is
+    set to the string ``"selective"``, this enables checkpointing then
+    swaps the model's ``_gradient_checkpointing_func`` for a layer-aware
+    variant that **skips checkpointing on Qwen3.5 DeltaNet layers** (those
+    that own a ``linear_attn`` submodule) and applies checkpointing to all
+    other decoder layers (FullAttention).
+
+    Why: per the 2026-04-26 perf investigation, DeltaNet's recompute under
+    checkpointing dominates the per-step wall clock (3 of every 4 Qwen3.5
+    decoder layers are DeltaNet). Skipping recompute on DeltaNet specifically
+    trades ~2 GB of extra activation memory for the recompute cost of the
+    expensive layers, while keeping cheaper FullAttention checkpointed.
     """
-    if not gradient_checkpointing_requested(cfg):
+    requested = _resolve_gradient_checkpointing_mode(cfg)
+    if requested is False or requested is None:
         return False
     enable_gradient_checkpointing(model)
+    if requested == "selective":
+        _install_selective_checkpoint_func(model)
     return True
+
+
+def _resolve_gradient_checkpointing_mode(cfg: Any) -> bool | str | None:
+    """Return True / False / "selective" / None for the gradient-checkpointing knob."""
+    tcfg = getattr(cfg, "training", None)
+    compute = getattr(cfg, "compute", None)
+
+    if tcfg is not None and hasattr(tcfg, "get"):
+        training_val = tcfg.get("gradient_checkpointing", None)
+        if training_val is not None:
+            return _coerce_gradient_checkpointing_value(training_val)
+
+    if compute is not None and hasattr(compute, "get"):
+        compute_val = compute.get("gradient_checkpointing", True)
+        return _coerce_gradient_checkpointing_value(compute_val)
+
+    return True
+
+
+def _coerce_gradient_checkpointing_value(val: Any) -> bool | str:
+    if isinstance(val, str):
+        normalized = val.strip().lower()
+        if normalized in {"selective", "deltanet_off", "skip_deltanet"}:
+            return "selective"
+        if normalized in {"true", "1", "on", "yes"}:
+            return True
+        if normalized in {"false", "0", "off", "no"}:
+            return False
+    return bool(val)
+
+
+def _install_selective_checkpoint_func(model: nn.Module) -> None:
+    """Replace model._gradient_checkpointing_func with a DeltaNet-skipping variant.
+
+    HF's text-model forward calls ``self._gradient_checkpointing_func(layer.__call__,
+    ...)`` per decoder layer. The first arg's ``__self__`` reveals the layer being
+    invoked. We pass DeltaNet layers through directly (skip recompute) and apply
+    standard ``torch.utils.checkpoint.checkpoint`` to all other layers.
+    """
+    from torch.utils.checkpoint import checkpoint as _torch_checkpoint
+
+    def _selective_checkpoint(fn, *args, use_reentrant: bool = False, **kwargs):
+        layer = getattr(fn, "__self__", None)
+        if layer is not None and _is_deltanet_layer(layer):
+            return fn(*args, **kwargs)
+        return _torch_checkpoint(fn, *args, use_reentrant=use_reentrant, **kwargs)
+
+    # The text-model is usually one level inside an AutoModelForCausalLM.
+    targets = [model]
+    inner = getattr(model, "model", None)
+    if inner is not None and inner is not model:
+        targets.append(inner)
+    text_model = getattr(inner, "language_model", None) if inner is not None else None
+    if text_model is not None and text_model not in targets:
+        targets.append(text_model)
+
+    for target in targets:
+        if hasattr(target, "_gradient_checkpointing_func"):
+            target._gradient_checkpointing_func = _selective_checkpoint
+
+
+def _is_deltanet_layer(layer: nn.Module) -> bool:
+    """A Qwen3.5 decoder layer is DeltaNet iff it owns a ``linear_attn`` submodule.
+
+    Full-attention layers expose ``self_attn`` instead. See the Qwen3.5
+    architecture notes in CLAUDE.md.
+    """
+    return hasattr(layer, "linear_attn") and getattr(layer, "linear_attn") is not None
 
 
 def clip_grad_norm(

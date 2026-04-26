@@ -8,6 +8,11 @@
 | `cuda_max_allocated_gb` | 18.5 GB | 10.4 GB | -44% |
 | 25k-step ETA | ~19 days | **~4 days** | -79% |
 
+(Earlier draft also reported 12.5 s/step with `gradient_checkpointing:
+false` — that ran fine for ~70 steps then blew the memory cap on a
+longer sample. Reverted; ckpt-off is too tight on this workload. See
+"Memory headroom is misleading" in the playbook.)
+
 Loss curve, gradient norm, and survivor metrics all preserved; bit-for-bit
 unchanged for non-Blackwell arches.
 

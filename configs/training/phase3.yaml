@@ -28,6 +28,11 @@ decoder_lr: 3.0e-5         # decoder and encoder share lr here (encoder frozen)
 warmup_steps: 2000         # TODO: 2k steps ~= 2% of 100k, matches typical SFT ramp
 max_batch_tokens: 32768
 gradient_accumulation_steps: 2
+# 2026-04-26: large distillation footprint (encoded SWE-bench repos +
+# decoder + teacher trajectories in memory). Override the new "selective"
+# default to full ckpt-on; selective skips DeltaNet activation-saving
+# and would push the footprint over the cap. Re-evaluate after profiling.
+gradient_checkpointing: true
 eval_every: 2000
 save_every: 5000
 diagnostic_metrics_every_n_steps: 100

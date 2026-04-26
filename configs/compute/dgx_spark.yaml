@@ -3,8 +3,17 @@
 device: cuda
 # Mixed precision -- BF16 default (MXFP8/MXFP4 not supported on sm_121)
 mixed_precision: bf16
-# Gradient checkpointing across BgKIT encoder levels and the 0.8B decoder
-gradient_checkpointing: true
+# Gradient checkpointing across BgKIT encoder levels and the 0.8B decoder.
+# "selective" (default since 2026-04-26): skip checkpointing on Qwen3.5
+# DeltaNet decoder layers (18 of 24, the recompute hot spot per the
+# 04-26 perf investigation) and apply checkpointing to the remaining
+# FullAttention layers. Bounds extra activation memory to ~2 GB while
+# eliminating the dominant recompute cost. Override to "true" in
+# stage configs that have heavier model footprints (Step 2 distillation,
+# Phase 2 Stage A, Phase 3) where the extra activation memory pushes
+# over the cap. Override to "false" only after profiling (see
+# docs/dgx_spark_perf_playbook.md).
+gradient_checkpointing: selective
 # Conservative defaults -- must be profiled on actual hardware
 # max_seq_len: 8192 pre-2026-04-19. Lowered to 4096 because decoder
 # splice under target_ratio≈0.9 balloons single-sample seq to 15K

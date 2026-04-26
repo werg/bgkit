@@ -45,11 +45,15 @@ gradient_accumulation_steps: 4
 # gradient_checkpointing: set training.gradient_checkpointing (overrides) or
 # compute.gradient_checkpointing (canonical, hardware-scoped). Default True.
 # Gated by bgkit.training.gradient_utils.maybe_enable_gradient_checkpointing
-# in every trainer; setting false disables grad-ckpt on both decoder + encoder.
-# 2026-04-26: tried disabling — instant OOM (model wants 75.7 GB, cap 75.55).
-# The 18 GB cuda_max_allocated reading was post-recompute (between recomputes
-# the activations are released); peak DURING the activation-saving pass is
-# much higher. Stays on.
+# in every trainer; "true" / "false" / "selective" all valid.
+# 2026-04-26 v4: "selective" mode skips checkpointing on the 18 of 24
+# Qwen3.5 decoder layers that own a DeltaNet (linear_attn) submodule
+# while keeping checkpointing on the 6 FullAttention layers. Targets
+# the dominant per-step recompute cost (DeltaNet) while bounding the
+# extra activation memory to ~2 GB — small enough to stay under the
+# unified-memory cap even on long-tail samples that broke ckpt-off in v3.
+# Falls back to full ckpt-on (the safe default) if anything goes wrong.
+gradient_checkpointing: selective
 max_eval_samples: 500
 eval_every: 500
 save_every: 500
