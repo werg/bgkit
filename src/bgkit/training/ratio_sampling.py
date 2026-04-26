@@ -106,21 +106,29 @@ def sample_ratio(
     is_evaluating: bool,
     override_active: bool,
 ) -> float:
-    """Sample a requested ratio according to ``config``."""
+    """Sample a requested ratio according to ``config``.
+
+    Two independent mechanisms:
+
+    1. **Window sampling** (``1 - anchor_sampling_prob``): uniform draw from
+       the window ``interval_for(base)`` — narrow band around the curriculum
+       floor for fine-grained θ(r) calibration near the operating point.
+    2. **Anchor sampling** (``anchor_sampling_prob``): uniform pick from the
+       *full* ``anchor_grid``, regardless of the window. This is the
+       wide-range calibration mechanism — it deliberately probes ratios far
+       from the current curriculum so the threshold curve stays calibrated
+       everywhere, not just near the operating point. Each anchor is
+       clamped to ``[lower_bound, upper_bound]``.
+    """
     base = _clamp_ratio(base_ratio, config.lower_bound, config.upper_bound)
     if is_evaluating or override_active or not config.enabled:
         return base
 
+    if config.anchor_grid and rng.random() < config.anchor_sampling_prob:
+        anchor = config.anchor_grid[rng.randrange(len(config.anchor_grid))]
+        return _clamp_ratio(anchor, config.lower_bound, config.upper_bound)
+
     low, high = config.interval_for(base)
     if high <= low + 1e-8:
         return base
-
-    if rng.random() < config.anchor_sampling_prob:
-        anchors = [
-            ratio for ratio in config.anchor_grid
-            if low - 1e-8 <= ratio <= high + 1e-8
-        ]
-        if anchors:
-            return anchors[rng.randrange(len(anchors))]
-
     return rng.uniform(low, high)

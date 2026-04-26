@@ -28,27 +28,35 @@ def test_window_sampling_returns_base_when_disabled():
     ) == pytest.approx(0.08)
 
 
-def test_window_sampling_can_hit_anchor_points():
+def test_anchor_sampling_picks_from_full_grid_ignoring_window():
+    """Anchor sampling is independent of the window: it picks any anchor
+    from the full grid, even ones far outside the curriculum-floor window.
+    This is the wide-range θ(r) calibration mechanism."""
     cfg = build_ratio_sampler_config(
         {
             "enabled": True,
             "mode": "window",
-            "window_above": 0.30,
-            "anchor_sampling_prob": 1.0,
+            "window_above": 0.05,           # narrow window
+            "anchor_sampling_prob": 1.0,    # always anchor
         },
-        anchor_grid=(0.08, 0.16, 0.32),
-        default_ratio=0.08,
+        anchor_grid=(0.02, 0.16, 0.95),    # all OUTSIDE [base, base+0.05]
+        default_ratio=0.50,
         enabled_default=False,
         mode_default="window",
     )
-    sampled = sample_ratio(
-        rng=random.Random(1),
-        config=cfg,
-        base_ratio=0.08,
-        is_evaluating=False,
-        override_active=False,
-    )
-    assert sampled in {0.08, 0.16, 0.32}
+    # Run multiple draws; verify they're from the FULL grid (including
+    # anchors below + above the window).
+    seen = set()
+    rng = random.Random(7)
+    for _ in range(50):
+        s = sample_ratio(
+            rng=rng, config=cfg, base_ratio=0.50,
+            is_evaluating=False, override_active=False,
+        )
+        assert s in {0.02, 0.16, 0.95}, f"sampled {s} not in full anchor grid"
+        seen.add(s)
+    # All three anchors should have been sampled at least once
+    assert seen == {0.02, 0.16, 0.95}
 
 
 def test_jitter_sampling_stays_inside_symmetric_band():

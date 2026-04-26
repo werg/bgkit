@@ -24,6 +24,12 @@ lr: 2.0e-4               # base LR (encoder gets this)
 decoder_lr: 1.0e-5        # decoder LoRA LR (low — LoRA concentrates gradients)
 encoder_lr: 2.0e-4        # encoder LR (higher — pruned encoder needs to adapt)
 warmup_steps: 500
+# 2026-04-26: drop resume_warmup_steps from default 200 → 50. Today's perf
+# investigation triggered ~10 restarts in an hour, each re-warming for 200
+# steps; cumulatively ~2000 step-equivalents at sub-base lr. 50 keeps a
+# small ramp to avoid grad spikes after restart without dominating the
+# training-step budget.
+resume_warmup_steps: 50
 # Packed-attention migration (Wave 4, 2026-04-20 sweep + wall-clock
 # investigation 2026-04-21):
 # Reverted to 32768/grad_accum=2 — the pre-migration baseline used the
@@ -97,7 +103,13 @@ target_ratio_ramp_steps: 1000
 # curve still gets calibrated as the floor moves.
 sample_target_ratio_during_training: true
 target_ratio_sampling_window_above: 0.10
-target_ratio_anchor_sampling_prob: 0.30
+# 2026-04-26: anchor sampling now picks from the full anchor grid
+# regardless of the window (was previously filtered to window-eligible
+# anchors → no-op when window narrow). Dropped from 0.30 → 0.05 since each
+# anchor draw is now an off-curriculum probe that creates a temporary
+# decoder shape change. 5% → roughly one in 20 microbatches probes a
+# random anchor for wide-range θ(r) calibration.
+target_ratio_anchor_sampling_prob: 0.05
 
 # Liger kernels: SwiGLU + RoPE + fused linear-CE are enabled. LigerRMSNorm
 # is pinned OFF due to a silent backward-pass corruption on Qwen3.5 in
