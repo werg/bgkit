@@ -46,6 +46,10 @@ gradient_accumulation_steps: 4
 # compute.gradient_checkpointing (canonical, hardware-scoped). Default True.
 # Gated by bgkit.training.gradient_utils.maybe_enable_gradient_checkpointing
 # in every trainer; setting false disables grad-ckpt on both decoder + encoder.
+# 2026-04-26: tried disabling — instant OOM (model wants 75.7 GB, cap 75.55).
+# The 18 GB cuda_max_allocated reading was post-recompute (between recomputes
+# the activations are released); peak DURING the activation-saving pass is
+# much higher. Stays on.
 max_eval_samples: 500
 eval_every: 500
 save_every: 500

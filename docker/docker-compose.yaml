@@ -34,6 +34,19 @@ x-gpu-common: &gpu-common
     # Triton autotuner crash on sm_121 is handled by bgkit.utils.triton_patch
     # Persist torch.compile cache across container restarts
     - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+    # PYTHONPATH override: prepend the local flash-linear-attention fork so
+    # `import fla` resolves to the bind-mounted blackwell-sm121-compat
+    # branch (sm_121 detection + global_scratch allocator) instead of the
+    # pip-installed PyPI fla 0.4.2 in dist-packages. Must include the
+    # Dockerfile's existing entries (FlashAttention, bgkit src, cutlass-dsl)
+    # because compose `environment` replaces, not augments, the image ENV.
+    # Entrypoint may further prepend the FA native cache repo.
+    - PYTHONPATH=/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+    # Triton kernel dump (off by default; opt-in via host env to capture
+    # PTX/SASS for TMA / cp.async.bulk verification on Blackwell sm_121).
+    # See plans/ for the perf investigation context.
+    - TRITON_KERNEL_DUMP=${TRITON_KERNEL_DUMP:-0}
+    - TRITON_DUMP_DIR=${TRITON_DUMP_DIR:-/workspace/.cache/triton-dump}
     # Unified memory tuning for DGX Spark's single 128 GB pool:
     #   - expandable_segments:True  — grow allocations incrementally instead
     #     of pre-reserving huge contiguous blocks (otherwise PyTorch would
@@ -88,6 +101,14 @@ x-gpu-common: &gpu-common
     - ../scripts:/workspace/bgkit/scripts:ro
     # Local FlashAttention checkout: mounted read-only and preferred via PYTHONPATH.
     - ../../flash-attention:/workspace/flash-attention:ro
+    # Local flash-linear-attention fork (branch blackwell-sm121-compat):
+    # broadens IS_NVIDIA_BLACKWELL gate to capability >= 10 (covers sm_121
+    # / DGX Spark) and registers the global_scratch allocator on Blackwell
+    # even when FLA_USE_TMA=0, preventing NullAllocator deadlocks on
+    # autotuned DeltaNet kernels (3 of 4 Qwen3.5 layers). Cherry-picked
+    # from upstream 8b05e2f. Pure-Python — preferred via PYTHONPATH below
+    # so it shadows the pip-installed fla 0.4.2 in dist-packages.
+    - ../../flash-linear-attention:/workspace/fla:ro
     # Wandb authenticates via netrc (machine api.wandb.ai).
     - ~/.netrc:/workspace/.netrc:ro
     # Persist torch.compile (inductor) and Triton kernel caches across restarts

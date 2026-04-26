@@ -139,6 +139,7 @@ class DecoderInitTrainer(BaseTrainer):
     LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
         "target_ratio": "_handle_target_ratio",
         "target_ratio_sampling_window_above": "_handle_ratio_sampling_window_above",
+        "sample_target_ratio_during_training": "_handle_ratio_sampling_enabled",
     }
 
     def setup(self) -> None:
@@ -1353,21 +1354,28 @@ class DecoderInitTrainer(BaseTrainer):
         survivor_cu = enc_out.survivor_cu_seqlens
 
         batch_size = int(tok_cu.shape[0]) - 1
-        tok_cu_list = tok_cu.to(torch.int64).tolist()
-        surv_cu_list = survivor_cu.to(torch.int64).tolist()
+        # Pull the four small int tensors to CPU once each (4 syncs total)
+        # instead of doing per-sample `.item()` calls inside the loop
+        # (was 2*B = ~16 syncs/microbatch on ARM unified memory). The
+        # trailing assembly stays on-device — only the loop's control
+        # variables are CPU ints.
+        tok_cu_list = tok_cu.cpu().to(torch.int64).tolist()
+        surv_cu_list = survivor_cu.cpu().to(torch.int64).tolist()
+        splice_start_list = splice_start.cpu().to(torch.int64).tolist()
+        splice_len_list = splice_len.cpu().to(torch.int64).tolist()
 
         prefix_ids: list[torch.Tensor] = []
         suffix_ids: list[torch.Tensor] = []
         per_segment_loss_masks: list[torch.Tensor] = []
         for b in range(batch_size):
-            sample_start = int(tok_cu_list[b])
-            sample_end = int(tok_cu_list[b + 1])
+            sample_start = tok_cu_list[b]
+            sample_end = tok_cu_list[b + 1]
             sample_tokens = token_ids_flat[sample_start:sample_end]
             sample_loss = loss_mask_flat[sample_start:sample_end]
-            splice_b_start = int(splice_start[b].item())
-            splice_b_len = int(splice_len[b].item())
+            splice_b_start = splice_start_list[b]
+            splice_b_len = splice_len_list[b]
             if splice_b_start < 0:
-                splice_b_start = sample_tokens.shape[0]
+                splice_b_start = sample_end - sample_start
                 splice_b_len = 0
             pre = sample_tokens[:splice_b_start]
             suf = sample_tokens[splice_b_start + splice_b_len :]
@@ -1376,8 +1384,8 @@ class DecoderInitTrainer(BaseTrainer):
 
             pre_mask = sample_loss[:splice_b_start]
             suf_mask = sample_loss[splice_b_start + splice_b_len :]
-            k_i = int(surv_cu_list[b + 1]) - int(surv_cu_list[b])
-            surv_mask = torch.zeros(k_i, dtype=torch.bool, device=device)
+            k_i = surv_cu_list[b + 1] - surv_cu_list[b]
+            surv_mask = pre_mask.new_zeros(k_i)
             per_segment_loss_masks.append(torch.cat([pre_mask, surv_mask, suf_mask], dim=0))
 
         flat_loss_mask = torch.cat(per_segment_loss_masks, dim=0)

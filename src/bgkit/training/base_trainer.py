@@ -832,6 +832,36 @@ class BaseTrainer(ABC):
                 new=new_val,
             )
 
+    def _handle_ratio_sampling_enabled(self, val: bool | int | float) -> None:
+        """Live-config handler for ``sample_target_ratio_during_training``.
+
+        Flips ``enabled`` on every ``RatioSamplerConfig`` listed in
+        ``RATIO_SAMPLER_CFG_ATTRS``. When disabled, ``sample_ratio``
+        returns the curriculum floor unchanged — useful to remove the
+        per-microbatch shape variance that defeats CUDA caching-allocator
+        block reuse.
+        """
+        if not isinstance(val, (bool, int, float)):
+            logger.warning(
+                "live_ratio_sampling_enabled_invalid",
+                value=val,
+                expected="bool",
+            )
+            return
+        new_val = bool(val)
+        for attr in self.RATIO_SAMPLER_CFG_ATTRS:
+            cfg = getattr(self, attr, None)
+            if cfg is None:
+                continue
+            old = cfg.enabled
+            setattr(self, attr, dataclasses.replace(cfg, enabled=new_val))
+            logger.info(
+                "live_ratio_sampling_enabled_update",
+                attr=attr,
+                old=old,
+                new=new_val,
+            )
+
     def _rebuild_train_dataloader_with_budget(self, new_budget: int) -> None:
         """Rebuild the train dataloader with a new token budget.
 

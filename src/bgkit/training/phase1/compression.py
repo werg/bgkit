@@ -81,6 +81,7 @@ class CompressionTrainer(BaseTrainer):
     LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
         "target_ratio": "_handle_target_ratio",
         "target_ratio_sampling_window_above": "_handle_ratio_sampling_window_above",
+        "sample_target_ratio_during_training": "_handle_ratio_sampling_enabled",
     }
 
     def setup(self) -> None:

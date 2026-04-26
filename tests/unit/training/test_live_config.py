@@ -251,3 +251,29 @@ def test_window_above_live_update_rebuilds_all_configured_attrs():
     t.apply_live_config({"target_ratio_sampling_window_above": 0.07})
     assert t._l0_ratio_sampler_cfg.window_above == 0.07
     assert t._l1_ratio_sampler_cfg.window_above == 0.07
+
+
+# --- Tests for the shared sampling-enabled live handler ---
+
+
+class _SamplingEnabledStub(_SamplerStubTrainer):
+    LIVE_CONFIG_HANDLERS = {
+        "sample_target_ratio_during_training": "_handle_ratio_sampling_enabled",
+    }
+
+
+def test_sampling_enabled_live_update_flips_enabled():
+    t = _SamplingEnabledStub()
+    assert t._target_ratio_sampler_cfg.enabled is True
+    t.apply_live_config({"sample_target_ratio_during_training": False})
+    assert t._target_ratio_sampler_cfg.enabled is False
+    # Other fields preserved.
+    assert t._target_ratio_sampler_cfg.window_above == 0.10
+    t.apply_live_config({"sample_target_ratio_during_training": True})
+    assert t._target_ratio_sampler_cfg.enabled is True
+
+
+def test_sampling_enabled_live_update_rejects_non_bool():
+    t = _SamplingEnabledStub()
+    t.apply_live_config({"sample_target_ratio_during_training": "yes"})
+    assert t._target_ratio_sampler_cfg.enabled is True  # unchanged

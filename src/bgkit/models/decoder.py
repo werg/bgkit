@@ -470,61 +470,82 @@ class ReconstructionDecoder(nn.Module):
 
         # ----------------------------------------------------------------
         # Build per-sample [prefix | survivors | suffix] embeddings and
-        # collect the flat token IDs + loss mask.
+        # collect the flat token IDs + loss mask. Vectorized to one
+        # embed_fn call for all prefixes + one for all suffixes (was
+        # 2*B small kernel launches that drove a ~17 s/step regression
+        # via host-side launch overhead on unified memory).
         # ----------------------------------------------------------------
+        surv_cu_list = survivor_cu_seqlens.tolist()  # one sync, used downstream
+        # Move prefix/suffix tensors to device once (host-side; no kernels).
+        prefix_on_device = [p.to(device=device, dtype=torch.long) for p in prefix_ids]
+        suffix_on_device = [s.to(device=device, dtype=torch.long) for s in suffix_ids]
+
+        prefix_lens = [p.shape[0] for p in prefix_on_device]
+        suffix_lens = [s.shape[0] for s in suffix_on_device]
+        surv_lens = [surv_cu_list[b + 1] - surv_cu_list[b] for b in range(batch_size)]
+        seg_lengths = [prefix_lens[b] + surv_lens[b] + suffix_lens[b] for b in range(batch_size)]
+
+        # Single concat + single embed for all prefixes (and again for suffixes).
+        if any(prefix_lens):
+            all_prefix_ids = torch.cat(prefix_on_device, dim=0)
+            emb_prefix_all = embed_fn(all_prefix_ids).to(dtype=target_dtype)
+        else:
+            emb_prefix_all = torch.empty(0, embed_fn.weight.shape[1], dtype=target_dtype, device=device)
+        if any(suffix_lens):
+            all_suffix_ids = torch.cat(suffix_on_device, dim=0)
+            emb_suffix_all = embed_fn(all_suffix_ids).to(dtype=target_dtype)
+        else:
+            emb_suffix_all = torch.empty(0, embed_fn.weight.shape[1], dtype=target_dtype, device=device)
+
+        # Assemble per-sample [emb_prefix | survivors | emb_suffix] via slice
+        # concatenations into Python lists; one final torch.cat builds the
+        # flat tensors. No per-element kernel launches inside the loop.
         sample_embeds: list[torch.Tensor] = []
         sample_token_ids: list[torch.Tensor] = []
         sample_loss: list[torch.Tensor] = []
-        # cu_seqlens for the concatenated [prefix | survivors | suffix] per sample.
-        seg_lengths: list[int] = []
-
-        surv_cu = survivor_cu_seqlens.tolist()  # (B+1,) int list
-
+        p_off = 0
+        s_off = 0
         for b in range(batch_size):
-            pre = prefix_ids[b].to(device=device, dtype=torch.long)
-            suf = suffix_ids[b].to(device=device, dtype=torch.long)
-            k_start, k_end = surv_cu[b], surv_cu[b + 1]
-            surv = survivor_embeddings[k_start:k_end].to(dtype=target_dtype)  # (K_i, D)
+            l_pre = prefix_lens[b]
+            l_suf = suffix_lens[b]
+            k_i = surv_lens[b]
 
-            l_pre = pre.shape[0]
-            k_i = surv.shape[0]
-            l_suf = suf.shape[0]
-            seg_len = l_pre + k_i + l_suf
-            seg_lengths.append(seg_len)
+            emb_pre = emb_prefix_all[p_off : p_off + l_pre]
+            emb_suf = emb_suffix_all[s_off : s_off + l_suf]
+            surv = survivor_embeddings[surv_cu_list[b] : surv_cu_list[b + 1]].to(dtype=target_dtype)
+            sample_embeds.append(torch.cat([emb_pre, surv, emb_suf], dim=0))
 
-            # Embeddings: embed prefix + raw survivors + embed suffix.
-            emb_pre = embed_fn(pre).to(dtype=target_dtype)  # (L_pre, D)
-            emb_suf = embed_fn(suf).to(dtype=target_dtype)  # (L_suf, D)
-            sample_emb = torch.cat([emb_pre, surv, emb_suf], dim=0)  # (seg_len, D)
-            sample_embeds.append(sample_emb)
+            # Token IDs: prefix + zeros for survivor splice + suffix
+            pre = prefix_on_device[b]
+            suf = suffix_on_device[b]
+            mid_zeros = pre.new_zeros(k_i)
+            sample_token_ids.append(torch.cat([pre, mid_zeros, suf], dim=0))
 
-            # Token IDs (zeros for embedding-segment positions).
-            tok = torch.zeros(seg_len, dtype=torch.long, device=device)
-            tok[:l_pre] = pre
-            # surv positions stay zero (not predictable targets)
-            tok[l_pre + k_i :] = suf
-            sample_token_ids.append(tok)
+            # Default loss mask: True only on suffix positions
+            lm_pre = pre.new_zeros(l_pre, dtype=torch.bool)
+            lm_mid = pre.new_zeros(k_i, dtype=torch.bool)
+            lm_suf = pre.new_ones(l_suf, dtype=torch.bool)
+            sample_loss.append(torch.cat([lm_pre, lm_mid, lm_suf], dim=0))
 
-            # Loss mask: by default, loss on suffix tokens only.
-            lm = torch.zeros(seg_len, dtype=torch.bool, device=device)
-            lm[l_pre + k_i :] = True  # suffix positions are loss-bearing
-            sample_loss.append(lm)
+            p_off += l_pre
+            s_off += l_suf
 
         # ----------------------------------------------------------------
         # Pack into flat (1, N_total, D) and build cu_seqlens / position_ids.
         # ----------------------------------------------------------------
-        # Flat concat along token axis.
         inputs_embeds = torch.cat(sample_embeds, dim=0).unsqueeze(0)  # (1, N_total, D)
         token_ids_flat = torch.cat(sample_token_ids, dim=0)  # (N_total,)
         default_loss_mask = torch.cat(sample_loss, dim=0)  # (N_total,)
 
         n_total = int(inputs_embeds.shape[1])
-        cu = torch.tensor(
-            [0] + [sum(seg_lengths[: i + 1]) for i in range(batch_size)],
-            dtype=torch.int32,
-            device=device,
-        )
-        max_seqlen = max(seg_lengths)
+        # Build cu via cumulative sum on a Python list (cheap; no GPU sync).
+        cu_list = [0]
+        running = 0
+        for sl in seg_lengths:
+            running += sl
+            cu_list.append(running)
+        cu = torch.tensor(cu_list, dtype=torch.int32, device=device)
+        max_seqlen = max(seg_lengths) if seg_lengths else 0
         pos_ids = position_ids_from_cu(cu, n_total)  # (N_total,)
 
         # Apply caller-supplied loss_mask if provided; otherwise use default.
@@ -538,12 +559,13 @@ class ReconstructionDecoder(nn.Module):
             final_loss_mask = default_loss_mask
 
         # Zero out cross-sample boundaries: the first token of each sample
-        # (cu[i] for i>0) appears at a shifted-target position; its source is
-        # the last token of the previous sample, which is semantically invalid.
-        for i in range(1, batch_size):
-            bnd = int(cu[i].item())
-            if bnd < n_total:
-                final_loss_mask[bnd] = False
+        # (cu[i] for i>0) appears at a shifted-target position; its source
+        # is the last token of the previous sample, which is semantically
+        # invalid. Vectorized: one indexed write instead of (B-1) .item()
+        # syncs.
+        if batch_size > 1:
+            bnds = cu[1:batch_size].long()
+            final_loss_mask = final_loss_mask.index_fill(0, bnds, False)
 
         # ----------------------------------------------------------------
         # Packed backbone forward.
