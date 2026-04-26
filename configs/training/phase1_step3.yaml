@@ -24,12 +24,13 @@ lr: 2.0e-4               # base LR (encoder gets this)
 decoder_lr: 1.0e-5        # decoder LoRA LR (low — LoRA concentrates gradients)
 encoder_lr: 2.0e-4        # encoder LR (higher — pruned encoder needs to adapt)
 warmup_steps: 500
-# 2026-04-26: drop resume_warmup_steps from default 200 → 50. Today's perf
-# investigation triggered ~10 restarts in an hour, each re-warming for 200
-# steps; cumulatively ~2000 step-equivalents at sub-base lr. 50 keeps a
-# small ramp to avoid grad spikes after restart without dominating the
-# training-step budget.
-resume_warmup_steps: 50
+# 2026-04-26 v2: dropped to 0. Checkpoint includes optimizer state
+# (Muon momentum + AdamW state), so a resumed step at full lr is
+# equivalent to one more step of the original run — no need to ramp.
+# (Earlier 50-step value was a half-measure; 200-step original default
+# was conservative against optimizer-state corruption that doesn't
+# happen in practice on clean resume.)
+resume_warmup_steps: 0
 # Packed-attention migration (Wave 4, 2026-04-20 sweep + wall-clock
 # investigation 2026-04-21):
 # Reverted to 32768/grad_accum=2 — the pre-migration baseline used the
@@ -45,9 +46,14 @@ resume_warmup_steps: 50
 # 2026-04-22: Halved from 32768/grad_accum=2 to 16384/grad_accum=4 after
 # fresh-decoder Step 3 (post-is_causal fix in 94bec17) hit allocator OOM
 # at 32768. Effective batch (tokens/optimizer-step) unchanged: 16384×4 = 65536.
-max_batch_tokens: 16384
-max_batch_tokens_eval: 65536
-gradient_accumulation_steps: 4
+# 2026-04-26: dropped 16384 → 8192 to ease memory pressure (cuda_max_reserved
+# was sustained at the 84.9 GB cap, sustaining allocator-fragmentation cost).
+# Effective batch size kept constant by doubling grad_accum_steps 4 → 8 (total
+# 65536 tokens/step unchanged). DeltaNet kernel cost ~ sum(L_i^2), so smaller
+# microbatches are also faster per step on this workload.
+max_batch_tokens: 8192
+max_batch_tokens_eval: 16384
+gradient_accumulation_steps: 8
 # gradient_checkpointing inherits "true" from compute/dgx_spark.yaml.
 # 2026-04-26 v4: tried "selective" (skip 18 DeltaNet layers, keep 6
 # FullAttention) — DeltaNet's chunk-level recurrent state is much larger
