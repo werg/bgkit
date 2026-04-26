@@ -72,8 +72,11 @@ x-gpu-common: &gpu-common
     # racing for CUDA can OOM the host without warning. The startup guard
     # refuses to start when peer CUDA usage would push us past the host
     # safety ceiling — enable ``BGKIT_ALLOW_PEER_CUDA=1`` per-invocation
-    # only when you've deliberately chosen to coexist with another GPU job
-    # and accept the auto-shrunk fraction.
+    # (e.g. via shell env or .env) only when you've deliberately chosen to
+    # coexist with another GPU job and accept the auto-shrunk fraction.
+    # Default 0 (refuse). Same pattern for BGKIT_CUDA_MEM_FRACTION (0.65).
+    - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+    - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.65}
   volumes:
     - ${DATA_DIR}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache

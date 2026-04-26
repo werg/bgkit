@@ -8,6 +8,7 @@ with bf16 autocast). Add Accelerate later for Phase 1/2.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import math
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
@@ -795,6 +796,41 @@ class BaseTrainer(ABC):
             value=val,
             expected="None or float in (0, 1)",
         )
+
+    # Subclasses with multi-level samplers (e.g. KRKBTrainer with separate
+    # L0 / L1 sampler configs) override this list so the live handler
+    # rebuilds every relevant dataclass.
+    RATIO_SAMPLER_CFG_ATTRS: ClassVar[tuple[str, ...]] = (
+        "_target_ratio_sampler_cfg",
+    )
+
+    def _handle_ratio_sampling_window_above(self, val: float | int) -> None:
+        """Live-config handler for ``target_ratio_sampling_window_above``.
+
+        Rebuilds every ``RatioSamplerConfig`` listed in
+        ``RATIO_SAMPLER_CFG_ATTRS`` with the new ``window_above``. The
+        config is a frozen dataclass so we use ``dataclasses.replace``.
+        """
+        if not isinstance(val, (int, float)) or float(val) < 0:
+            logger.warning(
+                "live_ratio_sampling_window_above_invalid",
+                value=val,
+                expected="non-negative float",
+            )
+            return
+        new_val = float(val)
+        for attr in self.RATIO_SAMPLER_CFG_ATTRS:
+            cfg = getattr(self, attr, None)
+            if cfg is None:
+                continue
+            old = cfg.window_above
+            setattr(self, attr, dataclasses.replace(cfg, window_above=new_val))
+            logger.info(
+                "live_ratio_sampling_window_above_update",
+                attr=attr,
+                old=old,
+                new=new_val,
+            )
 
     def _rebuild_train_dataloader_with_budget(self, new_budget: int) -> None:
         """Rebuild the train dataloader with a new token budget.

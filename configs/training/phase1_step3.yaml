@@ -88,12 +88,13 @@ target_ratio_start: 0.95
 target_ratio_end: 0.08
 target_ratio_ramp_steps: 1000
 # Train the threshold curve over a *range* of requested ratios instead of
-# only the current curriculum floor. Most batches sample uniformly from the
-# active window [target_ratio_floor, target_ratio_sampling_max]; a minority
-# hit the controller's anchor grid directly so every part of the curve keeps
-# getting refreshed as the floor moves.
+# only the current curriculum floor. Most batches sample uniformly from a
+# window that travels with the floor:
+# [target_ratio_floor, target_ratio_floor + target_ratio_sampling_window_above].
+# A minority hit the controller's anchor grid directly so the rest of the
+# curve still gets calibrated as the floor moves.
 sample_target_ratio_during_training: true
-target_ratio_sampling_max: 0.95
+target_ratio_sampling_window_above: 0.10
 target_ratio_anchor_sampling_prob: 0.30
 
 # Liger kernels: SwiGLU + RoPE + fused linear-CE are enabled. LigerRMSNorm

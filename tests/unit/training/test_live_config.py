@@ -170,3 +170,84 @@ def test_apply_live_config_preserves_type():
     t.apply_live_config({"weight_a": 2.5})
     assert t.w_a == 2  # int(2.5) = 2
     assert isinstance(t.w_a, int)
+
+
+# --- Tests for the shared sampling-window-above live handler ---
+
+
+class _SamplerStubTrainer(BaseTrainer):
+    """Trainer with a single ratio sampler config attribute."""
+
+    LIVE_CONFIG_HANDLERS = {
+        "target_ratio_sampling_window_above": "_handle_ratio_sampling_window_above",
+    }
+
+    def __init__(self):
+        from bgkit.training.ratio_sampling import build_ratio_sampler_config
+
+        self._target_ratio_sampler_cfg = build_ratio_sampler_config(
+            {"enabled": True, "mode": "window", "window_above": 0.10},
+            anchor_grid=(0.10, 0.50),
+            default_ratio=0.10,
+            enabled_default=False,
+            mode_default="window",
+        )
+
+    def setup(self):
+        pass
+
+    def _forward_backward(self, batch):
+        return {}
+
+    def evaluate(self):
+        return {}
+
+    def trainable_parameters(self):
+        return []
+
+
+class _MultiSamplerStubTrainer(_SamplerStubTrainer):
+    """Trainer that exposes two sampler configs (e.g. L0 + L1)."""
+
+    RATIO_SAMPLER_CFG_ATTRS = ("_l0_ratio_sampler_cfg", "_l1_ratio_sampler_cfg")
+
+    def __init__(self):
+        from bgkit.training.ratio_sampling import build_ratio_sampler_config
+
+        self._l0_ratio_sampler_cfg = build_ratio_sampler_config(
+            {"enabled": True, "mode": "window", "window_above": 0.10},
+            anchor_grid=(0.10,),
+            default_ratio=0.10,
+            enabled_default=False,
+            mode_default="window",
+        )
+        self._l1_ratio_sampler_cfg = build_ratio_sampler_config(
+            {"enabled": True, "mode": "window", "window_above": 0.20},
+            anchor_grid=(0.15,),
+            default_ratio=0.15,
+            enabled_default=False,
+            mode_default="window",
+        )
+
+
+def test_window_above_live_update_replaces_frozen_cfg():
+    t = _SamplerStubTrainer()
+    old_cfg = t._target_ratio_sampler_cfg
+    t.apply_live_config({"target_ratio_sampling_window_above": 0.05})
+    assert t._target_ratio_sampler_cfg.window_above == 0.05
+    # Other fields preserved
+    assert t._target_ratio_sampler_cfg.enabled is old_cfg.enabled
+    assert t._target_ratio_sampler_cfg.anchor_grid == old_cfg.anchor_grid
+
+
+def test_window_above_live_update_rejects_negative():
+    t = _SamplerStubTrainer()
+    t.apply_live_config({"target_ratio_sampling_window_above": -0.1})
+    assert t._target_ratio_sampler_cfg.window_above == 0.10  # unchanged
+
+
+def test_window_above_live_update_rebuilds_all_configured_attrs():
+    t = _MultiSamplerStubTrainer()
+    t.apply_live_config({"target_ratio_sampling_window_above": 0.07})
+    assert t._l0_ratio_sampler_cfg.window_above == 0.07
+    assert t._l1_ratio_sampler_cfg.window_above == 0.07

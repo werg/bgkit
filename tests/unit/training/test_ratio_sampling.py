@@ -13,7 +13,7 @@ from bgkit.training.ratio_sampling import (
 
 def test_window_sampling_returns_base_when_disabled():
     cfg = build_ratio_sampler_config(
-        {"enabled": False, "mode": "window", "sampling_max": 0.95},
+        {"enabled": False, "mode": "window", "window_above": 0.10},
         anchor_grid=(0.08, 0.16, 0.32),
         default_ratio=0.08,
         enabled_default=False,
@@ -33,7 +33,7 @@ def test_window_sampling_can_hit_anchor_points():
         {
             "enabled": True,
             "mode": "window",
-            "sampling_max": 0.95,
+            "window_above": 0.30,
             "anchor_sampling_prob": 1.0,
         },
         anchor_grid=(0.08, 0.16, 0.32),
@@ -81,7 +81,7 @@ def _window_cfg(**overrides) -> RatioSamplerConfig:
         mode="window",
         anchor_grid=(0.02, 0.08, 0.32, 0.95),
         anchor_sampling_prob=0.0,  # uniform-path only (deterministic)
-        sampling_max=0.95,
+        window_above=0.10,
         jitter_abs=0.0,
         jitter_rel=0.0,
         lower_bound=0.01,
@@ -92,45 +92,66 @@ def _window_cfg(**overrides) -> RatioSamplerConfig:
     return RatioSamplerConfig(**defaults)
 
 
-def test_window_interval_respects_min_window_at_sampling_max():
-    """When floor == sampling_max, min_window expands the window above it."""
-    cfg = _window_cfg(sampling_max=0.95, min_window=0.02)
-    low, high = cfg.interval_for(0.95)
-    assert low == pytest.approx(0.95)
-    assert high >= low + 0.02 - 1e-9
-    assert high <= cfg.upper_bound
+def test_window_interval_travels_with_floor():
+    """Window is [floor, floor + window_above] regardless of where the floor is."""
+    cfg = _window_cfg(window_above=0.05)
+    low_a, high_a = cfg.interval_for(0.50)
+    low_b, high_b = cfg.interval_for(0.20)
+    assert low_a == pytest.approx(0.50)
+    assert high_a == pytest.approx(0.55)
+    assert low_b == pytest.approx(0.20)
+    assert high_b == pytest.approx(0.25)
 
 
-def test_window_interval_respects_min_window_past_sampling_max():
-    """When floor > sampling_max, min_window prevents window collapse."""
-    cfg = _window_cfg(sampling_max=0.90, min_window=0.02)
-    low, high = cfg.interval_for(0.97)
-    assert low == pytest.approx(0.97)
-    assert high >= low + 0.02 - 1e-9
-    assert high <= cfg.upper_bound
-
-
-def test_window_interval_preserves_sampling_max_in_normal_case():
-    """Normal case: floor < sampling_max, high should equal sampling_max."""
-    cfg = _window_cfg(sampling_max=0.95, min_window=0.02)
+def test_window_interval_min_window_floor_when_window_above_too_small():
+    """``min_window`` prevents the band from collapsing if window_above < min_window."""
+    cfg = _window_cfg(window_above=0.005, min_window=0.02)
     low, high = cfg.interval_for(0.50)
     assert low == pytest.approx(0.50)
+    assert high == pytest.approx(0.52)
+
+
+def test_window_interval_clamps_to_upper_bound():
+    """Window can't extend past upper_bound."""
+    cfg = _window_cfg(window_above=0.20, upper_bound=0.95)
+    low, high = cfg.interval_for(0.90)
+    assert low == pytest.approx(0.90)
     assert high == pytest.approx(0.95)
 
 
-def test_sample_ratio_does_not_collapse_when_floor_past_sampling_max():
-    """Integration: repeated sampling produces a real window above the floor."""
-    cfg = _window_cfg(sampling_max=0.90, min_window=0.02)
+def test_sample_ratio_respects_traveling_window():
+    """Repeated sampling stays within the traveling window above the floor."""
+    cfg = _window_cfg(window_above=0.05, anchor_sampling_prob=0.0)
     rng = random.Random(17)
+    floor = 0.40
     samples = [
         sample_ratio(
-            rng=rng, config=cfg, base_ratio=0.95,
+            rng=rng, config=cfg, base_ratio=floor,
             is_evaluating=False, override_active=False,
         )
         for _ in range(64)
     ]
-    assert any(s > 0.95 + 1e-6 for s in samples)
-    assert all(s >= 0.95 - 1e-9 for s in samples)
+    assert all(floor - 1e-9 <= s <= floor + 0.05 + 1e-9 for s in samples)
+    assert any(s > floor + 1e-6 for s in samples)
+
+
+def test_build_ratio_sampler_config_window_above_default_and_override():
+    cfg_default = build_ratio_sampler_config(
+        {},
+        anchor_grid=(0.10, 0.50),
+        default_ratio=0.10,
+        enabled_default=True,
+        mode_default="window",
+    )
+    assert cfg_default.window_above == pytest.approx(0.10)
+    cfg_override = build_ratio_sampler_config(
+        {"window_above": 0.05},
+        anchor_grid=(0.10, 0.50),
+        default_ratio=0.10,
+        enabled_default=True,
+        mode_default="window",
+    )
+    assert cfg_override.window_above == pytest.approx(0.05)
 
 
 def test_build_ratio_sampler_config_min_window_default_and_override():

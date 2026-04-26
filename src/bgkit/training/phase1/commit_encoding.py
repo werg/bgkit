@@ -71,6 +71,7 @@ class CommitEncodingTrainer(BaseTrainer):
 
     LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
         "target_ratio": "_handle_target_ratio",
+        "target_ratio_sampling_window_above": "_handle_ratio_sampling_window_above",
     }
 
     def setup(self) -> None:
@@ -342,10 +343,7 @@ class CommitEncodingTrainer(BaseTrainer):
             {
                 "enabled": tcfg.get("sample_target_ratio_during_training", False),
                 "mode": tcfg.get("target_ratio_sampling_mode", "window"),
-                "sampling_max": tcfg.get(
-                    "target_ratio_sampling_max",
-                    max(float(self._target_ratio_start), max(anchor_grid)),
-                ),
+                "window_above": tcfg.get("target_ratio_sampling_window_above", 0.10),
                 "anchor_sampling_prob": tcfg.get(
                     "target_ratio_anchor_sampling_prob", 0.30,
                 ),
@@ -595,10 +593,7 @@ class CommitEncodingTrainer(BaseTrainer):
                 {
                     "enabled": tcfg.get("sample_target_ratio_during_training", False),
                     "mode": tcfg.get("target_ratio_sampling_mode", "window"),
-                    "sampling_max": tcfg.get(
-                        "target_ratio_sampling_max",
-                        max(float(self._target_ratio_start), max(anchor_grid)),
-                    ),
+                    "window_above": tcfg.get("target_ratio_sampling_window_above", 0.10),
                     "anchor_sampling_prob": tcfg.get(
                         "target_ratio_anchor_sampling_prob", 0.30,
                     ),

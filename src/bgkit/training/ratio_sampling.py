@@ -32,17 +32,20 @@ class RatioSamplerConfig:
     mode: str
     anchor_grid: tuple[float, ...]
     anchor_sampling_prob: float
-    sampling_max: float
+    # Width of the window mode's sampling band ABOVE the curriculum floor.
+    # The window travels with the floor: ``[floor, floor + window_above]``
+    # (clamped to upper_bound). This calibrates the threshold curve in a
+    # constant-width band around the operating point as the curriculum
+    # walks the floor down. Wider-range curve calibration is delegated to
+    # ``anchor_sampling_prob`` (snap to anchor grid points).
+    window_above: float
     jitter_abs: float
     jitter_rel: float
     lower_bound: float
     upper_bound: float
-    # Minimum sampling window above the curriculum floor. When the floor
-    # has walked past ``sampling_max`` (or past the anchor_grid max), the
-    # window would otherwise collapse to a single point and sampling
-    # degenerates back to the floor. Guaranteeing a small window keeps
-    # the θ curve learning just above the operating point even at the
-    # edge of the configured range.
+    # Minimum sampling window width. Acts as a floor on ``window_above``
+    # so the window doesn't collapse to a single point if a caller
+    # passes ``window_above=0`` or near it.
     min_window: float = 0.02
 
     def interval_for(self, base_ratio: float) -> tuple[float, float]:
@@ -50,8 +53,8 @@ class RatioSamplerConfig:
         base = _clamp_ratio(base_ratio, self.lower_bound, self.upper_bound)
         if self.mode == "window":
             low = base
-            reach = max(self.sampling_max, low + self.min_window)
-            high = _clamp_ratio(reach, low, self.upper_bound)
+            width = max(self.window_above, self.min_window)
+            high = _clamp_ratio(low + width, low, self.upper_bound)
             return low, high
         if self.mode == "jitter":
             width = max(
@@ -73,12 +76,12 @@ def build_ratio_sampler_config(
     default_ratio: float,
     enabled_default: bool,
     mode_default: str,
+    window_above_default: float = 0.10,
 ) -> RatioSamplerConfig:
     """Build a ratio-sampling config from a trainer config block."""
     anchors = anchor_grid or (float(default_ratio),)
     lower_bound = float(cfg_block.get("lower_bound", min(anchors)))
     upper_bound = float(cfg_block.get("upper_bound", 0.999))
-    default_sampling_max = max(float(default_ratio), max(anchors))
     return RatioSamplerConfig(
         enabled=bool(cfg_block.get("enabled", enabled_default)),
         mode=str(cfg_block.get("mode", mode_default)).strip().lower(),
@@ -86,7 +89,7 @@ def build_ratio_sampler_config(
             sorted(_clamp_ratio(float(r), lower_bound, upper_bound) for r in anchors)
         ),
         anchor_sampling_prob=float(cfg_block.get("anchor_sampling_prob", 0.30)),
-        sampling_max=float(cfg_block.get("sampling_max", default_sampling_max)),
+        window_above=float(cfg_block.get("window_above", window_above_default)),
         jitter_abs=float(cfg_block.get("jitter_abs", 0.0)),
         jitter_rel=float(cfg_block.get("jitter_rel", 0.0)),
         lower_bound=lower_bound,
