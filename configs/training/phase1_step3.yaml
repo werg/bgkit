@@ -136,7 +136,11 @@ survivorship:
   l0:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
-    utility_grad_loss_weight: 0.3
+    # 2026-04-26: bumped 0.3 → 0.45 to make up for the period of restart
+    # experimentation in which lr was repeatedly stuck in resume_warmup
+    # ramps. Live-tunable via control.json
+    # (handler in DecoderInitTrainer._handle_utility_grad_loss_weight).
+    utility_grad_loss_weight: 0.45
     moment_match_weight: 0.05
     moment_match_start_step: 500
     # Minimum-survivors floor loss: relative squared hinge on soft

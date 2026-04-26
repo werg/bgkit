@@ -141,6 +141,10 @@ class DecoderInitTrainer(BaseTrainer):
         "target_ratio_sampling_window_above": "_handle_ratio_sampling_window_above",
         "sample_target_ratio_during_training": "_handle_ratio_sampling_enabled",
         "target_ratio_anchor_sampling_prob": "_handle_ratio_sampling_anchor_prob",
+        # Per-loss weights on the survivorship aux losses. Frozen
+        # ``SurvivorshipLossWeights`` dataclass; handler does
+        # ``dataclasses.replace`` to update.
+        "utility_grad_loss_weight": "_handle_utility_grad_loss_weight",
     }
 
     def setup(self) -> None:
@@ -721,6 +725,39 @@ class DecoderInitTrainer(BaseTrainer):
         qa_ds = getattr(self, "_qa_dataset", None)
         if qa_ds is not None and hasattr(qa_ds, "set_epoch"):
             qa_ds.set_epoch(epoch)
+
+    # ------------------------------------------------------------------
+    # Live-config handler: utility_grad_loss_weight
+    # ------------------------------------------------------------------
+
+    def _handle_utility_grad_loss_weight(self, val: float | int) -> None:
+        """Live-config handler: update ``utility_grad_loss_weight`` on
+        the frozen ``_surv_l0`` and ``_surv_l1`` dataclasses via
+        ``dataclasses.replace``. Same pattern as the ratio-sampler
+        handlers in BaseTrainer.
+        """
+        if not isinstance(val, (int, float)) or float(val) < 0:
+            logger.warning(
+                "live_utility_grad_loss_weight_invalid",
+                value=val,
+                expected="non-negative float",
+            )
+            return
+        import dataclasses as _dc
+
+        new_val = float(val)
+        for attr in ("_surv_l0", "_surv_l1"):
+            cfg = getattr(self, attr, None)
+            if cfg is None:
+                continue
+            old = cfg.utility_grad_loss_weight
+            setattr(self, attr, _dc.replace(cfg, utility_grad_loss_weight=new_val))
+            logger.info(
+                "live_utility_grad_loss_weight_update",
+                attr=attr,
+                old=old,
+                new=new_val,
+            )
 
     # ------------------------------------------------------------------
     # Checkpoint resolution
