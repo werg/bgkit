@@ -61,35 +61,29 @@ For phase1_step3, DeltaNet had ~17× more samples than flash_attn — the
 naive expectation that "FA4 attention dominates" was wrong on this
 hardware.
 
-## 2. Use `gradient_checkpointing: selective` (default since 2026-04-26)
+## 2. Default is `gradient_checkpointing: true` (full ckpt-on); don't disable
 
-The 04-26 default in `configs/compute/dgx_spark.yaml` is
-`gradient_checkpointing: selective`. This skips checkpointing on the 18
-of 24 Qwen3.5 decoder layers that own a DeltaNet (`linear_attn`)
-submodule and applies checkpointing to the 6 FullAttention layers.
-Bounds extra activation memory to ~2 GB while eliminating the dominant
-recompute cost — DeltaNet's chunk_gated_delta_rule under recompute is
-where the time was going.
+Two attempts to reduce checkpointing on phase1_step3 both failed
+(2026-04-26):
 
-Override per-stage if needed:
-- `gradient_checkpointing: true` — full ckpt-on. Use for stages with
-  heavier model footprints where the extra ~2 GB pushes over the cap:
-  phase1_step2 (teacher + student distillation), phase2_kb_stage_a
-  (live L0 + L0 LoRA + L1 LoRA + decoder all training), phase3
-  (large distillation footprint).
-- `gradient_checkpointing: false` — full ckpt-off. **Only after
-  profiling with a representative long-tail sample distribution.**
+- **`false` (full ckpt-off)**: peak jumped from 10 → 62 GB on a
+  long-tail sample, hit the 79.8 GB cap, allocator thrashed, step rate
+  43 s/step. Variable sample shapes from `PackedTokenBudgetSampler`
+  make activation memory unpredictable.
+- **`selective` (skip ckpt on 18 DeltaNet layers, keep 6 FullAttn)**:
+  peak jumped to 71 GB and reserved hit the cap, 50 s/step. DeltaNet's
+  chunk-level recurrent state is much larger than the per-layer hidden
+  state suggests — every chunk × heads × K × V worth of fp32 state
+  hangs around per layer. The "+2 GB extra activation" prediction was
+  off by 30×.
 
-**Why `false` is risky** (tested 2026-04-26 on Step 3): tried disabling
-grad-ckpt entirely because `cuda_max_allocated` was only 10 GB with
-ckpt on. First ~70 steps ran fine at 12.5 s/step (peak 23 GB). Then a
-longer sample blew peak to 62 GB and `cuda_max_reserved` hit the
-79.8 GB cap → allocator thrashing → 43 s/step. Variable sample lengths
-from `PackedTokenBudgetSampler` make full ckpt-off too tight on most
-stages. Activation memory scales with the longest sample seen, not the
-average. Selective avoids the trap because the FullAttention layers
-(only 6 of 24) are still checkpointed and their activations were the
-bulk of the spike.
+So full ckpt-on is the default in `configs/compute/dgx_spark.yaml` and
+the safe winner. The `gradient_utils.maybe_enable_gradient_checkpointing`
+function still supports `"selective"` as a value (skips DeltaNet layers
+specifically) — left in place as a future hook if someone profiles a
+narrower subset (e.g. every other DeltaNet layer) that fits in memory.
+But don't enable it without measuring `cuda_max_allocated` over 100+
+steps with a representative shape distribution first.
 
 If you still want to try it for a stage with very stable shapes (e.g.
 fixed-length eval), set the override and watch
@@ -171,7 +165,7 @@ autotune fix landed first. Keep in the toolbox.
 | `IS_NVIDIA_BLACKWELL >= 10` (fla fork) | enables global_scratch alloc | ✓ |
 | sm_121 autotune configs (fla fork) | **5× DeltaNet speedup** | ✓ |
 | `gradient_checkpointing: false` | +13% short-run, then OOM-thrash on long samples | ✗ (revert) |
-| `gradient_checkpointing: selective` | bounded +2 GB activation; skips DeltaNet recompute | ✓ (default) |
+| `gradient_checkpointing: selective` (skip 18 DeltaNet layers) | +60 GB activation; cap thrash → 50 s/step | ✗ (revert) |
 | Custom `chunk_fwd_o_sm121` kernel | unverified; default-off | – |
 | Vectorize decoder splice loops | 0% wall-clock; cleanup only | hygiene |
 | `sample_target_ratio_during_training: false` | 0% — false hypothesis | revert |

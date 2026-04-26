@@ -100,34 +100,33 @@ def _coerce_gradient_checkpointing_value(val: Any) -> bool | str:
     return bool(val)
 
 
-def _install_selective_checkpoint_func(model: nn.Module) -> None:
-    """Replace model._gradient_checkpointing_func with a DeltaNet-skipping variant.
+def _install_selective_checkpoint_func(model: nn.Module) -> int:
+    """Disable per-layer ``gradient_checkpointing`` on DeltaNet decoder layers.
 
-    HF's text-model forward calls ``self._gradient_checkpointing_func(layer.__call__,
-    ...)`` per decoder layer. The first arg's ``__self__`` reveals the layer being
-    invoked. We pass DeltaNet layers through directly (skip recompute) and apply
-    standard ``torch.utils.checkpoint.checkpoint`` to all other layers.
+    HF transformers v5+ implements gradient checkpointing in
+    ``transformers.modeling_layers.GradientCheckpointingLayer.__call__``:
+    each layer carries its own ``gradient_checkpointing`` flag (set by
+    ``model.gradient_checkpointing_enable()``) and decides per-call whether
+    to wrap its forward in ``self._gradient_checkpointing_func``. So
+    "selective" mode walks every submodule and unsets the flag on the
+    18 of 24 Qwen3.5 decoder layers that own a ``linear_attn``
+    submodule (DeltaNet). The remaining 6 FullAttention layers keep
+    checkpointing on.
+
+    Returns the number of layers that had checkpointing disabled.
     """
-    from torch.utils.checkpoint import checkpoint as _torch_checkpoint
-
-    def _selective_checkpoint(fn, *args, use_reentrant: bool = False, **kwargs):
-        layer = getattr(fn, "__self__", None)
-        if layer is not None and _is_deltanet_layer(layer):
-            return fn(*args, **kwargs)
-        return _torch_checkpoint(fn, *args, use_reentrant=use_reentrant, **kwargs)
-
-    # The text-model is usually one level inside an AutoModelForCausalLM.
-    targets = [model]
-    inner = getattr(model, "model", None)
-    if inner is not None and inner is not model:
-        targets.append(inner)
-    text_model = getattr(inner, "language_model", None) if inner is not None else None
-    if text_model is not None and text_model not in targets:
-        targets.append(text_model)
-
-    for target in targets:
-        if hasattr(target, "_gradient_checkpointing_func"):
-            target._gradient_checkpointing_func = _selective_checkpoint
+    disabled = 0
+    for module in model.modules():
+        if not _is_deltanet_layer(module):
+            continue
+        if not hasattr(module, "gradient_checkpointing"):
+            continue
+        # Only flip layers that actually had checkpointing enabled — avoids
+        # masking real misconfiguration where the model never enabled ckpt.
+        if module.gradient_checkpointing:
+            module.gradient_checkpointing = False
+            disabled += 1
+    return disabled
 
 
 def _is_deltanet_layer(layer: nn.Module) -> bool:

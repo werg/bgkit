@@ -25,11 +25,6 @@ l0_lr: 2.0e-4
 l1_lr: 2.0e-4
 eval_every: 500
 save_every: 2000
-# 2026-04-26: live L0 + L0 LoRA + L1 LoRA + decoder all training. Heaviest
-# Phase 2 stage. Override the new "selective" default to full ckpt-on;
-# selective skips DeltaNet activation-saving and would push the live-L0
-# footprint over the cap. Stage B (cached L0) can use selective safely.
-gradient_checkpointing: true
 # max_steps is computed dynamically as ceil(len(train_dataset) / batch_size).
 # The trainer interprets ``max_steps: null`` as "one epoch over the train
 # split". Set explicitly to override.

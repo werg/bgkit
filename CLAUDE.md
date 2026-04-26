@@ -247,17 +247,15 @@ s/step investigation produced a sharp set of lessons:
 1. **fla autotune fix is automatic** for all `gpu-common` services on
    restart (DeltaNet runs ~5× faster on sm_121 once Triton picks the new
    Blackwell autotune configs).
-2. **Default `gradient_checkpointing: selective`** in `compute/dgx_spark.yaml`:
-   skips checkpointing on the 18 of 24 Qwen3.5 decoder layers that own a
-   DeltaNet (`linear_attn`) submodule, applies it to the 6 FullAttention
-   layers. Bounds extra activation memory to ~2 GB while eliminating
-   most of the recompute cost (DeltaNet *is* the bottleneck). Heavy
-   stages override to full ckpt-on: phase1_step2 (distillation),
-   phase2_kb_stage_a (live-L0), phase3 (distillation). Don't set to
-   `false` based on early `cuda_max_allocated` — tested Step 3 (10 GB
-   allocated with ckpt on); first ~70 steps ran fine at 23 GB, then a
-   long sample blew peak to 62 GB and reserved hit the cap → thrashing.
-   Activations scale with the longest sample seen, not the average.
+2. **Keep `gradient_checkpointing: true`** (full ckpt-on, the default).
+   Two attempts to reduce ckpt cost on phase1_step3 both broke memory:
+   `false` (peak 62 GB on long-tail sample) and `"selective"` (skip 18
+   DeltaNet layers, peak 71 GB — DeltaNet's chunk-level recurrent state
+   is much larger than the per-layer hidden state alone). The
+   `"selective"` mode is still implemented in
+   `bgkit.training.gradient_utils` for future experiments (e.g. skipping
+   only a subset of DeltaNet layers) but is not the default. Don't
+   enable without measuring `cuda_max_allocated` over 100+ steps.
 3. **Don't raise `max_batch_tokens` past 16384** for Step-3-style
    workloads; DeltaNet kernel cost is `sum(L_i²)` and bigger microbatches
    lose. step5/step6 still use 32768/2 (pre-autotune tuning); worth
