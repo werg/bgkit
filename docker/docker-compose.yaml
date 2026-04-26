@@ -21,6 +21,14 @@ x-gpu-common: &gpu-common
   # phase1_step3 stop at step ~4250 lost ~250 steps because the save
   # didn't finish before SIGKILL.
   stop_grace_period: 180s
+  # Auto-recover on crash: if training exits with a non-zero status (OOM,
+  # CUDA error, kernel panic), Docker restarts the container. The trainer
+  # always resumes from the latest registered checkpoint via
+  # `bgkit_checkpoint: auto`, so a single restart loses at most
+  # save_every (500) steps. ``unless-stopped`` (vs ``on-failure``) means
+  # the container doesn't restart if WE bring it down deliberately
+  # (``compose stop``), only if it crashes.
+  restart: unless-stopped
   deploy:
     resources:
       reservations:
