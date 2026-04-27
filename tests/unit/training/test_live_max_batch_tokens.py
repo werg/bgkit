@@ -307,3 +307,82 @@ def test_apply_live_config_dispatches_max_batch_tokens_eval():
     t.setup()
     t.apply_live_config({"max_batch_tokens_eval": 60000})
     assert t._max_batch_tokens_eval == 60000
+
+
+# ---------------------------------------------------------------------------
+# min_sample_length filter
+# ---------------------------------------------------------------------------
+
+def test_min_sample_length_filters_short_samples():
+    """Setting min_sample_length wraps the dataset in a Subset that drops
+    samples shorter than the threshold."""
+    lengths = [10, 50, 100, 200, 500, 1000]
+    t = _MinimalTrainer(lengths, budget=50000)
+    t.setup()
+    n_full = len(t.train_dataset)
+    assert n_full == 6
+
+    t._handle_min_sample_length(100)
+    # Three samples with length >= 100: [100, 200, 500, 1000] = 4 samples
+    assert len(t.train_dataset) == 4
+    assert t._min_sample_length == 100
+    # Sampler now operates over the filtered length array
+    assert all(int(L) >= 100 for L in t._train_lengths)
+
+
+def test_min_sample_length_zero_disables_filter():
+    """Setting min_sample_length back to 0 restores the full dataset."""
+    lengths = [10, 50, 100, 200, 500, 1000]
+    t = _MinimalTrainer(lengths, budget=50000)
+    t.setup()
+    t._handle_min_sample_length(100)
+    assert len(t.train_dataset) == 4
+    t._handle_min_sample_length(0)
+    assert len(t.train_dataset) == 6
+    assert t._min_sample_length == 0
+
+
+def test_min_sample_length_filters_all_warns_and_no_op():
+    """If the threshold filters every sample, the rebuild is skipped."""
+    lengths = [10, 50, 90]
+    t = _MinimalTrainer(lengths, budget=50000)
+    t.setup()
+    n_before = len(t.train_dataset)
+    t._handle_min_sample_length(1000)
+    # No-op: dataset unchanged because filter would empty it
+    assert len(t.train_dataset) == n_before
+
+
+def test_min_sample_length_invalid_rejected():
+    """Negative, non-int, or bool values are rejected with no state change."""
+    t = _make_trainer()
+    t._handle_min_sample_length(-1)
+    assert getattr(t, "_min_sample_length", 0) == 0
+    t._handle_min_sample_length("100")
+    assert getattr(t, "_min_sample_length", 0) == 0
+    t._handle_min_sample_length(True)
+    assert getattr(t, "_min_sample_length", 0) == 0
+
+
+def test_apply_live_config_dispatches_min_sample_length():
+    """apply_live_config routes min_sample_length to the handler."""
+    lengths = [10, 50, 100, 200, 500, 1000]
+    t = _MinimalTrainer(lengths, budget=50000)
+    t.setup()
+    t.apply_live_config({"min_sample_length": 100})
+    assert t._min_sample_length == 100
+    assert len(t.train_dataset) == 4
+
+
+def test_min_sample_length_combined_with_max_batch_tokens():
+    """Changing max_batch_tokens after a filter is set preserves the filter."""
+    lengths = [10, 50, 100, 200, 500, 1000]
+    t = _MinimalTrainer(lengths, budget=50000)
+    t.setup()
+    t._handle_min_sample_length(100)
+    assert len(t.train_dataset) == 4
+    t._handle_max_batch_tokens(30000)
+    assert t._max_batch_tokens == 30000
+    # Filter is still in effect
+    assert len(t.train_dataset) == 4
+    assert t._min_sample_length == 100

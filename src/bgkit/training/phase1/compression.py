@@ -351,9 +351,16 @@ class CompressionTrainer(BaseTrainer):
             self.compression_dataset.token_length(i)
             for i in self.eval_dataset.indices
         ], dtype=np.int64)
+        # Content-only lengths drive min_sample_length (encoder input);
+        # `lengths` includes chat-template overhead used by sampler budget.
+        train_content_lengths = np.array([
+            self.compression_dataset.content_token_length(i)
+            for i in self.train_dataset.indices
+        ], dtype=np.int64)
 
         # Stash for live-tunable budget rebuild (see BaseTrainer._handle_max_batch_tokens)
         self._train_lengths = train_lengths
+        self._train_content_lengths = train_content_lengths
         self._eval_lengths = eval_lengths
         self._train_collate_fn = collate_compression
         self._num_workers = num_workers
@@ -661,11 +668,26 @@ class CompressionTrainer(BaseTrainer):
             self.compression_dataset.token_length(i)
             for i in self.train_dataset.indices
         ], dtype=np.int64)
+        # Refresh content lengths too so the min_sample_length filter
+        # (lazily snapshotted in _rebuild_train_dataloader_with_budget)
+        # picks up L1's new sample shapes on the next rebuild.
+        train_content_lengths = np.array([
+            self.compression_dataset.content_token_length(i)
+            for i in self.train_dataset.indices
+        ], dtype=np.int64)
         max_batch_tokens = self.cfg.training.get("max_batch_tokens", 65536)
         max_batch_tokens_eval = self.cfg.training.get(
             "max_batch_tokens_eval", max_batch_tokens,
         )
         seed = self.cfg.get("seed", 42)
+        # Update stashes so any subsequent live rebuild sees fresh L1 lengths.
+        # Drop the cached "_full" snapshots so the next live filter rebuild
+        # re-snapshots from the L1-updated lengths/dataset.
+        self._train_lengths = train_lengths
+        self._train_content_lengths = train_content_lengths
+        for cached in ("_train_dataset_full", "_train_lengths_full", "_train_content_lengths_full"):
+            if hasattr(self, cached):
+                delattr(self, cached)
         self.train_sampler = PackedTokenBudgetSampler(
             self.train_dataset,
             lengths=train_lengths,

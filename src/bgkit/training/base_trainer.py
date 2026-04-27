@@ -160,6 +160,7 @@ class BaseTrainer(ABC):
     LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
         "max_batch_tokens": "_handle_max_batch_tokens",
         "max_batch_tokens_eval": "_handle_max_batch_tokens_eval",
+        "min_sample_length": "_handle_min_sample_length",
     }
 
     #: Steps between structured log messages. Override in subclass.
@@ -928,18 +929,54 @@ class BaseTrainer(ABC):
                 )
                 return
 
-        from torch.utils.data import DataLoader
+        import numpy as np
+        from torch.utils.data import DataLoader, Subset
 
         from bgkit.data.samplers import PackedTokenBudgetSampler
+
+        # Snapshot the unfiltered originals on first rebuild so we can
+        # re-derive the filtered Subset whenever min_sample_length changes.
+        # The filter operates on *content* lengths (encoder input size) when
+        # available; the sampler's budget still uses `_train_lengths` (which
+        # may include decoder/template overhead).
+        if not hasattr(self, "_train_dataset_full"):
+            self._train_dataset_full = self.train_dataset
+            self._train_lengths_full = np.asarray(self._train_lengths)
+            content_lengths = getattr(self, "_train_content_lengths", None)
+            self._train_content_lengths_full = (
+                np.asarray(content_lengths)
+                if content_lengths is not None
+                else self._train_lengths_full
+            )
+
+        min_len = int(getattr(self, "_min_sample_length", 0) or 0)
+        if min_len > 0:
+            valid_idx = np.where(self._train_content_lengths_full >= min_len)[0]
+            if len(valid_idx) == 0:
+                logger.warning(
+                    "live_min_sample_length_filters_all",
+                    min_sample_length=min_len,
+                    max_length=int(self._train_content_lengths_full.max())
+                    if len(self._train_content_lengths_full)
+                    else 0,
+                )
+                return
+            ds = Subset(self._train_dataset_full, valid_idx.tolist())
+            lengths = self._train_lengths_full[valid_idx]
+        else:
+            ds = self._train_dataset_full
+            lengths = self._train_lengths_full
 
         old_budget = getattr(self.train_sampler, "_max_batch_tokens", None)
         cursor = self._microbatches_in_epoch
 
         seed = getattr(self.train_sampler, "_seed", None)
         epoch = getattr(self.train_sampler, "_epoch", 0)
+        self.train_dataset = ds
+        self._train_lengths = lengths
         self.train_sampler = PackedTokenBudgetSampler(
-            self.train_dataset,
-            lengths=self._train_lengths,
+            ds,
+            lengths=lengths,
             max_batch_tokens=new_budget,
             shuffle=True,
             seed=seed,
@@ -950,7 +987,7 @@ class BaseTrainer(ABC):
         self.train_sampler.set_batch_cursor(cursor)
 
         self.train_dataloader = DataLoader(
-            self.train_dataset,
+            ds,
             batch_sampler=self.train_sampler,
             collate_fn=self._train_collate_fn,
             num_workers=self._num_workers,
@@ -963,6 +1000,8 @@ class BaseTrainer(ABC):
             old=old_budget,
             new=new_budget,
             cursor_preserved=cursor,
+            min_sample_length=min_len,
+            n_samples=len(ds),
         )
 
     def _rebuild_eval_dataloader_with_budget(self, new_budget: int) -> None:
@@ -1066,6 +1105,35 @@ class BaseTrainer(ABC):
             return
         self._max_batch_tokens_eval = val
         self._rebuild_eval_dataloader_with_budget(val)
+
+    def _handle_min_sample_length(self, val) -> None:
+        """Live-config handler for ``min_sample_length``.
+
+        Filters training samples shorter than ``val`` tokens by wrapping
+        the dataset in a ``Subset`` and rebuilding sampler + dataloader
+        via :meth:`_rebuild_train_dataloader_with_budget`. ``val=0``
+        disables the filter (returns to the unfiltered dataset).
+        """
+        if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+            logger.warning(
+                "live_min_sample_length_invalid",
+                value=val,
+                expected="non-negative int",
+            )
+            return
+        old = int(getattr(self, "_min_sample_length", 0) or 0)
+        if old == val:
+            return
+        self._min_sample_length = val
+        budget = getattr(self, "_max_batch_tokens", None)
+        if budget is None:
+            logger.warning(
+                "live_min_sample_length_skipped",
+                reason="trainer has no _max_batch_tokens (rebuild path unavailable)",
+            )
+            return
+        self._rebuild_train_dataloader_with_budget(int(budget))
+        logger.info("live_min_sample_length_update", old=old, new=val)
 
     # ------------------------------------------------------------------
     # Memory accounting: everything comes from ``compute.memory`` — a
@@ -1498,6 +1566,13 @@ class BaseTrainer(ABC):
             early_stopping=es_enabled,
             gradient_accumulation_steps=accum_steps,
         )
+
+        # Apply YAML-default min_sample_length once at training-loop start.
+        # The handler no-ops gracefully if the trainer lacks the rebuild
+        # infrastructure (e.g. KRKBTrainer with QueryAwareBatchSampler).
+        initial_min_len = int(tcfg.get("min_sample_length", 0) or 0)
+        if initial_min_len > 0 and hasattr(self, "_max_batch_tokens"):
+            self._handle_min_sample_length(initial_min_len)
 
         # Live config (file-based HP control)
         # Clear stale control file so ad-hoc changes don't carry across runs.

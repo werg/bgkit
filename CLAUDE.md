@@ -186,6 +186,7 @@ Example control file (one block per active phase):
 | `early_stopping_patience` | All | Adjusts early-stopping patience |
 | `max_batch_tokens` | All Phase 1 + Phase 3 | Rebuilds `PackedTokenBudgetSampler` + train dataloader; preserves epoch cursor |
 | `max_batch_tokens_eval` | All Phase 1 + Phase 3 | Rebuilds eval dataloader with new budget |
+| `min_sample_length` | All Phase 1 + Phase 3 | Wraps train dataset in `Subset` filtering samples shorter than `val` tokens; `0` disables. Reuses the `_rebuild_train_dataloader_with_budget` path |
 | `target_ratio` | DecoderInit, Compression, CommitEncoding | Override compression ratio (null to resume ramp) |
 | `target_ratio_start` | DecoderInit, Compression, CommitEncoding | Ramp start value |
 | `target_ratio_end` | DecoderInit, Compression, CommitEncoding | Ramp end value |

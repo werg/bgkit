@@ -1029,6 +1029,20 @@ class CompressionDataset(Dataset):
             return int(subset.lengths[local_idx])
         return 512  # conservative default
 
+    def content_token_length(self, idx: int) -> int:
+        """Content-only token length (encoder input size, no template overhead).
+
+        Drives the ``min_sample_length`` filter, which cares about how
+        much actual content the encoder sees — not the chat-formatted
+        decoder input. Every subset follows the same shape:
+        ``_cached_lengths = content + _max_overhead``, so we recover the
+        content length by subtracting the subset's per-template overhead.
+        """
+        obj_name, local_idx = self._map_index(idx)
+        subset = self._subsets[obj_name]
+        overhead = getattr(subset, "_max_overhead", 0)
+        return max(0, self.token_length(idx) - int(overhead))
+
     def objective_for_idx(self, idx: int) -> str:
         """Return which objective an index belongs to."""
         obj_name, _ = self._map_index(idx)

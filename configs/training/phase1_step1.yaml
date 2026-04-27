@@ -20,6 +20,7 @@ lr_scale_bottom: 0.1
 # 128 GB unified memory fits ~16K tokens with Qwen3.5-0.8B decoder (248K vocab).
 max_batch_tokens: 16384
 gradient_accumulation_steps: 4    # 16K × 4 = 64K effective tokens per step
+min_sample_length: 256       # filter trivially-short samples (license headers, .gitignore, tiny configs)
 max_eval_samples: 2000
 eval_every: 500
 save_every: 500

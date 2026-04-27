@@ -497,9 +497,16 @@ class DecoderInitTrainer(BaseTrainer):
 
         train_lengths = full_dataset.lengths[np.array(self.train_dataset.indices)]
         eval_lengths = full_dataset.lengths[np.array(self.eval_dataset.indices)]
+        # Content lengths are pre-template; the chat-formatted `lengths` add
+        # ~_max_template_overhead tokens of decoder overhead. The min_sample_length
+        # filter cares about *encoder* content size, so it operates on this.
+        train_content_lengths = full_dataset.content_lengths[
+            np.array(self.train_dataset.indices)
+        ]
 
         # Stash for live-tunable budget rebuild (see BaseTrainer._handle_max_batch_tokens)
         self._train_lengths = train_lengths
+        self._train_content_lengths = train_content_lengths
         self._eval_lengths = eval_lengths
         self._train_collate_fn = collate_chat_repro
         self._num_workers = num_workers

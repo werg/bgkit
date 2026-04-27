@@ -52,6 +52,7 @@ resume_warmup_steps: 500
 reset_schedule: true
 max_batch_tokens: 32768
 gradient_accumulation_steps: 1
+min_sample_length: 256       # filter trivially-short samples (license headers, .gitignore, tiny configs)
 max_eval_samples: 1000
 eval_every: 200
 save_every: 200

@@ -21,6 +21,7 @@ bidi_warmup_steps: 0         # already completed in step 1
 # See docs/wall_clock_investigation_2026_04_21.md.
 max_batch_tokens: 32768
 gradient_accumulation_steps: 2
+min_sample_length: 256       # filter trivially-short samples (license headers, .gitignore, tiny configs)
 
 objectives:
   data_reconstruction: 0.35
