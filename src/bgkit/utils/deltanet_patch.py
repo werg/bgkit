@@ -42,10 +42,13 @@ Two concerns are addressed here:
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+
+from bgkit.utils.gdn_backend import get_chunk_gated_delta_rule, resolved_backend_name
 
 if TYPE_CHECKING:
     pass
@@ -75,6 +78,25 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
     # Unwrap any previous patch to stay idempotent.
     original_fn = getattr(layer, "_unpatch_chunk_gdr", None) or layer.chunk_gated_delta_rule
     original_forward = getattr(layer, "_unpatch_forward", None) or layer.forward
+
+    # ---- 0. Backend swap: if BGKIT_GDN_BACKEND selects a non-fla backend,
+    #         replace the original_fn with the resolver's pick. The HF default
+    #         (assigned in Qwen3_5GatedDeltaNet.__init__) is the Triton fla
+    #         path; we override here so all subsequent wrapping (gate clamp,
+    #         cu_seqlens injection) operates on the resolved backend.
+    try:
+        backend_fn = get_chunk_gated_delta_rule()
+    except Exception as exc:  # pragma: no cover — surfaces clearly if BGKIT_GDN_BACKEND=flashqla
+        # Re-raise: the user explicitly opted into a backend that can't load.
+        # We must not silently fall back to the HF default and pretend nothing
+        # happened.
+        raise RuntimeError(f"deltanet_patch: gdn backend resolution failed: {exc}") from exc
+    if backend_fn is not original_fn:
+        # Backend differs from what HF wired up. Replace original_fn so the
+        # gate-clamp and cu_seqlens wrappers below dispatch through the
+        # selected backend. Stash the resolver pick under a separate attr
+        # for future patches' idempotency check.
+        original_fn = backend_fn
 
     # ---- 1. Patch chunk_gated_delta_rule: clamp g + forward cu_seqlens ----
 
@@ -197,9 +219,10 @@ def patch_gated_delta_rule_numerics(
         if count > 0:
             logger.info(
                 "GatedDeltaNet patched: %d layers, per-step g clamped to >= %.2f, "
-                "cu_seqlens varlen path enabled",
+                "cu_seqlens varlen path enabled, gdn_backend=%s",
                 count,
                 g_clamp_min,
+                resolved_backend_name() or "<unresolved>",
             )
         return
 
@@ -224,6 +247,8 @@ def patch_gated_delta_rule_numerics(
 
     logger.info(
         "GatedDeltaNet class patched: per-step g will be clamped to >= %.2f "
-        "(prevents backward NaN); cu_seqlens varlen path enabled",
+        "(prevents backward NaN); cu_seqlens varlen path enabled; "
+        "gdn_backend=%s (resolves on first layer init)",
         g_clamp_min,
+        os.environ.get("BGKIT_GDN_BACKEND", "fla").strip().lower(),
     )
