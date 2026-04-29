@@ -341,7 +341,22 @@ services:
       - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
       # Force the resolver to attempt the FlashQLA backend.
       - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}
-    command: ["scripts/test_flashqla_parity.py"]
+    # Install TileLang (FlashQLA's only non-PyPI dep) on entry, then run
+    # the parity test. Pin to FlashQLA's required version. --user keeps
+    # the install scoped to this container's writable layer; the bind
+    # mount and the rest of the image are unaffected. ~2-3 min on first
+    # run; subsequent runs reuse the install (the writable layer
+    # persists per ``docker compose run --rm`` invocation only — every
+    # invocation is fresh, so always ~2-3 min).
+    entrypoint: ["bash", "-lc"]
+    command:
+      - |
+        set -e
+        pip install --user --no-cache-dir tilelang==0.1.8 apache-tvm-ffi==0.1.9 || {
+          echo "FATAL: tilelang install failed; cannot proceed with FlashQLA parity test." >&2
+          exit 5
+        }
+        exec python /workspace/bgkit/scripts/test_flashqla_parity.py
 
   preprocess:
     build:
