@@ -235,11 +235,40 @@ docker exec <container> python -c \
 
 The fork is in-memory autotune only (no persistent cache); first ~50 steps after restart pay autotune-benchmarking cost as Triton tries each new config, then the winner is cached for the process lifetime.
 
+### FlashQLA backend (opt-in, blocked on sm_121 today)
+
+[FlashQLA](https://github.com/QwenLM/FlashQLA) (released 2026-04-24, blog at https://qwen.ai/blog?id=flashqla) claims **2-3x fwd / 2x bwd vs fla's Triton `chunk_gated_delta_rule`** on H200, via TileLang fused warp-specialized kernels with intra-card context parallelism. We built the integration scaffolding behind an opt-in env var; **as of 2026-04-29 it does not run on sm_121** (see "Status" below). The scaffolding is on the `flashqla` branch, ready to flip on the day Blackwell support lands upstream.
+
+**How it's wired**:
+
+- Bind mount: `/home/werg/FlashQLA` → `/workspace/flashqla:ro` (NOT prepended to PYTHONPATH globally — imported lazily by the resolver so absence of TileLang in the image doesn't break unrelated services).
+- Resolver: `bgkit.utils.gdn_backend.get_chunk_gated_delta_rule()` reads `BGKIT_GDN_BACKEND` env var ∈ {`fla` (default), `flashqla`, `auto`} and returns the matching callable.
+- Hook: `deltanet_patch.patch_deltanet_layer` consults the resolver only when `BGKIT_GDN_BACKEND` is explicitly set to `flashqla` or `auto`. The default (`fla` / unset) preserves the HF-wired fla path bit-for-bit. Backend swap composes cleanly with the existing gate-clamp + cu_seqlens-injection wrappers.
+- Logging: layer-init logs `gdn_backend=fla|flashqla` so the resolved choice is greppable in container logs.
+- Parity test: `scripts/test_flashqla_parity.py` runs in the `parity-flashqla` compose service (40g mem cap, restart=no, installs tilelang at runtime via --user). Tests fixed-length and varlen / cu_seqlens paths on Qwen3.5-0.8B linear-attention shape (`H_k=H_v=16, head_k=head_v=128`, T=2048).
+
+**Enable for a training stage**:
+
+```yaml
+# in docker/docker-compose.yaml, under the relevant train-* service:
+environment:
+  - BGKIT_GDN_BACKEND=flashqla
+```
+
+…then restart the container. `BGKIT_GDN_BACKEND=flashqla` raises `RuntimeError` at first DeltaNet layer init if FlashQLA cannot be imported — there is no silent fallback to fla, by design (we don't want the perf-claim signal masked).
+
+**Status on sm_121 (2026-04-29 parity result)**:
+
+- `flash_qla.ops.gated_delta_rule.chunk.__init__` raises `ValueError("FlashQLA now support sm90 only.")` at import time. The module unconditionally rejects any `tilelang.contrib.nvcc.get_target_compute_version() != "9.0"`. Parity script returns exit code 2.
+- With the gate bypassed (`BGKIT_FLASHQLA_BYPASS_SM_GATE=1`), TileLang JIT-compiles the Hopper kernels but sm_121 reports `CUDA_ERROR_NO_BINARY_FOR_GPU` — the kernels emit `wgmma` instructions which are Hopper-specific (Blackwell uses the `mma.block_scale` family; wgmma is sm_90 only). The bypass also corrupts fla's own TileLang backend dispatch (which shares the same compute-version probe) so fla itself crashes — a second reason not to ship the bypass to production.
+- Verdict: FlashQLA + TileLang's Hopper kernels are not portable to Blackwell sm_121 today. Migration is blocked until either FlashQLA grows Blackwell kernel variants or TileLang adds sm_120/sm_121 codegen targets. The integration scaffolding is in place; flipping the env var on the day either of those lands is a one-line change.
+
 | Task | Command |
 |---|---|
 | Backfill registry | `make ckpt-backfill` or `.venv/bin/bgkit-ckpt backfill` |
 | List checkpoints | `.venv/bin/bgkit-ckpt list --phase phase1_step4` |
 | Best checkpoint | `.venv/bin/bgkit-ckpt best --phase phase1_step6 --metric eval/loss` |
+| FlashQLA parity test | `docker compose -f docker/docker-compose.yaml run --rm parity-flashqla` |
 
 ## Perf playbook for new training stages
 
