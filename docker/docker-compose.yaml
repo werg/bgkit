@@ -127,6 +127,13 @@ x-gpu-common: &gpu-common
     # from upstream 8b05e2f. Pure-Python — preferred via PYTHONPATH below
     # so it shadows the pip-installed fla 0.4.2 in dist-packages.
     - ../../flash-linear-attention:/workspace/fla:ro
+    # Local FlashQLA checkout (QwenLM/FlashQLA, pinned at c465f49):
+    # opt-in alternative GDN backend. Mounted read-only; activated by
+    # setting BGKIT_GDN_BACKEND=flashqla on a per-service basis. Pure
+    # Python (kernels are JIT-compiled by TileLang). NOT prepended to
+    # PYTHONPATH globally — the resolver imports it lazily so absence
+    # of TileLang in the image doesn't break unrelated services.
+    - ../../FlashQLA:/workspace/flashqla:ro
     # Wandb authenticates via netrc (machine api.wandb.ai).
     - ~/.netrc:/workspace/.netrc:ro
     # Persist torch.compile (inductor) and Triton kernel caches across restarts
@@ -306,6 +313,35 @@ services:
       "scripts/profile_packed_memory_phase2.py",
       "+experiment=phase2_kb_stage_b",
     ]
+
+  # FlashQLA parity smoke test. Runs scripts/test_flashqla_parity.py inside
+  # the training image with the FlashQLA bind mount + flash_qla on
+  # PYTHONPATH. Hard memory cap (40g) so a runaway TileLang JIT compile
+  # cannot OOM the host. Designed to coexist with a running training
+  # container — the test allocates only modestly-sized tensors and runs
+  # forward+backward parity once, then exits.
+  parity-flashqla:
+    <<: *gpu-common
+    mem_limit: 40g
+    memswap_limit: 40g
+    restart: "no"
+    environment:
+      - HOME=/workspace
+      - HYDRA_FULL_ERROR=1
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      # Prepend FlashQLA AND fla fork to PYTHONPATH (parity test imports both).
+      - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+      - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+      - TORCH_COMPILE_DISABLE=1
+      - FLA_USE_TMA=1
+      - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
+      - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+      - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
+      # Force the resolver to attempt the FlashQLA backend.
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}
+    command: ["scripts/test_flashqla_parity.py"]
 
   preprocess:
     build:
