@@ -1615,10 +1615,25 @@ class BaseTrainer(ABC):
         )
         self._accum_steps = accum_steps
 
-        # Resume warmup: linear ramp from near-zero to scheduled LR over N steps
-        # after resuming from a checkpoint. Helps optimizer re-stabilize when
-        # training regime changed (new param groups, extended schedule, etc.).
-        resume_warmup_steps = int(tcfg.get("resume_warmup_steps", 200))
+        # Resume warmup: optional linear ramp from near-zero to scheduled LR
+        # over N steps after a resume. DEFAULT 0 (disabled) — the by-name
+        # optimizer state restore already preserves momentum for every param
+        # that received a gradient pre-checkpoint, and curriculum-aware
+        # trainers (e.g. CommitEncodingTrainer's stage 0→1 dual-loader
+        # schedule) handle their own warmup for newly-gradient-receiving
+        # params. The blanket LR ramp doesn't distinguish "params with stale
+        # momentum" from "params that just got their state restored", so
+        # leaving it on punishes both groups equally for no protective
+        # benefit on the second.
+        #
+        # Set ``training.resume_warmup_steps`` > 0 explicitly when:
+        #   - a topology change introduces new param groups that will receive
+        #     gradients immediately (e.g. mid-training LoRA adapter swap)
+        #   - the LR schedule changed substantially (extended max_steps,
+        #     base_lr bumped) and you want to avoid a one-step LR jump
+        # Otherwise leave at 0 — see plans/l0-l1-rebuild-blockers.md
+        # post-reboot resume notes for the diagnosis.
+        resume_warmup_steps = int(tcfg.get("resume_warmup_steps", 0))
         if resume_warmup_steps > 0 and resume_step is not None:
             resume_warmup_end = resume_step + resume_warmup_steps
             logger.info(
