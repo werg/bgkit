@@ -109,9 +109,51 @@ def main(cfg: DictConfig) -> None:
         # configuring our fraction; if existing usage + our ask would exceed
         # 90% of the pool (leaving 10% for OS + driver), refuse to start.
         # Set BGKIT_ALLOW_PEER_CUDA=1 to bypass (auto-shrink instead).
+        #
+        # On unified memory, ``mem_get_info`` returns the host-wide pool, so
+        # ``total - free`` includes reclaimable page cache (mmap'd dataset
+        # offsets, prior model weights still cached, HF cache files). Those
+        # pages get evicted instantly under memory pressure, so they are not
+        # real contention. Subtract them out to get an accurate estimate of
+        # what's actually pinned by peer processes.
+        def _reclaimable_bytes() -> int:
+            """Page cache + buffers + reclaimable slab from /proc/meminfo.
+
+            Linux can evict these instantly under memory pressure; counting
+            them as "held" inflates the peer-CUDA estimate by 30+ GB on a
+            system that has just finished a CUDA-heavy run.
+            """
+            try:
+                with open("/proc/meminfo") as f:
+                    info: dict[str, int] = {}
+                    for line in f:
+                        k, _, rest = line.partition(":")
+                        # values like "12345678 kB"
+                        parts = rest.strip().split()
+                        if parts:
+                            info[k.strip()] = int(parts[0]) * 1024
+                return (
+                    info.get("Cached", 0)
+                    + info.get("Buffers", 0)
+                    + info.get("SReclaimable", 0)
+                )
+            except (OSError, ValueError):
+                return 0
+
         _free_bytes, _total_bytes = _torch.cuda.mem_get_info()
         _total_gb = _total_bytes / 1e9
-        _used_by_peers_gb = (_total_bytes - _free_bytes) / 1e9
+        _raw_used_bytes = _total_bytes - _free_bytes
+        _reclaimable_bytes_val = _reclaimable_bytes()
+        _used_by_peers_bytes = max(0, _raw_used_bytes - _reclaimable_bytes_val)
+        _used_by_peers_gb = _used_by_peers_bytes / 1e9
+        _raw_used_gb = _raw_used_bytes / 1e9
+        _reclaimable_gb = _reclaimable_bytes_val / 1e9
+        print(
+            f"[cuda-mem-guard] raw used = {_raw_used_gb:.1f} GB "
+            f"(reclaimable cache = {_reclaimable_gb:.1f} GB) "
+            f"=> peer CUDA = {_used_by_peers_gb:.1f} GB / {_total_gb:.1f} GB pool",
+            flush=True,
+        )
         _our_ask_gb = _frac * _total_gb
         _safe_ceiling_gb = 0.90 * _total_gb
         _allow_peer = _os.environ.get("BGKIT_ALLOW_PEER_CUDA", "0") == "1"

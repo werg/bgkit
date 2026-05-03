@@ -50,27 +50,27 @@ class QAChatReproDataset(Dataset):
         self._base_seed = seed
         self._epoch_seed = seed
 
-        # Build join: QA row -> source file token index (single-chunk only).
-        # The two sides store ``repo_path`` differently — QA records use
-        # relative ``owner/repo`` (set at QA-generation time), while the
-        # file dataset stores the absolute disk path. Normalize both to
-        # ``owner/repo`` (last two path components) before keying.
-        file_key_to_chunk: dict[tuple[str, str, str], tuple[int, int]] = {}
+        # Build join: QA row -> source file token index. The two sides
+        # store ``repo_path`` differently — QA records use relative
+        # ``owner/repo`` (set at QA-generation time), while the file
+        # dataset stores the absolute disk path. Normalize both to
+        # ``owner/repo`` + file_path (commit_sha dropped — see
+        # ``_normalize_key``) before keying.
+        #
+        # When the same (owner/repo, file_path) appears multiple times in
+        # the file_token_dataset (different commits, same code path), we
+        # take the FIRST occurrence. Empirically chunking-into-multiple-
+        # rows isn't happening in our token mmap (max single-row length
+        # is 248k tokens; conversion does not split files), so duplicates
+        # come from re-scanning at different commits, not from chunking.
+        file_key_to_first_idx: dict[tuple[str, str], int] = {}
         for tok_idx in range(len(file_token_dataset)):
             key = file_token_dataset.file_key(tok_idx)
             if key is None:
                 continue
             key = self._normalize_key(key)
-            if key not in file_key_to_chunk:
-                file_key_to_chunk[key] = (tok_idx, 1)
-            else:
-                first, count = file_key_to_chunk[key]
-                file_key_to_chunk[key] = (first, count + 1)
-
-        single_chunk_keys = {
-            k: first for k, (first, count) in file_key_to_chunk.items()
-            if count == 1
-        }
+            if key not in file_key_to_first_idx:
+                file_key_to_first_idx[key] = tok_idx
 
         self._joined_indices: list[tuple[int, int]] = []
         for qa_idx in range(len(qa_dataset)):
@@ -78,7 +78,7 @@ class QAChatReproDataset(Dataset):
             if key is None:
                 continue
             key = self._normalize_key(key)
-            tok_idx = single_chunk_keys.get(key)
+            tok_idx = file_key_to_first_idx.get(key)
             if tok_idx is not None:
                 self._joined_indices.append((tok_idx, qa_idx))
 
@@ -112,14 +112,27 @@ class QAChatReproDataset(Dataset):
         self._lengths = answer_lens + self._max_overhead
 
     @staticmethod
-    def _normalize_key(key: tuple[str, str, str]) -> tuple[str, str, str]:
-        """Reduce repo_path to ``owner/repo`` so absolute and relative
-        forms match across the QA + file_token datasets."""
-        repo_path, file_path, commit_sha = key
+    def _normalize_key(key: tuple[str, str, str]) -> tuple[str, str]:
+        """Reduce repo_path to ``owner/repo`` and drop ``commit_sha`` so
+        absolute/relative forms match AND files match across commits.
+
+        The QA generation scan and the file-token conversion scan ran at
+        different times; same file paths but different commit_sha values
+        for ~43% of samples. Dropping commit_sha from the join key
+        recovers those samples — bgkit trains on whatever version of the
+        file is currently in the file-token dataset, not the exact
+        version the QA was generated against. For most QA pairs (which
+        ask high-level structural questions) this is fine; for a small
+        subset where the file content meaningfully changed between the
+        two scans, the encoder sees slightly different code than the QA
+        expects. Net effect: more data, slight noise in QA grounding,
+        broader context exposure for bgkit.
+        """
+        repo_path, file_path, _commit_sha = key
         # Strip trailing slash, take last two components.
         parts = repo_path.rstrip("/").split("/")
         norm_repo = "/".join(parts[-2:]) if len(parts) >= 2 else repo_path
-        return (norm_repo, file_path, commit_sha)
+        return (norm_repo, file_path)
 
     @staticmethod
     def _build_variant_stub() -> dict[str, str]:
@@ -187,13 +200,22 @@ class QAChatReproDataset(Dataset):
         # are token positions inside the *original* source file at filter
         # time; clip against the in-batch source length in case the dataset
         # truncated the file shorter than the filter saw.
+        #
+        # For samples where the underlying QA dataset has no attribution
+        # (the un-filtered ``qa_conditioned/`` mmap was generated before
+        # answer-position attribution; only ``qa_conditioned_filtered/``
+        # has positions), we still emit an all-False mask so the collator
+        # can pack mixed batches. The loss then trains the head toward
+        # ``qa_non_answer_target`` at every position for those samples — a
+        # weak sparsity prior, harmless to the attributed samples in the
+        # same batch and lets us use the full ~115k QA pool instead of
+        # the filtered 86k.
         pos_indices = qa.get("answer_position_indices")
-        if pos_indices is not None:
-            n_src = int(source_tokens.size(0))
-            mask = torch.zeros(n_src, dtype=torch.bool)
-            if pos_indices.numel() > 0:
-                in_range = pos_indices[(pos_indices >= 0) & (pos_indices < n_src)]
-                if in_range.numel() > 0:
-                    mask[in_range] = True
-            result["answer_position_mask"] = mask
+        n_src = int(source_tokens.size(0))
+        mask = torch.zeros(n_src, dtype=torch.bool)
+        if pos_indices is not None and pos_indices.numel() > 0:
+            in_range = pos_indices[(pos_indices >= 0) & (pos_indices < n_src)]
+            if in_range.numel() > 0:
+                mask[in_range] = True
+        result["answer_position_mask"] = mask
         return result

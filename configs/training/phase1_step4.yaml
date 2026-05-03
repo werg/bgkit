@@ -39,8 +39,15 @@ warmup_steps: 500
 # Step 3's shape. 32768 OOM'd at the 79 GB per-process allocator cap
 # on the first forward. 24576 keeps effective batch close to
 # baseline (49152 tokens/step vs Step 3's 65536) with headroom.
-max_batch_tokens: 16384
-gradient_accumulation_steps: 4
+# 2026-05-03 sm_121 OOM lessons: 16384 + occasional anchor=0.95 spike
+# repeatedly hit the 79 GB cgroup cap during Step 4. 4096/grad_accum=16
+# keeps the same 65k effective batch with much lower per-microbatch
+# peak. Combined with max_sample_length=800 this caps decoder splice
+# length and avoids the worst-case backward pass.
+max_batch_tokens: 4096
+gradient_accumulation_steps: 16
+min_sample_length: 256       # filter trivially-short content samples on reconstruction batches (QA batches unaffected)
+max_sample_length: 800       # OOM guard: drop pathologically long files
 max_eval_samples: 500
 eval_every: 500
 save_every: 500
@@ -75,7 +82,9 @@ sample_target_ratio_during_training: true
 target_ratio_sampling_mode: jitter
 target_ratio_jitter_abs: 0.01
 target_ratio_jitter_rel: 0.10
-target_ratio_anchor_sampling_prob: 0.30
+# 2026-05-03: disabled by default — anchor=0.95 spikes drove repeated
+# OOMs on sm_121 mid-Step 4. Re-enable via control.json if needed.
+target_ratio_anchor_sampling_prob: 0.0
 
 use_liger: true
 use_liger_rmsnorm: false
@@ -159,9 +168,9 @@ early_stopping:
 # QA training — heavy mix. The interleaver pulls a QA batch with
 # probability qa_ratio at each training step; reconstruction batches
 # fill the rest. Pure QA (1.0) risks specializing the head into
-# extractive-only mode; we keep 30% reconstruction to retain general
-# compression behavior on the same head.
-qa_ratio: 0.7
+# extractive-only mode; we keep a small recon slice (10%) as a hedge.
+# Live-tunable via control.json.
+qa_ratio: 0.9
 
 # NOTE: ``cfg.data.qa_data_dir`` must be set from the experiment shim
 # (configs/experiment/phase1_step4.yaml) because that file uses

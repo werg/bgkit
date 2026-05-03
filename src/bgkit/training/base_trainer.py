@@ -108,8 +108,15 @@ def _average_metrics(accum_metrics: list[dict[str, float]]) -> dict[str, float]:
             for k, v in m.items()
         }
 
+    # Union of keys across all microbatches — keys only present in some
+    # microbatches (e.g. ``loss_qa`` when the InterleavingDataLoader fed a
+    # mix of recon + QA batches in this accumulation window) average over
+    # the subset they appear in. Previously we only took the first
+    # microbatch's keys, silently dropping per-source loss tracking.
     result: dict[str, float] = {}
-    keys = accum_metrics[0].keys()
+    keys: set[str] = set()
+    for m in accum_metrics:
+        keys.update(m.keys())
     for key in keys:
         values = [m[key] for m in accum_metrics if key in m]
         if values and isinstance(values[0], (int, float)):
@@ -161,6 +168,7 @@ class BaseTrainer(ABC):
         "max_batch_tokens": "_handle_max_batch_tokens",
         "max_batch_tokens_eval": "_handle_max_batch_tokens_eval",
         "min_sample_length": "_handle_min_sample_length",
+        "max_sample_length": "_handle_max_sample_length",
     }
 
     #: Steps between structured log messages. Override in subclass.
@@ -950,15 +958,22 @@ class BaseTrainer(ABC):
             )
 
         min_len = int(getattr(self, "_min_sample_length", 0) or 0)
-        if min_len > 0:
-            valid_idx = np.where(self._train_content_lengths_full >= min_len)[0]
+        max_len = int(getattr(self, "_max_sample_length", 0) or 0)
+        if min_len > 0 or max_len > 0:
+            content = self._train_content_lengths_full
+            mask = np.ones(len(content), dtype=bool)
+            if min_len > 0:
+                mask &= content >= min_len
+            if max_len > 0:
+                mask &= content <= max_len
+            valid_idx = np.where(mask)[0]
             if len(valid_idx) == 0:
                 logger.warning(
-                    "live_min_sample_length_filters_all",
+                    "live_sample_length_filters_all",
                     min_sample_length=min_len,
-                    max_length=int(self._train_content_lengths_full.max())
-                    if len(self._train_content_lengths_full)
-                    else 0,
+                    max_sample_length=max_len,
+                    max_length_observed=int(content.max()) if len(content) else 0,
+                    min_length_observed=int(content.min()) if len(content) else 0,
                 )
                 return
             ds = Subset(self._train_dataset_full, valid_idx.tolist())
@@ -972,6 +987,22 @@ class BaseTrainer(ABC):
 
         seed = getattr(self.train_sampler, "_seed", None)
         epoch = getattr(self.train_sampler, "_epoch", 0)
+
+        # If the train_dataloader is currently wrapped (e.g. by
+        # ``_InterleavingDataLoader`` in DecoderInitTrainer for QA mixing),
+        # preserve the wrapper attributes so we can re-wrap after rebuild.
+        # Without this, the rebuild silently strips the QA secondary loader
+        # and training falls back to 100% primary — a subtle correctness
+        # bug, not an obvious crash.
+        wrapper_state = None
+        existing_loader = self.train_dataloader
+        if hasattr(existing_loader, "_secondary") and hasattr(existing_loader, "_ratio"):
+            wrapper_state = {
+                "type": type(existing_loader),
+                "secondary": existing_loader._secondary,
+                "ratio": existing_loader._ratio,
+            }
+
         self.train_dataset = ds
         self._train_lengths = lengths
         self.train_sampler = PackedTokenBudgetSampler(
@@ -986,13 +1017,21 @@ class BaseTrainer(ABC):
         # Preserve cursor so the next step continues from the same position.
         self.train_sampler.set_batch_cursor(cursor)
 
-        self.train_dataloader = DataLoader(
+        primary_loader = DataLoader(
             ds,
             batch_sampler=self.train_sampler,
             collate_fn=self._train_collate_fn,
             num_workers=self._num_workers,
             pin_memory=self._pin_memory,
         )
+        if wrapper_state is not None:
+            self.train_dataloader = wrapper_state["type"](
+                primary=primary_loader,
+                secondary=wrapper_state["secondary"],
+                secondary_ratio=wrapper_state["ratio"],
+            )
+        else:
+            self.train_dataloader = primary_loader
         self._dataloader_invalidated = True
 
         logger.info(
@@ -1001,6 +1040,7 @@ class BaseTrainer(ABC):
             new=new_budget,
             cursor_preserved=cursor,
             min_sample_length=min_len,
+            max_sample_length=max_len,
             n_samples=len(ds),
         )
 
@@ -1134,6 +1174,38 @@ class BaseTrainer(ABC):
             return
         self._rebuild_train_dataloader_with_budget(int(budget))
         logger.info("live_min_sample_length_update", old=old, new=val)
+
+    def _handle_max_sample_length(self, val) -> None:
+        """Live-config handler for ``max_sample_length`` — guard against
+        OOM-inducing pathologically long samples.
+
+        Symmetric to :meth:`_handle_min_sample_length`. Filters training
+        samples LONGER than ``val`` content tokens by adding an upper
+        bound to the same Subset-based filter. ``val=0`` disables the
+        upper bound (returns to "no max"). Useful when expanding the
+        corpus to looser file types brings in huge data dumps that the
+        decoder can't fit at high target_ratio.
+        """
+        if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+            logger.warning(
+                "live_max_sample_length_invalid",
+                value=val,
+                expected="non-negative int",
+            )
+            return
+        old = int(getattr(self, "_max_sample_length", 0) or 0)
+        if old == val:
+            return
+        self._max_sample_length = val
+        budget = getattr(self, "_max_batch_tokens", None)
+        if budget is None:
+            logger.warning(
+                "live_max_sample_length_skipped",
+                reason="trainer has no _max_batch_tokens (rebuild path unavailable)",
+            )
+            return
+        self._rebuild_train_dataloader_with_budget(int(budget))
+        logger.info("live_max_sample_length_update", old=old, new=val)
 
     # ------------------------------------------------------------------
     # Memory accounting: everything comes from ``compute.memory`` — a
@@ -1567,12 +1639,16 @@ class BaseTrainer(ABC):
             gradient_accumulation_steps=accum_steps,
         )
 
-        # Apply YAML-default min_sample_length once at training-loop start.
-        # The handler no-ops gracefully if the trainer lacks the rebuild
-        # infrastructure (e.g. KRKBTrainer with QueryAwareBatchSampler).
+        # Apply YAML-default min/max_sample_length once at training-loop
+        # start. The handlers no-op gracefully if the trainer lacks the
+        # rebuild infrastructure (e.g. KRKBTrainer with
+        # QueryAwareBatchSampler).
         initial_min_len = int(tcfg.get("min_sample_length", 0) or 0)
         if initial_min_len > 0 and hasattr(self, "_max_batch_tokens"):
             self._handle_min_sample_length(initial_min_len)
+        initial_max_len = int(tcfg.get("max_sample_length", 0) or 0)
+        if initial_max_len > 0 and hasattr(self, "_max_batch_tokens"):
+            self._handle_max_sample_length(initial_max_len)
 
         # Live config (file-based HP control)
         # Clear stale control file so ad-hoc changes don't carry across runs.

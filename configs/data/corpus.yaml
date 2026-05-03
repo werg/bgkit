@@ -4,6 +4,16 @@ corpus:
   output_dir: ${oc.env:DATA_DIR}/processed
   max_repos: null
   max_tokens_per_repo: 2000000  # 2M tokens per repo
+  # 2026-05-01: Broadened to recover ~38k QA-pair training samples that were
+  # being silently dropped because the QA generator targets repo files
+  # (READMEs, manifests, configs, web assets) whose languages weren't in
+  # the original code-only allowlist. Added: Markdown, reStructuredText,
+  # YAML, TOML, JSON, XML, HTML, CSS, Gradle. Recommended additions
+  # without an extension mapping in repo_processing.py (skipped — would
+  # need detect_language extension before they can be allowlisted):
+  # Plain Text (.txt), Vue (.vue), R-doc (.rd), MATLAB / Objective-C (.m),
+  # Fortran (.f90/.f95/.f03), Assembly (.asm/.s), Elm (.elm),
+  # Visual Basic (.vb), C# project files (.csproj/.proj).
   language_allowlist:
     - Python
     - JavaScript
@@ -43,3 +53,13 @@ corpus:
     - Nix
     - Terraform
     - Protocol Buffers
+    # Added 2026-05-01 for QA-pair coverage:
+    - Markdown
+    - reStructuredText
+    - YAML
+    - TOML
+    - JSON
+    - XML
+    - HTML
+    - CSS
+    - Gradle

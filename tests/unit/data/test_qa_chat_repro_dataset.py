@@ -102,7 +102,14 @@ class TestQAChatReproDataset:
         ds = QAChatReproDataset(qa_ds, token_ds, tokenizer)
         assert len(ds) == 0
 
-    def test_multi_chunk_excluded(self, tmp_path):
+    def test_multi_row_takes_first(self, tmp_path):
+        """When the same (owner/repo, file_path) appears multiple times in
+        the token_dataset (e.g. scanned at different commits), the join
+        takes the FIRST occurrence rather than dropping the QA sample.
+        Previously this test asserted exclusion (single-chunk-only); we
+        now keep the QA sample paired against the first token row to
+        recover ~22% more training data, since chunking-into-multiple-
+        rows isn't actually happening in our token mmap."""
         token_ds = MockTokenDataset([
             {
                 "token_ids": [1, 2],
@@ -116,7 +123,7 @@ class TestQAChatReproDataset:
                 "file_path": "big.py",
                 "language": "python",
                 "repo_path": "owner/repo",
-                "commit_sha": "sha1",
+                "commit_sha": "sha2",  # different commit, same file path
             },
         ])
         d = tmp_path / "qa"
@@ -136,7 +143,9 @@ class TestQAChatReproDataset:
         qa_ds = MmapQAConditionedDataset(str(d))
         tokenizer = MockTokenizer()
         ds = QAChatReproDataset(qa_ds, token_ds, tokenizer)
-        assert len(ds) == 0
+        assert len(ds) == 1
+        # First occurrence (sha1, token_ids [1,2]) wins.
+        assert ds._joined_indices[0] == (0, 0)
 
     def test_getitem_returns_token_ids(self, mock_token_ds, mock_qa_ds):
         tokenizer = MockTokenizer()

@@ -386,3 +386,68 @@ def test_min_sample_length_combined_with_max_batch_tokens():
     # Filter is still in effect
     assert len(t.train_dataset) == 4
     assert t._min_sample_length == 100
+
+
+# ---------------------------------------------------------------------------
+# max_sample_length filter (OOM guard against pathologically long samples)
+# ---------------------------------------------------------------------------
+
+def test_max_sample_length_filters_long_samples():
+    """Setting max_sample_length filters out samples longer than threshold."""
+    lengths = [10, 50, 100, 200, 500, 1000, 2000, 5000]
+    t = _MinimalTrainer(lengths, budget=50000)
+    t.setup()
+    n_full = len(t.train_dataset)
+    assert n_full == 8
+
+    t._handle_max_sample_length(500)
+    # Samples with length <= 500: [10, 50, 100, 200, 500] = 5
+    assert len(t.train_dataset) == 5
+    assert t._max_sample_length == 500
+    assert all(int(L) <= 500 for L in t._train_lengths)
+
+
+def test_max_sample_length_combined_with_min():
+    """min and max can be applied together — only samples in [min, max] survive."""
+    lengths = [10, 50, 100, 200, 500, 1000, 2000]
+    t = _MinimalTrainer(lengths, budget=50000)
+    t.setup()
+    t._handle_min_sample_length(100)
+    t._handle_max_sample_length(1000)
+    # Samples in [100, 1000]: [100, 200, 500, 1000] = 4
+    assert len(t.train_dataset) == 4
+
+
+def test_max_sample_length_zero_disables():
+    """max_sample_length=0 disables the upper bound."""
+    lengths = [10, 50, 100, 200, 500, 1000, 2000]
+    t = _MinimalTrainer(lengths, budget=50000)
+    t.setup()
+    t._handle_max_sample_length(500)
+    # Samples <= 500: [10, 50, 100, 200, 500] = 5
+    assert len(t.train_dataset) == 5
+    t._handle_max_sample_length(0)
+    assert len(t.train_dataset) == 7
+    assert t._max_sample_length == 0
+
+
+def test_max_sample_length_invalid_rejected():
+    """Negative, non-int, or bool values are rejected."""
+    t = _make_trainer()
+    t._handle_max_sample_length(-1)
+    assert getattr(t, "_max_sample_length", 0) == 0
+    t._handle_max_sample_length("100")
+    assert getattr(t, "_max_sample_length", 0) == 0
+    t._handle_max_sample_length(True)
+    assert getattr(t, "_max_sample_length", 0) == 0
+
+
+def test_apply_live_config_dispatches_max_sample_length():
+    """apply_live_config routes max_sample_length to the handler."""
+    lengths = [10, 50, 100, 200, 500, 1000, 2000]
+    t = _MinimalTrainer(lengths, budget=50000)
+    t.setup()
+    t.apply_live_config({"max_sample_length": 500})
+    assert t._max_sample_length == 500
+    # Samples <= 500: [10, 50, 100, 200, 500] = 5
+    assert len(t.train_dataset) == 5

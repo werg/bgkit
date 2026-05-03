@@ -7,13 +7,32 @@ defaults:
 
 run_name: phase1_step4
 
-# Load encoder + LoRA-adapted decoder from the best Step 3 checkpoint.
-# 'auto' resolves via the registry (phase=phase1_step3, metric=eval/loss).
-bgkit_checkpoint: auto
+# Load encoder + LoRA-adapted decoder from Step 3's terminal full-compression
+# checkpoint. NOT 'auto' — the registry's lowest eval/loss is step 5000
+# (~0.20) but that's at no/low compression; step 19500 (eval/loss=0.4962) is
+# the right one because it's the only on-disk checkpoint at the target
+# compression ratio (target=0.08). Step 17000 (eval/loss=0.4847, the
+# true minimum at full compression) was pruned by keep_best=3.
+bgkit_checkpoint: /workspace/checkpoints/phase1_step3_step19500_20260430_185303
 
 # Override the global ``data.qa_data_dir`` from data/tokens.yaml. Must
 # live here (with @package _global_) because the trainer reads
 # ``cfg.data.qa_data_dir`` — a ``data:`` block inside training/*.yaml
 # would land at ``cfg.training.data:`` and be silently ignored.
 data:
-  qa_data_dir: ${oc.env:DATA_DIR}/mmap/qa_conditioned_filtered
+  # Unfiltered QA pool (~115k samples). The filtered variant
+  # ``qa_conditioned_filtered`` has answer-position attribution for ~86k
+  # samples; we use the full pool now and the dataset wrapper emits an
+  # all-False answer_position_mask for samples without attribution. The
+  # head loss naturally trains toward ``qa_non_answer_target`` at every
+  # position for those samples (weak sparsity prior; the decoder CE on
+  # answers is the primary supervision and isn't affected).
+  qa_data_dir: ${oc.env:DATA_DIR}/mmap/qa_conditioned
+  # Override the default ``processed/tokens`` path. ``processed_v2/tokens``
+  # was rebuilt 2026-05-01 with a broadened language_allowlist (added
+  # Markdown, YAML, TOML, JSON, XML, HTML, CSS, Gradle) so that the QA-
+  # generator's looser file scope is matched by the file-token corpus.
+  # QA-join recovers 86,817 samples (75.8%) vs 60,705 (53.0%) on the
+  # original ``processed/tokens`` — +43% training data.
+  tokens:
+    input_dir: ${oc.env:DATA_DIR}/processed_v2/tokens

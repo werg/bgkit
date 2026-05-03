@@ -15,7 +15,12 @@ target_ratio_ramp_steps: 1
 sample_target_ratio_during_training: true
 target_ratio_sampling_mode: window
 target_ratio_sampling_window_above: 0.10
-target_ratio_anchor_sampling_prob: 0.30
+# 2026-05-03: anchor sampling disabled by default — its 0.95 anchor
+# repeatedly drove sm_121 over the 79 GB cgroup cap during Step 4 (see
+# Step 4 OOM history). The threshold curve is calibrated enough at the
+# operating point by step 5 entry; reactivate via control.json if a
+# specific run wants broader curve calibration.
+target_ratio_anchor_sampling_prob: 0.0
 
 # Survivorship head losses, per level. Step 4 is where L1 first activates.
 # L0 head is trained from Step 3 (no BCE re-warmup); L1 cold-starts here
@@ -80,13 +85,22 @@ data:
   max_files_per_commit: 16
   max_message_tokens: 256
 
-# Packed-attention migration (wall-clock investigation 2026-04-21):
-# Same fix as Step 3 — 32768/grad_accum=2 keeps effective batch at 65k tokens
-# while flattening right-tail latency from tail microbatches (8 samples × L≈4096
-# → 35 s/step at 65536/grad_accum=1 due to decoder splice ≈ 2× content length).
-# See docs/wall_clock_investigation_2026_04_21.md.
-max_batch_tokens: 32768
-gradient_accumulation_steps: 2
+# 2026-05-03 sm_121 OOM lessons from Step 4: 32768 packed batches push
+# the unified-memory pool past the 79 GB cgroup cap during decoder
+# backward (encoder is also fully unfrozen here, more memory pressure
+# than Step 4's frozen-encoder + LoRA-decoder setup). 4096/grad_accum=16
+# gives the same 65k effective batch with much smaller per-microbatch
+# peaks. min_sample_length=256 + max_sample_length=800 bound the worst-
+# case decoder splice length to ~256 survivor tokens at target=0.20.
+max_batch_tokens: 4096
+gradient_accumulation_steps: 16
+# Commit data has very different length distribution from QA/recon: median
+# token_length=1262, p90=4401, max=8388 (per inspect_commit_sample.py
+# 2026-05-03). max_sample_length=800 from Step 4 would drop 70%; 3000
+# keeps 80% and drops only the truly enormous commits that would OOM
+# the decoder backward at L²~70M per singleton.
+min_sample_length: 256
+max_sample_length: 3000
 
 eval_every: 1000
 save_every: 5000
