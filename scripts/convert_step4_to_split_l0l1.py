@@ -54,19 +54,31 @@ def _save_split_artifacts(
         if k.startswith("projection_block.")
     }
 
+    # Trainer load path expects a single `encoder.pt` keyed file with the
+    # full state dict (l0.*, l1.*, projection_block.* prefixes intact).
+    # The split-prefix files are kept too so precompute_l0_subset.py and
+    # similar scripts can load just one level cheaply.
+    torch.save(enc_sd, out_dir / "encoder.pt")
     torch.save(l0_sd, out_dir / "l0.pt")
     torch.save(l1_sd, out_dir / "l1.pt")
     torch.save(proj_sd, out_dir / "projection_block.pt")
     if decoder_state is not None:
         torch.save(decoder_state, out_dir / "decoder.pt")
 
+    # Match CheckpointMetadata schema so load_checkpoint() accepts it.
+    src_step = getattr(src_metadata, "step", 0) or 0
+    src_phase = getattr(src_metadata, "phase", None)
     metadata = {
         "phase": "phase1_step4_split",
-        "source_phase": getattr(src_metadata, "phase", None),
-        "source_step": getattr(src_metadata, "step", None),
-        "source_metrics": getattr(src_metadata, "metrics", None),
+        "step": int(src_step),
+        "epoch": int(getattr(src_metadata, "epoch", 0) or 0),
+        "parent_checkpoint": getattr(src_metadata, "parent_checkpoint", None),
+        "metrics": getattr(src_metadata, "metrics", None),
+        "schedule_params": None,
+        "training_state": None,
+        "optimizer_type": None,
         "note": (
-            "Converted from a legacy Step-4 checkpoint via "
+            f"Converted from {src_phase} step {src_step} via "
             "BgKITEncoder.from_pretrained_legacy_step4_checkpoint. "
             "L0/L1 backbones share initial state (deepcopy at construction). "
             "L0/L1 heads + survive_embedding TRANSFERRED from the legacy "
@@ -142,7 +154,10 @@ def main() -> int:
         hidden_dim=args.hidden_dim,
         torch_dtype=torch.bfloat16,
     )
-    decoder_state = state_dicts.get("decoder", None)
+    # Prefer decoder_merged (clean backbone.model.* keys) over decoder
+    # (which may have PEFT/LoRA wrappers with different prefixes that the
+    # downstream trainer's fresh ReconstructionDecoder won't accept).
+    decoder_state = state_dicts.get("decoder_merged") or state_dicts.get("decoder")
 
     out_dir = checkpoint_dir / f"{args.target_phase}_from_{src_path.name}"
     if args.dry_run:

@@ -52,6 +52,14 @@ x-gpu-common: &gpu-common
     # static, ship-with-fork variant; this is the live, grow-during-training
     # variant. They coexist.)
     - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+    # TileLang/TVM caches for FlashQLA JIT kernels. The image provides the
+    # toolchain; these dirs keep compiled artifacts out of the container layer.
+    - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+    - TVM_CACHE_DIR=/workspace/.cache/tvm
+    # FlashQLA is the default GatedDeltaNet backend. Set
+    # BGKIT_GDN_BACKEND=fla for the explicit FLA escape hatch, or =auto to
+    # permit fallback when FlashQLA cannot import.
+    - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}
     # PYTHONPATH override: prepend the local flash-linear-attention fork so
     # `import fla` resolves to the bind-mounted blackwell-sm121-compat
     # branch (sm_121 detection + global_scratch allocator) instead of the
@@ -59,7 +67,7 @@ x-gpu-common: &gpu-common
     # Dockerfile's existing entries (FlashAttention, bgkit src, cutlass-dsl)
     # because compose `environment` replaces, not augments, the image ENV.
     # Entrypoint may further prepend the FA native cache repo.
-    - PYTHONPATH=/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+    - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
     # Triton kernel dump (off by default; opt-in via host env to capture
     # PTX/SASS for TMA / cp.async.bulk verification on Blackwell sm_121).
     # See plans/ for the perf investigation context.
@@ -127,18 +135,17 @@ x-gpu-common: &gpu-common
     # from upstream 8b05e2f. Pure-Python — preferred via PYTHONPATH below
     # so it shadows the pip-installed fla 0.4.2 in dist-packages.
     - ../../flash-linear-attention:/workspace/fla:ro
-    # Local FlashQLA checkout (QwenLM/FlashQLA, pinned at c465f49):
-    # opt-in alternative GDN backend. Mounted read-only; activated by
-    # setting BGKIT_GDN_BACKEND=flashqla on a per-service basis. Pure
-    # Python (kernels are JIT-compiled by TileLang). NOT prepended to
-    # PYTHONPATH globally — the resolver imports it lazily so absence
-    # of TileLang in the image doesn't break unrelated services.
+    # Local FlashQLA checkout (QwenLM/FlashQLA):
+    # default GDN backend. Mounted read-only for normal runs; kernels are
+    # JIT-compiled by TileLang from the training image.
     - ../../FlashQLA:/workspace/flashqla:ro
     # Wandb authenticates via netrc (machine api.wandb.ai).
     - ~/.netrc:/workspace/.netrc:ro
     # Persist torch.compile (inductor) and Triton kernel caches across restarts
     - bgkit-compile-cache:/workspace/.cache/torchinductor
     - bgkit-triton-cache:/workspace/.triton
+    - bgkit-tilelang-cache:/workspace/.cache/tilelang
+    - bgkit-tvm-cache:/workspace/.cache/tvm
 
 x-llama-common: &llama-common
   build:
@@ -232,6 +239,12 @@ services:
 
   train-phase1-step5:
     <<: *gpu-common
+    # Pinned to phase1-step4 image: the bare gpu-common base image
+    # (e4cac9d17540) lacks `quack-kernels`, which `flash_attn.cute` requires
+    # at import. step4's image was rebuilt to include it. Revert this pin
+    # once the gpu-common image is rebuilt to match step4's deps.
+    image: docker-train-phase1-step4:latest
+    build: !reset null
     command: ["scripts/train.py", "+experiment=phase1_step5"]
 
   train-phase1-step6:
@@ -314,12 +327,63 @@ services:
       "+experiment=phase2_kb_stage_b",
     ]
 
+  # Interactive GPU shell with FlashQLA/FLA/FA4 on PYTHONPATH. FlashQLA is
+  # still edited from the host checkout; the mount is read-only here so ad hoc
+  # container commands cannot dirty kernel sources by accident.
+  shell-flashqla:
+    <<: *gpu-common
+    mem_limit: 40g
+    memswap_limit: 40g
+    restart: "no"
+    stdin_open: true
+    tty: true
+    environment:
+      - HOME=/workspace
+      - HYDRA_FULL_ERROR=1
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+      - TVM_CACHE_DIR=/workspace/.cache/tvm
+      - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+      - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+      - TORCH_COMPILE_DISABLE=1
+      - FLA_USE_TMA=1
+      - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
+      - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+      - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}
+    command: ["bash"]
+
+  # Environment smoke test for the FlashQLA toolchain. This does not run the
+  # kernels; it reports CUDA/TileLang/FLA/FlashQLA import status and classifies
+  # the known Hopper-only import gate separately from missing dependencies.
+  smoke-flashqla:
+    <<: *gpu-common
+    mem_limit: 20g
+    memswap_limit: 20g
+    restart: "no"
+    environment:
+      - HOME=/workspace
+      - HYDRA_FULL_ERROR=1
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+      - TVM_CACHE_DIR=/workspace/.cache/tvm
+      - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+      - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+      - TORCH_COMPILE_DISABLE=1
+      - FLA_USE_TMA=1
+      - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
+      - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+      - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.10}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}
+    command: ["scripts/flashqla_env_smoke.py"]
+
   # FlashQLA parity smoke test. Runs scripts/test_flashqla_parity.py inside
-  # the training image with the FlashQLA bind mount + flash_qla on
-  # PYTHONPATH. Hard memory cap (40g) so a runaway TileLang JIT compile
-  # cannot OOM the host. Designed to coexist with a running training
-  # container — the test allocates only modestly-sized tensors and runs
-  # forward+backward parity once, then exits.
+  # the training image with the baked TileLang toolchain and FlashQLA/FLA bind
+  # mounts. Hard memory cap (40g) so a runaway JIT compile cannot OOM the host.
   parity-flashqla:
     <<: *gpu-common
     mem_limit: 40g
@@ -330,7 +394,8 @@ services:
       - HYDRA_FULL_ERROR=1
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
-      # Prepend FlashQLA AND fla fork to PYTHONPATH (parity test imports both).
+      - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+      - TVM_CACHE_DIR=/workspace/.cache/tvm
       - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
       - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
@@ -339,24 +404,34 @@ services:
       - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
       - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
       - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
-      # Force the resolver to attempt the FlashQLA backend.
       - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}
-    # Install TileLang (FlashQLA's only non-PyPI dep) on entry, then run
-    # the parity test. Pin to FlashQLA's required version. --user keeps
-    # the install scoped to this container's writable layer; the bind
-    # mount and the rest of the image are unaffected. ~2-3 min on first
-    # run; subsequent runs reuse the install (the writable layer
-    # persists per ``docker compose run --rm`` invocation only — every
-    # invocation is fresh, so always ~2-3 min).
-    entrypoint: ["bash", "-lc"]
-    command:
-      - |
-        set -e
-        pip install --user --no-cache-dir tilelang==0.1.8 apache-tvm-ffi==0.1.9 || {
-          echo "FATAL: tilelang install failed; cannot proceed with FlashQLA parity test." >&2
-          exit 5
-        }
-        exec python /workspace/bgkit/scripts/test_flashqla_parity.py
+    command: ["scripts/test_flashqla_parity.py"]
+
+  # Lightweight backend timing harness for FLA vs FlashQLA after the sm_121
+  # kernels exist. Until then it fails with the same classified FlashQLA import
+  # or launch error as the parity service.
+  profile-flashqla:
+    <<: *gpu-common
+    mem_limit: 40g
+    memswap_limit: 40g
+    restart: "no"
+    environment:
+      - HOME=/workspace
+      - HYDRA_FULL_ERROR=1
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+      - TVM_CACHE_DIR=/workspace/.cache/tvm
+      - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+      - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+      - TORCH_COMPILE_DISABLE=1
+      - FLA_USE_TMA=1
+      - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
+      - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+      - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}
+    command: ["scripts/profile_flashqla_backend.py", "--backend", "both"]
 
   preprocess:
     build:
@@ -444,3 +519,5 @@ services:
 volumes:
   bgkit-compile-cache:
   bgkit-triton-cache:
+  bgkit-tilelang-cache:
+  bgkit-tvm-cache:
