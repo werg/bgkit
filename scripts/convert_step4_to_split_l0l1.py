@@ -6,15 +6,16 @@ and saves the result as a multi-artifact split-layout checkpoint
 (``l0.pt``, ``l1.pt``, ``projection_block.pt``, ``decoder.pt``,
 ``metadata.json``) under the registry phase ``phase1_step4_split``.
 
-After conversion the new ``encoder.l0.head`` / ``encoder.l1.head`` are
-fresh re-inits at the new last-block position. A short Step 5 head warmup
-phase (target_ratio=1.0, backbones frozen) re-trains them from the
-captured Step 4 backbone, projection, and decoder state.
+After conversion the new ``encoder.l0.head`` and ``encoder.l1.head`` carry
+the trained Step-4 head weights (transferred unchanged — heads still fire
+at the block-1 hook in the new architecture). ``encoder.l0.survive_embedding``
+and ``encoder.l1.survive_embedding`` are also transferred. The L1 backbone
+is a deepcopy of L0's backbone at construction.
 
 Usage::
 
     .venv/bin/python scripts/convert_step4_to_split_l0l1.py \\
-        [--source PHASE_NAME] [--dry-run]
+        [--source PHASE_NAME] [--checkpoint-name NAME] [--dry-run]
 """
 from __future__ import annotations
 
@@ -68,8 +69,9 @@ def _save_split_artifacts(
             "Converted from a legacy Step-4 checkpoint via "
             "BgKITEncoder.from_pretrained_legacy_step4_checkpoint. "
             "L0/L1 backbones share initial state (deepcopy at construction). "
-            "L0/L1 heads re-initialised at new last-block position; run a "
-            "Step 5 head warmup phase before resuming training."
+            "L0/L1 heads + survive_embedding TRANSFERRED from the legacy "
+            "compressor.head_base_l{0,1} / compressor.survive_embedding "
+            "(no re-initialisation needed — heads still fire at the block-1 hook)."
         ),
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -81,6 +83,13 @@ def main() -> int:
         "--source",
         default="phase1_step4",
         help="Source registry phase name (default: phase1_step4)",
+    )
+    parser.add_argument(
+        "--checkpoint-name",
+        default=None,
+        help="Specific checkpoint name to convert (overrides --source latest()). "
+             "Use this when the latest checkpoint is interrupted/incomplete and "
+             "you want a known-good earlier one.",
     )
     parser.add_argument(
         "--target-phase",
@@ -106,13 +115,20 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     checkpoint_dir = get_checkpoint_dir()
-    registry = CheckpointRegistry(checkpoint_dir / "registry.json")
-    src_entry = registry.latest(phase=args.source)
-    if src_entry is None:
-        logger.error("No checkpoint registered under phase %r", args.source)
-        return 1
+    registry = CheckpointRegistry(checkpoint_dir)
+    registry.backfill(checkpoint_dir)
+    if args.checkpoint_name is not None:
+        src_entry = registry.get(args.checkpoint_name)
+        if src_entry is None:
+            logger.error("No checkpoint registered under name %r", args.checkpoint_name)
+            return 1
+    else:
+        src_entry = registry.latest(phase=args.source)
+        if src_entry is None:
+            logger.error("No checkpoint registered under phase %r", args.source)
+            return 1
 
-    src_path = Path(src_entry.path)
+    src_path = checkpoint_dir / src_entry.name
     logger.info("loading source checkpoint: %s", src_path)
     metadata, state_dicts = load_checkpoint(src_path)
 
