@@ -158,6 +158,11 @@ class LevelOutput:
         """Captured grad of downstream loss w.r.t. post-head content values."""
         return self._utility_grad_state.get("post_head_content_grad")
 
+    @property
+    def theta_tensor(self) -> torch.Tensor | None:
+        """Alias for ``theta`` — the survivorship_helpers consume this name."""
+        return self.theta
+
     def release(self) -> None:
         """Drop tensor references to free memory after backward."""
         self._utility_grad_state.clear()

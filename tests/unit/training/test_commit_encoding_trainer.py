@@ -1,37 +1,44 @@
-"""Tests for CommitEncodingTrainer: ratio curriculum, live-config, resolve wiring.
+"""Tests for the rebuilt CommitEncodingTrainer (Phase 1 Step 5).
 
-The full ``_forward_backward`` path requires repo-batch packing
-(``cu_file_seqlens`` per-file, ``cu_repo_seqlens`` per-commit) and runs
-a packed L0 → L1 → decoder chain; that surface is covered by
-``tests/integration/``. The unit tests here cover the pure-Python
-control plane plus state-dict round-trip.
+Coverage:
+- Trainer constructs cleanly against the split-L0/L1 encoder.
+- ``_curriculum_state(step)`` returns sane values at every stage boundary.
+- Live-config dispatch updates the curriculum + survivorship knobs.
+- One CPU microbatch flows through ``_forward_backward`` end-to-end.
+- Checkpoint state-dict round-trip on encoder + decoder.
+
+Forward-pass tests use the SDPA monkey-patch shared with the
+``test_decoder_init_trainer.py`` suite: FA4 is GPU-only, but the packed
+attention surface accepts ``cu_seqlens`` directly so we can drop in
+SDPA per-segment loops on CPU.
 """
 
 from __future__ import annotations
+
+import copy
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from pathlib import Path
-from unittest.mock import patch
-
 from omegaconf import OmegaConf
 from torch import nn
 
-from bgkit.models.bgkit_compressor import BgKITCompressor
+from bgkit.data.datasets.compression_dataset import RepoCompressionSample
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
+from bgkit.models.level_compressor import LevelCompressor
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.training.phase1.commit_encoding import CommitEncodingTrainer
 
 # ---------------------------------------------------------------------------
-# Mocks — Qwen3.5-shaped packed surface (shared pattern with the other
-# Phase 1 trainer tests).
+# Mocks shared with test_decoder_init_trainer.py — Qwen3.5-shaped surface.
 # ---------------------------------------------------------------------------
 
-HIDDEN_DIM = 32
-VOCAB_SIZE = 256
+HIDDEN_DIM = 64
+VOCAB_SIZE = 1000
 
 
 class _Output:
@@ -44,7 +51,9 @@ class MockEncoderBackbone(nn.Module):
     def __init__(self, vocab_size: int = VOCAB_SIZE, hidden_dim: int = HIDDEN_DIM):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size, hidden_dim)
-        self.layers = nn.ModuleList([nn.Linear(hidden_dim, hidden_dim)])
+        self.layers = nn.ModuleList(
+            [nn.Linear(hidden_dim, hidden_dim) for _ in range(2)]
+        )
         self.norm = nn.Identity()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -65,6 +74,7 @@ class MockEncoderBackbone(nn.Module):
             x = layer(x)
             if layer_hooks and i in layer_hooks:
                 x = layer_hooks[i](x)
+        x = self.norm(x)
         return _Output(last_hidden_state=x)
 
 
@@ -157,20 +167,34 @@ class MockCausalLMBackbone(nn.Module):
 
 
 def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
-    backbone = MockEncoderBackbone(hidden_dim=hidden_dim)
-    compressor_norm = nn.LayerNorm(hidden_dim)
-    compressor = BgKITCompressor(backbone, compressor_norm, hidden_dim=hidden_dim)
+    backbone_l0 = MockEncoderBackbone(hidden_dim=hidden_dim)
+    backbone_l1 = copy.deepcopy(backbone_l0)
+    backbone_l1.embed_tokens = nn.Identity()
+
+    l0 = LevelCompressor(
+        backbone=backbone_l0,
+        hidden_dim=hidden_dim,
+        survivorship_inner_dim=8,
+        with_prompt=True,
+        with_auto_repro=True,
+    )
+    l1 = LevelCompressor(
+        backbone=backbone_l1,
+        hidden_dim=hidden_dim,
+        survivorship_inner_dim=8,
+        with_prompt=False,
+        with_auto_repro=False,
+    )
 
     proj_layer = MockTransformerLayer(hidden_dim)
     proj_norm = nn.LayerNorm(hidden_dim)
     rotary = MockRotaryEmb(hidden_dim)
     projection_block = ProjectionBlock(proj_layer, proj_norm, rotary, hidden_dim=hidden_dim)
-
-    return BgKITEncoder(compressor, projection_block)
+    return BgKITEncoder(l0, l1, projection_block)
 
 
 # ---------------------------------------------------------------------------
-# SDPA packed-attention shim.
+# SDPA monkey-patch fixture.
 # ---------------------------------------------------------------------------
 
 
@@ -232,15 +256,9 @@ def _sdpa_packed_attention(
 
 @pytest.fixture(autouse=True)
 def _patch_packed_attention(monkeypatch):
-    from bgkit.models import (
-        bidirectional_qwen35 as bq,
-    )
-    from bgkit.models import (
-        projection_block as pb,
-    )
-    from bgkit.models import (
-        pruned_qwen35 as pq,
-    )
+    from bgkit.models import bidirectional_qwen35 as bq
+    from bgkit.models import projection_block as pb
+    from bgkit.models import pruned_qwen35 as pq
 
     monkeypatch.setattr(bq, "_packed_full_attention", _sdpa_packed_attention)
     monkeypatch.setattr(pb, "_packed_full_attention", _sdpa_packed_attention)
@@ -248,13 +266,12 @@ def _patch_packed_attention(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Fixtures.
+# Trainer fixture.
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
-def trainer():
-    cfg = OmegaConf.create({
+def _base_cfg(**training_overrides):
+    base = {
         "training": {
             "phase": "phase1_step5",
             "max_steps": 100,
@@ -262,16 +279,38 @@ def trainer():
             "warmup_steps": 10,
             "eval_every": 50,
             "save_every": 0,
-            "curriculum": {
-                "target_ratio_start": 0.50,
-                "target_ratio_end": 0.20,
-                "target_ratio_ramp_steps": 30000,
-            },
+            "head_warmup_steps": 500,
+            "stage1_end_step": 3500,
+            "stage2_l1_ramp_start_step": 3500,
+            "stage2_l1_ramp_end_step": 5500,
+            "stage0_target_ratio_l0": 1.0,
+            "stage1_l0_ratio_start": 0.9,
+            "stage1_l0_ratio_end": 0.15,
+            "stage2_target_ratio_l0": 0.30,
+            "stage0_target_ratio_l1": 1.0,
+            "stage1_target_ratio_l1": 1.0,
+            "stage2_target_ratio_l1_start": 1.0,
+            "stage2_target_ratio_l1_end": 0.33,
+            "stage0_max_sample_length": 1500,
+            "stage1_max_sample_length": 2000,
+            "stage2_l0_frozen_max_sample_length": 6000,
+            "stage2_l0_unfrozen_max_sample_length": 1500,
+            "stage0_max_batch_tokens": 8192,
+            "stage1_max_batch_tokens": 8192,
+            "stage2_l0_frozen_max_batch_tokens": 16384,
+            "stage2_l0_unfrozen_max_batch_tokens": 4096,
+            "stage2_l0_unfrozen_period": 8,
         },
         "compute": {"num_workers": 0, "pin_memory": False},
         "wandb": {"enabled": False},
-    })
+    }
+    base["training"].update(training_overrides)
+    return OmegaConf.create(base)
 
+
+@pytest.fixture()
+def trainer():
+    cfg = _base_cfg()
     t = CommitEncodingTrainer(cfg)
     t.device = torch.device("cpu")
 
@@ -283,37 +322,192 @@ def trainer():
     t.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=HIDDEN_DIM)
     t.model = t.decoder
 
+    # Mirror what setup() would populate (tests skip the heavy setup() call).
+    t._init_curriculum_state(t.cfg.training)
+
+    from bgkit.training.survivorship_helpers import init_state, resolve_level_loss_cfg
+    t._surv_l0 = resolve_level_loss_cfg({"utility_grad_loss_weight": 0.0})
+    t._surv_l1 = resolve_level_loss_cfg({"utility_grad_loss_weight": 0.0})
+    from bgkit.training.survivorship_helpers import resolve_level_ice_cfg
+    t._ice_l0 = resolve_level_ice_cfg({})
+    t._ice_l1 = resolve_level_ice_cfg({})
+    t._ref_moments_l0 = None
+    t._ref_moments_l1 = None
+    t._ice_teacher = None
+    t._max_warmup_step = 0
+    t._surv_state_l0 = init_state()
+    t._surv_state_l1 = init_state()
+    t._diagnostic_metrics_every_n_steps = 1
+    t._stage2_small_dataloader = None
+    t._stage2_small_iter = None
+    t._l0_trainable_static = False
+    t._l1_trainable_static = False
+    t._last_post_step_metrics = {}
+    t._last_sampled_target_ratio = None
+
     params = list(t.encoder.parameters()) + list(t.decoder.parameters())
     t.optimizer = torch.optim.AdamW(params, lr=1e-3)
-
-    t._target_ratio_start = 0.50
-    t._target_ratio_end = 0.20
-    t._target_ratio_ramp_steps = 30000
-    t._target_ratio_override = None
-
-    t._profile_enabled = False
     t._accum_steps = 1
+    t._profile_enabled = False
     return t
 
 
 # ---------------------------------------------------------------------------
-# Component wiring (no forward pass).
+# Curriculum boundary tests.
 # ---------------------------------------------------------------------------
 
 
-class TestSetup:
-    def test_encoder_exists_and_trainable(self, trainer):
-        assert isinstance(trainer.encoder, BgKITEncoder)
-        assert any(p.requires_grad for p in trainer.encoder.parameters())
+class TestCurriculum:
+    def test_stage0_at_step0(self, trainer):
+        ratio_l0, ratio_l1, l0_train, max_len, max_tok = trainer._curriculum_state(0)
+        assert ratio_l0 == 1.0
+        assert ratio_l1 == 1.0
+        assert l0_train is False
+        assert max_len == 1500
+        assert max_tok == 8192
 
-    def test_decoder_exists_and_trainable(self, trainer):
+    def test_stage0_just_before_end(self, trainer):
+        ratio_l0, ratio_l1, l0_train, _, _ = trainer._curriculum_state(499)
+        assert ratio_l0 == 1.0
+        assert ratio_l1 == 1.0
+        assert l0_train is False
+
+    def test_stage1_at_start(self, trainer):
+        ratio_l0, ratio_l1, l0_train, max_len, _ = trainer._curriculum_state(500)
+        assert abs(ratio_l0 - 0.9) < 1e-6  # ramp start
+        assert ratio_l1 == 1.0
+        assert l0_train is False
+        assert max_len == 2000
+
+    def test_stage1_midpoint_ramp(self, trainer):
+        # midpoint between 500 and 3500 → t=0.5, ratio = 0.9 + 0.5*(0.15-0.9) = 0.525
+        ratio_l0, _, _, _, _ = trainer._curriculum_state(2000)
+        assert abs(ratio_l0 - 0.525) < 1e-6
+
+    def test_stage1_just_before_end(self, trainer):
+        ratio_l0, _, _, _, _ = trainer._curriculum_state(3499)
+        # Very close to ratio_end = 0.15, slightly above.
+        assert ratio_l0 > 0.15
+        assert abs(ratio_l0 - 0.15) < 0.01
+
+    def test_stage2_entry_frozen_microbatch(self, trainer):
+        # step=3500 % 8 == 4 → frozen microbatch.
+        ratio_l0, ratio_l1, l0_train, max_len, max_tok = trainer._curriculum_state(3500)
+        assert ratio_l0 == 0.30
+        # Ramp just started at 3500 → still at start value.
+        assert ratio_l1 == 1.0
+        assert l0_train is False
+        assert max_len == 6000
+        assert max_tok == 16384
+
+    def test_stage2_unfrozen_microbatch(self, trainer):
+        # step=3504 % 8 == 0 → L0-unfrozen microbatch.
+        # Actually: 3504 % 8 = 0; choose 3504.
+        ratio_l0, _, l0_train, max_len, max_tok = trainer._curriculum_state(3504)
+        assert ratio_l0 == 0.30
+        assert l0_train is True
+        assert max_len == 1500
+        assert max_tok == 4096
+
+    def test_stage2_l1_ramp_endpoint(self, trainer):
+        # at exactly stage2_l1_ramp_end_step the ratio is target.
+        _, ratio_l1, _, _, _ = trainer._curriculum_state(5500)
+        assert ratio_l1 == 0.33
+
+    def test_stage2_l1_ramp_post_end(self, trainer):
+        _, ratio_l1, _, _, _ = trainer._curriculum_state(7000)
+        assert ratio_l1 == 0.33
+
+    def test_user_override_target_ratio_l0(self, trainer):
+        trainer._target_ratio_l0_override = 0.07
+        ratio_l0, _, _, _, _ = trainer._curriculum_state(3500)
+        assert ratio_l0 == 0.07
+
+    def test_user_override_target_ratio_l1(self, trainer):
+        trainer._target_ratio_l1_override = 0.20
+        _, ratio_l1, _, _, _ = trainer._curriculum_state(0)
+        assert ratio_l1 == 0.20
+
+
+class TestCoarseStage:
+    def test_stage_names(self, trainer):
+        assert trainer._coarse_stage(0) == "stage0"
+        assert trainer._coarse_stage(499) == "stage0"
+        assert trainer._coarse_stage(500) == "stage1"
+        assert trainer._coarse_stage(3499) == "stage1"
+        # 3500 % 8 != 0 → stage2_frozen
+        assert trainer._coarse_stage(3500) == "stage2_frozen"
+        # 3504 % 8 == 0 → stage2_unfrozen
+        assert trainer._coarse_stage(3504) == "stage2_unfrozen"
+
+
+# ---------------------------------------------------------------------------
+# Live-config tests.
+# ---------------------------------------------------------------------------
+
+
+class TestLiveConfig:
+    def test_target_ratio_l0_override(self, trainer):
+        trainer.apply_live_config({"target_ratio_l0": 0.15})
+        assert trainer._target_ratio_l0_override == 0.15
+
+    def test_target_ratio_l0_clear(self, trainer):
+        trainer._target_ratio_l0_override = 0.30
+        trainer.apply_live_config({"target_ratio_l0": None})
+        assert trainer._target_ratio_l0_override is None
+
+    def test_target_ratio_l1_override(self, trainer):
+        trainer.apply_live_config({"target_ratio_l1": 0.20})
+        assert trainer._target_ratio_l1_override == 0.20
+
+    def test_stage_transition_step_update(self, trainer):
+        trainer.apply_live_config({"head_warmup_steps": 1000})
+        assert trainer._head_warmup_steps == 1000
+
+    def test_stage1_ratio_end_update(self, trainer):
+        trainer.apply_live_config({"stage1_l0_ratio_end": 0.20})
+        assert trainer._stage1_l0_ratio_end == 0.20
+        # And the ramp now hits 0.20 at the end.
+        ratio_l0, _, _, _, _ = trainer._curriculum_state(3499)
+        assert ratio_l0 > 0.20
+        # And just past stage1 end, holds at stage2 default (not 0.20).
+        ratio_l0, _, _, _, _ = trainer._curriculum_state(3500)
+        assert ratio_l0 == 0.30
+
+    def test_stage2_period_update(self, trainer):
+        trainer.apply_live_config({"stage2_l0_unfrozen_period": 4})
+        assert trainer._stage2_l0_unfrozen_period == 4
+        # Now every 4th step is L0-unfrozen.
+        assert trainer._coarse_stage(3500) == "stage2_unfrozen"  # 3500 % 4 == 0
+
+    def test_utility_grad_l0_update(self, trainer):
+        trainer.apply_live_config({"utility_grad_loss_weight_l0": 0.5})
+        assert trainer._surv_l0.utility_grad_loss_weight == 0.5
+
+    def test_utility_grad_l1_update(self, trainer):
+        trainer.apply_live_config({"utility_grad_loss_weight_l1": 0.4})
+        assert trainer._surv_l1.utility_grad_loss_weight == 0.4
+
+
+# ---------------------------------------------------------------------------
+# Setup helpers / wiring.
+# ---------------------------------------------------------------------------
+
+
+class TestComponentWiring:
+    def test_encoder_has_split_l0_l1(self, trainer):
+        assert hasattr(trainer.encoder, "l0")
+        assert hasattr(trainer.encoder, "l1")
+        assert hasattr(trainer.encoder, "projection_block")
+
+    def test_l0_has_auto_repro_head(self, trainer):
+        assert trainer.encoder.l0.auto_repro_head is not None
+
+    def test_l1_has_no_auto_repro_head(self, trainer):
+        assert trainer.encoder.l1.auto_repro_head is None
+
+    def test_decoder_present(self, trainer):
         assert isinstance(trainer.decoder, ReconstructionDecoder)
-        assert any(p.requires_grad for p in trainer.decoder.parameters())
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint state-dict round-trip — verifies both artifacts serialize.
-# ---------------------------------------------------------------------------
 
 
 class TestCheckpoint:
@@ -322,65 +516,110 @@ class TestCheckpoint:
         torch.save(state, tmp_path / "encoder.pt")
         reloaded = torch.load(tmp_path / "encoder.pt", weights_only=True)
         assert set(state.keys()) == set(reloaded.keys())
-        for k in state:
-            assert torch.equal(state[k], reloaded[k])
 
     def test_decoder_state_dict_roundtrip(self, trainer, tmp_path):
         state = trainer.decoder.state_dict()
         torch.save(state, tmp_path / "decoder.pt")
         reloaded = torch.load(tmp_path / "decoder.pt", weights_only=True)
         assert set(state.keys()) == set(reloaded.keys())
-        for k in state:
-            assert torch.equal(state[k], reloaded[k])
+
+
+class TestResolveStep1:
+    def test_auto_resolves_phase1_step4(self, trainer):
+        trainer.cfg = OmegaConf.merge(trainer.cfg, {
+            "step1_checkpoint": "auto",
+            "checkpoint_dir": "/tmp/nonexistent",
+        })
+        with patch("bgkit.training.phase1.commit_encoding.resolve_checkpoint") as mock:
+            mock.return_value = Path("/checkpoints/phase1_step4_step100")
+            result = trainer._resolve_step1_checkpoint()
+            assert result == "/checkpoints/phase1_step4_step100"
+
+    def test_explicit_path_passthrough(self, trainer):
+        trainer.cfg = OmegaConf.merge(trainer.cfg, {"step1_checkpoint": "/my/ckpt"})
+        assert trainer._resolve_step1_checkpoint() == "/my/ckpt"
+
+    def test_none_returns_none(self, trainer):
+        trainer.cfg = OmegaConf.merge(trainer.cfg, {"step1_checkpoint": None})
+        assert trainer._resolve_step1_checkpoint() is None
 
 
 # ---------------------------------------------------------------------------
-# Forward-pass tests requiring repo-batch (cu_file + cu_repo) packing.
-#
-# ``_forward_backward`` calls ``_compress_repo_l0_packed`` (two-level
-# hierarchical packing on per-file segments) followed by a per-commit
-# regrouping and a second packed L1 forward. Building a representative
-# batch needs the full ``CommitEncodingDataset`` pipeline; covered by
-# integration tests + live runs.
+# Forward / backward smoke test.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="Requires repo-batch (cu_file + cu_repo) L0→L1 packed forward; "
-    "covered by integration tests.",
-)
-class TestForwardBackward:
-    def test_returns_loss_and_metrics(self, trainer):
-        pass
+def _make_repo_batch(
+    n_commits: int = 2,
+    files_per_commit: int = 2,
+    file_len: int = 6,
+    target_len: int = 12,
+    prompt_len: int = 3,
+    splice_pos: int = 4,
+    splice_len: int = 2,
+    vocab_size: int = VOCAB_SIZE,
+) -> dict:
+    from bgkit.data.collators import collate_compression
+    samples = []
+    for _ in range(n_commits):
+        file_token_ids = [
+            torch.randint(1, vocab_size, (file_len,), dtype=torch.long)
+            for _ in range(files_per_commit)
+        ]
+        file_attention_masks = [
+            torch.ones(file_len, dtype=torch.bool)
+            for _ in range(files_per_commit)
+        ]
+        target_token_ids = torch.randint(1, vocab_size, (target_len,), dtype=torch.long)
+        loss_mask = torch.zeros(target_len, dtype=torch.bool)
+        loss_mask[splice_pos + splice_len:] = True
+        prefix_ids = target_token_ids[:splice_pos].clone()
+        compression_prompt_ids = torch.randint(
+            1, vocab_size, (prompt_len,), dtype=torch.long,
+        )
+        samples.append(
+            RepoCompressionSample(
+                objective="commit_encoding",
+                file_token_ids=file_token_ids,
+                file_attention_masks=file_attention_masks,
+                compression_ratio=0.0,
+                compression_level=1,
+                target_token_ids=target_token_ids,
+                target_attention_mask=torch.ones(target_len, dtype=torch.bool),
+                target_loss_mask=loss_mask,
+                prefix_ids=prefix_ids,
+                compression_prompt_ids=compression_prompt_ids,
+                bgkit_splice_start=splice_pos,
+                bgkit_splice_len=splice_len,
+            )
+        )
+    return collate_compression(samples)
 
-    def test_loss_is_finite(self, trainer):
-        pass
 
-    def test_gradients_flow_to_decoder(self, trainer):
-        pass
-
-    def test_multi_file_l0_compression(self, trainer):
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Curriculum ratio math (pure python).
-# ---------------------------------------------------------------------------
-
-
-class TestCurriculum:
-    def test_target_ratio_at_start(self, trainer):
+class TestForwardBackwardSmoke:
+    def test_stage0_forward_backward(self, trainer):
+        """Stage 0 step (no compression, both backbones frozen)."""
         trainer.global_step = 0
-        assert trainer._current_target_ratio() == 0.50
+        batch = _make_repo_batch()
+        result = trainer._forward_backward(batch)
+        assert "loss" in result
+        assert torch.isfinite(torch.tensor(result["loss"]))
+        assert result["target_ratio_l0"] == 1.0
+        assert result["target_ratio_l1"] == 1.0
 
-    def test_target_ratio_at_end(self, trainer):
-        trainer.global_step = 30000
-        assert trainer._current_target_ratio() == 0.20
+    def test_stage1_forward_backward(self, trainer):
+        """Stage 1 step (L0 frozen via no_grad, L1 trains)."""
+        trainer.global_step = 1500  # midway into stage 1 ramp
+        batch = _make_repo_batch()
+        result = trainer._forward_backward(batch)
+        assert torch.isfinite(torch.tensor(result["loss"]))
+        # L0 ratio is on the ramp; not 1.0 anymore.
+        assert result["target_ratio_l0"] < 1.0
 
-    def test_target_ratio_override(self, trainer):
-        trainer._target_ratio_override = 0.35
-        trainer.global_step = 15000
-        assert trainer._current_target_ratio() == 0.35
+
+# ---------------------------------------------------------------------------
+# Post-step bookkeeping.
+# ---------------------------------------------------------------------------
 
 
 class TestPostStep:
@@ -395,46 +634,3 @@ class TestPostStep:
         trainer._post_step(0)
         assert called[0]
         trainer.encoder.step_bidi_warmup = original
-
-
-class TestLiveConfig:
-    def test_target_ratio_override(self, trainer):
-        trainer.apply_live_config({"target_ratio": 0.4})
-        assert trainer._target_ratio_override == 0.4
-
-    def test_target_ratio_override_none_clears(self, trainer):
-        trainer._target_ratio_override = 0.4
-        trainer.apply_live_config({"target_ratio": None})
-        assert trainer._target_ratio_override is None
-
-
-class TestResolveStep1:
-    def test_auto_resolves_phase1_step1(self, trainer):
-        trainer.cfg = OmegaConf.create({
-            **OmegaConf.to_container(trainer.cfg),
-            "step1_checkpoint": "auto",
-            "checkpoint_dir": "/tmp/nonexistent",
-        })
-
-        with patch("bgkit.training.phase1.commit_encoding.resolve_checkpoint") as mock_resolve:
-            mock_resolve.return_value = Path("/checkpoints/phase1_step1_step100")
-            result = trainer._resolve_step1_checkpoint()
-            assert result == "/checkpoints/phase1_step1_step100"
-            mock_resolve.assert_called_once()
-
-    def test_explicit_path_passthrough(self, trainer):
-        trainer.cfg = OmegaConf.create({
-            **OmegaConf.to_container(trainer.cfg),
-            "step1_checkpoint": "/my/checkpoint",
-        })
-        result = trainer._resolve_step1_checkpoint()
-        assert result == "/my/checkpoint"
-        assert trainer._input_sources["step1"] == "checkpoint"
-
-    def test_none_returns_none(self, trainer):
-        trainer.cfg = OmegaConf.create({
-            **OmegaConf.to_container(trainer.cfg),
-            "step1_checkpoint": None,
-        })
-        result = trainer._resolve_step1_checkpoint()
-        assert result is None

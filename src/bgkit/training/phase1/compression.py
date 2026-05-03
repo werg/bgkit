@@ -76,6 +76,7 @@ class CompressionTrainer(BaseTrainer):
         "target_ratio_start": "_target_ratio_start",
         "target_ratio_end": "_target_ratio_end",
         "l1_introduction_step": "_l1_introduction_step",
+        "head_warmup_steps": "_head_warmup_steps",
     }
 
     LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
@@ -402,6 +403,12 @@ class CompressionTrainer(BaseTrainer):
 
         # --- Curriculum state ---
         self._l1_introduction_step = tcfg.get("l1_introduction_step", 20000)
+        # Head warmup: when > 0, the first N steps freeze both backbones
+        # and train only heads + auto_repro_head + projection + decoder LoRA
+        # at target_ratio=1.0 (no compression). Default 0 for Step 6, which
+        # picks up a Step 5 checkpoint with already-warmed heads.
+        self._head_warmup_steps = int(tcfg.get("head_warmup_steps", 0))
+        self._head_warmup_active = False
 
         # Ratio targeting — top-level config keys
         self._target_ratio_start = tcfg.get("target_ratio_start", 0.30)
@@ -604,8 +611,38 @@ class CompressionTrainer(BaseTrainer):
             self._l1_rebuild_pending = True
             logger.info("l1_curriculum_triggered", step=self.global_step)
 
+    def _maybe_apply_head_warmup_freeze(self) -> None:
+        """Freeze backbones for head warmup; unfreeze when warmup ends."""
+        if self._head_warmup_steps <= 0:
+            return
+        in_warmup = self.global_step < self._head_warmup_steps
+        if in_warmup and not self._head_warmup_active:
+            self.encoder.l0.backbone.requires_grad_(False)
+            self.encoder.l1.backbone.requires_grad_(False)
+            for p in self.encoder.l0.head.parameters():
+                p.requires_grad_(True)
+            for p in self.encoder.l1.head.parameters():
+                p.requires_grad_(True)
+            if self.encoder.l0.auto_repro_head is not None:
+                for p in self.encoder.l0.auto_repro_head.parameters():
+                    p.requires_grad_(True)
+            for p in self.encoder.projection_block.parameters():
+                p.requires_grad_(True)
+            self._head_warmup_active = True
+            logger.info("head_warmup_started", until_step=self._head_warmup_steps)
+        elif not in_warmup and self._head_warmup_active:
+            self.encoder.l0.backbone.requires_grad_(True)
+            self.encoder.l1.backbone.requires_grad_(True)
+            self._head_warmup_active = False
+            logger.info("head_warmup_ended", step=self.global_step)
+
     def _current_target_ratio(self) -> float:
         """Compute the current target compression ratio from the ramp or override."""
+        if (
+            self._head_warmup_steps > 0
+            and self.global_step < self._head_warmup_steps
+        ):
+            return 1.0
         if self._target_ratio_override is not None:
             return self._target_ratio_override
         step = self.global_step
@@ -830,9 +867,8 @@ class CompressionTrainer(BaseTrainer):
             prompt_embeddings=prompt_emb,
             prompt_cu_seqlens=prompt_cu,
             prompt_position_ids=prompt_position_ids,
-            target_ratio=target_ratio,
-            level="l0",
-            utility_grad_active=util_active,
+            target_ratio_l0=target_ratio,
+            utility_grad_active_l0=util_active,
         )
 
     def _compress_repo_l0_packed(self, batch: dict, target_ratio: float):
@@ -861,7 +897,7 @@ class CompressionTrainer(BaseTrainer):
         util_active = getattr(
             self, "_surv_l0", LevelLossCfg(),
         ).utility_grad_loss_weight > 0.0
-        return self.encoder(
+        return self.encoder.l0(
             content_embeddings=content_emb,
             content_cu_seqlens=cu_file,
             content_position_ids=content_position_ids,
@@ -869,7 +905,6 @@ class CompressionTrainer(BaseTrainer):
             prompt_cu_seqlens=prompt_cu,
             prompt_position_ids=prompt_position_ids,
             target_ratio=target_ratio,
-            level="l0",
             utility_grad_active=util_active,
         )
 
@@ -1019,9 +1054,9 @@ class CompressionTrainer(BaseTrainer):
 
             # Survivorship auxiliary losses (L0 — file compression path)
             surv_metrics: dict[str, float] = {}
-            if enc_out.logits_for_op is not None:
+            if enc_out.l0.logits_for_op is not None:
                 surv_loss, surv_metrics = self._compute_survivorship_losses(
-                    enc_out, target_ratio,
+                    enc_out.l0, target_ratio,
                     level="l0",
                     content_token_ids=batch["content_token_ids"].to(self.device),
                     content_cu_seqlens=batch["content_cu_seqlens"].to(self.device),
@@ -1035,14 +1070,14 @@ class CompressionTrainer(BaseTrainer):
             _surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
             if (
                 _surv_l0.utility_grad_loss_weight > 0.0
-                and enc_out.post_head_content_values is not None
+                and enc_out.l0.post_head_content_values is not None
             ):
                 from bgkit.training.survivorship_helpers import utility_grad_bce_loss
 
                 util_loss, util_metrics = utility_grad_bce_loss(
-                    base_raw_for_util=enc_out.base_raw_for_util,
-                    content_grad=enc_out.get_content_grad(),
-                    content_values=enc_out.post_head_content_values,
+                    base_raw_for_util=enc_out.l0.base_raw_for_util,
+                    content_grad=enc_out.l0.get_content_grad(),
+                    content_values=enc_out.l0.post_head_content_values,
                     valid_mask=None,
                     pinned_mask=None,
                     target_ratio=target_ratio,
@@ -1055,14 +1090,13 @@ class CompressionTrainer(BaseTrainer):
                     surv_metrics[f"l0_{k}"] = v
 
             n_survivors = (
-                int(enc_out.survivor_mask.sum().item())
-                if enc_out.survivor_mask is not None else 0
+                int(enc_out.l0.survivor_mask.sum().item())
+                if enc_out.l0.survivor_mask is not None else 0
             )
             n_valid = int(batch["content_token_ids"].shape[0])
             total_loss = loss.item()
 
-            # Drop tensor refs on the file-path enc_out — see
-            # ``CompressorOutput.release()``.
+            # Drop tensor refs on the file-path enc_out.
             enc_out.release()
         else:
             # Repo batches: packed L0 across all files, then packed L1
@@ -1154,32 +1188,23 @@ class CompressionTrainer(BaseTrainer):
                 l0_survivors, l0_survivor_cu, cu_repo,
             )
 
-            n_surv_total = int(l1_input_flat.shape[0])
+            # Bridge L0 final hidden states into L1's input-embedding space
+            # via L0's auto_repro_head. L1's backbone was deepcopied from
+            # L0 and expects input-embedding-distributed inputs.
+            l1_input_bridged = self.encoder.l0.auto_reproduce(l1_input_flat)
+            n_surv_total = int(l1_input_bridged.shape[0])
             l1_input_positions = position_ids_from_cu(l1_input_cu, n_surv_total)
-
-            # Build a synthetic "empty prompt" segmentation so the L1
-            # encoder runs without a conditioning prompt — the L0 stage
-            # already consumed the repo's compression prompt.
-            empty_prompt_cu = torch.zeros(
-                batch_size + 1, dtype=torch.int32, device=device,
-            )
-            empty_prompt_emb = l1_input_flat.new_zeros(0, l1_input_flat.shape[-1])
-            empty_prompt_pos = torch.zeros(0, dtype=torch.int64, device=device)
 
             util_w_l1 = getattr(
                 self, "_surv_l1", LevelLossCfg(),
             ).utility_grad_loss_weight
 
             # --- Step 3: packed L1 forward across all repos ---
-            l1_out = self.encoder(
-                content_embeddings=l1_input_flat,
+            l1_out = self.encoder.l1(
+                content_embeddings=l1_input_bridged,
                 content_cu_seqlens=l1_input_cu,
                 content_position_ids=l1_input_positions,
-                prompt_embeddings=empty_prompt_emb,
-                prompt_cu_seqlens=empty_prompt_cu,
-                prompt_position_ids=empty_prompt_pos,
                 target_ratio=target_ratio,
-                level="l1",
                 utility_grad_active=util_w_l1 > 0.0,
             )
 
@@ -1194,10 +1219,25 @@ class CompressionTrainer(BaseTrainer):
                 l1_surv_loss = loss_v
                 surv_metrics.update(l1_metrics)
 
+            # --- Step 3.5: project L1 survivors through the shared
+            # projection_block before handing off to the decoder.
+            from bgkit.utils.packing import lengths_from_cu
+            proj_cu = l1_out.survivor_cu_seqlens
+            proj_lengths = lengths_from_cu(proj_cu).to(torch.int64)
+            proj_max = int(proj_lengths.max().item()) if proj_lengths.numel() else 0
+            proj_pos = position_ids_from_cu(proj_cu, int(l1_out.survivor_embeddings.shape[0]))
+            proj_out = self.encoder.projection_block(
+                l1_out.survivor_embeddings,
+                cu_seqlens=proj_cu,
+                max_seqlen=proj_max,
+                position_ids=proj_pos,
+                survivor_mask=None,
+            )
+
             # --- Step 4: packed decoder across all repos ---
             loss = self._decoder_forward_single_splice(
-                l1_out.survivor_embeddings,
-                l1_out.survivor_cu_seqlens,
+                proj_out.projected_embeddings,
+                proj_cu,
                 batch,
             )
 
@@ -1303,8 +1343,8 @@ class CompressionTrainer(BaseTrainer):
             + avg_repo_loss * n_repo_samples
         ) / total_samples
         file_surv_count = (
-            int(file_enc_out.survivor_mask.sum().item())
-            if file_enc_out.survivor_mask is not None else 0
+            int(file_enc_out.l0.survivor_mask.sum().item())
+            if file_enc_out.l0.survivor_mask is not None else 0
         )
         total_survivors = file_surv_count + repo_survivors
         n_valid_file = int(file_batch["content_token_ids"].shape[0])
@@ -1336,12 +1376,14 @@ class CompressionTrainer(BaseTrainer):
         """Rebuild dataloader if resuming from a checkpoint with L1 already active."""
         if self._l1_transitioned or self._l1_rebuild_pending:
             self._perform_l1_rebuild()
+        self._maybe_apply_head_warmup_freeze()
 
     def _pre_step_hook(self) -> None:
         """Rebuild dataloader when L1 curriculum transition is pending."""
         if self._l1_rebuild_pending:
             self._perform_l1_rebuild()
             self._dataloader_invalidated = True
+        self._maybe_apply_head_warmup_freeze()
 
     def _post_optimizer_step(self, step: int) -> None:
         """Advance bidi warmup; run dual-ascent θ + EMA μ updates per level."""
@@ -1626,27 +1668,31 @@ class CompressionTrainer(BaseTrainer):
                 l0_out.survivor_cu_seqlens,
                 cu_repo,
             )
-            n_surv_total = int(l1_input_flat.shape[0])
+            l1_input_bridged = self.encoder.l0.auto_reproduce(l1_input_flat)
+            n_surv_total = int(l1_input_bridged.shape[0])
             l1_input_positions = position_ids_from_cu(l1_input_cu, n_surv_total)
-            empty_prompt_cu = torch.zeros(
-                batch_size + 1, dtype=torch.int32, device=device,
-            )
-            empty_prompt_emb = l1_input_flat.new_zeros(0, l1_input_flat.shape[-1])
-            empty_prompt_pos = torch.zeros(0, dtype=torch.int64, device=device)
 
-            l1_out = self.encoder(
-                content_embeddings=l1_input_flat,
+            l1_out = self.encoder.l1(
+                content_embeddings=l1_input_bridged,
                 content_cu_seqlens=l1_input_cu,
                 content_position_ids=l1_input_positions,
-                prompt_embeddings=empty_prompt_emb,
-                prompt_cu_seqlens=empty_prompt_cu,
-                prompt_position_ids=empty_prompt_pos,
                 target_ratio=target_ratio,
-                level="l1",
+            )
+            from bgkit.utils.packing import lengths_from_cu
+            proj_cu = l1_out.survivor_cu_seqlens
+            proj_lengths = lengths_from_cu(proj_cu).to(torch.int64)
+            proj_max = int(proj_lengths.max().item()) if proj_lengths.numel() else 0
+            proj_pos = position_ids_from_cu(proj_cu, int(l1_out.survivor_embeddings.shape[0]))
+            proj_out = self.encoder.projection_block(
+                l1_out.survivor_embeddings,
+                cu_seqlens=proj_cu,
+                max_seqlen=proj_max,
+                position_ids=proj_pos,
+                survivor_mask=None,
             )
             loss = self._decoder_forward_single_splice(
-                l1_out.survivor_embeddings,
-                l1_out.survivor_cu_seqlens,
+                proj_out.projected_embeddings,
+                proj_cu,
                 batch,
             )
 

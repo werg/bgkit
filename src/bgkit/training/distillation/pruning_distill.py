@@ -125,21 +125,24 @@ class PruningDistillTrainer(BaseTrainer):
         _, student_state = load_checkpoint(Path(step1_checkpoint))
         student_encoder_full.load_state_dict(student_state["encoder"])
 
-        # Pruning surgery: consume the BidirectionalQwen35 backbone
+        # Pruning surgery: consume the BidirectionalQwen35 backbone for L0,
+        # then deepcopy the pruned backbone into L1 (with embed_tokens stripped)
+        # so the split-encoder layout stays consistent for downstream stages.
+        import copy as _copy
+
         conv_kernel_size = tcfg.get("conv_kernel_size", 16)
-        pruned_backbone = PrunedBidirectionalQwen35.from_unpruned(
+        pruned_backbone_l0 = PrunedBidirectionalQwen35.from_unpruned(
             student_encoder_full.l0.backbone,
             hidden_dim=hidden_dim,
             conv_kernel_size=conv_kernel_size,
             bidi_warmup_steps=tcfg.get("bidi_warmup_steps", 0),
         )
-        # Replace the backbone in the compressor.
-        # Norm correctness: from_pretrained() already called _set_norm_to_identity()
-        # on the BidirectionalQwen35 backbone, so from_unpruned() received
-        # nn.Identity() as the norm. The pruned backbone's self.norm is Identity
-        # (no-op in forward), and the compressor's self.norm is the real LayerNorm.
-        # Single normalization path: backbone(Identity) -> compressor.norm(real).
-        student_encoder_full.l0.backbone = pruned_backbone
+        student_encoder_full.l0.backbone = pruned_backbone_l0
+
+        pruned_backbone_l1 = _copy.deepcopy(pruned_backbone_l0)
+        if hasattr(pruned_backbone_l1, "embed_tokens"):
+            pruned_backbone_l1.embed_tokens = nn.Identity()
+        student_encoder_full.l1.backbone = pruned_backbone_l1
 
         self.student_encoder = student_encoder_full
         self.student_encoder.to(dtype=torch.bfloat16, device=device)
@@ -396,8 +399,6 @@ class PruningDistillTrainer(BaseTrainer):
 
     def _compute_distillation_loss(
         self,
-        teacher_intermediates: list[torch.Tensor],
-        student_intermediates: list[torch.Tensor],
         teacher_repro: torch.Tensor,
         student_repro: torch.Tensor,
         teacher_proj: torch.Tensor,
@@ -411,15 +412,14 @@ class PruningDistillTrainer(BaseTrainer):
         MSE and cosine losses reduce globally over the flat token dimension —
         no per-sample accumulation is needed because each token is equally
         weighted and the batch is a single packed flat buffer.
+
+        With the L0/L1 split-encoder rebuild, mid-backbone intermediates are
+        no longer exposed by ``LevelCompressor`` — boundary MSE is now
+        computed against the post-norm last-block ``content_embeddings``
+        instead of a list of per-block hidden states.
         """
-        # Boundary MSE: average across block boundaries
-        n_boundaries = min(len(teacher_intermediates), len(student_intermediates))
-        boundary_loss = torch.tensor(0.0, device=teacher_final.device)
-        if n_boundaries > 0:
-            for t_h, s_h in zip(teacher_intermediates[:n_boundaries],
-                                student_intermediates[:n_boundaries], strict=True):
-                boundary_loss = boundary_loss + F.mse_loss(s_h, t_h.detach())
-            boundary_loss = boundary_loss / n_boundaries
+        # Boundary MSE on post-norm content embeddings (single boundary).
+        boundary_loss = F.mse_loss(student_final, teacher_final.detach())
 
         # Auto-repro MSE
         repro_loss = F.mse_loss(student_repro, teacher_repro.detach())
@@ -463,50 +463,46 @@ class PruningDistillTrainer(BaseTrainer):
         prompt_position_ids: torch.Tensor,
         target_ratio: float,
     ):
-        """Run compressor + projection block for one encoder (teacher or student).
+        """Run L0 + projection block for one encoder (teacher or student).
 
-        Returns ``(comp_out, proj_out)`` where:
-        - ``comp_out`` is a ``CompressorOutput`` with packed fields.
-        - ``proj_out`` is a ``ProjectionOutput``.
+        Returns ``(l0_out, proj_out)`` where ``l0_out`` is a ``LevelOutput``
+        and ``proj_out`` is a ``ProjectionOutput``.
 
         Both teacher and student go through the same code path; the caller
-        wraps with ``torch.no_grad()`` for the teacher.
+        wraps with ``torch.no_grad()`` for the teacher. The projection block
+        consumes the post-selection survivor embeddings directly — no
+        survivor_mask plumbing into a combined pack is needed in the new
+        split-encoder layout.
         """
         embed = encoder.l0.backbone.get_input_embeddings()
-        content_emb = embed(content_token_ids)  # (N_content, D)
-        prompt_emb = embed(compression_prompt_ids)  # (N_prompt, D)
+        content_emb = embed(content_token_ids)
+        prompt_emb = embed(compression_prompt_ids)
 
-        comp_out = encoder.l0(
-            content_emb,
+        l0_out = encoder.l0(
+            content_embeddings=content_emb,
             content_cu_seqlens=content_cu_seqlens,
             content_position_ids=content_position_ids,
             prompt_embeddings=prompt_emb,
             prompt_cu_seqlens=prompt_cu_seqlens,
+            prompt_position_ids=prompt_position_ids,
             target_ratio=target_ratio,
-            level="l0",
-            return_intermediates=True,
         )
 
-        # Map the content-only survivor mask into the combined pack for the
-        # projection block, mirroring BgKITEncoder.forward.
-        content_mask_combined = comp_out.content_position_mask  # (N_total,)
-        survivor_mask_content = comp_out.survivor_mask  # (N_content,) or None
-        if survivor_mask_content is not None:
-            survivor_mask_combined = torch.zeros_like(content_mask_combined)
-            content_indices = torch.nonzero(content_mask_combined, as_tuple=False).squeeze(-1)
-            survivor_mask_combined[content_indices] = survivor_mask_content
-        else:
-            survivor_mask_combined = None
+        from bgkit.utils.packing import lengths_from_cu
 
+        proj_cu = l0_out.survivor_cu_seqlens
+        proj_lengths = lengths_from_cu(proj_cu).to(torch.int64)
+        proj_max = int(proj_lengths.max().item()) if proj_lengths.numel() else 0
+        proj_pos = position_ids_from_cu(proj_cu, int(l0_out.survivor_embeddings.shape[0]))
         proj_out = encoder.projection_block(
-            comp_out.raw_embeddings,
-            cu_seqlens=comp_out.combined_cu_seqlens,
-            max_seqlen=comp_out.combined_max_seqlen,
-            position_ids=comp_out.combined_position_ids,
-            survivor_mask=survivor_mask_combined,
+            l0_out.survivor_embeddings,
+            cu_seqlens=proj_cu,
+            max_seqlen=proj_max,
+            position_ids=proj_pos,
+            survivor_mask=None,
         )
 
-        return comp_out, proj_out
+        return l0_out, proj_out
 
     def _forward_backward(self, batch) -> dict[str, float]:
         self.student_encoder.train()
@@ -525,7 +521,7 @@ class PruningDistillTrainer(BaseTrainer):
 
         # --- Teacher forward (fully frozen) ---
         with torch.no_grad():
-            teacher_comp, teacher_proj_out = self._run_encoder_forward(
+            teacher_l0, teacher_proj_out = self._run_encoder_forward(
                 self.teacher_encoder,
                 content_token_ids,
                 content_cu_seqlens,
@@ -535,21 +531,15 @@ class PruningDistillTrainer(BaseTrainer):
                 prompt_position_ids,
                 target_ratio,
             )
-            # Content-only normed embeddings for auto-repro
-            teacher_normed_content = teacher_comp.normed_embeddings[
-                teacher_comp.content_position_mask
-            ]
+            # Post-norm content embeddings for auto-repro and cosine signals.
             teacher_repro = self.teacher_encoder.l0.auto_reproduce(
-                teacher_normed_content,
+                teacher_l0.content_embeddings,
             )
-            # Content-only raw embeddings for cosine loss
-            teacher_content_raw = teacher_comp.raw_embeddings[
-                teacher_comp.content_position_mask
-            ]
+            teacher_content = teacher_l0.content_embeddings
 
         # --- Student forward ---
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
-            student_comp, student_proj_out = self._run_encoder_forward(
+            student_l0, student_proj_out = self._run_encoder_forward(
                 self.student_encoder,
                 content_token_ids,
                 content_cu_seqlens,
@@ -559,42 +549,32 @@ class PruningDistillTrainer(BaseTrainer):
                 prompt_position_ids,
                 target_ratio,
             )
-            # Content-only normed embeddings for auto-repro
-            student_normed_content = student_comp.normed_embeddings[
-                student_comp.content_position_mask
-            ]
             student_repro = self.student_encoder.l0.auto_reproduce(
-                student_normed_content,
+                student_l0.content_embeddings,
             )
-            # Content-only raw embeddings for cosine loss
-            student_content_raw = student_comp.raw_embeddings[
-                student_comp.content_position_mask
-            ]
+            student_content = student_l0.content_embeddings
 
             # Compute distillation loss
             loss, metrics = self._compute_distillation_loss(
-                teacher_intermediates=teacher_comp.intermediates or [],
-                student_intermediates=student_comp.intermediates or [],
                 teacher_repro=teacher_repro,
                 student_repro=student_repro,
                 teacher_proj=teacher_proj_out.projected_embeddings,
                 student_proj=student_proj_out.projected_embeddings,
-                teacher_final=teacher_content_raw,
-                student_final=student_content_raw,
+                teacher_final=teacher_content,
+                student_final=student_content,
             )
 
         (loss / self._accum_steps).backward()
 
         # Track compression stats
-        survivor_mask = student_comp.survivor_mask  # (N_content,) bool or None
+        survivor_mask = student_l0.survivor_mask  # (N_content,) bool or None
         n_survivors = int(survivor_mask.sum().item()) if survivor_mask is not None else 0
         n_content = int(content_cu_seqlens[-1].item())
         metrics["actual_ratio"] = n_survivors / max(n_content, 1)
         metrics["stage"] = self._current_stage
 
-        # Drop compressor-output tensor refs per CompressorOutput.release() contract.
-        teacher_comp.release()
-        student_comp.release()
+        teacher_l0.release()
+        student_l0.release()
 
         return {k: v.item() if hasattr(v, "item") else v for k, v in metrics.items()}
 
@@ -682,7 +662,7 @@ class PruningDistillTrainer(BaseTrainer):
                 ).to(self.device)
 
                 # Teacher forward
-                teacher_comp, teacher_proj_out = self._run_encoder_forward(
+                teacher_l0, teacher_proj_out = self._run_encoder_forward(
                     self.teacher_encoder,
                     content_token_ids,
                     content_cu_seqlens,
@@ -692,18 +672,12 @@ class PruningDistillTrainer(BaseTrainer):
                     prompt_position_ids,
                     target_ratio,
                 )
-                teacher_normed_content = teacher_comp.normed_embeddings[
-                    teacher_comp.content_position_mask
-                ]
                 teacher_repro = self.teacher_encoder.l0.auto_reproduce(
-                    teacher_normed_content,
+                    teacher_l0.content_embeddings,
                 )
-                teacher_content_raw = teacher_comp.raw_embeddings[
-                    teacher_comp.content_position_mask
-                ]
 
                 # Student forward
-                student_comp, student_proj_out = self._run_encoder_forward(
+                student_l0, student_proj_out = self._run_encoder_forward(
                     self.student_encoder,
                     content_token_ids,
                     content_cu_seqlens,
@@ -713,24 +687,17 @@ class PruningDistillTrainer(BaseTrainer):
                     prompt_position_ids,
                     target_ratio,
                 )
-                student_normed_content = student_comp.normed_embeddings[
-                    student_comp.content_position_mask
-                ]
                 student_repro = self.student_encoder.l0.auto_reproduce(
-                    student_normed_content,
+                    student_l0.content_embeddings,
                 )
-                student_content_raw = student_comp.raw_embeddings[
-                    student_comp.content_position_mask
-                ]
 
                 _, batch_metrics = self._compute_distillation_loss(
-                    teacher_comp.intermediates or [],
-                    student_comp.intermediates or [],
-                    teacher_repro, student_repro,
-                    teacher_proj_out.projected_embeddings,
-                    student_proj_out.projected_embeddings,
-                    teacher_content_raw,
-                    student_content_raw,
+                    teacher_repro=teacher_repro,
+                    student_repro=student_repro,
+                    teacher_proj=teacher_proj_out.projected_embeddings,
+                    student_proj=student_proj_out.projected_embeddings,
+                    teacher_final=teacher_l0.content_embeddings,
+                    student_final=student_l0.content_embeddings,
                 )
 
                 for k, v in batch_metrics.items():

@@ -21,15 +21,17 @@ from unittest.mock import patch
 from omegaconf import OmegaConf
 from torch import nn
 
+import copy
+
 from bgkit.data.collators import _collate_file_samples
 from bgkit.data.datasets.compression_dataset import FileCompressionSample
-from bgkit.models.bgkit_compressor import BgKITCompressor
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
+from bgkit.models.level_compressor import LevelCompressor
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.training.phase1.compression import CompressionTrainer
 from bgkit.training.ratio_sampling import build_ratio_sampler_config
-from bgkit.training.survivorship_helpers import LevelLossCfg, init_state
+from bgkit.training.survivorship_helpers import LevelICECfg, LevelLossCfg, init_state
 
 # ---------------------------------------------------------------------------
 # Mocks — Qwen3.5-shaped packed surface.
@@ -162,16 +164,31 @@ class MockCausalLMBackbone(nn.Module):
 
 
 def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
-    backbone = MockEncoderBackbone(hidden_dim=hidden_dim)
-    compressor_norm = nn.LayerNorm(hidden_dim)
-    compressor = BgKITCompressor(backbone, compressor_norm, hidden_dim=hidden_dim)
+    backbone_l0 = MockEncoderBackbone(hidden_dim=hidden_dim)
+    backbone_l1 = copy.deepcopy(backbone_l0)
+    backbone_l1.embed_tokens = nn.Identity()
+
+    l0 = LevelCompressor(
+        backbone=backbone_l0,
+        hidden_dim=hidden_dim,
+        survivorship_inner_dim=hidden_dim,
+        with_prompt=True,
+        with_auto_repro=True,
+    )
+    l1 = LevelCompressor(
+        backbone=backbone_l1,
+        hidden_dim=hidden_dim,
+        survivorship_inner_dim=hidden_dim,
+        with_prompt=False,
+        with_auto_repro=False,
+    )
 
     proj_layer = MockTransformerLayer(hidden_dim)
     proj_norm = nn.LayerNorm(hidden_dim)
     rotary = MockRotaryEmb(hidden_dim)
     projection_block = ProjectionBlock(proj_layer, proj_norm, rotary, hidden_dim=hidden_dim)
 
-    return BgKITEncoder(compressor, projection_block)
+    return BgKITEncoder(l0, l1, projection_block)
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +314,8 @@ def trainer():
     t._target_ratio_end = 0.15
     t._target_ratio_ramp_steps = 100
     t._target_ratio_override = None
+    t._head_warmup_steps = 0
+    t._head_warmup_active = False
 
     t._l1_enabled = False
     t._l1_transitioned = False
@@ -312,8 +331,8 @@ def trainer():
     # Survivorship helper state expected by the file path.
     t._surv_l0 = LevelLossCfg()
     t._surv_l1 = LevelLossCfg()
-    t._ice_l0 = None
-    t._ice_l1 = None
+    t._ice_l0 = LevelICECfg()
+    t._ice_l1 = LevelICECfg()
     t._ref_moments_l0 = None
     t._ref_moments_l1 = None
     t._ice_teacher = None

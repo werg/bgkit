@@ -517,11 +517,6 @@ class ProjectionRepairTrainer(BaseTrainer):
 
         (total / self._accum_steps).backward()
 
-        # Drop CompressorOutput tensor refs — see
-        # ``CompressionOutput.release()`` docstring for the motivating
-        # leak. Projection repair runs at ``target_ratio=None`` so
-        # ``_utility_grad_state`` is empty, but the call is safe and
-        # standardises the per-step cleanup pattern across trainers.
         enc_out.release()
 
         return {k: (v.item() if hasattr(v, "item") else v) for k, v in metrics.items()}

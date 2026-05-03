@@ -1,4 +1,5 @@
-# Commit encoding: two-level L0+L1 compression for commit reproduction
+# Commit encoding (Phase 1 Step 5): split-L0/L1 + L0-freeze curriculum.
+# See plans/step5-l0-freeze-curriculum.md for the full spec.
 phase: phase1_step5
 optimizer: muon
 max_steps: 15000
@@ -6,50 +7,63 @@ lr: 3.0e-5
 encoder_lr: 1.0e-5
 decoder_lr: 5.0e-5
 warmup_steps: 500
-bidi_warmup_steps: 0       # already bidirectional from previous steps
+bidi_warmup_steps: 0           # already bidirectional from previous steps
 
-# Ratio scheduling — already at target from Step 3; Step 4 adds L1 on top.
-target_ratio_start: 0.10
-target_ratio_end: 0.10
-target_ratio_ramp_steps: 1
-sample_target_ratio_during_training: true
-target_ratio_sampling_mode: window
-target_ratio_sampling_window_above: 0.10
-# 2026-05-03: anchor sampling disabled by default — its 0.95 anchor
-# repeatedly drove sm_121 over the 79 GB cgroup cap during Step 4 (see
-# Step 4 OOM history). The threshold curve is calibrated enough at the
-# operating point by step 5 entry; reactivate via control.json if a
-# specific run wants broader curve calibration.
+# ---- Three-stage curriculum (all live-tunable via control.json) ----
+# Stage transitions (steps).
+head_warmup_steps: 500          # stage 0 ends here — heads warm at ratio=1.0
+stage1_end_step: 3500           # stage 1 ends here (3000 steps of L0 ramp)
+stage2_l1_ramp_start_step: 3500 # L1 ratio ramp starts here
+stage2_l1_ramp_end_step: 5500   # L1 ratio ramp finishes here
+
+# L0 ratio curriculum (per-stage targets).
+stage0_target_ratio_l0: 1.0     # stage 0: no L0 compression
+stage1_l0_ratio_start: 0.9      # stage 1 L0 ramp start
+stage1_l0_ratio_end: 0.15       # stage 1 L0 ramp end
+stage2_target_ratio_l0: 0.30    # stage 2 L0 steady state
+
+# L1 ratio curriculum (per-stage targets).
+stage0_target_ratio_l1: 1.0     # stage 0: no L1 compression
+stage1_target_ratio_l1: 1.0     # stage 1: L1 just learns to consume L0
+stage2_target_ratio_l1_start: 1.0   # stage 2 L1 ramp start
+stage2_target_ratio_l1_end: 0.33    # stage 2 L1 ramp end
+
+# Per-stage sample-length / batch-token budgets (live-tunable).
+# Stage 0/1 use a single primary dataloader rebuilt at stage entry.
+stage0_max_sample_length: 1500  # head warmup — small commits only
+stage1_max_sample_length: 2000  # moderate; L0 still keeps high fraction early
+stage0_max_batch_tokens: 8192
+stage1_max_batch_tokens: 8192
+
+# Stage 2 dual-dataloader routing (frozen → large floodgates, unfrozen → tight).
+stage2_l0_frozen_max_sample_length: 6000
+stage2_l0_frozen_max_batch_tokens: 16384
+stage2_l0_unfrozen_max_sample_length: 1500
+stage2_l0_unfrozen_max_batch_tokens: 4096
+stage2_l0_unfrozen_period: 8     # every 8th step is L0-unfrozen (~12.5%)
+
+# ---- Compatibility — anchor sampling disabled per Step 4 lessons. ----
+sample_target_ratio_during_training: false
 target_ratio_anchor_sampling_prob: 0.0
 
-# Survivorship head losses, per level. Step 4 is where L1 first activates.
-# L0 head is trained from Step 3 (no BCE re-warmup); L1 cold-starts here
-# via decisiveness + utility-gradient BCE distillation.
+# ---- Survivorship head losses (per-level) ----
 survivorship:
   l0:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
-    utility_grad_loss_weight: 0.3
-    moment_match_weight: 0.05        # halved from Step 3; lighter anchor
+    utility_grad_loss_weight: 0.3   # only effective on L0-unfrozen microbatches
+    moment_match_weight: 0.05       # halved from Step 3; lighter anchor
     min_survivors_loss_weight: 0.05
     min_survivors_floor_ratio: 0.02
     min_survivors_absolute_min: 1
     min_survivors_tau: 0.3
   l1:
     ratio_loss_weight: 0.0
-    # L1 cold-start: hold a 4× stronger decisiveness signal for the first
-    # 2k steps (the window in which utility-grad BCE is weakest — decoder
-    # needs meaningful L1 output to produce useful gradients, but L1 needs
-    # decoder gradient to know what's useful; a strong bimodal push here
-    # breaks the chicken-and-egg tie). Linearly anneals down to the
-    # steady-state weight so it doesn't fight utility-grad BCE once that's
-    # doing the work. See docs/survivorship_design.md for the collapse
-    # mode this defends against.
-    decisiveness_loss_weight: 0.05   # symmetry-break — no BCE at L1
+    decisiveness_loss_weight: 0.05  # symmetry-break — no BCE at L1
     decisiveness_warmup_weight: 0.20
     decisiveness_warmup_steps: 2000
-    utility_grad_loss_weight: 0.3    # primary signal at L1
-    moment_match_weight: 0.0         # ICE shape doesn't apply at L1
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
     min_survivors_loss_weight: 0.05
     min_survivors_floor_ratio: 0.02
     min_survivors_absolute_min: 1
@@ -57,9 +71,9 @@ survivorship:
 
 ice_distillation:
   l0:
-    enabled: false                   # L0 head already trained from Step 3
+    enabled: false
   l1:
-    enabled: false                   # never ICE at L1
+    enabled: false
 
 moment_match_reference:
   l0:
@@ -74,7 +88,6 @@ decoder_lora:
   dropout: 0.05
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
-# Legacy block (unused — no trainer reads it). Kept for grep compatibility.
 freeze:
   bgkit: false
   decoder: false
@@ -86,22 +99,16 @@ data:
   max_files_per_commit: 16
   max_message_tokens: 256
 
-# 2026-05-03 sm_121 OOM lessons from Step 4: 32768 packed batches push
-# the unified-memory pool past the 79 GB cgroup cap. Step 5 uses bigger
-# samples than Step 4 (commit median 1262 tokens vs file recon ~700),
-# so PackedTokenBudgetSampler's quadratic budget needs more room — at
-# max_batch_tokens=4096 (budget 8M), a single max-3000-token commit
-# (L²=9M) exceeds budget and emits as singleton. 8192 raises the
-# singleton threshold to L≈5800; most commits pack normally.
+# Initial primary-loader budget (stage 0 default; live curriculum drives it
+# from stage 1 onward via stage{0,1,2}_max_batch_tokens overrides).
 max_batch_tokens: 8192
 gradient_accumulation_steps: 8
-# Commit data has very different length distribution from QA/recon: median
-# token_length=1262, p90=4401, max=8388 (per inspect_commit_sample.py
-# 2026-05-03). max_sample_length=800 from Step 4 would drop 70%; 3000
-# keeps 80% and drops only the truly enormous commits that would OOM
-# the decoder backward at L²~70M per singleton.
 min_sample_length: 256
-max_sample_length: 3000
+# Initial max_sample_length for stage 0 (curriculum overrides per stage).
+max_sample_length: 1500
 
 eval_every: 1000
 save_every: 5000
+
+# Diagnostic-cadence gate for survivorship metrics (.item() syncs).
+diagnostic_metrics_every_n_steps: 10
