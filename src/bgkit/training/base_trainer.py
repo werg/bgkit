@@ -510,15 +510,34 @@ class BaseTrainer(ABC):
         depend on build order — fatal under any topology change. This
         method re-keys by stable module-path name instead, so the saved
         state survives param-group rebuilds.
+
+        Asserts every optimizer-tracked param is reachable by
+        ``_named_parameters_for_optimizer`` — if any aren't, their
+        momentum is lost on the next resume and we want to know now.
         """
+        opt_param_ids = {
+            id(p) for pg in self.optimizer.param_groups for p in pg["params"]
+        }
+        seen_opt_ids: set[int] = set()
         state_by_name: dict = {}
         for name, param in self._named_parameters_for_optimizer():
+            if id(param) in opt_param_ids:
+                seen_opt_ids.add(id(param))
             if param in self.optimizer.state:
                 # Copy the per-param state dict so the saved tensor isn't
                 # aliased to the live optimizer buffer (torch.save will
                 # serialize whatever we hand it, but an aliased dict is
                 # fragile if the optimizer mutates mid-serialization).
                 state_by_name[name] = dict(self.optimizer.state[param])
+        unreachable = len(opt_param_ids) - len(seen_opt_ids)
+        if unreachable:
+            raise RuntimeError(
+                f"_build_optimizer_state_by_name: {unreachable} optimizer-tracked "
+                f"param(s) have no name in _named_parameters_for_optimizer. Their "
+                "state will not be saved and momentum will be lost on resume. "
+                "Override _named_parameters_for_optimizer to yield every param "
+                "the optimizer touches.",
+            )
         return state_by_name
 
     def _legacy_optimizer_fallback(self, state_dicts: dict) -> bool:
@@ -577,12 +596,29 @@ class BaseTrainer(ABC):
         Without this, the first Muon/Adam update crashes with "Expected
         all tensors to be on the same device" when the momentum buffer
         is on CPU and the grad is on cuda:0.
+
+        Counts split into ``in_optimizer`` (param is currently in an
+        optimizer param group — these are the ones that actually train)
+        and ``frozen`` (param is reachable by name but isn't in the
+        optimizer right now — restoring state is harmless and preserves
+        momentum across freeze→unfreeze cycles, but it doesn't reflect
+        any training cost). Asserts that every optimizer-tracked param
+        is reachable by ``_named_parameters_for_optimizer`` — if any
+        aren't, save/restore would silently lose state for them.
         """
         import torch
 
-        matched = 0
-        new = 0
+        opt_param_ids = {
+            id(p) for pg in self.optimizer.param_groups for p in pg["params"]
+        }
+        n_opt = len(opt_param_ids)
+
+        matched_in_opt = 0
+        matched_frozen = 0
+        new_in_opt = 0
+        new_frozen = 0
         for name, param in self._named_parameters_for_optimizer():
+            in_opt = id(param) in opt_param_ids
             if name in state_by_name:
                 saved = state_by_name[name]
                 device = param.device
@@ -591,16 +627,35 @@ class BaseTrainer(ABC):
                     for k, v in saved.items()
                 }
                 self.optimizer.state[param] = moved
-                matched += 1
+                if in_opt:
+                    matched_in_opt += 1
+                else:
+                    matched_frozen += 1
             else:
-                new += 1
-        skipped = len(state_by_name) - matched
+                if in_opt:
+                    new_in_opt += 1
+                else:
+                    new_frozen += 1
+        skipped_from_save = len(state_by_name) - (matched_in_opt + matched_frozen)
         logger.info(
             "optimizer_state_restored_by_name",
-            matched=matched,
-            new=new,
-            skipped=skipped,
+            matched_in_optimizer=matched_in_opt,
+            new_in_optimizer=new_in_opt,
+            matched_frozen=matched_frozen,
+            new_frozen=new_frozen,
+            skipped_from_save=skipped_from_save,
         )
+
+        accounted = matched_in_opt + new_in_opt
+        if accounted != n_opt:
+            raise RuntimeError(
+                f"Optimizer tracks {n_opt} param tensors but only {accounted} of "
+                f"them are reachable via _named_parameters_for_optimizer. The "
+                f"unreachable {n_opt - accounted} param(s) will silently lose "
+                "optimizer state across save/restore. Override "
+                "_named_parameters_for_optimizer in your trainer to yield every "
+                "param the optimizer touches.",
+            )
 
     def save_checkpoint(
         self, checkpoint_dir: Path, metrics: dict[str, float] | None = None
