@@ -22,8 +22,10 @@ Current architecture has L0 and L1 as *two forward passes through one shared
 
 L0 and L1 are **two complete bgkit encoder instances** with independent weights.
 Each is a full `PrunedBidirectionalQwen35` + survivorship head + threshold
-controller. Heads fire at the **last block (block 5)**, not block 1, so the
-selection logits and the survivor embeddings come from the same representation.
+controller. Heads fire at the **block 1 hook** (mid-backbone), and
+`survive_embedding` propagates the selection signal to the remaining blocks
+(2..5), exactly as in the pre-rebuild architecture. Survivor embeddings come
+from the post-norm last-block output at the same survivor mask.
 
 ```
 content tokens
@@ -32,32 +34,36 @@ content tokens
 encoder.l0.backbone.embed_tokens          (only L0 has embed_tokens)
    │
    ▼
-┌──────────────────────┐
-│ encoder.l0           │   PrunedBidirectionalQwen35 + head + threshold + norm
-│   backbone (6 blks)  │   head fires at block 5 output (post-norm)
-│   head               │   auto_repro_head — pretrained in Joint Block,
-│   threshold          │   reused as the L0→L1 bridge below; trainable in
-│   norm               │   downstream stages
-│   survive_embedding  │
-│   auto_repro_head    │
-└──────────┬───────────┘
-           │ L0 survivor embeddings (final, post-norm) at survivor positions
+┌─────────────────────────────────────────────┐
+│ encoder.l0  (PrunedBidirectionalQwen35)     │
+│   backbone block 0                          │
+│   backbone block 1                          │
+│   ▼─── HOOK: head fires here ──────────┐    │
+│        base_raw on content positions   │    │
+│        adaptive_threshold_select       │    │
+│        scatter survive_embedding at    │    │
+│        surviving content positions     │    │
+│   ◀────────────────────────────────────┘    │
+│   backbone blocks 2 → 3 → 4 → 5 → norm      │
+│   take post-norm survivor positions only    │
+│   auto_repro_head (L0→L1 bridge)            │
+└──────────┬──────────────────────────────────┘
+           │ L0 survivor embeddings, projected back into input-embedding space
            │
            │ ── if L0-only: skip to projection_block ─────────────┐
            ▼                                                      │
-encoder.l0.auto_repro_head                                        │
-           │ projects L0 final hidden states → input embedding    │
-           │ space (the distribution L1's backbone expects)       │
-           ▼                                                      │
-┌──────────────────────┐                                          │
-│ encoder.l1           │   Independent PrunedBidirectionalQwen35 + head + threshold
-│   backbone (6 blks)  │   Init by deepcopy from encoder.l0.backbone at construction
-│   head               │   Then evolves independently. NO embed_tokens.
-│   threshold          │   NO auto_repro_head (one bridge, on the L0 side).
-│   norm               │
-│   survive_embedding  │
-└──────────┬───────────┘
-           │ L1 survivor embeddings + L1 survivor mask
+┌─────────────────────────────────────────────┐                   │
+│ encoder.l1  (deepcopy of l0.backbone init,  │                   │
+│              embed_tokens stripped)         │                   │
+│   backbone block 0                          │                   │
+│   backbone block 1                          │                   │
+│   ▼─── HOOK: l1.head fires here ────────┐   │                   │
+│        scatter l1.survive_embedding     │   │                   │
+│   ◀─────────────────────────────────────┘   │                   │
+│   backbone blocks 2 → 3 → 4 → 5 → norm      │                   │
+│   take post-norm survivor positions only    │                   │
+└──────────┬──────────────────────────────────┘                   │
+           │ L1 survivor embeddings                               │
            ▼                                                      │
 encoder.projection_block ← shared, single instance ───────────────┘
            │
@@ -86,8 +92,12 @@ Step 5+ so it adapts as L0 evolves.
    `l0_compressor.backbone.state_dict()` into `l1_compressor.backbone`. Smooth
    warm start, then evolves independently.
 
-3. **Head at block 5 (last), post-norm.** Head input == survivor embedding.
-   Most informed selection, no asymmetric depth.
+3. **Head at block 1 hook (mid-backbone), with `survive_embedding` scatter.**
+   Same position as pre-rebuild — Step 4 trains the head here, so it's warm
+   when Step 5 starts. `survive_embedding` propagates the decision to blocks
+   2..5 for consolidation. (An earlier draft of this rebuild moved the head
+   to the last block; that was reverted because it broke head/embedding
+   continuity from Step 4 and required an unnecessary head warmup phase.)
 
 4. **No `l1_introduction_step`.** Both L0 and L1 are first-class from step 0 of
    any training stage that uses them. (Steps 1-4 only use L0; that's still
@@ -201,23 +211,21 @@ Step 4 checkpoint has:
 
 Conversion (`scripts/convert_step4_to_split_l0l1.py`):
 1. Load Step 4 state dicts
-2. Build `l0_compressor` with new architecture (head at block 5)
+2. Build `l0_compressor` with new architecture (head at block 1 hook —
+   same as legacy)
 3. Copy `compressor.backbone.*` → `l0_compressor.backbone.*`
 4. Copy `compressor.norm` → `l0_compressor.norm`
-5. Copy `compressor.survive_embedding`, `compressor.head_tanh_temperature_l0`
-   → `l0_compressor`
-6. **Discard `compressor.head_base_l0`** (it was trained at block 1; new
-   position requires re-warm)
-7. Build `l1_compressor`: deepcopy `l0_compressor` state into it
-8. Save in new format
+5. Copy `compressor.survive_embedding` → both `l0.survive_embedding` and
+   `l1.survive_embedding`
+6. Copy `compressor.head_tanh_temperature_l0` → `l0.head_tanh_temperature`
+7. Copy `compressor.head_base_l0.*` → `l0.head.*` and
+   `compressor.head_base_l1.*` → `l1.head.*` (head position unchanged
+   between old and new — direct transfer)
+8. Build `l1_compressor`: deepcopy `l0_compressor.backbone` state into it
+9. Save in new format
 
-After conversion, **head_l0 at block 5 is uninitialized** (zeros + small noise).
-We need a Step 4.5: head re-warm (encoder + decoder frozen, only head_l0 trains
-on the QA-position objective from Step 4, ~500-1000 steps). Then Step 5 starts.
-
-Alternative: skip Step 4.5 and let Step 5 absorb the head re-warm. Riskier
-(L0 selection is initially random for the first ~hundred steps), but a faster
-path. Recommend Step 4.5 — cheap insurance.
+Heads carry over directly from Step 4. No Step 4.5 head re-warm is needed —
+the new architecture preserves the head position.
 
 ## Phases of work
 
@@ -248,12 +256,10 @@ Total: ~5 days of focused work.
 
 ## Decisions (locked 2026-05-03)
 
-1. **No Step 4.5** — absorb head re-warm into Step 5. To handle the cold L0
-   head at block 5, Step 5 starts with a short head-only sub-phase: first ~300
-   steps run at `target_ratio=1.0` (no compression, all positions survive);
-   only L0 head + L1 head + projection_block update; encoder backbones frozen.
-   This gives the heads a stable warmup signal before compression curriculum
-   starts. Then standard Step 5 training takes over.
+1. **Head position unchanged from pre-rebuild** — block 1 hook with
+   `survive_embedding` scatter. Step 4's head training carries over directly
+   into Step 5; no head warmup phase needed. (An earlier draft of this
+   rebuild moved the head to the last block; that was reverted.)
 2. **Hard break** — no shim. `encoder.compressor` and the `level=` kwarg get
    deleted. Every call site updated in one pass.
 3. **Drop L0 LoRA in Phase 2 KB Stage A** — `l0_compressor` weights are trained

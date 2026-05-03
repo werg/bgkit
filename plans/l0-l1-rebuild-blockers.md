@@ -1,23 +1,27 @@
 # L0/L1 split rebuild — completion log
 
-**Status as of 2026-05-03 evening: COMPLETE.** All planned work landed across
-three commits on `flashqla`. Test suite is green (1712 pass, 14 baseline
-failures unrelated to the rebuild). This document is now a historical record
-— for the architecture itself see `plans/l0-l1-split-architecture.md`, for the
+**Status as of 2026-05-03 evening: COMPLETE (after head-position revert).**
+The original three-commit landing on `flashqla` moved the head to the last
+backbone block; this was reverted in a follow-up pass that restored the
+pre-rebuild head position (block 1 hook + `survive_embedding` scatter) while
+keeping the other architectural improvements (split L0/L1 backbones +
+auto_repro_head bridge + shared projection_block + drop-L0-LoRA in Phase 2).
+For the architecture itself see `plans/l0-l1-split-architecture.md`, for the
 Step 5 curriculum see `plans/step5-l0-freeze-curriculum.md`.
 
-## Three landing commits
+## Landing commits
 
 | Commit | Scope |
 |---|---|
 | `77b5b90` | Foundation: `BgKITEncoder` rewrite + `LevelCompressor` + L0→L1 bridge via `auto_repro_head` + `from_pretrained_legacy_step4_checkpoint` + Joint Block / DecoderInit / ProjectionRepair migrations + conversion script |
-| `e4442d7` | Step 5 (`CommitEncodingTrainer`) full rewrite + three-stage L0-freeze curriculum + `phase1_step5.yaml` overhaul + Step 6 (`CompressionTrainer`) + Step 2 (`PruningDistillTrainer`) heavy rewrite + `LevelCompressor.theta_tensor` alias + 4 trainer test files |
+| `e4442d7` | Step 5 (`CommitEncodingTrainer`) full rewrite + L0-freeze curriculum + `phase1_step5.yaml` overhaul + Step 6 (`CompressionTrainer`) + Step 2 (`PruningDistillTrainer`) heavy rewrite + `LevelCompressor.theta_tensor` alias + 4 trainer test files |
 | `06d8971` | Phase 2 (`KRKBTrainer`) migration + drop L0 LoRA + `BgKITEncoder.load_l0_only` + 14 scripts + integration test fix + `test_step4_split_conversion.py` (new) + 2 test re-enables |
+| reverted (working tree) | Head position revert: restore block 1 hook + `survive_embedding` in `LevelCompressor`; transfer (not drop) heads + survive embedding in `from_pretrained_legacy_step4_checkpoint`; collapse Step 5 head warmup phase (Stage 0/1/2 → Stage 0/1) |
 
 ## Architecture summary
 
-- One `BgKITEncoder` composes `l0` (with prompt + auto_repro_head) + `l1` (no prompt, no auto_repro_head; backbone init by deepcopy of L0 backbone, embed_tokens stripped) + shared `projection_block`.
-- Both heads fire at the **last block, post-norm output**. Selection logits and survivor embeddings come from the same representation.
+- One `BgKITEncoder` composes `l0` (with prompt + auto_repro_head + survive_embedding) + `l1` (no prompt, no auto_repro_head; backbone init by deepcopy of L0 backbone, embed_tokens stripped; survive_embedding present) + shared `projection_block`.
+- Both heads fire at the **block 1 hook (mid-backbone)**. The hook scatters `survive_embedding` at surviving content positions so blocks 2..5 see the survival signal. Survivor embeddings come from the post-norm last-block output at the same survivor mask.
 - L0→L1 bridge: `encoder.l0.auto_repro_head(l0_survivor_embeddings)` projects L0 survivors into the input-embedding distribution that L1's backbone (cloned from L0) was pretrained for. Load-bearing — without it, L1 sees a foreign input distribution.
 - `encoder.forward(target_ratio_l0, target_ratio_l1, ...)` routes the L0→bridge→L1 flow internally; `target_ratio_l1=None` skips L1 entirely.
 - The level-multiplexed `BgKITCompressor` is deleted. The `level=` kwarg is gone everywhere.
@@ -29,13 +33,12 @@ Step 5 curriculum see `plans/step5-l0-freeze-curriculum.md`.
 
 ## What's launchable now
 
-- **Phase 1 Step 5** (`CommitEncodingTrainer`): three-stage curriculum, all parameters live-tunable
-  - Stage 0 (steps 0–500): head warmup, both backbones frozen, ratios=1.0
-  - Stage 1 (500–3500): L0 frozen via `torch.no_grad()` + eval; L0 ratio ramps 0.9→0.15
-  - Stage 2 (3500+): dual-dataloader routing — L0-frozen large microbatches 87.5%, L0-trainable small microbatches 12.5%; L1 ratio ramps 1.0→0.33
-- **Phase 1 Step 6** (`CompressionTrainer`): multi-objective; head warmup defaults off (Step 5 hand-off has heads warmed)
+- **Phase 1 Step 5** (`CommitEncodingTrainer`): two-stage curriculum, all parameters live-tunable
+  - Stage 0 (steps 0–3000): L0 frozen via `torch.no_grad()` + eval; L0 ratio ramps 0.9→0.15
+  - Stage 1 (3000+): dual-dataloader routing — L0-frozen large microbatches 87.5%, L0-trainable small microbatches 12.5%; L1 ratio ramps 1.0→0.33
+- **Phase 1 Step 6** (`CompressionTrainer`): multi-objective; head warmup defaults off (Step 5 hand-off has heads warmed — they were warmed back in Step 4 at the block 1 hook)
 - **Phase 2 KB** (`KRKBTrainer` Stages A + B): drop-L0-LoRA in place; Stage A trains L0 weights directly, Stage B freezes L0 + trains L1 LoRA + decoder
-- **Conversion**: `scripts/convert_step4_to_split_l0l1.py` migrates a Step 4 checkpoint into the split-L0/L1 layout (drops the old block-1 heads, deepcopies backbone into both L0 and L1)
+- **Conversion**: `scripts/convert_step4_to_split_l0l1.py` migrates a Step 4 checkpoint into the split-L0/L1 layout (transfers backbone, heads, survive_embedding, threshold controllers, auto_repro_head, projection_block — head position unchanged so no re-warm needed)
 
 ## Pre-launch checklist for Step 5
 
@@ -43,6 +46,14 @@ Step 5 curriculum see `plans/step5-l0-freeze-curriculum.md`.
 2. Run conversion: `python scripts/convert_step4_to_split_l0l1.py`
 3. GPU smoke test: load converted checkpoint into Step 5, run ~50 steps, check loss is finite + memory OK
 4. Launch: `scripts/run-train.sh --no-follow train-phase1-step5`
+
+**Caveat for the head transfer**: L1's head was trained against
+shared-backbone(L0_survivors) at block 1 in the legacy single-encoder world.
+Post-rebuild it sees `l1.backbone(auto_repro_head(L0_survivors))` at block 1
+— close but not identical input distribution. Stage 0 of Step 5 (L1 backbone
++ bridge trainable, L0 frozen) is the natural place where L1 adapts to the
+new input distribution. Expect some early-Stage-0 loss bump as the bridge
+co-adapts.
 
 ## Things deferred but not blocking
 

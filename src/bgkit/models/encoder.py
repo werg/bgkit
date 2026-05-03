@@ -1,14 +1,16 @@
 """BgKIT encoder: two independent ``LevelCompressor`` stages + projection block.
 
 Packed FA4 form. The L0 compressor consumes raw content embeddings (with an
-optional prompt prefix), runs its own complete backbone, fires a survivorship
-head on the post-norm last-block hidden states, and emits survivor embeddings.
-Those survivors are projected back into input-embedding space by L0's
-``auto_repro_head`` (the L0→L1 bridge — pretrained during Joint Block Pretrain
-and kept trainable downstream) and fed to L1's independent backbone for a
-second compression pass. The final survivor embeddings (from L1 when active,
-otherwise from L0) flow through the shared ``projection_block`` into the
-decoder's embedding space.
+optional prompt prefix), runs its own complete backbone with a mid-backbone
+hook (block 1 / layer 7) that fires the survivorship head and scatters
+``survive_embedding`` at surviving positions, then emits survivor embeddings
+from the post-norm last-block output at the same survivor mask. Those
+survivors are projected back into input-embedding space by L0's
+``auto_repro_head`` (the L0->L1 bridge — pretrained during Joint Block
+Pretrain and kept trainable downstream) and fed to L1's independent backbone
+for a second compression pass. The final survivor embeddings (from L1 when
+active, otherwise from L0) flow through the shared ``projection_block`` into
+the decoder's embedding space.
 
 L1's backbone is initialized at construction by deep-copying L0's backbone
 state, then evolves independently. L1 has no ``embed_tokens`` (its input is
@@ -469,25 +471,25 @@ class BgKITEncoder(nn.Module):
     ) -> BgKITEncoder:
         """Migrate a legacy ``compressor.*`` Step-4 state dict into the new layout.
 
+        Both old and new architectures fire the head at the **block 1 hook**
+        and use ``survive_embedding`` scatter, so the legacy head + survive
+        embedding tensors transfer 1:1 into the new per-level slots.
+
         - ``compressor.backbone.*`` (everything but the legacy norm-Identity slot)
           → ``l0.backbone.*`` (and deepcopy → ``l1.backbone.*``)
         - ``compressor.norm.*`` (the real norm; legacy backbone.norm was Identity)
           → ``l0.backbone.norm.*`` (and clone → ``l1.backbone.norm.*``)
-        - ``compressor.survive_embedding`` → DROPPED (the new architecture
-          fires the head at the last backbone block, so there are no
-          downstream layers for the survive flag to propagate to)
+        - ``compressor.survive_embedding`` → both ``l0.survive_embedding``
+          and ``l1.survive_embedding``
         - ``compressor.prompt_separator_embedding`` → ``l0.prompt_separator_embedding``
         - ``compressor.auto_repro_head.*`` → ``l0.auto_repro_head.*``
         - ``compressor.head_tanh_temperature_l0`` → ``l0.head_tanh_temperature``
         - ``compressor.head_tanh_temperature_l1`` → ``l1.head_tanh_temperature``
         - ``compressor.threshold_l0.*`` → ``l0.threshold.*``
         - ``compressor.threshold_l1.*`` → ``l1.threshold.*``
-        - ``compressor.head_base_l0.*`` / ``compressor.head_base_l1.*`` → DROPPED
-          (block-1 heads are incompatible with the new last-block head position).
+        - ``compressor.head_base_l0.*`` → ``l0.head.*``
+        - ``compressor.head_base_l1.*`` → ``l1.head.*``
         - ``projection_block.*`` → unchanged.
-
-        The new ``l0.head`` / ``l1.head`` parameters stay at their constructor
-        init; a Step 5 head warmup re-trains them at the new position.
         """
         pruned = any(
             k.startswith("compressor.backbone.blocks.")
@@ -510,10 +512,6 @@ class BgKITEncoder(nn.Module):
         migrated: dict[str, torch.Tensor] = {}
 
         for k, v in encoder_state_dict.items():
-            if k.startswith("compressor.head_base_l"):
-                continue
-            if k == "compressor.survive_embedding":
-                continue
             if k.startswith("compressor.backbone.norm."):
                 # Legacy backbone.norm was Identity (no params).
                 continue
@@ -526,6 +524,10 @@ class BgKITEncoder(nn.Module):
                 tail = k[len("compressor.norm."):]
                 migrated[f"l0.backbone.norm.{tail}"] = v
                 migrated[f"l1.backbone.norm.{tail}"] = v.clone()
+                continue
+            if k == "compressor.survive_embedding":
+                migrated["l0.survive_embedding"] = v
+                migrated["l1.survive_embedding"] = v.clone()
                 continue
             if k == "compressor.prompt_separator_embedding":
                 migrated["l0.prompt_separator_embedding"] = v
@@ -547,6 +549,14 @@ class BgKITEncoder(nn.Module):
             if k.startswith("compressor.threshold_l1."):
                 tail = k[len("compressor.threshold_l1."):]
                 migrated[f"l1.threshold.{tail}"] = v
+                continue
+            if k.startswith("compressor.head_base_l0."):
+                tail = k[len("compressor.head_base_l0."):]
+                migrated[f"l0.head.{tail}"] = v
+                continue
+            if k.startswith("compressor.head_base_l1."):
+                tail = k[len("compressor.head_base_l1."):]
+                migrated[f"l1.head.{tail}"] = v
                 continue
             if k.startswith("compressor."):
                 continue

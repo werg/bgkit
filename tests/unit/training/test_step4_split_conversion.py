@@ -32,12 +32,14 @@ class _StubBackbone(nn.Module):
     so :meth:`BgKITEncoder.from_pretrained` can use it as the projection
     layer (the last layer is split off into ``ProjectionBlock``)."""
 
-    def __init__(self, hidden_dim: int = HIDDEN_DIM, num_layers: int = 3):
+    def __init__(self, hidden_dim: int = HIDDEN_DIM, num_layers: int = 4):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.embed_tokens = nn.Embedding(64, hidden_dim)
         # All but the last layer are plain Linears (only invoked inside the
-        # backbone's own forward, never in ProjectionBlock).
+        # backbone's own forward, never in ProjectionBlock). Need at least
+        # 3 plain layers so the LevelCompressor's block-1 hook still has a
+        # downstream block to scatter into.
         layers: list[nn.Module] = [
             nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers - 1)
         ]
@@ -57,15 +59,20 @@ class _StubBackbone(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         position_ids: torch.Tensor,
+        layer_hooks: dict | None = None,
         **_kw,
     ):
         h = inputs_embeds
         # Apply only the plain-Linear layers; the final transformer layer
         # is consumed by from_pretrained's ``del layers[-1]`` and ends up
         # in ProjectionBlock, so it never runs in the backbone forward.
+        idx = 0
         for layer in self.layers:
             if isinstance(layer, nn.Linear):
                 h = layer(h)
+                if layer_hooks and idx in layer_hooks:
+                    h = layer_hooks[idx](h)
+                idx += 1
         h = self.norm(h)
         return BaseModelOutputWithPast(last_hidden_state=h, hidden_states=None)
 
@@ -115,21 +122,9 @@ def _build_synthetic_legacy_state_dict(template_encoder: BgKITEncoder) -> dict[s
     """Synthesize a legacy ``compressor.*`` state dict from a new-format encoder.
 
     Inverts what :meth:`BgKITEncoder.from_pretrained_legacy_step4_checkpoint`
-    does:
-
-    - L0 backbone (minus its norm) → ``compressor.backbone.*``
-    - L0 backbone norm → ``compressor.norm.*``
-    - L0 prompt_separator_embedding → ``compressor.prompt_separator_embedding``
-    - L0 auto_repro_head.* → ``compressor.auto_repro_head.*``
-    - L0 head_tanh_temperature → ``compressor.head_tanh_temperature_l0``
-    - L1 head_tanh_temperature → ``compressor.head_tanh_temperature_l1``
-    - L0 threshold.* → ``compressor.threshold_l0.*``
-    - L1 threshold.* → ``compressor.threshold_l1.*``
-    - projection_block.* → unchanged
-
-    Adds two synthetic legacy block-1 head tensors (head_base_l0/l1) and
-    a synthetic survive_embedding so we can verify the migration drops
-    them.
+    does. Heads, ``survive_embedding``, threshold controllers, and the bridge
+    all transfer directly into the new layout — head position is unchanged
+    (block 1 hook).
     """
     legacy: dict[str, torch.Tensor] = {}
     new_sd = template_encoder.state_dict()
@@ -142,8 +137,14 @@ def _build_synthetic_legacy_state_dict(template_encoder: BgKITEncoder) -> dict[s
             tail = k[len("l0.backbone."):]
             legacy[f"compressor.backbone.{tail}"] = v.clone()
         elif k.startswith("l1.backbone."):
-            # l1 backbone in legacy was a clone of l0; we just skip here
-            # (the migration synthesizes l1 from l0).
+            # l1 backbone in legacy was a clone of l0; the migration
+            # synthesizes l1 from l0, so we skip here.
+            continue
+        elif k == "l0.survive_embedding":
+            legacy["compressor.survive_embedding"] = v.clone()
+        elif k == "l1.survive_embedding":
+            # l1 survive_embedding in legacy was the same as l0 (one shared
+            # tensor); the migration clones l0's into l1 on read.
             continue
         elif k == "l0.prompt_separator_embedding":
             legacy["compressor.prompt_separator_embedding"] = v.clone()
@@ -161,7 +162,6 @@ def _build_synthetic_legacy_state_dict(template_encoder: BgKITEncoder) -> dict[s
             tail = k[len("l1.threshold."):]
             legacy[f"compressor.threshold_l1.{tail}"] = v.clone()
         elif k.startswith("l0.head."):
-            # Old block-1 heads: legacy stored these as compressor.head_base_l0
             tail = k[len("l0.head."):]
             legacy[f"compressor.head_base_l0.{tail}"] = v.clone()
         elif k.startswith("l1.head."):
@@ -170,8 +170,6 @@ def _build_synthetic_legacy_state_dict(template_encoder: BgKITEncoder) -> dict[s
         elif k.startswith("projection_block."):
             legacy[k] = v.clone()
 
-    # Add a synthetic survive_embedding the migration must drop.
-    legacy["compressor.survive_embedding"] = torch.randn(HIDDEN_DIM)
     return legacy
 
 
@@ -262,9 +260,12 @@ def test_legacy_step4_conversion_builds_correct_split_encoder():
         assert torch.allclose(got, v), f"l1.threshold.{k} drifted"
 
 
-def test_legacy_step4_conversion_drops_old_heads():
-    """The block-1 ``compressor.head_base_l*`` keys must be DROPPED;
-    new heads stay at constructor init."""
+def test_legacy_step4_conversion_transfers_heads_and_survive_embedding():
+    """The block-1 ``compressor.head_base_l*`` keys are TRANSFERRED into
+    the new per-level ``head`` slots; ``compressor.survive_embedding``
+    is transferred into both ``l0.survive_embedding`` and
+    ``l1.survive_embedding``. Head position is unchanged across the
+    rebuild."""
     torch.manual_seed(7)
 
     backbone = _StubBackbone()
@@ -291,11 +292,18 @@ def test_legacy_step4_conversion_drops_old_heads():
 
     legacy_sd = _build_synthetic_legacy_state_dict(template)
 
-    # Stuff the legacy heads with a recognisable sentinel value.
-    sentinel = 42.0
+    # Stuff the legacy heads + survive_embedding with recognisable sentinels.
+    head_l0_sentinel = 13.0
+    head_l1_sentinel = 17.0
+    surv_sentinel = 23.0
     for k in list(legacy_sd):
-        if k.startswith("compressor.head_base_l"):
-            legacy_sd[k] = torch.full_like(legacy_sd[k], sentinel)
+        if k.startswith("compressor.head_base_l0."):
+            legacy_sd[k] = torch.full_like(legacy_sd[k], head_l0_sentinel)
+        elif k.startswith("compressor.head_base_l1."):
+            legacy_sd[k] = torch.full_like(legacy_sd[k], head_l1_sentinel)
+    legacy_sd["compressor.survive_embedding"] = torch.full(
+        (HIDDEN_DIM,), surv_sentinel,
+    )
 
     raw_backbone = _StubBackbone()
     migrated = BgKITEncoder.from_pretrained_legacy_step4_checkpoint(
@@ -307,13 +315,29 @@ def test_legacy_step4_conversion_drops_old_heads():
         threshold_controller_cfg={"init_target_ratio": 0.5},
     )
 
-    # The migrated encoder's heads should NOT carry the sentinel value;
-    # they're at their constructor init (Linear default init).
-    for level_lc in (migrated.l0, migrated.l1):
-        for p in level_lc.head.parameters():
-            assert not torch.allclose(
-                p, torch.full_like(p, sentinel),
-            ), "legacy block-1 head should not have been loaded into new head"
+    # L0 head should carry the L0 sentinel.
+    for p in migrated.l0.head.parameters():
+        if p.numel() > 0:
+            assert torch.allclose(
+                p, torch.full_like(p, head_l0_sentinel),
+            ), "legacy compressor.head_base_l0 should have been transferred to l0.head"
+
+    # L1 head should carry the L1 sentinel.
+    for p in migrated.l1.head.parameters():
+        if p.numel() > 0:
+            assert torch.allclose(
+                p, torch.full_like(p, head_l1_sentinel),
+            ), "legacy compressor.head_base_l1 should have been transferred to l1.head"
+
+    # Both survive_embeddings should carry the survive sentinel.
+    assert torch.allclose(
+        migrated.l0.survive_embedding,
+        torch.full((HIDDEN_DIM,), surv_sentinel),
+    ), "legacy compressor.survive_embedding should have been transferred to l0.survive_embedding"
+    assert torch.allclose(
+        migrated.l1.survive_embedding,
+        torch.full((HIDDEN_DIM,), surv_sentinel),
+    ), "legacy compressor.survive_embedding should have been transferred to l1.survive_embedding"
 
 
 def test_legacy_step4_conversion_l1_backbone_clones_l0():

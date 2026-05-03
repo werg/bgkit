@@ -1,19 +1,25 @@
-"""Single-level bgkit compressor — packed FA4 form, head at last block.
+"""Single-level bgkit compressor — packed FA4 form, head fires at block 1 hook.
 
 One ``LevelCompressor`` instance = one full bgkit compression stage:
-backbone (PrunedBidirectionalQwen35) + survivorship head + threshold
-controller + (optional) prompt separator + (optional) auto-reproduction
-head (the L0→L1 bridge on L0; absent on L1).
+backbone (PrunedBidirectionalQwen35 or BidirectionalQwen35) + survivorship
+head + threshold controller + ``survive_embedding`` flag + (optional) prompt
+separator + (optional) auto-reproduction head (the L0->L1 bridge on L0;
+absent on L1).
 
-The head fires on the **post-norm output of the last backbone block**, so
-the selection logits and the survivor embeddings come from the same
-representation. No mid-backbone hooks.
+The head fires at a **mid-backbone hook** — pruned block 1 (or layer 7 on
+the full Qwen3.5 backbone). The hook computes ``base_raw`` on the post-block
+hidden state at content positions, runs adaptive-threshold selection, and
+**scatters ``survive_embedding`` into the hidden state at surviving content
+positions**. The remaining backbone blocks (2..N) consume this modified
+hidden state — they "see" who survived. After the full backbone (post-norm),
+survivor embeddings are extracted from the same ``survivor_mask``.
 
 Two instances are composed inside :class:`bgkit.models.encoder.BgKITEncoder`:
 ``encoder.l0`` (with prompt support, with auto_repro_head) and ``encoder.l1``
-(no prompt, no auto_repro_head — its input is L0 survivor embeddings).
-``encoder.l1`` is initialized by deepcopy of ``encoder.l0.backbone`` state at
-construction, then evolves independently.
+(no prompt, no auto_repro_head — its input is L0 survivor embeddings bridged
+through ``encoder.l0.auto_repro_head``). ``encoder.l1.backbone`` is
+initialized at construction by deepcopy of ``encoder.l0.backbone`` and then
+evolves independently.
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from bgkit.models.components.selection import (
     adaptive_threshold_select,
 )
 from bgkit.models.components.survivorship_head import SurvivorshipHead
+from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
 from bgkit.utils.packing import lengths_from_cu
 
 
@@ -130,13 +137,13 @@ class LevelOutput:
     survivor_mask: torch.Tensor                # (N_content,) bool
 
     # ---- Full content axis (pre-selection) ----
-    content_embeddings: torch.Tensor           # (N_content, D) post-norm
+    content_embeddings: torch.Tensor           # (N_content, D) post-norm last-block
     content_cu_seqlens: torch.Tensor           # (B+1,) int32
 
     # ---- Head + threshold internals ----
     base_raw: torch.Tensor | None = None        # (N_content,) raw head output
     logits_for_op: torch.Tensor | None = None   # (N_content,) tanh(base_raw/T)
-    survive_probs: torch.Tensor | None = None   # (N_content,) sigmoid(logits - θ)
+    survive_probs: torch.Tensor | None = None   # (N_content,) sigmoid(logits - theta)
     survive_probs_metrics: torch.Tensor | None = None  # detached copy
     theta: torch.Tensor | None = None           # scalar tensor
 
@@ -183,12 +190,18 @@ class LevelCompressor(nn.Module):
       1. Build the packed input — ``[prompt_i | sep | content_i]`` per sample
          when ``with_prompt=True`` and prompts are supplied; otherwise the
          content pack is the input directly.
-      2. Run the full backbone (post-norm output).
-      3. Extract content positions; head + threshold + adaptive selection.
-      4. Return survivor embeddings + survivor mask + diagnostic fields.
+      2. Run the backbone with a layer hook installed at block 1 (pruned)
+         or layer 7 (full Qwen3.5). The hook fires the survivorship head on
+         the post-block hidden state at content positions, runs
+         adaptive-threshold selection, and scatters ``survive_embedding``
+         at surviving content positions so the downstream blocks consolidate
+         under the survival signal.
+      3. After the full backbone (post-norm), extract survivor embeddings
+         at the same ``survivor_mask`` and rebuild per-sample cu_seqlens.
 
-    No mid-backbone hooks — the head consumes the deep representation and
-    selection happens after the full backbone forward.
+    When ``target_ratio`` is None or >= 0.999 compression is disabled — the
+    hook is not installed, no head runs, no ``survive_embedding`` is added,
+    and survivors == all content positions.
     """
 
     def __init__(
@@ -200,11 +213,22 @@ class LevelCompressor(nn.Module):
         head_tanh_temperature: float = 5.0,
         with_prompt: bool = True,
         with_auto_repro: bool = False,
+        head_layer_index: int | None = None,
     ):
         super().__init__()
         self.backbone = backbone
         self.hidden_dim = hidden_dim
         self.with_prompt = with_prompt
+
+        # Resolve which backbone layer fires the head hook. Pruned backbone has
+        # 6 blocks -> hook at block 1 (~17% depth). Full Qwen3.5 has 24 layers
+        # -> hook at layer 7 (~same relative depth). Tests can override.
+        if head_layer_index is None:
+            if isinstance(backbone, PrunedBidirectionalQwen35):
+                head_layer_index = 1
+            else:
+                head_layer_index = 7
+        self._head_layer_index = int(head_layer_index)
 
         self.head = SurvivorshipHead(hidden_dim, survivorship_inner_dim)
 
@@ -224,6 +248,8 @@ class LevelCompressor(nn.Module):
             "head_tanh_temperature",
             torch.tensor(float(head_tanh_temperature), dtype=torch.float32),
         )
+
+        self.survive_embedding = nn.Parameter(torch.randn(hidden_dim) * 0.02)
 
         if with_prompt:
             self.prompt_separator_embedding = nn.Parameter(
@@ -255,26 +281,7 @@ class LevelCompressor(nn.Module):
         utility_grad_active: bool = False,
         utility_grad_capture: dict | None = None,
     ) -> LevelOutput:
-        """Run one compression level.
-
-        Args:
-            content_embeddings: ``(N_content, D)`` flat content embeddings.
-            content_cu_seqlens: ``(B+1,)`` int32 segmentation.
-            content_position_ids: ``(N_content,)`` int64.
-            prompt_embeddings, prompt_cu_seqlens, prompt_position_ids: optional
-                prompt pack. Only honored when ``with_prompt=True``.
-            pinned_positions: ``(N_content,)`` bool of positions that MUST
-                survive. OR'd into the hard mask after the head decision;
-                excluded from rate measurement.
-            target_ratio: when ``None`` or ``≥ 0.999`` compression is disabled
-                — survivors == all content positions; head not consulted.
-            min_per_sample: per-sample floor for the operator (warmup).
-            utility_grad_active: when True, capture post-norm content values
-                + register backward hook so :func:`get_content_grad` can return
-                the gradient flowing back from downstream loss.
-            utility_grad_capture: optional external dict to receive the
-                captured grad (instead of the LevelOutput's internal dict).
-        """
+        """Run one compression level."""
         if content_embeddings.ndim != 2:
             raise ValueError(
                 f"content_embeddings must be packed (N, D); got "
@@ -314,12 +321,116 @@ class LevelCompressor(nn.Module):
             lengths = lengths_from_cu(content_cu_seqlens).to(torch.int64)
             combined_max = int(lengths.max().item()) if lengths.numel() else 0
 
-        # ---- Run backbone (post-norm by default) ----
+        hook_state: dict = {}
+        util_state: dict = (
+            utility_grad_capture if utility_grad_capture is not None else {}
+        )
+
+        def _hook_after_head_layer(hidden: torch.Tensor) -> torch.Tensor:
+            """Single-head survivorship + adaptive-threshold selection (packed).
+
+            ``hidden`` arrives as ``(N_total, D)`` — the combined pack at the
+            output of the head layer (block 1 / layer 7). Content positions
+            are picked via ``content_pos_mask``. Head outputs are flat
+            ``(N_content,)``. ``survive_embedding`` is added at surviving
+            content positions so the downstream blocks see who survived.
+            """
+            content_hidden = hidden[content_pos_mask]  # (N_content, D)
+            base_raw = self.head(content_hidden.unsqueeze(0)).squeeze(0)  # (N_content,)
+
+            if utility_grad_active and content_hidden.requires_grad:
+                base_raw_for_util = self.head(
+                    content_hidden.detach().unsqueeze(0),
+                ).squeeze(0)
+                hook_state["base_raw_for_util"] = base_raw_for_util
+                hook_state["post_head_content_values"] = content_hidden.detach().clone()
+
+                def _save_content_grad(grad, _state=util_state):
+                    _state["post_head_content_grad"] = grad.detach()
+
+                content_hidden.register_hook(_save_content_grad)
+
+            T = self.head_tanh_temperature.to(base_raw.dtype)  # noqa: N806
+            logits_for_op = torch.tanh(base_raw / T)
+
+            valid = torch.ones_like(base_raw, dtype=torch.bool)
+            theta = self.threshold.theta_for_ratio(float(target_ratio)).to(
+                base_raw.device,
+            )
+            sel = adaptive_threshold_select(
+                logits=logits_for_op,
+                valid_mask=valid,
+                theta=theta,
+                cu_seqlens=content_cu_seqlens,
+                pinned=pinned_positions,
+                min_per_sample=min_per_sample,
+            )
+            mask = sel.mask  # (N_content,)
+
+            survive_probs = torch.sigmoid(
+                logits_for_op.float() - theta.float(),
+            ).to(base_raw.dtype)
+            with torch.no_grad():
+                survive_probs_metrics = survive_probs.detach()
+
+            # Flag-embedding scatter: add survive_embedding at surviving
+            # content positions only. Clone hidden to avoid autograd aliasing
+            # with residual connections upstream of the hook.
+            hidden = hidden.clone()
+            hard_mask = mask.detach()  # (N_content,)
+            content_indices = torch.nonzero(content_pos_mask, as_tuple=False).squeeze(-1)
+            surviving_combined = content_indices[hard_mask]
+            survive_vec = self.survive_embedding.to(hidden.dtype)
+            hidden[surviving_combined] = hidden[surviving_combined] + survive_vec
+
+            # Aggregation primitives for the trainer's true-mean update of theta.
+            with torch.no_grad():
+                valid_count = valid.sum()
+                organic = (logits_for_op.float() > theta.float()) & valid
+                if pinned_positions is None:
+                    pinned_mask = torch.zeros_like(valid)
+                else:
+                    pinned_mask = pinned_positions & valid
+                floor_mask = mask & ~organic & ~pinned_mask
+                controllable = valid & ~pinned_mask & ~floor_mask
+                organic_count = (organic & controllable).sum()
+                controllable_count = controllable.sum()
+
+                undecided_mask = (
+                    (survive_probs_metrics > 0.2)
+                    & (survive_probs_metrics < 0.8)
+                    & valid
+                )
+                denom = valid.sum().float().clamp(min=1.0)
+                undecided_fraction = undecided_mask.sum().float() / denom
+
+            hook_state["base_raw"] = base_raw
+            hook_state["logits_for_op"] = logits_for_op
+            hook_state["survive_probs"] = survive_probs
+            hook_state["survive_probs_metrics"] = survive_probs_metrics
+            hook_state["survivor_mask"] = mask
+            hook_state["valid_count"] = valid_count
+            hook_state["organic_count"] = organic_count
+            hook_state["controllable_count"] = controllable_count
+            hook_state["floor_trigger_rate"] = sel.floor_trigger_rate
+            hook_state["num_pinned"] = sel.num_pinned
+            hook_state["organic_rate_std"] = sel.organic_rate_std
+            hook_state["undecided_fraction"] = undecided_fraction
+            hook_state["theta_tensor"] = theta.detach()
+            return hidden
+
+        if compression_off:
+            hooks = None
+        else:
+            hooks = {self._head_layer_index: _hook_after_head_layer}
+
+        # ---- Run backbone (post-norm by default; hook fires mid-backbone) ----
         backbone_out = self.backbone(
             inputs_embeds=x,
             cu_seqlens=combined_cu,
             max_seqlen=combined_max,
             position_ids=combined_pos,
+            layer_hooks=hooks,
         )
         hidden = backbone_out.last_hidden_state  # (N_total, D), post-norm
 
@@ -327,7 +438,6 @@ class LevelCompressor(nn.Module):
         content_hidden = hidden[content_pos_mask]
 
         if compression_off:
-            # No head, no selection — survivors = all content positions.
             n_content = content_hidden.shape[0]
             counts = lengths_from_cu(content_cu_seqlens).to(torch.int64)
             return LevelOutput(
@@ -341,63 +451,7 @@ class LevelCompressor(nn.Module):
                 content_cu_seqlens=content_cu_seqlens,
             )
 
-        # ---- Head + threshold + utility-grad capture ----
-        base_raw = self.head(content_hidden.unsqueeze(0)).squeeze(0)  # (N_content,)
-
-        util_state: dict = (
-            utility_grad_capture if utility_grad_capture is not None else {}
-        )
-        base_raw_for_util = None
-        post_head_content_values = None
-        if utility_grad_active and content_hidden.requires_grad:
-            base_raw_for_util = self.head(
-                content_hidden.detach().unsqueeze(0),
-            ).squeeze(0)
-            post_head_content_values = content_hidden.detach().clone()
-
-            def _save_content_grad(grad, _state=util_state):
-                _state["post_head_content_grad"] = grad.detach()
-
-            content_hidden.register_hook(_save_content_grad)
-
-        T = self.head_tanh_temperature.to(base_raw.dtype)
-        logits_for_op = torch.tanh(base_raw / T)
-
-        valid = torch.ones_like(base_raw, dtype=torch.bool)
-        theta = self.threshold.theta_for_ratio(float(target_ratio)).to(base_raw.device)
-        sel = adaptive_threshold_select(
-            logits=logits_for_op,
-            valid_mask=valid,
-            theta=theta,
-            cu_seqlens=content_cu_seqlens,
-            pinned=pinned_positions,
-            min_per_sample=min_per_sample,
-        )
-        mask = sel.mask  # (N_content,)
-
-        survive_probs = torch.sigmoid(
-            logits_for_op.float() - theta.float(),
-        ).to(base_raw.dtype)
-        with torch.no_grad():
-            survive_probs_metrics = survive_probs.detach()
-
-            valid_count = valid.sum()
-            organic = mask & ~(pinned_positions if pinned_positions is not None
-                               else torch.zeros_like(mask))
-            pinned_mask = (
-                pinned_positions if pinned_positions is not None
-                else torch.zeros_like(mask)
-            )
-            controllable = valid & ~pinned_mask
-            organic_count = (organic & controllable).sum()
-            controllable_count = controllable.sum()
-            undecided_mask = (
-                (survive_probs_metrics > 0.2)
-                & (survive_probs_metrics < 0.8)
-                & valid
-            )
-            denom = valid.sum().float().clamp(min=1.0)
-            undecided_fraction = undecided_mask.sum().float() / denom
+        mask = hook_state["survivor_mask"]
 
         # ---- Select survivors and rebuild cu_seqlens ----
         survivor_embeddings, survivor_cu_seqlens, survivor_counts = (
@@ -415,20 +469,20 @@ class LevelCompressor(nn.Module):
             survivor_mask=mask,
             content_embeddings=content_hidden,
             content_cu_seqlens=content_cu_seqlens,
-            base_raw=base_raw,
-            logits_for_op=logits_for_op,
-            survive_probs=survive_probs,
-            survive_probs_metrics=survive_probs_metrics,
-            theta=theta.detach(),
-            valid_count=valid_count,
-            organic_count=organic_count,
-            controllable_count=controllable_count,
-            floor_trigger_rate=sel.floor_trigger_rate,
-            num_pinned=sel.num_pinned,
-            organic_rate_std=sel.organic_rate_std,
-            undecided_fraction=undecided_fraction,
-            base_raw_for_util=base_raw_for_util,
-            post_head_content_values=post_head_content_values,
+            base_raw=hook_state.get("base_raw"),
+            logits_for_op=hook_state.get("logits_for_op"),
+            survive_probs=hook_state.get("survive_probs"),
+            survive_probs_metrics=hook_state.get("survive_probs_metrics"),
+            theta=hook_state.get("theta_tensor"),
+            valid_count=hook_state.get("valid_count"),
+            organic_count=hook_state.get("organic_count"),
+            controllable_count=hook_state.get("controllable_count"),
+            floor_trigger_rate=hook_state.get("floor_trigger_rate"),
+            num_pinned=hook_state.get("num_pinned"),
+            organic_rate_std=hook_state.get("organic_rate_std"),
+            undecided_fraction=hook_state.get("undecided_fraction"),
+            base_raw_for_util=hook_state.get("base_raw_for_util"),
+            post_head_content_values=hook_state.get("post_head_content_values"),
         )
         if utility_grad_active and utility_grad_capture is None:
             out._utility_grad_state = util_state

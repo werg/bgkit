@@ -174,6 +174,7 @@ def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
         survivorship_inner_dim=hidden_dim,
         with_prompt=True,
         with_auto_repro=True,
+        head_layer_index=0,
     )
     l1 = LevelCompressor(
         backbone=backbone_l1,
@@ -181,6 +182,7 @@ def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
         survivorship_inner_dim=hidden_dim,
         with_prompt=False,
         with_auto_repro=False,
+        head_layer_index=0,
     )
 
     proj_layer = MockTransformerLayer(hidden_dim)

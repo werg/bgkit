@@ -18,10 +18,14 @@ from bgkit.models.projection_block import ProjectionBlock
 
 
 class _StubBackbone(nn.Module):
-    def __init__(self, hidden_dim: int = 16, num_layers: int = 2):
+    def __init__(self, hidden_dim: int = 16, num_layers: int = 3):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.embed_tokens = nn.Embedding(64, hidden_dim)
+        # 3 layers so block 1 has both an "upstream" (block 0) and a
+        # "downstream" (block 2) — the LevelCompressor hook fires after
+        # block 1, and tests want at least one downstream block to consume
+        # the modified hidden state.
         self.layers = nn.ModuleList(
             [nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers)]
         )
@@ -36,11 +40,14 @@ class _StubBackbone(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         position_ids: torch.Tensor,
+        layer_hooks: dict | None = None,
         **_kw,
     ):
         h = inputs_embeds
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             h = layer(h)
+            if layer_hooks and i in layer_hooks:
+                h = layer_hooks[i](h)
         h = self.norm(h)
         return BaseModelOutputWithPast(last_hidden_state=h, hidden_states=None)
 
@@ -88,6 +95,8 @@ def _make_encoder(hidden_dim: int = 16) -> BgKITEncoder:
     backbone_l1 = copy.deepcopy(backbone_l0)
     backbone_l1.embed_tokens = nn.Identity()
 
+    # Stub backbone has 3 plain linear layers + norm — fire the head hook
+    # at index 1 (matches the pruned-backbone default semantics).
     l0 = LevelCompressor(
         backbone=backbone_l0,
         hidden_dim=hidden_dim,
@@ -95,6 +104,7 @@ def _make_encoder(hidden_dim: int = 16) -> BgKITEncoder:
         with_prompt=True,
         with_auto_repro=True,
         threshold_controller_cfg={"init_target_ratio": 0.5},
+        head_layer_index=1,
     )
     l1 = LevelCompressor(
         backbone=backbone_l1,
@@ -103,6 +113,7 @@ def _make_encoder(hidden_dim: int = 16) -> BgKITEncoder:
         with_prompt=False,
         with_auto_repro=False,
         threshold_controller_cfg={"init_target_ratio": 0.5},
+        head_layer_index=1,
     )
 
     proj_layer = _MockTransformerLayer(hidden_dim)
@@ -263,24 +274,31 @@ def test_l1_evolves_independently_after_training_step():
         assert torch.allclose(sd0_before[k], sd0_after[k]), f"L0 changed at {k}"
 
 
-def test_legacy_step4_migration_drops_old_heads_and_remaps_threshold():
-    enc = _make_encoder()
+def test_legacy_step4_migration_transfers_heads_and_remaps_threshold():
+    """Smoke test of the manual migration logic — verifies that heads,
+    survive_embedding, head_tanh_temperature, and threshold controllers
+    all transfer (not drop) into the new per-level slots."""
     fake_legacy_sd = {
-        "compressor.head_base_l0.head.0.weight": torch.zeros(8, 16),
-        "compressor.head_base_l1.head.0.weight": torch.zeros(8, 16),
+        "compressor.head_base_l0.head.0.weight": torch.full((8, 16), 1.0),
+        "compressor.head_base_l1.head.0.weight": torch.full((8, 16), 2.0),
+        "compressor.survive_embedding": torch.full((16,), 5.0),
         "compressor.head_tanh_temperature_l0": torch.tensor(3.0),
         "compressor.head_tanh_temperature_l1": torch.tensor(7.0),
         "compressor.threshold_l0.anchor_thetas": torch.zeros(11),
         "compressor.threshold_l1.anchor_thetas": torch.zeros(11),
     }
-    # Just verify the migration logic runs and returns reasonable structure
-    # without exception (full integration tested separately).
-    from bgkit.models import encoder as enc_mod
     migrated: dict = {}
     for k, v in fake_legacy_sd.items():
-        if k.startswith("compressor.head_base_l"):
-            continue
-        if k == "compressor.head_tanh_temperature_l0":
+        if k.startswith("compressor.head_base_l0."):
+            tail = k[len("compressor.head_base_l0."):]
+            migrated[f"l0.head.{tail}"] = v
+        elif k.startswith("compressor.head_base_l1."):
+            tail = k[len("compressor.head_base_l1."):]
+            migrated[f"l1.head.{tail}"] = v
+        elif k == "compressor.survive_embedding":
+            migrated["l0.survive_embedding"] = v
+            migrated["l1.survive_embedding"] = v.clone()
+        elif k == "compressor.head_tanh_temperature_l0":
             migrated["l0.head_tanh_temperature"] = v
         elif k == "compressor.head_tanh_temperature_l1":
             migrated["l1.head_tanh_temperature"] = v
@@ -288,7 +306,11 @@ def test_legacy_step4_migration_drops_old_heads_and_remaps_threshold():
             migrated[f"l0.threshold.{k[len('compressor.threshold_l0.'):]}"] = v
         elif k.startswith("compressor.threshold_l1."):
             migrated[f"l1.threshold.{k[len('compressor.threshold_l1.'):]}"] = v
-    assert "l0.head_tanh_temperature" in migrated
-    assert "l1.head_tanh_temperature" in migrated
+    assert "l0.head.head.0.weight" in migrated
+    assert "l1.head.head.0.weight" in migrated
+    assert "l0.survive_embedding" in migrated
+    assert "l1.survive_embedding" in migrated
     assert migrated["l0.head_tanh_temperature"].item() == 3.0
     assert migrated["l1.head_tanh_temperature"].item() == 7.0
+    assert torch.allclose(migrated["l0.head.head.0.weight"], torch.full((8, 16), 1.0))
+    assert torch.allclose(migrated["l1.head.head.0.weight"], torch.full((8, 16), 2.0))

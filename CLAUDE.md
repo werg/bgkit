@@ -116,25 +116,21 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 
 **Encoder split (2026-05-03): two independent `LevelCompressor` instances + projection block.** Phase 1 Step 5+ and Phase 2 use a **fully split** encoder:
 
-- `encoder.l0` — `LevelCompressor`: full backbone + survivorship head + threshold controller + `auto_repro_head` (the L0→L1 bridge) + `prompt_separator_embedding`.
-- `encoder.l1` — `LevelCompressor`: independent backbone (deepcopy of L0's at construction; `embed_tokens` stripped to `nn.Identity`) + head + threshold. NO prompt separator, NO `auto_repro_head`.
+- `encoder.l0` — `LevelCompressor`: full backbone + survivorship head + threshold controller + `survive_embedding` flag + `auto_repro_head` (the L0→L1 bridge) + `prompt_separator_embedding`.
+- `encoder.l1` — `LevelCompressor`: independent backbone (deepcopy of L0's at construction; `embed_tokens` stripped to `nn.Identity`) + head + threshold + `survive_embedding`. NO prompt separator, NO `auto_repro_head`.
 - `encoder.projection_block` — single shared projection block consumed by whichever level produces the final survivor embeddings (L1 when active, otherwise L0).
 
-The head fires on the **post-norm output of the last backbone block**, so the selection logits and the survivor embeddings come from the same representation. No mid-backbone hooks. Each level's `head_tanh_temperature` is calibrated separately (L0 vs L1 input distributions differ).
+The head fires at the **block 1 hook (mid-backbone)** — pruned block 1 / layer 7 on the full Qwen3.5 backbone, same position as pre-rebuild. The hook scatters `survive_embedding` at surviving content positions so the remaining backbone blocks (2..5) consolidate under the survival signal. Survivor embeddings come from the post-norm last-block output at the same survivor mask. Each level's `head_tanh_temperature` is calibrated separately (L0 vs L1 input distributions differ).
 
 **L0→L1 bridge (load-bearing):** L1's backbone is a deepcopy of L0's pre-trained backbone, so it expects *input-embedding-distributed* inputs. L0's last-block hidden states live in a different distribution. `encoder.l0.auto_repro_head` (pre-trained during Joint Block Pretrain to invert L0's encoding back to input-embedding space) projects L0 survivors into L1's expected input space. The bridge stays trainable in Step 5+ so it adapts as L0 evolves. **Removing it would feed L1 a foreign input distribution it cannot interpret — do not bypass.**
 
-`encoder.forward(target_ratio_l0, target_ratio_l1, ...)` runs `l0(...)` → optionally bridge through `l0.auto_repro_head(l0_out.survivor_embeddings)` → `l1(...)` → `projection_block(...)`. When `target_ratio_l1 is None`, the bridge and L1 are skipped and L0 survivors flow directly to projection. When `target_ratio_l0 is None` (or ≥0.999) the L0 head is also skipped (all positions survive at L0 — used during Step 5 head warmup).
-
-**Step 5 head warmup (configurable `head_warmup_steps: int = 300`):** at the start of Step 5, L0 and L1 backbones are frozen; only `l0.head`, `l1.head`, `l0.auto_repro_head`, `projection_block`, and decoder LoRA train at `target_ratio=1.0` (no compression) so the heads have a stable signal at the new last-block position before the compression curriculum starts.
+`encoder.forward(target_ratio_l0, target_ratio_l1, ...)` runs `l0(...)` → optionally bridge through `l0.auto_repro_head(l0_out.survivor_embeddings)` → `l1(...)` → `projection_block(...)`. When `target_ratio_l1 is None`, the bridge and L1 are skipped and L0 survivors flow directly to projection. When `target_ratio_l0 is None` (or ≥0.999) the L0 head is also skipped (all positions survive at L0).
 
 Selection per level is `logits_for_op = tanh(base_raw / head_tanh_temperature) > θ`. θ is owned by each level's `DualThresholdController` and updated externally by **dual ascent** on the aggregate keep-rate against the curriculum's target compression ratio. There is **no straight-through estimator** on the hard mask — head gradient flows only via BCE + moment-match + decisiveness + utility-grad BCE.
 
 The earlier ratio-embedding-at-layer-3 was **removed**. `target_ratio` is consumed by the operator (DualThresholdController), not by a learned embedding. See "Known limitations" below for the Phase 2 KB regression this introduces.
 
-The earlier `survive_embedding` flag was **removed** in the split-encoder rebuild — with the head firing at the LAST block there are no downstream backbone layers for the flag to propagate to.
-
-See `configs/model/survivorship_head.yaml` and the per-level `survivorship.l{0,1}` blocks in each training config. Legacy single-shared-backbone `BgKITCompressor` was deleted; legacy Step-4 checkpoints migrate via `BgKITEncoder.from_pretrained_legacy_step4_checkpoint(...)` (see `scripts/convert_step4_to_split_l0l1.py`).
+See `configs/model/survivorship_head.yaml` and the per-level `survivorship.l{0,1}` blocks in each training config. Legacy single-shared-backbone `BgKITCompressor` was deleted; legacy Step-4 checkpoints migrate via `BgKITEncoder.from_pretrained_legacy_step4_checkpoint(...)` (see `scripts/convert_step4_to_split_l0l1.py`). The migration **transfers** the legacy block-1 heads + `survive_embedding` directly into the new per-level slots — head position is unchanged, no re-warm needed.
 
 **Per-kernel Liger toggles**: `use_liger_{rmsnorm,swiglu,rope,ce}` in `configs/compute/dgx_spark.yaml`. `use_liger_rmsnorm` is **off** by default — liger-kernel 0.7.x's LigerRMSNorm silently corrupts backward on Qwen3.5 (decoder loss jumps to the LM prior). SwiGLU + RoPE + fused linear-CE remain enabled.
 
@@ -245,40 +241,46 @@ docker exec <container> python -c \
 
 The fork is in-memory autotune only (no persistent cache); first ~50 steps after restart pay autotune-benchmarking cost as Triton tries each new config, then the winner is cached for the process lifetime.
 
-### FlashQLA backend (opt-in, blocked on sm_121 today)
+### FlashQLA backend (default on sm_121)
 
-[FlashQLA](https://github.com/QwenLM/FlashQLA) (released 2026-04-24, blog at https://qwen.ai/blog?id=flashqla) claims **2-3x fwd / 2x bwd vs fla's Triton `chunk_gated_delta_rule`** on H200, via TileLang fused warp-specialized kernels with intra-card context parallelism. We built the integration scaffolding behind an opt-in env var; **as of 2026-04-29 it does not run on sm_121** (see "Status" below). The scaffolding is on the `flashqla` branch, ready to flip on the day Blackwell support lands upstream.
+[FlashQLA](https://github.com/QwenLM/FlashQLA) (released 2026-04-24, blog at https://qwen.ai/blog?id=flashqla) claims **2-3x fwd / 2x bwd vs fla's Triton `chunk_gated_delta_rule`** on H200, via TileLang fused warp-specialized kernels with intra-card context parallelism. BgKIT now uses FlashQLA as the default GDN backend. On sm_121 it currently resolves to FlashQLA's Blackwell compatibility backend, which delegates to FLA until native Blackwell TileLang kernels are ready.
 
 **How it's wired**:
 
-- Bind mount: `/home/werg/FlashQLA` → `/workspace/flashqla:ro` (NOT prepended to PYTHONPATH globally — imported lazily by the resolver so absence of TileLang in the image doesn't break unrelated services).
-- Resolver: `bgkit.utils.gdn_backend.get_chunk_gated_delta_rule()` reads `BGKIT_GDN_BACKEND` env var ∈ {`fla` (default), `flashqla`, `auto`} and returns the matching callable.
-- Hook: `deltanet_patch.patch_deltanet_layer` consults the resolver only when `BGKIT_GDN_BACKEND` is explicitly set to `flashqla` or `auto`. The default (`fla` / unset) preserves the HF-wired fla path bit-for-bit. Backend swap composes cleanly with the existing gate-clamp + cu_seqlens-injection wrappers.
+- Bind mount: `/home/werg/FlashQLA` → `/workspace/flashqla:ro`; `/workspace/flashqla` is on GPU-service `PYTHONPATH`, and `BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}` is set in the shared GPU compose environment.
+- Image deps: `tilelang==0.1.8` and `apache-tvm-ffi==0.1.9` are baked into `docker/Dockerfile`. Parity/profiling services no longer install TileLang at runtime.
+- Resolver: `bgkit.utils.gdn_backend.get_chunk_gated_delta_rule()` reads `BGKIT_GDN_BACKEND` env var ∈ {`flashqla` (default), `fla`, `auto`} and returns the matching callable. Invalid values fail configuration instead of silently falling back.
+- Hook: `deltanet_patch.patch_deltanet_layer` uses the resolver by default, so an unset env swaps the HF-wired FLA callable to FlashQLA before gate-clamp + cu_seqlens wrappers are applied. `BGKIT_GDN_BACKEND=fla` preserves the HF-wired FLA callable as the explicit escape hatch.
 - Logging: layer-init logs `gdn_backend=fla|flashqla` so the resolved choice is greppable in container logs.
-- Parity test: `scripts/test_flashqla_parity.py` runs in the `parity-flashqla` compose service (40g mem cap, restart=no, installs tilelang at runtime via --user). Tests fixed-length and varlen / cu_seqlens paths on Qwen3.5-0.8B linear-attention shape (`H_k=H_v=16, head_k=head_v=128`, T=2048).
+- Diagnostics: `smoke-flashqla` runs `scripts/flashqla_env_smoke.py` without launching kernels and reports the active FlashQLA chunk architecture.
+- Parity test: `scripts/test_flashqla_parity.py` runs in the `parity-flashqla` compose service (40g mem cap, restart=no). Tests fixed-length and varlen / cu_seqlens paths on Qwen3.5-0.8B linear-attention shape (`H_k=H_v=16, head_k=head_v=128`, T=2048).
+- Profile harness: `profile-flashqla` runs `scripts/profile_flashqla_backend.py --backend both`.
 
-**Enable for a training stage**:
+**Backend override**:
 
 ```yaml
 # in docker/docker-compose.yaml, under the relevant train-* service:
 environment:
-  - BGKIT_GDN_BACKEND=flashqla
+  - BGKIT_GDN_BACKEND=fla
 ```
 
-…then restart the container. `BGKIT_GDN_BACKEND=flashqla` raises `RuntimeError` at first DeltaNet layer init if FlashQLA cannot be imported — there is no silent fallback to fla, by design (we don't want the perf-claim signal masked).
+…then restart the container. The default `BGKIT_GDN_BACKEND=flashqla` raises `RuntimeError` at first DeltaNet layer init if FlashQLA cannot be imported. Use `BGKIT_GDN_BACKEND=auto` only for exploratory fallback runs where silent fallback to FLA is acceptable.
 
-**Status on sm_121 (2026-04-29 parity result)**:
+**Status on sm_121 (2026-05-03 compatibility result)**:
 
-- `flash_qla.ops.gated_delta_rule.chunk.__init__` raises `ValueError("FlashQLA now support sm90 only.")` at import time. The module unconditionally rejects any `tilelang.contrib.nvcc.get_target_compute_version() != "9.0"`. Parity script returns exit code 2.
-- With the gate bypassed (`BGKIT_FLASHQLA_BYPASS_SM_GATE=1`), TileLang JIT-compiles the Hopper kernels but sm_121 reports `CUDA_ERROR_NO_BINARY_FOR_GPU` — the kernels emit `wgmma` instructions which are Hopper-specific (Blackwell uses the `mma.block_scale` family; wgmma is sm_90 only). The bypass also corrupts fla's own TileLang backend dispatch (which shares the same compute-version probe) so fla itself crashes — a second reason not to ship the bypass to production.
-- Verdict: FlashQLA + TileLang's Hopper kernels are not portable to Blackwell sm_121 today. Migration is blocked until either FlashQLA grows Blackwell kernel variants or TileLang adds sm_120/sm_121 codegen targets. The integration scaffolding is in place; flipping the env var on the day either of those lands is a one-line change.
+- FlashQLA now imports on sm_121 through `ACTIVE_CHUNK_ARCH.name == "blackwell_sm121"`.
+- The Blackwell path is a compatibility backend that delegates to FLA's Blackwell-capable GDN implementation. It is correctness-equivalent to FLA, not a native FlashQLA speedup path.
+- 2026-05-03 validation: `smoke-flashqla` imports successfully; `parity-flashqla` passes fixed-length and varlen forward/backward with exact tensor parity; `profile-flashqla` reports FLA-equivalent latency (`flashqla` median fwd/bwd 0.91/1.95 ms, `fla` 0.93/2.25 ms on the small harness).
+- Native FlashQLA speedups still require new Blackwell TileLang schedules. The original Hopper forward/state/backward kernels exceed the 99 KiB/block sm_121 shared-memory budget and should not be run by faking an sm90 target.
 
 | Task | Command |
 |---|---|
 | Backfill registry | `make ckpt-backfill` or `.venv/bin/bgkit-ckpt backfill` |
 | List checkpoints | `.venv/bin/bgkit-ckpt list --phase phase1_step4` |
 | Best checkpoint | `.venv/bin/bgkit-ckpt best --phase phase1_step6 --metric eval/loss` |
+| FlashQLA env smoke | `docker compose -f docker/docker-compose.yaml run --rm smoke-flashqla` |
 | FlashQLA parity test | `docker compose -f docker/docker-compose.yaml run --rm parity-flashqla` |
+| FlashQLA profile harness | `docker compose -f docker/docker-compose.yaml run --rm profile-flashqla` |
 
 ## Perf playbook for new training stages
 

@@ -1,25 +1,22 @@
 """Commit encoding (Phase 1 Step 5): two-level L0/L1 compression on commits.
 
-Three-stage curriculum (see ``plans/step5-l0-freeze-curriculum.md``):
+Two-stage curriculum (see ``plans/step5-l0-freeze-curriculum.md``):
 
-* Stage 0 (steps ``< head_warmup_steps``): both ratios = 1.0, both
-  backbones frozen. Only the per-level heads, the L0→L1 bridge
-  (``encoder.l0.auto_repro_head``), the projection block, and the
-  decoder LoRA train. Lets the new last-block heads warm up cleanly
-  before any compression pressure.
-* Stage 1 (``head_warmup_steps <= step < stage1_end_step``): L0 entirely
-  frozen via ``torch.no_grad()`` + eval mode (NOT just
-  ``requires_grad_(False)``). L0 ratio ramps ``stage1_l0_ratio_start``
-  → ``stage1_l0_ratio_end``; L1 ratio fixed at ``stage1_target_ratio_l1``
-  (= 1.0). Trains L1, the bridge, the projection block, and decoder LoRA.
-* Stage 2 (``step >= stage1_end_step``): two microbatch types
-  alternated by ``stage2_l0_unfrozen_period``. Most steps run L0 in
+* Stage 0 (``step < stage0_end_step``): L0 entirely frozen via
+  ``torch.no_grad()`` + eval mode (NOT just ``requires_grad_(False)``).
+  L0 ratio ramps ``stage0_l0_ratio_start`` -> ``stage0_l0_ratio_end``;
+  L1 ratio fixed at ``stage0_target_ratio_l1`` (= 1.0). Trains L1, the
+  bridge (``encoder.l0.auto_repro_head``), the projection block, and
+  decoder LoRA. The L0/L1 heads are pretrained from Step 4 (head fires
+  at the block 1 hook) so no head warmup is needed.
+* Stage 1 (``step >= stage0_end_step``): two microbatch types
+  alternated by ``stage1_l0_unfrozen_period``. Most steps run L0 in
   ``no_grad`` + eval with a large sample-length / batch-token budget;
   every Nth step pulls a small-commit microbatch with L0 backward
-  enabled. L1 ratio ramps ``stage2_target_ratio_l1_start`` →
-  ``stage2_target_ratio_l1_end`` over
-  ``[stage2_l1_ramp_start_step, stage2_l1_ramp_end_step]``; L0 ratio
-  holds at ``stage2_target_ratio_l0``.
+  enabled. L1 ratio ramps ``stage1_target_ratio_l1_start`` ->
+  ``stage1_target_ratio_l1_end`` over
+  ``[stage1_l1_ramp_start_step, stage1_l1_ramp_end_step]``; L0 ratio
+  holds at ``stage1_target_ratio_l0``.
 
 All curriculum keys are live-tunable via ``control.json``. User-pinned
 ``target_ratio_l0`` / ``target_ratio_l1`` overrides the curriculum.
@@ -76,22 +73,19 @@ class CommitEncodingTrainer(BaseTrainer):
 
     LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {
         # Stage transitions
-        "head_warmup_steps": "_head_warmup_steps",
-        "stage1_end_step": "_stage1_end_step",
-        "stage2_l1_ramp_start_step": "_stage2_l1_ramp_start_step",
-        "stage2_l1_ramp_end_step": "_stage2_l1_ramp_end_step",
+        "stage0_end_step": "_stage0_end_step",
+        "stage1_l1_ramp_start_step": "_stage1_l1_ramp_start_step",
+        "stage1_l1_ramp_end_step": "_stage1_l1_ramp_end_step",
         # L0 ratio curriculum
-        "stage0_target_ratio_l0": "_stage0_target_ratio_l0",
-        "stage1_l0_ratio_start": "_stage1_l0_ratio_start",
-        "stage1_l0_ratio_end": "_stage1_l0_ratio_end",
-        "stage2_target_ratio_l0": "_stage2_target_ratio_l0",
+        "stage0_l0_ratio_start": "_stage0_l0_ratio_start",
+        "stage0_l0_ratio_end": "_stage0_l0_ratio_end",
+        "stage1_target_ratio_l0": "_stage1_target_ratio_l0",
         # L1 ratio curriculum
         "stage0_target_ratio_l1": "_stage0_target_ratio_l1",
-        "stage1_target_ratio_l1": "_stage1_target_ratio_l1",
-        "stage2_target_ratio_l1_start": "_stage2_target_ratio_l1_start",
-        "stage2_target_ratio_l1_end": "_stage2_target_ratio_l1_end",
-        # Stage-2 routing
-        "stage2_l0_unfrozen_period": "_stage2_l0_unfrozen_period",
+        "stage1_target_ratio_l1_start": "_stage1_target_ratio_l1_start",
+        "stage1_target_ratio_l1_end": "_stage1_target_ratio_l1_end",
+        # Stage-1 routing
+        "stage1_l0_unfrozen_period": "_stage1_l0_unfrozen_period",
         # Diagnostics cadence
         "diagnostic_metrics_every_n_steps": "_diagnostic_metrics_every_n_steps",
     }
@@ -100,16 +94,15 @@ class CommitEncodingTrainer(BaseTrainer):
         # User overrides (pin / clear via null) — composes ON TOP of curriculum.
         "target_ratio_l0": "_handle_target_ratio_l0",
         "target_ratio_l1": "_handle_target_ratio_l1",
-        # Stage 0 + 1 sample-length cap (rebuilds primary dataloader).
+        # Stage 0 sample-length cap (rebuilds primary dataloader).
         "stage0_max_sample_length": "_handle_stage0_max_sample_length",
-        "stage1_max_sample_length": "_handle_stage1_max_sample_length",
-        # Stage 2 routing budgets (rebuild small/large dataloaders).
-        "stage2_l0_frozen_max_sample_length": "_handle_stage2_l0_frozen_max_sample_length",
-        "stage2_l0_unfrozen_max_sample_length": (
-            "_handle_stage2_l0_unfrozen_max_sample_length"
+        # Stage 1 routing budgets (rebuild small/large dataloaders).
+        "stage1_l0_frozen_max_sample_length": "_handle_stage1_l0_frozen_max_sample_length",
+        "stage1_l0_unfrozen_max_sample_length": (
+            "_handle_stage1_l0_unfrozen_max_sample_length"
         ),
-        "stage2_l0_frozen_max_batch_tokens": "_handle_stage2_l0_frozen_max_batch_tokens",
-        "stage2_l0_unfrozen_max_batch_tokens": "_handle_stage2_l0_unfrozen_max_batch_tokens",
+        "stage1_l0_frozen_max_batch_tokens": "_handle_stage1_l0_frozen_max_batch_tokens",
+        "stage1_l0_unfrozen_max_batch_tokens": "_handle_stage1_l0_unfrozen_max_batch_tokens",
         # Survivorship loss weights (per-level utility-grad gating).
         "utility_grad_loss_weight_l0": "_handle_utility_grad_loss_weight_l0",
         "utility_grad_loss_weight_l1": "_handle_utility_grad_loss_weight_l1",
@@ -138,7 +131,7 @@ class CommitEncodingTrainer(BaseTrainer):
         bidi_warmup = tcfg.get("bidi_warmup_steps", 0)
         model_cfg = self.cfg.model
         ctrl_src = model_cfg.get("threshold_controller", {})
-        ratio_init = float(self._stage1_l0_ratio_start)
+        ratio_init = float(self._stage0_l0_ratio_start)
         threshold_controller_cfg = {
             "init_theta": float(ctrl_src.get("init_theta", 1.0 - 2.0 * ratio_init)),
             "lr": float(ctrl_src.get("lr", 0.02)),
@@ -306,7 +299,7 @@ class CommitEncodingTrainer(BaseTrainer):
         self._num_workers = num_workers
         self._pin_memory = pin_memory
 
-        # Initial budget = stage 0 (head warmup) defaults.
+        # Initial budget = stage 0 defaults (L0-frozen ramp).
         self._max_batch_tokens = int(self._stage0_max_batch_tokens)
         self._max_batch_tokens_eval = self._resolve_eval_batch_budget(
             tcfg, self._max_batch_tokens,
@@ -343,11 +336,11 @@ class CommitEncodingTrainer(BaseTrainer):
             pin_memory=pin_memory,
         )
 
-        # Stage-2 secondary "small / L0-unfrozen" dataloader. Built lazily on
-        # first stage-2 microbatch — until then it's None and the trainer
+        # Stage-1 secondary "small / L0-unfrozen" dataloader. Built lazily on
+        # first stage-1 microbatch — until then it's None and the trainer
         # only ever pulls from `train_dataloader`.
-        self._stage2_small_dataloader = None
-        self._stage2_small_iter = None
+        self._stage1_small_dataloader = None
+        self._stage1_small_iter = None
 
         # ---- Survivorship loss / ICE config (per-level) ----
         from bgkit.training.survivorship_helpers import (
@@ -424,8 +417,7 @@ class CommitEncodingTrainer(BaseTrainer):
             train_samples=train_size,
             eval_samples=eval_size,
             device=str(device),
-            head_warmup_steps=self._head_warmup_steps,
-            stage1_end_step=self._stage1_end_step,
+            stage0_end_step=self._stage0_end_step,
         )
 
     # ------------------------------------------------------------------
@@ -433,51 +425,44 @@ class CommitEncodingTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     def _init_curriculum_state(self, tcfg) -> None:
-        self._head_warmup_steps = int(tcfg.get("head_warmup_steps", 500))
-        self._stage1_end_step = int(tcfg.get("stage1_end_step", 3500))
-        self._stage2_l1_ramp_start_step = int(
-            tcfg.get("stage2_l1_ramp_start_step", 3500),
+        self._stage0_end_step = int(tcfg.get("stage0_end_step", 3000))
+        self._stage1_l1_ramp_start_step = int(
+            tcfg.get("stage1_l1_ramp_start_step", 3000),
         )
-        self._stage2_l1_ramp_end_step = int(
-            tcfg.get("stage2_l1_ramp_end_step", 5500),
+        self._stage1_l1_ramp_end_step = int(
+            tcfg.get("stage1_l1_ramp_end_step", 5000),
         )
 
-        self._stage0_target_ratio_l0 = float(tcfg.get("stage0_target_ratio_l0", 1.0))
-        self._stage1_l0_ratio_start = float(tcfg.get("stage1_l0_ratio_start", 0.9))
-        self._stage1_l0_ratio_end = float(tcfg.get("stage1_l0_ratio_end", 0.15))
-        self._stage2_target_ratio_l0 = float(tcfg.get("stage2_target_ratio_l0", 0.30))
+        self._stage0_l0_ratio_start = float(tcfg.get("stage0_l0_ratio_start", 0.9))
+        self._stage0_l0_ratio_end = float(tcfg.get("stage0_l0_ratio_end", 0.15))
+        self._stage1_target_ratio_l0 = float(tcfg.get("stage1_target_ratio_l0", 0.30))
 
         self._stage0_target_ratio_l1 = float(tcfg.get("stage0_target_ratio_l1", 1.0))
-        self._stage1_target_ratio_l1 = float(tcfg.get("stage1_target_ratio_l1", 1.0))
-        self._stage2_target_ratio_l1_start = float(
-            tcfg.get("stage2_target_ratio_l1_start", 1.0),
+        self._stage1_target_ratio_l1_start = float(
+            tcfg.get("stage1_target_ratio_l1_start", 1.0),
         )
-        self._stage2_target_ratio_l1_end = float(
-            tcfg.get("stage2_target_ratio_l1_end", 0.33),
+        self._stage1_target_ratio_l1_end = float(
+            tcfg.get("stage1_target_ratio_l1_end", 0.33),
         )
 
-        self._stage0_max_sample_length = int(tcfg.get("stage0_max_sample_length", 1500))
-        self._stage1_max_sample_length = int(tcfg.get("stage1_max_sample_length", 2000))
-        self._stage2_l0_frozen_max_sample_length = int(
-            tcfg.get("stage2_l0_frozen_max_sample_length", 6000),
+        self._stage0_max_sample_length = int(tcfg.get("stage0_max_sample_length", 2000))
+        self._stage1_l0_frozen_max_sample_length = int(
+            tcfg.get("stage1_l0_frozen_max_sample_length", 6000),
         )
-        self._stage2_l0_unfrozen_max_sample_length = int(
-            tcfg.get("stage2_l0_unfrozen_max_sample_length", 1500),
+        self._stage1_l0_unfrozen_max_sample_length = int(
+            tcfg.get("stage1_l0_unfrozen_max_sample_length", 1500),
         )
         self._stage0_max_batch_tokens = int(
             tcfg.get("stage0_max_batch_tokens", tcfg.get("max_batch_tokens", 8192)),
         )
-        self._stage1_max_batch_tokens = int(
-            tcfg.get("stage1_max_batch_tokens", tcfg.get("max_batch_tokens", 8192)),
+        self._stage1_l0_frozen_max_batch_tokens = int(
+            tcfg.get("stage1_l0_frozen_max_batch_tokens", 16384),
         )
-        self._stage2_l0_frozen_max_batch_tokens = int(
-            tcfg.get("stage2_l0_frozen_max_batch_tokens", 16384),
+        self._stage1_l0_unfrozen_max_batch_tokens = int(
+            tcfg.get("stage1_l0_unfrozen_max_batch_tokens", 4096),
         )
-        self._stage2_l0_unfrozen_max_batch_tokens = int(
-            tcfg.get("stage2_l0_unfrozen_max_batch_tokens", 4096),
-        )
-        self._stage2_l0_unfrozen_period = int(
-            tcfg.get("stage2_l0_unfrozen_period", 8),
+        self._stage1_l0_unfrozen_period = int(
+            tcfg.get("stage1_l0_unfrozen_period", 8),
         )
 
         # User overrides — None means "follow curriculum".
@@ -488,11 +473,11 @@ class CommitEncodingTrainer(BaseTrainer):
         # Ratio sampling (window above floor) — kept for compat.
         anchor_grid = resolve_anchor_grid(
             self.cfg.get("model", {}),
-            self._stage1_l0_ratio_start,
+            self._stage0_l0_ratio_start,
             getattr(
                 self.encoder.l0.threshold,
                 "anchor_ratios",
-                torch.tensor([self._stage1_l0_ratio_start], dtype=torch.float32),
+                torch.tensor([self._stage0_l0_ratio_start], dtype=torch.float32),
             ).tolist() if hasattr(self, "encoder") else None,
         ) if hasattr(self, "encoder") else []
         self._target_ratio_sampler_cfg = build_ratio_sampler_config(
@@ -507,7 +492,7 @@ class CommitEncodingTrainer(BaseTrainer):
                 "jitter_rel": tcfg.get("target_ratio_jitter_rel", 0.0),
             },
             anchor_grid=anchor_grid,
-            default_ratio=self._stage1_l0_ratio_start,
+            default_ratio=self._stage0_l0_ratio_start,
             enabled_default=False,
             mode_default="window",
         )
@@ -519,7 +504,7 @@ class CommitEncodingTrainer(BaseTrainer):
     ) -> tuple[float, float, bool, int, int]:
         """Compute (ratio_l0, ratio_l1, l0_trainable, max_sample_length, max_batch_tokens).
 
-        Stage 2 has two microbatch types: L0-frozen (default) and L0-unfrozen
+        Stage 1 has two microbatch types: L0-frozen (default) and L0-unfrozen
         (every Nth step). The boolean ``l0_trainable`` is True only on the
         L0-unfrozen microbatches. ``max_sample_length`` / ``max_batch_tokens``
         track the same routing — large/16K for frozen, small/4K for
@@ -528,50 +513,42 @@ class CommitEncodingTrainer(BaseTrainer):
         User overrides ``target_ratio_l0`` / ``target_ratio_l1`` win over
         the curriculum schedule.
         """
-        if step < self._head_warmup_steps:
-            ratio_l0 = self._stage0_target_ratio_l0
+        if step < self._stage0_end_step:
+            t = step / max(self._stage0_end_step, 1)
+            t = max(0.0, min(1.0, t))
+            ratio_l0 = (
+                self._stage0_l0_ratio_start
+                + t * (self._stage0_l0_ratio_end - self._stage0_l0_ratio_start)
+            )
             ratio_l1 = self._stage0_target_ratio_l1
             l0_trainable = False
             max_sample_length = self._stage0_max_sample_length
             max_batch_tokens = self._stage0_max_batch_tokens
-        elif step < self._stage1_end_step:
-            t = (step - self._head_warmup_steps) / max(
-                self._stage1_end_step - self._head_warmup_steps, 1
-            )
-            t = max(0.0, min(1.0, t))
-            ratio_l0 = (
-                self._stage1_l0_ratio_start
-                + t * (self._stage1_l0_ratio_end - self._stage1_l0_ratio_start)
-            )
-            ratio_l1 = self._stage1_target_ratio_l1
-            l0_trainable = False
-            max_sample_length = self._stage1_max_sample_length
-            max_batch_tokens = self._stage1_max_batch_tokens
         else:
-            ratio_l0 = self._stage2_target_ratio_l0
-            ramp_start = self._stage2_l1_ramp_start_step
-            ramp_end = self._stage2_l1_ramp_end_step
+            ratio_l0 = self._stage1_target_ratio_l0
+            ramp_start = self._stage1_l1_ramp_start_step
+            ramp_end = self._stage1_l1_ramp_end_step
             if step < ramp_start:
-                ratio_l1 = self._stage2_target_ratio_l1_start
+                ratio_l1 = self._stage1_target_ratio_l1_start
             elif step >= ramp_end:
-                ratio_l1 = self._stage2_target_ratio_l1_end
+                ratio_l1 = self._stage1_target_ratio_l1_end
             else:
                 t1 = (step - ramp_start) / max(ramp_end - ramp_start, 1)
                 ratio_l1 = (
-                    self._stage2_target_ratio_l1_start
+                    self._stage1_target_ratio_l1_start
                     + t1 * (
-                        self._stage2_target_ratio_l1_end
-                        - self._stage2_target_ratio_l1_start
+                        self._stage1_target_ratio_l1_end
+                        - self._stage1_target_ratio_l1_start
                     )
                 )
-            period = max(int(self._stage2_l0_unfrozen_period), 1)
+            period = max(int(self._stage1_l0_unfrozen_period), 1)
             l0_trainable = (step % period) == 0
             if l0_trainable:
-                max_sample_length = self._stage2_l0_unfrozen_max_sample_length
-                max_batch_tokens = self._stage2_l0_unfrozen_max_batch_tokens
+                max_sample_length = self._stage1_l0_unfrozen_max_sample_length
+                max_batch_tokens = self._stage1_l0_unfrozen_max_batch_tokens
             else:
-                max_sample_length = self._stage2_l0_frozen_max_sample_length
-                max_batch_tokens = self._stage2_l0_frozen_max_batch_tokens
+                max_sample_length = self._stage1_l0_frozen_max_sample_length
+                max_batch_tokens = self._stage1_l0_frozen_max_batch_tokens
 
         # Apply user overrides last — pin / clear via control.json.
         if self._target_ratio_l0_override is not None:
@@ -600,13 +577,12 @@ class CommitEncodingTrainer(BaseTrainer):
     def _configure_trainable_state(self) -> None:
         """Set requires_grad flags + optimizer based on current curriculum stage.
 
-        Three coarse modes:
-        * ``stage0`` (step < head_warmup_steps): both backbones frozen, only
-          heads + bridge + projection_block + decoder LoRA train.
-        * ``stage1`` or ``stage2_frozen`` (L0 frozen, L1 trainable): same as
-          stage 0 plus L1's full stack. L0 backbone params don't receive
-          grad regardless because we wrap L0 forward in ``torch.no_grad()``.
-        * ``stage2_unfrozen`` (every Nth stage-2 step): everything trainable.
+        Two coarse modes:
+        * ``stage0`` or ``stage1_frozen`` (L0 frozen, L1 trainable): heads +
+          bridge + projection_block + decoder LoRA + L1 train. L0 backbone
+          params don't receive grad regardless because we wrap L0 forward in
+          ``torch.no_grad()``.
+        * ``stage1_unfrozen`` (every Nth stage-1 step): everything trainable.
         """
         step = int(self.global_step)
         stage = self._coarse_stage(step)
@@ -624,14 +600,11 @@ class CommitEncodingTrainer(BaseTrainer):
         for module in always_trainable:
             module.requires_grad_(True)
 
-        if stage == "stage0":
-            self._l0_trainable_static = False
-            self._l1_trainable_static = False
-        elif stage == "stage1" or stage == "stage2_frozen":
+        if stage == "stage0" or stage == "stage1_frozen":
             self._l0_trainable_static = False
             self._l1_trainable_static = True
             self.encoder.l1.requires_grad_(True)
-        else:  # stage2_unfrozen
+        else:  # stage1_unfrozen
             self._l0_trainable_static = True
             self._l1_trainable_static = True
             self.encoder.l0.requires_grad_(True)
@@ -663,12 +636,10 @@ class CommitEncodingTrainer(BaseTrainer):
         )
 
     def _coarse_stage(self, step: int) -> str:
-        if step < self._head_warmup_steps:
+        if step < self._stage0_end_step:
             return "stage0"
-        if step < self._stage1_end_step:
-            return "stage1"
-        period = max(int(self._stage2_l0_unfrozen_period), 1)
-        return "stage2_unfrozen" if (step % period) == 0 else "stage2_frozen"
+        period = max(int(self._stage1_l0_unfrozen_period), 1)
+        return "stage1_unfrozen" if (step % period) == 0 else "stage1_frozen"
 
     def _unfreeze_decoder_respecting_lora(self) -> None:
         if getattr(self.decoder, "_has_lora", False):
@@ -760,32 +731,27 @@ class CommitEncodingTrainer(BaseTrainer):
         if self._coarse_stage(int(self.global_step)) == "stage0":
             self._refresh_active_dataloader_for_stage()
 
-    def _handle_stage1_max_sample_length(self, val) -> None:
-        self._stage1_max_sample_length = int(val)
-        if self._coarse_stage(int(self.global_step)) == "stage1":
+    def _handle_stage1_l0_frozen_max_sample_length(self, val) -> None:
+        self._stage1_l0_frozen_max_sample_length = int(val)
+        # Refresh primary (large) loader if we're already in stage1.
+        if self._coarse_stage(int(self.global_step)).startswith("stage1"):
             self._refresh_active_dataloader_for_stage()
 
-    def _handle_stage2_l0_frozen_max_sample_length(self, val) -> None:
-        self._stage2_l0_frozen_max_sample_length = int(val)
-        # Refresh primary (large) loader if we're already in stage2.
-        if self._coarse_stage(int(self.global_step)).startswith("stage2"):
+    def _handle_stage1_l0_unfrozen_max_sample_length(self, val) -> None:
+        self._stage1_l0_unfrozen_max_sample_length = int(val)
+        # Force lazy rebuild of small-loader on next stage-1 unfrozen tick.
+        self._stage1_small_dataloader = None
+        self._stage1_small_iter = None
+
+    def _handle_stage1_l0_frozen_max_batch_tokens(self, val) -> None:
+        self._stage1_l0_frozen_max_batch_tokens = int(val)
+        if self._coarse_stage(int(self.global_step)).startswith("stage1"):
             self._refresh_active_dataloader_for_stage()
 
-    def _handle_stage2_l0_unfrozen_max_sample_length(self, val) -> None:
-        self._stage2_l0_unfrozen_max_sample_length = int(val)
-        # Force lazy rebuild of small-loader on next stage-2 unfrozen tick.
-        self._stage2_small_dataloader = None
-        self._stage2_small_iter = None
-
-    def _handle_stage2_l0_frozen_max_batch_tokens(self, val) -> None:
-        self._stage2_l0_frozen_max_batch_tokens = int(val)
-        if self._coarse_stage(int(self.global_step)).startswith("stage2"):
-            self._refresh_active_dataloader_for_stage()
-
-    def _handle_stage2_l0_unfrozen_max_batch_tokens(self, val) -> None:
-        self._stage2_l0_unfrozen_max_batch_tokens = int(val)
-        self._stage2_small_dataloader = None
-        self._stage2_small_iter = None
+    def _handle_stage1_l0_unfrozen_max_batch_tokens(self, val) -> None:
+        self._stage1_l0_unfrozen_max_batch_tokens = int(val)
+        self._stage1_small_dataloader = None
+        self._stage1_small_iter = None
 
     def _handle_utility_grad_loss_weight_l0(self, val) -> None:
         if not isinstance(val, (int, float)) or float(val) < 0:
@@ -809,16 +775,16 @@ class CommitEncodingTrainer(BaseTrainer):
         self._rebuild_train_dataloader_with_budget(self._max_batch_tokens)
 
     # ------------------------------------------------------------------
-    # Stage-2 small (L0-unfrozen) dataloader
+    # Stage-1 small (L0-unfrozen) dataloader
     # ------------------------------------------------------------------
 
-    def _build_stage2_small_dataloader(self):
+    def _build_stage1_small_dataloader(self):
         """Create a separate small-commit / tight-budget dataloader for the
-        L0-unfrozen microbatches. Filtered by ``stage2_l0_unfrozen_max_sample_length``,
-        budgeted at ``stage2_l0_unfrozen_max_batch_tokens``.
+        L0-unfrozen microbatches. Filtered by ``stage1_l0_unfrozen_max_sample_length``,
+        budgeted at ``stage1_l0_unfrozen_max_batch_tokens``.
         """
-        max_len = int(self._stage2_l0_unfrozen_max_sample_length)
-        budget = int(self._stage2_l0_unfrozen_max_batch_tokens)
+        max_len = int(self._stage1_l0_unfrozen_max_sample_length)
+        budget = int(self._stage1_l0_unfrozen_max_batch_tokens)
         from torch.utils.data import Subset
 
         full_lengths = (
@@ -834,7 +800,7 @@ class CommitEncodingTrainer(BaseTrainer):
         valid = np.where(full_lengths <= max_len)[0]
         if len(valid) == 0:
             logger.warning(
-                "stage2_small_dataloader_filter_dropped_all",
+                "stage1_small_dataloader_filter_dropped_all",
                 max_len=max_len,
                 full_max=int(full_lengths.max()) if len(full_lengths) else 0,
             )
@@ -856,15 +822,15 @@ class CommitEncodingTrainer(BaseTrainer):
         )
         return loader
 
-    def _next_stage2_small_batch(self):
-        if self._stage2_small_dataloader is None:
-            self._stage2_small_dataloader = self._build_stage2_small_dataloader()
-            self._stage2_small_iter = iter(self._stage2_small_dataloader)
+    def _next_stage1_small_batch(self):
+        if self._stage1_small_dataloader is None:
+            self._stage1_small_dataloader = self._build_stage1_small_dataloader()
+            self._stage1_small_iter = iter(self._stage1_small_dataloader)
         try:
-            return next(self._stage2_small_iter)
+            return next(self._stage1_small_iter)
         except StopIteration:
-            self._stage2_small_iter = iter(self._stage2_small_dataloader)
-            return next(self._stage2_small_iter)
+            self._stage1_small_iter = iter(self._stage1_small_dataloader)
+            return next(self._stage1_small_iter)
 
     # ------------------------------------------------------------------
     # Variant bank + checkpoint resolution
@@ -1180,17 +1146,17 @@ class CommitEncodingTrainer(BaseTrainer):
         self, default_batch: dict, l0_trainable: bool,
     ) -> tuple[dict, bool]:
         """Decide whether this microbatch comes from the primary (L0-frozen)
-        dataloader or the stage-2 small (L0-unfrozen) dataloader.
+        dataloader or the stage-1 small (L0-unfrozen) dataloader.
 
         ``default_batch`` was already pulled from the primary loader by the
-        BaseTrainer loop. If we're entering an L0-unfrozen step in stage 2,
+        BaseTrainer loop. If we're entering an L0-unfrozen step in stage 1,
         we discard ``default_batch`` and pull from the small loader instead.
         """
         if not l0_trainable:
             return default_batch, False
-        # L0-unfrozen step in stage 2 — try to pull a small-commit microbatch.
+        # L0-unfrozen step in stage 1 — try to pull a small-commit microbatch.
         try:
-            small_batch = self._next_stage2_small_batch()
+            small_batch = self._next_stage1_small_batch()
         except StopIteration:
             # Empty small loader — fall back to the primary batch but train L0.
             return default_batch, True
@@ -1478,9 +1444,8 @@ def _stage_id(stage_name: str) -> float:
     """Numeric stage id for wandb logging — float so the dict stays uniform."""
     return {
         "stage0": 0.0,
-        "stage1": 1.0,
-        "stage2_frozen": 2.0,
-        "stage2_unfrozen": 2.5,
+        "stage1_frozen": 1.0,
+        "stage1_unfrozen": 1.5,
     }.get(stage_name, -1.0)
 
 

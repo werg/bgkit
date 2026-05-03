@@ -171,12 +171,16 @@ def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
     backbone_l1 = copy.deepcopy(backbone_l0)
     backbone_l1.embed_tokens = nn.Identity()
 
+    # Mock backbone has 2 layers; fire the head hook at layer 1 (the last
+    # layer before norm — matches the pruned-backbone semantics in the
+    # absence of a real PrunedBidirectionalQwen35 here).
     l0 = LevelCompressor(
         backbone=backbone_l0,
         hidden_dim=hidden_dim,
         survivorship_inner_dim=8,
         with_prompt=True,
         with_auto_repro=True,
+        head_layer_index=1,
     )
     l1 = LevelCompressor(
         backbone=backbone_l1,
@@ -184,6 +188,7 @@ def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
         survivorship_inner_dim=8,
         with_prompt=False,
         with_auto_repro=False,
+        head_layer_index=1,
     )
 
     proj_layer = MockTransformerLayer(hidden_dim)
@@ -279,27 +284,22 @@ def _base_cfg(**training_overrides):
             "warmup_steps": 10,
             "eval_every": 50,
             "save_every": 0,
-            "head_warmup_steps": 500,
-            "stage1_end_step": 3500,
-            "stage2_l1_ramp_start_step": 3500,
-            "stage2_l1_ramp_end_step": 5500,
-            "stage0_target_ratio_l0": 1.0,
-            "stage1_l0_ratio_start": 0.9,
-            "stage1_l0_ratio_end": 0.15,
-            "stage2_target_ratio_l0": 0.30,
+            "stage0_end_step": 3000,
+            "stage1_l1_ramp_start_step": 3000,
+            "stage1_l1_ramp_end_step": 5000,
+            "stage0_l0_ratio_start": 0.9,
+            "stage0_l0_ratio_end": 0.15,
+            "stage1_target_ratio_l0": 0.30,
             "stage0_target_ratio_l1": 1.0,
-            "stage1_target_ratio_l1": 1.0,
-            "stage2_target_ratio_l1_start": 1.0,
-            "stage2_target_ratio_l1_end": 0.33,
-            "stage0_max_sample_length": 1500,
-            "stage1_max_sample_length": 2000,
-            "stage2_l0_frozen_max_sample_length": 6000,
-            "stage2_l0_unfrozen_max_sample_length": 1500,
+            "stage1_target_ratio_l1_start": 1.0,
+            "stage1_target_ratio_l1_end": 0.33,
+            "stage0_max_sample_length": 2000,
+            "stage1_l0_frozen_max_sample_length": 6000,
+            "stage1_l0_unfrozen_max_sample_length": 1500,
             "stage0_max_batch_tokens": 8192,
-            "stage1_max_batch_tokens": 8192,
-            "stage2_l0_frozen_max_batch_tokens": 16384,
-            "stage2_l0_unfrozen_max_batch_tokens": 4096,
-            "stage2_l0_unfrozen_period": 8,
+            "stage1_l0_frozen_max_batch_tokens": 16384,
+            "stage1_l0_unfrozen_max_batch_tokens": 4096,
+            "stage1_l0_unfrozen_period": 8,
         },
         "compute": {"num_workers": 0, "pin_memory": False},
         "wandb": {"enabled": False},
@@ -338,8 +338,8 @@ def trainer():
     t._surv_state_l0 = init_state()
     t._surv_state_l1 = init_state()
     t._diagnostic_metrics_every_n_steps = 1
-    t._stage2_small_dataloader = None
-    t._stage2_small_iter = None
+    t._stage1_small_dataloader = None
+    t._stage1_small_iter = None
     t._l0_trainable_static = False
     t._l1_trainable_static = False
     t._last_post_step_metrics = {}
@@ -360,61 +360,48 @@ def trainer():
 class TestCurriculum:
     def test_stage0_at_step0(self, trainer):
         ratio_l0, ratio_l1, l0_train, max_len, max_tok = trainer._curriculum_state(0)
-        assert ratio_l0 == 1.0
-        assert ratio_l1 == 1.0
-        assert l0_train is False
-        assert max_len == 1500
-        assert max_tok == 8192
-
-    def test_stage0_just_before_end(self, trainer):
-        ratio_l0, ratio_l1, l0_train, _, _ = trainer._curriculum_state(499)
-        assert ratio_l0 == 1.0
-        assert ratio_l1 == 1.0
-        assert l0_train is False
-
-    def test_stage1_at_start(self, trainer):
-        ratio_l0, ratio_l1, l0_train, max_len, _ = trainer._curriculum_state(500)
-        assert abs(ratio_l0 - 0.9) < 1e-6  # ramp start
+        # L0 ramp starts at 0.9.
+        assert abs(ratio_l0 - 0.9) < 1e-6
         assert ratio_l1 == 1.0
         assert l0_train is False
         assert max_len == 2000
+        assert max_tok == 8192
 
-    def test_stage1_midpoint_ramp(self, trainer):
-        # midpoint between 500 and 3500 → t=0.5, ratio = 0.9 + 0.5*(0.15-0.9) = 0.525
-        ratio_l0, _, _, _, _ = trainer._curriculum_state(2000)
+    def test_stage0_midpoint_ramp(self, trainer):
+        # midpoint between 0 and 3000 → t=0.5, ratio = 0.9 + 0.5*(0.15-0.9) = 0.525
+        ratio_l0, _, _, _, _ = trainer._curriculum_state(1500)
         assert abs(ratio_l0 - 0.525) < 1e-6
 
-    def test_stage1_just_before_end(self, trainer):
-        ratio_l0, _, _, _, _ = trainer._curriculum_state(3499)
+    def test_stage0_just_before_end(self, trainer):
+        ratio_l0, _, _, _, _ = trainer._curriculum_state(2999)
         # Very close to ratio_end = 0.15, slightly above.
         assert ratio_l0 > 0.15
         assert abs(ratio_l0 - 0.15) < 0.01
 
-    def test_stage2_entry_frozen_microbatch(self, trainer):
-        # step=3500 % 8 == 4 → frozen microbatch.
-        ratio_l0, ratio_l1, l0_train, max_len, max_tok = trainer._curriculum_state(3500)
+    def test_stage1_entry_frozen_microbatch(self, trainer):
+        # step=3001 % 8 != 0 → frozen microbatch.
+        ratio_l0, ratio_l1, l0_train, max_len, max_tok = trainer._curriculum_state(3001)
         assert ratio_l0 == 0.30
-        # Ramp just started at 3500 → still at start value.
-        assert ratio_l1 == 1.0
+        # L1 ramp just started at 3000; barely past start at 3001.
+        assert abs(ratio_l1 - 1.0) < 0.001
         assert l0_train is False
         assert max_len == 6000
         assert max_tok == 16384
 
-    def test_stage2_unfrozen_microbatch(self, trainer):
-        # step=3504 % 8 == 0 → L0-unfrozen microbatch.
-        # Actually: 3504 % 8 = 0; choose 3504.
-        ratio_l0, _, l0_train, max_len, max_tok = trainer._curriculum_state(3504)
+    def test_stage1_unfrozen_microbatch(self, trainer):
+        # step=3000 % 8 == 0 → L0-unfrozen microbatch.
+        ratio_l0, _, l0_train, max_len, max_tok = trainer._curriculum_state(3000)
         assert ratio_l0 == 0.30
         assert l0_train is True
         assert max_len == 1500
         assert max_tok == 4096
 
-    def test_stage2_l1_ramp_endpoint(self, trainer):
-        # at exactly stage2_l1_ramp_end_step the ratio is target.
-        _, ratio_l1, _, _, _ = trainer._curriculum_state(5500)
+    def test_stage1_l1_ramp_endpoint(self, trainer):
+        # at exactly stage1_l1_ramp_end_step the ratio is target.
+        _, ratio_l1, _, _, _ = trainer._curriculum_state(5000)
         assert ratio_l1 == 0.33
 
-    def test_stage2_l1_ramp_post_end(self, trainer):
+    def test_stage1_l1_ramp_post_end(self, trainer):
         _, ratio_l1, _, _, _ = trainer._curriculum_state(7000)
         assert ratio_l1 == 0.33
 
@@ -432,13 +419,13 @@ class TestCurriculum:
 class TestCoarseStage:
     def test_stage_names(self, trainer):
         assert trainer._coarse_stage(0) == "stage0"
-        assert trainer._coarse_stage(499) == "stage0"
-        assert trainer._coarse_stage(500) == "stage1"
-        assert trainer._coarse_stage(3499) == "stage1"
-        # 3500 % 8 != 0 → stage2_frozen
-        assert trainer._coarse_stage(3500) == "stage2_frozen"
-        # 3504 % 8 == 0 → stage2_unfrozen
-        assert trainer._coarse_stage(3504) == "stage2_unfrozen"
+        assert trainer._coarse_stage(2999) == "stage0"
+        # 3000 % 8 == 0 → stage1_unfrozen
+        assert trainer._coarse_stage(3000) == "stage1_unfrozen"
+        # 3001 % 8 != 0 → stage1_frozen
+        assert trainer._coarse_stage(3001) == "stage1_frozen"
+        # 3008 % 8 == 0 → stage1_unfrozen
+        assert trainer._coarse_stage(3008) == "stage1_unfrozen"
 
 
 # ---------------------------------------------------------------------------
@@ -461,24 +448,24 @@ class TestLiveConfig:
         assert trainer._target_ratio_l1_override == 0.20
 
     def test_stage_transition_step_update(self, trainer):
-        trainer.apply_live_config({"head_warmup_steps": 1000})
-        assert trainer._head_warmup_steps == 1000
+        trainer.apply_live_config({"stage0_end_step": 1000})
+        assert trainer._stage0_end_step == 1000
 
-    def test_stage1_ratio_end_update(self, trainer):
-        trainer.apply_live_config({"stage1_l0_ratio_end": 0.20})
-        assert trainer._stage1_l0_ratio_end == 0.20
+    def test_stage0_ratio_end_update(self, trainer):
+        trainer.apply_live_config({"stage0_l0_ratio_end": 0.20})
+        assert trainer._stage0_l0_ratio_end == 0.20
         # And the ramp now hits 0.20 at the end.
-        ratio_l0, _, _, _, _ = trainer._curriculum_state(3499)
+        ratio_l0, _, _, _, _ = trainer._curriculum_state(2999)
         assert ratio_l0 > 0.20
-        # And just past stage1 end, holds at stage2 default (not 0.20).
-        ratio_l0, _, _, _, _ = trainer._curriculum_state(3500)
+        # And just past stage0 end, holds at stage1 default (not 0.20).
+        ratio_l0, _, _, _, _ = trainer._curriculum_state(3001)
         assert ratio_l0 == 0.30
 
-    def test_stage2_period_update(self, trainer):
-        trainer.apply_live_config({"stage2_l0_unfrozen_period": 4})
-        assert trainer._stage2_l0_unfrozen_period == 4
+    def test_stage1_period_update(self, trainer):
+        trainer.apply_live_config({"stage1_l0_unfrozen_period": 4})
+        assert trainer._stage1_l0_unfrozen_period == 4
         # Now every 4th step is L0-unfrozen.
-        assert trainer._coarse_stage(3500) == "stage2_unfrozen"  # 3500 % 4 == 0
+        assert trainer._coarse_stage(3000) == "stage1_unfrozen"  # 3000 % 4 == 0
 
     def test_utility_grad_l0_update(self, trainer):
         trainer.apply_live_config({"utility_grad_loss_weight_l0": 0.5})
@@ -598,23 +585,25 @@ def _make_repo_batch(
 
 class TestForwardBackwardSmoke:
     def test_stage0_forward_backward(self, trainer):
-        """Stage 0 step (no compression, both backbones frozen)."""
+        """Stage 0 step (L0 frozen via no_grad, L1 trains, L0 ramp at start)."""
         trainer.global_step = 0
         batch = _make_repo_batch()
         result = trainer._forward_backward(batch)
         assert "loss" in result
         assert torch.isfinite(torch.tensor(result["loss"]))
-        assert result["target_ratio_l0"] == 1.0
+        # L0 starts at the ramp start (0.9).
+        assert abs(result["target_ratio_l0"] - 0.9) < 1e-6
         assert result["target_ratio_l1"] == 1.0
 
-    def test_stage1_forward_backward(self, trainer):
-        """Stage 1 step (L0 frozen via no_grad, L1 trains)."""
-        trainer.global_step = 1500  # midway into stage 1 ramp
+    def test_stage0_midpoint_forward_backward(self, trainer):
+        """Stage 0 mid-ramp (L0 frozen via no_grad, L1 trains)."""
+        trainer.global_step = 1500  # midway into stage 0 ramp
         batch = _make_repo_batch()
         result = trainer._forward_backward(batch)
         assert torch.isfinite(torch.tensor(result["loss"]))
-        # L0 ratio is on the ramp; not 1.0 anymore.
-        assert result["target_ratio_l0"] < 1.0
+        # L0 ratio is on the ramp; less than start (0.9), more than end (0.15).
+        assert result["target_ratio_l0"] < 0.9
+        assert result["target_ratio_l0"] > 0.15
 
 
 # ---------------------------------------------------------------------------
