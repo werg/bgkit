@@ -72,28 +72,23 @@ class _InterleavingDataLoader:
         return self._primary.dataset
 
     def __iter__(self):
-        return _InterleavingIterator(self)
+        return _InterleavingIterator(
+            self._primary, self._secondary, self._ratio,
+        )
 
     def __len__(self):
         return len(self._primary)
 
 
 class _InterleavingIterator:
-    def __init__(self, parent):
-        # Hold the parent loader so we can read its ``_ratio`` live.
-        # When a handler updates ``parent._ratio`` mid-epoch, the very
-        # next ``__next__`` call sees the new value.
-        self._parent = parent
-        self._primary_loader = parent._primary
-        self._secondary_loader = parent._secondary
-        self._primary_iter = iter(self._primary_loader)
-        self._secondary_iter = iter(self._secondary_loader)
+    def __init__(self, primary, secondary, ratio):
+        self._primary_loader = primary
+        self._secondary_loader = secondary
+        self._primary_iter = iter(primary)
+        self._secondary_iter = iter(secondary)
+        self._ratio = ratio
         self._primary_samples = 0
         self._secondary_samples = 0
-
-    @property
-    def _ratio(self) -> float:
-        return self._parent._ratio
 
     @staticmethod
     def _batch_sample_count(batch: dict) -> int:
@@ -112,9 +107,6 @@ class _InterleavingIterator:
             try:
                 batch = next(self._secondary_iter)
                 self._secondary_samples += self._batch_sample_count(batch)
-                # Tag for downstream loss-source separation. Secondary is
-                # the QA dataloader in DecoderInitTrainer.
-                batch["_is_qa"] = True
                 return batch
             except StopIteration:
                 # Secondary exhausted — restart it
@@ -124,7 +116,6 @@ class _InterleavingIterator:
         # Primary batch (or secondary was exhausted)
         batch = next(self._primary_iter)  # StopIteration propagates = epoch end
         self._primary_samples += self._batch_sample_count(batch)
-        batch["_is_qa"] = False
         return batch
 
 
@@ -154,10 +145,6 @@ class DecoderInitTrainer(BaseTrainer):
         # ``SurvivorshipLossWeights`` dataclass; handler does
         # ``dataclasses.replace`` to update.
         "utility_grad_loss_weight": "_handle_utility_grad_loss_weight",
-        "qa_position_loss_weight": "_handle_qa_position_loss_weight",
-        # QA / recon mix — updates the InterleavingDataLoader's _ratio
-        # in place; iterator picks it up on the very next batch.
-        "qa_ratio": "_handle_qa_ratio",
     }
 
     def setup(self) -> None:
@@ -424,7 +411,7 @@ class DecoderInitTrainer(BaseTrainer):
             from bgkit.models.ice_teacher import ICETeacher
 
             ice_path = ice_cfg["checkpoint_path"]
-            embed_tokens = self.encoder.compressor.backbone.embed_tokens
+            embed_tokens = self.encoder.l0.backbone.embed_tokens
             self._ice_teacher = ICETeacher(
                 ice_path,
                 embed_tokens,
@@ -675,7 +662,7 @@ class DecoderInitTrainer(BaseTrainer):
             calibrate_head_tanh_temperature,
         )
         calibrated_T = calibrate_head_tanh_temperature(
-            self.encoder.compressor,
+            self.encoder,
             self.train_dataloader,
             self.device,
             level="l0",
@@ -703,7 +690,7 @@ class DecoderInitTrainer(BaseTrainer):
             self.cfg.model,
             self._target_ratio_start,
             getattr(
-                self.encoder.compressor.threshold_l0,
+                self.encoder.l0.threshold,
                 "anchor_ratios",
                 torch.tensor([self._target_ratio_start], dtype=torch.float32),
             ).tolist(),
@@ -778,59 +765,6 @@ class DecoderInitTrainer(BaseTrainer):
                 old=old,
                 new=new_val,
             )
-
-    def _handle_qa_position_loss_weight(self, val: float | int) -> None:
-        """Live-config handler: update ``qa_position_loss_weight`` on the
-        survivorship loss weight dataclasses (l0 + l1)."""
-        if not isinstance(val, (int, float)) or float(val) < 0:
-            logger.warning(
-                "live_qa_position_loss_weight_invalid",
-                value=val, expected="non-negative float",
-            )
-            return
-        import dataclasses as _dc
-        new_val = float(val)
-        for attr in ("_surv_l0", "_surv_l1"):
-            cfg = getattr(self, attr, None)
-            if cfg is None or not hasattr(cfg, "qa_position_loss_weight"):
-                continue
-            old = cfg.qa_position_loss_weight
-            setattr(self, attr, _dc.replace(cfg, qa_position_loss_weight=new_val))
-            logger.info(
-                "live_qa_position_loss_weight_update",
-                attr=attr, old=old, new=new_val,
-            )
-
-    def _handle_qa_ratio(self, val: float | int) -> None:
-        """Live-config handler: update the QA/recon interleaving ratio.
-
-        ``val`` is the QA fraction in [0, 1]. Writes to
-        ``_qa_ratio`` and ``self.train_dataloader._ratio`` so the
-        next batch from the iterator already uses the new ratio.
-        Skips with a warning if the QA loader isn't set up.
-        """
-        if not isinstance(val, (int, float)) or not (0.0 <= float(val) <= 1.0):
-            logger.warning(
-                "live_qa_ratio_invalid",
-                value=val, expected="float in [0, 1]",
-            )
-            return
-        new_val = float(val)
-        old = getattr(self, "_qa_ratio", None)
-        if old is None:
-            logger.warning("live_qa_ratio_skipped", reason="_qa_ratio attr missing")
-            return
-        if not isinstance(self.train_dataloader, _InterleavingDataLoader):
-            logger.warning(
-                "live_qa_ratio_skipped",
-                reason="train_dataloader is not _InterleavingDataLoader",
-            )
-            return
-        if old == new_val:
-            return
-        self._qa_ratio = new_val
-        self.train_dataloader._ratio = new_val
-        logger.info("live_qa_ratio_update", old=old, new=new_val)
 
     # ------------------------------------------------------------------
     # Checkpoint resolution
@@ -1008,14 +942,14 @@ class DecoderInitTrainer(BaseTrainer):
             or self.global_step < self._encoder_unfreeze_step
         )
         if not self._encoder_frozen:
-            self.encoder.compressor.requires_grad_(True)
-            self.encoder.compressor.train()
+            self.encoder.l0.requires_grad_(True)
+            self.encoder.l0.train()
             maybe_enable_gradient_checkpointing(
-                self.encoder.compressor.backbone, self.cfg,
+                self.encoder.l0.backbone, self.cfg,
             )
         else:
-            self.encoder.compressor.requires_grad_(False)
-            self.encoder.compressor.eval()
+            self.encoder.l0.requires_grad_(False)
+            self.encoder.l0.eval()
 
         # Compression: active after compression_introduction_step
         self._compression_active = (
@@ -1032,7 +966,7 @@ class DecoderInitTrainer(BaseTrainer):
         )
         dec_params = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
         enc_params = sum(
-            p.numel() for p in self.encoder.compressor.parameters() if p.requires_grad
+            p.numel() for p in self.encoder.l0.parameters() if p.requires_grad
         )
         logger.info(
             "trainable_state_configured",
@@ -1091,10 +1025,10 @@ class DecoderInitTrainer(BaseTrainer):
             return
 
         # Unfreeze compressor backbone
-        self.encoder.compressor.requires_grad_(True)
-        self.encoder.compressor.train()
+        self.encoder.l0.requires_grad_(True)
+        self.encoder.l0.train()
         maybe_enable_gradient_checkpointing(
-            self.encoder.compressor.backbone, self.cfg,
+            self.encoder.l0.backbone, self.cfg,
         )
         self._encoder_frozen = False
 
@@ -1206,7 +1140,7 @@ class DecoderInitTrainer(BaseTrainer):
         tcfg = self.cfg.training
         encoder_lr = tcfg.get("encoder_lr", tcfg.lr)
         compressor_params = [
-            p for p in self.encoder.compressor.parameters() if p.requires_grad
+            p for p in self.encoder.l0.parameters() if p.requires_grad
         ]
         if compressor_params:
             return [{"params": compressor_params, "lr": encoder_lr, "base_lr": encoder_lr}]
@@ -1258,7 +1192,7 @@ class DecoderInitTrainer(BaseTrainer):
             ]
         if not self._encoder_frozen:
             params += [
-                p for p in self.encoder.compressor.parameters() if p.requires_grad
+                p for p in self.encoder.l0.parameters() if p.requires_grad
             ]
         return params
 
@@ -1411,7 +1345,7 @@ class DecoderInitTrainer(BaseTrainer):
         # gradients because their requires_grad=False).
         use_no_grad = self._encoder_frozen and not self._train_projection
 
-        bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+        bgkit_embed = self.encoder.l0.backbone.get_input_embeddings()
         content_emb = bgkit_embed(content_token_ids)
         prompt_emb = bgkit_embed(prompt_ids)
 
@@ -1424,9 +1358,8 @@ class DecoderInitTrainer(BaseTrainer):
                     prompt_embeddings=prompt_emb,
                     prompt_cu_seqlens=prompt_cu,
                     prompt_position_ids=prompt_position_ids,
-                    target_ratio=target_ratio,
-                    level="l0",
-                    min_per_sample=min_per_sample,
+                    target_ratio_l0=target_ratio,
+                    min_per_sample_l0=min_per_sample,
                 )
         else:
             enc_out = self.encoder(
@@ -1436,17 +1369,15 @@ class DecoderInitTrainer(BaseTrainer):
                 prompt_embeddings=prompt_emb,
                 prompt_cu_seqlens=prompt_cu,
                 prompt_position_ids=prompt_position_ids,
-                target_ratio=target_ratio,
-                level="l0",
-                min_per_sample=min_per_sample,
-                utility_grad_active=util_active,
+                target_ratio_l0=target_ratio,
+                min_per_sample_l0=min_per_sample,
+                utility_grad_active_l0=util_active,
             )
 
         return enc_out
 
     def _decoder_forward_packed(
         self, batch: dict, enc_out,
-        survivors_override: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the packed decoder forward from a chat-repro batch.
 
@@ -1454,11 +1385,6 @@ class DecoderInitTrainer(BaseTrainer):
         ``bgkit_splice_start`` into prefix/suffix lists, and builds the
         per-segment loss mask over the assembled ``[prefix | survivors |
         suffix]`` layout that ``forward_with_single_splice`` expects.
-
-        ``survivors_override``: when provided, splice these embeddings in
-        place of ``enc_out.survivor_embeddings``. Used by eval-time
-        ablation passes (zeroed/noise) — must have the same shape and
-        cu_seqlens partitioning as the original.
         """
         device = self.device
         token_ids_flat = batch["token_ids"].to(device)
@@ -1467,11 +1393,7 @@ class DecoderInitTrainer(BaseTrainer):
         splice_len = batch["bgkit_splice_len"].to(device)
         loss_mask_flat = batch["loss_mask"].to(device).to(torch.bool)
 
-        survivors = (
-            survivors_override
-            if survivors_override is not None
-            else enc_out.survivor_embeddings
-        )
+        survivors = enc_out.survivor_embeddings
         survivor_cu = enc_out.survivor_cu_seqlens
 
         batch_size = int(tok_cu.shape[0]) - 1
@@ -1523,7 +1445,7 @@ class DecoderInitTrainer(BaseTrainer):
         if self._train_projection:
             self.encoder.projection_block.train()
         if not self._encoder_frozen:
-            self.encoder.compressor.train()
+            self.encoder.l0.train()
 
         target_ratio = self._sample_target_ratio() if self._compression_active else None
         if self._encoder_frozen and not self._train_projection:
@@ -1538,22 +1460,13 @@ class DecoderInitTrainer(BaseTrainer):
 
         total_loss = loss
 
-        # Per-source loss tracking. The headline ``loss`` is the
-        # combined train loss for this microbatch; ``loss_recon`` and
-        # ``loss_qa`` split it by which dataloader produced the batch
-        # so wandb shows the QA signal independently of recon.
-        loss_val = loss.item()
-        is_qa = bool(batch.get("_is_qa", False))
-        metrics: dict[str, float] = {
-            "loss": loss_val,
-            "loss_qa" if is_qa else "loss_recon": loss_val,
-        }
+        metrics: dict[str, float] = {"loss": loss.item()}
 
         # Survivorship head auxiliary losses (when compression is active).
         # Note: survive_probs_metrics is the canonical "probability that this
         # position survives" exposed for metrics; survive_probs is its alias
         # on CompressorOutput for backwards compatibility.
-        if self._compression_active and enc_out.logits_for_op is not None:
+        if self._compression_active and enc_out.l0.logits_for_op is not None:
             from bgkit.training.survivorship_helpers import accumulate
 
             self._last_sampled_target_ratio = target_ratio
@@ -1563,7 +1476,7 @@ class DecoderInitTrainer(BaseTrainer):
             content_token_ids = batch["content_token_ids"].to(self.device)
             content_cu = batch["content_cu_seqlens"].to(self.device)
             surv_loss, surv_metrics = self._compute_survivorship_losses(
-                enc_out,
+                enc_out.l0,
                 target_ratio,
                 content_token_ids=content_token_ids,
                 content_cu_seqlens=content_cu,
@@ -1584,43 +1497,43 @@ class DecoderInitTrainer(BaseTrainer):
             emit_diag = (
                 diag_interval <= 1 or self.global_step % diag_interval == 0
             )
-            if enc_out.survivor_mask is not None:
+            if enc_out.l0.survivor_mask is not None:
                 metrics["min_target_ratio"] = target_ratio
                 metrics["sampled_target_ratio"] = target_ratio
                 # Packed: all content positions are valid; valid count is N.
                 n_valid = int(content_token_ids.shape[0])
                 if emit_diag:
-                    n_survivors = int(enc_out.survivor_mask.sum().item())
+                    n_survivors = int(enc_out.l0.survivor_mask.sum().item())
                     metrics["actual_ratio"] = n_survivors / max(n_valid, 1)
                 # floor_trigger_rate / theta are zero-dim tensors on
                 # device; .item() at log time (still gated on emit_diag
                 # to keep off hot path).
                 if emit_diag:
-                    if enc_out.floor_trigger_rate is not None:
+                    if enc_out.l0.floor_trigger_rate is not None:
                         metrics["floor_trigger_rate"] = float(
-                            enc_out.floor_trigger_rate.item(),
+                            enc_out.l0.floor_trigger_rate.item(),
                         )
-                    if enc_out.theta_tensor is not None:
-                        metrics["theta_l0_step"] = float(enc_out.theta_tensor.item())
+                    if enc_out.l0.theta_tensor is not None:
+                        metrics["theta_l0_step"] = float(enc_out.l0.theta_tensor.item())
                     # Head health
-                    if enc_out.base_raw is not None:
-                        base = enc_out.base_raw.detach()
+                    if enc_out.l0.base_raw is not None:
+                        base = enc_out.l0.base_raw.detach()
                         base_norm = float(base.norm().item()) / max(n_valid ** 0.5, 1.0)
                         metrics["base_norm"] = base_norm
-                    if enc_out.logits_for_op is not None:
-                        logits = enc_out.logits_for_op.detach()
+                    if enc_out.l0.logits_for_op is not None:
+                        logits = enc_out.l0.logits_for_op.detach()
                         metrics["head_logit_std"] = float(logits.std().item())
                         metrics["head_logit_min"] = float(logits.min().item())
                         metrics["head_logit_max"] = float(logits.max().item())
                     # L0 collapse-detection diagnostics. See
                     # ``survivorship_diagnostics`` docstring.
-                    if enc_out.organic_rate_std is not None:
+                    if enc_out.l0.organic_rate_std is not None:
                         metrics["l0_organic_rate_std"] = float(
-                            enc_out.organic_rate_std.item(),
+                            enc_out.l0.organic_rate_std.item(),
                         )
-                    if enc_out.undecided_fraction is not None:
+                    if enc_out.l0.undecided_fraction is not None:
                         metrics["l0_undecided_fraction"] = float(
-                            enc_out.undecided_fraction.item(),
+                            enc_out.l0.undecided_fraction.item(),
                         )
 
         # Main scaled backward (for gradient accumulation). This populates
@@ -1639,14 +1552,14 @@ class DecoderInitTrainer(BaseTrainer):
             self._compression_active
             and not self._encoder_frozen
             and self._surv_l0.utility_grad_loss_weight > 0.0
-            and enc_out.post_head_content_values is not None
+            and enc_out.l0.post_head_content_values is not None
         ):
             content_cu = batch["content_cu_seqlens"].to(self.device)
-            content_grad = enc_out.get_content_grad()
+            content_grad = enc_out.l0.get_content_grad()
             util_loss, util_metrics = utility_grad_bce_loss(
-                base_raw_for_util=enc_out.base_raw_for_util,
+                base_raw_for_util=enc_out.l0.base_raw_for_util,
                 content_grad=content_grad,
-                content_values=enc_out.post_head_content_values,
+                content_values=enc_out.l0.post_head_content_values,
                 valid_mask=None,
                 pinned_mask=None,
                 target_ratio=self._current_target_ratio(),
@@ -1678,7 +1591,7 @@ class DecoderInitTrainer(BaseTrainer):
         if self._train_projection:
             self.encoder.projection_block.eval()
         if not self._encoder_frozen:
-            self.encoder.compressor.eval()
+            self.encoder.l0.eval()
         self._is_evaluating = True
         self._eval_count += 1
 
@@ -1705,8 +1618,8 @@ class DecoderInitTrainer(BaseTrainer):
                 total_loss += loss.item() * batch_content_tokens
                 total_content_tokens += batch_content_tokens
 
-                if self._compression_active and enc_out.survivor_mask is not None:
-                    total_survivors += int(enc_out.survivor_mask.sum().item())
+                if self._compression_active and enc_out.l0.survivor_mask is not None:
+                    total_survivors += int(enc_out.l0.survivor_mask.sum().item())
                     # Packed: all content positions are valid.
                     total_content += int(batch["content_token_ids"].shape[0])
 
@@ -1720,7 +1633,6 @@ class DecoderInitTrainer(BaseTrainer):
 
             metrics: dict[str, float] = {
                 "loss": avg_loss,
-                "loss_recon": avg_loss,  # explicit alias — this loss is reconstruction
                 "perplexity": perplexity,
             }
 
@@ -1753,20 +1665,6 @@ class DecoderInitTrainer(BaseTrainer):
                     metrics["combined_loss"] = (
                         total_loss + qa_loss
                     ) / combined_tokens
-
-            # Survivor ablation: re-run the eval loops with survivors zeroed
-            # and noised, on the same batches. Reuses the encoder forward
-            # by caching the survivor embeddings, then does two extra cheap
-            # decoder passes per batch. Default on; gate via training.eval.
-            # ablation_enabled: false to skip when iterating fast.
-            ablation_enabled = self.cfg.training.get("eval", {}).get(
-                "ablation_enabled", True,
-            )
-            if ablation_enabled and self._compression_active:
-                ablation_metrics = self._run_eval_ablation(
-                    qa_eval_loader=qa_eval_loader,
-                )
-                metrics.update(ablation_metrics)
 
             # Generation metrics (expensive -- only every Nth eval).
             # Scoped separately from outer ``evaluate`` because the KV
@@ -1808,101 +1706,6 @@ class DecoderInitTrainer(BaseTrainer):
             self._is_evaluating = False
 
         return metrics
-
-    @torch.no_grad()
-    def _run_eval_ablation(
-        self, qa_eval_loader=None,
-    ) -> dict[str, float]:
-        """Re-run eval batches with survivors zeroed and noised.
-
-        Provides the with/without-survivors ablation as routine eval
-        metrics, replacing the standalone scripts/run_ablation.py path
-        that has historically OOM'd on shared-memory Blackwell. Same
-        encoder + decoder + dataloaders are already loaded from the
-        outer evaluate() call, so the only added cost is two extra
-        decoder forwards per batch.
-
-        Returns metrics keyed:
-          ablation/loss_zeroed, ablation/loss_noise,
-          ablation/gap_zeroed, ablation/gap_noise,
-          (and qa_loss_zeroed/noise + qa_gap_* when QA loader present)
-        Gap is loss_ablated − loss_present; positive means survivors help.
-        """
-        from bgkit.eval.ablations import AblationCondition, _modify_survivors
-
-        def _accum_two_conditions(loader) -> tuple[float, float, float, float]:
-            """Returns (loss_present, loss_zeroed, loss_noise, total_tokens)."""
-            l_present = l_zeroed = l_noise = 0.0
-            total_tokens = 0.0
-            for batch in loader:
-                loss_mask = batch["loss_mask"].to(self.device)
-                bt = float(loss_mask.sum().item())
-                if bt <= 0:
-                    continue
-                enc_out = self._compute_survivors(batch)
-                survivors = enc_out.survivor_embeddings
-                with torch.autocast(
-                    "cuda", dtype=torch.bfloat16,
-                    enabled=self.device.type == "cuda",
-                ):
-                    loss_p = self._decoder_forward_packed(batch, enc_out)
-                    loss_z = self._decoder_forward_packed(
-                        batch, enc_out,
-                        survivors_override=_modify_survivors(
-                            survivors, AblationCondition.SURVIVORS_ZEROED,
-                        ),
-                    )
-                    loss_n = self._decoder_forward_packed(
-                        batch, enc_out,
-                        survivors_override=_modify_survivors(
-                            survivors, AblationCondition.SURVIVORS_NOISE,
-                        ),
-                    )
-                l_present += float(loss_p.item()) * bt
-                l_zeroed += float(loss_z.item()) * bt
-                l_noise += float(loss_n.item()) * bt
-                total_tokens += bt
-                enc_out.release()
-            return l_present, l_zeroed, l_noise, total_tokens
-
-        out: dict[str, float] = {}
-
-        # Reconstruction-side ablation (uses self.eval_dataloader).
-        try:
-            lp, lz, ln, tt = _accum_two_conditions(self.eval_dataloader)
-            if tt > 0:
-                lp /= tt; lz /= tt; ln /= tt
-                out["ablation/loss_present"] = lp
-                out["ablation/loss_zeroed"] = lz
-                out["ablation/loss_noise"] = ln
-                out["ablation/gap_zeroed"] = lz - lp
-                out["ablation/gap_noise"] = ln - lp
-        except Exception as exc:
-            logger.warning(
-                "ablation_recon_failed",
-                error=str(exc),
-                exc_type=type(exc).__name__,
-            )
-
-        # QA-side ablation (the signal step 4 trains for).
-        if qa_eval_loader is not None:
-            try:
-                lp, lz, ln, tt = _accum_two_conditions(qa_eval_loader)
-                if tt > 0:
-                    lp /= tt; lz /= tt; ln /= tt
-                    out["ablation/qa_loss_present"] = lp
-                    out["ablation/qa_loss_zeroed"] = lz
-                    out["ablation/qa_loss_noise"] = ln
-                    out["ablation/qa_gap_zeroed"] = lz - lp
-                    out["ablation/qa_gap_noise"] = ln - lp
-            except Exception as exc:
-                logger.warning(
-                    "ablation_qa_failed",
-                    error=str(exc),
-                    exc_type=type(exc).__name__,
-                )
-
-        return out
 
     @torch.no_grad()
     def _run_generation_eval(self) -> dict[str, float]:
@@ -1983,7 +1786,7 @@ class DecoderInitTrainer(BaseTrainer):
         if all_survivors:
             combined_survivors = torch.cat(all_survivors, dim=0)
             token_emb = (
-                self.encoder.compressor.backbone.get_input_embeddings().weight.detach()
+                self.encoder.l0.backbone.get_input_embeddings().weight.detach()
             )
             health = embedding_drift_metrics(combined_survivors, token_emb)
             gen_metrics["mean_max_cosine_sim"] = health["mean_max_cosine_sim"]
@@ -2023,7 +1826,7 @@ class DecoderInitTrainer(BaseTrainer):
             state_l0 = getattr(self, "_surv_state_l0", None)
             if state_l0 is not None:
                 update_metrics = apply_post_step_updates(
-                    self.encoder.compressor,
+                    self.encoder,
                     state_l0,
                     target_ratio=None,
                     level="l0",
@@ -2157,12 +1960,7 @@ class DecoderInitTrainer(BaseTrainer):
             raise ValueError(
                 f"Resume checkpoint missing 'encoder' key. Found: {list(state_dicts.keys())}"
             )
-        from bgkit.models.encoder import migrate_legacy_threshold_controller_state_dict
-
-        enc_state = migrate_legacy_threshold_controller_state_dict(
-            state_dicts["encoder"],
-            self.encoder,
-        )
+        enc_state = state_dicts["encoder"]
         result = self.encoder.load_state_dict(enc_state, strict=False)
         if result.missing_keys:
             logger.info(

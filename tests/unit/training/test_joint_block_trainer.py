@@ -13,8 +13,10 @@ torch = pytest.importorskip("torch")
 
 from torch import nn
 
-from bgkit.models.bgkit_compressor import BgKITCompressor
+import copy
+
 from bgkit.models.encoder import BgKITEncoder, _resolve_layers
+from bgkit.models.level_compressor import LevelCompressor
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.training.joint_block_trainer import JointBlockTrainer, joint_block_collate_fn
 
@@ -125,10 +127,23 @@ class MockRotaryEmb(nn.Module):
 
 
 def _make_encoder(hidden_dim: int = 64, num_layers: int = 3) -> BgKITEncoder:
-    backbone = MockBackbone(vocab_size=1000, hidden_dim=hidden_dim, num_layers=num_layers)
-    compressor_norm = nn.LayerNorm(hidden_dim)
-    compressor = BgKITCompressor(
-        backbone, compressor_norm, hidden_dim=hidden_dim, survivorship_inner_dim=8
+    backbone_l0 = MockBackbone(vocab_size=1000, hidden_dim=hidden_dim, num_layers=num_layers)
+    backbone_l1 = copy.deepcopy(backbone_l0)
+    backbone_l1.embed_tokens = nn.Identity()
+
+    l0 = LevelCompressor(
+        backbone=backbone_l0,
+        hidden_dim=hidden_dim,
+        survivorship_inner_dim=8,
+        with_prompt=True,
+        with_auto_repro=True,
+    )
+    l1 = LevelCompressor(
+        backbone=backbone_l1,
+        hidden_dim=hidden_dim,
+        survivorship_inner_dim=8,
+        with_prompt=False,
+        with_auto_repro=False,
     )
 
     proj_layer = MockTransformerLayer(hidden_dim)
@@ -136,7 +151,7 @@ def _make_encoder(hidden_dim: int = 64, num_layers: int = 3) -> BgKITEncoder:
     rotary = MockRotaryEmb(hidden_dim)
     projection_block = ProjectionBlock(proj_layer, proj_norm, rotary, hidden_dim=hidden_dim)
 
-    return BgKITEncoder(compressor, projection_block)
+    return BgKITEncoder(l0, l1, projection_block)
 
 
 # ---------------------------------------------------------------------------
@@ -179,13 +194,13 @@ def trainer():
     # Freeze everything, then unfreeze targets
     t.encoder.requires_grad_(False)
 
-    # Unfreeze penultimate layer (last in compressor backbone)
-    compressor_layers = _resolve_layers(t.encoder.compressor.backbone)
-    compressor_layers[-1].requires_grad_(True)
+    # Unfreeze penultimate layer (last in L0 backbone)
+    l0_layers = _resolve_layers(t.encoder.l0.backbone)
+    l0_layers[-1].requires_grad_(True)
 
-    # Unfreeze compressor norm + auto_repro_head + projection block
-    t.encoder.compressor.norm.requires_grad_(True)
-    t.encoder.compressor.auto_repro_head.requires_grad_(True)
+    # Unfreeze L0 backbone norm + auto_repro_head + projection block
+    t.encoder.l0.backbone.norm.requires_grad_(True)
+    t.encoder.l0.auto_repro_head.requires_grad_(True)
     t.encoder.projection_block.requires_grad_(True)
 
     trainable_params = [p for p in t.encoder.parameters() if p.requires_grad]
@@ -256,34 +271,35 @@ class TestJointBlockTrainStep:
 class TestJointBlockFreeze:
     def test_only_target_components_unfrozen(self, trainer):
         """Only penultimate layer, norm, auto_repro_head, and projection block trainable."""
-        # Compressor embedding should be frozen
-        for p in trainer.encoder.compressor.backbone.embed_tokens.parameters():
+        # L0 embedding should be frozen
+        for p in trainer.encoder.l0.backbone.embed_tokens.parameters():
             assert not p.requires_grad, "Embedding should be frozen"
 
         # Earlier layers should be frozen
-        compressor_layers = _resolve_layers(trainer.encoder.compressor.backbone)
-        for i in range(len(compressor_layers) - 1):
-            for p in compressor_layers[i].parameters():
+        l0_layers = _resolve_layers(trainer.encoder.l0.backbone)
+        for i in range(len(l0_layers) - 1):
+            for p in l0_layers[i].parameters():
                 assert not p.requires_grad, f"Layer {i} should be frozen"
 
-        # Penultimate layer (last in compressor) should be unfrozen
-        for p in compressor_layers[-1].parameters():
+        # Penultimate layer (last in L0 backbone) should be unfrozen
+        for p in l0_layers[-1].parameters():
             assert p.requires_grad, "Penultimate layer should be trainable"
 
-        # Compressor norm should be unfrozen
-        for p in trainer.encoder.compressor.norm.parameters():
-            assert p.requires_grad, "Compressor norm should be trainable"
+        # L0 backbone norm should be unfrozen
+        for p in trainer.encoder.l0.backbone.norm.parameters():
+            assert p.requires_grad, "L0 backbone norm should be trainable"
 
         # Auto-repro head should be unfrozen
-        for p in trainer.encoder.compressor.auto_repro_head.parameters():
+        for p in trainer.encoder.l0.auto_repro_head.parameters():
             assert p.requires_grad, "Auto-repro head should be trainable"
 
         # Projection block should be unfrozen
         for p in trainer.encoder.projection_block.parameters():
             assert p.requires_grad, "Projection block should be trainable"
 
-        # Survive embedding should be frozen
-        assert not trainer.encoder.compressor.survive_embedding.requires_grad
+        # Head should be frozen (joint-block pretraining doesn't train heads)
+        for p in trainer.encoder.l0.head.parameters():
+            assert not p.requires_grad, "L0 head should be frozen"
 
 
 # ---------------------------------------------------------------------------

@@ -23,9 +23,11 @@ from pathlib import Path
 
 from torch import nn
 
-from bgkit.models.bgkit_compressor import BgKITCompressor
+import copy
+
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
+from bgkit.models.level_compressor import LevelCompressor
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
@@ -192,10 +194,23 @@ class MockCausalLMBackbone(nn.Module):
 
 
 def _make_mock_encoder(hidden_dim: int = 64) -> BgKITEncoder:
-    backbone = MockEncoderBackbone(hidden_dim=hidden_dim)
-    compressor_norm = nn.LayerNorm(hidden_dim)
-    compressor = BgKITCompressor(
-        backbone, compressor_norm, hidden_dim=hidden_dim, survivorship_inner_dim=8,
+    backbone_l0 = MockEncoderBackbone(hidden_dim=hidden_dim)
+    backbone_l1 = copy.deepcopy(backbone_l0)
+    backbone_l1.embed_tokens = nn.Identity()
+
+    l0 = LevelCompressor(
+        backbone=backbone_l0,
+        hidden_dim=hidden_dim,
+        survivorship_inner_dim=8,
+        with_prompt=True,
+        with_auto_repro=True,
+    )
+    l1 = LevelCompressor(
+        backbone=backbone_l1,
+        hidden_dim=hidden_dim,
+        survivorship_inner_dim=8,
+        with_prompt=False,
+        with_auto_repro=False,
     )
 
     proj_layer = MockTransformerLayer(hidden_dim)
@@ -203,7 +218,7 @@ def _make_mock_encoder(hidden_dim: int = 64) -> BgKITEncoder:
     rotary = MockRotaryEmb(hidden_dim)
     projection_block = ProjectionBlock(proj_layer, proj_norm, rotary, hidden_dim=hidden_dim)
 
-    return BgKITEncoder(compressor, projection_block)
+    return BgKITEncoder(l0, l1, projection_block)
 
 
 # ---------------------------------------------------------------------------
@@ -423,8 +438,10 @@ class TestDecoderInitTrainStep:
         )
         assert has_dec_grad
 
-        # Encoder compressor params are frozen — no grads.
-        for p in trainer.encoder.compressor.parameters():
+        # Encoder L0 (and L1) backbone params are frozen — no grads.
+        for p in trainer.encoder.l0.parameters():
+            assert p.grad is None or p.grad.abs().sum().item() == 0.0
+        for p in trainer.encoder.l1.parameters():
             assert p.grad is None or p.grad.abs().sum().item() == 0.0
 
     def test_loss_only_on_masked_region(self, trainer):

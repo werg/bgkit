@@ -1,42 +1,38 @@
-"""BgKIT encoder: compressor (layers 0..N-2) + projection block (layer N-1).
+"""BgKIT encoder: two independent ``LevelCompressor`` stages + projection block.
 
-Packed FA4 form. Orchestrates the full encoding pipeline from input
-embeddings to projected output embeddings. All inputs and outputs are flat
-packed tensors — no padding, no ``attention_mask``.
+Packed FA4 form. The L0 compressor consumes raw content embeddings (with an
+optional prompt prefix), runs its own complete backbone, fires a survivorship
+head on the post-norm last-block hidden states, and emits survivor embeddings.
+Those survivors are projected back into input-embedding space by L0's
+``auto_repro_head`` (the L0→L1 bridge — pretrained during Joint Block Pretrain
+and kept trainable downstream) and fed to L1's independent backbone for a
+second compression pass. The final survivor embeddings (from L1 when active,
+otherwise from L0) flow through the shared ``projection_block`` into the
+decoder's embedding space.
 
-The compressor builds a combined ``[prompt_i | sep | content_i]`` pack per
-sample and runs the bulk of transformer layers to produce dense hidden
-states. The projection block (a single transformer layer) performs
-context-aware projection into the decoder's embedding space and
-flat-slices surviving content positions.
-
-For Qwen3.5-0.8B backbones, the model is wrapped in BidirectionalQwen35
-(or PrunedBidirectionalQwen35) to make full-attention layers bidirectional
-while keeping DeltaNet layers causal over segment boundaries.
+L1's backbone is initialized at construction by deep-copying L0's backbone
+state, then evolves independently. L1 has no ``embed_tokens`` (its input is
+always survivor embeddings), no prompt support, and no ``auto_repro_head``
+(one bridge per pair, on the L0 side).
 """
 
 from __future__ import annotations
 
-import contextlib
-from copy import deepcopy
+import copy
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 
-from bgkit.models.bgkit_compressor import BgKITCompressor, CompressionOutput
 from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
+from bgkit.models.level_compressor import LevelCompressor, LevelOutput
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
 from bgkit.utils.attention_backend import resolve_attention_implementation
-
-
-@contextlib.contextmanager
-def _null_ctx():
-    yield
+from bgkit.utils.packing import lengths_from_cu, position_ids_from_cu
 
 
 def _resolve_layers(backbone: nn.Module) -> nn.ModuleList:
-    """Find the transformer layer list across HF model variants."""
     for attr in ("layers", "encoder.layers", "transformer.h"):
         obj = backbone
         for part in attr.split("."):
@@ -71,8 +67,7 @@ def _is_qwen35_model(model: nn.Module) -> bool:
     config = getattr(model, "config", None)
     if config is None:
         return False
-    model_type = getattr(config, "model_type", "")
-    return "qwen3_5" in model_type.lower()
+    return "qwen3_5" in getattr(config, "model_type", "").lower()
 
 
 def _extract_text_model(model: nn.Module) -> nn.Module:
@@ -82,83 +77,69 @@ def _extract_text_model(model: nn.Module) -> nn.Module:
     return model
 
 
-def _set_norm_to_identity(backbone: nn.Module) -> None:
-    for attr in ("norm", "ln_f", "final_layer_norm"):
-        if hasattr(backbone, attr):
-            setattr(backbone, attr, nn.Identity())
-            return
-    raise ValueError(f"Cannot find final norm to replace in {type(backbone).__name__}.")
+def _strip_embed_tokens(backbone: nn.Module) -> None:
+    """Replace L1's embed_tokens with nn.Identity — L1 never embeds raw tokens."""
+    if hasattr(backbone, "embed_tokens"):
+        backbone.embed_tokens = nn.Identity()
 
 
 def is_pruned_encoder_state_dict(state_dict: dict) -> bool:
-    """Detect whether an encoder state dict came from a pruned backbone."""
-    return any(k.startswith("compressor.backbone.blocks.") for k in state_dict)
+    """Detect whether an encoder state dict came from a pruned backbone.
 
-
-def migrate_legacy_threshold_controller_state_dict(
-    state_dict: dict,
-    encoder: "BgKITEncoder",
-) -> dict:
-    """Expand legacy scalar-threshold controller state into curve anchors.
-
-    Older checkpoints stored:
-
-    - ``compressor.threshold_l{0,1}.theta_param`` (scalar)
-    - ``compressor.threshold_l{0,1}._velocity`` (scalar)
-
-    The threshold-curve controller now stores anchor vectors. When loading an
-    old checkpoint, replicate the scalar threshold / velocity across every
-    anchor so resume keeps the operating point instead of silently
-    reinitializing the controller.
+    Handles both the new ``l0.backbone.blocks.`` layout and the legacy
+    ``compressor.backbone.blocks.`` layout.
     """
-    migrated = dict(state_dict)
-    for level in ("l0", "l1"):
-        controller = getattr(encoder.compressor, f"threshold_{level}", None)
-        if controller is None:
-            continue
-        prefix = f"compressor.threshold_{level}"
-        anchor_key = f"{prefix}.anchor_thetas"
-        velocity_key = f"{prefix}._anchor_velocity"
-        last_target_key = f"{prefix}._last_target_rate"
-        legacy_theta_key = f"{prefix}.theta_param"
-        legacy_velocity_key = f"{prefix}._velocity"
+    return any(
+        k.startswith("l0.backbone.blocks.")
+        or k.startswith("compressor.backbone.blocks.")
+        for k in state_dict
+    )
 
-        if anchor_key not in migrated and legacy_theta_key in migrated:
-            legacy_theta = migrated.pop(legacy_theta_key)
-            theta_value = float(
-                legacy_theta.item() if hasattr(legacy_theta, "item") else legacy_theta
-            )
-            migrated[anchor_key] = torch.full_like(
-                controller.anchor_thetas,
-                theta_value,
-            ).cpu()
 
-        if velocity_key not in migrated and legacy_velocity_key in migrated:
-            legacy_velocity = migrated.pop(legacy_velocity_key)
-            velocity_value = float(
-                legacy_velocity.item() if hasattr(legacy_velocity, "item") else legacy_velocity
-            )
-            migrated[velocity_key] = torch.full_like(
-                controller._anchor_velocity,
-                velocity_value,
-            ).cpu()
+@dataclass
+class EncoderOutput:
+    """Final encoder output.
 
-        if last_target_key not in migrated:
-            migrated[last_target_key] = controller._last_target_rate.detach().cpu().clone()
+    ``survivor_embeddings`` are the projected survivor embeddings ready for
+    the decoder. ``l0`` and ``l1`` carry the per-level diagnostic / loss
+    surface (head logits, threshold, utility-grad capture, etc.). When the
+    encoder runs L0-only (``target_ratio_l1 is None``), ``l1`` is ``None``.
+    """
 
-    return migrated
+    survivor_embeddings: torch.Tensor
+    survivor_cu_seqlens: torch.Tensor
+    survivor_counts: torch.Tensor
+
+    l0: LevelOutput
+    l1: LevelOutput | None = None
+
+    def release(self) -> None:
+        if self.l0 is not None:
+            self.l0.release()
+        if self.l1 is not None:
+            self.l1.release()
+        self.survivor_embeddings = None
+        self.survivor_cu_seqlens = None
+        self.survivor_counts = None
+
+
+def _max_from_cu(cu_seqlens: torch.Tensor) -> int:
+    lengths = lengths_from_cu(cu_seqlens).to(torch.int64)
+    return int(lengths.max().item()) if lengths.numel() else 0
 
 
 class BgKITEncoder(nn.Module):
-    """Full BgKIT encoder: compressor + projection block (packed)."""
+    """L0 compressor + L1 compressor + projection block (packed)."""
 
     def __init__(
         self,
-        compressor: BgKITCompressor,
+        l0: LevelCompressor,
+        l1: LevelCompressor,
         projection_block: ProjectionBlock,
     ):
         super().__init__()
-        self.compressor = compressor
+        self.l0 = l0
+        self.l1 = l1
         self.projection_block = projection_block
 
     def forward(
@@ -170,133 +151,72 @@ class BgKITEncoder(nn.Module):
         prompt_cu_seqlens: torch.Tensor | None = None,
         prompt_position_ids: torch.Tensor | None = None,
         pinned_positions: torch.Tensor | None = None,
-        target_ratio: float | None = None,
-        level: str | None = None,
-        min_per_sample: int = 0,
-        utility_grad_active: bool = False,
-        utility_grad_capture: dict | None = None,
-    ) -> CompressionOutput:
-        """Run the full encoder: compressor then projection block (packed).
-
-        Args:
-            content_embeddings: ``(N_content, D)`` flat content embeddings.
-            content_cu_seqlens: ``(B+1,)`` int32.
-            content_position_ids: ``(N_content,)`` int64.
-            prompt_embeddings: optional ``(N_prompt, D)`` — with matching
-                ``prompt_cu_seqlens`` and ``prompt_position_ids``.
-            pinned_positions: ``(N_content,)`` bool — content positions that
-                MUST survive. OR'd into the hard mask.
-            target_ratio: sentinel for whether compression is active. When
-                None (or ≥ 0.999) the head/operator are skipped.
-            level: ``"l0"`` or ``"l1"`` (defaults to ``"l0"`` when compression
-                is active and ``level`` is None).
-            min_per_sample: per-sample floor for the operator (warmup only).
-            utility_grad_active / utility_grad_capture: see compressor.
-
-        Returns:
-            :class:`CompressionOutput` with flat projected embeddings,
-            survivor segmentation, and head outputs.
-        """
-        from bgkit.models.lora_encoder import LoRARouter
-
-        router = LoRARouter.get()
-        lora_ctx = router.active(level) if router is not None else _null_ctx()
-        with lora_ctx:
-            comp_out = self.compressor(
-                content_embeddings,
-                content_cu_seqlens=content_cu_seqlens,
-                content_position_ids=content_position_ids,
-                prompt_embeddings=prompt_embeddings,
-                prompt_cu_seqlens=prompt_cu_seqlens,
-                prompt_position_ids=prompt_position_ids,
-                pinned_positions=pinned_positions,
-                target_ratio=target_ratio,
-                level=level or "l0",
-                min_per_sample=min_per_sample,
-                utility_grad_active=utility_grad_active,
-                utility_grad_capture=utility_grad_capture,
-            )
-
-            # Projection block sees the full combined sequence. It is
-            # bidirectional so the prompt context is preserved in the
-            # final projection.
-            full_raw = comp_out.raw_embeddings  # (N_total, D)
-            combined_cu = comp_out.combined_cu_seqlens
-            combined_pos = comp_out.combined_position_ids
-            combined_max = comp_out.combined_max_seqlen
-            content_mask_combined = comp_out.content_position_mask  # (N_total,)
-            content_cu = comp_out.content_cu_seqlens
-            survivor_mask_content = comp_out.survivor_mask  # (N_content,) or None
-
-            if survivor_mask_content is not None:
-                # Map the content-only survivor mask into the combined pack.
-                survivor_mask_combined = torch.zeros_like(content_mask_combined)
-                content_indices = torch.nonzero(
-                    content_mask_combined,
-                    as_tuple=False,
-                ).squeeze(-1)
-                survivor_mask_combined[content_indices] = survivor_mask_content
-            else:
-                survivor_mask_combined = None
-
-            proj_out = self.projection_block(
-                full_raw,
-                cu_seqlens=combined_cu,
-                max_seqlen=combined_max,
-                position_ids=combined_pos,
-                survivor_mask=survivor_mask_combined,
-            )
-
-        # Build the public CompressionOutput.
-        if survivor_mask_content is None:
-            # No compression: slice projected to content-only positions, and
-            # recompute survivor_cu_seqlens from content_cu_seqlens.
-            content_proj = proj_out.projected_embeddings[content_mask_combined]
-            survivor_cu = content_cu
-            # Per-sample counts are the content lengths.
-            from bgkit.utils.packing import lengths_from_cu
-
-            survivor_counts = lengths_from_cu(content_cu).to(torch.int64)
-        else:
-            # Compression: projection block already extracted survivors (content-only).
-            content_proj = proj_out.projected_embeddings
-            survivor_cu = proj_out.survivor_cu_seqlens
-            survivor_counts = proj_out.survivor_counts
-
-        # Content-only normed embeddings for auto-repro.
-        content_normed = comp_out.normed_embeddings[content_mask_combined]
-
-        out = CompressionOutput(
-            survivor_embeddings=content_proj,
-            all_embeddings=content_normed,
-            survivor_cu_seqlens=survivor_cu,
-            survivor_counts=survivor_counts,
-            content_cu_seqlens=content_cu,
-            survivor_mask=survivor_mask_content,
-            head_logits=comp_out.head_logits,
-            survive_probs=comp_out.survive_probs,
-            base_raw=comp_out.base_raw,
-            logits_for_op=comp_out.logits_for_op,
-            survive_probs_metrics=comp_out.survive_probs_metrics,
-            base_raw_for_util=comp_out.base_raw_for_util,
-            post_head_content_values=comp_out.post_head_content_values,
-            valid_count=comp_out.valid_count,
-            organic_count=comp_out.organic_count,
-            controllable_count=comp_out.controllable_count,
-            floor_trigger_rate=comp_out.floor_trigger_rate,
-            num_pinned=comp_out.num_pinned,
-            organic_rate_std=comp_out.organic_rate_std,
-            undecided_fraction=comp_out.undecided_fraction,
-            theta_tensor=comp_out.theta_tensor,
+        target_ratio_l0: float | None = None,
+        target_ratio_l1: float | None = None,
+        min_per_sample_l0: int = 0,
+        min_per_sample_l1: int = 0,
+        utility_grad_active_l0: bool = False,
+        utility_grad_capture_l0: dict | None = None,
+        utility_grad_active_l1: bool = False,
+        utility_grad_capture_l1: dict | None = None,
+    ) -> EncoderOutput:
+        l0_out = self.l0(
+            content_embeddings=content_embeddings,
+            content_cu_seqlens=content_cu_seqlens,
+            content_position_ids=content_position_ids,
+            prompt_embeddings=prompt_embeddings,
+            prompt_cu_seqlens=prompt_cu_seqlens,
+            prompt_position_ids=prompt_position_ids,
+            pinned_positions=pinned_positions,
+            target_ratio=target_ratio_l0,
+            min_per_sample=min_per_sample_l0,
+            utility_grad_active=utility_grad_active_l0,
+            utility_grad_capture=utility_grad_capture_l0,
         )
-        hook_state = getattr(comp_out, "_utility_grad_state", None)
-        if hook_state is not None:
-            out._utility_grad_state = hook_state  # type: ignore[attr-defined]
-        return out
 
-    def auto_reproduce(self, normed_embeddings: torch.Tensor) -> torch.Tensor:
-        """Map normed embeddings back to input embedding space."""
-        return self.compressor.auto_reproduce(normed_embeddings)
+        if target_ratio_l1 is None:
+            proj_input = l0_out.survivor_embeddings
+            proj_cu = l0_out.survivor_cu_seqlens
+            l1_out: LevelOutput | None = None
+        else:
+            l1_input = self.l0.auto_reproduce(l0_out.survivor_embeddings)
+            l1_pos = position_ids_from_cu(
+                l0_out.survivor_cu_seqlens,
+                l1_input.shape[0],
+            )
+            l1_out = self.l1(
+                content_embeddings=l1_input,
+                content_cu_seqlens=l0_out.survivor_cu_seqlens,
+                content_position_ids=l1_pos,
+                target_ratio=target_ratio_l1,
+                min_per_sample=min_per_sample_l1,
+                utility_grad_active=utility_grad_active_l1,
+                utility_grad_capture=utility_grad_capture_l1,
+            )
+            proj_input = l1_out.survivor_embeddings
+            proj_cu = l1_out.survivor_cu_seqlens
+
+        proj_max = _max_from_cu(proj_cu)
+        proj_pos = position_ids_from_cu(proj_cu, proj_input.shape[0])
+        proj_out = self.projection_block(
+            proj_input,
+            cu_seqlens=proj_cu,
+            max_seqlen=proj_max,
+            position_ids=proj_pos,
+            survivor_mask=None,
+        )
+
+        counts = proj_out.survivor_counts
+        if counts is None:
+            counts = lengths_from_cu(proj_cu).to(torch.int64)
+
+        return EncoderOutput(
+            survivor_embeddings=proj_out.projected_embeddings,
+            survivor_cu_seqlens=proj_cu,
+            survivor_counts=counts,
+            l0=l0_out,
+            l1=l1_out,
+        )
 
     def step_bidi_warmup(self) -> None:
         for module in self.modules():
@@ -318,7 +238,6 @@ class BgKITEncoder(nn.Module):
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
     ) -> BgKITEncoder:
-        """Construct a BgKITEncoder from a pretrained HF model."""
         if isinstance(backbone_name_or_module, str):
             from transformers import AutoModel
 
@@ -349,29 +268,37 @@ class BgKITEncoder(nn.Module):
             )
 
         if not isinstance(raw_model, BidirectionalQwen35) and _is_qwen35_model(raw_model):
-            backbone = BidirectionalQwen35(raw_model, bidi_warmup_steps=bidi_warmup_steps)
+            backbone_l0 = BidirectionalQwen35(raw_model, bidi_warmup_steps=bidi_warmup_steps)
         else:
-            backbone = raw_model
+            backbone_l0 = raw_model
 
-        layers = _resolve_layers(backbone)
+        layers = _resolve_layers(backbone_l0)
         projection_layer = layers[-1]
         del layers[-1]
 
-        rotary_emb = _resolve_rotary_emb(backbone)
-        original_norm = _resolve_final_norm(backbone)
-        projection_norm = deepcopy(original_norm)
-        compressor_norm = deepcopy(original_norm)
+        rotary_emb = _resolve_rotary_emb(backbone_l0)
+        original_norm = _resolve_final_norm(backbone_l0)
+        projection_norm = copy.deepcopy(original_norm)
 
-        _set_norm_to_identity(backbone)
+        backbone_l1 = copy.deepcopy(backbone_l0)
+        _strip_embed_tokens(backbone_l1)
 
-        compressor = BgKITCompressor(
-            backbone,
-            compressor_norm,
+        l0 = LevelCompressor(
+            backbone=backbone_l0,
             hidden_dim=hidden_dim,
             survivorship_inner_dim=survivorship_inner_dim,
             threshold_controller_cfg=threshold_controller_cfg,
+            with_prompt=True,
+            with_auto_repro=True,
         )
-
+        l1 = LevelCompressor(
+            backbone=backbone_l1,
+            hidden_dim=hidden_dim,
+            survivorship_inner_dim=survivorship_inner_dim,
+            threshold_controller_cfg=threshold_controller_cfg,
+            with_prompt=False,
+            with_auto_repro=False,
+        )
         projection_block = ProjectionBlock(
             projection_layer,
             projection_norm,
@@ -379,7 +306,7 @@ class BgKITEncoder(nn.Module):
             hidden_dim=hidden_dim,
         )
 
-        encoder = cls(compressor, projection_block)
+        encoder = cls(l0, l1, projection_block)
         encoder.to(dtype=torch_dtype)
         return encoder
 
@@ -400,23 +327,32 @@ class BgKITEncoder(nn.Module):
 
         rotary_emb = _resolve_rotary_emb(text_model)
         original_norm = _resolve_final_norm(text_model)
-        projection_norm = deepcopy(original_norm)
-        compressor_norm = deepcopy(original_norm)
+        projection_norm = copy.deepcopy(original_norm)
 
-        pruned_backbone = PrunedBidirectionalQwen35.from_text_model(
+        backbone_l0 = PrunedBidirectionalQwen35.from_text_model(
             text_model,
             hidden_dim=hidden_dim,
             conv_kernel_size=conv_kernel_size,
             bidi_warmup_steps=bidi_warmup_steps,
-            norm_override=nn.Identity(),
         )
+        backbone_l1 = copy.deepcopy(backbone_l0)
+        _strip_embed_tokens(backbone_l1)
 
-        compressor = BgKITCompressor(
-            pruned_backbone,
-            compressor_norm,
+        l0 = LevelCompressor(
+            backbone=backbone_l0,
             hidden_dim=hidden_dim,
             survivorship_inner_dim=survivorship_inner_dim,
             threshold_controller_cfg=threshold_controller_cfg,
+            with_prompt=True,
+            with_auto_repro=True,
+        )
+        l1 = LevelCompressor(
+            backbone=backbone_l1,
+            hidden_dim=hidden_dim,
+            survivorship_inner_dim=survivorship_inner_dim,
+            threshold_controller_cfg=threshold_controller_cfg,
+            with_prompt=False,
+            with_auto_repro=False,
         )
         projection_block = ProjectionBlock(
             projection_layer,
@@ -425,7 +361,7 @@ class BgKITEncoder(nn.Module):
             hidden_dim=hidden_dim,
         )
 
-        encoder = cls(compressor, projection_block)
+        encoder = cls(l0, l1, projection_block)
         encoder.to(dtype=torch_dtype)
         return encoder
 
@@ -444,8 +380,78 @@ class BgKITEncoder(nn.Module):
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
     ) -> BgKITEncoder:
-        """Construct a BgKITEncoder, auto-detecting pruned architecture from state dict."""
-        pruned = is_pruned_encoder_state_dict(encoder_state_dict)
+        """Construct an encoder and load a state dict in the new split-L0/L1 layout."""
+        pruned = any(k.startswith("l0.backbone.blocks.") for k in encoder_state_dict)
+        encoder = cls.from_pretrained(
+            backbone_name_or_module,
+            hidden_dim=hidden_dim,
+            torch_dtype=torch_dtype,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            attn_implementation=attn_implementation,
+            bidi_warmup_steps=bidi_warmup_steps,
+            pruned=pruned,
+            conv_kernel_size=conv_kernel_size,
+            survivorship_inner_dim=survivorship_inner_dim,
+            threshold_controller_cfg=threshold_controller_cfg,
+        )
+        result = encoder.load_state_dict(encoder_state_dict, strict=False)
+        import logging
+
+        logger = logging.getLogger(__name__)
+        if result.missing_keys:
+            logger.info(
+                "Missing keys when loading encoder state dict: %s",
+                result.missing_keys,
+            )
+        if result.unexpected_keys:
+            logger.info(
+                "Unexpected keys when loading encoder state dict: %s",
+                result.unexpected_keys,
+            )
+        return encoder
+
+    @classmethod
+    def from_pretrained_legacy_step4_checkpoint(
+        cls,
+        backbone_name_or_module: str | nn.Module,
+        encoder_state_dict: dict,
+        hidden_dim: int = 1024,
+        torch_dtype: torch.dtype = torch.bfloat16,
+        trust_remote_code: bool = True,
+        revision: str | None = None,
+        attn_implementation: str | None = None,
+        bidi_warmup_steps: int = 0,
+        conv_kernel_size: int = 16,
+        survivorship_inner_dim: int = 256,
+        threshold_controller_cfg: dict | None = None,
+    ) -> BgKITEncoder:
+        """Migrate a legacy ``compressor.*`` Step-4 state dict into the new layout.
+
+        - ``compressor.backbone.*`` (everything but the legacy norm-Identity slot)
+          → ``l0.backbone.*`` (and deepcopy → ``l1.backbone.*``)
+        - ``compressor.norm.*`` (the real norm; legacy backbone.norm was Identity)
+          → ``l0.backbone.norm.*`` (and clone → ``l1.backbone.norm.*``)
+        - ``compressor.survive_embedding`` → DROPPED (the new architecture
+          fires the head at the last backbone block, so there are no
+          downstream layers for the survive flag to propagate to)
+        - ``compressor.prompt_separator_embedding`` → ``l0.prompt_separator_embedding``
+        - ``compressor.auto_repro_head.*`` → ``l0.auto_repro_head.*``
+        - ``compressor.head_tanh_temperature_l0`` → ``l0.head_tanh_temperature``
+        - ``compressor.head_tanh_temperature_l1`` → ``l1.head_tanh_temperature``
+        - ``compressor.threshold_l0.*`` → ``l0.threshold.*``
+        - ``compressor.threshold_l1.*`` → ``l1.threshold.*``
+        - ``compressor.head_base_l0.*`` / ``compressor.head_base_l1.*`` → DROPPED
+          (block-1 heads are incompatible with the new last-block head position).
+        - ``projection_block.*`` → unchanged.
+
+        The new ``l0.head`` / ``l1.head`` parameters stay at their constructor
+        init; a Step 5 head warmup re-trains them at the new position.
+        """
+        pruned = any(
+            k.startswith("compressor.backbone.blocks.")
+            for k in encoder_state_dict
+        )
         encoder = cls.from_pretrained(
             backbone_name_or_module,
             hidden_dim=hidden_dim,
@@ -460,55 +466,63 @@ class BgKITEncoder(nn.Module):
             threshold_controller_cfg=threshold_controller_cfg,
         )
 
-        legacy_prefixes = (
-            "compressor.ratio_embedding.",
-            "compressor.survivorship_head_l0.",
-            "compressor.survivorship_head_l1.",
-            "compressor.head_adapter_l0.",
-            "compressor.head_adapter_l1.",
-            "compressor.adapter_mean_ema_l0.",
-            "compressor.adapter_mean_ema_l1.",
-        )
-        filtered_state_dict = {
-            k: v
-            for k, v in encoder_state_dict.items()
-            if not any(k.startswith(p) for p in legacy_prefixes)
-        }
-        n_filtered = len(encoder_state_dict) - len(filtered_state_dict)
+        migrated: dict[str, torch.Tensor] = {}
+
+        for k, v in encoder_state_dict.items():
+            if k.startswith("compressor.head_base_l"):
+                continue
+            if k == "compressor.survive_embedding":
+                continue
+            if k.startswith("compressor.backbone.norm."):
+                # Legacy backbone.norm was Identity (no params).
+                continue
+            if k.startswith("compressor.backbone."):
+                tail = k[len("compressor.backbone."):]
+                migrated[f"l0.backbone.{tail}"] = v
+                migrated[f"l1.backbone.{tail}"] = v.clone()
+                continue
+            if k.startswith("compressor.norm."):
+                tail = k[len("compressor.norm."):]
+                migrated[f"l0.backbone.norm.{tail}"] = v
+                migrated[f"l1.backbone.norm.{tail}"] = v.clone()
+                continue
+            if k == "compressor.prompt_separator_embedding":
+                migrated["l0.prompt_separator_embedding"] = v
+                continue
+            if k.startswith("compressor.auto_repro_head."):
+                tail = k[len("compressor.auto_repro_head."):]
+                migrated[f"l0.auto_repro_head.{tail}"] = v
+                continue
+            if k == "compressor.head_tanh_temperature_l0":
+                migrated["l0.head_tanh_temperature"] = v
+                continue
+            if k == "compressor.head_tanh_temperature_l1":
+                migrated["l1.head_tanh_temperature"] = v
+                continue
+            if k.startswith("compressor.threshold_l0."):
+                tail = k[len("compressor.threshold_l0."):]
+                migrated[f"l0.threshold.{tail}"] = v
+                continue
+            if k.startswith("compressor.threshold_l1."):
+                tail = k[len("compressor.threshold_l1."):]
+                migrated[f"l1.threshold.{tail}"] = v
+                continue
+            if k.startswith("compressor."):
+                continue
+            migrated[k] = v
+
+        result = encoder.load_state_dict(migrated, strict=False)
         import logging
 
         logger = logging.getLogger(__name__)
-        if n_filtered > 0:
-            logger.info(
-                "filtered %d legacy ratio_embedding key(s) from encoder state dict",
-                n_filtered,
-            )
-
-        legacy_tanh_key = "compressor.head_tanh_temperature"
-        if legacy_tanh_key in filtered_state_dict:
-            legacy_value = filtered_state_dict.pop(legacy_tanh_key)
-            filtered_state_dict.setdefault(
-                "compressor.head_tanh_temperature_l0",
-                legacy_value,
-            )
-            logger.info(
-                "migrated legacy head_tanh_temperature → "
-                "head_tanh_temperature_l0 (value=%.3f); L1 buffer left at "
-                "default until trainer re-calibrates it",
-                float(legacy_value.item())
-                if hasattr(legacy_value, "item")
-                else float(legacy_value),
-            )
-
-        filtered_state_dict = migrate_legacy_threshold_controller_state_dict(
-            filtered_state_dict,
-            encoder,
-        )
-        result = encoder.load_state_dict(filtered_state_dict, strict=False)
         if result.missing_keys:
             logger.info(
-                "Missing keys when loading encoder state dict (expected for "
-                "new survivorship head / threshold controller components): %s",
+                "Missing keys after legacy Step-4 migration: %s",
                 result.missing_keys,
+            )
+        if result.unexpected_keys:
+            logger.info(
+                "Unexpected keys after legacy Step-4 migration: %s",
+                result.unexpected_keys,
             )
         return encoder

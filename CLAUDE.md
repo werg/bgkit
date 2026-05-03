@@ -114,17 +114,27 @@ Checkpoints are saved to `checkpoint_dir` (default: `./checkpoints`) with names 
 
 **Training phase pipeline**: Joint Block Pretrain → Phase 1 Steps 1-6 (compression pre-training on code; Step 3 is LoRA reconstruction with compression curriculum 0.95→0.10, Step 4 is QA-conditioned head supervision, Steps 5–6 are commit encoding / multi-objective compression) → Phase 2 (single-doc KR Steps 1-4, KB-scale KR Stages A/B/C, Track B git history, Track C user memory) → Phase 3 (agentic distillation from SWE-bench trajectories). The decoder is **Qwen3.5-0.8B throughout** — bgkit does not train any larger in-house target LLM.
 
-**Survivorship head (2026-04-16 single-head)**: Phase 1 Step 3+ and Phase 2 use a **single head per level** inside the encoder (at layer 7 / pruned block 1):
+**Encoder split (2026-05-03): two independent `LevelCompressor` instances + projection block.** Phase 1 Step 5+ and Phase 2 use a **fully split** encoder:
 
-- `head_base_l{0,1}` (name retained for checkpoint continuity; there is no "adapter" counterpart): BCE/moment-match anchor at L0; soft-attn-driven at L1.
-- Operator-facing logit: `logits_for_op = tanh(base_raw / T)` where `T` is `head_tanh_temperature`. Auto-calibrated at sidecar load so `base_raw`'s std matches T (avoids brittle hardcoded temperature). Tanh saturation at ±1 is the sole structural guard against soft-attn inflating aggregate logit mass.
-- The earlier two-head `base + (adapter_raw − μ)` composition + `AdapterMeanEMA` was removed 2026-04-16 once training stabilized after the LigerRMSNorm fix. A single head per level, trained by BCE + moment-match + soft-attn, is sufficient.
+- `encoder.l0` — `LevelCompressor`: full backbone + survivorship head + threshold controller + `auto_repro_head` (the L0→L1 bridge) + `prompt_separator_embedding`.
+- `encoder.l1` — `LevelCompressor`: independent backbone (deepcopy of L0's at construction; `embed_tokens` stripped to `nn.Identity`) + head + threshold. NO prompt separator, NO `auto_repro_head`.
+- `encoder.projection_block` — single shared projection block consumed by whichever level produces the final survivor embeddings (L1 when active, otherwise L0).
 
-Selection is `logits_for_op > θ` against a single global threshold θ owned by `DualThresholdController` and updated externally by **dual ascent** on the aggregate keep-rate against the curriculum's target compression ratio. There is **no straight-through estimator** on the hard mask — head gradient flows only via BCE + moment-match + soft-attn.
+The head fires on the **post-norm output of the last backbone block**, so the selection logits and the survivor embeddings come from the same representation. No mid-backbone hooks. Each level's `head_tanh_temperature` is calibrated separately (L0 vs L1 input distributions differ).
+
+**L0→L1 bridge (load-bearing):** L1's backbone is a deepcopy of L0's pre-trained backbone, so it expects *input-embedding-distributed* inputs. L0's last-block hidden states live in a different distribution. `encoder.l0.auto_repro_head` (pre-trained during Joint Block Pretrain to invert L0's encoding back to input-embedding space) projects L0 survivors into L1's expected input space. The bridge stays trainable in Step 5+ so it adapts as L0 evolves. **Removing it would feed L1 a foreign input distribution it cannot interpret — do not bypass.**
+
+`encoder.forward(target_ratio_l0, target_ratio_l1, ...)` runs `l0(...)` → optionally bridge through `l0.auto_repro_head(l0_out.survivor_embeddings)` → `l1(...)` → `projection_block(...)`. When `target_ratio_l1 is None`, the bridge and L1 are skipped and L0 survivors flow directly to projection. When `target_ratio_l0 is None` (or ≥0.999) the L0 head is also skipped (all positions survive at L0 — used during Step 5 head warmup).
+
+**Step 5 head warmup (configurable `head_warmup_steps: int = 300`):** at the start of Step 5, L0 and L1 backbones are frozen; only `l0.head`, `l1.head`, `l0.auto_repro_head`, `projection_block`, and decoder LoRA train at `target_ratio=1.0` (no compression) so the heads have a stable signal at the new last-block position before the compression curriculum starts.
+
+Selection per level is `logits_for_op = tanh(base_raw / head_tanh_temperature) > θ`. θ is owned by each level's `DualThresholdController` and updated externally by **dual ascent** on the aggregate keep-rate against the curriculum's target compression ratio. There is **no straight-through estimator** on the hard mask — head gradient flows only via BCE + moment-match + decisiveness + utility-grad BCE.
 
 The earlier ratio-embedding-at-layer-3 was **removed**. `target_ratio` is consumed by the operator (DualThresholdController), not by a learned embedding. See "Known limitations" below for the Phase 2 KB regression this introduces.
 
-Hard flag embeddings (survive/doomed) propagate the decision to subsequent layers for consolidation. See `configs/model/survivorship_head.yaml` and the per-level `survivorship.l{0,1}` blocks in each training config.
+The earlier `survive_embedding` flag was **removed** in the split-encoder rebuild — with the head firing at the LAST block there are no downstream backbone layers for the flag to propagate to.
+
+See `configs/model/survivorship_head.yaml` and the per-level `survivorship.l{0,1}` blocks in each training config. Legacy single-shared-backbone `BgKITCompressor` was deleted; legacy Step-4 checkpoints migrate via `BgKITEncoder.from_pretrained_legacy_step4_checkpoint(...)` (see `scripts/convert_step4_to_split_l0l1.py`).
 
 **Per-kernel Liger toggles**: `use_liger_{rmsnorm,swiglu,rope,ce}` in `configs/compute/dgx_spark.yaml`. `use_liger_rmsnorm` is **off** by default — liger-kernel 0.7.x's LigerRMSNorm silently corrupts backward on Qwen3.5 (decoder loss jumps to the LM prior). SwiGLU + RoPE + fused linear-CE remain enabled.
 
@@ -139,7 +149,7 @@ Hard flag embeddings (survive/doomed) propagate the decision to subsequent layer
 
 **Dual-ascent θ under gradient accumulation**: token-budget batching gives microbatches with variable valid/controllable counts. The trainer aggregates `(sum, count)` tuples per microbatch (via `accumulate(state, enc_out)` from `bgkit.training.survivorship_helpers`) and updates θ ONCE per optimizer step using the **true global mean** (NOT mean-of-means).
 
-**Checkpoint registry note (legacy key filters)**: `BgKITEncoder.from_pretrained_with_state_dict` filters legacy `compressor.ratio_embedding.*` (pre-2026-04), `compressor.survivorship_head_l{0,1}.*` (pre-single-head), and short-lived `compressor.head_adapter_l{0,1}.*` / `compressor.adapter_mean_ema_l{0,1}.*` (befd361-era two-head) keys before loading. Remove these filters once Step 2 is re-run under the current architecture.
+**Checkpoint registry note (split-L0/L1 layout)**: `BgKITEncoder.from_pretrained_with_state_dict` loads new-layout state dicts directly (keys like `l0.backbone.*`, `l0.head.*`, `l0.threshold.*`, `l0.auto_repro_head.*`, `l1.backbone.*`, `l1.head.*`, `l1.threshold.*`, `projection_block.*`). For one-time migration of pre-2026-05 `compressor.*` checkpoints, use `from_pretrained_legacy_step4_checkpoint` — it copies the legacy backbone into both `l0.backbone` and `l1.backbone`, preserves the legacy threshold controllers + `auto_repro_head` + tanh temperatures, and DROPS the legacy block-1 heads (`compressor.head_base_l{0,1}`) since the new heads fire at the last block and need re-training.
 
 **Known limitations**:
 - **Phase 2 KB ratio-conditioning regression** (pending separate design pass): removing the ratio embedding means the encoder backbone no longer adapts representation per ratio. For Phase 2 KB with per-query ratios in the Pareto sweep at [0.5, 0.1, 0.05, 0.02, 0.01], this likely hurts ablation numbers at extreme ratios. See `docs/survivorship_design.md §Phase 2 KB regression` for the constraint and possible mitigations.

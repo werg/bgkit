@@ -171,7 +171,7 @@ def run_ablation_suite(
             ).to(device)
             loss_mask_flat = batch["loss_mask"].to(device)
 
-            bgkit_embed = encoder.compressor.backbone.get_input_embeddings()
+            bgkit_embed = encoder.l0.backbone.get_input_embeddings()
             content_emb = bgkit_embed(content_token_ids)
             prompt_emb = bgkit_embed(prompt_ids)
 

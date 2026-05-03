@@ -135,9 +135,10 @@ class JointBlockTrainer(BaseTrainer):
         )
         self.encoder.to(device)
 
-        # Enable gradient checkpointing on the backbone to reduce memory
+        # Enable gradient checkpointing on both backbones to reduce memory
         # (essential when using torch DeltaNet fallback without fla Triton kernels)
-        enable_gradient_checkpointing(self.encoder.compressor.backbone)
+        enable_gradient_checkpointing(self.encoder.l0.backbone)
+        enable_gradient_checkpointing(self.encoder.l1.backbone)
 
         # Load decoder's embedding matrix as frozen reference target
         decoder_name = self.cfg.model.decoder.backbone_name
@@ -161,14 +162,16 @@ class JointBlockTrainer(BaseTrainer):
         heads_only = tcfg.get("heads_only", False)
         if heads_only:
             # Only train the linear projection heads
-            self.encoder.compressor.auto_repro_head.requires_grad_(True)
+            self.encoder.l0.auto_repro_head.requires_grad_(True)
             self.encoder.projection_block.projection_head.requires_grad_(True)
         else:
-            # Train heads + transformer blocks + norms
-            compressor_layers = _resolve_layers(self.encoder.compressor.backbone)
-            compressor_layers[-1].requires_grad_(True)
-            self.encoder.compressor.norm.requires_grad_(True)
-            self.encoder.compressor.auto_repro_head.requires_grad_(True)
+            # Train heads + transformer blocks + norms (L0 only — joint block
+            # pretraining does not exercise L1; L1 inherits L0's weights at the
+            # subsequent split-encoder construction).
+            l0_layers = _resolve_layers(self.encoder.l0.backbone)
+            l0_layers[-1].requires_grad_(True)
+            self.encoder.l0.backbone.norm.requires_grad_(True)
+            self.encoder.l0.auto_repro_head.requires_grad_(True)
             self.encoder.projection_block.requires_grad_(True)
 
         trainable = count_parameters(self.encoder, trainable_only=True)
@@ -299,15 +302,8 @@ class JointBlockTrainer(BaseTrainer):
         )
 
     def _get_input_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Get input embeddings from the compressor's backbone embedding layer.
-
-        Args:
-            token_ids: ``(L,)`` or ``(N,)`` int64 token IDs (flat, 1-D).
-
-        Returns:
-            ``(L, D)`` or ``(N, D)`` float embeddings.
-        """
-        return self.encoder.compressor.backbone.get_input_embeddings()(token_ids)
+        """Get input embeddings from L0's backbone embedding layer."""
+        return self.encoder.l0.backbone.get_input_embeddings()(token_ids)
 
     def _sync_epoch(self, epoch: int) -> None:
         """Propagate epoch + rotate encoder prompt if variant bank is loaded."""
@@ -406,14 +402,16 @@ class JointBlockTrainer(BaseTrainer):
             prompt_embeddings=prompt_emb,
             prompt_cu_seqlens=prompt_cu,
             prompt_position_ids=prompt_pos,
-            target_ratio=None,  # no compression in joint-block pretraining
+            target_ratio_l0=None,  # no compression in joint-block pretraining
+            target_ratio_l1=None,
         )
 
-        # auto_repro_pred: (N_content, D) — flat over all content tokens
-        auto_repro_pred = self.encoder.auto_reproduce(comp_out.all_embeddings)
+        # auto_repro_pred: (N_content, D) — flat over all content tokens.
+        # L0's content_embeddings carries the post-norm last-block hidden states.
+        auto_repro_pred = self.encoder.l0.auto_reproduce(comp_out.l0.content_embeddings)
 
         # proj_content: (N_content, D) — survivor_embeddings when no compression
-        # equals all content positions (survivor_cu_seqlens == content_cu_seqlens)
+        # equals all content positions (survivor_cu_seqlens == content_cu_seqlens).
         proj_content = comp_out.survivor_embeddings
 
         # MSE losses over flat positions — no mask needed (no padding)

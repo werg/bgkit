@@ -14,7 +14,9 @@ torch = pytest.importorskip("torch")
 from omegaconf import OmegaConf
 from torch import nn
 
-from bgkit.models.bgkit_compressor import BgKITCompressor
+import copy
+
+from bgkit.models.level_compressor import LevelCompressor
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.models.projection_block import ProjectionBlock
@@ -147,10 +149,16 @@ HIDDEN_DIM = 64
 
 
 def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
-    backbone = MockEncoderBackbone(hidden_dim=hidden_dim)
-    compressor_norm = nn.LayerNorm(hidden_dim)
-    compressor = BgKITCompressor(
-        backbone, compressor_norm, hidden_dim=hidden_dim, survivorship_inner_dim=8,
+    backbone_l0 = MockEncoderBackbone(hidden_dim=hidden_dim)
+    backbone_l1 = copy.deepcopy(backbone_l0)
+    backbone_l1.embed_tokens = nn.Identity()
+    l0 = LevelCompressor(
+        backbone=backbone_l0, hidden_dim=hidden_dim, survivorship_inner_dim=8,
+        with_prompt=True, with_auto_repro=True,
+    )
+    l1 = LevelCompressor(
+        backbone=backbone_l1, hidden_dim=hidden_dim, survivorship_inner_dim=8,
+        with_prompt=False, with_auto_repro=False,
     )
 
     proj_layer = MockTransformerLayer(hidden_dim)
@@ -158,7 +166,7 @@ def _make_mock_encoder(hidden_dim: int = HIDDEN_DIM) -> BgKITEncoder:
     rotary = MockRotaryEmb(hidden_dim)
     projection_block = ProjectionBlock(proj_layer, proj_norm, rotary, hidden_dim=hidden_dim)
 
-    return BgKITEncoder(compressor, projection_block)
+    return BgKITEncoder(l0, l1, projection_block)
 
 
 # ---------------------------------------------------------------------------
@@ -351,8 +359,10 @@ class TestProjectionBlockTrainable:
 
     def test_compressor_remains_frozen(self):
         t = _make_trainer(train_projection_block=True)
-        for name, p in t.encoder.compressor.named_parameters():
-            assert not p.requires_grad, f"compressor.{name} should be frozen"
+        for name, p in t.encoder.l0.named_parameters():
+            assert not p.requires_grad, f"l0.{name} should be frozen"
+        for name, p in t.encoder.l1.named_parameters():
+            assert not p.requires_grad, f"l1.{name} should be frozen"
 
     def test_projection_block_frozen_when_disabled(self):
         t = _make_trainer(train_projection_block=False)
@@ -661,7 +671,9 @@ class TestTrainStepWithProjection:
         t = _make_trainer(train_projection_block=True, freeze_top_layer=False)
         batch = _make_chat_repro_batch()
         t._forward_backward(batch)
-        for p in t.encoder.compressor.parameters():
+        for p in t.encoder.l0.parameters():
+            assert p.grad is None or p.grad.abs().sum().item() == 0.0
+        for p in t.encoder.l1.parameters():
             assert p.grad is None or p.grad.abs().sum().item() == 0.0
 
     def test_decoder_no_gradients_during_warmup(self):

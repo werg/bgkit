@@ -671,7 +671,7 @@ def _default_batch_to_content(batch):
 
 @torch.no_grad()
 def calibrate_head_tanh_temperature(
-    compressor,
+    encoder,
     dataloader,
     device,
     level: str,
@@ -680,39 +680,34 @@ def calibrate_head_tanh_temperature(
     batch_to_content=None,
 ) -> float | None:
     """Probe the given level's head raw-logit std and set
-    ``head_tanh_temperature_{level}`` to match.
+    ``encoder.{level}.head_tanh_temperature`` to match.
 
     The operator applies ``tanh(base_raw / T)``. When T matches
     ``base_raw``'s std, most positions land in tanh's linear region and
-    ranking is preserved. A hardcoded T is brittle to the head's init
-    scale, to sidecar-distillation hyperparameter drift, and — most
-    importantly — to the L0 vs. L1 split (L1's input distribution differs
-    from L0's, so sharing a single T under-uses L1's range).
+    ranking is preserved. Per-level calibration accommodates L1's
+    different input distribution.
 
-    Runs a fresh backbone forward with ``return_intermediates=True`` to
-    get the layer-7 tap (packed), applies the level's head to get
-    ``base_raw`` as a flat ``(N,)`` tensor, and averages std across
-    ``n_probe_batches`` batches. Clamped to ``t_floor`` to avoid a
-    vanishing T on a near-constant fresh head.
+    Runs the level's backbone forward in isolation, applies the level's
+    head to get ``base_raw`` as a flat ``(N,)`` tensor, and averages std
+    across ``n_probe_batches`` batches. Clamped to ``t_floor``.
 
-    ``batch_to_content`` lets callers whose batches aren't plain dicts
-    with ``content_token_ids`` + ``content_cu_seqlens`` plug in their
-    own extractor. The callable receives a batch and returns
-    ``(token_ids: LongTensor (N,), cu_seqlens: IntTensor (B+1,))`` or
-    ``None`` to skip that batch. Defaults to the Phase 1 dict-based
-    extractor.
+    For ``level="l0"`` we embed token ids via L0's backbone.
+    For ``level="l1"`` we feed the L0-bridge output (auto_repro_head over
+    L0 last-block hidden states) into L1's backbone.
     """
     if level not in {"l0", "l1"}:
         raise ValueError(f"Unknown level: {level!r}")
     if batch_to_content is None:
         batch_to_content = _default_batch_to_content
 
-    head, _ = compressor._heads_for_level(level)
-    backbone = compressor.backbone
+    if level == "l0":
+        lc = encoder.l0
+    else:
+        lc = encoder.l1
+    head = lc.head
     stds: list[float] = []
-    was_training = compressor.training
-    backbone.eval()
-    head.eval()
+    was_training = encoder.training
+    encoder.eval()
     try:
         probed = 0
         for batch in dataloader:
@@ -728,41 +723,45 @@ def calibrate_head_tanh_temperature(
             position_ids = position_ids_from_cu(
                 content_cu_seqlens, int(content_token_ids.shape[0])
             )
-            embed_tokens = backbone.get_input_embeddings()
+            embed_tokens = encoder.l0.backbone.get_input_embeddings()
             inputs_embeds = embed_tokens(content_token_ids)
-            backbone_out = backbone(
+            l0_out = encoder.l0.backbone(
                 inputs_embeds=inputs_embeds,
                 cu_seqlens=content_cu_seqlens,
                 max_seqlen=max_seqlen,
                 position_ids=position_ids,
-                return_intermediates=True,
             )
-            intermediates = getattr(backbone_out, "hidden_states", None)
-            if intermediates is None or len(intermediates) < 2:
-                return None
-            layer7 = intermediates[1]
-            base_raw = head(layer7.to(dtype=head.head[0].weight.dtype))
-            # Flat (N,) — every position is valid.
+            l0_hidden = l0_out.last_hidden_state  # (N, D), post-norm
+            if level == "l0":
+                target_hidden = l0_hidden
+            else:
+                bridged = encoder.l0.auto_reproduce(l0_hidden)
+                l1_out = encoder.l1.backbone(
+                    inputs_embeds=bridged,
+                    cu_seqlens=content_cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    position_ids=position_ids,
+                )
+                target_hidden = l1_out.last_hidden_state
+            base_raw = head(target_hidden.to(dtype=head.head[0].weight.dtype).unsqueeze(0)).squeeze(0)
             mean = base_raw.float().mean()
             var = (base_raw.float() - mean).pow(2).mean()
             stds.append(float(var.clamp(min=1e-8).sqrt().item()))
             probed += 1
     finally:
         if was_training:
-            backbone.train()
-            head.train()
+            encoder.train()
 
     if not stds:
         return None
     calibrated_T = max(sum(stds) / len(stds), t_floor)
-    buf = compressor._head_tanh_temperature_for_level(level)
-    buf.fill_(calibrated_T)
+    lc.head_tanh_temperature.fill_(calibrated_T)
     return calibrated_T
 
 
 @torch.no_grad()
 def apply_post_step_updates(
-    compressor,
+    encoder,
     state: MicrobatchAggState,
     target_ratio: float | None,
     level: str,
@@ -771,16 +770,14 @@ def apply_post_step_updates(
 ) -> dict[str, float]:
     """Run θ-step for the given level using true-mean aggregation.
 
-    Wraps in no_grad. Returns a logging dict.
-
-    Skips θ-step if total controllable_count == 0 across the optimizer step.
-    Use ``skip_threshold_step`` for frozen-level paths (e.g. Phase 2 Stage
-    B with cached L0).
+    Accepts the full ``BgKITEncoder`` and selects ``encoder.{level}.threshold``.
+    Wraps in no_grad. Returns a logging dict. Skips θ-step if total
+    controllable_count == 0 across the optimizer step.
     """
     if level == "l0":
-        controller = compressor.threshold_l0
+        controller = encoder.l0.threshold
     elif level == "l1":
-        controller = compressor.threshold_l1
+        controller = encoder.l1.threshold
     else:
         raise ValueError(f"Unknown level: {level!r}")
 

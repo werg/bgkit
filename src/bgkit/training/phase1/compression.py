@@ -171,7 +171,7 @@ class CompressionTrainer(BaseTrainer):
         self.encoder.requires_grad_(True)
         self.encoder.train()
         maybe_enable_gradient_checkpointing(
-            self.encoder.compressor.backbone, self.cfg,
+            self.encoder.l0.backbone, self.cfg,
         )
 
         # --- Decoder (trainable, with drift monitoring) ---
@@ -279,7 +279,7 @@ class CompressionTrainer(BaseTrainer):
         ):
             from bgkit.models.ice_teacher import ICETeacher
             ice_path = ice_cfg["checkpoint_path"]
-            embed_tokens = self.encoder.compressor.backbone.embed_tokens
+            embed_tokens = self.encoder.l0.backbone.embed_tokens
             self._ice_teacher = ICETeacher(
                 ice_path, embed_tokens,
                 input_dim=int(ice_cfg.get("input_dim", 1024)),
@@ -411,7 +411,7 @@ class CompressionTrainer(BaseTrainer):
         anchor_grid = resolve_anchor_grid(
             self.cfg.model,
             float(self._target_ratio_start),
-            getattr(self.encoder.compressor.threshold_l0, "anchor_ratios", None),
+            getattr(self.encoder.l0.threshold, "anchor_ratios", None),
         )
         self._target_ratio_sampler_cfg = build_ratio_sampler_config(
             {
@@ -476,7 +476,7 @@ class CompressionTrainer(BaseTrainer):
         )
         for level in ("l0", "l1"):
             calibrated_T = calibrate_head_tanh_temperature(
-                self.encoder.compressor,
+            self.encoder,
                 self.train_dataloader,
                 self.device,
                 level=level,
@@ -622,7 +622,7 @@ class CompressionTrainer(BaseTrainer):
             anchor_grid = resolve_anchor_grid(
                 model_cfg,
                 float(self._target_ratio_start),
-                getattr(self.encoder.compressor.threshold_l0, "anchor_ratios", None),
+                getattr(self.encoder.l0.threshold, "anchor_ratios", None),
             )
             self._target_ratio_sampler_cfg = build_ratio_sampler_config(
                 {
@@ -816,7 +816,7 @@ class CompressionTrainer(BaseTrainer):
         prompt_cu = batch["prompt_cu_seqlens"].to(device)
         prompt_position_ids = position_ids_from_cu(prompt_cu, int(prompt_ids.shape[0]))
 
-        bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+        bgkit_embed = self.encoder.l0.backbone.get_input_embeddings()
         content_emb = bgkit_embed(content_ids)
         prompt_emb = bgkit_embed(prompt_ids)
 
@@ -854,7 +854,7 @@ class CompressionTrainer(BaseTrainer):
         prompt_cu = batch["prompt_cu_seqlens"].to(device)
         prompt_position_ids = position_ids_from_cu(prompt_cu, int(prompt_ids.shape[0]))
 
-        bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+        bgkit_embed = self.encoder.l0.backbone.get_input_embeddings()
         content_emb = bgkit_embed(file_ids)
         prompt_emb = bgkit_embed(prompt_ids)
 
@@ -1359,7 +1359,7 @@ class CompressionTrainer(BaseTrainer):
             if state is None:
                 continue
             update_metrics = apply_post_step_updates(
-                self.encoder.compressor, state,
+            self.encoder, state,
                 target_ratio=None, level=level,
             )
             merged.update(update_metrics)
@@ -1710,12 +1710,7 @@ class CompressionTrainer(BaseTrainer):
 
     def _restore_model_state(self, state_dicts: dict) -> None:
         if "encoder" in state_dicts:
-            from bgkit.models.encoder import migrate_legacy_threshold_controller_state_dict
-
-            enc_state = migrate_legacy_threshold_controller_state_dict(
-                state_dicts["encoder"],
-                self.encoder,
-            )
+            enc_state = state_dicts["encoder"]
             result = self.encoder.load_state_dict(enc_state, strict=False)
             if result.missing_keys:
                 logger.info(

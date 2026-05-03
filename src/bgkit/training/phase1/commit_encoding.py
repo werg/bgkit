@@ -1148,12 +1148,7 @@ class CommitEncodingTrainer(BaseTrainer):
 
     def _restore_model_state(self, state_dicts: dict) -> None:
         if "encoder" in state_dicts:
-            from bgkit.models.encoder import migrate_legacy_threshold_controller_state_dict
-
-            enc_state = migrate_legacy_threshold_controller_state_dict(
-                state_dicts["encoder"],
-                self.encoder,
-            )
+            enc_state = state_dicts["encoder"]
             self.encoder.load_state_dict(enc_state)
         if "decoder" in state_dicts:
             self.decoder.load_state_dict(state_dicts["decoder"])

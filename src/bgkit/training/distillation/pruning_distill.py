@@ -128,7 +128,7 @@ class PruningDistillTrainer(BaseTrainer):
         # Pruning surgery: consume the BidirectionalQwen35 backbone
         conv_kernel_size = tcfg.get("conv_kernel_size", 16)
         pruned_backbone = PrunedBidirectionalQwen35.from_unpruned(
-            student_encoder_full.compressor.backbone,
+            student_encoder_full.l0.backbone,
             hidden_dim=hidden_dim,
             conv_kernel_size=conv_kernel_size,
             bidi_warmup_steps=tcfg.get("bidi_warmup_steps", 0),
@@ -139,13 +139,13 @@ class PruningDistillTrainer(BaseTrainer):
         # nn.Identity() as the norm. The pruned backbone's self.norm is Identity
         # (no-op in forward), and the compressor's self.norm is the real LayerNorm.
         # Single normalization path: backbone(Identity) -> compressor.norm(real).
-        student_encoder_full.compressor.backbone = pruned_backbone
+        student_encoder_full.l0.backbone = pruned_backbone
 
         self.student_encoder = student_encoder_full
         self.student_encoder.to(dtype=torch.bfloat16, device=device)
 
         # Enable gradient checkpointing on FullAttn layers in pruned backbone
-        enable_gradient_checkpointing(self.student_encoder.compressor.backbone)
+        enable_gradient_checkpointing(self.student_encoder.l0.backbone)
 
         # Also save the decoder state for pass-through in checkpoints
         self._decoder_state_dict = teacher_state.get("decoder", None)
@@ -319,7 +319,7 @@ class PruningDistillTrainer(BaseTrainer):
                 new_stage = i
         if new_stage >= 0:
             self._current_stage = new_stage
-            self.student_encoder.compressor.backbone.freeze_stage(new_stage)
+            self.student_encoder.l0.backbone.freeze_stage(new_stage)
             logger.info("stage_set", stage=new_stage, step=self.global_step)
 
     def _maybe_advance_stage(self) -> None:
@@ -327,7 +327,7 @@ class PruningDistillTrainer(BaseTrainer):
         for i, threshold in enumerate(self._stage_thresholds):
             if i > self._current_stage and self.global_step >= threshold:
                 self._current_stage = i
-                self.student_encoder.compressor.backbone.freeze_stage(i)
+                self.student_encoder.l0.backbone.freeze_stage(i)
 
                 # Add newly trainable params to optimizer
                 new_params = [
@@ -362,7 +362,7 @@ class PruningDistillTrainer(BaseTrainer):
     def _muon_excluded_param_ids(self) -> frozenset[int]:
         """Return param IDs of encoder embed_tokens — 2D but should not use Muon."""
         exclude = set()
-        embed = self.student_encoder.compressor.backbone.get_input_embeddings()
+        embed = self.student_encoder.l0.backbone.get_input_embeddings()
         for p in embed.parameters():
             exclude.add(id(p))
         return frozenset(exclude)
@@ -472,11 +472,11 @@ class PruningDistillTrainer(BaseTrainer):
         Both teacher and student go through the same code path; the caller
         wraps with ``torch.no_grad()`` for the teacher.
         """
-        embed = encoder.compressor.backbone.get_input_embeddings()
+        embed = encoder.l0.backbone.get_input_embeddings()
         content_emb = embed(content_token_ids)  # (N_content, D)
         prompt_emb = embed(compression_prompt_ids)  # (N_prompt, D)
 
-        comp_out = encoder.compressor(
+        comp_out = encoder.l0(
             content_emb,
             content_cu_seqlens=content_cu_seqlens,
             content_position_ids=content_position_ids,
@@ -539,7 +539,7 @@ class PruningDistillTrainer(BaseTrainer):
             teacher_normed_content = teacher_comp.normed_embeddings[
                 teacher_comp.content_position_mask
             ]
-            teacher_repro = self.teacher_encoder.compressor.auto_reproduce(
+            teacher_repro = self.teacher_encoder.l0.auto_reproduce(
                 teacher_normed_content,
             )
             # Content-only raw embeddings for cosine loss
@@ -563,7 +563,7 @@ class PruningDistillTrainer(BaseTrainer):
             student_normed_content = student_comp.normed_embeddings[
                 student_comp.content_position_mask
             ]
-            student_repro = self.student_encoder.compressor.auto_reproduce(
+            student_repro = self.student_encoder.l0.auto_reproduce(
                 student_normed_content,
             )
             # Content-only raw embeddings for cosine loss
@@ -606,10 +606,10 @@ class PruningDistillTrainer(BaseTrainer):
         self._maybe_advance_stage()
 
     def _post_optimizer_step(self, step: int) -> None:
-        self.student_encoder.compressor.backbone.step_bidi_warmup()
+        self.student_encoder.l0.backbone.step_bidi_warmup()
 
     def _add_step_metrics(self, metrics: dict[str, float]) -> None:
-        metrics["bidi_alpha"] = self.student_encoder.compressor.backbone.bidi_alpha
+        metrics["bidi_alpha"] = self.student_encoder.l0.backbone.bidi_alpha
         metrics["stage"] = self._current_stage
         metrics["trainable_params"] = sum(
             p.numel() for p in self.student_encoder.parameters() if p.requires_grad
@@ -695,7 +695,7 @@ class PruningDistillTrainer(BaseTrainer):
                 teacher_normed_content = teacher_comp.normed_embeddings[
                     teacher_comp.content_position_mask
                 ]
-                teacher_repro = self.teacher_encoder.compressor.auto_reproduce(
+                teacher_repro = self.teacher_encoder.l0.auto_reproduce(
                     teacher_normed_content,
                 )
                 teacher_content_raw = teacher_comp.raw_embeddings[
@@ -716,7 +716,7 @@ class PruningDistillTrainer(BaseTrainer):
                 student_normed_content = student_comp.normed_embeddings[
                     student_comp.content_position_mask
                 ]
-                student_repro = self.student_encoder.compressor.auto_reproduce(
+                student_repro = self.student_encoder.l0.auto_reproduce(
                     student_normed_content,
                 )
                 student_content_raw = student_comp.raw_embeddings[

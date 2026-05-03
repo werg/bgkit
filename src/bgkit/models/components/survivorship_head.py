@@ -7,7 +7,7 @@ survive logits.
 
 Two instances are used — one for L0 (within-file) and one for L1 (cross-file) —
 since they face different input distributions. The head returns raw logits; the
-caller (BgKITCompressor) applies sigmoid to get probabilities and derives hard
+caller (``LevelCompressor``) applies sigmoid to get probabilities and derives hard
 masks via p > 0.5 with optional pinned-position override.
 
 ~260K params per instance (hidden_dim=1024, inner_dim=256).
@@ -49,7 +49,7 @@ class SurvivorshipHead(nn.Module):
 
         The operator applies ``tanh(base_raw / T)`` at the composition
         level so the operator-facing logit is bounded to (-1, 1) — see
-        :class:`BgKITCompressor` hook. BCE-with-logits distillation / warmup
+        :class:`LevelCompressor.forward`. BCE-with-logits distillation / warmup
         consumes this raw output directly.
 
         Args:

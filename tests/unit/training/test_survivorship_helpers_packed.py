@@ -764,15 +764,18 @@ def test_utility_grad_bce_short_sample_forces_k_ge_1():
 # ----------------------------------------------------------------------
 
 
-class _FakeCompressor:
+class _FakeLevel:
     def __init__(self):
         from bgkit.models.components.selection import DualThresholdController
-        self.threshold_l0 = DualThresholdController(
+        self.threshold = DualThresholdController(
             init_theta=-0.5, lr=0.1, init_target_ratio=0.1, default_query_ratio=0.1,
         )
-        self.threshold_l1 = DualThresholdController(
-            init_theta=-0.5, lr=0.1, init_target_ratio=0.1, default_query_ratio=0.1,
-        )
+
+
+class _FakeCompressor:
+    def __init__(self):
+        self.l0 = _FakeLevel()
+        self.l1 = _FakeLevel()
 
 
 def test_apply_post_step_updates_uses_true_mean():
@@ -804,7 +807,7 @@ def test_apply_post_step_updates_uses_aggregated_target_ratio_when_unspecified()
 def test_apply_post_step_updates_skips_threshold_when_no_controllable():
     compressor = _FakeCompressor()
     state = init_state()
-    initial_theta = float(compressor.threshold_l0.theta.item())
+    initial_theta = float(compressor.l0.threshold.theta.item())
     metrics = apply_post_step_updates(
         compressor, state, target_ratio=0.10, level="l0",
     )
@@ -817,7 +820,7 @@ def test_apply_post_step_updates_skip_flags_for_frozen_level():
     state = init_state()
     state.organic_count_sum = 30
     state.controllable_count_sum = 100
-    initial_theta = float(compressor.threshold_l0.theta.item())
+    initial_theta = float(compressor.l0.threshold.theta.item())
     metrics = apply_post_step_updates(
         compressor, state, target_ratio=0.10, level="l0",
         skip_threshold_step=True,
@@ -830,31 +833,30 @@ def test_apply_post_step_updates_skip_flags_for_frozen_level():
 # ----------------------------------------------------------------------
 
 
-class _SimCompressor:
-    """Bare-bones compressor shim for simulating controller dynamics.
+class _SimLevel:
+    def __init__(self, init_theta: float, lr: float, clamp: float):
+        from bgkit.models.components.selection import DualThresholdController
 
-    Owns two DualThresholdControllers so ``apply_post_step_updates``
-    finds ``threshold_l0`` / ``threshold_l1``. Default clamp=1.5 lets
-    θ saturate cleanly past tanh's (−1, 1) range; tests can override.
+        self.threshold = DualThresholdController(
+            init_theta=init_theta,
+            lr=lr,
+            clamp=clamp,
+            init_target_ratio=0.5,
+            default_query_ratio=0.5,
+        )
+
+
+class _SimCompressor:
+    """Bare-bones encoder shim for simulating controller dynamics.
+
+    Owns two ``_SimLevel`` shells so ``apply_post_step_updates`` finds
+    ``encoder.l0.threshold`` / ``encoder.l1.threshold``. Default clamp=1.5
+    lets θ saturate cleanly past tanh's (−1, 1) range; tests can override.
     """
 
     def __init__(self, init_theta: float = 0.0, lr: float = 0.05, clamp: float = 1.5):
-        from bgkit.models.components.selection import DualThresholdController
-
-        self.threshold_l0 = DualThresholdController(
-            init_theta=init_theta,
-            lr=lr,
-            clamp=clamp,
-            init_target_ratio=0.5,
-            default_query_ratio=0.5,
-        )
-        self.threshold_l1 = DualThresholdController(
-            init_theta=init_theta,
-            lr=lr,
-            clamp=clamp,
-            init_target_ratio=0.5,
-            default_query_ratio=0.5,
-        )
+        self.l0 = _SimLevel(init_theta, lr, clamp)
+        self.l1 = _SimLevel(init_theta, lr, clamp)
 
 
 def _feed_rate(compressor, rate: float, N: int = 1000) -> None:
@@ -882,13 +884,13 @@ def test_dual_ascent_converges_on_static_target():
             comp = _SimCompressor(init_theta=-0.5, lr=0.05, clamp=1.5)
             N = 1000
             for _ in range(200):
-                theta = float(comp.threshold_l0.theta_for_ratio(target).item())
+                theta = float(comp.l0.threshold.theta_for_ratio(target).item())
                 rate = rate_of_theta(theta)
                 state = _feed_rate(comp, rate, N)
                 apply_post_step_updates(
                     comp, state, target_ratio=target, level="l0",
                 )
-            final_theta = float(comp.threshold_l0.theta_for_ratio(target).item())
+            final_theta = float(comp.l0.threshold.theta_for_ratio(target).item())
             final_rate = rate_of_theta(final_theta)
             assert abs(final_rate - target) < 0.02, (
                 f"target={target}: final rate={final_rate:.3f}, "
@@ -902,19 +904,19 @@ def test_dual_ascent_sign_is_correct():
     Conversely actual < target ⇒ θ falls.
     """
     comp = _SimCompressor(init_theta=0.0, lr=0.1, clamp=1.5)
-    initial_theta = float(comp.threshold_l0.theta_for_ratio(0.3).item())
+    initial_theta = float(comp.l0.threshold.theta_for_ratio(0.3).item())
 
     # actual=0.7 vs target=0.3 → gap=+0.4 → θ should rise.
     state = _feed_rate(comp, rate=0.7, N=1000)
     apply_post_step_updates(comp, state, target_ratio=0.3, level="l0")
-    after_positive_gap = float(comp.threshold_l0.theta_for_ratio(0.3).item())
+    after_positive_gap = float(comp.l0.threshold.theta_for_ratio(0.3).item())
     assert after_positive_gap > initial_theta
 
     # Reset and test the other direction.
     comp2 = _SimCompressor(init_theta=0.0, lr=0.1, clamp=1.5)
     state = _feed_rate(comp2, rate=0.1, N=1000)
     apply_post_step_updates(comp2, state, target_ratio=0.5, level="l0")
-    after_negative_gap = float(comp2.threshold_l0.theta_for_ratio(0.5).item())
+    after_negative_gap = float(comp2.l0.threshold.theta_for_ratio(0.5).item())
     assert after_negative_gap < 0.0
 
 
@@ -934,7 +936,7 @@ def test_dual_ascent_tracks_ramping_target():
     N = 1000
     for step in range(800):
         target = max(0.1, 0.5 - 0.4 * (step / 500.0))
-        theta = float(comp.threshold_l0.theta_for_ratio(target).item())
+        theta = float(comp.l0.threshold.theta_for_ratio(target).item())
         rate = rate_of_theta(theta)
         state = _feed_rate(comp, rate, N)
         apply_post_step_updates(
@@ -942,7 +944,7 @@ def test_dual_ascent_tracks_ramping_target():
         )
     # After the ramp (step ≥ 500 target is pinned at 0.1), controller
     # should have converged within tolerance.
-    final_theta = float(comp.threshold_l0.theta_for_ratio(0.1).item())
+    final_theta = float(comp.l0.threshold.theta_for_ratio(0.1).item())
     final_rate = rate_of_theta(final_theta)
     assert abs(final_rate - 0.1) < 0.05, (
         f"after-ramp rate={final_rate:.3f}, θ={final_theta:.3f}"
@@ -975,13 +977,13 @@ def test_dual_ascent_clamp_saturates_cleanly_on_infeasible_target():
     comp = _SimCompressor(init_theta=0.0, lr=0.1, clamp=1.5)
     N = 1000
     for _ in range(300):
-        theta = float(comp.threshold_l0.theta_for_ratio(0.95).item())
+        theta = float(comp.l0.threshold.theta_for_ratio(0.95).item())
         rate = rate_of_theta(theta)
         state = _feed_rate(comp, rate, N)
         apply_post_step_updates(
             comp, state, target_ratio=0.95, level="l0",
         )
-    final_theta = float(comp.threshold_l0.theta_for_ratio(0.95).item())
+    final_theta = float(comp.l0.threshold.theta_for_ratio(0.95).item())
     # θ should have saturated at the lower clamp.
     assert final_theta == pytest.approx(-1.5, abs=1e-2)
     # And the actual rate is the infeasibility ceiling (0.85), NOT 0.95.

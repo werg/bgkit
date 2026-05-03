@@ -127,7 +127,7 @@ class ProjectionRepairTrainer(BaseTrainer):
         n_unfreeze = int(tcfg.get("unfreeze_compressor_final_blocks", 0))
         self._compressor_trainable_params: list = []
         if n_unfreeze > 0:
-            backbone = self.encoder.compressor.backbone
+            backbone = self.encoder.l0.backbone
             if not hasattr(backbone, "blocks"):
                 raise ValueError(
                     "unfreeze_compressor_final_blocks requires a pruned "
@@ -371,7 +371,7 @@ class ProjectionRepairTrainer(BaseTrainer):
         prompt_cu = batch["compression_prompt_cu_seqlens"].to(device)
         from bgkit.utils.packing import position_ids_from_cu
         prompt_position_ids = position_ids_from_cu(prompt_cu, int(prompt_ids.shape[0]))
-        bgkit_embed = self.encoder.compressor.backbone.get_input_embeddings()
+        bgkit_embed = self.encoder.l0.backbone.get_input_embeddings()
         enc_out = self.encoder(
             content_embeddings=bgkit_embed(content_token_ids),
             content_cu_seqlens=content_cu,
@@ -379,9 +379,8 @@ class ProjectionRepairTrainer(BaseTrainer):
             prompt_embeddings=bgkit_embed(prompt_ids),
             prompt_cu_seqlens=prompt_cu,
             prompt_position_ids=prompt_position_ids,
-            target_ratio=None,
-            level="l0",
-            min_per_sample=0,
+            target_ratio_l0=None,
+            min_per_sample_l0=0,
         )
         return enc_out, content_token_ids, content_cu
 
@@ -604,12 +603,7 @@ class ProjectionRepairTrainer(BaseTrainer):
 
     def _restore_model_state(self, state_dicts: dict) -> None:
         if "encoder" in state_dicts:
-            from bgkit.models.encoder import migrate_legacy_threshold_controller_state_dict
-
-            enc_state = migrate_legacy_threshold_controller_state_dict(
-                state_dicts["encoder"],
-                self.encoder,
-            )
+            enc_state = state_dicts["encoder"]
             self.encoder.load_state_dict(enc_state, strict=False)
         if "decoder" in state_dicts:
             self._decoder_state_dict = state_dicts["decoder"]

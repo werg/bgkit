@@ -74,6 +74,7 @@ decoder_lora:
   dropout: 0.05
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
+# Legacy block (unused — no trainer reads it). Kept for grep compatibility.
 freeze:
   bgkit: false
   decoder: false
@@ -86,14 +87,14 @@ data:
   max_message_tokens: 256
 
 # 2026-05-03 sm_121 OOM lessons from Step 4: 32768 packed batches push
-# the unified-memory pool past the 79 GB cgroup cap during decoder
-# backward (encoder is also fully unfrozen here, more memory pressure
-# than Step 4's frozen-encoder + LoRA-decoder setup). 4096/grad_accum=16
-# gives the same 65k effective batch with much smaller per-microbatch
-# peaks. min_sample_length=256 + max_sample_length=800 bound the worst-
-# case decoder splice length to ~256 survivor tokens at target=0.20.
-max_batch_tokens: 4096
-gradient_accumulation_steps: 16
+# the unified-memory pool past the 79 GB cgroup cap. Step 5 uses bigger
+# samples than Step 4 (commit median 1262 tokens vs file recon ~700),
+# so PackedTokenBudgetSampler's quadratic budget needs more room — at
+# max_batch_tokens=4096 (budget 8M), a single max-3000-token commit
+# (L²=9M) exceeds budget and emits as singleton. 8192 raises the
+# singleton threshold to L≈5800; most commits pack normally.
+max_batch_tokens: 8192
+gradient_accumulation_steps: 8
 # Commit data has very different length distribution from QA/recon: median
 # token_length=1262, p90=4401, max=8388 (per inspect_commit_sample.py
 # 2026-05-03). max_sample_length=800 from Step 4 would drop 70%; 3000
