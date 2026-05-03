@@ -339,8 +339,7 @@ def test_encoder_packed_compressed_parity(monkeypatch):
             content_embeddings=packed_emb,
             content_cu_seqlens=cu_cuda,
             content_position_ids=pos_ids,
-            target_ratio=target_ratio,
-            level="l0",
+            target_ratio_l0=target_ratio,
         )
 
     # --- head outputs: (N_content,) <-> (B, L_max) ---
@@ -349,9 +348,9 @@ def test_encoder_packed_compressed_parity(monkeypatch):
     exp_mask = expected["survivor_mask"]  # (B, L_max) bool
     exp_counts = expected["survivor_counts"]  # (B,) int
 
-    got_base_raw_padded, _ = _unpack_to_padded(out.base_raw.cpu(), cu)
-    got_logits_padded, _ = _unpack_to_padded(out.logits_for_op.cpu(), cu)
-    got_mask_padded, _ = _unpack_to_padded(out.survivor_mask.cpu(), cu)
+    got_base_raw_padded, _ = _unpack_to_padded(out.l0.base_raw.cpu(), cu)
+    got_logits_padded, _ = _unpack_to_padded(out.l0.logits_for_op.cpu(), cu)
+    got_mask_padded, _ = _unpack_to_padded(out.l0.survivor_mask.cpu(), cu)
 
     # Compare at valid positions only.
     torch.testing.assert_close(
@@ -409,14 +408,13 @@ def test_encoder_packed_output_shapes(monkeypatch):
             content_embeddings=packed_emb,
             content_cu_seqlens=cu,
             content_position_ids=pos_ids,
-            target_ratio=None,
+            target_ratio_l0=None,
         )
         out_yes = encoder(
             content_embeddings=packed_emb,
             content_cu_seqlens=cu,
             content_position_ids=pos_ids,
-            target_ratio=0.5,
-            level="l0",
+            target_ratio_l0=0.5,
         )
 
     # No-compression: survivor_embeddings is flat over content positions.

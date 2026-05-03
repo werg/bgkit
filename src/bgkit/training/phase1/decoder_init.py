@@ -232,7 +232,7 @@ class DecoderInitTrainer(BaseTrainer):
                 bgkit_state_dicts.get("decoder_merged")
                 or bgkit_state_dicts.get("decoder")
             )
-            # Optional: load a pre-distilled head_base_l0 sidecar as a warm
+            # Optional: load a pre-distilled l0.head sidecar as a warm
             # start. Produced by scripts/pretrain_survivorship_head.py.
             sidecar_path = self.cfg.training.get(
                 "survivorship_head_sidecar", None,
@@ -1463,9 +1463,8 @@ class DecoderInitTrainer(BaseTrainer):
         metrics: dict[str, float] = {"loss": loss.item()}
 
         # Survivorship head auxiliary losses (when compression is active).
-        # Note: survive_probs_metrics is the canonical "probability that this
-        # position survives" exposed for metrics; survive_probs is its alias
-        # on CompressorOutput for backwards compatibility.
+        # ``survive_probs_metrics`` on the LevelOutput is a detached copy of
+        # ``survive_probs``; both are exposed for metrics.
         if self._compression_active and enc_out.l0.logits_for_op is not None:
             from bgkit.training.survivorship_helpers import accumulate
 
@@ -1573,10 +1572,10 @@ class DecoderInitTrainer(BaseTrainer):
             if content_grad is not None:
                 metrics["l0_content_grad_norm"] = float(content_grad.norm().item())
 
-        # Explicit release of CompressorOutput tensor references to
+        # Explicit release of EncoderOutput / LevelOutput tensor refs to
         # avoid the utility-grad hook-state leak (diagnosed 2026-04-20,
         # ~140 MB/step growth to 107 GB by step 2650). See
-        # ``CompressorOutput.release()`` docstring for the mechanism.
+        # ``LevelOutput.release()`` docstring for the mechanism.
         enc_out.release()
 
         return metrics

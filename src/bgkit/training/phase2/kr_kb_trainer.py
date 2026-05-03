@@ -354,7 +354,7 @@ class KRKBTrainer(BaseTrainer):
         anchor_grid = resolve_anchor_grid(
             self.cfg.model,
             float(self._l1_retention),
-            getattr(self.encoder.compressor.threshold_l0, "anchor_ratios", None),
+            getattr(self.encoder.l0.threshold, "anchor_ratios", None),
         )
         self._l0_ratio_sampler_cfg = build_ratio_sampler_config(
             self.step_cfg.get("l0_retention_jitter", {}) or {},
@@ -414,7 +414,7 @@ class KRKBTrainer(BaseTrainer):
         ):
             from bgkit.models.ice_teacher import ICETeacher
             ice_path = ice_cfg["checkpoint_path"]
-            embed_tokens = self.encoder.compressor.backbone.embed_tokens
+            embed_tokens = self.encoder.l0.backbone.embed_tokens
             self._ice_teacher = ICETeacher(
                 ice_path, embed_tokens,
                 input_dim=int(ice_cfg.get("input_dim", 1024)),
@@ -649,7 +649,7 @@ class KRKBTrainer(BaseTrainer):
         has special-token additions). Caught early via an explicit
         assertion rather than via silent garbage embeddings.
         """
-        enc_embed = self.encoder.compressor.backbone.get_input_embeddings()
+        enc_embed = self.encoder.l0.backbone.get_input_embeddings()
         enc_vocab = enc_embed.num_embeddings
         dec_embed = self.decoder.backbone.get_input_embeddings()
         dec_vocab = dec_embed.weight.shape[0]
@@ -707,15 +707,17 @@ class KRKBTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     def _install_lora(self) -> None:
+        """Install L1-only LoRA. Stage A trains ``encoder.l0`` weights
+        directly (no LoRA wrapper); Stage B freezes ``encoder.l0`` entirely
+        and trains ``l1`` LoRA + decoder.
+        """
         lora_cfg = self.step_cfg.get("lora", {})
-        levels = {
-            "l0": int(lora_cfg.get("l0_rank", 32)),
-            "l1": int(lora_cfg.get("l1_rank", 32)),
-        }
+        # Only install on L1's submodule — keep L0 free of LoRA wrappers.
+        levels = {"l1": int(lora_cfg.get("l1_rank", 32))}
         targets = tuple(lora_cfg.get("target_modules", DEFAULT_LORA_TARGETS))
         alpha = lora_cfg.get("alpha")
         self.lora_router = LoRARouter.install(
-            self.encoder,
+            self.encoder.l1,
             target_names=targets,
             levels=levels,
             alpha=float(alpha) if alpha is not None else None,
@@ -723,13 +725,13 @@ class KRKBTrainer(BaseTrainer):
         )
         LoRARouter.bind(self.lora_router)
 
-        # Freeze encoder base; unfreeze adapters.
+        # Freeze encoder base; unfreeze L1 LoRA always.
         self.encoder.requires_grad_(False)
         self.lora_router.set_level_trainable("l1", True)
+        # Stage A: train L0 weights directly (head + auto_repro_head + backbone).
+        # Stage B: keep L0 frozen.
         if self._live_l0:
-            self.lora_router.set_level_trainable("l0", True)
-        else:
-            self.lora_router.set_level_trainable("l0", False)
+            self.encoder.l0.requires_grad_(True)
 
     # ------------------------------------------------------------------
     # Browse trees
@@ -1139,7 +1141,7 @@ class KRKBTrainer(BaseTrainer):
 
         for level in ("l0", "l1"):
             calibrated_T = calibrate_head_tanh_temperature(
-                self.encoder.compressor,
+                self.encoder,
                 self.train_dataloader,
                 self.device,
                 level=level,
@@ -1174,6 +1176,16 @@ class KRKBTrainer(BaseTrainer):
                     "decoder_lr", self.step_cfg.get("lr", 1e-4)
                 )),
             })
+        # Stage A: L0 weights train directly (no LoRA wrapper).
+        if self._live_l0:
+            l0_params = [p for p in self.encoder.l0.parameters() if p.requires_grad]
+            if l0_params:
+                groups.append({
+                    "params": l0_params,
+                    "lr": float(
+                        self.step_cfg.get("l0_lr", self.step_cfg.get("lr", 1e-4))
+                    ),
+                })
         for level in sorted(self.lora_router.levels):
             lvl_params = [
                 p for p in self.lora_router.adapter_parameters(level) if p.requires_grad
@@ -1197,9 +1209,9 @@ class KRKBTrainer(BaseTrainer):
     # Activation-checkpointed encoder forward
     # ------------------------------------------------------------------
 
-    # Canonical positional argument order for the encoder forward. Must
-    # match ``BgKITEncoder.forward``'s kwarg-or-positional signature.
-    _ENCODER_ARG_ORDER = (
+    # Canonical positional argument order for a single LevelCompressor
+    # forward (encoder.l0 or encoder.l1).
+    _LEVEL_ARG_ORDER = (
         "content_embeddings",
         "content_cu_seqlens",
         "content_position_ids",
@@ -1208,47 +1220,37 @@ class KRKBTrainer(BaseTrainer):
         "prompt_position_ids",
         "pinned_positions",
         "target_ratio",
-        "level",
+        "min_per_sample",
         "utility_grad_active",
         "utility_grad_capture",
     )
 
-    def _checkpointed_encoder(self, **kwargs):
-        """Call ``self.encoder(**kwargs)`` with activation checkpointing.
+    def _checkpointed_level(self, level: str, **kwargs):
+        """Call ``self.encoder.{level}(**kwargs)`` with optional activation checkpointing.
 
-        Uses ``torch.utils.checkpoint.checkpoint(use_reentrant=False)``,
-        which (unlike the reentrant flavor) accepts mixed tensor / non-
-        tensor positional arguments and relies on saved-tensor hooks for
-        backward rather than re-entering from positional arg signatures.
-        We flatten our kwargs into the canonical positional order above
-        and pass them straight through — no closure trickery.
-
-        Falls back to a plain forward call when checkpointing is
-        disabled, when the trainer is in eval mode, or when no input
-        tensor tracks gradients.
+        ``level`` is ``"l0"`` or ``"l1"``. Falls back to a plain forward
+        when checkpointing is disabled, when in eval mode, or when no
+        input tensor tracks gradients.
         """
+        lc = getattr(self.encoder, level)
         if not getattr(self, "_checkpoint_encoder", False):
-            return self.encoder(**kwargs)
+            return lc(**kwargs)
         if not self.encoder.training:
-            return self.encoder(**kwargs)
+            return lc(**kwargs)
         any_requires = any(
             isinstance(v, torch.Tensor) and v.requires_grad
             for v in kwargs.values()
         )
         if not any_requires:
-            return self.encoder(**kwargs)
+            return lc(**kwargs)
 
         from torch.utils.checkpoint import checkpoint
 
-        # Flatten kwargs into positional args in canonical order; missing
-        # kwargs become ``None`` (the encoder's forward treats all of
-        # these as optional with ``None`` defaults).
-        positional = tuple(kwargs.get(name) for name in self._ENCODER_ARG_ORDER)
-        encoder = self.encoder
-        arg_names = self._ENCODER_ARG_ORDER
+        positional = tuple(kwargs.get(name) for name in self._LEVEL_ARG_ORDER)
+        arg_names = self._LEVEL_ARG_ORDER
 
         def _forward(*args):
-            return encoder(**dict(zip(arg_names, args, strict=True)))
+            return lc(**dict(zip(arg_names, args, strict=True)))
 
         if getattr(self, "_cpu_offload_activations", False):
             from bgkit.utils.cpu_offload_checkpoint import cpu_offload_checkpoint
@@ -1335,10 +1337,10 @@ class KRKBTrainer(BaseTrainer):
         encoder produces the survivor mask internally based on the target
         retention ratio.
 
-        Returns ``(out, content_cu_seqlens, ratio)`` where ``out`` is the full
-        :class:`CompressionOutput` (carrying flat head outputs +
-        ``base_raw_for_util`` / ``post_head_content_values`` /
-        ``_utility_grad_state``) and ``content_cu_seqlens`` marks the
+        Returns ``(out, content_cu_seqlens, ratio)`` where ``out`` is the
+        :class:`bgkit.models.level_compressor.LevelOutput` (carrying flat
+        head outputs + ``base_raw_for_util`` / ``post_head_content_values``
+        / ``_utility_grad_state``) and ``content_cu_seqlens`` marks the
         per-article boundaries inside the flat buffer, so downstream aux
         losses can do segment-aware reductions without repacking.
         """
@@ -1363,7 +1365,7 @@ class KRKBTrainer(BaseTrainer):
         ).cumsum(0)
         position_ids = position_ids_from_cu(cu_seqlens, int(tokens_flat.shape[0]))
 
-        embed_tokens = self.encoder.compressor.backbone.get_input_embeddings()
+        embed_tokens = self.encoder.l0.backbone.get_input_embeddings()
         input_embeddings = embed_tokens(tokens_flat)  # (N_content, D)
 
         ratio = self._sample_l0_retention_for(dataset)
@@ -1373,12 +1375,12 @@ class KRKBTrainer(BaseTrainer):
         ).utility_grad_loss_weight > 0.0
         grad_capture: dict | None = {} if util_active else None
 
-        out = self._checkpointed_encoder(
+        out = self._checkpointed_level(
+            "l0",
             content_embeddings=input_embeddings,
             content_cu_seqlens=cu_seqlens,
             content_position_ids=position_ids,
             target_ratio=ratio,
-            level="l0",
             utility_grad_active=util_active,
             utility_grad_capture=grad_capture,
         )
@@ -1433,7 +1435,7 @@ class KRKBTrainer(BaseTrainer):
         ]
         lengths = [int(r.size(0)) for r in rows_list]
         if sum(lengths) == 0:
-            hidden = self.encoder.compressor.hidden_dim
+            hidden = self.encoder.l0.hidden_dim
             flat = torch.zeros((0, hidden), dtype=torch.bfloat16, device=self.device)
         else:
             flat = torch.cat(rows_list, dim=0).to(self.device, dtype=torch.bfloat16)
@@ -1764,7 +1766,7 @@ class KRKBTrainer(BaseTrainer):
                 ids = [0]
             id_token_lists.append(ids)
 
-        embed_tokens = self.encoder.compressor.backbone.get_input_embeddings()
+        embed_tokens = self.encoder.l0.backbone.get_input_embeddings()
 
         pieces: list[torch.Tensor] = []
         pinned_list: list[bool] = []
@@ -1827,7 +1829,7 @@ class KRKBTrainer(BaseTrainer):
         fall back to a 1-vector zero tensor so the decoder sentinel splice
         always has something to drop in.
         """
-        hidden_dim = self.encoder.compressor.hidden_dim
+        hidden_dim = self.encoder.l1.hidden_dim
         zero_fallback = torch.zeros(
             (1, hidden_dim), device=self.device, dtype=torch.bfloat16,
         )
@@ -1873,19 +1875,27 @@ class KRKBTrainer(BaseTrainer):
         l1_grad_capture: dict | None = {} if util_active_l1 else None
         if target_ratio is None:
             target_ratio = self._sample_l1_retention()
-        out = self._checkpointed_encoder(
-            content_embeddings=content_flat,
-            content_cu_seqlens=content_cu,
-            content_position_ids=content_pos_ids,
-            prompt_embeddings=query_flat,
-            prompt_cu_seqlens=query_cu,
-            prompt_position_ids=query_pos_ids,
-            pinned_positions=pinned_flat,
-            target_ratio=target_ratio,
-            level="l1",
-            utility_grad_active=util_active_l1,
-            utility_grad_capture=l1_grad_capture,
-        )
+
+        # Bridge L0 survivors + pinned ID embeddings through L0's
+        # auto_repro_head so L1's independent backbone (a deepcopy of L0
+        # at construction) sees its expected input-embedding distribution.
+        bridged_content = self.encoder.l0.auto_reproduce(content_flat)
+        # Activate L1 LoRA so wrapped Linears in L1's backbone apply the
+        # adapter delta during forward.
+        with self.lora_router.active("l1"):
+            out = self._checkpointed_level(
+                "l1",
+                content_embeddings=bridged_content,
+                content_cu_seqlens=content_cu,
+                content_position_ids=content_pos_ids,
+                prompt_embeddings=query_flat,
+                prompt_cu_seqlens=query_cu,
+                prompt_position_ids=query_pos_ids,
+                pinned_positions=pinned_flat,
+                target_ratio=target_ratio,
+                utility_grad_active=util_active_l1,
+                utility_grad_capture=l1_grad_capture,
+            )
         if l1_grad_capture is not None:
             out._l1_grad_capture = l1_grad_capture  # type: ignore[attr-defined]
 
@@ -1901,10 +1911,31 @@ class KRKBTrainer(BaseTrainer):
                 "ratio": target_ratio,
             })
 
-        # Extract per-turn survivors from the packed output. The encoder
-        # returns flat survivor_embeddings (N_surv_total, D) with per-turn
-        # boundaries in survivor_cu_seqlens.
-        surv_cu = out.survivor_cu_seqlens.to(torch.int64).tolist()
+        # Project L1 survivors into decoder space via the shared
+        # projection block. L1's raw survivor_embeddings are post-norm
+        # backbone hidden states; the decoder expects projected vectors.
+        surv_emb = out.survivor_embeddings  # (N_surv_total, D)
+        surv_cu_t = out.survivor_cu_seqlens
+        if int(surv_cu_t[-1].item()) > 0:
+            from bgkit.utils.packing import lengths_from_cu as _lfc
+            from bgkit.utils.packing import position_ids_from_cu as _pfc
+
+            surv_lengths = _lfc(surv_cu_t).to(torch.int64)
+            surv_max = int(surv_lengths.max().item()) if surv_lengths.numel() else 0
+            surv_pos = _pfc(surv_cu_t, int(surv_emb.shape[0]))
+            proj_out = self.encoder.projection_block(
+                surv_emb,
+                cu_seqlens=surv_cu_t,
+                max_seqlen=surv_max,
+                position_ids=surv_pos,
+                survivor_mask=None,
+            )
+            projected = proj_out.projected_embeddings
+        else:
+            projected = surv_emb
+
+        # Extract per-turn projected survivors via per-turn boundaries.
+        surv_cu = surv_cu_t.to(torch.int64).tolist()
         per_turn: list[torch.Tensor] = []
         for i in range(batch_size):
             start = int(surv_cu[i])
@@ -1912,7 +1943,7 @@ class KRKBTrainer(BaseTrainer):
             if end <= start:
                 per_turn.append(zero_fallback)
             else:
-                per_turn.append(out.survivor_embeddings[start:end])
+                per_turn.append(projected[start:end])
 
         # Re-interleave with None fallbacks
         results: list[torch.Tensor] = []
@@ -2840,7 +2871,7 @@ class KRKBTrainer(BaseTrainer):
             bucket_key = max(0, (max(n_content, 1) - 1).bit_length())
             buckets.setdefault(bucket_key, []).append((s_idx, t_idx, prep))
 
-        hidden_dim = self.encoder.compressor.hidden_dim
+        hidden_dim = self.encoder.l1.hidden_dim
         zero_fallback = torch.zeros(
             (1, hidden_dim), device=self.device, dtype=torch.bfloat16,
         )
@@ -2901,8 +2932,8 @@ class KRKBTrainer(BaseTrainer):
         (total_weighted / self._accum_steps).backward()
 
         # --- Utility-gradient BCE distillation (post-backward) ---
-        # The main backward populated each enc_out's captured
-        # ``post_head_content_grad`` via the compressor's backward hook.
+        # The main backward populated each LevelOutput's captured
+        # ``post_head_content_grad`` via the level's backward hook.
         # Rebuild the top-k teacher from ``-(grad · value)`` and run a
         # small head-local backward per level.
         util_metrics = self._apply_utility_grad_bce_phase2()
@@ -2961,12 +2992,12 @@ class KRKBTrainer(BaseTrainer):
                     )
                 )
 
-        # Drop CompressorOutput tensor refs held by this step's pending
+        # Drop LevelOutput tensor refs held by this step's pending
         # outputs. Even though the lists are re-assigned at the top of
         # the next ``_forward_backward`` call, explicit release here
         # ensures the hook-closure retention (see
-        # ``CompressorOutput.release()``) doesn't keep subgraph
-        # activations pinned across optimizer steps.
+        # ``LevelOutput.release()``) doesn't keep subgraph activations
+        # pinned across optimizer steps.
         for _entry in (*self._pending_l0_outputs, *self._pending_l1_outputs):
             _enc_out = _entry.get("enc_out")
             if _enc_out is not None and hasattr(_enc_out, "release"):
@@ -3069,9 +3100,9 @@ class KRKBTrainer(BaseTrainer):
             target_l1 = float(self._l1_retention)
 
         merged: dict[str, float] = {}
-        # L0 update: skip if Stage B (cached L0, L0 LoRA frozen).
+        # L0 update: skip if Stage B (cached L0, L0 frozen).
         l0_metrics = apply_post_step_updates(
-            self.encoder.compressor,
+            self.encoder,
             self._surv_state_l0,
             target_ratio=target_l0,
             level="l0",
@@ -3082,7 +3113,7 @@ class KRKBTrainer(BaseTrainer):
 
         # L1 always updates.
         l1_metrics = apply_post_step_updates(
-            self.encoder.compressor,
+            self.encoder,
             self._surv_state_l1,
             target_ratio=target_l1,
             level="l1",

@@ -412,6 +412,47 @@ class BgKITEncoder(nn.Module):
         return encoder
 
     @classmethod
+    def load_l0_only(
+        cls,
+        backbone_name_or_module: str | nn.Module,
+        encoder_state_dict: dict,
+        hidden_dim: int = 1024,
+        torch_dtype: torch.dtype = torch.bfloat16,
+        trust_remote_code: bool = True,
+        revision: str | None = None,
+        attn_implementation: str | None = None,
+        bidi_warmup_steps: int = 0,
+        conv_kernel_size: int = 16,
+        survivorship_inner_dim: int = 256,
+        threshold_controller_cfg: dict | None = None,
+    ) -> BgKITEncoder:
+        """Construct an encoder and load ONLY the ``l0.*`` keys from the
+        state dict.
+
+        Use this for offline L0-only consumers (cache pre-computation,
+        diagnostics) where ``l1`` / ``projection_block`` are never
+        consulted — the constructor still builds them (they appear in the
+        module tree at their fresh init), but they receive no trained
+        weights from the supplied state dict.
+        """
+        l0_only_state = {
+            k: v for k, v in encoder_state_dict.items() if k.startswith("l0.")
+        }
+        return cls.from_pretrained_with_state_dict(
+            backbone_name_or_module,
+            l0_only_state,
+            hidden_dim=hidden_dim,
+            torch_dtype=torch_dtype,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            attn_implementation=attn_implementation,
+            bidi_warmup_steps=bidi_warmup_steps,
+            conv_kernel_size=conv_kernel_size,
+            survivorship_inner_dim=survivorship_inner_dim,
+            threshold_controller_cfg=threshold_controller_cfg,
+        )
+
+    @classmethod
     def from_pretrained_legacy_step4_checkpoint(
         cls,
         backbone_name_or_module: str | nn.Module,

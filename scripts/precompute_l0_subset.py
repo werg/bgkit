@@ -12,23 +12,17 @@ Input:
     --phase1-checkpoint: Phase 1 checkpoint that provides the encoder base
                          weights (frozen throughout KB training).
     --stage-a-checkpoint: Optional Stage A checkpoint. When provided, the
-                          L0 LoRA adapter weights from it are loaded and
-                          activated so the cache reflects Stage A's
-                          text-adapted L0 behavior. Omit to encode with
-                          bare Phase 1 weights (bootstrap before Stage A).
+                          ``encoder.l0.*`` weights from Stage A are merged
+                          on top of Phase 1's base so the cache reflects
+                          Stage A's text-adapted L0 behavior. Omit to
+                          encode with bare Phase 1 weights (bootstrap
+                          before Stage A).
     --output-dir: root directory for the :class:`L0Cache` layout.
     --retention-json: JSON file mapping dataset name → retention ratio.
 
-This script reuses the canonical Phase 2 token store via
-:class:`bgkit.data.article_token_store.ArticleTokenStore`. There is no
-sidecar ``{dataset}_tokens.parquet`` — tokens come from the same mmap
-files that the single-doc Phase 2 trainers consume.
-
-Packed-attention migration (Wave 4.4): the script now calls the packed
-encoder forward — flat ``(N_content, D)`` content embeddings with
-``content_cu_seqlens`` + per-article ``position_ids`` — and extracts
-survivors per article via ``survivor_cu_seqlens`` into the variable-length
-on-disk cache format.
+Loads ONLY ``encoder.l0`` (skips L1 + projection_block weights — they're
+constructed but never consulted) via
+:meth:`BgKITEncoder.load_l0_only`.
 """
 
 from __future__ import annotations
@@ -46,24 +40,19 @@ from bgkit.data.l0_cache import (
     update_dataset_index,
     write_cache_manifest,
 )
-from bgkit.models.lora_encoder import DEFAULT_LORA_TARGETS, LoRARouter
 from bgkit.utils.packing import position_ids_from_cu
 
 
-def _load_encoder_and_lora(
+def _load_encoder(
     phase1_checkpoint: Path,
     stage_a_checkpoint: Path | None,
-    lora_rank: int,
-    lora_alpha: float | None,
-) -> tuple[torch.nn.Module, LoRARouter | None]:
-    """Load Phase 1 encoder, optionally install and load a Stage A LoRA.
+) -> torch.nn.Module:
+    """Load Phase 1 ``encoder.l0`` and optionally overlay Stage A's L0.
 
-    When ``stage_a_checkpoint`` is provided we install the same LoRA router
-    configuration that ``KRKBTrainer._install_lora`` uses, then load the
-    Stage A model state dict into the encoder so the LoRA adapters receive
-    their trained weights. Without this the ``level="l0"`` hint at
-    encoder forward time is a no-op — the router returns None and the
-    bare Phase 1 weights run, silently discarding Stage A's training.
+    With L0 LoRA dropped (Phase 2 KB now trains ``encoder.l0`` weights
+    directly in Stage A), Stage A's L0 weights are merged on top of the
+    Phase 1 base. Without ``stage_a_checkpoint`` the cache reflects bare
+    Phase 1 L0 (bootstrap pre-compute).
     """
     from bgkit.models.encoder import BgKITEncoder
     from bgkit.training.checkpointing import load_checkpoint
@@ -75,56 +64,26 @@ def _load_encoder_and_lora(
         for k, v in model_state.items()
         if k.startswith("encoder.")
     }
-    encoder = BgKITEncoder.from_pretrained_with_state_dict(
-        "Qwen/Qwen3.5-0.8B-Base", encoder_state, hidden_dim=1024,
-    )
 
-    router: LoRARouter | None = None
     if stage_a_checkpoint is not None:
-        # Install LoRA router with the same target modules and level ranks
-        # that the KRKBTrainer uses. Adapters are zero-initialized here;
-        # the Stage A state dict load below populates them.
-        router = LoRARouter.install(
-            encoder,
-            target_names=DEFAULT_LORA_TARGETS,
-            levels={"l0": lora_rank, "l1": lora_rank},
-            alpha=alpha_or_default(lora_alpha, lora_rank),
-            dropout=0.0,
-        )
-        LoRARouter.bind(router)
-
         _meta_a, state_a = load_checkpoint(stage_a_checkpoint)
         model_state_a = state_a.get("model", {})
-        encoder_state_a = {
+        l0_state_a = {
             k.replace("encoder.", "", 1): v
             for k, v in model_state_a.items()
-            if k.startswith("encoder.")
+            if k.startswith("encoder.l0.")
         }
-        if not encoder_state_a:
+        if not l0_state_a:
             raise RuntimeError(
-                f"Stage A checkpoint {stage_a_checkpoint} has no encoder.* "
-                "keys — cannot load L0 LoRA weights."
+                f"Stage A checkpoint {stage_a_checkpoint} has no "
+                "encoder.l0.* keys to merge."
             )
-        # strict=False because Phase 1 base keys are already loaded and the
-        # checkpoint may also contain decoder/ice keys we're ignoring here.
-        encoder.load_state_dict(encoder_state_a, strict=False)
-        # Sanity check: at least some lora_A/lora_B params should have loaded.
-        loaded_lora = sum(
-            1 for k in encoder_state_a
-            if ".adapters.l0." in k or ".adapters.l1." in k
-        )
-        if loaded_lora == 0:
-            raise RuntimeError(
-                f"Stage A checkpoint {stage_a_checkpoint} contains no LoRA "
-                "adapter keys (looked for '.adapters.l0.' / '.adapters.l1.'). "
-                "Was this checkpoint saved by KRKBTrainer?"
-            )
+        encoder_state.update(l0_state_a)
 
-    return encoder, router
-
-
-def alpha_or_default(alpha: float | None, rank: int) -> float:
-    return float(alpha) if alpha is not None else 2.0 * rank
+    encoder = BgKITEncoder.load_l0_only(
+        "Qwen/Qwen3.5-0.8B-Base", encoder_state, hidden_dim=1024,
+    )
+    return encoder
 
 
 def _pack_batch(
@@ -184,12 +143,11 @@ def _encode_and_write_batch(
         input_embeds, cu_seqlens, position_ids = _pack_batch(
             tokens_list, embed_tokens, device,
         )
-        out = encoder(
+        out = encoder.l0(
             content_embeddings=input_embeds,
             content_cu_seqlens=cu_seqlens,
             content_position_ids=position_ids,
             target_ratio=retention_ratio,
-            level="l0",
         )
         survivors_flat = out.survivor_embeddings.cpu().float().numpy()
         survivor_cu = out.survivor_cu_seqlens.cpu().to(torch.int64).numpy()
@@ -229,20 +187,21 @@ def main() -> None:
         required=False,
         type=Path,
         default=None,
-        help="Stage A KRKBTrainer checkpoint providing trained L0 LoRA weights. "
-             "Omit for bootstrap pre-compute before Stage A has trained.",
+        help="Stage A KRKBTrainer checkpoint providing trained encoder.l0.* "
+             "weights. Omit for bootstrap pre-compute before Stage A.",
     )
     parser.add_argument(
         "--lora-rank",
         type=int,
         default=32,
-        help="LoRA rank — must match the rank used during Stage A training.",
+        help="LoRA rank — recorded in the cache manifest only (Phase 2 KB "
+             "now trains encoder.l0 directly without an L0 LoRA wrapper).",
     )
     parser.add_argument(
         "--lora-alpha",
         type=float,
         default=None,
-        help="LoRA alpha. Defaults to 2*rank (matches Stage A default).",
+        help="LoRA alpha — recorded in the cache manifest only.",
     )
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--retention-json", required=True, type=Path)
@@ -265,16 +224,12 @@ def main() -> None:
             by_dataset[str(row["dataset"])].append(str(row["article_id"]))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    encoder, router = _load_encoder_and_lora(
+    encoder = _load_encoder(
         args.phase1_checkpoint,
         args.stage_a_checkpoint,
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha,
     )
     encoder.to(device).eval()
-    if router is not None:
-        router.to(device)
-    embed_tokens = encoder.compressor.backbone.get_input_embeddings()
+    embed_tokens = encoder.l0.backbone.get_input_embeddings()
     token_store = ArticleTokenStore(args.mmap_dir)
 
     for dataset, article_ids in by_dataset.items():

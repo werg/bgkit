@@ -713,44 +713,56 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
         def get_input_embeddings(self):
             return self._embed
 
-    class _StubCompressor(torch.nn.Module):
+    class _StubLevel(torch.nn.Module):
+        """Routes prompt influence into content so survivors depend on the query."""
+
         def __init__(self):
             super().__init__()
             self.backbone = _StubBackbone()
             self.hidden_dim = hidden_dim
-
-    class _StubEncoder(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.compressor = _StubCompressor()
             self.calls: list = []
 
+        def auto_reproduce(self, x):
+            return x
+
         def __call__(self, **kwargs):
-            # Packed form. Pass per-turn prompt mean through to output so
-            # the stub's result depends on the query.
             self.calls.append(kwargs)
             content = kwargs["content_embeddings"]        # (N_content, D)
             content_cu = kwargs["content_cu_seqlens"]     # (B+1,)
-            prompt = kwargs["prompt_embeddings"]          # (N_query, D)
-            prompt_cu = kwargs["prompt_cu_seqlens"]       # (B+1,)
-            batch_size = int(content_cu.shape[0]) - 1
-            # Compute per-sample prompt mean and broadcast into the
-            # corresponding content rows.
+            prompt = kwargs.get("prompt_embeddings")
+            prompt_cu = kwargs.get("prompt_cu_seqlens")
             out_content = content.clone()
-            for i in range(batch_size):
-                q_start = int(prompt_cu[i].item())
-                q_end = int(prompt_cu[i + 1].item())
-                if q_end > q_start:
-                    mean_i = prompt[q_start:q_end].mean(dim=0, keepdim=True)
-                    c_start = int(content_cu[i].item())
-                    c_end = int(content_cu[i + 1].item())
-                    out_content[c_start:c_end] = content[c_start:c_end] + mean_i
+            if prompt is not None and prompt_cu is not None:
+                batch_size = int(content_cu.shape[0]) - 1
+                for i in range(batch_size):
+                    q_start = int(prompt_cu[i].item())
+                    q_end = int(prompt_cu[i + 1].item())
+                    if q_end > q_start:
+                        mean_i = prompt[q_start:q_end].mean(dim=0, keepdim=True)
+                        c_start = int(content_cu[i].item())
+                        c_end = int(content_cu[i + 1].item())
+                        out_content[c_start:c_end] = content[c_start:c_end] + mean_i
             counts = (content_cu[1:] - content_cu[:-1]).to(torch.int64)
             return types.SimpleNamespace(
                 survivor_embeddings=out_content,
                 survivor_cu_seqlens=content_cu,
                 survivor_counts=counts,
             )
+
+    class _StubProjection(torch.nn.Module):
+        def __call__(self, x, **_kw):
+            return types.SimpleNamespace(projected_embeddings=x)
+
+    class _StubEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l0 = _StubLevel()
+            self.l1 = _StubLevel()
+            self.projection_block = _StubProjection()
+
+        @property
+        def calls(self):
+            return self.l0.calls + self.l1.calls
 
     trainer = KRKBTrainer.__new__(KRKBTrainer)
     trainer.device = torch.device("cpu")
@@ -797,6 +809,14 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
     trainer._token_store = _TokenStore()
     trainer._missing_article_counts = {}
     trainer._checkpoint_encoder = False
+
+    # No-op LoRA router (the trainer does `with self.lora_router.active("l1"): ...`)
+    import contextlib
+    class _NullLoRARouter:
+        @contextlib.contextmanager
+        def active(self, _level):
+            yield
+    trainer.lora_router = _NullLoRARouter()
 
     # Provide a tiny ICE stub
     class _IceStub(torch.nn.Module):
@@ -868,8 +888,8 @@ def test_training_time_ablation_partial_rolls():
 
 
 def test_checkpointed_encoder_matches_plain_forward():
-    """_checkpointed_encoder should return the same output as a direct
-    encoder call when activation checkpointing is enabled, and fall back
+    """_checkpointed_level should return the same output as a direct
+    level call when activation checkpointing is enabled, and fall back
     cleanly when disabled or when no tensor requires grad."""
     import types
 
@@ -879,7 +899,7 @@ def test_checkpointed_encoder_matches_plain_forward():
     trainer.device = torch.device("cpu")
     trainer._checkpoint_encoder = True
 
-    class _FakeEncoder(torch.nn.Module):
+    class _FakeLevel(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.linear = torch.nn.Linear(4, 4)
@@ -894,6 +914,11 @@ def test_checkpointed_encoder_matches_plain_forward():
                 survivor_counts=(cu[1:] - cu[:-1]).to(torch.int64),
             )
 
+    class _FakeEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l0 = _FakeLevel()
+
     trainer.encoder = _FakeEncoder()
     trainer.encoder.train()
 
@@ -902,14 +927,15 @@ def test_checkpointed_encoder_matches_plain_forward():
     cu = torch.tensor([0, 3], dtype=torch.int32)
     pos = torch.arange(3, dtype=torch.int64)
     # Plain forward reference
-    plain = trainer.encoder(
+    plain = trainer.encoder.l0(
         content_embeddings=x,
         content_cu_seqlens=cu,
         content_position_ids=pos,
     ).survivor_embeddings
 
     # Checkpointed forward
-    ckpt = trainer._checkpointed_encoder(
+    ckpt = trainer._checkpointed_level(
+        "l0",
         content_embeddings=x,
         content_cu_seqlens=cu,
         content_position_ids=pos,
@@ -924,7 +950,8 @@ def test_checkpointed_encoder_matches_plain_forward():
 
     # With no grad-tracking input, checkpointed path falls back to plain.
     x_nograd = torch.randn(3, 4, requires_grad=False)
-    out_nograd = trainer._checkpointed_encoder(
+    out_nograd = trainer._checkpointed_level(
+        "l0",
         content_embeddings=x_nograd,
         content_cu_seqlens=cu,
         content_position_ids=pos,

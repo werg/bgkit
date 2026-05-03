@@ -79,7 +79,7 @@ def _encode_batch(
     """
     from bgkit.utils.packing import position_ids_from_cu
 
-    embed_tokens = encoder.compressor.backbone.get_input_embeddings()
+    embed_tokens = encoder.l0.backbone.get_input_embeddings()
 
     lengths = torch.tensor([int(t.size) for t in token_lists], dtype=torch.int32)
     cu_seqlens = torch.zeros(len(token_lists) + 1, dtype=torch.int32)
@@ -91,12 +91,11 @@ def _encode_batch(
     cu_seqlens = cu_seqlens.to(device)
     position_ids = position_ids_from_cu(cu_seqlens, int(flat_tokens.size(0)))
 
-    output = encoder(
+    output = encoder.l0(
         content_embeddings=input_embeds,
         content_cu_seqlens=cu_seqlens,
         content_position_ids=position_ids,
         target_ratio=retention_ratio,
-        level="l0",
     )
 
     survivors_flat = (

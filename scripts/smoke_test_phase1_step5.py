@@ -111,13 +111,13 @@ def main():
         print(f"  ✗ Encoder construction FAILED: {exc}")
         raise
 
-    print("\n--- Verifying L1 survivorship head presence in encoder ---")
-    head_l0 = sum(1 for n, _ in encoder.named_parameters() if "head_base_l0" in n)
-    head_l1 = sum(1 for n, _ in encoder.named_parameters() if "head_base_l1" in n)
-    print(f"  head_base_l0 params: {head_l0}")
-    print(f"  head_base_l1 params: {head_l1}")
+    print("\n--- Verifying split-L0/L1 survivorship heads ---")
+    head_l0 = sum(1 for n, _ in encoder.named_parameters() if n.startswith("l0.head."))
+    head_l1 = sum(1 for n, _ in encoder.named_parameters() if n.startswith("l1.head."))
+    print(f"  l0.head params: {head_l0}")
+    print(f"  l1.head params: {head_l1}")
     if head_l1 == 0:
-        print("  ⚠ Step 4 checkpoint has no L1 head; Step 5 will cold-start it (expected).")
+        print("  WARN: encoder has no L1 head; Step 5 will cold-start it (expected for legacy migrations).")
 
     print("\n--- Decoder construction ---")
     decoder_cfg = cfg.model.decoder

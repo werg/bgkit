@@ -146,7 +146,7 @@ def _eval_at_ratio(
     all_ref_texts: list[str] = []
     all_languages: list[str] = []
 
-    bgkit_embed = encoder.compressor.backbone.get_input_embeddings()
+    bgkit_embed = encoder.l0.backbone.get_input_embeddings()
 
     with torch.no_grad():
         for batch in dataloader:
@@ -168,8 +168,7 @@ def _eval_at_ratio(
                 prompt_embeddings=prompt_emb,
                 prompt_cu_seqlens=prompt_cu,
                 prompt_position_ids=prompt_position_ids,
-                target_ratio=ratio,
-                level="l0",
+                target_ratio_l0=ratio,
             )
             survivors = enc_out.survivor_embeddings
             survivor_cu = enc_out.survivor_cu_seqlens
@@ -233,7 +232,7 @@ def _run_compression_curve(encoder, decoder, dataloader, device, tokenizer) -> l
 def _run_embedding_health(encoder, dataloader, device) -> dict[str, float]:
     """Check embedding drift and health (packed form)."""
     all_embeddings = []
-    bgkit_embed = encoder.compressor.backbone.get_input_embeddings()
+    bgkit_embed = encoder.l0.backbone.get_input_embeddings()
 
     with torch.no_grad():
         for batch in dataloader:
@@ -246,7 +245,7 @@ def _run_embedding_health(encoder, dataloader, device) -> dict[str, float]:
                 content_embeddings=content_emb,
                 content_cu_seqlens=content_cu,
                 content_position_ids=content_position_ids,
-                target_ratio=None,
+                target_ratio_l0=None,
             )
             # Flat (N, D) survivor embeddings from the uncompressed pass.
             flat = enc_out.survivor_embeddings.detach().cpu()
@@ -316,7 +315,7 @@ def _run_rag_baseline(
     files = {e["file_key"]: e["content_text"] for e in indexed_samples}
     rag.index_repository(files)
 
-    bgkit_embed = encoder.compressor.backbone.get_input_embeddings()
+    bgkit_embed = encoder.l0.backbone.get_input_embeddings()
     decoder_embed = decoder.backbone.get_input_embeddings()
     rag_total_loss = 0.0
     bgkit_total_loss = 0.0
@@ -383,7 +382,7 @@ def _run_rag_baseline(
                 prompt_embeddings=prompt_emb,
                 prompt_cu_seqlens=prompt_cu_i,
                 prompt_position_ids=prompt_pos_i,
-                target_ratio=None,
+                target_ratio_l0=None,
             )
             survivors = enc_out.survivor_embeddings
             survivor_cu = enc_out.survivor_cu_seqlens

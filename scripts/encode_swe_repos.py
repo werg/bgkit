@@ -219,7 +219,7 @@ def encode_swe_repos(
                         continue
 
                     # Encode each blob independently using packed (varlen) format.
-                    embed_tokens = encoder.compressor.backbone.get_input_embeddings()
+                    embed_tokens = encoder.l0.backbone.get_input_embeddings()
 
                     with torch.no_grad():
                         for sha, tokens in zip(valid_shas, batch_texts, strict=True):
@@ -237,8 +237,7 @@ def encode_swe_repos(
                                 content_embeddings=content_emb,
                                 content_cu_seqlens=cu,
                                 content_position_ids=pos,
-                                target_ratio=retention_ratio,
-                                level="l0",
+                                target_ratio_l0=retention_ratio,
                             )
                             # survivor_embeddings is flat (K, D); no mask needed.
                             survivors = (

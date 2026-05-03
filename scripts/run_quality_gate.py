@@ -166,7 +166,7 @@ def main(cfg: DictConfig) -> None:
             loss_mask_flat = batch["loss_mask"].to(device)
             batch_size = int(content_cu.shape[0]) - 1
 
-            bgkit_embed = encoder.compressor.backbone.get_input_embeddings()
+            bgkit_embed = encoder.l0.backbone.get_input_embeddings()
             content_emb = bgkit_embed(content_token_ids)
             prompt_emb = bgkit_embed(prompt_ids)
 
@@ -177,7 +177,7 @@ def main(cfg: DictConfig) -> None:
                 prompt_embeddings=prompt_emb,
                 prompt_cu_seqlens=prompt_cu,
                 prompt_position_ids=prompt_position_ids,
-                target_ratio=None,
+                target_ratio_l0=None,
             )
             survivors = enc_out.survivor_embeddings
             survivor_cu = enc_out.survivor_cu_seqlens

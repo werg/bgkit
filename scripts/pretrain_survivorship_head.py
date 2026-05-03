@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Offline distillation: ICE → head_base_l0 (tanh-bounded operator regime).
+"""Offline distillation: ICE → ``encoder.l0.head`` (tanh-bounded operator regime).
 
 Runs a dedicated BCE-with-logits pass against ICE top-k teacher targets to
-initialize ``compressor.head_base_l0`` before Phase 1 Step 3 starts. Frees
-Step 3 from doing this work while simultaneously trying to teach the
-decoder to use BgKIT output.
+initialize ``encoder.l0.head`` before Phase 1 Step 3 starts. Frees Step 3
+from doing this work while simultaneously trying to teach the decoder to
+use BgKIT output.
 
 What's trained:
-    Only ``compressor.head_base_l0.*``. Everything else (pruned backbone,
-    projection block, adapter head, flag embeddings, etc.) is frozen. The
-    script taps the pruned backbone at block 1 (≡ layer 7 of the unpruned
-    Qwen3.5-0.8B) via ``return_intermediates=True`` and feeds that hidden
-    state into ``head_base_l0`` for BCE against ICE's top-k mask.
+    Only ``encoder.l0.head.*``. Everything else (L0 backbone, projection
+    block, threshold controller, etc.) is frozen. The script runs L0's
+    backbone end-to-end and taps the post-norm last-block output (where
+    the head fires in the split-L0/L1 architecture), then feeds that
+    hidden state into ``l0.head`` for BCE against ICE's top-k mask.
 
 Architecture note: ``SurvivorshipHead.forward`` returns raw (pre-tanh)
-logits. Tanh is applied at composition inside the compressor hook so the
+logits. Tanh is applied at composition inside the level compressor so the
 operator-facing logit is bounded. During distillation we train on raw
 logits so BCE-with-logits is numerically stable. At runtime the trained
 head outputs a raw distribution that tanh bounds naturally — if BCE
@@ -23,10 +23,10 @@ is the sweet spot for the θ ∈ (-0.99, 0.99) operator.
 
 What's saved:
     A standalone sidecar checkpoint at
-    ``$CHECKPOINT_DIR/survivorship_head_base_l0_YYYYMMDD_HHMMSS/``
-    containing ONLY head_base_l0 weights, loadable into a Step 3 encoder
-    via a partial state-dict update. The encoder state dict from the Step 2
-    checkpoint is NOT modified.
+    ``$CHECKPOINT_DIR/survivorship_l0_head_YYYYMMDD_HHMMSS/``
+    containing ONLY ``encoder.l0.head`` weights, loadable into a Step 3
+    encoder via a partial state-dict update. The encoder state dict from
+    the Step 2 checkpoint is NOT modified.
 
 Usage:
     python scripts/pretrain_survivorship_head.py \
@@ -36,10 +36,9 @@ Usage:
         --output-dir $CHECKPOINT_DIR \
         --teacher-ratio 0.10 --max-steps 3000 --max-batch-tokens 16384
 
-The script intentionally does NOT touch the head_adapter_l0 or the
-threshold controller — these are initialized fresh by Step 3. It only
-provides a warm start for the ICE-aligned ranking signal that BCE would
-have installed online.
+The script intentionally does NOT touch the threshold controller — that
+is initialized fresh by Step 3. It only provides a warm start for the
+ICE-aligned ranking signal that BCE would have installed online.
 """
 
 from __future__ import annotations
@@ -84,7 +83,7 @@ def parse_args() -> argparse.Namespace:
                         help="Token budget per microbatch.")
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3,
-                        help="AdamW LR for head_base_l0. This is small head, "
+                        help="AdamW LR for l0.head. This is a small head, "
                              "can afford higher LR than Step 3's encoder_lr.")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--max-seq-len", type=int, default=8192)
@@ -123,7 +122,7 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("device=%s", device)
 
-    # --- Encoder (frozen except head_base_l0) ---
+    # --- Encoder (frozen except l0.head) ---
     logger.info("loading_step2_checkpoint path=%s", args.step2_checkpoint)
     _metadata, state_dicts = load_checkpoint(args.step2_checkpoint)
     if "encoder" not in state_dicts:
@@ -140,20 +139,20 @@ def main() -> int:
         attn_implementation=resolve_attention_implementation(),
     ).to(device)
 
-    # Freeze everything; only head_base_l0 gets grad.
+    # Freeze everything; only L0's head gets grad.
     encoder.requires_grad_(False)
     encoder.eval()
-    head = encoder.compressor.head_base_l0
+    head = encoder.l0.head
     head.requires_grad_(True)
     head.train()
 
     head_params = [p for p in head.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in head_params)
-    logger.info("trainable_params head_base_l0=%d", n_trainable)
+    logger.info("trainable_params l0_head=%d", n_trainable)
 
     # --- ICE teacher ---
     logger.info("loading_ice path=%s", args.ice_checkpoint)
-    embed_tokens = encoder.compressor.backbone.get_input_embeddings()
+    embed_tokens = encoder.l0.backbone.get_input_embeddings()
     ice_teacher = ICETeacher(
         args.ice_checkpoint, embed_tokens,
         input_dim=args.ice_input_dim,
@@ -245,14 +244,9 @@ def main() -> int:
     )
 
     # --- Training loop ---
-    # Reach the encoder's layer-7 (pruned: block 1) hidden state by running
-    # only the compressor backbone up to that point. We can't reuse the head
-    # hook because we're training head_base_l0 itself; instead, we tap
-    # after-block-1 via `forward_from_block` convention. The simplest and
-    # safest approach is to run compressor.forward(...) WITHOUT a target
-    # ratio (compression_off → hook doesn't fire) and capture the output
-    # block-1 hidden via `return_intermediates=True`, then feed that into
-    # head_base_l0 ourselves.
+    # The split-architecture head fires at L0's post-norm last-block
+    # output. We run L0's backbone end-to-end and apply the head to its
+    # ``last_hidden_state`` ourselves, training only the head weights.
 
     def _run_one(batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute BCE loss + two diagnostic stats (packed).
@@ -271,29 +265,24 @@ def main() -> int:
                 token_ids, cu_seqlens, args.teacher_ratio,
             )
 
-        # Run backbone up to block 1, then apply head_base_l0.
+        # Run L0's backbone (post-norm last-block output), then apply head.
+        # The split-architecture head fires at the last block, not block 1.
         bgkit_embed = embed_tokens
         input_emb = bgkit_embed(token_ids)  # (N, D)
 
         with torch.no_grad():
-            backbone = encoder.compressor.backbone
+            backbone = encoder.l0.backbone
             backbone_out = backbone(
                 inputs_embeds=input_emb,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 position_ids=position_ids,
-                return_intermediates=True,
             )
-            intermediates = backbone_out.hidden_states
-            if intermediates is None or len(intermediates) < 2:
-                raise RuntimeError(
-                    "backbone did not return enough intermediate states; "
-                    f"got {len(intermediates) if intermediates is not None else 0}",
-                )
-            layer7 = intermediates[1]  # (N, D)
+            last_hidden = backbone_out.last_hidden_state  # (N, D), post-norm
 
-        head_in = layer7.to(head.head[0].weight.dtype)
-        base_raw = head(head_in)  # (N,)
+        head_in = last_hidden.to(head.head[0].weight.dtype)
+        # SurvivorshipHead expects (B, L, D); pack as (1, N, D) and squeeze.
+        base_raw = head(head_in.unsqueeze(0)).squeeze(0)  # (N,)
 
         # BCE over all packed positions (no padding in packed layout).
         bce = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -361,13 +350,13 @@ def main() -> int:
 
     # --- Save sidecar ---
     timestamp = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    out_dir = args.output_dir / f"survivorship_head_base_l0_{timestamp}"
+    out_dir = args.output_dir / f"survivorship_l0_head_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
     head_state = {
-        f"compressor.head_base_l0.{k}": v.detach().cpu()
+        f"l0.head.{k}": v.detach().cpu()
         for k, v in head.state_dict().items()
     }
-    torch.save(head_state, out_dir / "head_base_l0.pt")
+    torch.save(head_state, out_dir / "l0_head.pt")
     (out_dir / "meta.json").write_text(json.dumps({
         "step2_checkpoint": str(args.step2_checkpoint),
         "ice_checkpoint": str(args.ice_checkpoint),

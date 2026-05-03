@@ -140,18 +140,20 @@ def main(ckpt_dir: Path) -> None:
     # Before the 2026-04-18 fix, the trainer called a blanket
     # ``decoder.requires_grad_(True)`` AFTER ``apply_lora``. That's what
     # produced the 512-param decoder group in the saved state. Replay it.
+    # Step 3 only used L0; the legacy ``encoder.compressor`` group maps
+    # 1:1 onto the split-architecture's ``encoder.l0``.
     encoder.projection_block.requires_grad_(True)
-    encoder.compressor.requires_grad_(True)
+    encoder.l0.requires_grad_(True)
     decoder.requires_grad_(True)
     encoder.projection_block.train()
-    encoder.compressor.train()
+    encoder.l0.train()
     decoder.train()
 
     # -------- Build param groups in the SAME order as the trainer --------
     # DecoderInitTrainer._setup_optimizer order:
     #   1. projection_block (proj_lr)
     #   2. decoder         (decoder_lr)
-    #   3. encoder.compressor (encoder_lr)
+    #   3. encoder.l0      (encoder_lr)
     # LRs from the saved param_groups metadata so we don't have to
     # re-derive them from config.
     proj_lr = saved_counts_to_lr(legacy_opt["param_groups"], group_idx=0)
@@ -166,17 +168,17 @@ def main(ckpt_dir: Path) -> None:
 
     proj_params = [p for p in encoder.projection_block.parameters() if p.requires_grad]
     decoder_params = [p for p in decoder.parameters() if p.requires_grad]
-    compressor_params = [p for p in encoder.compressor.parameters() if p.requires_grad]
+    l0_params = [p for p in encoder.l0.parameters() if p.requires_grad]
 
     logger.info(
         "current_param_counts",
         projection=len(proj_params),
         decoder=len(decoder_params),
-        compressor=len(compressor_params),
-        total=len(proj_params) + len(decoder_params) + len(compressor_params),
+        l0=len(l0_params),
+        total=len(proj_params) + len(decoder_params) + len(l0_params),
     )
     expected_total = sum(saved_counts)
-    actual_total = len(proj_params) + len(decoder_params) + len(compressor_params)
+    actual_total = len(proj_params) + len(decoder_params) + len(l0_params)
     if actual_total != expected_total:
         raise SystemExit(
             f"param count mismatch: saved {expected_total} vs current "
@@ -187,7 +189,7 @@ def main(ckpt_dir: Path) -> None:
     param_groups = [
         {"params": proj_params, "lr": proj_lr, "base_lr": proj_lr},
         {"params": decoder_params, "lr": decoder_lr, "base_lr": decoder_lr},
-        {"params": compressor_params, "lr": encoder_lr, "base_lr": encoder_lr},
+        {"params": l0_params, "lr": encoder_lr, "base_lr": encoder_lr},
     ]
 
     # -------- Build the exclude set for Muon (embed_tokens, lm_head) --------
@@ -207,7 +209,7 @@ def main(ckpt_dir: Path) -> None:
                 exclude_ids.add(id(p))
     except ImportError:
         pass
-    # Encoder compressor's embed_tokens is also 2D but should be Muon-excluded
+    # Encoder L0's embed_tokens is also 2D but should be Muon-excluded
     # per ``PruningDistillTrainer._muon_excluded_param_ids`` convention;
     # DecoderInitTrainer doesn't add it explicitly, so don't add it here.
 

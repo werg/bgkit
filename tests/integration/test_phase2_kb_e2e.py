@@ -490,7 +490,7 @@ def test_phase2_kb_e2e_pipeline(tmp_path: Path):
     #
     # Note: we drive training via the trainer's :meth:`_compute_sample_loss`
     # (single-sample path) rather than :meth:`_forward_backward`. The
-    # real ``_forward_backward`` reads ``self.encoder.compressor.hidden_dim``
+    # real ``_forward_backward`` reads ``self.encoder.l1.hidden_dim``
     # and the ``content`` tensor produced by the real ``_prepare_l1_turn``
     # — both require a real encoder. The single-sample path flows through
     # ``_build_decoder_segments`` → ``_prepare_sample_for_decode`` →

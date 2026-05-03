@@ -284,23 +284,24 @@ def live_verify(
         except TypeError:
             decoder_backbone.gradient_checkpointing_enable()
 
-    # Install LoRA adapters (both levels)
+    # Install LoRA adapters on L1 only — Phase 2 KB drops the L0 LoRA
+    # wrapper and trains ``encoder.l0`` weights directly in Stage A.
     router = LoRARouter.install(
-        encoder,
+        encoder.l1,
         target_names=DEFAULT_LORA_TARGETS,
-        levels={"l0": lora_rank, "l1": lora_rank},
+        levels={"l1": lora_rank},
         alpha=2.0 * lora_rank,
         dropout=0.0,
     )
     LoRARouter.bind(router)
     encoder.requires_grad_(False)
-    router.set_level_trainable("l0", True)
+    encoder.l0.requires_grad_(True)  # Stage A trains L0 directly.
     router.set_level_trainable("l1", True)
 
-    # Optimizer over decoder + LoRA params
+    # Optimizer over decoder + L0 (live) + L1 LoRA params
     trainable_params: list[nn.Parameter] = []
     trainable_params += [p for p in decoder.parameters() if p.requires_grad]
-    trainable_params += router.adapter_parameters("l0")
+    trainable_params += [p for p in encoder.l0.parameters() if p.requires_grad]
     trainable_params += router.adapter_parameters("l1")
     optim = torch.optim.AdamW(trainable_params, lr=1e-4)
 
@@ -314,7 +315,7 @@ def live_verify(
     # Build a flat (N_content, D) buffer with per-article cu_seqlens.
     n_articles = articles_per_bgkit
     article_len = doc_length
-    token_embeds = encoder.compressor.backbone.get_input_embeddings()
+    token_embeds = encoder.l0.backbone.get_input_embeddings()
     vocab_size = token_embeds.num_embeddings
 
     # All articles have the same length in this synthetic test; construct
@@ -331,31 +332,28 @@ def live_verify(
 
     print(f"[live] L0 forward: B={n_articles}, L={article_len}, "
           f"retention={l0_retention} ...")
-    with router.active("l0"):
-        if activation_checkpointing:
-            from torch.utils.checkpoint import checkpoint
+    if activation_checkpointing:
+        from torch.utils.checkpoint import checkpoint
 
-            def _run_l0(c, cu, pos, _enc=encoder):
-                return _enc(
-                    content_embeddings=c,
-                    content_cu_seqlens=cu,
-                    content_position_ids=pos,
-                    target_ratio=l0_retention,
-                    level="l0",
-                )
-
-            l0_out = checkpoint(
-                _run_l0, content_flat, l0_cu, l0_pos,
-                use_reentrant=False,
-            )
-        else:
-            l0_out = encoder(
-                content_embeddings=content_flat,
-                content_cu_seqlens=l0_cu,
-                content_position_ids=l0_pos,
+        def _run_l0(c, cu, pos, _enc=encoder):
+            return _enc.l0(
+                content_embeddings=c,
+                content_cu_seqlens=cu,
+                content_position_ids=pos,
                 target_ratio=l0_retention,
-                level="l0",
             )
+
+        l0_out = checkpoint(
+            _run_l0, content_flat, l0_cu, l0_pos,
+            use_reentrant=False,
+        )
+    else:
+        l0_out = encoder.l0(
+            content_embeddings=content_flat,
+            content_cu_seqlens=l0_cu,
+            content_position_ids=l0_pos,
+            target_ratio=l0_retention,
+        )
 
     # L0 survivors — flat (N_survivors, D) with per-article boundaries in
     # survivor_cu_seqlens.  Treat all articles' survivors as a single L1
@@ -380,12 +378,14 @@ def live_verify(
 
     l1_retention = 0.50
     print(f"[live] L1 forward: K_total={k_total}, query_len={query_len} ...")
+    # Bridge L0 survivors through L0's auto_repro_head into L1 input space.
+    bridged = encoder.l0.auto_reproduce(l0_surv_flat)
     with router.active("l1"):
         if activation_checkpointing:
             from torch.utils.checkpoint import checkpoint
 
             def _run_l1(c, c_cu, c_pos, qe, q_cu, q_pos, pp, _enc=encoder):
-                return _enc(
+                return _enc.l1(
                     content_embeddings=c,
                     content_cu_seqlens=c_cu,
                     content_position_ids=c_pos,
@@ -394,17 +394,16 @@ def live_verify(
                     prompt_position_ids=q_pos,
                     pinned_positions=pp,
                     target_ratio=l1_retention,
-                    level="l1",
                 )
 
             l1_out = checkpoint(
-                _run_l1, l0_surv_flat, l1_cu, l1_pos,
+                _run_l1, bridged, l1_cu, l1_pos,
                 query_emb, query_cu, query_pos, l1_pinned,
                 use_reentrant=False,
             )
         else:
-            l1_out = encoder(
-                content_embeddings=l0_surv_flat,
+            l1_out = encoder.l1(
+                content_embeddings=bridged,
                 content_cu_seqlens=l1_cu,
                 content_position_ids=l1_pos,
                 prompt_embeddings=query_emb,
@@ -412,7 +411,6 @@ def live_verify(
                 prompt_position_ids=query_pos,
                 pinned_positions=l1_pinned,
                 target_ratio=l1_retention,
-                level="l1",
             )
 
     l1_survivors = l1_out.survivor_embeddings  # (K1, D) flat

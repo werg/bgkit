@@ -1,8 +1,8 @@
 """Joint block pretraining trainer — packed FA4 form.
 
-Jointly pretrains the penultimate compressor layer (for auto-reproduction)
-and the projection block (for decoder alignment). Two-objective training
-loop where gradients flow freely between both objectives.
+Jointly pretrains L0's auto_reproduction head (the L0→L1 bridge) and the
+projection block (for decoder alignment). Two-objective training loop
+where gradients flow freely between both objectives.
 
 All inputs are packed: flat ``(N,)`` token IDs, ``cu_seqlens`` for
 segmentation, ``position_ids`` for per-sample RoPE. No ``attention_mask``.
@@ -58,7 +58,7 @@ def joint_block_collate_fn(batch: list[dict[str, torch.Tensor]]) -> dict[str, to
 class _ForwardResult:
     """Intermediate forward pass results for both objectives."""
 
-    comp_out: object  # CompressionOutput
+    comp_out: object  # bgkit.models.encoder.EncoderOutput
     auto_repro_pred: torch.Tensor  # (N_content, D) flat
     proj_content: torch.Tensor  # (N_content, D) flat projected embeddings
     loss_repro: torch.Tensor
@@ -127,7 +127,7 @@ class JointBlockTrainer(BaseTrainer):
             backbone.load_state_dict(merged_sd, strict=False)
             del decoder_for_slerp, sd_a, sd_b, merged_sd
 
-        # Construct encoder (splits backbone into compressor + projection block).
+        # Construct encoder (splits backbone into l0/l1 LevelCompressors + projection block).
         # Stay fully causal (-1): frozen backbone layers can't adapt to bidi masks,
         # and the task is too trivial to benefit. Step 2 handles the gradual warmup.
         self.encoder = BgKITEncoder.from_pretrained(
@@ -466,7 +466,7 @@ class JointBlockTrainer(BaseTrainer):
             "cosine_sim_proj": cos_proj.detach(),
         }
 
-        # Drop CompressionOutput tensor refs per release() contract.
+        # Drop EncoderOutput tensor refs per release() contract.
         fwd.comp_out.release()
 
         return metrics
