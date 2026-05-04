@@ -382,7 +382,14 @@ class BgKITEncoder(nn.Module):
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
     ) -> BgKITEncoder:
-        """Construct an encoder and load a state dict in the new split-L0/L1 layout."""
+        """Construct an encoder and load a state dict in the new split-L0/L1 layout.
+
+        Auto-migrates ``l{0,1}.backbone.norm.*`` → ``l{0,1}.norm.*`` for
+        checkpoints saved before the norm-placement fix (bug introduced
+        when the L0/L1 split rebuild dropped ``_set_norm_to_identity`` and
+        the legacy migration mistakenly routed the trained final-norm
+        weights into the backbone's Identity slot).
+        """
         pruned = any(k.startswith("l0.backbone.blocks.") for k in encoder_state_dict)
         encoder = cls.from_pretrained(
             backbone_name_or_module,
@@ -397,7 +404,30 @@ class BgKITEncoder(nn.Module):
             survivorship_inner_dim=survivorship_inner_dim,
             threshold_controller_cfg=threshold_controller_cfg,
         )
-        result = encoder.load_state_dict(encoder_state_dict, strict=False)
+
+        # One-shot migration: if a checkpoint was saved with the broken
+        # ``l{0,1}.backbone.norm.*`` keys, re-route them to ``l{0,1}.norm.*``.
+        migrated = dict(encoder_state_dict)
+        broken_keys = [
+            k for k in migrated
+            if k.startswith("l0.backbone.norm.") or k.startswith("l1.backbone.norm.")
+        ]
+        if broken_keys:
+            import logging
+            logger = logging.getLogger(__name__)
+            for k in broken_keys:
+                if k.startswith("l0.backbone.norm."):
+                    new_k = k.replace("l0.backbone.norm.", "l0.norm.", 1)
+                else:
+                    new_k = k.replace("l1.backbone.norm.", "l1.norm.", 1)
+                migrated[new_k] = migrated.pop(k)
+            logger.info(
+                "Auto-migrated %d legacy backbone-norm key(s) to level-norm slot "
+                "(fixes the double-norm regression introduced in the rebuild)",
+                len(broken_keys),
+            )
+
+        result = encoder.load_state_dict(migrated, strict=False)
         import logging
 
         logger = logging.getLogger(__name__)
@@ -478,7 +508,10 @@ class BgKITEncoder(nn.Module):
         - ``compressor.backbone.*`` (everything but the legacy norm-Identity slot)
           → ``l0.backbone.*`` (and deepcopy → ``l1.backbone.*``)
         - ``compressor.norm.*`` (the real norm; legacy backbone.norm was Identity)
-          → ``l0.backbone.norm.*`` (and clone → ``l1.backbone.norm.*``)
+          → ``l0.norm.*`` (and clone → ``l1.norm.*``). The new architecture
+          stores the final norm at the LevelCompressor level (``self.norm``)
+          to match the old invariant that ``backbone`` returns pre-norm
+          output.
         - ``compressor.survive_embedding`` → both ``l0.survive_embedding``
           and ``l1.survive_embedding``
         - ``compressor.prompt_separator_embedding`` → ``l0.prompt_separator_embedding``
@@ -522,8 +555,8 @@ class BgKITEncoder(nn.Module):
                 continue
             if k.startswith("compressor.norm."):
                 tail = k[len("compressor.norm."):]
-                migrated[f"l0.backbone.norm.{tail}"] = v
-                migrated[f"l1.backbone.norm.{tail}"] = v.clone()
+                migrated[f"l0.norm.{tail}"] = v
+                migrated[f"l1.norm.{tail}"] = v.clone()
                 continue
             if k == "compressor.survive_embedding":
                 migrated["l0.survive_embedding"] = v

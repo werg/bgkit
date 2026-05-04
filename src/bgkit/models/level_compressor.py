@@ -131,13 +131,13 @@ class LevelOutput:
     """
 
     # ---- Survivor outputs (downstream consumers see these) ----
-    survivor_embeddings: torch.Tensor          # (N_surv, D)
+    survivor_embeddings: torch.Tensor          # (N_surv, D) PRE-norm last-block
     survivor_cu_seqlens: torch.Tensor          # (B+1,) int32
     survivor_counts: torch.Tensor              # (B,) int64
     survivor_mask: torch.Tensor                # (N_content,) bool
 
     # ---- Full content axis (pre-selection) ----
-    content_embeddings: torch.Tensor           # (N_content, D) post-norm last-block
+    content_embeddings: torch.Tensor           # (N_content, D) PRE-norm last-block
     content_cu_seqlens: torch.Tensor           # (B+1,) int32
 
     # ---- Head + threshold internals ----
@@ -214,11 +214,35 @@ class LevelCompressor(nn.Module):
         with_prompt: bool = True,
         with_auto_repro: bool = False,
         head_layer_index: int | None = None,
+        norm: nn.Module | None = None,
     ):
         super().__init__()
         self.backbone = backbone
         self.hidden_dim = hidden_dim
         self.with_prompt = with_prompt
+
+        # Final norm lives at the LevelCompressor (level-owned), not at the
+        # backbone. Match the OLD pre-rebuild invariant: backbone returns
+        # pre-norm output; ``self.norm`` is applied by ``auto_reproduce``
+        # (which feeds an MSE-trained inverse mapper that expects post-norm
+        # input from Joint Block training); ``projection_block`` consumes the
+        # pre-norm survivors directly so its own ``output_norm`` is the FIRST
+        # RMSNorm applied (matches Step 2.5's training distribution).
+        # Steal the backbone's final norm into self.norm and replace the
+        # backbone's with Identity so it doesn't double-norm.
+        if norm is None:
+            backbone_norm = getattr(backbone, "norm", None)
+            if backbone_norm is None or isinstance(backbone_norm, nn.Identity):
+                # Fresh init (no norm to inherit) — instantiate a small RMSNorm.
+                # In practice this branch fires only in unit tests with stub
+                # backbones; production uses from_pretrained which always has a
+                # real norm to steal.
+                norm = nn.LayerNorm(hidden_dim)
+            else:
+                norm = backbone_norm
+        self.norm = norm
+        if hasattr(backbone, "norm") and not isinstance(backbone.norm, nn.Identity):
+            backbone.norm = nn.Identity()
 
         # Resolve which backbone layer fires the head hook. Pruned backbone has
         # 6 blocks -> hook at block 1 (~17% depth). Full Qwen3.5 has 24 layers
@@ -432,7 +456,7 @@ class LevelCompressor(nn.Module):
             position_ids=combined_pos,
             layer_hooks=hooks,
         )
-        hidden = backbone_out.last_hidden_state  # (N_total, D), post-norm
+        hidden = backbone_out.last_hidden_state  # (N_total, D), PRE-norm (backbone.norm = Identity)
 
         # Content-only view: (N_content, D)
         content_hidden = hidden[content_pos_mask]
@@ -489,13 +513,19 @@ class LevelCompressor(nn.Module):
         return out
 
     def auto_reproduce(self, embeddings: torch.Tensor) -> torch.Tensor:
-        """Map embeddings back to input embedding space (L0 only)."""
+        """Map pre-norm embeddings back to input embedding space (L0 only).
+
+        Applies ``self.norm`` first (Joint Block trained the head against
+        post-norm L0 outputs, but ``LevelOutput.content_embeddings`` and
+        ``survivor_embeddings`` are now pre-norm — see ``__init__`` for the
+        rationale). Callers pass pre-norm survivor or content embeddings.
+        """
         if self.auto_repro_head is None:
             raise RuntimeError(
                 "LevelCompressor was constructed with with_auto_repro=False; "
                 "auto_reproduce() is unavailable."
             )
-        return self.auto_repro_head(embeddings)
+        return self.auto_repro_head(self.norm(embeddings))
 
 
 def _gather_survivors_packed(

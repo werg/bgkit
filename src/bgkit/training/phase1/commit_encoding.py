@@ -73,6 +73,7 @@ class CommitEncodingTrainer(BaseTrainer):
 
     LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {
         # Stage transitions
+        "head_warmup_steps": "_head_warmup_steps",
         "stage0_end_step": "_stage0_end_step",
         "stage1_l1_ramp_start_step": "_stage1_l1_ramp_start_step",
         "stage1_l1_ramp_end_step": "_stage1_l1_ramp_end_step",
@@ -425,6 +426,18 @@ class CommitEncodingTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     def _init_curriculum_state(self, tcfg) -> None:
+        # Head warmup: initial window where backbones are frozen (both L0
+        # and L1) and only the heads + L0 auto_repro_head + projection_block
+        # + decoder LoRA train. Lets the bridge (auto_repro_head) and
+        # projection_block re-anchor against whatever input distribution
+        # they actually receive, before L1's backbone starts moving and
+        # contaminates the training signal. The architectural change
+        # to LevelCompressor.norm placement (and the survivor-subset +
+        # survive_embedding distribution shift compared to Joint Block's
+        # full-content training) means both load-bearing projections need
+        # gradient time to settle on a clean substrate.
+        # target_ratio during warmup is the stage 0 starting ratio (0.9).
+        self._head_warmup_steps = int(tcfg.get("head_warmup_steps", 500))
         self._stage0_end_step = int(tcfg.get("stage0_end_step", 3000))
         self._stage1_l1_ramp_start_step = int(
             tcfg.get("stage1_l1_ramp_start_step", 3000),
@@ -514,6 +527,9 @@ class CommitEncodingTrainer(BaseTrainer):
         the curriculum schedule.
         """
         if step < self._stage0_end_step:
+            # Stage 0 (incl. head_warmup as a freeze sub-phase). L0 ramp
+            # 0 → stage0_end_step; head_warmup only changes which params
+            # are trainable, not the ratio schedule.
             t = step / max(self._stage0_end_step, 1)
             t = max(0.0, min(1.0, t))
             ratio_l0 = (
@@ -600,7 +616,14 @@ class CommitEncodingTrainer(BaseTrainer):
         for module in always_trainable:
             module.requires_grad_(True)
 
-        if stage == "stage0" or stage == "stage1_frozen":
+        if stage == "head_warmup":
+            # Both backbones frozen; only heads + bridge + projection +
+            # decoder LoRA train. The L0 forward path is wrapped in
+            # torch.no_grad() too (l0_trainable=False) for memory.
+            self._l0_trainable_static = False
+            self._l1_trainable_static = False
+            # L1 backbone stays frozen — only its head fires gradient.
+        elif stage == "stage0" or stage == "stage1_frozen":
             self._l0_trainable_static = False
             self._l1_trainable_static = True
             self.encoder.l1.requires_grad_(True)
@@ -636,6 +659,8 @@ class CommitEncodingTrainer(BaseTrainer):
         )
 
     def _coarse_stage(self, step: int) -> str:
+        if step < self._head_warmup_steps:
+            return "head_warmup"
         if step < self._stage0_end_step:
             return "stage0"
         period = max(int(self._stage1_l0_unfrozen_period), 1)
@@ -859,12 +884,27 @@ class CommitEncodingTrainer(BaseTrainer):
         self._input_sources = {}
         if step1_checkpoint == "auto":
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
-            resolved = resolve_checkpoint(
-                checkpoint_dir,
-                phase="phase1_step4",
-                metric="eval/loss",
-                label="step1_checkpoint",
-            )
+            # Prefer the converted split-L0/L1 layout if a phase1_step4_split
+            # checkpoint exists; fall back to legacy phase1_step4 (which Step 5
+            # cannot consume directly — would need conversion).
+            resolved = None
+            for phase in ("phase1_step4_split", "phase1_step4"):
+                try:
+                    resolved = resolve_checkpoint(
+                        checkpoint_dir,
+                        phase=phase,
+                        metric="eval/loss",
+                        label="step1_checkpoint",
+                    )
+                    break
+                except (FileNotFoundError, RuntimeError, ValueError):
+                    continue
+            if resolved is None:
+                raise RuntimeError(
+                    "step1_checkpoint=auto but no phase1_step4_split or "
+                    "phase1_step4 checkpoint found. Run "
+                    "scripts/convert_step4_to_split_l0l1.py first.",
+                )
             step1_checkpoint = str(resolved)
         if step1_checkpoint is not None:
             self._input_sources["step1"] = Path(step1_checkpoint).name
@@ -1333,25 +1373,55 @@ class CommitEncodingTrainer(BaseTrainer):
 
     @torch.no_grad()
     def evaluate(self) -> dict[str, float]:
+        """Eval = present-survivor reconstruction loss + ablation gaps.
+
+        Three passes:
+          - ``present``: real encoder survivors (full eval set)
+          - ``zeroed``: survivors zeroed before splice (subset; ablation)
+          - ``noise``: survivors replaced by ``randn_like`` (subset; ablation)
+
+        Reports ``eval/loss`` (present) and ``eval/ablation/{loss,gap}_{zeroed,noise}``.
+        Positive ``gap_*`` means the encoder is contributing — the decoder's
+        reconstruction loss is lower with real survivors than with the ablated
+        substitute. ``gap`` near zero means the decoder is silently ignoring
+        the encoder.
+
+        Ablation passes run on a SUBSET (``eval.ablation_max_batches``,
+        default 100) and only every Nth eval (``eval.ablation_every_n_evals``,
+        default 1) so they don't dominate eval cost.
+        """
         self.encoder.eval()
         self.decoder.eval()
 
-        try:
+        target_ratio_l0, target_ratio_l1, _, _, _ = self._curriculum_state(
+            int(self.global_step),
+        )
+        eval_cfg = self.cfg.get("eval", {})
+        ablation_max_batches = int(eval_cfg.get("ablation_max_batches", 100))
+        ablation_every_n_evals = int(eval_cfg.get("ablation_every_n_evals", 1))
+        self._eval_count = getattr(self, "_eval_count", 0) + 1
+        do_ablation = (
+            ablation_max_batches > 0
+            and ablation_every_n_evals > 0
+            and (self._eval_count % ablation_every_n_evals == 0)
+        )
+
+        def _run_pass(survivor_transform, max_batches=None, label="present"):
+            """Loop over eval set, optionally transform survivors before splice."""
             total_loss = 0.0
             total_tokens = 0.0
-            target_ratio_l0, target_ratio_l1, _, _, _ = self._curriculum_state(
-                int(self.global_step),
-            )
-
             num_batches = len(self.eval_dataloader)
             for batch_idx, batch in enumerate(self.eval_dataloader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
                 if batch_idx % 100 == 0:
-                    logger.info("eval_progress", batch=batch_idx, total=num_batches)
-
+                    logger.info(
+                        "eval_progress", batch=batch_idx, total=num_batches,
+                        pass_label=label,
+                    )
                 loss_mask_flat = batch.get("target_loss_mask")
                 if loss_mask_flat is not None:
                     loss_mask_flat = loss_mask_flat.to(self.device).to(torch.bool)
-
                 with torch.autocast(
                     "cuda", dtype=torch.bfloat16,
                     enabled=self.device.type == "cuda",
@@ -1368,23 +1438,51 @@ class CommitEncodingTrainer(BaseTrainer):
                         target_ratio_l1=target_ratio_l1,
                         l0_trainable=False,
                     )
+                    if survivor_transform is not None:
+                        projected_survivors = survivor_transform(projected_survivors)
                     loss = self._decoder_forward_single_splice(
                         projected_survivors, projected_survivor_cu, batch,
                     )
-
                 if loss_mask_flat is not None:
                     batch_tokens = float(loss_mask_flat.sum().item())
                 else:
                     batch_tokens = float(batch["target_token_ids"].shape[0])
                 total_loss += float(loss.item()) * batch_tokens
                 total_tokens += batch_tokens
-
                 l0_out.release()
                 l1_out.release()
+            return total_loss / max(total_tokens, 1)
 
-            avg_loss = total_loss / max(total_tokens, 1)
-            perplexity = torch.exp(torch.tensor(avg_loss)).item()
-            return {"loss": avg_loss, "perplexity": perplexity}
+        try:
+            present_loss = _run_pass(survivor_transform=None, label="present")
+            results = {
+                "loss": present_loss,
+                "perplexity": torch.exp(torch.tensor(present_loss)).item(),
+            }
+            if do_ablation:
+                # Subset present-loss for fair gap arithmetic against subset ablations.
+                subset_present_loss = _run_pass(
+                    survivor_transform=None,
+                    max_batches=ablation_max_batches,
+                    label="present_subset",
+                )
+                zeroed_loss = _run_pass(
+                    survivor_transform=lambda s: torch.zeros_like(s),
+                    max_batches=ablation_max_batches,
+                    label="zeroed",
+                )
+                noise_loss = _run_pass(
+                    survivor_transform=lambda s: torch.randn_like(s) * s.std(),
+                    max_batches=ablation_max_batches,
+                    label="noise",
+                )
+                results["ablation/loss_present_subset"] = subset_present_loss
+                results["ablation/loss_zeroed"] = zeroed_loss
+                results["ablation/loss_noise"] = noise_loss
+                results["ablation/gap_zeroed"] = zeroed_loss - subset_present_loss
+                results["ablation/gap_noise"] = noise_loss - subset_present_loss
+                results["ablation/n_batches"] = float(ablation_max_batches)
+            return results
         finally:
             self.encoder.train()
             self.decoder.train()
@@ -1443,6 +1541,7 @@ class CommitEncodingTrainer(BaseTrainer):
 def _stage_id(stage_name: str) -> float:
     """Numeric stage id for wandb logging — float so the dict stays uniform."""
     return {
+        "head_warmup": -0.5,
         "stage0": 0.0,
         "stage1_frozen": 1.0,
         "stage1_unfrozen": 1.5,

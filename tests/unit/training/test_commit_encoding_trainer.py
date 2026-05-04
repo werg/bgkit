@@ -418,7 +418,11 @@ class TestCurriculum:
 
 class TestCoarseStage:
     def test_stage_names(self, trainer):
-        assert trainer._coarse_stage(0) == "stage0"
+        # First N steps = head_warmup (default 500): backbones frozen.
+        assert trainer._coarse_stage(0) == "head_warmup"
+        assert trainer._coarse_stage(499) == "head_warmup"
+        # After head_warmup, normal stage 0 (L0 ramp).
+        assert trainer._coarse_stage(500) == "stage0"
         assert trainer._coarse_stage(2999) == "stage0"
         # 3000 % 8 == 0 → stage1_unfrozen
         assert trainer._coarse_stage(3000) == "stage1_unfrozen"

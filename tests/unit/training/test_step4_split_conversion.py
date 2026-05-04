@@ -130,9 +130,12 @@ def _build_synthetic_legacy_state_dict(template_encoder: BgKITEncoder) -> dict[s
     new_sd = template_encoder.state_dict()
 
     for k, v in new_sd.items():
-        if k.startswith("l0.backbone.norm."):
-            tail = k[len("l0.backbone.norm."):]
+        if k.startswith("l0.norm."):
+            tail = k[len("l0.norm."):]
             legacy[f"compressor.norm.{tail}"] = v.clone()
+        elif k.startswith("l1.norm."):
+            # l1 norm in legacy was the same as l0; migration clones.
+            continue
         elif k.startswith("l0.backbone."):
             tail = k[len("l0.backbone."):]
             legacy[f"compressor.backbone.{tail}"] = v.clone()

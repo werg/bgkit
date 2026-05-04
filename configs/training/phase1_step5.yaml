@@ -9,15 +9,19 @@ decoder_lr: 5.0e-5
 warmup_steps: 500
 bidi_warmup_steps: 0           # already bidirectional from previous steps
 
-# ---- Two-stage curriculum (all live-tunable via control.json) ----
+# ---- Three-phase curriculum (all live-tunable via control.json) ----
 # Stage transitions (steps).
-stage0_end_step: 3000           # stage 0 ends here (3000 steps of L0 ramp)
+head_warmup_steps: 500          # initial warmup: backbones frozen, only
+                                # heads + L0 auto_repro_head + projection_block
+                                # + decoder LoRA train. Lets the bridge and
+                                # decoder-anchor projection re-stabilize on the
+                                # post-rebuild input distribution before L1's
+                                # backbone starts moving.
+stage0_end_step: 3000           # L0 ramp finishes here (also stage 0 → 1 transition)
 stage1_l1_ramp_start_step: 3000 # L1 ratio ramp starts here
 stage1_l1_ramp_end_step: 5000   # L1 ratio ramp finishes here
 
-# L0 ratio curriculum (per-stage targets). The L0/L1 heads are pretrained
-# from Step 4 (head fires at the block 1 hook), so no head warmup is
-# needed — L0 starts ramping under no_grad immediately at step 0.
+# L0 ratio curriculum (per-stage targets).
 stage0_l0_ratio_start: 0.9      # stage 0 L0 ramp start
 stage0_l0_ratio_end: 0.15       # stage 0 L0 ramp end
 stage1_target_ratio_l0: 0.30    # stage 1 L0 steady state
