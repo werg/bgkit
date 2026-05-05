@@ -358,18 +358,26 @@ def trainer():
 
 
 class TestCurriculum:
-    def test_stage0_at_step0(self, trainer):
+    def test_phase_a_at_step0(self, trainer):
+        # Phase A (auto_repro_warmup, 0..499): ratios FORCED to 1.0
+        # so heads stay dormant and auto_repro_head + projection train
+        # against their familiar full-content distribution.
         ratio_l0, ratio_l1, l0_train, max_len, max_tok = trainer._curriculum_state(0)
-        # L0 ramp starts at 0.9.
-        assert abs(ratio_l0 - 0.9) < 1e-6
+        assert ratio_l0 == 1.0
         assert ratio_l1 == 1.0
         assert l0_train is False
         assert max_len == 2000
         assert max_tok == 8192
 
+    def test_phase_b_starts_ramp_after_phase_a(self, trainer):
+        # At step 500 (just past auto_repro_warmup), L0 ramp begins at 0.9.
+        ratio_l0, _, _, _, _ = trainer._curriculum_state(500)
+        assert abs(ratio_l0 - 0.9) < 1e-6
+
     def test_stage0_midpoint_ramp(self, trainer):
-        # midpoint between 0 and 3000 → t=0.5, ratio = 0.9 + 0.5*(0.15-0.9) = 0.525
-        ratio_l0, _, _, _, _ = trainer._curriculum_state(1500)
+        # Ramp spans 500 → 3000 (2500 steps). Midpoint at step 1750:
+        # t = (1750-500)/2500 = 0.5 → ratio = 0.9 + 0.5*(0.15-0.9) = 0.525
+        ratio_l0, _, _, _, _ = trainer._curriculum_state(1750)
         assert abs(ratio_l0 - 0.525) < 1e-6
 
     def test_stage0_just_before_end(self, trainer):
@@ -418,11 +426,16 @@ class TestCurriculum:
 
 class TestCoarseStage:
     def test_stage_names(self, trainer):
-        # First N steps = head_warmup (default 500): backbones frozen.
-        assert trainer._coarse_stage(0) == "head_warmup"
-        assert trainer._coarse_stage(499) == "head_warmup"
-        # After head_warmup, normal stage 0 (L0 ramp).
-        assert trainer._coarse_stage(500) == "stage0"
+        # Phase A — auto_repro_warmup (default 500 steps): ratios=1.0,
+        # backbones frozen, only auto_repro_head + projection train.
+        assert trainer._coarse_stage(0) == "auto_repro_warmup"
+        assert trainer._coarse_stage(499) == "auto_repro_warmup"
+        # Phase B — head_warmup (default 500 steps): backbones frozen,
+        # ratios start moving, heads fire.
+        assert trainer._coarse_stage(500) == "head_warmup"
+        assert trainer._coarse_stage(999) == "head_warmup"
+        # Phase C — stage 0: L1 backbone unfreezes, ratio continues ramp.
+        assert trainer._coarse_stage(1000) == "stage0"
         assert trainer._coarse_stage(2999) == "stage0"
         # 3000 % 8 == 0 → stage1_unfrozen
         assert trainer._coarse_stage(3000) == "stage1_unfrozen"
@@ -589,14 +602,14 @@ def _make_repo_batch(
 
 class TestForwardBackwardSmoke:
     def test_stage0_forward_backward(self, trainer):
-        """Stage 0 step (L0 frozen via no_grad, L1 trains, L0 ramp at start)."""
+        """Phase A (auto_repro_warmup): ratios=1.0, no compression."""
         trainer.global_step = 0
         batch = _make_repo_batch()
         result = trainer._forward_backward(batch)
         assert "loss" in result
         assert torch.isfinite(torch.tensor(result["loss"]))
-        # L0 starts at the ramp start (0.9).
-        assert abs(result["target_ratio_l0"] - 0.9) < 1e-6
+        # Phase A pins both ratios to 1.0.
+        assert result["target_ratio_l0"] == 1.0
         assert result["target_ratio_l1"] == 1.0
 
     def test_stage0_midpoint_forward_backward(self, trainer):

@@ -11,12 +11,17 @@ bidi_warmup_steps: 0           # already bidirectional from previous steps
 
 # ---- Three-phase curriculum (all live-tunable via control.json) ----
 # Stage transitions (steps).
-head_warmup_steps: 500          # initial warmup: backbones frozen, only
-                                # heads + L0 auto_repro_head + projection_block
-                                # + decoder LoRA train. Lets the bridge and
-                                # decoder-anchor projection re-stabilize on the
-                                # post-rebuild input distribution before L1's
-                                # backbone starts moving.
+auto_repro_warmup_steps: 500    # Phase A: backbones frozen + ratios FORCED
+                                # to 1.0 (no compression). Only auto_repro_head
+                                # + projection_block + decoder LoRA train.
+                                # Heads dormant. Lets the bridge and the
+                                # decoder-anchor projection re-anchor on their
+                                # TRAINED distribution (Joint Block / Step 2.5
+                                # were both at no-compression).
+head_warmup_steps: 500          # Phase B: backbones still frozen, ratios
+                                # start moving. Heads fire and train.
+                                # auto_repro_head + projection_block re-tune
+                                # as the input distribution shifts to compressed.
 stage0_end_step: 3000           # L0 ramp finishes here (also stage 0 → 1 transition)
 stage1_l1_ramp_start_step: 3000 # L1 ratio ramp starts here
 stage1_l1_ramp_end_step: 5000   # L1 ratio ramp finishes here

@@ -73,6 +73,7 @@ class CommitEncodingTrainer(BaseTrainer):
 
     LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {
         # Stage transitions
+        "auto_repro_warmup_steps": "_auto_repro_warmup_steps",
         "head_warmup_steps": "_head_warmup_steps",
         "stage0_end_step": "_stage0_end_step",
         "stage1_l1_ramp_start_step": "_stage1_l1_ramp_start_step",
@@ -426,17 +427,27 @@ class CommitEncodingTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     def _init_curriculum_state(self, tcfg) -> None:
-        # Head warmup: initial window where backbones are frozen (both L0
-        # and L1) and only the heads + L0 auto_repro_head + projection_block
-        # + decoder LoRA train. Lets the bridge (auto_repro_head) and
-        # projection_block re-anchor against whatever input distribution
-        # they actually receive, before L1's backbone starts moving and
-        # contaminates the training signal. The architectural change
-        # to LevelCompressor.norm placement (and the survivor-subset +
-        # survive_embedding distribution shift compared to Joint Block's
-        # full-content training) means both load-bearing projections need
-        # gradient time to settle on a clean substrate.
-        # target_ratio during warmup is the stage 0 starting ratio (0.9).
+        # Two-phase warmup before stage 0:
+        #
+        # Phase A (auto_repro_warmup): backbones FROZEN + ratios=1.0 (no
+        # compression). Only auto_repro_head + projection_block + decoder
+        # LoRA train (heads don't fire when ratio>=0.999). This re-anchors
+        # the bridge and decoder-projection on their TRAINED distribution
+        # — auto_repro_head was trained in Joint Block on full-content L0
+        # outputs (no compression, no survive_embedding); projection_block
+        # in Step 2.5 was anchored against decoder.embed_tokens(content_ids)
+        # at target_ratio=None. Phase A lets both fine-tune to the current
+        # backbone state without the additional compression/survive_embedding
+        # distribution shift confound.
+        #
+        # Phase B (head_warmup): backbones STILL frozen, ratios start moving
+        # (L0 ramps from 0.9, L1 at target 0.33). Heads fire and start
+        # training. auto_repro_head + projection_block re-tune as the
+        # input distribution shifts to compressed.
+        #
+        # Then stage 0: L1 backbone unfreezes, L0 stays no_grad-frozen,
+        # ratio ramps continue.
+        self._auto_repro_warmup_steps = int(tcfg.get("auto_repro_warmup_steps", 500))
         self._head_warmup_steps = int(tcfg.get("head_warmup_steps", 500))
         self._stage0_end_step = int(tcfg.get("stage0_end_step", 3000))
         self._stage1_l1_ramp_start_step = int(
@@ -526,11 +537,21 @@ class CommitEncodingTrainer(BaseTrainer):
         User overrides ``target_ratio_l0`` / ``target_ratio_l1`` win over
         the curriculum schedule.
         """
-        if step < self._stage0_end_step:
+        if step < self._auto_repro_warmup_steps:
+            # Phase A: ratios FORCED to 1.0 — no compression at either
+            # level. Heads dormant; auto_repro_head + projection_block
+            # + decoder LoRA train on their familiar distribution.
+            ratio_l0 = 1.0
+            ratio_l1 = 1.0
+            l0_trainable = False
+            max_sample_length = self._stage0_max_sample_length
+            max_batch_tokens = self._stage0_max_batch_tokens
+        elif step < self._stage0_end_step:
             # Stage 0 (incl. head_warmup as a freeze sub-phase). L0 ramp
-            # 0 → stage0_end_step; head_warmup only changes which params
-            # are trainable, not the ratio schedule.
-            t = step / max(self._stage0_end_step, 1)
+            # starts after auto_repro_warmup, completes at stage0_end_step.
+            ramp_offset = step - self._auto_repro_warmup_steps
+            ramp_span = max(self._stage0_end_step - self._auto_repro_warmup_steps, 1)
+            t = ramp_offset / ramp_span
             t = max(0.0, min(1.0, t))
             ratio_l0 = (
                 self._stage0_l0_ratio_start
@@ -616,13 +637,17 @@ class CommitEncodingTrainer(BaseTrainer):
         for module in always_trainable:
             module.requires_grad_(True)
 
-        if stage == "head_warmup":
-            # Both backbones frozen; only heads + bridge + projection +
-            # decoder LoRA train. The L0 forward path is wrapped in
-            # torch.no_grad() too (l0_trainable=False) for memory.
+        if stage == "auto_repro_warmup":
+            # Phase A: backbones frozen, ratios=1.0 (so heads don't fire,
+            # no head gradient). auto_repro_head + projection_block +
+            # decoder LoRA carry the gradient signal.
             self._l0_trainable_static = False
             self._l1_trainable_static = False
-            # L1 backbone stays frozen — only its head fires gradient.
+        elif stage == "head_warmup":
+            # Phase B: backbones still frozen, ratios start moving. Heads
+            # fire and train.
+            self._l0_trainable_static = False
+            self._l1_trainable_static = False
         elif stage == "stage0" or stage == "stage1_frozen":
             self._l0_trainable_static = False
             self._l1_trainable_static = True
@@ -659,7 +684,9 @@ class CommitEncodingTrainer(BaseTrainer):
         )
 
     def _coarse_stage(self, step: int) -> str:
-        if step < self._head_warmup_steps:
+        if step < self._auto_repro_warmup_steps:
+            return "auto_repro_warmup"
+        if step < self._auto_repro_warmup_steps + self._head_warmup_steps:
             return "head_warmup"
         if step < self._stage0_end_step:
             return "stage0"
@@ -1541,6 +1568,7 @@ class CommitEncodingTrainer(BaseTrainer):
 def _stage_id(stage_name: str) -> float:
     """Numeric stage id for wandb logging — float so the dict stays uniform."""
     return {
+        "auto_repro_warmup": -1.0,
         "head_warmup": -0.5,
         "stage0": 0.0,
         "stage1_frozen": 1.0,
