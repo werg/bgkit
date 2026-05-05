@@ -325,12 +325,14 @@ def test_legacy_step4_conversion_transfers_heads_and_survive_embedding():
                 p, torch.full_like(p, head_l0_sentinel),
             ), "legacy compressor.head_base_l0 should have been transferred to l0.head"
 
-    # L1 head should carry the L1 sentinel.
+    # L1 head should be a CLONE of L0 head (post-rebuild design intent —
+    # L1 is "another instance of the same bgkit network"; legacy
+    # compressor.head_base_l1 was barely trained and is dropped).
     for p in migrated.l1.head.parameters():
         if p.numel() > 0:
             assert torch.allclose(
-                p, torch.full_like(p, head_l1_sentinel),
-            ), "legacy compressor.head_base_l1 should have been transferred to l1.head"
+                p, torch.full_like(p, head_l0_sentinel),
+            ), "l1.head should be a clone of l0.head, not legacy head_base_l1"
 
     # Both survive_embeddings should carry the survive sentinel.
     assert torch.allclose(

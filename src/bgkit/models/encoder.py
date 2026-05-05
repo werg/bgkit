@@ -586,10 +586,18 @@ class BgKITEncoder(nn.Module):
             if k.startswith("compressor.head_base_l0."):
                 tail = k[len("compressor.head_base_l0."):]
                 migrated[f"l0.head.{tail}"] = v
+                # Clone L0 head into L1 head as well — in the post-rebuild
+                # architecture L1 is "another instance of the same bgkit
+                # network" and (assuming auto_repro_head bridges cleanly)
+                # sees the same input distribution L0 was trained on. The
+                # legacy compressor.head_base_l1 was barely trained (Step 4
+                # was L0-only) so cloning L0's trained weights gives L1 a
+                # much better starting point than transferring near-random
+                # head_base_l1 weights.
+                migrated[f"l1.head.{tail}"] = v.clone()
                 continue
             if k.startswith("compressor.head_base_l1."):
-                tail = k[len("compressor.head_base_l1."):]
-                migrated[f"l1.head.{tail}"] = v
+                # Drop legacy head_base_l1 — L1 head is cloned from L0 above.
                 continue
             if k.startswith("compressor."):
                 continue
