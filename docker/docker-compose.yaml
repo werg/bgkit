@@ -56,10 +56,11 @@ x-gpu-common: &gpu-common
     # toolchain; these dirs keep compiled artifacts out of the container layer.
     - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
     - TVM_CACHE_DIR=/workspace/.cache/tvm
-    # FlashQLA is the default GatedDeltaNet backend. Set
-    # BGKIT_GDN_BACKEND=fla for the explicit FLA escape hatch, or =auto to
-    # permit fallback when FlashQLA cannot import.
-    - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}
+    # FLA is the default GatedDeltaNet backend on sm_121. It carries the
+    # local Blackwell compatibility and GDR backward optimizations. Set
+    # BGKIT_GDN_BACKEND=flashqla for explicit FlashQLA testing, or =auto to
+    # prefer FlashQLA when it becomes faster and falls back cleanly.
+    - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
     # PYTHONPATH override: prepend the local flash-linear-attention fork so
     # `import fla` resolves to the bind-mounted blackwell-sm121-compat
     # branch (sm_121 detection + global_scratch allocator) instead of the
@@ -352,7 +353,7 @@ services:
       - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
       - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
       - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
-      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
     command: ["bash"]
 
   # Environment smoke test for the FlashQLA toolchain. This does not run the
@@ -378,7 +379,7 @@ services:
       - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
       - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
       - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.10}
-      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
     command: ["scripts/flashqla_env_smoke.py"]
 
   # FlashQLA parity smoke test. Runs scripts/test_flashqla_parity.py inside
@@ -404,7 +405,7 @@ services:
       - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
       - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
       - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
-      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
     command: ["scripts/test_flashqla_parity.py"]
 
   # Lightweight backend timing harness for FLA vs FlashQLA after the sm_121
@@ -430,7 +431,7 @@ services:
       - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
       - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
       - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
-      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-flashqla}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
     command: ["scripts/profile_flashqla_backend.py", "--backend", "both"]
 
   preprocess:

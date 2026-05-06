@@ -42,13 +42,16 @@ Two concerns are addressed here:
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 
-from bgkit.utils.gdn_backend import get_chunk_gated_delta_rule, resolved_backend_name
+from bgkit.utils.gdn_backend import (
+    get_chunk_gated_delta_rule,
+    requested_backend_name,
+    resolved_backend_name,
+)
 
 if TYPE_CHECKING:
     pass
@@ -75,28 +78,36 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
     if not hasattr(layer, "chunk_gated_delta_rule"):
         return
 
-    # Unwrap any previous patch to stay idempotent.
-    original_fn = getattr(layer, "_unpatch_chunk_gdr", None) or layer.chunk_gated_delta_rule
-    original_forward = getattr(layer, "_unpatch_forward", None) or layer.forward
-
-    # ---- 0. Backend swap: if BGKIT_GDN_BACKEND selects a non-fla backend,
-    #         replace the original_fn with the resolver's pick. The HF default
-    #         (assigned in Qwen3_5GatedDeltaNet.__init__) is the Triton fla
-    #         path; we override here so all subsequent wrapping (gate clamp,
-    #         cu_seqlens injection) operates on the resolved backend.
+    # Unwrap any previous patch to stay idempotent. Read from the instance dict
+    # so MagicMock-style dynamic __getattr__ does not manufacture truthy
+    # "_unpatch_*" attributes that were never installed by this patch.
     try:
-        backend_fn = get_chunk_gated_delta_rule()
-    except Exception as exc:  # pragma: no cover — surfaces clearly if BGKIT_GDN_BACKEND=flashqla
-        # Re-raise: the user explicitly opted into a backend that can't load.
-        # We must not silently fall back to the HF default and pretend nothing
-        # happened.
-        raise RuntimeError(f"deltanet_patch: gdn backend resolution failed: {exc}") from exc
-    if backend_fn is not original_fn:
-        # Backend differs from what HF wired up. Replace original_fn so the
-        # gate-clamp and cu_seqlens wrappers below dispatch through the
-        # selected backend. Stash the resolver pick under a separate attr
-        # for future patches' idempotency check.
-        original_fn = backend_fn
+        layer_vars = vars(layer)
+    except TypeError:
+        layer_vars = {}
+    original_fn = layer_vars.get("_unpatch_chunk_gdr") or layer.chunk_gated_delta_rule
+    original_forward = layer_vars.get("_unpatch_forward") or layer.forward
+
+    # ---- 0. Backend swap: replace the HF-wired callable with the resolver's
+    #         pick unless the operator requested the FLA path. The HF default
+    #         assigned in Qwen3_5GatedDeltaNet.__init__ is already an FLA
+    #         callable; BgKIT's default remains FLA on sm_121. FlashQLA and
+    #         auto modes resolve here before gate-clamp and cu_seqlens wrapping.
+    #
+    # BGKIT_GDN_BACKEND=fla preserves whatever HF wired up. That keeps the
+    # optimized FLA path available without forcing a second resolver import.
+    _gdn_choice = requested_backend_name()
+    if _gdn_choice != "fla":
+        try:
+            backend_fn = get_chunk_gated_delta_rule()
+        except Exception as exc:
+            # Re-raise: the configured backend could not load. We must not
+            # silently fall back to the HF default and pretend nothing happened.
+            raise RuntimeError(
+                f"deltanet_patch: gdn backend resolution failed: {exc}"
+            ) from exc
+        if backend_fn is not original_fn:
+            original_fn = backend_fn
 
     # ---- 1. Patch chunk_gated_delta_rule: clamp g + forward cu_seqlens ----
 
@@ -222,7 +233,7 @@ def patch_gated_delta_rule_numerics(
                 "cu_seqlens varlen path enabled, gdn_backend=%s",
                 count,
                 g_clamp_min,
-                resolved_backend_name() or "<unresolved>",
+                resolved_backend_name() or requested_backend_name(),
             )
         return
 
@@ -250,5 +261,70 @@ def patch_gated_delta_rule_numerics(
         "(prevents backward NaN); cu_seqlens varlen path enabled; "
         "gdn_backend=%s (resolves on first layer init)",
         g_clamp_min,
-        os.environ.get("BGKIT_GDN_BACKEND", "fla").strip().lower(),
+        requested_backend_name(),
+    )
+
+
+def patch_fused_rms_norm_gated_for_sm121() -> None:
+    """Replace fla.modules.FusedRMSNormGated.forward with a pure-PyTorch fallback.
+
+    Why: fla's ``layer_norm_gated_bwd`` Triton kernel deadlocks on sm_121
+    on certain shapes — observed as a hang at random training steps after
+    ~1000-2000 steps (py-spy stack: ``backward → layer_norm_gated_bwd``,
+    GPU at 96 percent in an unkillable spin). Replacing the autograd
+    Function-wrapped fused kernel with naive PyTorch RMSNorm + gate ops
+    sidesteps the problem at the cost of higher activation memory and
+    slower per-step compute. Idempotent.
+    """
+    try:
+        from fla.modules import fused_norm_gate as _fng
+    except ImportError:
+        logger.warning(
+            "fla.modules.fused_norm_gate not found; skipping FusedRMSNormGated patch"
+        )
+        return
+
+    cls = getattr(_fng, "FusedRMSNormGated", None)
+    if cls is None:
+        return
+    if getattr(cls, "_bgkit_sm121_patched", False):
+        return
+
+    import torch.nn.functional as F
+
+    def _fallback_forward(
+        self,
+        x,
+        g,
+        residual=None,
+        prenorm: bool = False,
+        residual_in_fp32: bool = False,
+    ):
+        compute_dtype = torch.float32
+        x_in = x.to(compute_dtype) if residual_in_fp32 else x
+        if residual is not None:
+            res = residual.to(compute_dtype) if residual_in_fp32 else residual
+            x_in = x_in + res
+        residual_out = x_in
+        var = x_in.pow(2).mean(dim=-1, keepdim=True)
+        x_normed = x_in * torch.rsqrt(var + self.eps)
+        if self.elementwise_affine and self.weight is not None:
+            x_normed = x_normed * self.weight.to(x_normed.dtype)
+        if self.activation in ("swish", "silu"):
+            gate = F.silu(g.to(x_normed.dtype))
+        elif self.activation == "sigmoid":
+            gate = torch.sigmoid(g.to(x_normed.dtype))
+        else:
+            raise ValueError(f"Unsupported activation: {self.activation}")
+        out = x_normed * gate
+        out = out.to(x.dtype)
+        if prenorm:
+            return out, residual_out.to(x.dtype)
+        return out
+
+    cls.forward = _fallback_forward
+    cls._bgkit_sm121_patched = True
+    logger.info(
+        "FusedRMSNormGated patched: pure-PyTorch fallback (sidesteps "
+        "layer_norm_gated_bwd Triton hang on sm_121)."
     )

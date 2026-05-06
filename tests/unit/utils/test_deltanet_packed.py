@@ -54,6 +54,12 @@ def _build_cu_seqlens(lengths: list[int], device: str = "cpu") -> torch.Tensor:
     return torch.tensor(cumlen, dtype=torch.long, device=device)
 
 
+@pytest.fixture(autouse=True)
+def _use_fla_escape_hatch(monkeypatch):
+    """Most tests in this module verify patch wiring against fake/FLA callables."""
+    monkeypatch.setenv("BGKIT_GDN_BACKEND", "fla")
+
+
 # ---------------------------------------------------------------------------
 # CPU wiring tests (no GPU / fla kernel needed)
 # ---------------------------------------------------------------------------

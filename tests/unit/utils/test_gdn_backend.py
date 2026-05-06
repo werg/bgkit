@@ -79,9 +79,10 @@ class TestBackendChoice:
         monkeypatch.setenv("BGKIT_GDN_BACKEND", "auto")
         assert gdn_backend._backend_choice() == "auto"
 
-    def test_unknown_falls_back_to_fla(self, monkeypatch):
+    def test_unknown_is_rejected(self, monkeypatch):
         monkeypatch.setenv("BGKIT_GDN_BACKEND", "tinkerbell")
-        assert gdn_backend._backend_choice() == "fla"
+        with pytest.raises(ValueError, match="BGKIT_GDN_BACKEND"):
+            gdn_backend._backend_choice()
 
     def test_case_insensitive(self, monkeypatch):
         monkeypatch.setenv("BGKIT_GDN_BACKEND", "FlashQLA")
@@ -107,6 +108,13 @@ class TestResolution:
         assert fn is sentinel
         assert gdn_backend.resolved_backend_name() == "fla"
 
+    def test_explicit_fla_resolves_to_fla(self, monkeypatch):
+        monkeypatch.setenv("BGKIT_GDN_BACKEND", "fla")
+        sentinel = self._install_fla()
+        fn = gdn_backend.get_chunk_gated_delta_rule()
+        assert fn is sentinel
+        assert gdn_backend.resolved_backend_name() == "fla"
+
     def test_explicit_flashqla(self, monkeypatch):
         monkeypatch.setenv("BGKIT_GDN_BACKEND", "flashqla")
         sentinel = self._install_flashqla()
@@ -116,8 +124,11 @@ class TestResolution:
 
     def test_explicit_flashqla_missing_raises(self, monkeypatch):
         monkeypatch.setenv("BGKIT_GDN_BACKEND", "flashqla")
-        # flash_qla NOT installed in sys.modules; ensure absence.
-        sys.modules.pop("flash_qla", None)
+        monkeypatch.setattr(
+            gdn_backend,
+            "_import_flashqla",
+            lambda: (_ for _ in ()).throw(ImportError("missing")),
+        )
         with pytest.raises(RuntimeError, match="FlashQLA could not be imported"):
             gdn_backend.get_chunk_gated_delta_rule()
 
@@ -131,7 +142,11 @@ class TestResolution:
 
     def test_auto_falls_back_to_fla(self, monkeypatch):
         monkeypatch.setenv("BGKIT_GDN_BACKEND", "auto")
-        sys.modules.pop("flash_qla", None)
+        monkeypatch.setattr(
+            gdn_backend,
+            "_import_flashqla",
+            lambda: (_ for _ in ()).throw(ImportError("missing")),
+        )
         fla_sentinel = self._install_fla()
         fn = gdn_backend.get_chunk_gated_delta_rule()
         assert fn is fla_sentinel
@@ -156,7 +171,7 @@ class TestResolution:
         monkeypatch.setenv("BGKIT_GDN_BACKEND", "flashqla")
 
         # Build a module that raises ValueError on attribute access of
-        # chunk_gated_delta_rule, mimicking the hopper-only gate.
+        # chunk_gated_delta_rule, mimicking an architecture gate.
         class _RaisingModule(types.ModuleType):
             def __getattr__(self, name):
                 if name == "chunk_gated_delta_rule":
@@ -167,16 +182,26 @@ class TestResolution:
         with pytest.raises(RuntimeError, match="FlashQLA"):
             gdn_backend.get_chunk_gated_delta_rule()
 
+    def test_describe_backend_environment_does_not_import_flashqla(self, monkeypatch):
+        monkeypatch.setenv("BGKIT_GDN_BACKEND", "flashqla")
+        sys.modules.pop("flash_qla", None)
+
+        info = gdn_backend.describe_backend_environment()
+
+        assert info["requested_backend"] == "flashqla"
+        assert info["resolved_backend"] is None
+        assert "flash_qla" not in sys.modules
+        assert "modules" in info
+        assert "cuda" in info
+        assert "tilelang" in info
+
 
 class TestDeltanetPatchIntegration:
-    """Verify deltanet_patch consults the resolver only when explicitly opted in.
+    """Verify deltanet_patch uses FLA by default and FlashQLA when explicit.
 
-    The default path (``BGKIT_GDN_BACKEND`` unset or =fla) preserves whatever
-    HF wired up on the layer — important for the bit-for-bit-same-as-pre-resolver
-    behavior in production. Uses a real object (not MagicMock) for the layer
-    so the existing class-level pre-existing bug (MagicMock auto-attribbing
-    _unpatch_chunk_gdr to a truthy mock and shadowing the sentinel) doesn't
-    confuse this test.
+    Uses a real object (not MagicMock) for the layer so the existing
+    class-level pre-existing bug (MagicMock auto-attribbing _unpatch_chunk_gdr
+    to a truthy mock and shadowing the sentinel) doesn't confuse this test.
     """
 
     def _make_layer(self, gdr_fn):
@@ -192,12 +217,29 @@ class TestDeltanetPatchIntegration:
         layer.forward = lambda *a, **kw: ("orig-forward", None)
         return layer
 
-    def test_patch_default_preserves_layer_fn(self, monkeypatch):
-        """With BGKIT_GDN_BACKEND unset, the patched chunk_gated_delta_rule still
-        dispatches to the layer's original implementation (gate-clamp wrap only)."""
+    def test_patch_default_preserves_fla(self, monkeypatch):
+        """With BGKIT_GDN_BACKEND unset, the HF-wired FLA callable is kept."""
         from bgkit.utils import deltanet_patch
 
         monkeypatch.delenv("BGKIT_GDN_BACKEND", raising=False)
+
+        hf_calls = []
+
+        def hf_default(*args, **kwargs):
+            hf_calls.append((args, kwargs))
+            return ("hf-default", None)
+
+        layer = self._make_layer(hf_default)
+        deltanet_patch.patch_deltanet_layer(layer)
+
+        layer.chunk_gated_delta_rule("q", "k", "v", g=__import__("torch").zeros(3), beta="beta")
+        assert len(hf_calls) == 1
+
+    def test_patch_explicit_fla_preserves_layer_fn(self, monkeypatch):
+        """BGKIT_GDN_BACKEND=fla keeps the HF-wired FLA callable as escape hatch."""
+        from bgkit.utils import deltanet_patch
+
+        monkeypatch.setenv("BGKIT_GDN_BACKEND", "fla")
 
         calls = []
 

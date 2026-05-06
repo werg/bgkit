@@ -10,6 +10,37 @@ for required in src/bgkit/__init__.py scripts/train.py configs/config.yaml; do
     fi
 done
 
+backend_choice="$(printf '%s' "${BGKIT_GDN_BACKEND:-fla}" | tr '[:upper:]' '[:lower:]')"
+case "$backend_choice" in
+    fla)
+        ;;
+    flashqla|auto)
+        if [ ! -f /workspace/flashqla/flash_qla/__init__.py ]; then
+            if [ "$backend_choice" = "flashqla" ]; then
+                echo "FATAL: BGKIT_GDN_BACKEND=flashqla but /workspace/flashqla is not mounted." >&2
+                exit 6
+            fi
+            echo "WARNING: BGKIT_GDN_BACKEND=auto but /workspace/flashqla is not mounted; auto will fall back to fla." >&2
+        fi
+        if ! python - <<'PY'
+import importlib.util
+
+raise SystemExit(0 if importlib.util.find_spec("tilelang") is not None else 1)
+PY
+        then
+            if [ "$backend_choice" = "flashqla" ]; then
+                echo "FATAL: BGKIT_GDN_BACKEND=flashqla but tilelang is not importable in the image." >&2
+                exit 7
+            fi
+            echo "WARNING: BGKIT_GDN_BACKEND=auto but tilelang is not importable; auto will fall back to fla." >&2
+        fi
+        ;;
+    *)
+        echo "FATAL: BGKIT_GDN_BACKEND=$backend_choice is invalid. Valid values: flashqla, fla, auto." >&2
+        exit 8
+        ;;
+esac
+
 bootstrap_flash_attn_native() {
     # Build FlashAttention's native CUDA extension against the container's own
     # torch/libc10 when running on SM12x. The host checkout is bind-mounted
@@ -195,6 +226,10 @@ bootstrap_flash_attn_native
 # Print source hash so logs always show which code is running
 hash=$(find /workspace/bgkit/src -name '*.py' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12)
 echo "bgkit source hash: $hash"
+if [ -d /workspace/flashqla/flash_qla ]; then
+    flashqla_hash=$(find /workspace/flashqla/flash_qla -name '*.py' -print0 | sort -z | xargs -0 -r sha256sum | sha256sum | cut -c1-12 || true)
+    echo "flashqla source hash: ${flashqla_hash:-unavailable}"
+fi
 python -c "import bgkit; print(f'bgkit {bgkit.__version__}')"
 
 # If the first arg is a .py script, run it with python.

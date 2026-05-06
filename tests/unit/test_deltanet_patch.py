@@ -14,6 +14,12 @@ from bgkit.utils.deltanet_patch import (
     patch_gated_delta_rule_numerics,
 )
 
+
+@pytest.fixture(autouse=True)
+def _use_fla_escape_hatch(monkeypatch):
+    """These tests exercise clamp/packed wiring against the layer's own fake GDR."""
+    monkeypatch.setenv("BGKIT_GDN_BACKEND", "fla")
+
 # ---------------------------------------------------------------------------
 # patch_deltanet_layer
 # ---------------------------------------------------------------------------
