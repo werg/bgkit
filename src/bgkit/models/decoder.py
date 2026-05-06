@@ -25,6 +25,7 @@ constructed or passed.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import structlog
@@ -36,6 +37,12 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from bgkit.utils.packing import position_ids_from_cu
 
 logger = structlog.get_logger()
+
+DEFAULT_LM_CE_CHUNK_SIZE = int(os.environ.get("BGKIT_DECODER_CE_CHUNK_SIZE", "1024"))
+
+
+def _resolve_ce_chunk_size(chunk_size: int | None) -> int:
+    return DEFAULT_LM_CE_CHUNK_SIZE if chunk_size is None else int(chunk_size)
 
 
 @dataclass
@@ -128,7 +135,7 @@ def _chunked_lm_ce(
     target_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     loss_mask: torch.Tensor | None,
-    chunk_size: int,
+    chunk_size: int | None,
 ) -> torch.Tensor:
     """CE loss without materializing full (B, S, V) logits tensor.
 
@@ -144,6 +151,7 @@ def _chunked_lm_ce(
     if loss_mask is not None:
         shift_mask = shift_mask * loss_mask[:, 1:].float()
 
+    chunk_size = _resolve_ce_chunk_size(chunk_size)
     _b, seq_len, _h = shift_hidden.shape
     weighted_sum = shift_hidden.new_zeros(())
 
@@ -403,7 +411,7 @@ class ReconstructionDecoder(nn.Module):
         prefix_ids: list[torch.Tensor],
         suffix_ids: list[torch.Tensor],
         loss_mask: torch.Tensor | None = None,
-        chunk_size: int = 256,
+        chunk_size: int | None = None,
         return_hidden_states: bool = False,
     ) -> torch.Tensor | InterleavedForwardOutput:
         """Forward + loss with one embedding splice per sample — packed path.
@@ -718,7 +726,7 @@ class ReconstructionDecoder(nn.Module):
         token_ids_full: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask_full: torch.Tensor | None,
-        chunk_size: int,
+        chunk_size: int | None,
     ) -> torch.Tensor:
         """Dispatch CE computation: Liger fused path if available, else chunked.
 
@@ -729,6 +737,7 @@ class ReconstructionDecoder(nn.Module):
         Otherwise we stay on the existing ``_chunked_lm_ce`` path for exact
         backward compatibility.
         """
+        chunk_size = _resolve_ce_chunk_size(chunk_size)
         use_liger = getattr(self, "_use_liger_ce", False)
         if use_liger:
             from bgkit.utils.liger_integration import (
@@ -812,7 +821,7 @@ class ReconstructionDecoder(nn.Module):
         segments: list[Segment],
         *,
         attention_mask: torch.Tensor | None = None,
-        chunk_size: int = 256,
+        chunk_size: int | None = None,
         return_hidden_states: bool = False,
     ) -> torch.Tensor | InterleavedForwardOutput:
         """Forward + loss over a heterogeneous segment sequence.

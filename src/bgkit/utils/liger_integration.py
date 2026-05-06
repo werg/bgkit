@@ -38,6 +38,7 @@ The two entry points used by the rest of the codebase are:
 from __future__ import annotations
 
 import contextlib
+import os
 import warnings
 from typing import Any
 
@@ -376,6 +377,63 @@ def _try_import_liger_fused_ce():
         return None, None
 
 
+def _ceildiv(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def _next_power_of_2(n: int) -> int:
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def _estimated_liger_ce_chunks(num_tokens: int, hidden_dim: int, vocab_size: int) -> int:
+    """Mirror Liger's internal token chunking heuristic for fused CE."""
+    inc_factor = _ceildiv(vocab_size, hidden_dim)
+    chunk_size = _next_power_of_2(_ceildiv(num_tokens, inc_factor))
+    return _ceildiv(num_tokens, chunk_size)
+
+
+def _should_use_liger_ce(num_tokens: int, hidden_dim: int, vocab_size: int) -> bool:
+    if os.environ.get("BGKIT_FORCE_LIGER_CE") == "1":
+        return True
+    if os.environ.get("BGKIT_DISABLE_LIGER_CE") == "1":
+        return False
+
+    max_chunks = int(os.environ.get("BGKIT_LIGER_CE_MAX_INTERNAL_CHUNKS", "64"))
+    return _estimated_liger_ce_chunks(num_tokens, hidden_dim, vocab_size) <= max_chunks
+
+
+def _fallback_chunked_ce_loss(
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    lm_head_bias: torch.Tensor | None,
+    labels: torch.Tensor,
+    mask: torch.Tensor | None,
+    chunk_size: int | None,
+) -> torch.Tensor:
+    from bgkit.models.decoder import _chunked_lm_ce
+
+    b, s, _ = hidden_states.shape
+    attn = hidden_states.new_ones(b, s, dtype=torch.float32)
+
+    class _TempHead(nn.Module):
+        def __init__(self, w, bias):
+            super().__init__()
+            self.weight = w
+            self.bias = bias
+
+    head = _TempHead(lm_head_weight, lm_head_bias)
+    return _chunked_lm_ce(
+        head,
+        hidden_states,
+        labels,
+        attn,
+        mask if mask is not None else None,
+        chunk_size,
+    )
+
+
 def liger_chunked_ce_loss(
     hidden_states: torch.Tensor,
     lm_head_weight: torch.Tensor,
@@ -395,9 +453,12 @@ def liger_chunked_ce_loss(
       where ``mask[:, 1:]`` is zero contribute 0 loss and the denominator
       excludes them.
 
-    When Liger's fused kernel is available it is used directly. Otherwise
-    we fall back to :func:`bgkit.models.decoder._chunked_lm_ce`, preserving
-    the existing (slower, logits-materializing) chunked path.
+    When Liger's fused kernel is available and its internal token chunking is
+    reasonable, it is used directly. Qwen3.5's 248K vocab can otherwise push
+    Liger into hundreds of tiny matmuls on GB10, so the dispatcher falls back
+    to :func:`bgkit.models.decoder._chunked_lm_ce` unless
+    ``BGKIT_FORCE_LIGER_CE=1`` is set. ``BGKIT_LIGER_CE_MAX_INTERNAL_CHUNKS``
+    controls the auto-fallback threshold; default is 64.
 
     Returns:
         Scalar mean loss over unmasked positions.
@@ -415,6 +476,16 @@ def liger_chunked_ce_loss(
             torch.full_like(shift_labels, ignore_index),
         )
 
+    if not (shift_hidden.is_cuda and lm_head_weight.is_cuda and shift_labels.is_cuda):
+        return _fallback_chunked_ce_loss(
+            hidden_states,
+            lm_head_weight,
+            lm_head_bias,
+            labels,
+            mask,
+            chunk_size,
+        )
+
     fused_cls, kind = (None, None)
     if is_liger_available():
         fused_cls, kind = _try_import_liger_fused_ce()
@@ -422,27 +493,12 @@ def liger_chunked_ce_loss(
     if fused_cls is None:
         # Fallback: reuse the existing chunked CE path from decoder.py so we
         # never regress behaviour on non-Liger runs (host tests, etc.).
-        from bgkit.models.decoder import _chunked_lm_ce
-
-        # Re-wrap into the form _chunked_lm_ce expects: it re-applies its own
-        # shift internally, so pass the unshifted tensors + an all-ones
-        # attention_mask and the *original* ``mask`` as ``loss_mask``.
-        b, s, _ = hidden_states.shape
-        attn = hidden_states.new_ones(b, s, dtype=torch.float32)
-
-        class _TempHead(nn.Module):
-            def __init__(self, w, bias):
-                super().__init__()
-                self.weight = w
-                self.bias = bias
-
-        head = _TempHead(lm_head_weight, lm_head_bias)
-        return _chunked_lm_ce(
-            head,
+        return _fallback_chunked_ce_loss(
             hidden_states,
+            lm_head_weight,
+            lm_head_bias,
             labels,
-            attn,
-            mask if mask is not None else None,
+            mask,
             chunk_size,
         )
 
@@ -452,12 +508,30 @@ def liger_chunked_ce_loss(
     bsz, seq, hidden = shift_hidden.shape
     flat_hidden = shift_hidden.reshape(bsz * seq, hidden)
     flat_labels = shift_labels.reshape(bsz * seq)
+    if not _should_use_liger_ce(
+        num_tokens=flat_hidden.shape[0],
+        hidden_dim=hidden,
+        vocab_size=lm_head_weight.shape[0],
+    ):
+        return _fallback_chunked_ce_loss(
+            hidden_states,
+            lm_head_weight,
+            lm_head_bias,
+            labels,
+            mask,
+            chunk_size,
+        )
 
     if kind == "module":
         loss_mod = fused_cls(ignore_index=ignore_index, reduction="mean")
         loss = loss_mod(lm_head_weight, flat_hidden, flat_labels, lm_head_bias)
     else:  # "functional"
-        loss = fused_cls.apply(
-            flat_hidden, lm_head_weight, flat_labels, lm_head_bias, ignore_index,
+        loss, _z_loss, _acc, _pred = fused_cls.apply(
+            flat_hidden,
+            lm_head_weight,
+            flat_labels,
+            lm_head_bias,
+            None,
+            ignore_index,
         )
     return loss

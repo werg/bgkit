@@ -1,6 +1,6 @@
 """Unit tests for :mod:`bgkit.utils.liger_integration`.
 
-These tests run on CPU without liger-kernel installed. They exercise:
+These tests run on CPU and force the no-Liger paths where needed. They exercise:
 
 - the no-op behaviour of ``apply_liger_to_qwen35`` when the package is
   absent (should warn once, return 0, never raise);
@@ -49,6 +49,7 @@ def _reset_availability_cache():
 class TestApplyLigerToQwen35Fallback:
     def test_no_liger_installed_returns_zero(self):
         """Without liger-kernel installed the helper must return 0 cleanly."""
+        liger_integration._LIGER_AVAILABLE = False
         assert not is_liger_available()
         model = nn.Linear(4, 4)
         with warnings.catch_warnings(record=True) as caught:
@@ -61,6 +62,7 @@ class TestApplyLigerToQwen35Fallback:
     def test_no_liger_warning_is_one_shot(self):
         """Calling twice without liger should still just return 0 and not
         crash. The warning is throttled after the first emission."""
+        liger_integration._LIGER_AVAILABLE = False
         model = nn.Linear(4, 4)
         apply_liger_to_qwen35(model)  # triggers the warning
         with warnings.catch_warnings(record=True) as caught:
