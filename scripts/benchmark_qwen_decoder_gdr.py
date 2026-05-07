@@ -220,6 +220,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ce-chunk-size", type=int, default=2048)
     parser.add_argument(
+        "--ce-impl",
+        choices=[
+            "auto",
+            "chunked",
+            "liger",
+            "cce",
+            "cce_exact",
+            "cce_kahan_full",
+            "cce_kahan_full_c",
+            "cce_kahan_full_e",
+            "cce_kahan_full_c_full_e",
+            "torch_compile",
+        ],
+        default=os.environ.get("BGKIT_DECODER_CE_IMPL", "auto"),
+        help="Decoder LM CE implementation for the packed-splice path.",
+    )
+    parser.add_argument(
         "--decoder-lora",
         action="store_true",
         help="Apply bgkit's default decoder LoRA setup.",
@@ -261,6 +278,8 @@ def main() -> None:
     _set_toggle("FLA_GDR_SAVE_INTERMEDIATES", args.save_intermediates)
     _set_toggle("FLA_GDR_FUSE_KKT_WU", args.fuse_kkt_wu)
     _set_toggle("FLA_USE_SM121_CUSTOM_KERNEL", args.sm121_output)
+    if args.ce_impl not in {"auto", "chunked", "liger"}:
+        _set_env_default("BGKIT_DECODER_CE_STRICT", "1")
     if args.dqkwg_warps is not None:
         os.environ["FLA_DQKWG_TL_NUM_WARPS"] = str(args.dqkwg_warps)
     if args.dqkwg_bk is not None:
@@ -317,6 +336,8 @@ def main() -> None:
             )
         if args.decoder_nvfp4:
             model.enable_nvfp4()
+        if hasattr(model, "set_lm_ce_impl"):
+            model.set_lm_ce_impl(args.ce_impl)
     else:
         if args.decoder_lora:
             raise ValueError("--decoder-lora currently requires --loss-path packed-splice.")
@@ -383,6 +404,7 @@ def main() -> None:
     env_dqkwg_warps = os.environ.get("FLA_DQKWG_TL_NUM_WARPS", "<default>")
     env_dqkwg_bk = os.environ.get("FLA_DQKWG_TL_BK", "<default>")
     env_dqkwg_bv = os.environ.get("FLA_DQKWG_TL_BV", "<default>")
+    env_ce_strict = os.environ.get("BGKIT_DECODER_CE_STRICT", "<default>")
     print(
         textwrap.dedent(
             f"""
@@ -390,7 +412,7 @@ def main() -> None:
               model={args.model}
               device={torch.cuda.get_device_name()} capability={torch.cuda.get_device_capability()}
               dtype={args.dtype} batch={args.batch_size} seq_len={args.seq_len} tokens/step={tokens}
-              loss_path={args.loss_path} ce_chunk_size={args.ce_chunk_size}
+              loss_path={args.loss_path} ce_impl={args.ce_impl} ce_chunk_size={args.ce_chunk_size}
               requested_backend={args.backend} active_backend={active_backend}
               gdr_layers={n_gdr}
               FLA_GDR_SAVE_INTERMEDIATES={env_save_intermediates}
@@ -399,6 +421,7 @@ def main() -> None:
               FLA_DQKWG_TL_NUM_WARPS={env_dqkwg_warps}
               FLA_DQKWG_TL_BK={env_dqkwg_bk}
               FLA_DQKWG_TL_BV={env_dqkwg_bv}
+              BGKIT_DECODER_CE_STRICT={env_ce_strict}
               gradient_checkpointing={args.gradient_checkpointing} use_liger={args.use_liger}
               decoder_lora={args.decoder_lora} lora_impl={args.lora_implementation}
               lora_dropout={args.lora_dropout}
@@ -432,6 +455,7 @@ def main() -> None:
         "active_backend": _active_backend(args.backend, resolved_backend_name()),
         "dtype": args.dtype,
         "loss_path": args.loss_path,
+        "ce_impl": args.ce_impl,
         "ce_chunk_size": args.ce_chunk_size,
         "decoder_lora": args.decoder_lora,
         "lora_implementation": args.lora_implementation,
@@ -456,6 +480,7 @@ def main() -> None:
             "FLA_DQKWG_TL_NUM_WARPS": env_dqkwg_warps,
             "FLA_DQKWG_TL_BK": env_dqkwg_bk,
             "FLA_DQKWG_TL_BV": env_dqkwg_bv,
+            "BGKIT_DECODER_CE_STRICT": env_ce_strict,
         },
     }
     print("summary=" + json.dumps(summary, sort_keys=True))

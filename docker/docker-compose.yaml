@@ -61,6 +61,11 @@ x-gpu-common: &gpu-common
     # BGKIT_GDN_BACKEND=flashqla for explicit FlashQLA testing, or =auto to
     # prefer FlashQLA when it becomes faster and falls back cleanly.
     - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+    # Apple Cut Cross Entropy is the GB10 default for decoder LM loss:
+    # measured 2026-05-07 at seq2048 as ~7% lower total step time and
+    # ~2.8 GiB lower peak memory than BgKIT chunked CE. Set =chunked for
+    # fallback/bisecting; missing CCE package falls back safely.
+    - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
     # PYTHONPATH override: prepend the local flash-linear-attention fork so
     # `import fla` resolves to the bind-mounted blackwell-sm121-compat
     # branch (sm_121 detection + global_scratch allocator) instead of the
@@ -403,6 +408,7 @@ services:
       - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
       - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
       - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+      - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
     command: ["bash"]
 
   # Environment smoke test for the FlashQLA toolchain. This does not run the
@@ -429,6 +435,7 @@ services:
       - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
       - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.10}
       - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+      - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
     command: ["scripts/flashqla_env_smoke.py"]
 
   # FlashQLA parity smoke test. Runs scripts/test_flashqla_parity.py inside
@@ -455,6 +462,7 @@ services:
       - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
       - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
       - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+      - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
     command: ["scripts/test_flashqla_parity.py"]
 
   # Lightweight backend timing harness for FLA vs FlashQLA after the sm_121
@@ -481,6 +489,7 @@ services:
       - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
       - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
       - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+      - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
     command: ["scripts/profile_flashqla_backend.py", "--backend", "both"]
 
   preprocess:

@@ -260,6 +260,13 @@ class KRKBTrainer(BaseTrainer):
         ).to(self.device)
         hidden = decoder_backbone.get_input_embeddings().weight.shape[1]
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden)
+        self.decoder.set_lm_ce_impl(
+            self.step_cfg.get(
+                "decoder_ce_impl",
+                self.cfg.compute.get("decoder_ce_impl", None),
+            )
+        )
+        logger.info("phase2_kb_decoder_ce_impl_selected", impl=self.decoder.lm_ce_impl)
         self.decoder.train()
 
         # Activation checkpointing on the decoder — significant memory win
@@ -476,19 +483,26 @@ class KRKBTrainer(BaseTrainer):
         self._validate_trajectory_article_coverage()
 
         # --- Optional Liger Kernel fused kernels ---
-        # RMSNorm / SwiGLU / RoPE + fused linear+CE over the 248K Qwen vocab.
-        # Gated on ``training.use_liger`` (default True); no-op when
-        # liger-kernel is not installed in the environment.
+        # RMSNorm / SwiGLU / RoPE, plus Liger CE only when decoder_ce_impl is
+        # auto/liger. Gated on ``training.use_liger`` (default True); no-op
+        # when liger-kernel is not installed in the environment.
         if bool(self.step_cfg.get("use_liger", True)):
             from bgkit.utils.liger_integration import apply_liger_to_qwen35
 
+            use_liger_ce = (
+                bool(self.step_cfg.get("use_liger_ce", True))
+                and self.decoder.lm_ce_impl in {"auto", "liger"}
+            )
             enc_patched = apply_liger_to_qwen35(self.encoder)
             dec_patched = apply_liger_to_qwen35(self.decoder)
-            self.decoder.enable_liger_ce(True)
+            if use_liger_ce:
+                self.decoder.enable_liger_ce(True)
             logger.info(
                 "phase2_kb_liger_applied",
                 encoder_modules=enc_patched,
                 decoder_modules=dec_patched,
+                use_liger_ce=use_liger_ce,
+                decoder_ce_impl=self.decoder.lm_ce_impl,
             )
 
         # --- Model container + optimizer ---

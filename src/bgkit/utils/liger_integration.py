@@ -471,9 +471,9 @@ def apply_liger_to_qwen35(
     grad_norm ~500 but no NaN). Discovered during phase1_step4 after
     ~24 hours of debugging; see commit 313f597. Only flip this to True
     if you have independently verified the kernel is good against the
-    current ``transformers`` + Qwen3.5 combination. SwiGLU / RoPE /
-    fused linear-CE are unaffected and still default-on — they provide
-    the bulk of the throughput win.
+    current ``transformers`` + Qwen3.5 combination. SwiGLU / RoPE remain
+    default-on; decoder CE now defaults to Apple CCE on GB10, with Liger CE
+    kept as an explicit ``decoder_ce_impl=auto`` / ``liger`` option.
 
     Safe to call on encoders and decoders alike, on top of LoRA wrappers,
     before or after ``enable_gradient_checkpointing``, and multiple times

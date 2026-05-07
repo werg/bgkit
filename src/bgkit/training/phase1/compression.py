@@ -193,6 +193,10 @@ class CompressionTrainer(BaseTrainer):
             device_map=device,
         )
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
+        self.decoder.set_lm_ce_impl(
+            tcfg.get("decoder_ce_impl", self.cfg.compute.get("decoder_ce_impl", None))
+        )
+        logger.info("decoder_ce_impl_selected", impl=self.decoder.lm_ce_impl)
 
         # Load decoder from Step 1 checkpoint
         if step1_state_dicts is not None:
@@ -227,19 +231,43 @@ class CompressionTrainer(BaseTrainer):
         # re-recording overhead. PeftModel isinstance fix landed in decoder.py
         # for when this becomes viable.
 
-        # Optional Liger Kernel fused kernels (RMSNorm / SwiGLU / RoPE +
-        # fused linear+CE). Gated on ``training.use_liger`` (default True);
-        # no-op when liger-kernel is not installed.
+        # Optional Liger Kernel fused kernels (RMSNorm / SwiGLU / RoPE, plus
+        # Liger CE only when decoder_ce_impl is auto/liger). Gated on
+        # ``training.use_liger`` (default True); no-op when liger-kernel is not
+        # installed.
         if tcfg.get("use_liger", True):
             from bgkit.utils.liger_integration import apply_liger_to_qwen35
 
-            enc_patched = apply_liger_to_qwen35(self.encoder)
-            dec_patched = apply_liger_to_qwen35(self.decoder)
-            self.decoder.enable_liger_ce(True)
+            patch_rmsnorm = bool(tcfg.get("use_liger_rmsnorm", False))
+            patch_swiglu = bool(tcfg.get("use_liger_swiglu", True))
+            patch_rope = bool(tcfg.get("use_liger_rope", True))
+            use_liger_ce = (
+                bool(tcfg.get("use_liger_ce", True))
+                and self.decoder.lm_ce_impl in {"auto", "liger"}
+            )
+            enc_patched = apply_liger_to_qwen35(
+                self.encoder,
+                patch_rmsnorm=patch_rmsnorm,
+                patch_swiglu=patch_swiglu,
+                patch_rope=patch_rope,
+            )
+            dec_patched = apply_liger_to_qwen35(
+                self.decoder,
+                patch_rmsnorm=patch_rmsnorm,
+                patch_swiglu=patch_swiglu,
+                patch_rope=patch_rope,
+            )
+            if use_liger_ce:
+                self.decoder.enable_liger_ce(True)
             logger.info(
                 "liger_kernel_applied",
                 encoder_modules=enc_patched,
                 decoder_modules=dec_patched,
+                patch_rmsnorm=patch_rmsnorm,
+                patch_swiglu=patch_swiglu,
+                patch_rope=patch_rope,
+                use_liger_ce=use_liger_ce,
+                decoder_ce_impl=self.decoder.lm_ce_impl,
             )
 
         # BaseTrainer uses self.model for logging

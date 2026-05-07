@@ -39,10 +39,35 @@ from bgkit.utils.packing import position_ids_from_cu
 logger = structlog.get_logger()
 
 DEFAULT_LM_CE_CHUNK_SIZE = int(os.environ.get("BGKIT_DECODER_CE_CHUNK_SIZE", "2048"))
+DEFAULT_LM_CE_IMPL = os.environ.get("BGKIT_DECODER_CE_IMPL", "cce").strip().lower()
+LM_CE_IMPLS = frozenset(
+    {
+        "auto",
+        "chunked",
+        "liger",
+        "cce",
+        "cce_exact",
+        "cce_kahan_full",
+        "cce_kahan_full_c",
+        "cce_kahan_full_e",
+        "cce_kahan_full_c_full_e",
+        "torch_compile",
+    }
+)
 
 
 def _resolve_ce_chunk_size(chunk_size: int | None) -> int:
     return DEFAULT_LM_CE_CHUNK_SIZE if chunk_size is None else int(chunk_size)
+
+
+def _resolve_lm_ce_impl(impl: str | None) -> str:
+    resolved = DEFAULT_LM_CE_IMPL if impl is None else impl.strip().lower()
+    if resolved not in LM_CE_IMPLS:
+        raise ValueError(
+            f"Unsupported decoder CE implementation {impl!r}; "
+            f"expected one of {sorted(LM_CE_IMPLS)}"
+        )
+    return resolved
 
 
 @dataclass
@@ -274,6 +299,7 @@ class ReconstructionDecoder(nn.Module):
         # the default is off so CPU host tests and un-installed environments
         # keep hitting the existing chunked-CE path.
         self._use_liger_ce = False
+        self._lm_ce_impl = DEFAULT_LM_CE_IMPL
 
         if nvfp4:
             self.enable_nvfp4()
@@ -287,6 +313,25 @@ class ReconstructionDecoder(nn.Module):
         without Liger is a silent no-op.
         """
         self._use_liger_ce = bool(enabled)
+
+    def set_lm_ce_impl(self, impl: str | None) -> None:
+        """Select decoder LM CE implementation.
+
+        The default is ``cce`` because it is faster and much lower memory on
+        GB10 when the optional ``cut_cross_entropy`` package is installed. If
+        that package is missing and strict mode is not set, the CCE integration
+        falls back to BgKIT's chunked CE. ``auto`` preserves the old behaviour:
+        use the Liger CE adapter when ``enable_liger_ce(True)`` has been called,
+        and otherwise use chunked CE.
+        """
+
+        self._lm_ce_impl = _resolve_lm_ce_impl(impl)
+
+    @property
+    def lm_ce_impl(self) -> str:
+        """Return the effective decoder LM CE implementation."""
+
+        return self._lm_ce_impl
 
     def enable_nvfp4(self) -> None:
         """Convert decoder Linear modules to TE Linear with NVFP4 support.
@@ -311,7 +356,9 @@ class ReconstructionDecoder(nn.Module):
                 "decoder NVFP4 is disabled for the current sm_121 container. "
                 "TransformerEngine FP4 conversion requires an architecture-specific "
                 "sm_121a build; the current image emits device-side PTX errors. "
-                "Rebuild TE for sm_121a and set BGKIT_ALLOW_NVFP4_SM121=1 to opt in."
+                "The Atlas/Spark route avoids this by packing weights with software "
+                "E4M3/E2M1 conversion and using custom W4A16 kernels instead of TE. "
+                "Set BGKIT_ALLOW_NVFP4_SM121=1 only for explicit TE experiments."
             )
 
         from transformer_engine.common.recipe import NVFP4BlockScaling
@@ -802,18 +849,35 @@ class ReconstructionDecoder(nn.Module):
         loss_mask_full: torch.Tensor | None,
         chunk_size: int | None,
     ) -> torch.Tensor:
-        """Dispatch CE computation: Liger fused path if available, else chunked.
+        """Dispatch CE computation among chunked, Liger, and optional CCE paths.
 
         Controlled by the module-level flag ``self._use_liger_ce`` (default
         True if set on the decoder, matching the trainer gate). When Liger
         is installed *and* the flag is on, we call ``liger_chunked_ce_loss``
         which never materialises the full ``(B, S, V)`` logits tensor.
-        Otherwise we stay on the existing ``_chunked_lm_ce`` path for exact
-        backward compatibility.
+        Explicit ``BGKIT_DECODER_CE_IMPL=cce`` / ``cce_exact`` /
+        ``torch_compile`` requests route through Apple CCE when available.
         """
         chunk_size = _resolve_ce_chunk_size(chunk_size)
+        ce_impl = _resolve_lm_ce_impl(getattr(self, "_lm_ce_impl", None))
+
+        if ce_impl not in {"auto", "chunked", "liger"}:
+            from bgkit.utils.cce_integration import cut_cross_entropy_lm_ce
+
+            return cut_cross_entropy_lm_ce(
+                hidden_states=hidden_states,
+                lm_head_weight=lm_head.weight,
+                lm_head_bias=getattr(lm_head, "bias", None),
+                labels=token_ids_full,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask_full,
+                impl=ce_impl,
+                chunk_size=chunk_size,
+                strict=os.environ.get("BGKIT_DECODER_CE_STRICT", "0") == "1",
+            )
+
         use_liger = getattr(self, "_use_liger_ce", False)
-        if use_liger:
+        if ce_impl == "liger" or (ce_impl == "auto" and use_liger):
             from bgkit.utils.liger_integration import (
                 is_liger_available,
                 liger_chunked_ce_loss,

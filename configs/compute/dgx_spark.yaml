@@ -39,6 +39,11 @@ max_grad_norm: 1.0
 # repeat-interleaving K/V heads (native FA4 sm_120 GQA still produces wrong
 # gradients). See docs/memory for the full story.
 attention_implementation: auto
+# Decoder LM loss: Apple Cut Cross Entropy is the default on GB10. In the
+# training image it is installed and measured faster/lower-memory than the
+# previous chunked CE path; if the optional package is missing, BgKIT falls
+# back to chunked CE unless strict benchmarking is requested.
+decoder_ce_impl: cce
 # Dataloader
 num_workers: 0  # fork workers cause CoW memory exhaustion on unified memory
 pin_memory: false  # unified memory, pinning not applicable

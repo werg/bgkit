@@ -282,6 +282,10 @@ class DecoderInitTrainer(BaseTrainer):
             device_map=device,  # load directly to CUDA, avoid CPU staging copy
         )
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
+        self.decoder.set_lm_ce_impl(
+            tcfg.get("decoder_ce_impl", self.cfg.compute.get("decoder_ce_impl", None))
+        )
+        logger.info("decoder_ce_impl_selected", impl=self.decoder.lm_ce_impl)
 
         # Load decoder weights from bgkit checkpoint if available (step 2 includes decoder).
         # ``load_decoder_from_bgkit_checkpoint: false`` skips this and keeps the
@@ -311,9 +315,10 @@ class DecoderInitTrainer(BaseTrainer):
 
         maybe_enable_gradient_checkpointing(self.decoder.backbone, self.cfg)
 
-        # Optional Liger Kernel fused kernels (RMSNorm / SwiGLU / RoPE +
-        # fused linear+CE). Gated on ``training.use_liger`` (default True);
-        # no-op when liger-kernel is not installed.
+        # Optional Liger Kernel fused kernels (RMSNorm / SwiGLU / RoPE, plus
+        # Liger CE only when decoder_ce_impl is auto/liger). Gated on
+        # ``training.use_liger`` (default True); no-op when liger-kernel is not
+        # installed.
         if tcfg.get("use_liger", True):
             from bgkit.utils.liger_integration import apply_liger_to_qwen35
 
@@ -326,7 +331,10 @@ class DecoderInitTrainer(BaseTrainer):
             patch_rmsnorm = bool(tcfg.get("use_liger_rmsnorm", False))
             patch_swiglu = bool(tcfg.get("use_liger_swiglu", True))
             patch_rope = bool(tcfg.get("use_liger_rope", True))
-            use_liger_ce = bool(tcfg.get("use_liger_ce", True))
+            use_liger_ce = (
+                bool(tcfg.get("use_liger_ce", True))
+                and self.decoder.lm_ce_impl in {"auto", "liger"}
+            )
             enc_patched = apply_liger_to_qwen35(
                 self.encoder,
                 patch_rmsnorm=patch_rmsnorm,
@@ -349,6 +357,7 @@ class DecoderInitTrainer(BaseTrainer):
                 patch_swiglu=patch_swiglu,
                 patch_rope=patch_rope,
                 use_liger_ce=use_liger_ce,
+                decoder_ce_impl=self.decoder.lm_ce_impl,
             )
 
         # BaseTrainer logging/device logic uses self.model

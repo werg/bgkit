@@ -135,6 +135,13 @@ class DistillationTrainer(BaseTrainer):
             decoder_backbone,
             hidden_dim=decoder_backbone.get_input_embeddings().weight.shape[1],
         )
+        self.decoder.set_lm_ce_impl(
+            self.cfg.training.get(
+                "decoder_ce_impl",
+                self.cfg.compute.get("decoder_ce_impl", None),
+            )
+        )
+        logger.info("phase3_decoder_ce_impl_selected", impl=self.decoder.lm_ce_impl)
         self.decoder.train()
 
         self.tokenizer = AutoTokenizer.from_pretrained(decoder_name, trust_remote_code=True)

@@ -198,6 +198,10 @@ class CommitEncodingTrainer(BaseTrainer):
             device_map=device,
         )
         self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
+        self.decoder.set_lm_ce_impl(
+            tcfg.get("decoder_ce_impl", self.cfg.compute.get("decoder_ce_impl", None))
+        )
+        logger.info("decoder_ce_impl_selected", impl=self.decoder.lm_ce_impl)
 
         if step1_state_dicts is not None:
             decoder_sd = step1_state_dicts.get(
@@ -222,14 +226,17 @@ class CommitEncodingTrainer(BaseTrainer):
             patch_rmsnorm = bool(tcfg.get("use_liger_rmsnorm", False))
             patch_swiglu = bool(tcfg.get("use_liger_swiglu", True))
             patch_rope = bool(tcfg.get("use_liger_rope", True))
-            use_liger_ce = bool(tcfg.get("use_liger_ce", True))
-            apply_liger_to_qwen35(
+            use_liger_ce = (
+                bool(tcfg.get("use_liger_ce", True))
+                and self.decoder.lm_ce_impl in {"auto", "liger"}
+            )
+            enc_patched = apply_liger_to_qwen35(
                 self.encoder,
                 patch_rmsnorm=patch_rmsnorm,
                 patch_swiglu=patch_swiglu,
                 patch_rope=patch_rope,
             )
-            apply_liger_to_qwen35(
+            dec_patched = apply_liger_to_qwen35(
                 self.decoder,
                 patch_rmsnorm=patch_rmsnorm,
                 patch_swiglu=patch_swiglu,
@@ -237,6 +244,16 @@ class CommitEncodingTrainer(BaseTrainer):
             )
             if use_liger_ce:
                 self.decoder.enable_liger_ce(True)
+            logger.info(
+                "liger_kernel_applied",
+                encoder_modules=enc_patched,
+                decoder_modules=dec_patched,
+                patch_rmsnorm=patch_rmsnorm,
+                patch_swiglu=patch_swiglu,
+                patch_rope=patch_rope,
+                use_liger_ce=use_liger_ce,
+                decoder_ce_impl=self.decoder.lm_ce_impl,
+            )
 
         self.model = self.decoder
 
