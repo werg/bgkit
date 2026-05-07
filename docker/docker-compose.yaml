@@ -258,12 +258,6 @@ services:
 
   train-phase1-step5:
     <<: *gpu-common
-    # Pinned to phase1-step4 image: the bare gpu-common base image
-    # (e4cac9d17540) lacks `quack-kernels`, which `flash_attn.cute` requires
-    # at import. step4's image was rebuilt to include it. Revert this pin
-    # once the gpu-common image is rebuilt to match step4's deps.
-    image: docker-train-phase1-step4:latest
-    build: !reset null
     # Bumped from gpu-common's 80g default to 100g on 2026-05-06 to give
     # batch=8192 (or future larger batches) room. Leaves ~28g for the host
     # OS + Claude Code harness on 128 GB unified memory; still bounded so a
@@ -276,14 +270,11 @@ services:
   # Phase 1 Step 4.7: bridge distillation. Teacher = frozen Step 4 L0-only
   # encoder; student = full L0->L1 with bridge + last L0 block + first 2 L1
   # blocks + projection_block trainable. See plans/bridge-distill-step.md.
-  # Pinned to the same image as Step 5 for the `quack-kernels` dependency.
   # The default `BGKIT_GDN_BACKEND=fla` from gpu-common uses the optimized
   # local FLA path on sm_121. Export `BGKIT_GDN_BACKEND=flashqla` in the
   # shell before `docker compose up` only when testing the FlashQLA backend.
   train-phase1-step4p7:
     <<: *gpu-common
-    image: docker-train-phase1-step4:latest
-    build: !reset null
     command: ["scripts/train.py", "+experiment=phase1_step4p7"]
 
   # Phase 1 Step 4.7-v2: bridge re-distillation with extended ratio range.
@@ -296,8 +287,6 @@ services:
   # extra headroom).
   train-phase1-step4p7-v2:
     <<: *gpu-common
-    image: docker-train-phase1-step4:latest
-    build: !reset null
     mem_limit: 100g
     memswap_limit: 100g
     command: ["scripts/train.py", "+experiment=phase1_step4p7_v2"]
@@ -309,8 +298,6 @@ services:
   # v2+v3 give the bridge full coverage of Step 5's operating range.
   train-phase1-step4p7-v3:
     <<: *gpu-common
-    image: docker-train-phase1-step4:latest
-    build: !reset null
     mem_limit: 100g
     memswap_limit: 100g
     command: ["scripts/train.py", "+experiment=phase1_step4p7_v3"]
@@ -323,13 +310,9 @@ services:
   # checkpoint, freezes compressor + decoder, re-trains only the
   # projection block so its output lands on decoder.embed_tokens
   # manifold. See scripts/analyze_embedding_deviation.py for the
-  # motivating diagnostic. Pinned to the phase1-step3 image to avoid
-  # triggering a rebuild that would hit the cutlass libcuda import
-  # issue; the image is already validated for this pipeline.
+  # motivating diagnostic.
   train-phase1-step2p5:
     <<: *gpu-common
-    image: docker-train-phase1-step3:latest
-    build: !reset null
     command: ["scripts/train.py", "+experiment=phase1_step2p5"]
 
   train-phase2-kb-stage-a:
