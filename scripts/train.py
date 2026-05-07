@@ -3,14 +3,19 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from bgkit.utils.deltanet_patch import patch_gated_delta_rule_numerics
+from bgkit.utils.deltanet_patch import (
+    patch_fused_rms_norm_gated_for_sm121,
+    patch_gated_delta_rule_numerics,
+)
 from bgkit.utils.logging import setup_logging
 from bgkit.utils.reproducibility import set_seed
+from bgkit.utils.step_watchdog import install_step_watchdog
 from bgkit.utils.triton_alloc_patch import patch_triton_allocator
 from bgkit.utils.triton_patch import patch_triton_autotuner
 
@@ -53,6 +58,22 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
         return DecoderInitTrainer(cfg)
+    elif phase in (
+        "phase1_step4p7",
+        "phase1_step4p7_v2",
+        "phase1_step4p7_v3",
+    ):
+        # Bridge distillation: teacher = frozen reference encoder; student =
+        # full L0->L1 with bridge + last L0 block + first 2 L1 blocks +
+        # projection_block trainable. v1 (phase1_step4p7) uses Step 4 as
+        # both teacher and student. v2 (phase1_step4p7_v2) loads teacher
+        # and student from separate checkpoints (typically teacher =
+        # phase1_step4p7, student = current phase1_step5) and trains
+        # across an extended ratio range. See plans/bridge-distill-step.md
+        # for the v1 design.
+        from bgkit.training.phase1.bridge_distill import BridgeDistillTrainer
+
+        return BridgeDistillTrainer(cfg)
     elif phase == "phase1_step5":
         from bgkit.training.phase1.commit_encoding import CommitEncodingTrainer
 
@@ -85,6 +106,11 @@ def main(cfg: DictConfig) -> None:
     patch_triton_allocator()
     patch_triton_autotuner()
     patch_gated_delta_rule_numerics()
+    patch_fused_rms_norm_gated_for_sm121()
+    install_step_watchdog(
+        timeout_seconds=float(os.environ.get("BGKIT_STEP_TIMEOUT", "60.0")),
+        poll_seconds=5.0,
+    )
     setup_logging()
     set_seed(cfg.seed)
 

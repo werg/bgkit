@@ -911,11 +911,19 @@ class CommitEncodingTrainer(BaseTrainer):
         self._input_sources = {}
         if step1_checkpoint == "auto":
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
-            # Prefer the converted split-L0/L1 layout if a phase1_step4_split
-            # checkpoint exists; fall back to legacy phase1_step4 (which Step 5
-            # cannot consume directly — would need conversion).
+            # Prefer phase1_step4p7_v2 (bridge re-distilled with extended
+            # ratio range and decoder LoRA preserved from a Step 5 run)
+            # -> phase1_step4p7 (original bridge distillation)
+            # -> phase1_step4_split (raw split conversion)
+            # -> legacy phase1_step4 (Step 5 cannot consume directly).
             resolved = None
-            for phase in ("phase1_step4_split", "phase1_step4"):
+            for phase in (
+                "phase1_step4p7_v3",
+                "phase1_step4p7_v2",
+                "phase1_step4p7",
+                "phase1_step4_split",
+                "phase1_step4",
+            ):
                 try:
                     resolved = resolve_checkpoint(
                         checkpoint_dir,
@@ -928,9 +936,10 @@ class CommitEncodingTrainer(BaseTrainer):
                     continue
             if resolved is None:
                 raise RuntimeError(
-                    "step1_checkpoint=auto but no phase1_step4_split or "
-                    "phase1_step4 checkpoint found. Run "
-                    "scripts/convert_step4_to_split_l0l1.py first.",
+                    "step1_checkpoint=auto but no phase1_step4p7_v2, "
+                    "phase1_step4p7, phase1_step4_split, or phase1_step4 "
+                    "checkpoint found. Run scripts/convert_step4_to_split_l0l1.py "
+                    "first, then optionally phase1_step4p7 bridge distillation.",
                 )
             step1_checkpoint = str(resolved)
         if step1_checkpoint is not None:
@@ -1192,6 +1201,20 @@ class CommitEncodingTrainer(BaseTrainer):
         )
         return loss, out_metrics
 
+    def _accumulate_l0_state_only(self, l0_out, target_ratio: float) -> None:
+        """Update dual-ascent θ_L0 state without computing surv losses.
+
+        Used when L0 backbone is frozen but the curriculum's
+        target_ratio_l0 is moving — keeps θ_L0 in sync with the target
+        without flowing gradient through L0. apply_post_step_updates picks
+        up _surv_state_l0 unconditionally and updates θ.
+        """
+        from bgkit.training.survivorship_helpers import accumulate, init_state
+
+        state = self._surv_state_l0 or init_state()
+        self._surv_state_l0 = state
+        accumulate(state, l0_out, target_ratio=target_ratio)
+
     # ------------------------------------------------------------------
     # Forward / backward
     # ------------------------------------------------------------------
@@ -1271,6 +1294,15 @@ class CommitEncodingTrainer(BaseTrainer):
                     content_cu_seqlens=cu_file,
                 )
                 aux_metrics.update(l0_metrics)
+            elif l0_out.logits_for_op is not None:
+                # L0 backbone is frozen this microbatch, so we skip the loss
+                # backward through L0. But dual-ascent θ_L0 still needs to
+                # track the curriculum's L0 ratio target — otherwise θ_L0
+                # stays frozen at its loaded value and L0 actual_ratio
+                # diverges from target_ratio_l0 (observed on phase1_step5
+                # stage 0: θ_L0 calibrated for ratio 0.08 stuck the L0
+                # selection at ~0.2 while curriculum asked for 0.5+).
+                self._accumulate_l0_state_only(l0_out, target_ratio_l0)
 
             l1_surv_loss = None
             if l1_out.logits_for_op is not None:

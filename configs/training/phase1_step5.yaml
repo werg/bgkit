@@ -11,17 +11,14 @@ bidi_warmup_steps: 0           # already bidirectional from previous steps
 
 # ---- Three-phase curriculum (all live-tunable via control.json) ----
 # Stage transitions (steps).
-auto_repro_warmup_steps: 500    # Phase A: backbones frozen + ratios FORCED
-                                # to 1.0 (no compression). Only auto_repro_head
-                                # + projection_block + decoder LoRA train.
-                                # Heads dormant. Lets the bridge and the
-                                # decoder-anchor projection re-anchor on their
-                                # TRAINED distribution (Joint Block / Step 2.5
-                                # were both at no-compression).
-head_warmup_steps: 500          # Phase B: backbones still frozen, ratios
-                                # start moving. Heads fire and train.
-                                # auto_repro_head + projection_block re-tune
-                                # as the input distribution shifts to compressed.
+auto_repro_warmup_steps: 0      # Step 4.7 (BridgeDistillTrainer) re-anchors
+                                # auto_repro_head and projection_block under a
+                                # teacher-distillation curriculum at the actual
+                                # operating compression regime, so this phase
+                                # is no longer needed. Forcing ratios=1.0 here
+                                # would actively un-train the bridge.
+head_warmup_steps: 0            # Heads are unchanged from Step 4 and need no
+                                # additional warmup; stage0 starts firing them.
 stage0_end_step: 3000           # L0 ramp finishes here (also stage 0 → 1 transition)
 stage1_l1_ramp_start_step: 3000 # L1 ratio ramp starts here
 stage1_l1_ramp_end_step: 5000   # L1 ratio ramp finishes here
@@ -46,8 +43,8 @@ stage1_target_ratio_l1_end: 0.33
 
 # Per-stage sample-length / batch-token budgets (live-tunable).
 # Stage 0 uses a single primary dataloader.
-stage0_max_sample_length: 2000  # moderate; L0 still keeps high fraction early
-stage0_max_batch_tokens: 8192
+stage0_max_sample_length: 1500  # tightened from 2000 after step 460 stall
+stage0_max_batch_tokens: 4096
 
 # Stage 1 dual-dataloader routing (frozen -> large floodgates, unfrozen -> tight).
 stage1_l0_frozen_max_sample_length: 6000
@@ -109,17 +106,20 @@ freeze:
 data:
   commit_encoding_dir: ${oc.env:DATA_DIR}/processed/commit_encoding
   prompt_variants_dir: configs/prompt_variants
-  max_diff_tokens_per_file: 4096
-  max_files_per_commit: 16
+  # Bound content size at the dataset level to avoid 2h+ singleton stalls
+  # observed at step 460 (sample 10858 reached L^2=46M ≈ 6800 tokens despite
+  # max_sample_length=2000; commit_encoding's token_length filter is
+  # per-file, not summed across files).
+  max_diff_tokens_per_file: 1024
+  max_files_per_commit: 4
   max_message_tokens: 256
 
-# Initial primary-loader budget (stage 0 default; live curriculum drives it
-# from stage 1 onward via per-stage max_batch_tokens overrides).
-max_batch_tokens: 8192
+# Halved from 8192 to bound singleton-emission cost on oversized samples
+# (sampler's quadratic budget = max_batch_tokens × reference_seq_len).
+max_batch_tokens: 4096
 gradient_accumulation_steps: 8
 min_sample_length: 256
-# Initial max_sample_length for stage 0 (curriculum overrides per stage).
-max_sample_length: 2000
+max_sample_length: 1500
 
 eval_every: 1000
 save_every: 5000
