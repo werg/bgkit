@@ -50,9 +50,11 @@ bgkit_cache_dir: ${oc.env:DATA_DIR}/swe_embeddings
 # LoRA on decoder for parameter efficiency (same config as Phase 1 Step 3+).
 decoder_lora:
   enabled: true
+  implementation: peft
   r: 16
   alpha: 32
   dropout: 0.0
+  peft_fused_backward: true
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 # Liger kernels: same pattern as Phase 1. LigerRMSNorm pinned OFF (Qwen3.5
