@@ -10,6 +10,7 @@ Verifies:
 from __future__ import annotations
 
 import copy
+import os
 
 import pytest
 
@@ -20,8 +21,15 @@ from torch.nn import functional as F
 
 from bgkit.models.decoder import DecoderLoRALinear, ReconstructionDecoder
 from bgkit.models.lora_triton import (
+    can_use_triton_gate_up_base_dx,
     can_use_triton_lora_dx_add,
+    can_use_triton_lora_pair_dx_add,
     can_use_triton_swiglu_backward,
+    can_use_triton_swiglu_forward,
+    triton_gate_up_base_dx,
+    triton_lora_pair_dx_add_,
+    triton_swiglu_backward,
+    triton_swiglu_forward,
 )
 
 # ---------------------------------------------------------------------------
@@ -379,6 +387,98 @@ class TestApplyLora:
         up = torch.zeros(4, 8)
 
         assert not can_use_triton_swiglu_backward(grad_hidden, gate, up)
+
+    def test_triton_swiglu_forward_rejects_cpu_tensors(self):
+        gate = torch.zeros(4, 8)
+        up = torch.zeros(4, 8)
+
+        assert not can_use_triton_swiglu_forward(gate, up)
+
+    def test_triton_lora_pair_dx_add_rejects_cpu_tensors(self):
+        dx = torch.zeros(4, 8)
+        gh = torch.zeros(4, 2)
+        a = torch.zeros(2, 8)
+
+        assert not can_use_triton_lora_pair_dx_add(dx, gh, a, gh, a)
+
+    def test_triton_gate_up_base_dx_rejects_cpu_tensors(self):
+        grad_gate = torch.zeros(4, 8)
+        grad_up = torch.zeros(4, 8)
+        gate_weight = torch.zeros(8, 4)
+        up_weight = torch.zeros(8, 4)
+
+        assert not can_use_triton_gate_up_base_dx(
+            grad_gate,
+            gate_weight,
+            grad_up,
+            up_weight,
+        )
+
+    @pytest.mark.skipif(
+        not (torch.cuda.is_available() and os.environ.get("BGKIT_RUN_GPU_TESTS")),
+        reason="CUDA Triton test; set BGKIT_RUN_GPU_TESTS=1 in the training container",
+    )
+    def test_triton_swiglu_forward_matches_torch_cuda(self):
+        torch.manual_seed(0)
+        gate = torch.randn(7, 64, device="cuda", dtype=torch.bfloat16)
+        up = torch.randn(7, 64, device="cuda", dtype=torch.bfloat16)
+
+        actual = triton_swiglu_forward(gate, up)
+        expected = F.silu(gate.float()).to(torch.bfloat16) * up
+
+        torch.testing.assert_close(actual, expected, atol=0.04, rtol=0.03)
+
+    @pytest.mark.skipif(
+        not (torch.cuda.is_available() and os.environ.get("BGKIT_RUN_GPU_TESTS")),
+        reason="CUDA Triton test; set BGKIT_RUN_GPU_TESTS=1 in the training container",
+    )
+    def test_triton_swiglu_backward_matches_torch_cuda(self):
+        torch.manual_seed(0)
+        gate = torch.randn(7, 64, device="cuda", dtype=torch.bfloat16)
+        up = torch.randn(7, 64, device="cuda", dtype=torch.bfloat16)
+        grad_hidden = torch.randn_like(gate)
+
+        grad_gate, grad_up = triton_swiglu_backward(grad_hidden, gate, up)
+        gate_ref = gate.float().requires_grad_(True)
+        up_ref = up.float().requires_grad_(True)
+        expected = F.silu(gate_ref) * up_ref
+        expected.backward(grad_hidden.float())
+
+        torch.testing.assert_close(grad_gate.float(), gate_ref.grad, atol=0.04, rtol=0.04)
+        torch.testing.assert_close(grad_up.float(), up_ref.grad, atol=0.04, rtol=0.04)
+
+    @pytest.mark.skipif(
+        not (torch.cuda.is_available() and os.environ.get("BGKIT_RUN_GPU_TESTS")),
+        reason="CUDA Triton test; set BGKIT_RUN_GPU_TESTS=1 in the training container",
+    )
+    def test_triton_lora_pair_dx_add_matches_torch_cuda(self):
+        torch.manual_seed(0)
+        dx = torch.randn(7, 64, device="cuda", dtype=torch.bfloat16)
+        gh0 = torch.randn(7, 16, device="cuda", dtype=torch.bfloat16)
+        gh1 = torch.randn(7, 16, device="cuda", dtype=torch.bfloat16)
+        a0 = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
+        a1 = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
+
+        expected = dx + gh0 @ a0 + gh1 @ a1
+        actual = triton_lora_pair_dx_add_(dx.clone(), gh0, a0, gh1, a1)
+
+        torch.testing.assert_close(actual, expected, atol=0.08, rtol=0.04)
+
+    @pytest.mark.skipif(
+        not (torch.cuda.is_available() and os.environ.get("BGKIT_RUN_GPU_TESTS")),
+        reason="CUDA Triton test; set BGKIT_RUN_GPU_TESTS=1 in the training container",
+    )
+    def test_triton_gate_up_base_dx_matches_torch_cuda(self):
+        torch.manual_seed(0)
+        grad_gate = torch.randn(7, 64, device="cuda", dtype=torch.bfloat16)
+        grad_up = torch.randn(7, 64, device="cuda", dtype=torch.bfloat16)
+        gate_weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
+        up_weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
+
+        actual = triton_gate_up_base_dx(grad_gate, gate_weight, grad_up, up_weight)
+        expected = grad_gate @ gate_weight + grad_up @ up_weight
+
+        torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.04)
 
 
 class TestLoraStateDictCompatibility:

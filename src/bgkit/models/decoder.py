@@ -39,6 +39,11 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from bgkit.utils.packing import position_ids_from_cu
 
+try:
+    from bgkit.models import lora_triton as _LORA_TRITON
+except Exception:  # pragma: no cover - optional Triton dependency
+    _LORA_TRITON = None
+
 logger = structlog.get_logger()
 
 DEFAULT_LM_CE_CHUNK_SIZE = int(os.environ.get("BGKIT_DECODER_CE_CHUNK_SIZE", "2048"))
@@ -397,8 +402,18 @@ class _FrozenBaseMLPLoRAFunction(torch.autograd.Function):
         gate_y = torch.addmm(gate_y, gate_h, gate_b.t(), beta=1.0, alpha=float(gate_scaling))
         up_y = torch.addmm(up_y, up_h, up_b.t(), beta=1.0, alpha=float(up_scaling))
 
-        activated = F.silu(gate_y)
-        hidden = activated * up_y
+        if _LORA_TRITON is not None and _LORA_TRITON.can_use_triton_swiglu_forward(
+            gate_y,
+            up_y,
+        ):
+            try:
+                hidden = _LORA_TRITON.triton_swiglu_forward(gate_y, up_y)
+            except Exception:
+                activated = F.silu(gate_y)
+                hidden = activated * up_y
+        else:
+            activated = F.silu(gate_y)
+            hidden = activated * up_y
         down_h = F.linear(hidden, down_a)
         out = F.linear(hidden, down_weight)
         out = torch.addmm(out, down_h, down_b.t(), beta=1.0, alpha=float(down_scaling))
@@ -450,35 +465,107 @@ class _FrozenBaseMLPLoRAFunction(torch.autograd.Function):
 
         down_grad_h = grad_out.matmul(down_b).mul_(ctx.down_scaling)
         grad_hidden_base = grad_out.matmul(down_weight)
-        grad_hidden = torch.addmm(grad_hidden_base, down_grad_h, down_a)
+        if _LORA_TRITON is not None and _LORA_TRITON.can_use_triton_lora_dx_add(
+            grad_hidden_base,
+            down_grad_h,
+            down_a,
+        ):
+            try:
+                grad_hidden = _LORA_TRITON.triton_lora_dx_add_(
+                    grad_hidden_base,
+                    down_grad_h,
+                    down_a,
+                )
+            except Exception:
+                grad_hidden = torch.addmm(grad_hidden_base, down_grad_h, down_a)
+        else:
+            grad_hidden = torch.addmm(grad_hidden_base, down_grad_h, down_a)
         grad_down_a = down_grad_h.t().matmul(hidden)
         grad_down_b = grad_out.t().matmul(down_h).mul_(ctx.down_scaling)
 
-        try:
-            from bgkit.models.lora_triton import (
-                can_use_triton_swiglu_backward,
-                triton_lora_dx_add_,
-                triton_swiglu_backward,
-            )
-
-            if can_use_triton_swiglu_backward(grad_hidden, gate_y, up_y):
-                grad_gate, grad_up = triton_swiglu_backward(grad_hidden, gate_y, up_y)
-            else:
-                raise RuntimeError("triton_swiglu_backward unavailable")
-        except Exception:
+        if _LORA_TRITON is not None and _LORA_TRITON.can_use_triton_swiglu_backward(
+            grad_hidden,
+            gate_y,
+            up_y,
+        ):
+            try:
+                grad_gate, grad_up = _LORA_TRITON.triton_swiglu_backward(
+                    grad_hidden,
+                    gate_y,
+                    up_y,
+                )
+            except Exception:
+                sigmoid_gate = torch.sigmoid(gate_y)
+                silu_gate = gate_y * sigmoid_gate
+                grad_up = grad_hidden * silu_gate
+                grad_gate = grad_hidden * up_y * sigmoid_gate * (
+                    1.0 + gate_y * (1.0 - sigmoid_gate)
+                )
+        else:
             sigmoid_gate = torch.sigmoid(gate_y)
             silu_gate = gate_y * sigmoid_gate
             grad_up = grad_hidden * silu_gate
-            grad_gate = grad_hidden * up_y * sigmoid_gate * (1.0 + gate_y * (1.0 - sigmoid_gate))
+            grad_gate = grad_hidden * up_y * sigmoid_gate * (
+                1.0 + gate_y * (1.0 - sigmoid_gate)
+            )
 
         gate_grad_h = grad_gate.matmul(gate_b).mul_(ctx.gate_scaling)
         up_grad_h = grad_up.matmul(up_b).mul_(ctx.up_scaling)
-        grad_cat = torch.cat((grad_gate, grad_up), dim=-1)
-        grad_x = grad_cat.matmul(gate_up_weight)
-        try:
-            grad_x = triton_lora_dx_add_(grad_x, gate_grad_h, gate_a)
-            grad_x = triton_lora_dx_add_(grad_x, up_grad_h, up_a)
-        except Exception:
+        base_dx_mode = os.environ.get("BGKIT_DECODER_MLP_BASE_DX", "cat").strip().lower()
+        if base_dx_mode == "cat":
+            grad_cat = torch.cat((grad_gate, grad_up), dim=-1)
+            grad_x = grad_cat.matmul(gate_up_weight)
+        elif base_dx_mode == "triton":
+            try:
+                gate_weight, up_weight = gate_up_weight.split(ctx.out_features, dim=0)
+                if _LORA_TRITON is None:
+                    raise RuntimeError("lora_triton unavailable")
+                grad_x = _LORA_TRITON.triton_gate_up_base_dx(
+                    grad_gate,
+                    gate_weight,
+                    grad_up,
+                    up_weight,
+                )
+            except Exception:
+                if _coerce_bool(os.environ.get("BGKIT_DECODER_MLP_TRITON_BASE_DX_STRICT", "0")):
+                    raise
+                gate_weight, up_weight = gate_up_weight.split(ctx.out_features, dim=0)
+                grad_x = grad_gate.matmul(gate_weight)
+                grad_x.addmm_(grad_up, up_weight)
+        else:
+            gate_weight, up_weight = gate_up_weight.split(ctx.out_features, dim=0)
+            grad_x = grad_gate.matmul(gate_weight)
+            grad_x.addmm_(grad_up, up_weight)
+        if _LORA_TRITON is not None and _LORA_TRITON.can_use_triton_lora_pair_dx_add(
+            grad_x,
+            gate_grad_h,
+            gate_a,
+            up_grad_h,
+            up_a,
+        ):
+            try:
+                grad_x = _LORA_TRITON.triton_lora_pair_dx_add_(
+                    grad_x,
+                    gate_grad_h,
+                    gate_a,
+                    up_grad_h,
+                    up_a,
+                )
+            except Exception:
+                grad_x.addmm_(gate_grad_h, gate_a)
+                grad_x.addmm_(up_grad_h, up_a)
+        elif _LORA_TRITON is not None and _LORA_TRITON.can_use_triton_lora_dx_add(
+            grad_x,
+            gate_grad_h,
+            gate_a,
+        ) and _LORA_TRITON.can_use_triton_lora_dx_add(grad_x, up_grad_h, up_a):
+            try:
+                grad_x = _LORA_TRITON.triton_lora_dx_add_(grad_x, gate_grad_h, gate_a)
+                grad_x = _LORA_TRITON.triton_lora_dx_add_(grad_x, up_grad_h, up_a)
+            except Exception:
+                grad_x.addmm_(gate_grad_h, gate_a)
+                grad_x.addmm_(up_grad_h, up_a)
+        else:
             grad_x.addmm_(gate_grad_h, gate_a)
             grad_x.addmm_(up_grad_h, up_a)
 
