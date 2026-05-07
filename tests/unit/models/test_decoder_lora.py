@@ -14,6 +14,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from torch import nn
+from torch.nn import functional as F
 
 from bgkit.models.decoder import DecoderLoRALinear, ReconstructionDecoder
 
@@ -163,6 +164,40 @@ class TestApplyLora:
         decoder.apply_lora({**LORA_CONFIG, "implementation": "peft"})
 
         assert isinstance(decoder.backbone, peft.PeftModel)
+
+    def test_native_frozen_base_lora_backward_matches_reference(self):
+        torch.manual_seed(123)
+        base = nn.Linear(7, 5, bias=True).to(dtype=torch.float64)
+        wrapper = DecoderLoRALinear(
+            base,
+            rank=3,
+            alpha=6.0,
+            dropout=0.0,
+            adapter_dtype=torch.float64,
+        )
+        wrapper.lora_A.data.normal_(0, 0.1)
+        wrapper.lora_B.data.normal_(0, 0.1)
+
+        ref_weight = wrapper.base_layer.weight.detach().clone()
+        ref_bias = wrapper.base_layer.bias.detach().clone()
+        ref_a = wrapper.lora_A.detach().clone().requires_grad_(True)
+        ref_b = wrapper.lora_B.detach().clone().requires_grad_(True)
+
+        x = torch.randn(2, 4, 7, dtype=torch.float64, requires_grad=True)
+        ref_x = x.detach().clone().requires_grad_(True)
+        grad = torch.randn(2, 4, 5, dtype=torch.float64)
+
+        y = wrapper(x)
+        ref_y = F.linear(ref_x, ref_weight, ref_bias)
+        ref_y = ref_y + F.linear(F.linear(ref_x, ref_a), ref_b) * wrapper.scaling
+
+        torch.testing.assert_close(y, ref_y)
+        y.backward(grad)
+        ref_y.backward(grad)
+
+        torch.testing.assert_close(x.grad, ref_x.grad)
+        torch.testing.assert_close(wrapper.lora_A.grad, ref_a.grad)
+        torch.testing.assert_close(wrapper.lora_B.grad, ref_b.grad)
 
 
 class TestLoraStateDictCompatibility:

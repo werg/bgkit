@@ -251,6 +251,16 @@ def parse_args() -> argparse.Namespace:
         help="Apply bgkit's default decoder LoRA setup.",
     )
     parser.add_argument("--lora-implementation", choices=["peft", "native"], default="peft")
+    parser.add_argument(
+        "--lora-fused",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use BgKIT's fused frozen-base native LoRA autograd path. "
+            "Only affects --lora-implementation native; default follows "
+            "BGKIT_DECODER_LORA_FUSED."
+        ),
+    )
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument(
         "--decoder-nvfp4",
@@ -346,23 +356,24 @@ def main() -> None:
         hidden_dim = backbone.get_input_embeddings().weight.shape[1]
         model = ReconstructionDecoder(backbone, hidden_dim=hidden_dim)
         if args.decoder_lora:
-            model.apply_lora(
-                {
-                    "r": 16,
-                    "alpha": 32,
-                    "dropout": args.lora_dropout,
-                    "implementation": args.lora_implementation,
-                    "target_modules": [
-                        "q_proj",
-                        "k_proj",
-                        "v_proj",
-                        "o_proj",
-                        "gate_proj",
-                        "up_proj",
-                        "down_proj",
-                    ],
-                }
-            )
+            lora_config = {
+                "r": 16,
+                "alpha": 32,
+                "dropout": args.lora_dropout,
+                "implementation": args.lora_implementation,
+                "target_modules": [
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ],
+            }
+            if args.lora_fused is not None:
+                lora_config["fused"] = bool(args.lora_fused)
+            model.apply_lora(lora_config)
         if args.decoder_nvfp4:
             if args.decoder_nvfp4_backend == "native-frozen":
                 model.enable_native_frozen_nvfp4()
@@ -442,6 +453,11 @@ def main() -> None:
     env_dqkwg_bk = os.environ.get("FLA_DQKWG_TL_BK", "<default>")
     env_dqkwg_bv = os.environ.get("FLA_DQKWG_TL_BV", "<default>")
     env_ce_strict = os.environ.get("BGKIT_DECODER_CE_STRICT", "<default>")
+    lora_fused_display = (
+        args.lora_fused
+        if args.lora_fused is not None
+        else os.environ.get("BGKIT_DECODER_LORA_FUSED", "<default>")
+    )
     cce_available: bool | None = None
     expected_ce_path = args.ce_impl
     if _cce_requested(args.ce_impl):
@@ -474,6 +490,7 @@ def main() -> None:
               BGKIT_DECODER_CE_STRICT={env_ce_strict}
               gradient_checkpointing={args.gradient_checkpointing} use_liger={args.use_liger}
               decoder_lora={args.decoder_lora} lora_impl={args.lora_implementation}
+              lora_fused={lora_fused_display}
               lora_dropout={args.lora_dropout}
               decoder_nvfp4={args.decoder_nvfp4} decoder_nvfp4_backend={args.decoder_nvfp4_backend}
             """
@@ -512,6 +529,9 @@ def main() -> None:
         "expected_ce_path": expected_ce_path,
         "decoder_lora": args.decoder_lora,
         "lora_implementation": args.lora_implementation,
+        "lora_fused": args.lora_fused
+        if args.lora_fused is not None
+        else os.environ.get("BGKIT_DECODER_LORA_FUSED"),
         "lora_dropout": args.lora_dropout,
         "decoder_nvfp4": args.decoder_nvfp4,
         "decoder_nvfp4_backend": args.decoder_nvfp4_backend,

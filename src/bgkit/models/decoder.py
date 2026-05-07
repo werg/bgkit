@@ -72,6 +72,16 @@ def _resolve_lm_ce_impl(impl: str | None) -> str:
     return resolved
 
 
+def _coerce_bool(value: object, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass
 class TokenSegment:
     """A run of token IDs in an interleaved decoder sequence.
@@ -219,6 +229,50 @@ class GenerationOutput:
     full_ids: list[torch.Tensor]  # per-sample complete generation for debugging
 
 
+class _FrozenBaseLoRAFunction(torch.autograd.Function):
+    """Autograd for frozen base linear + trainable LoRA A/B adapters."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        base_weight: torch.Tensor,
+        base_bias: torch.Tensor | None,
+        lora_a: torch.Tensor,
+        lora_b: torch.Tensor,
+        scaling: float,
+    ) -> torch.Tensor:
+        x_shape = tuple(x.shape)
+        x_2d = x.reshape(-1, x_shape[-1])
+        h = F.linear(x_2d, lora_a)
+        y = F.linear(x_2d, base_weight, base_bias)
+        y = torch.addmm(y, h, lora_b.t(), beta=1.0, alpha=float(scaling))
+        ctx.save_for_backward(x_2d, base_weight, lora_a, lora_b, h)
+        ctx.x_shape = x_shape
+        ctx.scaling = float(scaling)
+        return y.reshape(*x_shape[:-1], base_weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x_2d, base_weight, lora_a, lora_b, h = ctx.saved_tensors
+        grad_2d = grad_output.reshape(-1, grad_output.shape[-1])
+        scaling = ctx.scaling
+
+        grad_lora_h = grad_2d.matmul(lora_b).mul_(scaling)
+        grad_x = grad_2d.matmul(base_weight).add_(grad_lora_h.matmul(lora_a))
+        grad_a = grad_lora_h.t().matmul(x_2d)
+        grad_b = grad_2d.t().matmul(h).mul_(scaling)
+
+        return (
+            grad_x.reshape(ctx.x_shape),
+            None,
+            None,
+            grad_a,
+            grad_b,
+            None,
+        )
+
+
 class DecoderLoRALinear(nn.Module):
     """Small always-on LoRA wrapper for frozen decoder ``nn.Linear`` modules."""
 
@@ -230,12 +284,14 @@ class DecoderLoRALinear(nn.Module):
         alpha: float,
         dropout: float,
         adapter_dtype: torch.dtype,
+        fused: bool = True,
     ) -> None:
         super().__init__()
         self.base_layer = base_layer
         self.rank = int(rank)
         self.alpha = float(alpha)
         self.scaling = self.alpha / max(self.rank, 1)
+        self.fused = bool(fused)
         self.lora_A = nn.Parameter(
             torch.empty(self.rank, base_layer.in_features, device=base_layer.weight.device)
         )
@@ -253,6 +309,23 @@ class DecoderLoRALinear(nn.Module):
         self.base_layer.requires_grad_(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            self.fused
+            and isinstance(self.dropout, nn.Identity)
+            and isinstance(self.base_layer, nn.Linear)
+            and x.dtype == self.base_layer.weight.dtype
+            and x.dtype == self.lora_A.dtype
+            and x.dtype == self.lora_B.dtype
+        ):
+            return _FrozenBaseLoRAFunction.apply(
+                x,
+                self.base_layer.weight,
+                self.base_layer.bias,
+                self.lora_A,
+                self.lora_B,
+                self.scaling,
+            )
+
         y = self.base_layer(x)
         h = self.dropout(x)
         if h.dtype != self.lora_A.dtype:
@@ -1161,6 +1234,10 @@ class ReconstructionDecoder(nn.Module):
                 os.environ.get("BGKIT_DECODER_LORA_IMPL", "peft"),
             )
         ).strip().lower()
+        native_fused = _coerce_bool(
+            lora_config.get("fused", os.environ.get("BGKIT_DECODER_LORA_FUSED", "1")),
+            default=True,
+        )
         if implementation in {"native", "bgkit", "lightweight"}:
             wrapped = self._apply_native_lora(
                 target_modules=target_modules,
@@ -1168,6 +1245,7 @@ class ReconstructionDecoder(nn.Module):
                 alpha=alpha,
                 dropout=dropout,
                 adapter_dtype=adapter_dtype or torch.float32,
+                fused=native_fused,
             )
             cast_lora_params = wrapped
             self._lora_impl = "native"
@@ -1205,6 +1283,7 @@ class ReconstructionDecoder(nn.Module):
             dropout=dropout,
             adapter_dtype=str(adapter_dtype) if adapter_dtype is not None else "peft",
             cast_lora_params=cast_lora_params,
+            native_fused=native_fused if self._lora_impl == "native" else None,
         )
 
     def _apply_peft_lora(
@@ -1245,6 +1324,7 @@ class ReconstructionDecoder(nn.Module):
         alpha: float,
         dropout: float,
         adapter_dtype: torch.dtype,
+        fused: bool,
     ) -> int:
         self.backbone.requires_grad_(False)
         targets = set(target_modules)
@@ -1259,6 +1339,7 @@ class ReconstructionDecoder(nn.Module):
                     alpha=alpha,
                     dropout=dropout,
                     adapter_dtype=adapter_dtype,
+                    fused=fused,
                 )
                 setattr(parent, child_name, wrapper)
                 wrapped_params += wrapper.lora_A.numel() + wrapper.lora_B.numel()
