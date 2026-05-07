@@ -304,15 +304,29 @@ class LevelCompressor(nn.Module):
         min_per_sample: int = 0,
         utility_grad_active: bool = False,
         utility_grad_capture: dict | None = None,
+        forced_survivor_mask: torch.Tensor | None = None,
     ) -> LevelOutput:
-        """Run one compression level."""
+        """Run one compression level. ``forced_survivor_mask`` (bool, ``(N_content,)``)
+        overrides head selection when provided; head still runs for diagnostics."""
         if content_embeddings.ndim != 2:
             raise ValueError(
                 f"content_embeddings must be packed (N, D); got "
                 f"{tuple(content_embeddings.shape)}"
             )
+        if forced_survivor_mask is not None:
+            if forced_survivor_mask.shape != (content_embeddings.shape[0],):
+                raise ValueError(
+                    f"forced_survivor_mask must have shape "
+                    f"({content_embeddings.shape[0]},); got "
+                    f"{tuple(forced_survivor_mask.shape)}"
+                )
+            if forced_survivor_mask.dtype != torch.bool:
+                forced_survivor_mask = forced_survivor_mask.to(torch.bool)
 
-        compression_off = target_ratio is None or target_ratio >= 0.999
+        compression_off = (
+            forced_survivor_mask is None
+            and (target_ratio is None or target_ratio >= 0.999)
+        )
 
         # ---- Build the input pack ----
         prompt_supplied = (
@@ -378,24 +392,34 @@ class LevelCompressor(nn.Module):
             logits_for_op = torch.tanh(base_raw / T)
 
             valid = torch.ones_like(base_raw, dtype=torch.bool)
-            theta = self.threshold.theta_for_ratio(float(target_ratio)).to(
-                base_raw.device,
-            )
-            sel = adaptive_threshold_select(
-                logits=logits_for_op,
-                valid_mask=valid,
-                theta=theta,
-                cu_seqlens=content_cu_seqlens,
-                pinned=pinned_positions,
-                min_per_sample=min_per_sample,
-            )
-            mask = sel.mask  # (N_content,)
-
-            survive_probs = torch.sigmoid(
-                logits_for_op.float() - theta.float(),
-            ).to(base_raw.dtype)
-            with torch.no_grad():
-                survive_probs_metrics = survive_probs.detach()
+            # When forced_survivor_mask is supplied the head still runs for
+            # diagnostics, but selection bypasses adaptive_threshold_select
+            # and theta lookup. The dual-ascent counts are zeroed because the
+            # trainer using forced_survivor_mask owns mask construction.
+            if forced_survivor_mask is not None:
+                theta = torch.zeros((), dtype=base_raw.dtype, device=base_raw.device)
+                mask = forced_survivor_mask.to(base_raw.device)
+                survive_probs = torch.sigmoid(logits_for_op.float()).to(base_raw.dtype)
+                with torch.no_grad():
+                    survive_probs_metrics = survive_probs.detach()
+            else:
+                theta = self.threshold.theta_for_ratio(float(target_ratio)).to(
+                    base_raw.device,
+                )
+                sel = adaptive_threshold_select(
+                    logits=logits_for_op,
+                    valid_mask=valid,
+                    theta=theta,
+                    cu_seqlens=content_cu_seqlens,
+                    pinned=pinned_positions,
+                    min_per_sample=min_per_sample,
+                )
+                mask = sel.mask  # (N_content,)
+                survive_probs = torch.sigmoid(
+                    logits_for_op.float() - theta.float(),
+                ).to(base_raw.dtype)
+                with torch.no_grad():
+                    survive_probs_metrics = survive_probs.detach()
 
             # Flag-embedding scatter: add survive_embedding at surviving
             # content positions only. Clone hidden to avoid autograd aliasing
@@ -409,24 +433,43 @@ class LevelCompressor(nn.Module):
 
             # Aggregation primitives for the trainer's true-mean update of theta.
             with torch.no_grad():
-                valid_count = valid.sum()
-                organic = (logits_for_op.float() > theta.float()) & valid
-                if pinned_positions is None:
-                    pinned_mask = torch.zeros_like(valid)
+                if forced_survivor_mask is not None:
+                    zero_l = torch.zeros((), dtype=torch.int64, device=mask.device)
+                    valid_count = zero_l
+                    organic_count = zero_l
+                    controllable_count = zero_l
+                    floor_trigger_rate = torch.zeros(
+                        (), dtype=torch.float32, device=mask.device,
+                    )
+                    num_pinned = zero_l
+                    organic_rate_std = torch.zeros(
+                        (), dtype=torch.float32, device=mask.device,
+                    )
+                    undecided_fraction = torch.zeros(
+                        (), dtype=torch.float32, device=mask.device,
+                    )
                 else:
-                    pinned_mask = pinned_positions & valid
-                floor_mask = mask & ~organic & ~pinned_mask
-                controllable = valid & ~pinned_mask & ~floor_mask
-                organic_count = (organic & controllable).sum()
-                controllable_count = controllable.sum()
+                    valid_count = valid.sum()
+                    organic = (logits_for_op.float() > theta.float()) & valid
+                    if pinned_positions is None:
+                        pinned_mask = torch.zeros_like(valid)
+                    else:
+                        pinned_mask = pinned_positions & valid
+                    floor_mask = mask & ~organic & ~pinned_mask
+                    controllable = valid & ~pinned_mask & ~floor_mask
+                    organic_count = (organic & controllable).sum()
+                    controllable_count = controllable.sum()
 
-                undecided_mask = (
-                    (survive_probs_metrics > 0.2)
-                    & (survive_probs_metrics < 0.8)
-                    & valid
-                )
-                denom = valid.sum().float().clamp(min=1.0)
-                undecided_fraction = undecided_mask.sum().float() / denom
+                    undecided_mask = (
+                        (survive_probs_metrics > 0.2)
+                        & (survive_probs_metrics < 0.8)
+                        & valid
+                    )
+                    denom = valid.sum().float().clamp(min=1.0)
+                    undecided_fraction = undecided_mask.sum().float() / denom
+                    floor_trigger_rate = sel.floor_trigger_rate
+                    num_pinned = sel.num_pinned
+                    organic_rate_std = sel.organic_rate_std
 
             hook_state["base_raw"] = base_raw
             hook_state["logits_for_op"] = logits_for_op
@@ -436,9 +479,9 @@ class LevelCompressor(nn.Module):
             hook_state["valid_count"] = valid_count
             hook_state["organic_count"] = organic_count
             hook_state["controllable_count"] = controllable_count
-            hook_state["floor_trigger_rate"] = sel.floor_trigger_rate
-            hook_state["num_pinned"] = sel.num_pinned
-            hook_state["organic_rate_std"] = sel.organic_rate_std
+            hook_state["floor_trigger_rate"] = floor_trigger_rate
+            hook_state["num_pinned"] = num_pinned
+            hook_state["organic_rate_std"] = organic_rate_std
             hook_state["undecided_fraction"] = undecided_fraction
             hook_state["theta_tensor"] = theta.detach()
             return hidden

@@ -1,0 +1,10 @@
+# @package _global_
+# Experiment preset: Phase 1 Step 4.7 bridge distillation.
+defaults:
+  - /config
+  - /training/phase1_step4p7
+  - _self_
+
+run_name: phase1_step4p7
+bgkit_checkpoint: auto
+resume_checkpoint: null

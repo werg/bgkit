@@ -161,7 +161,16 @@ class BgKITEncoder(nn.Module):
         utility_grad_capture_l0: dict | None = None,
         utility_grad_active_l1: bool = False,
         utility_grad_capture_l1: dict | None = None,
+        forced_survivor_mask_l0: torch.Tensor | None = None,
+        forced_survivor_mask_l1: torch.Tensor | None = None,
     ) -> EncoderOutput:
+        if forced_survivor_mask_l1 is not None and target_ratio_l1 is None:
+            raise ValueError(
+                "forced_survivor_mask_l1 is set but target_ratio_l1 is None — "
+                "L1 would be skipped entirely; pass a target_ratio_l1 (used "
+                "only for diagnostics under the forced mask)."
+            )
+
         l0_out = self.l0(
             content_embeddings=content_embeddings,
             content_cu_seqlens=content_cu_seqlens,
@@ -174,6 +183,7 @@ class BgKITEncoder(nn.Module):
             min_per_sample=min_per_sample_l0,
             utility_grad_active=utility_grad_active_l0,
             utility_grad_capture=utility_grad_capture_l0,
+            forced_survivor_mask=forced_survivor_mask_l0,
         )
 
         if target_ratio_l1 is None:
@@ -194,6 +204,7 @@ class BgKITEncoder(nn.Module):
                 min_per_sample=min_per_sample_l1,
                 utility_grad_active=utility_grad_active_l1,
                 utility_grad_capture=utility_grad_capture_l1,
+                forced_survivor_mask=forced_survivor_mask_l1,
             )
             proj_input = l1_out.survivor_embeddings
             proj_cu = l1_out.survivor_cu_seqlens

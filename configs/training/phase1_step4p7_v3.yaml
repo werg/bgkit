@@ -1,0 +1,86 @@
+# Phase 1 Step 4.7 v3: bridge distillation with teacher_ratio=0.10.
+#
+# Continuation of v2 to extend the bridge's training distribution to
+# even tighter compression (L0 ratio reaching down to 0.10). v3 starts
+# from v2's output as both teacher and student — teacher is held frozen
+# at v2's state (which has the broadest L0/L1 ratio coverage so far),
+# student trains its bridge + last L0 block + first 2 L1 blocks +
+# projection_block to handle teacher_ratio=0.10 across the full
+# frac_extras 1.0 → 0.0 sweep.
+#
+# Curriculum at teacher_ratio=0.10:
+# - frac_extras=1.0: r_l0=1.0 (no L0), r_l1=0.10 (heavy L1)
+# - frac_extras=0.5: r_l0=0.55, r_l1=0.18 (both, L1 heavier)
+# - frac_extras=0.0: r_l0=0.10 (heavy L0), r_l1=1.0 (no L1)
+#
+# Combined with v2 (teacher_ratio=0.20), v3 covers Step 5's full ratio
+# range: stage0 r_l0 = 0.9 → 0.15, stage1 r_l0 = 0.30 / r_l1 = 0.33.
+
+phase: phase1_step4p7_v3
+optimizer: adamw
+max_steps: 3500
+lr: 1.0e-3
+warmup_steps: 100
+
+# Source: student = latest v2 (best by eval/loss).
+bgkit_checkpoint: auto_phase1_step4p7_v2
+
+# Teacher: also v2 (same start; distillation signal emerges as student
+# trains for the new tighter ratios while teacher stays frozen at v2's
+# state).
+teacher_checkpoint: auto_phase1_step4p7_v2
+
+# Distillation parameters. teacher_ratio=0.10 was too aggressive — with
+# the per-file packing in commit_encoding, very short files (10-20
+# tokens) collapse to 1-2 survivors which crashes flash_attn varlen
+# (shape [4, 2, 4, 256] with 2-token-per-file packed sequences).
+# 0.15 gives min ~3-4 survivors per file, FA still hits its short-seq
+# fast path but stays valid.
+teacher_ratio: 0.15
+mse_weight: 1.0
+cos_weight: 1.0
+
+# Curriculum on the L0/L1 compression-load split.
+curriculum_steps: 3000
+frac_extras_start: 1.0
+frac_extras_end: 0.0
+
+# Path selection (50/50 alternation between L0-only and L0->L1).
+path_a_prob: 0.5
+
+# Data (matches Step 5 distribution).
+data:
+  commit_encoding_dir: ${oc.env:DATA_DIR}/processed/commit_encoding
+  prompt_variants_dir: configs/prompt_variants
+  max_diff_tokens_per_file: 1024
+  max_files_per_commit: 4
+  max_message_tokens: 256
+
+max_batch_tokens: 4096
+gradient_accumulation_steps: 4
+min_sample_length: 256
+max_sample_length: 1500
+max_eval_samples: 1000
+
+eval_every: 1000
+save_every: 500
+
+use_liger: true
+use_liger_rmsnorm: false
+
+# Trainable scoping.
+unfreeze:
+  l0_last_blocks: 1
+  l1_first_blocks: 2
+  bridge: true
+  projection_block: true
+  l0_norm: true
+  l1_norm: true
+
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+early_stopping:
+  enabled: false

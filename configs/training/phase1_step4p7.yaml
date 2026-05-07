@@ -1,0 +1,65 @@
+# Phase 1 Step 4.7: Bridge distillation.
+#
+# Repairs the L0->L1 auto_repro_head bridge and adapts the last L0 backbone
+# block + first 2 L1 backbone blocks + projection_block by distilling
+# against the frozen Step 4 (L0-only) encoder. See
+# plans/bridge-distill-step.md for the design.
+phase: phase1_step4p7
+optimizer: adamw
+max_steps: 3000
+lr: 1.0e-3
+warmup_steps: 100
+
+# Source: Step 4 split-layout checkpoint (resolved via registry; falls back
+# to phase1_step4 if no split variant is registered).
+bgkit_checkpoint: auto
+
+# Distillation parameters.
+teacher_ratio: 0.20          # what teacher's L0 compresses to
+mse_weight: 1.0
+cos_weight: 1.0
+
+# Curriculum on the L0/L1 compression-load split.
+curriculum_steps: 2500       # ramp completes by step 2500
+frac_extras_start: 1.0       # step 0: L0 passes everyone through, L1 selects M_t from all
+frac_extras_end: 0.31        # step 2500: 50/50 endpoint, L0 ratio ~ 0.447
+
+# Path selection (50/50 alternation between L0-only and L0->L1).
+path_a_prob: 0.5
+
+# Data (matches Step 5 distribution).
+data:
+  commit_encoding_dir: ${oc.env:DATA_DIR}/processed/commit_encoding
+  prompt_variants_dir: configs/prompt_variants
+  max_diff_tokens_per_file: 4096
+  max_files_per_commit: 16
+  max_message_tokens: 256
+
+max_batch_tokens: 8192
+gradient_accumulation_steps: 4
+min_sample_length: 256
+max_sample_length: 2000
+max_eval_samples: 1000
+
+eval_every: 500
+save_every: 1000
+
+use_liger: true
+use_liger_rmsnorm: false
+
+# Trainable scoping.
+unfreeze:
+  l0_last_blocks: 1          # last N blocks of L0 backbone unfrozen
+  l1_first_blocks: 2         # first N blocks of L1 backbone unfrozen
+  bridge: true
+  projection_block: true
+  l0_norm: true
+  l1_norm: true
+
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+early_stopping:
+  enabled: false
