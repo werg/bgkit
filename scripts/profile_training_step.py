@@ -233,7 +233,15 @@ def _run_optimizer_step(
     warmup_steps: int,
     base_lr: float,
     accum_steps: int,
+    fixed_batches: list[dict] | None = None,
 ) -> tuple[object, dict[str, float]]:
+    if fixed_batches is not None and len(fixed_batches) != accum_steps:
+        raise ValueError(
+            f"fixed batch replay expected {accum_steps} microbatches, "
+            f"got {len(fixed_batches)}"
+        )
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     trainer.global_step = step
     trainer._pre_step_hook()
     if trainer._dataloader_invalidated:
@@ -250,7 +258,10 @@ def _run_optimizer_step(
     batch_stats: dict[str, float] = {}
     for micro_idx in range(accum_steps):
         with torch.profiler.record_function(f"microbatch_{micro_idx:02d}/fetch"):
-            batch, dataloader_iter = _next_batch(trainer, dataloader_iter)
+            if fixed_batches is None:
+                batch, dataloader_iter = _next_batch(trainer, dataloader_iter)
+            else:
+                batch = fixed_batches[micro_idx]
             _accumulate_batch_stats(
                 batch_stats,
                 _batch_profile_stats(batch, "batch"),
@@ -268,7 +279,7 @@ def _run_optimizer_step(
     with torch.profiler.record_function("post_optimizer_step"):
         trainer._post_optimizer_step(step)
 
-    if trainer.cfg.training.get("cuda_empty_cache_every_step", True) and torch.cuda.is_available():
+    if _empty_cache_every_step(trainer.cfg) and torch.cuda.is_available():
         with torch.profiler.record_function("cuda_empty_cache"):
             torch.cuda.empty_cache()
 
@@ -278,8 +289,41 @@ def _run_optimizer_step(
     metrics["lr"] = trainer.optimizer.param_groups[0]["lr"]
     if len(trainer.optimizer.param_groups) > 1:
         metrics["lr_min"] = min(pg["lr"] for pg in trainer.optimizer.param_groups)
+    if torch.cuda.is_available():
+        metrics["peak_memory_gib"] = torch.cuda.max_memory_allocated() / 1024**3
+        metrics["reserved_memory_gib"] = torch.cuda.max_memory_reserved() / 1024**3
     trainer._add_step_metrics(metrics)
     return dataloader_iter, metrics
+
+
+def _prefetch_optimizer_step_batches(
+    trainer,
+    dataloader_iter,
+    *,
+    optimizer_steps: int,
+    accum_steps: int,
+) -> tuple[list[list[dict]], object, dict[str, float]]:
+    step_batches: list[list[dict]] = []
+    total_stats: dict[str, float] = {}
+    for _ in range(optimizer_steps):
+        micro_batches: list[dict] = []
+        for _micro_idx in range(accum_steps):
+            batch, dataloader_iter = _next_batch(trainer, dataloader_iter)
+            micro_batches.append(batch)
+            _accumulate_batch_stats(
+                total_stats,
+                _batch_profile_stats(batch, "prefetch"),
+            )
+        step_batches.append(micro_batches)
+    return step_batches, dataloader_iter, total_stats
+
+
+def _empty_cache_every_step(cfg: DictConfig) -> bool:
+    training_val = cfg.training.get("cuda_empty_cache_every_step", None)
+    if training_val is not None:
+        return bool(training_val)
+    compute_cfg = cfg.get("compute", {}) or {}
+    return bool(compute_cfg.get("cuda_empty_cache_every_step", False))
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
@@ -307,6 +351,7 @@ def main(cfg: DictConfig) -> None:
     topk = int(profile_cfg.get("topk", 60))
     record_shapes = bool(profile_cfg.get("record_shapes", False))
     profile_memory = bool(profile_cfg.get("profile_memory", False))
+    fixed_batches = bool(profile_cfg.get("fixed_batches", False))
     trace_path_raw = profile_cfg.get("trace_path", None)
 
     trainer, dataloader_iter, checkpoint = _prepare_trainer(cfg)
@@ -317,6 +362,28 @@ def main(cfg: DictConfig) -> None:
     trainer._accum_steps = accum_steps
 
     start_step = int(trainer.global_step)
+    prefetched_batches: list[list[dict]] | None = None
+    prefetch_stats: dict[str, float] = {}
+    if fixed_batches:
+        prefetched_batches, dataloader_iter, prefetch_stats = _prefetch_optimizer_step_batches(
+            trainer,
+            dataloader_iter,
+            optimizer_steps=warmup_profile_steps + measured_steps,
+            accum_steps=accum_steps,
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "profile_fixed_batches_prefetched",
+                    "optimizer_steps": len(prefetched_batches),
+                    "accum_steps": accum_steps,
+                    **prefetch_stats,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
     print(
         json.dumps(
             {
@@ -327,6 +394,7 @@ def main(cfg: DictConfig) -> None:
                 "warmup_steps": warmup_profile_steps,
                 "profile_steps": measured_steps,
                 "accum_steps": accum_steps,
+                "fixed_batches": fixed_batches,
                 "ce_impl": os.environ.get("BGKIT_DECODER_CE_IMPL", "<unset>"),
             },
             sort_keys=True,
@@ -336,6 +404,7 @@ def main(cfg: DictConfig) -> None:
 
     step = start_step
     warmup_metrics: list[dict[str, float]] = []
+    replay_idx = 0
     for _ in range(warmup_profile_steps):
         t0 = time.perf_counter()
         dataloader_iter, metrics = _run_optimizer_step(
@@ -346,6 +415,9 @@ def main(cfg: DictConfig) -> None:
             warmup_steps=warmup_steps,
             base_lr=base_lr,
             accum_steps=accum_steps,
+            fixed_batches=(
+                prefetched_batches[replay_idx] if prefetched_batches is not None else None
+            ),
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -355,6 +427,7 @@ def main(cfg: DictConfig) -> None:
         warmup_metrics.append(metrics)
         print(json.dumps({"event": "warmup_step", **metrics}, sort_keys=True), flush=True)
         step += 1
+        replay_idx += 1
 
     from torch.profiler import ProfilerActivity, profile
 
@@ -379,6 +452,9 @@ def main(cfg: DictConfig) -> None:
                 warmup_steps=warmup_steps,
                 base_lr=base_lr,
                 accum_steps=accum_steps,
+                fixed_batches=(
+                    prefetched_batches[replay_idx] if prefetched_batches is not None else None
+                ),
             )
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -388,6 +464,7 @@ def main(cfg: DictConfig) -> None:
             measured_metrics.append(metrics)
             print(json.dumps({"event": "profiled_step", **metrics}, sort_keys=True), flush=True)
             step += 1
+            replay_idx += 1
             prof.step()
 
     table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=topk)
@@ -416,6 +493,8 @@ def main(cfg: DictConfig) -> None:
                 cfg.training.get("decoder_lora", {}),
                 resolve=True,
             ),
+            "fixed_batches": fixed_batches,
+            "prefetch_stats": prefetch_stats,
             "gradient_accumulation_steps": int(
                 cfg.training.get("gradient_accumulation_steps", 1),
             ),

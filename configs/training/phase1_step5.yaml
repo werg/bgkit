@@ -8,6 +8,8 @@ encoder_lr: 1.0e-5
 decoder_lr: 5.0e-5
 warmup_steps: 500
 bidi_warmup_steps: 0           # already bidirectional from previous steps
+gradient_checkpointing: false  # GB10 Step 5 profile: ~18-22% faster, <27 GiB peak at stage-0 budget
+cuda_empty_cache_every_step: false  # Avoid per-step allocator sync; measured peak stays <27 GiB
 
 # ---- Three-phase curriculum (all live-tunable via control.json) ----
 # Stage transitions (steps).
@@ -94,6 +96,7 @@ moment_match_reference:
 
 decoder_lora:
   enabled: true
+  implementation: peft
   r: 16
   alpha: 32
   dropout: 0.0

@@ -4,16 +4,16 @@ device: cuda
 # Mixed precision -- BF16 default (MXFP8/MXFP4 not supported on sm_121)
 mixed_precision: bf16
 # Gradient checkpointing across BgKIT encoder levels and the 0.8B decoder.
-# Stays "true" (full ckpt-on) on DGX Spark. The "selective" mode (added
-# in src/bgkit/training/gradient_utils.py) is left available for future
-# experiments but is NOT the default — tested 2026-04-26 on phase1_step3
-# and saw cuda_max_allocated jump to 71 GB (vs 10 GB full ckpt-on) and
-# reserved hit the 79.8 GB cap. DeltaNet's chunk-level recurrent state
-# is larger than the per-layer hidden state alone suggests; skipping
-# ckpt on all 18 DeltaNet layers is too aggressive. A future variant
-# (skip ckpt on a subset, e.g. every other DeltaNet layer) might fit
-# but needs measurement.
-gradient_checkpointing: true
+# Default off on DGX Spark: recompute is a wall-clock cost, and phases should
+# opt in only when their measured activation footprint needs it. The shared
+# helper still supports "selective" for explicitly measured experiments.
+gradient_checkpointing: false
+# Per-step ``torch.cuda.empty_cache`` is off by default on GB10. It was
+# historically used as a fragmentation guard, but Step 5 profiling on
+# 2026-05-07 showed it costing ~0.5-1.0s/step while measured peaks stayed
+# below 27 GiB. Phases with known allocator pressure can override
+# ``training.cuda_empty_cache_every_step: true`` locally.
+cuda_empty_cache_every_step: false
 # Conservative defaults -- must be profiled on actual hardware
 # max_seq_len: 8192 pre-2026-04-19. Lowered to 4096 because decoder
 # splice under target_ratio≈0.9 balloons single-sample seq to 15K

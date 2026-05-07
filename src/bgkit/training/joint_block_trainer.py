@@ -34,7 +34,7 @@ from bgkit.data.samplers import PackedTokenBudgetSampler
 from bgkit.models.encoder import BgKITEncoder, _resolve_layers
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpointing import CheckpointMetadata, save_checkpoint
-from bgkit.training.gradient_utils import enable_gradient_checkpointing
+from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
 from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.model_utils import count_parameters, slerp_merge
 from bgkit.utils.packing import position_ids_from_cu
@@ -135,10 +135,10 @@ class JointBlockTrainer(BaseTrainer):
         )
         self.encoder.to(device)
 
-        # Enable gradient checkpointing on both backbones to reduce memory
-        # (essential when using torch DeltaNet fallback without fla Triton kernels)
-        enable_gradient_checkpointing(self.encoder.l0.backbone)
-        enable_gradient_checkpointing(self.encoder.l1.backbone)
+        # Config-gated checkpointing on both backbones. Defaults come from
+        # compute config; phases can override at training scope.
+        maybe_enable_gradient_checkpointing(self.encoder.l0.backbone, self.cfg)
+        maybe_enable_gradient_checkpointing(self.encoder.l1.backbone, self.cfg)
 
         # Load decoder's embedding matrix as frozen reference target
         decoder_name = self.cfg.model.decoder.backbone_name
@@ -195,8 +195,9 @@ class JointBlockTrainer(BaseTrainer):
                 f"Dataset too small for train/eval split (got {len(full_dataset)} samples, "
                 "need at least 2)"
             )
+        split_generator = torch.Generator().manual_seed(int(self.cfg.get("seed", 42)))
         self.train_dataset, self.eval_dataset = random_split(
-            full_dataset, [train_size, eval_size]
+            full_dataset, [train_size, eval_size], generator=split_generator
         )
 
         max_batch_tokens = tcfg.get("max_batch_tokens", 65536)

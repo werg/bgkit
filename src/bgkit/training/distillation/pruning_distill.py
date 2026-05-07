@@ -28,7 +28,7 @@ from bgkit.models.encoder import BgKITEncoder
 from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
-from bgkit.training.gradient_utils import enable_gradient_checkpointing
+from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
 from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.packing import position_ids_from_cu
 
@@ -147,8 +147,9 @@ class PruningDistillTrainer(BaseTrainer):
         self.student_encoder = student_encoder_full
         self.student_encoder.to(dtype=torch.bfloat16, device=device)
 
-        # Enable gradient checkpointing on FullAttn layers in pruned backbone
-        enable_gradient_checkpointing(self.student_encoder.l0.backbone)
+        # Config-gated checkpointing on the pruned backbone. Defaults come
+        # from compute config; phases can override at training scope.
+        maybe_enable_gradient_checkpointing(self.student_encoder.l0.backbone, self.cfg)
 
         # Also save the decoder state for pass-through in checkpoints
         self._decoder_state_dict = teacher_state.get("decoder", None)
@@ -205,8 +206,9 @@ class PruningDistillTrainer(BaseTrainer):
         max_eval_samples = tcfg.get("max_eval_samples", 2000)
         eval_size = min(max(1, int(len(full_dataset) * 0.1)), max_eval_samples)
         train_size = len(full_dataset) - eval_size
+        split_generator = torch.Generator().manual_seed(int(self.cfg.get("seed", 42)))
         self.train_dataset, self.eval_dataset = random_split(
-            full_dataset, [train_size, eval_size],
+            full_dataset, [train_size, eval_size], generator=split_generator,
         )
 
         max_batch_tokens = tcfg.get("max_batch_tokens", 16384)

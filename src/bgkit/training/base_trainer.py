@@ -1864,19 +1864,15 @@ class BaseTrainer(ABC):
                     from bgkit.utils.step_watchdog import heartbeat as _hb
                     _hb()
 
-                    # Release cached-but-unused CUDA allocator blocks back
-                    # to the OS each optimizer step. The DGX Spark's
-                    # unified-memory allocator, combined with variable-
-                    # shape batches from a shuffled-order sampler, was
-                    # observed to accumulate fragmentation (monotonic
-                    # system-memory growth over ~30 steps leading to a
-                    # whole-machine stall, 2026-04-19). ``empty_cache``
-                    # forces a defragmentation pass; cost is ~ms scale
-                    # compared to multi-second steps. Gate via
-                    # ``training.cuda_empty_cache_every_step`` in case a
-                    # future workload hits an allocator path where this
-                    # hurts more than it helps.
-                    if tcfg.get("cuda_empty_cache_every_step", True):
+                    # Optional allocator flush. GB10 defaults this off at
+                    # compute scope; memory-risky phases can opt back in at
+                    # training scope.
+                    empty_cache_every_step = tcfg.get("cuda_empty_cache_every_step", None)
+                    if empty_cache_every_step is None:
+                        empty_cache_every_step = self.cfg.compute.get(
+                            "cuda_empty_cache_every_step", False
+                        )
+                    if empty_cache_every_step:
                         import torch as _t
                         if _t.cuda.is_available():
                             _t.cuda.empty_cache()

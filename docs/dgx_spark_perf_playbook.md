@@ -61,10 +61,15 @@ For phase1_step3, DeltaNet had ~17× more samples than flash_attn — the
 naive expectation that "FA4 attention dominates" was wrong on this
 hardware.
 
-## 2. Default is `gradient_checkpointing: true` (full ckpt-on); don't disable
+## 2. Default is `gradient_checkpointing: false`; opt in only for memory-bound phases
 
-Two attempts to reduce checkpointing on phase1_step3 both failed
-(2026-04-26):
+Gradient checkpointing is a memory optimization, not a speed optimization.
+The DGX Spark compute default is off so decoder forward/backward does not
+pay recompute unless a phase explicitly opts in. Keep the memory rails on
+and watch `cuda_max_reserved_gb` when carrying ckpt-off into a new phase.
+
+Phase 1 Step 3 is an explicit exception. Two attempts to reduce
+checkpointing on phase1_step3 both failed (2026-04-26):
 
 - **`false` (full ckpt-off)**: peak jumped from 10 → 62 GB on a
   long-tail sample, hit the 79.8 GB cap, allocator thrashed, step rate
@@ -77,13 +82,20 @@ Two attempts to reduce checkpointing on phase1_step3 both failed
   hangs around per layer. The "+2 GB extra activation" prediction was
   off by 30×.
 
-So full ckpt-on is the default in `configs/compute/dgx_spark.yaml` and
-the safe winner. The `gradient_utils.maybe_enable_gradient_checkpointing`
-function still supports `"selective"` as a value (skips DeltaNet layers
-specifically) — left in place as a future hook if someone profiles a
-narrower subset (e.g. every other DeltaNet layer) that fits in memory.
-But don't enable it without measuring `cuda_max_allocated` over 100+
-steps with a representative shape distribution first.
+So full ckpt-on remains explicit in `configs/training/phase1_step3.yaml`.
+The `gradient_utils.maybe_enable_gradient_checkpointing` function still
+supports `"selective"` as a value (skips DeltaNet layers specifically) —
+left in place as a future hook if someone profiles a narrower subset
+(e.g. every other DeltaNet layer) that fits in memory. But don't enable
+it without measuring `cuda_max_allocated` over 100+ steps with a
+representative shape distribution first.
+
+Measured 2026-05-07: **Phase 1 Step 5 stage 0** is configured with
+`training.gradient_checkpointing: false` and
+`training.cuda_empty_cache_every_step: false`. A fixed-batch profile from
+`phase1_step5_step571_20260507_134009` improved measured steps from
+~15.1-15.7 s to ~11.4-11.9 s, with peak allocation below 27 GiB on GB10.
+Re-check before carrying that override to larger Step 5 stage-1 budgets.
 
 If you still want to try it for a stage with very stable shapes (e.g.
 fixed-length eval), set the override and watch
@@ -101,7 +113,7 @@ Stages where ckpt-off is **definitely too risky** (skip the test):
   in memory.
 - **Phase 2 Stage A** — live L0 + L0/L1 LoRA + decoder all training.
 - **Phase 3** — large distillation footprint.
-- **Step 3 and similar** (Step 1, 4, 5, 6) — confirmed too risky on
+- **Step 3 and similar** (Step 1, 4, 6) — confirmed too risky on
   the 04-26 live test; spike tail of long samples blows the cap.
 
 ## 3. Pick `max_batch_tokens` / `gradient_accumulation_steps` deliberately
@@ -164,7 +176,7 @@ autotune fix landed first. Keep in the toolbox.
 |---|---|---|
 | `IS_NVIDIA_BLACKWELL >= 10` (fla fork) | enables global_scratch alloc | ✓ |
 | sm_121 autotune configs (fla fork) | **5× DeltaNet speedup** | ✓ |
-| `gradient_checkpointing: false` | +13% short-run, then OOM-thrash on long samples | ✗ (revert) |
+| phase1_step3 `gradient_checkpointing: false` | +13% short-run, then OOM-thrash on long samples | Step 3 opt-in ckpt-on |
 | `gradient_checkpointing: selective` (skip 18 DeltaNet layers) | +60 GB activation; cap thrash → 50 s/step | ✗ (revert) |
 | Custom `chunk_fwd_o_sm121` kernel | unverified; default-off | – |
 | Vectorize decoder splice loops | 0% wall-clock; cleanup only | hygiene |

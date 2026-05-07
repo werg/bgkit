@@ -269,11 +269,12 @@ class KRKBTrainer(BaseTrainer):
         logger.info("phase2_kb_decoder_ce_impl_selected", impl=self.decoder.lm_ce_impl)
         self.decoder.train()
 
-        # Activation checkpointing on the decoder — significant memory win
-        # at a ~30% throughput cost. Default on; disable via
-        # ``training.activation_checkpointing.decoder: false``.
+        # Activation checkpointing on the decoder is a memory/speed tradeoff.
+        # Default off; enable explicitly via
+        # ``training.activation_checkpointing.decoder: true`` when a phase
+        # needs the extra activation headroom.
         ac_cfg = self.step_cfg.get("activation_checkpointing", {}) or {}
-        if ac_cfg.get("decoder", True) and hasattr(
+        if ac_cfg.get("decoder", False) and hasattr(
             decoder_backbone, "gradient_checkpointing_enable",
         ):
             try:
@@ -285,7 +286,13 @@ class KRKBTrainer(BaseTrainer):
                 # Older HF versions don't accept kwargs.
                 decoder_backbone.gradient_checkpointing_enable()
                 logger.info("phase2_kb_decoder_gc_enabled_legacy")
-        self._checkpoint_encoder = bool(ac_cfg.get("encoder", True))
+        else:
+            logger.info("phase2_kb_decoder_gc_disabled")
+        self._checkpoint_encoder = bool(ac_cfg.get("encoder", False))
+        logger.info(
+            "phase2_kb_encoder_activation_checkpointing_resolved",
+            enabled=self._checkpoint_encoder,
+        )
         # CPU offload for encoder activation checkpointing. When enabled,
         # _checkpointed_encoder routes through ``cpu_offload_checkpoint``
         # which parks the saved input tensors on pinned host memory between

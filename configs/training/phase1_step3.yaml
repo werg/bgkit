@@ -54,8 +54,12 @@ resume_warmup_steps: 0
 max_batch_tokens: 8192
 max_batch_tokens_eval: 16384
 gradient_accumulation_steps: 8
+cuda_empty_cache_every_step: true  # Step 3 has known allocator-pressure tails; override compute default.
 min_sample_length: 256       # filter trivially-short samples (license headers, .gitignore, tiny configs); short samples explode packing density and tank step rate
-# gradient_checkpointing inherits "true" from compute/dgx_spark.yaml.
+gradient_checkpointing: true
+# Step 3 is an explicit exception to the compute default. The 2026-04-26
+# live test saw ckpt-off spike activation memory badly enough to allocator-
+# thrash on long samples.
 # 2026-04-26 v4: tried "selective" (skip 18 DeltaNet layers, keep 6
 # FullAttention) — DeltaNet's chunk-level recurrent state is much larger
 # than estimated; cuda_max_allocated jumped to 71 GB (vs 10 GB full

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import structlog
 import torch
 import torch.nn as nn
+
+logger = structlog.get_logger()
 
 
 def enable_gradient_checkpointing(model: nn.Module) -> None:
@@ -25,7 +28,8 @@ def gradient_checkpointing_requested(cfg: Any) -> bool:
     Canonical knob is ``cfg.compute.gradient_checkpointing`` (hardware-scoped,
     since grad-ckpt is a memory/compute tradeoff tied to VRAM budget). Legacy
     ``cfg.training.gradient_checkpointing`` is honored for backward compat if
-    explicitly set. Default is True to match the pre-gating behavior.
+    explicitly set. Default is False because checkpointing trades speed for
+    memory and should be an explicit phase-level opt-in.
     """
     tcfg = getattr(cfg, "training", None)
     compute = getattr(cfg, "compute", None)
@@ -34,12 +38,16 @@ def gradient_checkpointing_requested(cfg: Any) -> bool:
     if tcfg is not None and hasattr(tcfg, "get"):
         training_val = tcfg.get("gradient_checkpointing", None)
         if training_val is not None:
-            return bool(training_val)
+            return bool(_coerce_gradient_checkpointing_value(training_val))
 
     if compute is not None and hasattr(compute, "get"):
-        return bool(compute.get("gradient_checkpointing", True))
+        return bool(
+            _coerce_gradient_checkpointing_value(
+                compute.get("gradient_checkpointing", False),
+            ),
+        )
 
-    return True
+    return False
 
 
 def maybe_enable_gradient_checkpointing(model: nn.Module, cfg: Any) -> bool:
@@ -64,10 +72,22 @@ def maybe_enable_gradient_checkpointing(model: nn.Module, cfg: Any) -> bool:
     """
     requested = _resolve_gradient_checkpointing_mode(cfg)
     if requested is False or requested is None:
+        logger.info(
+            "gradient_checkpointing_disabled",
+            model=model.__class__.__name__,
+            mode=requested,
+        )
         return False
     enable_gradient_checkpointing(model)
+    selective_disabled_layers = 0
     if requested == "selective":
-        _install_selective_checkpoint_func(model)
+        selective_disabled_layers = _install_selective_checkpoint_func(model)
+    logger.info(
+        "gradient_checkpointing_enabled",
+        model=model.__class__.__name__,
+        mode=requested,
+        selective_disabled_layers=selective_disabled_layers,
+    )
     return True
 
 
@@ -82,10 +102,10 @@ def _resolve_gradient_checkpointing_mode(cfg: Any) -> bool | str | None:
             return _coerce_gradient_checkpointing_value(training_val)
 
     if compute is not None and hasattr(compute, "get"):
-        compute_val = compute.get("gradient_checkpointing", True)
+        compute_val = compute.get("gradient_checkpointing", False)
         return _coerce_gradient_checkpointing_value(compute_val)
 
-    return True
+    return False
 
 
 def _coerce_gradient_checkpointing_value(val: Any) -> bool | str:
@@ -135,7 +155,7 @@ def _is_deltanet_layer(layer: nn.Module) -> bool:
     Full-attention layers expose ``self_attn`` instead. See the Qwen3.5
     architecture notes in CLAUDE.md.
     """
-    return hasattr(layer, "linear_attn") and getattr(layer, "linear_attn") is not None
+    return hasattr(layer, "linear_attn") and layer.linear_attn is not None
 
 
 def clip_grad_norm(
