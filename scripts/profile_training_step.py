@@ -9,11 +9,14 @@ steps with ``torch.profiler``.
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import math
 import os
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import hydra
@@ -224,6 +227,236 @@ def _accumulate_batch_stats(total: dict[str, float], stats: dict[str, float]) ->
             total[key] = total.get(key, 0.0) + value
 
 
+def _stable_json_hash(value: object) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.blake2b(payload, digest_size=12).hexdigest()
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _cu_lengths_summary(key: str, value: torch.Tensor) -> dict[str, int | str] | None:
+    if value.ndim != 1 or value.numel() < 2:
+        return None
+    if "cu_seqlens" not in key and not key.startswith("cu_") and not key.endswith("_cu"):
+        return None
+
+    cu = value.detach().to(device="cpu", dtype=torch.int64)
+    lengths = (cu[1:] - cu[:-1]).tolist()
+    if not lengths:
+        return None
+    total = int(sum(lengths))
+    l2_cost = int(sum(int(length) * int(length) for length in lengths))
+    return {
+        "count": len(lengths),
+        "total": total,
+        "min": int(min(lengths)),
+        "max": int(max(lengths)),
+        "l2_cost": l2_cost,
+        "lengths_hash": _stable_json_hash(lengths),
+    }
+
+
+def _batch_bucket_signature(batch: dict) -> dict:
+    """Return a graph-bucket signature for one microbatch.
+
+    CUDA graphs need tensor metadata to be stable for each replay slot. Sequence
+    lengths are summarized separately because some current code still branches
+    on ``cu_seqlens`` values on the Python side; those hashes tell us when a
+    nominally shape-static bucket is still value-dynamic.
+    """
+
+    tensors: list[dict[str, object]] = []
+    cu_lengths: dict[str, dict[str, int | str]] = {}
+    non_tensors: list[dict[str, str]] = []
+    for key in sorted(batch):
+        value = batch[key]
+        if isinstance(value, torch.Tensor):
+            tensors.append(
+                {
+                    "key": key,
+                    "shape": [int(dim) for dim in value.shape],
+                    "dtype": _dtype_name(value.dtype),
+                    "device": str(value.device),
+                }
+            )
+            summary = _cu_lengths_summary(key, value)
+            if summary is not None:
+                cu_lengths[key] = summary
+        else:
+            non_tensors.append({"key": key, "type": type(value).__name__})
+    return {
+        "hash": _stable_json_hash({"tensors": tensors, "cu_lengths": cu_lengths}),
+        "tensors": tensors,
+        "cu_lengths": cu_lengths,
+        "non_tensors": non_tensors,
+    }
+
+
+def _batch_bucket_signatures(step_batches: list[list[dict]]) -> list[list[dict]]:
+    return [
+        [_batch_bucket_signature(batch) for batch in micro_batches]
+        for micro_batches in step_batches
+    ]
+
+
+def _summarize_static_buckets(
+    step_signatures: list[list[dict]],
+    *,
+    max_buckets: int = 64,
+) -> dict:
+    micro_keys = [
+        json.dumps(signature, sort_keys=True, separators=(",", ":"))
+        for step in step_signatures
+        for signature in step
+    ]
+    micro_counter = Counter(micro_keys)
+    sorted_micro_keys = sorted(micro_counter, key=lambda key: (-micro_counter[key], key))
+    micro_id_by_key = {key: idx for idx, key in enumerate(sorted_micro_keys)}
+
+    optimizer_step_keys = [
+        tuple(
+            json.dumps(signature, sort_keys=True, separators=(",", ":"))
+            for signature in step
+        )
+        for step in step_signatures
+    ]
+    optimizer_counter = Counter(optimizer_step_keys)
+    sorted_optimizer_keys = sorted(
+        optimizer_counter,
+        key=lambda key: (-optimizer_counter[key], [micro_id_by_key[item] for item in key]),
+    )
+
+    micro_buckets = []
+    for key in sorted_micro_keys[:max_buckets]:
+        signature = json.loads(key)
+        micro_buckets.append(
+            {
+                "bucket_id": micro_id_by_key[key],
+                "count": micro_counter[key],
+                "hash": signature["hash"],
+                "signature": signature,
+            }
+        )
+
+    optimizer_step_buckets = []
+    for key in sorted_optimizer_keys[:max_buckets]:
+        micro_bucket_ids = [micro_id_by_key[item] for item in key]
+        optimizer_step_buckets.append(
+            {
+                "count": optimizer_counter[key],
+                "micro_bucket_ids": micro_bucket_ids,
+                "hash": _stable_json_hash(micro_bucket_ids),
+            }
+        )
+
+    return {
+        "optimizer_steps": len(step_signatures),
+        "microbatches": len(micro_keys),
+        "unique_microbatch_buckets": len(micro_counter),
+        "unique_optimizer_step_buckets": len(optimizer_counter),
+        "reported_microbatch_buckets": len(micro_buckets),
+        "reported_optimizer_step_buckets": len(optimizer_step_buckets),
+        "omitted_microbatch_buckets": max(0, len(micro_counter) - len(micro_buckets)),
+        "omitted_optimizer_step_buckets": max(
+            0,
+            len(optimizer_counter) - len(optimizer_step_buckets),
+        ),
+        "microbatch_buckets": micro_buckets,
+        "optimizer_step_buckets": optimizer_step_buckets,
+    }
+
+
+def _compact_static_bucket_summary(report: dict | None) -> dict | None:
+    if report is None:
+        return None
+    keys = (
+        "optimizer_steps",
+        "microbatches",
+        "unique_microbatch_buckets",
+        "unique_optimizer_step_buckets",
+        "omitted_microbatch_buckets",
+        "omitted_optimizer_step_buckets",
+    )
+    return {key: report[key] for key in keys}
+
+
+def _move_batch_to_device(batch, device: torch.device):
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device, non_blocking=True)
+    if isinstance(batch, dict):
+        return {key: _move_batch_to_device(value, device) for key, value in batch.items()}
+    if isinstance(batch, tuple):
+        return tuple(_move_batch_to_device(value, device) for value in batch)
+    if isinstance(batch, list):
+        return [_move_batch_to_device(value, device) for value in batch]
+    return batch
+
+
+def _move_step_batches_to_device(
+    step_batches: list[list[dict]],
+    device: torch.device,
+) -> list[list[dict]]:
+    return [
+        [_move_batch_to_device(batch, device) for batch in micro_batches]
+        for micro_batches in step_batches
+    ]
+
+
+def _fixed_step_batches(
+    prefetched_batches: list[list[dict]] | None,
+    replay_idx: int,
+    *,
+    repeat_first_fixed_step: bool,
+) -> list[dict] | None:
+    if prefetched_batches is None:
+        return None
+    if repeat_first_fixed_step:
+        return prefetched_batches[0]
+    return prefetched_batches[replay_idx]
+
+
+def _cuda_graph_forward_backward_probe(
+    trainer,
+    fixed_batches: list[list[dict]] | None,
+) -> dict[str, object]:
+    if not torch.cuda.is_available():
+        return {"enabled": True, "status": "skipped", "reason": "cuda_unavailable"}
+    if not fixed_batches:
+        return {"enabled": True, "status": "skipped", "reason": "fixed_batches_required"}
+
+    batch = _move_batch_to_device(fixed_batches[0][0], trainer.device)
+    result: dict[str, object] = {
+        "enabled": True,
+        "status": "failed",
+        "microbatches": 1,
+        "bucket_hash": _batch_bucket_signature(batch)["hash"],
+    }
+    try:
+        trainer.optimizer.zero_grad()
+        torch.cuda.synchronize()
+
+        trainer._forward_backward(batch)
+        trainer.optimizer.zero_grad()
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            trainer._forward_backward(batch)
+        graph.replay()
+        torch.cuda.synchronize()
+        trainer.optimizer.zero_grad()
+
+        result["status"] = "captured"
+    except Exception as exc:  # pragma: no cover - depends on CUDA/kernel runtime.
+        result["error_type"] = type(exc).__name__
+        result["error"] = str(exc)[:1000]
+        with contextlib.suppress(Exception):
+            trainer.optimizer.zero_grad()
+    return result
+
+
 def _run_optimizer_step(
     trainer,
     dataloader_iter,
@@ -352,6 +585,11 @@ def main(cfg: DictConfig) -> None:
     record_shapes = bool(profile_cfg.get("record_shapes", False))
     profile_memory = bool(profile_cfg.get("profile_memory", False))
     fixed_batches = bool(profile_cfg.get("fixed_batches", False))
+    repeat_first_fixed_step = bool(profile_cfg.get("repeat_first_fixed_step", False))
+    static_device_batches = bool(profile_cfg.get("static_device_batches", False))
+    static_bucket_summary = bool(profile_cfg.get("static_bucket_summary", fixed_batches))
+    static_bucket_max_buckets = int(profile_cfg.get("static_bucket_max_buckets", 64))
+    cuda_graph_probe = bool(profile_cfg.get("cuda_graph_probe", False))
     trace_path_raw = profile_cfg.get("trace_path", None)
 
     trainer, dataloader_iter, checkpoint = _prepare_trainer(cfg)
@@ -364,19 +602,38 @@ def main(cfg: DictConfig) -> None:
     start_step = int(trainer.global_step)
     prefetched_batches: list[list[dict]] | None = None
     prefetch_stats: dict[str, float] = {}
+    static_bucket_report: dict | None = None
     if fixed_batches:
+        prefetch_optimizer_steps = (
+            1 if repeat_first_fixed_step else warmup_profile_steps + measured_steps
+        )
         prefetched_batches, dataloader_iter, prefetch_stats = _prefetch_optimizer_step_batches(
             trainer,
             dataloader_iter,
-            optimizer_steps=warmup_profile_steps + measured_steps,
+            optimizer_steps=prefetch_optimizer_steps,
             accum_steps=accum_steps,
         )
+        if static_device_batches and torch.cuda.is_available():
+            prefetched_batches = _move_step_batches_to_device(
+                prefetched_batches,
+                trainer.device,
+            )
+        if static_bucket_summary:
+            static_bucket_report = _summarize_static_buckets(
+                _batch_bucket_signatures(prefetched_batches),
+                max_buckets=static_bucket_max_buckets,
+            )
         print(
             json.dumps(
                 {
                     "event": "profile_fixed_batches_prefetched",
                     "optimizer_steps": len(prefetched_batches),
                     "accum_steps": accum_steps,
+                    "repeat_first_fixed_step": repeat_first_fixed_step,
+                    "static_device_batches": static_device_batches,
+                    "static_bucket_summary": _compact_static_bucket_summary(
+                        static_bucket_report
+                    ),
                     **prefetch_stats,
                 },
                 sort_keys=True,
@@ -395,6 +652,10 @@ def main(cfg: DictConfig) -> None:
                 "profile_steps": measured_steps,
                 "accum_steps": accum_steps,
                 "fixed_batches": fixed_batches,
+                "repeat_first_fixed_step": repeat_first_fixed_step,
+                "static_device_batches": static_device_batches,
+                "static_bucket_summary": static_bucket_summary,
+                "cuda_graph_probe": cuda_graph_probe,
                 "ce_impl": os.environ.get("BGKIT_DECODER_CE_IMPL", "<unset>"),
             },
             sort_keys=True,
@@ -415,8 +676,10 @@ def main(cfg: DictConfig) -> None:
             warmup_steps=warmup_steps,
             base_lr=base_lr,
             accum_steps=accum_steps,
-            fixed_batches=(
-                prefetched_batches[replay_idx] if prefetched_batches is not None else None
+            fixed_batches=_fixed_step_batches(
+                prefetched_batches,
+                replay_idx,
+                repeat_first_fixed_step=repeat_first_fixed_step,
             ),
         )
         if torch.cuda.is_available():
@@ -452,8 +715,10 @@ def main(cfg: DictConfig) -> None:
                 warmup_steps=warmup_steps,
                 base_lr=base_lr,
                 accum_steps=accum_steps,
-                fixed_batches=(
-                    prefetched_batches[replay_idx] if prefetched_batches is not None else None
+                fixed_batches=_fixed_step_batches(
+                    prefetched_batches,
+                    replay_idx,
+                    repeat_first_fixed_step=repeat_first_fixed_step,
                 ),
             )
             if torch.cuda.is_available():
@@ -469,6 +734,20 @@ def main(cfg: DictConfig) -> None:
 
     table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=topk)
     print(table)
+
+    cuda_graph_probe_report: dict[str, object] | None = None
+    if cuda_graph_probe:
+        cuda_graph_probe_report = _cuda_graph_forward_backward_probe(
+            trainer,
+            prefetched_batches,
+        )
+        print(
+            json.dumps(
+                {"event": "cuda_graph_forward_backward_probe", **cuda_graph_probe_report},
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
     checkpoint_dir = Path(cfg.get("checkpoint_dir", "checkpoints"))
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -494,7 +773,11 @@ def main(cfg: DictConfig) -> None:
                 resolve=True,
             ),
             "fixed_batches": fixed_batches,
+            "repeat_first_fixed_step": repeat_first_fixed_step,
+            "static_device_batches": static_device_batches,
             "prefetch_stats": prefetch_stats,
+            "static_bucket_summary": static_bucket_report,
+            "cuda_graph_probe": cuda_graph_probe_report,
             "gradient_accumulation_steps": int(
                 cfg.training.get("gradient_accumulation_steps", 1),
             ),
