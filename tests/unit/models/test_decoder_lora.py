@@ -1,7 +1,7 @@
 """Tests for ReconstructionDecoder.apply_lora() and merge_lora().
 
 Verifies:
-1. apply_lora wraps the backbone with peft
+1. apply_lora wraps decoder target modules with PEFT by default
 2. merge_lora produces a clean state dict loadable into a plain decoder
 3. Merged weights incorporate the LoRA delta (W' = W + scaling * B @ A)
 4. Roundtrip: apply_lora → train → merge_lora → load into plain decoder
@@ -12,11 +12,10 @@ from __future__ import annotations
 import pytest
 
 torch = pytest.importorskip("torch")
-peft = pytest.importorskip("peft")
 
 from torch import nn
 
-from bgkit.models.decoder import ReconstructionDecoder
+from bgkit.models.decoder import DecoderLoRALinear, ReconstructionDecoder
 
 # ---------------------------------------------------------------------------
 # Mock backbone with HF CausalLM-style .model / .lm_head nesting
@@ -89,6 +88,7 @@ LORA_CONFIG = {
     "dropout": 0.0,
     "target_modules": ["q_proj", "v_proj"],
 }
+NATIVE_LORA_CONFIG = {**LORA_CONFIG, "implementation": "native"}
 
 
 # ---------------------------------------------------------------------------
@@ -97,13 +97,24 @@ LORA_CONFIG = {
 
 
 class TestApplyLora:
-    def test_wraps_with_peft(self):
+    def test_default_wraps_with_peft(self):
+        peft = pytest.importorskip("peft")
         backbone = MockCausalLMBackbone()
         decoder = ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
+
         decoder.apply_lora(LORA_CONFIG)
 
         assert decoder._has_lora
         assert isinstance(decoder.backbone, peft.PeftModel)
+
+    def test_native_wraps_target_linears(self):
+        backbone = MockCausalLMBackbone()
+        decoder = ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
+        decoder.apply_lora(NATIVE_LORA_CONFIG)
+
+        assert decoder._has_lora
+        assert isinstance(decoder.backbone.model.q_proj, DecoderLoRALinear)
+        assert isinstance(decoder.backbone.model.v_proj, DecoderLoRALinear)
 
     def test_reduces_trainable_params(self):
         backbone = MockCausalLMBackbone()
@@ -131,7 +142,7 @@ class TestApplyLora:
         }
         assert lora_dtypes == {torch.bfloat16}
 
-    def test_peft_dtype_opt_out_keeps_fp32_adapters(self):
+    def test_legacy_dtype_opt_out_keeps_fp32_adapters(self):
         backbone = MockCausalLMBackbone().to(dtype=torch.bfloat16)
         decoder = ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
 
@@ -143,6 +154,15 @@ class TestApplyLora:
             if "lora_" in name
         }
         assert lora_dtypes == {torch.float32}
+
+    def test_peft_implementation_still_available(self):
+        peft = pytest.importorskip("peft")
+        backbone = MockCausalLMBackbone()
+        decoder = ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
+
+        decoder.apply_lora({**LORA_CONFIG, "implementation": "peft"})
+
+        assert isinstance(decoder.backbone, peft.PeftModel)
 
 
 class TestMergeLora:

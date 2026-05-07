@@ -218,12 +218,13 @@ def parse_args() -> argparse.Namespace:
         default="packed-splice",
         help="Use bgkit's packed decoder loss path, or raw HF causal-LM loss.",
     )
-    parser.add_argument("--ce-chunk-size", type=int, default=1024)
+    parser.add_argument("--ce-chunk-size", type=int, default=2048)
     parser.add_argument(
         "--decoder-lora",
         action="store_true",
         help="Apply bgkit's default decoder LoRA setup.",
     )
+    parser.add_argument("--lora-implementation", choices=["peft", "native"], default="peft")
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument(
         "--decoder-nvfp4",
@@ -302,6 +303,7 @@ def main() -> None:
                     "r": 16,
                     "alpha": 32,
                     "dropout": args.lora_dropout,
+                    "implementation": args.lora_implementation,
                     "target_modules": [
                         "q_proj",
                         "k_proj",
@@ -398,7 +400,8 @@ def main() -> None:
               FLA_DQKWG_TL_BK={env_dqkwg_bk}
               FLA_DQKWG_TL_BV={env_dqkwg_bv}
               gradient_checkpointing={args.gradient_checkpointing} use_liger={args.use_liger}
-              decoder_lora={args.decoder_lora} lora_dropout={args.lora_dropout}
+              decoder_lora={args.decoder_lora} lora_impl={args.lora_implementation}
+              lora_dropout={args.lora_dropout}
               decoder_nvfp4={args.decoder_nvfp4}
             """
         ).strip()
@@ -431,6 +434,7 @@ def main() -> None:
         "loss_path": args.loss_path,
         "ce_chunk_size": args.ce_chunk_size,
         "decoder_lora": args.decoder_lora,
+        "lora_implementation": args.lora_implementation,
         "lora_dropout": args.lora_dropout,
         "decoder_nvfp4": args.decoder_nvfp4,
         "batch_size": args.batch_size,

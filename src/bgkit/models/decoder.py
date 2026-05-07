@@ -38,7 +38,7 @@ from bgkit.utils.packing import position_ids_from_cu
 
 logger = structlog.get_logger()
 
-DEFAULT_LM_CE_CHUNK_SIZE = int(os.environ.get("BGKIT_DECODER_CE_CHUNK_SIZE", "1024"))
+DEFAULT_LM_CE_CHUNK_SIZE = int(os.environ.get("BGKIT_DECODER_CE_CHUNK_SIZE", "2048"))
 
 
 def _resolve_ce_chunk_size(chunk_size: int | None) -> int:
@@ -192,13 +192,61 @@ class GenerationOutput:
     full_ids: list[torch.Tensor]  # per-sample complete generation for debugging
 
 
+class DecoderLoRALinear(nn.Module):
+    """Small always-on LoRA wrapper for frozen decoder ``nn.Linear`` modules."""
+
+    def __init__(
+        self,
+        base_layer: nn.Linear,
+        *,
+        rank: int,
+        alpha: float,
+        dropout: float,
+        adapter_dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        self.base_layer = base_layer
+        self.rank = int(rank)
+        self.alpha = float(alpha)
+        self.scaling = self.alpha / max(self.rank, 1)
+        self.lora_A = nn.Parameter(
+            torch.empty(self.rank, base_layer.in_features, device=base_layer.weight.device)
+        )
+        self.lora_B = nn.Parameter(
+            torch.zeros(
+                base_layer.out_features,
+                self.rank,
+                device=base_layer.weight.device,
+            )
+        )
+        nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
+        self.lora_A.data = self.lora_A.data.to(dtype=adapter_dtype)
+        self.lora_B.data = self.lora_B.data.to(dtype=adapter_dtype)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.base_layer.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.base_layer(x)
+        h = self.dropout(x)
+        if h.dtype != self.lora_A.dtype:
+            h = h.to(dtype=self.lora_A.dtype)
+        h = F.linear(h, self.lora_A)
+        h = F.linear(h, self.lora_B)
+        return y + (h * self.scaling).to(dtype=y.dtype)
+
+    def merged_weight(self) -> torch.Tensor:
+        delta = (self.lora_B @ self.lora_A) * self.scaling
+        return self.base_layer.weight + delta.to(dtype=self.base_layer.weight.dtype)
+
+
 class ReconstructionDecoder(nn.Module):
     """Causal LM decoder for reconstructing content from BgKIT survivors.
 
     Wraps Qwen3.5-0.8B and exposes interleaved survivor-injection helpers.
 
-    Supports optional NVFP4 quantization via TransformerEngine and LoRA
-    via peft. Setup order: construct → load checkpoint → enable_nvfp4() → apply_lora().
+    Supports optional NVFP4 quantization via TransformerEngine and decoder
+    LoRA. Setup order: construct → load checkpoint → enable_nvfp4() →
+    apply_lora().
 
     Attention regime: packed (varlen) only.  No padded / masked path.
     ``forward_with_single_splice`` accepts flat packed inputs;
@@ -218,6 +266,9 @@ class ReconstructionDecoder(nn.Module):
         self._use_te = False
         self._te_recipe = None
         self._has_lora = False
+        self._lora_impl: str | None = None
+        self._lora_target_modules: tuple[str, ...] = ()
+        self._lora_scaling: float | None = None
         # Opt-in flag for Liger-fused linear+CE. Trainers toggle this via
         # ``enable_liger_ce(True)`` when the Liger Kernel package is available;
         # the default is off so CPU host tests and un-installed environments
@@ -284,14 +335,16 @@ class ReconstructionDecoder(nn.Module):
         """
         import transformer_engine.pytorch as te
 
+        wrapper_types: tuple[type[nn.Module], ...] = (DecoderLoRALinear,)
         try:
             from peft.tuners.lora import Linear as LoraLinear
+            wrapper_types = (DecoderLoRALinear, LoraLinear)
         except ImportError:
-            return
+            pass
 
         count = 0
         for _name, module in self.backbone.named_modules():
-            if not isinstance(module, LoraLinear):
+            if not isinstance(module, wrapper_types):
                 continue
             base = module.base_layer
             if isinstance(base, te.Linear):
@@ -935,61 +988,141 @@ class ReconstructionDecoder(nn.Module):
             lora_config: Dict with keys: r, alpha, dropout (optional, default 0.0),
                 target_modules (list of module name strings), and optional
                 dtype/adapter_dtype. Decoder adapters default to the base
-                model dtype so PEFT does not cast every adapted projection
-                through fp32 on bf16 training runs.
+                model dtype. ``implementation`` defaults to ``"peft"``;
+                ``"native"`` is retained as a compatibility/debug path.
         """
-        from peft import LoraConfig, get_peft_model
-
-        config = LoraConfig(
-            r=lora_config.get("r", 16),
-            lora_alpha=lora_config.get("alpha", 32),
-            lora_dropout=lora_config.get("dropout", 0.0),
-            target_modules=list(
-                lora_config.get(
-                    "target_modules",
-                    [
-                        "q_proj",
-                        "k_proj",
-                        "v_proj",
-                        "o_proj",
-                        "gate_proj",
-                        "up_proj",
-                        "down_proj",
-                    ],
-                )
-            ),
-            bias="none",
-            task_type="CAUSAL_LM",
+        rank = int(lora_config.get("r", 16))
+        alpha = float(lora_config.get("alpha", 32))
+        dropout = float(lora_config.get("dropout", 0.0))
+        target_modules = tuple(
+            lora_config.get(
+                "target_modules",
+                [
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ],
+            )
         )
         adapter_dtype = self._resolve_lora_adapter_dtype(
             lora_config.get("adapter_dtype", lora_config.get("dtype"))
         )
-        autocast_adapter_dtype = bool(
-            lora_config.get("autocast_adapter_dtype", adapter_dtype is None)
-        )
-        try:
-            self.backbone = get_peft_model(
-                self.backbone,
-                config,
-                autocast_adapter_dtype=autocast_adapter_dtype,
+        implementation = str(
+            lora_config.get(
+                "implementation",
+                os.environ.get("BGKIT_DECODER_LORA_IMPL", "peft"),
             )
-        except TypeError:
-            self.backbone = get_peft_model(self.backbone, config)
+        ).strip().lower()
+        if implementation in {"native", "bgkit", "lightweight"}:
+            wrapped = self._apply_native_lora(
+                target_modules=target_modules,
+                rank=rank,
+                alpha=alpha,
+                dropout=dropout,
+                adapter_dtype=adapter_dtype or torch.float32,
+            )
+            cast_lora_params = wrapped
+            self._lora_impl = "native"
+        elif implementation == "peft":
+            cast_lora_params = self._apply_peft_lora(
+                target_modules=target_modules,
+                rank=rank,
+                alpha=alpha,
+                dropout=dropout,
+                adapter_dtype=adapter_dtype,
+                autocast_adapter_dtype=bool(
+                    lora_config.get("autocast_adapter_dtype", adapter_dtype is None)
+                ),
+            )
+            self._lora_impl = "peft"
+        else:
+            raise ValueError(
+                "decoder LoRA implementation must be native or peft; "
+                f"got {implementation!r}"
+            )
         self._has_lora = True
-        cast_lora_params = self._cast_lora_adapters(adapter_dtype)
+        self._lora_target_modules = target_modules
+        self._lora_scaling = alpha / max(rank, 1)
 
         trainable = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.backbone.parameters())
         logger.info(
             "decoder_lora_applied",
+            implementation=self._lora_impl,
             trainable_params=trainable,
             total_params=total,
             ratio=f"{trainable / total:.4f}",
-            r=config.r,
-            alpha=config.lora_alpha,
+            r=rank,
+            alpha=alpha,
+            dropout=dropout,
             adapter_dtype=str(adapter_dtype) if adapter_dtype is not None else "peft",
             cast_lora_params=cast_lora_params,
         )
+
+    def _apply_peft_lora(
+        self,
+        *,
+        target_modules: tuple[str, ...],
+        rank: int,
+        alpha: float,
+        dropout: float,
+        adapter_dtype: torch.dtype | None,
+        autocast_adapter_dtype: bool,
+    ) -> int:
+        from peft import LoraConfig, get_peft_model
+
+        config = LoraConfig(
+            r=rank,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=list(target_modules),
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        try:
+            self.backbone = get_peft_model(
+                self.backbone,
+                config,
+                autocast_adapter_dtype=bool(autocast_adapter_dtype),
+            )
+        except TypeError:
+            self.backbone = get_peft_model(self.backbone, config)
+        return self._cast_lora_adapters(adapter_dtype)
+
+    def _apply_native_lora(
+        self,
+        *,
+        target_modules: tuple[str, ...],
+        rank: int,
+        alpha: float,
+        dropout: float,
+        adapter_dtype: torch.dtype,
+    ) -> int:
+        self.backbone.requires_grad_(False)
+        targets = set(target_modules)
+        wrapped_params = 0
+        for parent in list(self.backbone.modules()):
+            for child_name, child in list(parent.named_children()):
+                if child_name not in targets or not isinstance(child, nn.Linear):
+                    continue
+                wrapper = DecoderLoRALinear(
+                    child,
+                    rank=rank,
+                    alpha=alpha,
+                    dropout=dropout,
+                    adapter_dtype=adapter_dtype,
+                )
+                setattr(parent, child_name, wrapper)
+                wrapped_params += wrapper.lora_A.numel() + wrapper.lora_B.numel()
+        if wrapped_params == 0:
+            raise ValueError(
+                f"decoder LoRA found no nn.Linear target modules in {sorted(targets)!r}"
+            )
+        return wrapped_params
 
     def _base_lora_dtype(self) -> torch.dtype:
         """Return the decoder's compute dtype for LoRA adapter matmuls."""
@@ -1050,7 +1183,11 @@ class ReconstructionDecoder(nn.Module):
         """
         if not self._has_lora:
             return self.state_dict()
+        if self._lora_impl == "native":
+            return self._merge_native_lora()
+        return self._merge_peft_lora()
 
+    def _merge_peft_lora(self) -> dict:
         peft_sd = self.state_dict()
         merged = {}
         peft_prefix = "backbone.base_model.model."
@@ -1098,6 +1235,22 @@ class ReconstructionDecoder(nn.Module):
 
             merged[clean_key] = val
 
+        return merged
+
+    def _merge_native_lora(self) -> dict:
+        sd = self.state_dict()
+        modules = dict(self.named_modules())
+        merged = {}
+        for key, val in sd.items():
+            if key.endswith(".lora_A") or key.endswith(".lora_B"):
+                continue
+            clean_key = key.replace(".base_layer.", ".")
+            if key.endswith(".base_layer.weight"):
+                module_key = key[: -len(".base_layer.weight")]
+                module = modules.get(module_key)
+                if isinstance(module, DecoderLoRALinear):
+                    val = module.merged_weight()
+            merged[clean_key] = val
         return merged
 
     @torch.no_grad()

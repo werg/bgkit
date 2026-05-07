@@ -119,6 +119,48 @@ class TestApplyLigerToQwen35Fallback:
         assert sig.parameters["patch_rope"].default is True
 
 
+class TestFusedGateUpSwiGLU:
+    def test_frozen_gate_up_fusion_matches_liger_forward(self, monkeypatch):
+        from bgkit.utils.liger_integration import _install_fused_gate_up_swiglu
+
+        class _FakeSiLUMul:
+            @staticmethod
+            def apply(gate, up):
+                return F.silu(gate) * up
+
+        class _FakeLigerMLP(nn.Module):
+            def forward(self, x):
+                return self.down_proj(_FakeSiLUMul.apply(self.gate_proj(x), self.up_proj(x)))
+
+        class _TinyMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.Linear(4, 8, bias=False)
+                self.up_proj = nn.Linear(4, 8, bias=False)
+                self.down_proj = nn.Linear(8, 4, bias=False)
+
+        torch.manual_seed(0)
+        mlp = _TinyMLP()
+        ref = _TinyMLP()
+        ref.load_state_dict(mlp.state_dict())
+        for proj in (mlp.gate_proj, mlp.up_proj):
+            proj.weight.requires_grad_(False)
+
+        monkeypatch.setenv("BGKIT_FUSE_FROZEN_GATE_UP_SWIGLU", "1")
+        monkeypatch.setattr(liger_integration, "_try_import_liger_silu_mul", lambda: _FakeSiLUMul)
+        assert _install_fused_gate_up_swiglu(mlp, _FakeLigerMLP)
+
+        x = torch.randn(2, 3, 4, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        out = mlp(x)
+        ref_out = _FakeLigerMLP.forward(ref, x_ref)
+
+        torch.testing.assert_close(out, ref_out)
+        out.sum().backward()
+        ref_out.sum().backward()
+        torch.testing.assert_close(x.grad, x_ref.grad)
+
+
 # ---------------------------------------------------------------------------
 # liger_chunked_ce_loss — fallback path
 # ---------------------------------------------------------------------------

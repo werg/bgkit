@@ -44,6 +44,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
 # Availability probe
@@ -141,6 +142,163 @@ def _try_import_liger_swiglu():
         return LigerSwiGLUMLP
     except Exception:
         return None
+
+
+def _try_import_liger_silu_mul():
+    try:
+        from liger_kernel.ops import LigerSiLUMulFunction  # type: ignore
+        return LigerSiLUMulFunction
+    except Exception:
+        return None
+
+
+_UNSUPPORTED_LORA = object()
+
+
+def _base_linear(module: nn.Module) -> nn.Linear | None:
+    if isinstance(module, nn.Linear):
+        return module
+    base = getattr(module, "base_layer", None)
+    if isinstance(base, nn.Linear):
+        return base
+    return None
+
+
+def _peft_or_native_lora_delta(
+    module: nn.Module,
+    x: torch.Tensor,
+    result_dtype: torch.dtype,
+) -> torch.Tensor | None | object:
+    """Return LoRA delta for supported PEFT/native wrappers.
+
+    The fused gate/up path below handles only the vanilla single-adapter LoRA
+    shape BgKIT installs for decoder training. Anything more exotic falls
+    back to Liger's normal two-projection SwiGLU forward.
+    """
+    lora_a = getattr(module, "lora_A", None)
+    lora_b = getattr(module, "lora_B", None)
+
+    # BgKIT native wrapper: lora_A/lora_B are Parameters.
+    if isinstance(lora_a, torch.nn.Parameter) and isinstance(lora_b, torch.nn.Parameter):
+        dropout = getattr(module, "dropout", None)
+        h = dropout(x) if dropout is not None else x
+        if h.dtype != lora_a.dtype:
+            h = h.to(dtype=lora_a.dtype)
+        h = F.linear(h, lora_a)
+        h = F.linear(h, lora_b)
+        return (h * float(getattr(module, "scaling", 1.0))).to(dtype=result_dtype)
+
+    # PEFT LoraLinear: lora_A/lora_B are ModuleDicts keyed by active adapter.
+    if not hasattr(module, "active_adapters") or lora_a is None or lora_b is None:
+        return None
+    if bool(getattr(module, "disable_adapters", False)) or bool(getattr(module, "merged", False)):
+        return None
+    if getattr(module, "lora_variant", None):
+        return _UNSUPPORTED_LORA
+
+    delta: torch.Tensor | None = None
+    try:
+        active_adapters = tuple(module.active_adapters)
+    except Exception:
+        return _UNSUPPORTED_LORA
+
+    for active_adapter in active_adapters:
+        if active_adapter not in lora_a:
+            continue
+        a_mod = lora_a[active_adapter]
+        b_mod = lora_b[active_adapter]
+        dropouts = getattr(module, "lora_dropout", {})
+        dropout = dropouts[active_adapter] if active_adapter in dropouts else nn.Identity()
+        scalings = getattr(module, "scaling", {})
+        scaling = float(scalings.get(active_adapter, 1.0))
+        x_lora = x
+        cast_input = getattr(module, "_cast_input_dtype", None)
+        if callable(cast_input):
+            x_lora = cast_input(x_lora, a_mod.weight.dtype)
+        elif x_lora.dtype != a_mod.weight.dtype:
+            x_lora = x_lora.to(dtype=a_mod.weight.dtype)
+        part = b_mod(a_mod(dropout(x_lora))) * scaling
+        delta = part if delta is None else delta + part
+
+    if delta is None:
+        return None
+    return delta.to(dtype=result_dtype)
+
+
+def _fused_gate_up_swiglu_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    weight = self._bgkit_gate_up_weight
+    bias = getattr(self, "_bgkit_gate_up_bias", None)
+    if weight.device != x.device:
+        weight = weight.to(device=x.device)
+    gate_up = F.linear(x, weight, bias)
+    gate, up = gate_up.chunk(2, dim=-1)
+    result_dtype = gate.dtype
+
+    gate_delta = _peft_or_native_lora_delta(self.gate_proj, x, result_dtype)
+    up_delta = _peft_or_native_lora_delta(self.up_proj, x, result_dtype)
+    if gate_delta is _UNSUPPORTED_LORA or up_delta is _UNSUPPORTED_LORA:
+        return self._bgkit_liger_swiglu_fallback_forward(x)
+    if gate_delta is not None:
+        gate = gate + gate_delta
+    if up_delta is not None:
+        up = up + up_delta
+
+    swiglu_fn = self._bgkit_liger_swiglu_fn
+    return self.down_proj(swiglu_fn.apply(gate, up))
+
+
+def _install_fused_gate_up_swiglu(module: nn.Module, swiglu_cls: type[nn.Module]) -> bool:
+    """Install a wider gate/up projection for frozen Qwen MLPs.
+
+    PEFT/native decoder LoRA freezes the base model, so the gate and up base
+    weights are static. Concatenating them once lets the MLP compute both
+    projections with one larger GEMM and one input-gradient GEMM in backward,
+    while LoRA deltas and the down projection remain ordinary modules.
+    """
+    if os.environ.get("BGKIT_FUSE_FROZEN_GATE_UP_SWIGLU", "0") != "1":
+        return False
+    gate_base = _base_linear(module.gate_proj)
+    up_base = _base_linear(module.up_proj)
+    if gate_base is None or up_base is None:
+        return False
+    if gate_base.weight.requires_grad or up_base.weight.requires_grad:
+        return False
+    if gate_base.weight.shape[1] != up_base.weight.shape[1]:
+        return False
+    if gate_base.weight.device != up_base.weight.device:
+        return False
+    if gate_base.weight.dtype != up_base.weight.dtype:
+        return False
+
+    gate_bias = gate_base.bias
+    up_bias = up_base.bias
+    if (gate_bias is None) != (up_bias is None):
+        return False
+    if gate_bias is not None and (
+        gate_bias.device != up_bias.device or gate_bias.dtype != up_bias.dtype
+    ):
+        return False
+
+    swiglu_fn = _try_import_liger_silu_mul()
+    if swiglu_fn is None:
+        return False
+
+    weight = torch.cat((gate_base.weight.detach(), up_base.weight.detach()), dim=0).contiguous()
+    module.register_buffer("_bgkit_gate_up_weight", weight, persistent=False)
+    if gate_bias is not None:
+        bias = torch.cat((gate_bias.detach(), up_bias.detach()), dim=0).contiguous()
+        module.register_buffer("_bgkit_gate_up_bias", bias, persistent=False)
+
+    import types
+
+    module._bgkit_liger_swiglu_fn = swiglu_fn  # type: ignore[attr-defined]
+    module._bgkit_liger_swiglu_fallback_forward = types.MethodType(  # type: ignore[attr-defined]
+        swiglu_cls.forward,
+        module,
+    )
+    module.forward = types.MethodType(_fused_gate_up_swiglu_forward, module)
+    module._bgkit_fused_gate_up_swiglu = True  # type: ignore[attr-defined]
+    return True
 
 
 def _try_import_liger_rope():
@@ -242,6 +400,10 @@ def _patch_swiglu_mlp_modules(root: nn.Module) -> int:
             and "Liger" not in type(module).__name__
         ):
             try:
+                if _install_fused_gate_up_swiglu(module, liger_swiglu_cls):
+                    count += 1
+                    continue
+
                 # Bind Liger's forward as a method on this instance.
                 import types
 
