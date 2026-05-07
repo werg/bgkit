@@ -26,6 +26,7 @@ constructed or passed.
 from __future__ import annotations
 
 import os
+import types
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -259,7 +260,28 @@ class _FrozenBaseLoRAFunction(torch.autograd.Function):
         scaling = ctx.scaling
 
         grad_lora_h = grad_2d.matmul(lora_b).mul_(scaling)
-        grad_x = grad_2d.matmul(base_weight).add_(grad_lora_h.matmul(lora_a))
+        grad_x_base = grad_2d.matmul(base_weight)
+        use_triton_dx = _coerce_bool(
+            os.environ.get("BGKIT_DECODER_LORA_TRITON_DX", "1"),
+            default=True,
+        )
+        if use_triton_dx:
+            try:
+                from bgkit.models.lora_triton import (
+                    can_use_triton_lora_dx_add,
+                    triton_lora_dx_add_,
+                )
+
+                if can_use_triton_lora_dx_add(grad_x_base, grad_lora_h, lora_a):
+                    grad_x = triton_lora_dx_add_(grad_x_base, grad_lora_h, lora_a)
+                else:
+                    grad_x = torch.addmm(grad_x_base, grad_lora_h, lora_a)
+            except Exception:
+                if _coerce_bool(os.environ.get("BGKIT_DECODER_LORA_TRITON_DX_STRICT", "0")):
+                    raise
+                grad_x = torch.addmm(grad_x_base, grad_lora_h, lora_a)
+        else:
+            grad_x = torch.addmm(grad_x_base, grad_lora_h, lora_a)
         grad_a = grad_lora_h.t().matmul(x_2d)
         grad_b = grad_2d.t().matmul(h).mul_(scaling)
 
@@ -271,6 +293,75 @@ class _FrozenBaseLoRAFunction(torch.autograd.Function):
             grad_b,
             None,
         )
+
+
+def _peft_fused_lora_forward(module: nn.Module, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    """PEFT-compatible fast path for frozen-base decoder LoRA.
+
+    This deliberately accepts only the Step-5 hot path: one active vanilla
+    adapter, no dropout, no mixed-adapter batch, and an ``nn.Linear`` frozen
+    base. Other PEFT features fall back to the original module method.
+    """
+
+    original_forward = getattr(module, "_bgkit_original_forward", None)
+    if original_forward is None:
+        raise RuntimeError("PEFT fused LoRA forward was installed without an original forward")
+
+    if args or kwargs:
+        return original_forward(x, *args, **kwargs)
+    if bool(getattr(module, "disable_adapters", False)) or bool(getattr(module, "merged", False)):
+        return original_forward(x)
+
+    active_adapters = tuple(getattr(module, "active_adapters", ()))
+    if len(active_adapters) != 1:
+        return original_forward(x)
+    active_adapter = active_adapters[0]
+
+    lora_variant = getattr(module, "lora_variant", {})
+    if active_adapter in lora_variant:
+        return original_forward(x)
+
+    lora_a_modules = getattr(module, "lora_A", None)
+    lora_b_modules = getattr(module, "lora_B", None)
+    lora_dropout = getattr(module, "lora_dropout", None)
+    scaling_map = getattr(module, "scaling", None)
+    if (
+        lora_a_modules is None
+        or lora_b_modules is None
+        or lora_dropout is None
+        or scaling_map is None
+        or active_adapter not in lora_a_modules
+        or active_adapter not in lora_b_modules
+    ):
+        return original_forward(x)
+
+    dropout = lora_dropout[active_adapter]
+    dropout_is_noop = isinstance(dropout, nn.Identity) or (
+        isinstance(dropout, nn.Dropout) and float(dropout.p) == 0.0
+    )
+    if not dropout_is_noop:
+        return original_forward(x)
+
+    base_layer = getattr(module, "base_layer", None)
+    lora_a = lora_a_modules[active_adapter].weight
+    lora_b = lora_b_modules[active_adapter].weight
+    if not isinstance(base_layer, nn.Linear):
+        return original_forward(x)
+    if (
+        x.dtype != base_layer.weight.dtype
+        or x.dtype != lora_a.dtype
+        or x.dtype != lora_b.dtype
+    ):
+        return original_forward(x)
+
+    return _FrozenBaseLoRAFunction.apply(
+        x,
+        base_layer.weight,
+        base_layer.bias,
+        lora_a,
+        lora_b,
+        float(scaling_map[active_adapter]),
+    )
 
 
 class DecoderLoRALinear(nn.Module):
@@ -370,6 +461,7 @@ class ReconstructionDecoder(nn.Module):
         self._lora_impl: str | None = None
         self._lora_target_modules: tuple[str, ...] = ()
         self._lora_scaling: float | None = None
+        self._lora_peft_fused_count = 0
         # Opt-in flag for Liger-fused linear+CE. Trainers toggle this via
         # ``enable_liger_ce(True)`` when the Liger Kernel package is available;
         # the default is off so CPU host tests and un-installed environments
@@ -1238,6 +1330,13 @@ class ReconstructionDecoder(nn.Module):
             lora_config.get("fused", os.environ.get("BGKIT_DECODER_LORA_FUSED", "1")),
             default=True,
         )
+        peft_fused_backward = _coerce_bool(
+            lora_config.get(
+                "peft_fused_backward",
+                os.environ.get("BGKIT_DECODER_PEFT_FUSED_BACKWARD", "0"),
+            ),
+            default=False,
+        )
         if implementation in {"native", "bgkit", "lightweight"}:
             wrapped = self._apply_native_lora(
                 target_modules=target_modules,
@@ -1259,6 +1358,7 @@ class ReconstructionDecoder(nn.Module):
                 autocast_adapter_dtype=bool(
                     lora_config.get("autocast_adapter_dtype", adapter_dtype is None)
                 ),
+                fused_backward=peft_fused_backward,
             )
             self._lora_impl = "peft"
         else:
@@ -1284,6 +1384,8 @@ class ReconstructionDecoder(nn.Module):
             adapter_dtype=str(adapter_dtype) if adapter_dtype is not None else "peft",
             cast_lora_params=cast_lora_params,
             native_fused=native_fused if self._lora_impl == "native" else None,
+            peft_fused_backward=peft_fused_backward if self._lora_impl == "peft" else None,
+            peft_fused_modules=self._lora_peft_fused_count if self._lora_impl == "peft" else None,
         )
 
     def _apply_peft_lora(
@@ -1295,6 +1397,7 @@ class ReconstructionDecoder(nn.Module):
         dropout: float,
         adapter_dtype: torch.dtype | None,
         autocast_adapter_dtype: bool,
+        fused_backward: bool,
     ) -> int:
         from peft import LoraConfig, get_peft_model
 
@@ -1314,7 +1417,29 @@ class ReconstructionDecoder(nn.Module):
             )
         except TypeError:
             self.backbone = get_peft_model(self.backbone, config)
-        return self._cast_lora_adapters(adapter_dtype)
+        cast_count = self._cast_lora_adapters(adapter_dtype)
+        self._lora_peft_fused_count = (
+            self._enable_peft_fused_lora_backward() if fused_backward else 0
+        )
+        return cast_count
+
+    def _enable_peft_fused_lora_backward(self) -> int:
+        """Patch PEFT LoRA Linear modules to use BgKIT's fused autograd path."""
+
+        try:
+            from peft.tuners.lora import Linear as PeftLoraLinear
+        except ImportError:
+            return 0
+
+        count = 0
+        for module in self.backbone.modules():
+            if not isinstance(module, PeftLoraLinear):
+                continue
+            if not hasattr(module, "_bgkit_original_forward"):
+                module._bgkit_original_forward = module.forward
+            module.forward = types.MethodType(_peft_fused_lora_forward, module)
+            count += 1
+        return count
 
     def _apply_native_lora(
         self,

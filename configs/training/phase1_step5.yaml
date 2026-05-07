@@ -97,6 +97,10 @@ decoder_lora:
   r: 16
   alpha: 32
   dropout: 0.0
+  # Experimental: preserves PEFT checkpoint keys while replacing PEFT's LoRA
+  # graph with BgKIT's fused frozen-base autograd path. Keep disabled until
+  # real-step profiling beats the PEFT default.
+  peft_fused_backward: false
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
 freeze:

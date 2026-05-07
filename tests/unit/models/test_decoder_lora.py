@@ -9,6 +9,8 @@ Verifies:
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -17,6 +19,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from bgkit.models.decoder import DecoderLoRALinear, ReconstructionDecoder
+from bgkit.models.lora_triton import can_use_triton_lora_dx_add
 
 # ---------------------------------------------------------------------------
 # Mock backbone with HF CausalLM-style .model / .lm_head nesting
@@ -165,6 +168,63 @@ class TestApplyLora:
 
         assert isinstance(decoder.backbone, peft.PeftModel)
 
+    def test_peft_fused_backward_preserves_peft_layout(self):
+        pytest.importorskip("peft")
+        backbone = MockCausalLMBackbone()
+        decoder = ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
+
+        decoder.apply_lora(
+            {
+                **LORA_CONFIG,
+                "implementation": "peft",
+                "peft_fused_backward": True,
+            }
+        )
+
+        assert decoder._lora_peft_fused_count == 2
+        assert hasattr(decoder.backbone.base_model.model.model.q_proj, "_bgkit_original_forward")
+        assert any(".lora_A.default.weight" in key for key in decoder.state_dict())
+        assert not any(key.endswith(".lora_A") for key in decoder.state_dict())
+
+    def test_peft_fused_backward_matches_peft_reference(self):
+        pytest.importorskip("peft")
+        torch.manual_seed(123)
+        backbone = MockCausalLMBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        ref.apply_lora({**LORA_CONFIG, "implementation": "peft"})
+        fused.apply_lora(
+            {
+                **LORA_CONFIG,
+                "implementation": "peft",
+                "peft_fused_backward": True,
+            }
+        )
+        fused.load_state_dict(ref.state_dict())
+
+        ref_module = ref.backbone.base_model.model.model.q_proj
+        fused_module = fused.backbone.base_model.model.model.q_proj
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        grad = torch.randn(2, 4, HIDDEN_DIM)
+
+        y_ref = ref_module(x_ref)
+        y_fused = fused_module(x)
+        torch.testing.assert_close(y_fused, y_ref)
+
+        y_ref.backward(grad)
+        y_fused.backward(grad)
+
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        torch.testing.assert_close(
+            fused_module.lora_A.default.weight.grad,
+            ref_module.lora_A.default.weight.grad,
+        )
+        torch.testing.assert_close(
+            fused_module.lora_B.default.weight.grad,
+            ref_module.lora_B.default.weight.grad,
+        )
+
     def test_native_frozen_base_lora_backward_matches_reference(self):
         torch.manual_seed(123)
         base = nn.Linear(7, 5, bias=True).to(dtype=torch.float64)
@@ -198,6 +258,13 @@ class TestApplyLora:
         torch.testing.assert_close(x.grad, ref_x.grad)
         torch.testing.assert_close(wrapper.lora_A.grad, ref_a.grad)
         torch.testing.assert_close(wrapper.lora_B.grad, ref_b.grad)
+
+    def test_triton_lora_dx_add_rejects_cpu_tensors(self):
+        dx = torch.zeros(4, 8)
+        gh = torch.zeros(4, 2)
+        a = torch.zeros(2, 8)
+
+        assert not can_use_triton_lora_dx_add(dx, gh, a)
 
 
 class TestLoraStateDictCompatibility:

@@ -261,6 +261,16 @@ def parse_args() -> argparse.Namespace:
             "BGKIT_DECODER_LORA_FUSED."
         ),
     )
+    parser.add_argument(
+        "--peft-fused-backward",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Patch PEFT LoRA Linear modules to use BgKIT's fused frozen-base "
+            "autograd path. Only affects --lora-implementation peft; default "
+            "follows BGKIT_DECODER_PEFT_FUSED_BACKWARD."
+        ),
+    )
     parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument(
         "--decoder-nvfp4",
@@ -373,6 +383,8 @@ def main() -> None:
             }
             if args.lora_fused is not None:
                 lora_config["fused"] = bool(args.lora_fused)
+            if args.peft_fused_backward is not None:
+                lora_config["peft_fused_backward"] = bool(args.peft_fused_backward)
             model.apply_lora(lora_config)
         if args.decoder_nvfp4:
             if args.decoder_nvfp4_backend == "native-frozen":
@@ -453,10 +465,16 @@ def main() -> None:
     env_dqkwg_bk = os.environ.get("FLA_DQKWG_TL_BK", "<default>")
     env_dqkwg_bv = os.environ.get("FLA_DQKWG_TL_BV", "<default>")
     env_ce_strict = os.environ.get("BGKIT_DECODER_CE_STRICT", "<default>")
+    env_lora_triton_dx = os.environ.get("BGKIT_DECODER_LORA_TRITON_DX", "<default>")
     lora_fused_display = (
         args.lora_fused
         if args.lora_fused is not None
         else os.environ.get("BGKIT_DECODER_LORA_FUSED", "<default>")
+    )
+    peft_fused_backward_display = (
+        args.peft_fused_backward
+        if args.peft_fused_backward is not None
+        else os.environ.get("BGKIT_DECODER_PEFT_FUSED_BACKWARD", "<default>")
     )
     cce_available: bool | None = None
     expected_ce_path = args.ce_impl
@@ -488,9 +506,11 @@ def main() -> None:
               FLA_DQKWG_TL_BK={env_dqkwg_bk}
               FLA_DQKWG_TL_BV={env_dqkwg_bv}
               BGKIT_DECODER_CE_STRICT={env_ce_strict}
+              BGKIT_DECODER_LORA_TRITON_DX={env_lora_triton_dx}
               gradient_checkpointing={args.gradient_checkpointing} use_liger={args.use_liger}
               decoder_lora={args.decoder_lora} lora_impl={args.lora_implementation}
               lora_fused={lora_fused_display}
+              peft_fused_backward={peft_fused_backward_display}
               lora_dropout={args.lora_dropout}
               decoder_nvfp4={args.decoder_nvfp4} decoder_nvfp4_backend={args.decoder_nvfp4_backend}
             """
@@ -532,6 +552,9 @@ def main() -> None:
         "lora_fused": args.lora_fused
         if args.lora_fused is not None
         else os.environ.get("BGKIT_DECODER_LORA_FUSED"),
+        "peft_fused_backward": args.peft_fused_backward
+        if args.peft_fused_backward is not None
+        else os.environ.get("BGKIT_DECODER_PEFT_FUSED_BACKWARD"),
         "lora_dropout": args.lora_dropout,
         "decoder_nvfp4": args.decoder_nvfp4,
         "decoder_nvfp4_backend": args.decoder_nvfp4_backend,
@@ -560,6 +583,7 @@ def main() -> None:
             "FLA_DQKWG_TL_BK": env_dqkwg_bk,
             "FLA_DQKWG_TL_BV": env_dqkwg_bv,
             "BGKIT_DECODER_CE_STRICT": env_ce_strict,
+            "BGKIT_DECODER_LORA_TRITON_DX": env_lora_triton_dx,
         },
     }
     print("summary=" + json.dumps(summary, sort_keys=True))
