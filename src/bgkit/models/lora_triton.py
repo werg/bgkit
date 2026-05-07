@@ -55,6 +55,33 @@ def _lora_dx_add_kernel(
     )
 
 
+@triton.jit
+def _swiglu_backward_kernel(
+    GRAD_HIDDEN,
+    GATE,
+    UP,
+    GRAD_GATE,
+    GRAD_UP,
+    N: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < N
+
+    grad_hidden = tl.load(GRAD_HIDDEN + offsets, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.load(GATE + offsets, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(UP + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    sigmoid_gate = tl.sigmoid(gate)
+    silu_gate = gate * sigmoid_gate
+    grad_up = grad_hidden * silu_gate
+    grad_gate = grad_hidden * up * sigmoid_gate * (1.0 + gate * (1.0 - sigmoid_gate))
+
+    tl.store(GRAD_GATE + offsets, grad_gate, mask=mask)
+    tl.store(GRAD_UP + offsets, grad_up, mask=mask)
+
+
 def _next_power_of_2(value: int) -> int:
     return 1 << max(int(value) - 1, 1).bit_length()
 
@@ -112,3 +139,49 @@ def triton_lora_dx_add_(
         num_stages=3,
     )
     return dx_base
+
+
+def can_use_triton_swiglu_backward(
+    grad_hidden: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+) -> bool:
+    if triton is None or tl is None:
+        return False
+    if not (grad_hidden.is_cuda and gate.is_cuda and up.is_cuda):
+        return False
+    if not (grad_hidden.is_contiguous() and gate.is_contiguous() and up.is_contiguous()):
+        return False
+    if grad_hidden.dtype not in {torch.bfloat16, torch.float16}:
+        return False
+    if gate.dtype != grad_hidden.dtype or up.dtype != grad_hidden.dtype:
+        return False
+    return grad_hidden.shape == gate.shape == up.shape
+
+
+def triton_swiglu_backward(
+    grad_hidden: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused elementwise backward for ``silu(gate) * up``."""
+
+    if not can_use_triton_swiglu_backward(grad_hidden, gate, up):
+        raise RuntimeError("Triton SwiGLU backward is unavailable for these tensors")
+    assert triton is not None
+    grad_gate = torch.empty_like(gate)
+    grad_up = torch.empty_like(up)
+    n = grad_hidden.numel()
+    block = 256
+    grid = (triton.cdiv(n, block),)
+    _swiglu_backward_kernel[grid](
+        grad_hidden,
+        gate,
+        up,
+        grad_gate,
+        grad_up,
+        n,
+        BLOCK=block,
+        num_warps=8,
+    )
+    return grad_gate, grad_up

@@ -120,6 +120,38 @@ class TestApplyLigerToQwen35Fallback:
 
 
 class TestFusedGateUpSwiGLU:
+    def test_liger_swiglu_patch_preserves_bgkit_fused_lora_mlp(self, monkeypatch):
+        from bgkit.utils.liger_integration import _patch_swiglu_mlp_modules
+
+        class _FakeLigerMLP(nn.Module):
+            def forward(self, x):
+                return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+        class _TinyMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.Linear(4, 8, bias=False)
+                self.up_proj = nn.Linear(4, 8, bias=False)
+                self.down_proj = nn.Linear(8, 4, bias=False)
+                self._bgkit_fused_lora_mlp_forward = True
+
+            def forward(self, x):
+                return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+        mlp = _TinyMLP()
+        original_forward = mlp.forward
+        root = nn.Module()
+        root.mlp = mlp
+
+        monkeypatch.setattr(
+            liger_integration,
+            "_try_import_liger_swiglu",
+            lambda: _FakeLigerMLP,
+        )
+
+        assert _patch_swiglu_mlp_modules(root) == 0
+        assert mlp.forward.__func__ is original_forward.__func__
+
     def test_frozen_gate_up_fusion_matches_liger_forward(self, monkeypatch):
         from bgkit.utils.liger_integration import _install_fused_gate_up_swiglu
 

@@ -372,8 +372,7 @@ class _FrozenBaseMLPLoRAFunction(torch.autograd.Function):
     def forward(
         ctx,
         x: torch.Tensor,
-        gate_weight: torch.Tensor,
-        up_weight: torch.Tensor,
+        gate_up_weight: torch.Tensor,
         down_weight: torch.Tensor,
         gate_a: torch.Tensor,
         gate_b: torch.Tensor,
@@ -384,14 +383,17 @@ class _FrozenBaseMLPLoRAFunction(torch.autograd.Function):
         gate_scaling: float,
         up_scaling: float,
         down_scaling: float,
+        out_features: int,
     ) -> torch.Tensor:
         x_shape = tuple(x.shape)
         x_2d = x.reshape(-1, x_shape[-1])
 
-        gate_h = F.linear(x_2d, gate_a)
-        up_h = F.linear(x_2d, up_a)
-        gate_y = F.linear(x_2d, gate_weight)
-        up_y = F.linear(x_2d, up_weight)
+        y_cat = F.linear(x_2d, gate_up_weight)
+        gate_y, up_y = y_cat.split(int(out_features), dim=-1)
+        a_cat = torch.cat((gate_a, up_a), dim=0)
+        h_cat = F.linear(x_2d, a_cat)
+        rank = int(gate_a.shape[0])
+        gate_h, up_h = h_cat.split(rank, dim=-1)
         gate_y = torch.addmm(gate_y, gate_h, gate_b.t(), beta=1.0, alpha=float(gate_scaling))
         up_y = torch.addmm(up_y, up_h, up_b.t(), beta=1.0, alpha=float(up_scaling))
 
@@ -403,8 +405,7 @@ class _FrozenBaseMLPLoRAFunction(torch.autograd.Function):
 
         ctx.save_for_backward(
             x_2d,
-            gate_weight,
-            up_weight,
+            gate_up_weight,
             down_weight,
             gate_a,
             gate_b,
@@ -423,14 +424,14 @@ class _FrozenBaseMLPLoRAFunction(torch.autograd.Function):
         ctx.gate_scaling = float(gate_scaling)
         ctx.up_scaling = float(up_scaling)
         ctx.down_scaling = float(down_scaling)
+        ctx.out_features = int(out_features)
         return out.reshape(*x_shape[:-1], down_weight.shape[0])
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (
             x_2d,
-            gate_weight,
-            up_weight,
+            gate_up_weight,
             down_weight,
             gate_a,
             gate_b,
@@ -453,26 +454,43 @@ class _FrozenBaseMLPLoRAFunction(torch.autograd.Function):
         grad_down_a = down_grad_h.t().matmul(hidden)
         grad_down_b = grad_out.t().matmul(down_h).mul_(ctx.down_scaling)
 
-        sigmoid_gate = torch.sigmoid(gate_y)
-        silu_gate = gate_y * sigmoid_gate
-        grad_up = grad_hidden * silu_gate
-        grad_gate = grad_hidden * up_y * sigmoid_gate * (1.0 + gate_y * (1.0 - sigmoid_gate))
+        try:
+            from bgkit.models.lora_triton import (
+                can_use_triton_swiglu_backward,
+                triton_lora_dx_add_,
+                triton_swiglu_backward,
+            )
+
+            if can_use_triton_swiglu_backward(grad_hidden, gate_y, up_y):
+                grad_gate, grad_up = triton_swiglu_backward(grad_hidden, gate_y, up_y)
+            else:
+                raise RuntimeError("triton_swiglu_backward unavailable")
+        except Exception:
+            sigmoid_gate = torch.sigmoid(gate_y)
+            silu_gate = gate_y * sigmoid_gate
+            grad_up = grad_hidden * silu_gate
+            grad_gate = grad_hidden * up_y * sigmoid_gate * (1.0 + gate_y * (1.0 - sigmoid_gate))
 
         gate_grad_h = grad_gate.matmul(gate_b).mul_(ctx.gate_scaling)
         up_grad_h = grad_up.matmul(up_b).mul_(ctx.up_scaling)
-        grad_x = grad_gate.matmul(gate_weight)
-        grad_x.addmm_(gate_grad_h, gate_a)
-        grad_x.addmm_(grad_up, up_weight)
-        grad_x.addmm_(up_grad_h, up_a)
+        grad_cat = torch.cat((grad_gate, grad_up), dim=-1)
+        grad_x = grad_cat.matmul(gate_up_weight)
+        try:
+            grad_x = triton_lora_dx_add_(grad_x, gate_grad_h, gate_a)
+            grad_x = triton_lora_dx_add_(grad_x, up_grad_h, up_a)
+        except Exception:
+            grad_x.addmm_(gate_grad_h, gate_a)
+            grad_x.addmm_(up_grad_h, up_a)
 
-        grad_gate_a = gate_grad_h.t().matmul(x_2d)
+        grad_h_cat = torch.cat((gate_grad_h, up_grad_h), dim=-1)
+        grad_a_cat = grad_h_cat.t().matmul(x_2d)
+        rank = int(gate_a.shape[0])
+        grad_gate_a, grad_up_a = grad_a_cat.split(rank, dim=0)
         grad_gate_b = grad_gate.t().matmul(gate_h).mul_(ctx.gate_scaling)
-        grad_up_a = up_grad_h.t().matmul(x_2d)
         grad_up_b = grad_up.t().matmul(up_h).mul_(ctx.up_scaling)
 
         return (
             grad_x.reshape(ctx.x_shape),
-            None,
             None,
             None,
             grad_gate_a,
@@ -481,6 +499,7 @@ class _FrozenBaseMLPLoRAFunction(torch.autograd.Function):
             grad_up_b,
             grad_down_a,
             grad_down_b,
+            None,
             None,
             None,
             None,
@@ -604,6 +623,32 @@ def _peft_fast_lora_tensors(module: nn.Module, x: torch.Tensor | torch.dtype):
     return base_layer, lora_a, lora_b, float(scaling_map[active_adapter])
 
 
+def _install_peft_gate_up_base_cache(
+    module: nn.Module,
+    gate_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+) -> torch.Tensor:
+    cached = getattr(module, "_bgkit_peft_gate_up_base_weight", None)
+    expected_shape = (
+        gate_weight.shape[0] + up_weight.shape[0],
+        gate_weight.shape[1],
+    )
+    if (
+        cached is not None
+        and cached.device == gate_weight.device
+        and cached.dtype == gate_weight.dtype
+        and tuple(cached.shape) == expected_shape
+    ):
+        return cached
+
+    base_weight_cat = torch.cat((gate_weight.detach(), up_weight.detach()), dim=0).contiguous()
+    if cached is not None:
+        module._buffers["_bgkit_peft_gate_up_base_weight"] = base_weight_cat
+        return base_weight_cat
+    module.register_buffer("_bgkit_peft_gate_up_base_weight", base_weight_cat, persistent=False)
+    return base_weight_cat
+
+
 def _peft_fused_gate_up_mlp_forward(
     module: nn.Module,
     x: torch.Tensor,
@@ -640,7 +685,6 @@ def _peft_fused_gate_up_mlp_forward(
         gate_base.bias is not None
         or up_base.bias is not None
         or down_base.bias is not None
-        or gate_scaling != up_scaling
         or gate_base.in_features != up_base.in_features
         or gate_base.out_features != up_base.out_features
         or down_base.in_features != gate_base.out_features
@@ -651,10 +695,14 @@ def _peft_fused_gate_up_mlp_forward(
     ):
         return original_forward(x)
 
-    return _FrozenBaseMLPLoRAFunction.apply(
-        x,
+    gate_up_weight = _install_peft_gate_up_base_cache(
+        module,
         gate_base.weight,
         up_base.weight,
+    )
+    return _FrozenBaseMLPLoRAFunction.apply(
+        x,
+        gate_up_weight,
         down_base.weight,
         gate_a,
         gate_b,
@@ -665,6 +713,7 @@ def _peft_fused_gate_up_mlp_forward(
         gate_scaling,
         up_scaling,
         down_scaling,
+        gate_base.out_features,
     )
 
 
@@ -1826,6 +1875,7 @@ class ReconstructionDecoder(nn.Module):
             ):
                 module._bgkit_original_forward = module.forward
                 module.forward = types.MethodType(_peft_fused_gate_up_mlp_forward, module)
+                module._bgkit_fused_lora_mlp_forward = True
                 count += 1
         return count
 
@@ -1877,6 +1927,7 @@ class ReconstructionDecoder(nn.Module):
             ):
                 module._bgkit_original_forward = module.forward
                 module.forward = types.MethodType(_fused_gate_up_mlp_forward, module)
+                module._bgkit_fused_lora_mlp_forward = True
                 fused_count += 1
         self._lora_native_gate_up_fused_count = fused_count
         return fused_count

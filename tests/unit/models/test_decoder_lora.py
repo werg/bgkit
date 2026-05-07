@@ -19,7 +19,10 @@ from torch import nn
 from torch.nn import functional as F
 
 from bgkit.models.decoder import DecoderLoRALinear, ReconstructionDecoder
-from bgkit.models.lora_triton import can_use_triton_lora_dx_add
+from bgkit.models.lora_triton import (
+    can_use_triton_lora_dx_add,
+    can_use_triton_swiglu_backward,
+)
 
 # ---------------------------------------------------------------------------
 # Mock backbone with HF CausalLM-style .model / .lm_head nesting
@@ -369,6 +372,13 @@ class TestApplyLora:
         a = torch.zeros(2, 8)
 
         assert not can_use_triton_lora_dx_add(dx, gh, a)
+
+    def test_triton_swiglu_backward_rejects_cpu_tensors(self):
+        grad_hidden = torch.zeros(4, 8)
+        gate = torch.zeros(4, 8)
+        up = torch.zeros(4, 8)
+
+        assert not can_use_triton_swiglu_backward(grad_hidden, gate, up)
 
 
 class TestLoraStateDictCompatibility:

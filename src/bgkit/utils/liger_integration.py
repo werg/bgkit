@@ -400,6 +400,9 @@ def _patch_swiglu_mlp_modules(root: nn.Module) -> int:
             and "Liger" not in type(module).__name__
         ):
             try:
+                if getattr(module, "_bgkit_fused_lora_mlp_forward", False):
+                    continue
+
                 if _install_fused_gate_up_swiglu(module, liger_swiglu_cls):
                     count += 1
                     continue
