@@ -289,6 +289,7 @@ class ReconstructionDecoder(nn.Module):
         self.backbone = backbone
         self.hidden_dim = hidden_dim
         self._use_te = False
+        self._use_native_nvfp4 = False
         self._te_recipe = None
         self._has_lora = False
         self._lora_impl: str | None = None
@@ -374,6 +375,46 @@ class ReconstructionDecoder(nn.Module):
         self._te_recipe = NVFP4BlockScaling(disable_rht=True)
         logger.info("decoder_nvfp4_enabled", mode="qlora" if self._has_lora else "direct")
 
+    def enable_native_frozen_nvfp4(
+        self,
+        *,
+        target_modules: tuple[str, ...] | None = None,
+    ) -> None:
+        """Pack frozen decoder base Linear weights into BgKIT-native NVFP4.
+
+        This is an explicit experimental path for LoRA-style training where the
+        base decoder weights are frozen and only activation gradients are needed.
+        The current module uses a reference dequantizing forward; it establishes
+        the packed format and autograd contract for the forthcoming W4A16 CUDA
+        kernel, and is deliberately not a default training path.
+        """
+
+        if self._use_native_nvfp4:
+            return
+        targets = target_modules or self._lora_target_modules or (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        )
+        if self._has_lora:
+            count = self._convert_lora_base_layers_to_native_nvfp4(tuple(targets))
+        else:
+            count = self._convert_linear_layers_to_native_nvfp4(tuple(targets))
+        if count == 0:
+            raise ValueError(
+                f"native NVFP4 found no decoder Linear targets in {sorted(set(targets))!r}"
+            )
+        self._use_native_nvfp4 = True
+        logger.info(
+            "decoder_native_frozen_nvfp4_enabled",
+            mode="lora_base" if self._has_lora else "direct",
+            count=count,
+        )
+
     def _convert_lora_base_layers_to_te(self) -> None:
         """Swap nn.Linear base_layer inside LoRA wrappers with te.Linear.
 
@@ -416,6 +457,43 @@ class ReconstructionDecoder(nn.Module):
             count += 1
 
         logger.info("lora_base_layers_converted_to_te", count=count)
+
+    def _convert_lora_base_layers_to_native_nvfp4(
+        self,
+        target_modules: tuple[str, ...],
+    ) -> int:
+        from bgkit.quant.nvfp4 import FrozenNVFP4Linear
+
+        targets = set(target_modules)
+        count = 0
+        for name, module in self.backbone.named_modules():
+            base = getattr(module, "base_layer", None)
+            if isinstance(base, FrozenNVFP4Linear):
+                continue
+            if not isinstance(base, nn.Linear):
+                continue
+            local_name = name.rsplit(".", 1)[-1]
+            if local_name not in targets:
+                continue
+            module.base_layer = FrozenNVFP4Linear.from_linear(base)
+            count += 1
+        return count
+
+    def _convert_linear_layers_to_native_nvfp4(
+        self,
+        target_modules: tuple[str, ...],
+    ) -> int:
+        from bgkit.quant.nvfp4 import FrozenNVFP4Linear
+
+        targets = set(target_modules)
+        count = 0
+        for parent in list(self.backbone.modules()):
+            for child_name, child in list(parent.named_children()):
+                if child_name not in targets or not isinstance(child, nn.Linear):
+                    continue
+                setattr(parent, child_name, FrozenNVFP4Linear.from_linear(child))
+                count += 1
+        return count
 
     def _get_inner_model_and_head(self) -> tuple[nn.Module, nn.Module]:
         """Return (inner_model, lm_head) handling plain, PeftModel, and TE cases.

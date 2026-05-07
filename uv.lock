@@ -328,6 +328,7 @@ eval = [
 gpu = [
     { name = "accelerate" },
     { name = "bitsandbytes" },
+    { name = "cut-cross-entropy" },
     { name = "einops" },
     { name = "flash-attn-4", extra = ["cu13"] },
     { name = "flash-linear-attention" },
@@ -345,6 +346,7 @@ requires-dist = [
     { name = "accelerate", marker = "extra == 'gpu'", specifier = ">=1.12" },
     { name = "aiosqlite", marker = "extra == 'data'", specifier = ">=0.20" },
     { name = "bitsandbytes", marker = "extra == 'gpu'", specifier = ">=0.49" },
+    { name = "cut-cross-entropy", marker = "extra == 'gpu'", git = "https://github.com/apple/ml-cross-entropy.git?rev=b7a02791b234e187b524fb1dba6a812d521b203a" },
     { name = "datasets", specifier = ">=4.0" },
     { name = "einops", marker = "extra == 'gpu'", specifier = ">=0.8" },
     { name = "faiss-cpu", marker = "extra == 'eval'" },
@@ -700,6 +702,15 @@ nvrtc = [
 ]
 nvtx = [
     { name = "nvidia-nvtx", marker = "sys_platform == 'linux'" },
+]
+
+[[package]]
+name = "cut-cross-entropy"
+version = "25.9.3"
+source = { git = "https://github.com/apple/ml-cross-entropy.git?rev=b7a02791b234e187b524fb1dba6a812d521b203a#b7a02791b234e187b524fb1dba6a812d521b203a" }
+dependencies = [
+    { name = "torch" },
+    { name = "triton", marker = "sys_platform != 'darwin'" },
 ]
 
 [[package]]

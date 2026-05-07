@@ -246,7 +246,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decoder-nvfp4",
         action="store_true",
-        help="Convert decoder base linears to TE NVFP4.",
+        help="Convert decoder base linears to an NVFP4 backend.",
+    )
+    parser.add_argument(
+        "--decoder-nvfp4-backend",
+        choices=["te", "native-frozen"],
+        default="te",
+        help="NVFP4 backend; native-frozen is BgKIT's packed frozen-base reference path.",
     )
     parser.add_argument("--save-intermediates", choices=["default", "on", "off"], default="default")
     parser.add_argument("--fuse-kkt-wu", choices=["default", "on", "off"], default="default")
@@ -335,7 +341,10 @@ def main() -> None:
                 }
             )
         if args.decoder_nvfp4:
-            model.enable_nvfp4()
+            if args.decoder_nvfp4_backend == "native-frozen":
+                model.enable_native_frozen_nvfp4()
+            else:
+                model.enable_nvfp4()
         if hasattr(model, "set_lm_ce_impl"):
             model.set_lm_ce_impl(args.ce_impl)
     else:
@@ -425,7 +434,7 @@ def main() -> None:
               gradient_checkpointing={args.gradient_checkpointing} use_liger={args.use_liger}
               decoder_lora={args.decoder_lora} lora_impl={args.lora_implementation}
               lora_dropout={args.lora_dropout}
-              decoder_nvfp4={args.decoder_nvfp4}
+              decoder_nvfp4={args.decoder_nvfp4} decoder_nvfp4_backend={args.decoder_nvfp4_backend}
             """
         ).strip()
     )
@@ -461,6 +470,7 @@ def main() -> None:
         "lora_implementation": args.lora_implementation,
         "lora_dropout": args.lora_dropout,
         "decoder_nvfp4": args.decoder_nvfp4,
+        "decoder_nvfp4_backend": args.decoder_nvfp4_backend,
         "batch_size": args.batch_size,
         "seq_len": args.seq_len,
         "tokens_per_step": tokens,

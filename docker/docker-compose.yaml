@@ -52,6 +52,10 @@ x-gpu-common: &gpu-common
     # static, ship-with-fork variant; this is the live, grow-during-training
     # variant. They coexist.)
     - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+    # Use shipped GB10 FLA configs before falling back to Triton autotune.
+    # This keeps the conservative GDR h/dhu BV=16 defaults from adding
+    # repeated autotune stalls on future training restarts.
+    - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
     # TileLang/TVM caches for FlashQLA JIT kernels. The image provides the
     # toolchain; these dirs keep compiled artifacts out of the container layer.
     - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
@@ -397,6 +401,7 @@ services:
       - HYDRA_FULL_ERROR=1
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
       - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
       - TVM_CACHE_DIR=/workspace/.cache/tvm
       - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
@@ -424,6 +429,7 @@ services:
       - HYDRA_FULL_ERROR=1
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
       - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
       - TVM_CACHE_DIR=/workspace/.cache/tvm
       - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
@@ -451,6 +457,7 @@ services:
       - HYDRA_FULL_ERROR=1
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
       - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
       - TVM_CACHE_DIR=/workspace/.cache/tvm
       - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
@@ -478,6 +485,7 @@ services:
       - HYDRA_FULL_ERROR=1
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
       - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
       - TVM_CACHE_DIR=/workspace/.cache/tvm
       - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
