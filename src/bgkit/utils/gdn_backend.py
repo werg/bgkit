@@ -116,6 +116,21 @@ def describe_backend_environment() -> dict[str, Any]:
         },
         "cuda": {},
         "tilelang": {},
+        "env": {
+            name: os.environ.get(name)
+            for name in (
+                "BGKIT_GDN_BACKEND",
+                "FLA_CACHE_MODE",
+                "FLA_GDR_SAVE_INTERMEDIATES",
+                "FLA_GDR_SAVE_LOCAL_ATTENTION",
+                "FLA_GDR_RECOMPUTE_WY_DW",
+                "FLA_GDR_FUSE_WY_DG_CUMSUM",
+                "FLA_GDR_FUSE_DQKG_WY",
+                "FLA_GDR_FUSE_GATE_BWD",
+                "BGKIT_DECODER_CE_IMPL",
+                "BGKIT_NATIVE_NVFP4_KERNEL",
+            )
+        },
     }
 
     try:

@@ -56,6 +56,15 @@ x-gpu-common: &gpu-common
     # This keeps the conservative GDR h/dhu BV=16 defaults from adding
     # repeated autotune stalls on future training restarts.
     - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
+    # Keep Blackwell's fused GDR backward path explicit in every training
+    # service. These are also FLA's sm_121 defaults, but exporting them here
+    # prevents accidental fallback when bisecting or launching ad-hoc shells.
+    - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-1}
+    - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
+    - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
+    - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
+    - FLA_GDR_FUSE_DQKG_WY=${FLA_GDR_FUSE_DQKG_WY:-1}
+    - FLA_GDR_FUSE_GATE_BWD=${FLA_GDR_FUSE_GATE_BWD:-1}
     # TileLang/TVM caches for FlashQLA JIT kernels. The image provides the
     # toolchain; these dirs keep compiled artifacts out of the container layer.
     - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
@@ -402,6 +411,12 @@ services:
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
       - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
+      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-1}
+      - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
+      - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
+      - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
+      - FLA_GDR_FUSE_DQKG_WY=${FLA_GDR_FUSE_DQKG_WY:-1}
+      - FLA_GDR_FUSE_GATE_BWD=${FLA_GDR_FUSE_GATE_BWD:-1}
       - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
       - TVM_CACHE_DIR=/workspace/.cache/tvm
       - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
@@ -430,6 +445,12 @@ services:
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
       - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
+      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-1}
+      - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
+      - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
+      - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
+      - FLA_GDR_FUSE_DQKG_WY=${FLA_GDR_FUSE_DQKG_WY:-1}
+      - FLA_GDR_FUSE_GATE_BWD=${FLA_GDR_FUSE_GATE_BWD:-1}
       - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
       - TVM_CACHE_DIR=/workspace/.cache/tvm
       - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
@@ -458,6 +479,12 @@ services:
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
       - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
+      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-1}
+      - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
+      - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
+      - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
+      - FLA_GDR_FUSE_DQKG_WY=${FLA_GDR_FUSE_DQKG_WY:-1}
+      - FLA_GDR_FUSE_GATE_BWD=${FLA_GDR_FUSE_GATE_BWD:-1}
       - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
       - TVM_CACHE_DIR=/workspace/.cache/tvm
       - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
@@ -486,6 +513,12 @@ services:
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
       - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
+      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-1}
+      - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
+      - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
+      - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
+      - FLA_GDR_FUSE_DQKG_WY=${FLA_GDR_FUSE_DQKG_WY:-1}
+      - FLA_GDR_FUSE_GATE_BWD=${FLA_GDR_FUSE_GATE_BWD:-1}
       - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
       - TVM_CACHE_DIR=/workspace/.cache/tvm
       - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages

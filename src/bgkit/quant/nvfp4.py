@@ -10,6 +10,7 @@ not the final fast path.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -19,6 +20,10 @@ import torch.nn.functional as F
 NVFP4_GROUP_SIZE = 16
 E2M1_MAX = 6.0
 E4M3_MAX = 448.0
+
+
+def _native_nvfp4_kernel_enabled() -> bool:
+    return os.environ.get("BGKIT_NATIVE_NVFP4_KERNEL", "1").lower() in {"1", "true", "yes"}
 
 
 @dataclass(frozen=True)
@@ -185,8 +190,8 @@ class FrozenNVFP4Linear(nn.Module):
     """Reference frozen Linear backed by packed native NVFP4 weights.
 
     The base weight is stored as packed buffers, so it never receives gradients.
-    The reference forward dequantizes before calling ``F.linear``; custom W4A16
-    kernels should replace that implementation while preserving this module API.
+    CUDA BF16 inputs use a direct-from-packed Triton W4A16 kernel when
+    available; other inputs fall back to reference dequantization.
     """
 
     in_features: int
@@ -234,6 +239,31 @@ class FrozenNVFP4Linear(nn.Module):
         return self.dequantized_weight()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _native_nvfp4_kernel_enabled():
+            try:
+                from bgkit.quant.nvfp4_triton import (
+                    can_use_triton_nvfp4_linear,
+                    triton_frozen_nvfp4_linear,
+                )
+
+                if can_use_triton_nvfp4_linear(
+                    x,
+                    self.weight_packed,
+                    self.weight_scale_e4m3,
+                    self.weight_scale2,
+                ):
+                    return triton_frozen_nvfp4_linear(
+                        x,
+                        self.weight_packed,
+                        self.weight_scale_e4m3,
+                        self.weight_scale2,
+                        self.bias,
+                        out_features=self.out_features,
+                        in_features=self.in_features,
+                    )
+            except Exception:
+                if os.environ.get("BGKIT_NATIVE_NVFP4_KERNEL_STRICT", "0") == "1":
+                    raise
         weight = self.dequantized_weight(dtype=x.dtype)
         bias = self.bias.to(dtype=x.dtype) if self.bias is not None else None
         return F.linear(x, weight, bias)

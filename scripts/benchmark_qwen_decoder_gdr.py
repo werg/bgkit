@@ -34,7 +34,7 @@ def _set_env_default(name: str, value: str) -> None:
 
 def _set_toggle(name: str, value: str) -> None:
     if value == "default":
-        os.environ.pop(name, None)
+        return
     elif value == "on":
         os.environ[name] = "1"
     elif value == "off":
@@ -255,6 +255,15 @@ def parse_args() -> argparse.Namespace:
         help="NVFP4 backend; native-frozen is BgKIT's packed frozen-base reference path.",
     )
     parser.add_argument("--save-intermediates", choices=["default", "on", "off"], default="default")
+    parser.add_argument(
+        "--save-local-attention",
+        choices=["default", "on", "off"],
+        default="default",
+    )
+    parser.add_argument("--recompute-wy-dw", choices=["default", "on", "off"], default="default")
+    parser.add_argument("--fuse-wy-dg-cumsum", choices=["default", "on", "off"], default="default")
+    parser.add_argument("--fuse-dqkg-wy", choices=["default", "on", "off"], default="default")
+    parser.add_argument("--fuse-gate-bwd", choices=["default", "on", "off"], default="default")
     parser.add_argument("--fuse-kkt-wu", choices=["default", "on", "off"], default="default")
     parser.add_argument("--sm121-output", choices=["default", "on", "off"], default="off")
     parser.add_argument("--dqkwg-warps", type=int, default=None)
@@ -282,6 +291,11 @@ def main() -> None:
 
     os.environ["BGKIT_GDN_BACKEND"] = args.backend
     _set_toggle("FLA_GDR_SAVE_INTERMEDIATES", args.save_intermediates)
+    _set_toggle("FLA_GDR_SAVE_LOCAL_ATTENTION", args.save_local_attention)
+    _set_toggle("FLA_GDR_RECOMPUTE_WY_DW", args.recompute_wy_dw)
+    _set_toggle("FLA_GDR_FUSE_WY_DG_CUMSUM", args.fuse_wy_dg_cumsum)
+    _set_toggle("FLA_GDR_FUSE_DQKG_WY", args.fuse_dqkg_wy)
+    _set_toggle("FLA_GDR_FUSE_GATE_BWD", args.fuse_gate_bwd)
     _set_toggle("FLA_GDR_FUSE_KKT_WU", args.fuse_kkt_wu)
     _set_toggle("FLA_USE_SM121_CUSTOM_KERNEL", args.sm121_output)
     if args.ce_impl not in {"auto", "chunked", "liger"}:
@@ -408,6 +422,11 @@ def main() -> None:
     n_gdr = _count_gdr_layers(model)
     tokens = args.batch_size * args.seq_len
     env_save_intermediates = os.environ.get("FLA_GDR_SAVE_INTERMEDIATES", "<default>")
+    env_save_local_attention = os.environ.get("FLA_GDR_SAVE_LOCAL_ATTENTION", "<default>")
+    env_recompute_wy_dw = os.environ.get("FLA_GDR_RECOMPUTE_WY_DW", "<default>")
+    env_fuse_wy_dg_cumsum = os.environ.get("FLA_GDR_FUSE_WY_DG_CUMSUM", "<default>")
+    env_fuse_dqkg_wy = os.environ.get("FLA_GDR_FUSE_DQKG_WY", "<default>")
+    env_fuse_gate_bwd = os.environ.get("FLA_GDR_FUSE_GATE_BWD", "<default>")
     env_fuse_kkt_wu = os.environ.get("FLA_GDR_FUSE_KKT_WU", "<default>")
     env_sm121_output = os.environ.get("FLA_USE_SM121_CUSTOM_KERNEL", "<default>")
     env_dqkwg_warps = os.environ.get("FLA_DQKWG_TL_NUM_WARPS", "<default>")
@@ -425,6 +444,11 @@ def main() -> None:
               requested_backend={args.backend} active_backend={active_backend}
               gdr_layers={n_gdr}
               FLA_GDR_SAVE_INTERMEDIATES={env_save_intermediates}
+              FLA_GDR_SAVE_LOCAL_ATTENTION={env_save_local_attention}
+              FLA_GDR_RECOMPUTE_WY_DW={env_recompute_wy_dw}
+              FLA_GDR_FUSE_WY_DG_CUMSUM={env_fuse_wy_dg_cumsum}
+              FLA_GDR_FUSE_DQKG_WY={env_fuse_dqkg_wy}
+              FLA_GDR_FUSE_GATE_BWD={env_fuse_gate_bwd}
               FLA_GDR_FUSE_KKT_WU={env_fuse_kkt_wu}
               FLA_USE_SM121_CUSTOM_KERNEL={env_sm121_output}
               FLA_DQKWG_TL_NUM_WARPS={env_dqkwg_warps}
@@ -485,6 +509,11 @@ def main() -> None:
         "gdr_layers": n_gdr,
         "env": {
             "FLA_GDR_SAVE_INTERMEDIATES": env_save_intermediates,
+            "FLA_GDR_SAVE_LOCAL_ATTENTION": env_save_local_attention,
+            "FLA_GDR_RECOMPUTE_WY_DW": env_recompute_wy_dw,
+            "FLA_GDR_FUSE_WY_DG_CUMSUM": env_fuse_wy_dg_cumsum,
+            "FLA_GDR_FUSE_DQKG_WY": env_fuse_dqkg_wy,
+            "FLA_GDR_FUSE_GATE_BWD": env_fuse_gate_bwd,
             "FLA_GDR_FUSE_KKT_WU": env_fuse_kkt_wu,
             "FLA_USE_SM121_CUSTOM_KERNEL": env_sm121_output,
             "FLA_DQKWG_TL_NUM_WARPS": env_dqkwg_warps,

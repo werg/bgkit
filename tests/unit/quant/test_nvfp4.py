@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import sysconfig
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -92,3 +95,31 @@ def test_decoder_native_nvfp4_converts_lora_base_layers():
     wrapper = decoder.backbone.model.q_proj
     assert isinstance(wrapper, DecoderLoRALinear)
     assert isinstance(wrapper.base_layer, FrozenNVFP4Linear)
+
+
+def test_triton_nvfp4_linear_matches_reference_cuda(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip(reason="native NVFP4 Triton parity requires CUDA")
+    include_dir = sysconfig.get_paths().get("include")
+    if include_dir is None or not (Path(include_dir) / "Python.h").exists():
+        pytest.skip(reason="local Triton driver build requires Python.h")
+
+    torch.manual_seed(2)
+    linear = nn.Linear(64, 48, bias=True, dtype=torch.bfloat16, device="cuda")
+    frozen = FrozenNVFP4Linear.from_linear(linear)
+    x = torch.randn(5, 64, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    dy = torch.randn(5, 48, dtype=torch.bfloat16, device="cuda")
+
+    monkeypatch.setenv("BGKIT_NATIVE_NVFP4_KERNEL", "0")
+    y_ref = frozen(x)
+    y_ref.backward(dy)
+    dx_ref = x.grad.detach().clone()
+
+    x.grad = None
+    monkeypatch.setenv("BGKIT_NATIVE_NVFP4_KERNEL", "1")
+    monkeypatch.setenv("BGKIT_NATIVE_NVFP4_KERNEL_STRICT", "1")
+    y_tri = frozen(x)
+    y_tri.backward(dy)
+
+    torch.testing.assert_close(y_tri.float(), y_ref.float(), rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(x.grad.float(), dx_ref.float(), rtol=2e-2, atol=2e-2)

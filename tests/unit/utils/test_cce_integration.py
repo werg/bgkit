@@ -40,10 +40,14 @@ def _reference_ce(
 @pytest.fixture(autouse=True)
 def _reset_cce_state():
     cce_integration._CCE_AVAILABLE = None
+    cce_integration._CCE_IMPORT_ATTEMPTED = False
+    cce_integration._CCE_LINEAR_CROSS_ENTROPY = None
     cce_integration._CCE_WARNED = False
     cce_integration._CCE_RUNTIME_WARNED = False
     yield
     cce_integration._CCE_AVAILABLE = None
+    cce_integration._CCE_IMPORT_ATTEMPTED = False
+    cce_integration._CCE_LINEAR_CROSS_ENTROPY = None
     cce_integration._CCE_WARNED = False
     cce_integration._CCE_RUNTIME_WARNED = False
 
@@ -115,3 +119,18 @@ def test_decoder_ce_impl_default_is_cce():
     from bgkit.models.decoder import DEFAULT_LM_CE_IMPL
 
     assert DEFAULT_LM_CE_IMPL == "cce"
+
+
+def test_cut_cross_entropy_import_is_cached(monkeypatch):
+    calls = 0
+
+    def fake_import():
+        nonlocal calls
+        calls += 1
+        return None
+
+    monkeypatch.setattr(cce_integration, "_try_import_linear_cross_entropy", fake_import)
+
+    assert not cce_integration.is_cut_cross_entropy_available()
+    assert not cce_integration.is_cut_cross_entropy_available()
+    assert calls == 1

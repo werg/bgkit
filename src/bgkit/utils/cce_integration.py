@@ -26,6 +26,8 @@ CCE_IMPLS = frozenset(
 )
 
 _CCE_AVAILABLE: bool | None = None
+_CCE_IMPORT_ATTEMPTED = False
+_CCE_LINEAR_CROSS_ENTROPY: Callable[..., torch.Tensor] | None = None
 _CCE_WARNED = False
 _CCE_RUNTIME_WARNED = False
 
@@ -57,8 +59,16 @@ def is_cut_cross_entropy_available() -> bool:
 
     global _CCE_AVAILABLE
     if _CCE_AVAILABLE is None:
-        _CCE_AVAILABLE = _try_import_linear_cross_entropy() is not None
+        _CCE_AVAILABLE = _get_linear_cross_entropy() is not None
     return _CCE_AVAILABLE
+
+
+def _get_linear_cross_entropy() -> Callable[..., torch.Tensor] | None:
+    global _CCE_IMPORT_ATTEMPTED, _CCE_LINEAR_CROSS_ENTROPY
+    if not _CCE_IMPORT_ATTEMPTED:
+        _CCE_LINEAR_CROSS_ENTROPY = _try_import_linear_cross_entropy()
+        _CCE_IMPORT_ATTEMPTED = True
+    return _CCE_LINEAR_CROSS_ENTROPY
 
 
 def cce_labels_from_masks(
@@ -154,7 +164,7 @@ def cut_cross_entropy_lm_ce(
             chunk_size,
         )
 
-    linear_cross_entropy = _try_import_linear_cross_entropy()
+    linear_cross_entropy = _get_linear_cross_entropy()
     if linear_cross_entropy is None:
         if strict:
             raise RuntimeError(
