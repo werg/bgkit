@@ -90,6 +90,36 @@ class TestCreateOptimizer:
             t._create_optimizer(groups, 1e-3)
 
 
+class TestOptimizerStateAliases:
+    def test_decoder_native_lora_name_finds_peft_checkpoint_name(self):
+        t = _make_trainer("adamw")
+
+        aliases = t._optimizer_state_lookup_names(
+            "decoder.backbone.model.layers.0.self_attn.q_proj.lora_A"
+        )
+
+        assert aliases[0] == "decoder.backbone.model.layers.0.self_attn.q_proj.lora_A"
+        assert (
+            "decoder.backbone.base_model.model.model.layers.0.self_attn.q_proj"
+            ".lora_A.default.weight"
+            in aliases
+        )
+
+    def test_model_native_lora_name_finds_peft_checkpoint_name(self):
+        t = _make_trainer("adamw")
+
+        aliases = t._optimizer_state_lookup_names(
+            "model.backbone.model.layers.0.mlp.down_proj.lora_B"
+        )
+
+        assert aliases[0] == "model.backbone.model.layers.0.mlp.down_proj.lora_B"
+        assert (
+            "model.backbone.base_model.model.model.layers.0.mlp.down_proj"
+            ".lora_B.default.weight"
+            in aliases
+        )
+
+
 # ---------------------------------------------------------------------------
 # Muon param splitting
 # ---------------------------------------------------------------------------

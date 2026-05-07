@@ -30,18 +30,18 @@ The trained model has zero runtime ICE dependency — ICE can be freed via
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-
-from bgkit.utils.packing import lengths_from_cu, position_ids_from_cu
 import torch.nn.functional as F
 from torch import Tensor
 
 from bgkit.models.components.selection import moment_match_loss
 from bgkit.utils.packing import (
     lengths_from_cu,
+    position_ids_from_cu,
     segment_ids_from_cu,
     segment_sum,
 )
@@ -269,12 +269,20 @@ class LevelLossCfg:
     qa_non_answer_target: float = 0.10
 
 
+def _metric_scalar(value: Tensor, *, sync: bool):
+    value = value.detach()
+    if sync:
+        return float(value.item())
+    return value
+
+
 def survivorship_diagnostics(
     enc_out,
     level: str,
     global_step: int,
     every_n_steps: int = 1,
-) -> dict[str, float]:
+    sync_metrics: bool = True,
+) -> dict[str, float | Tensor]:
     """Read the diagnostic zero-dim tensors off ``enc_out`` and surface them
     as floats for logging. Each read forces a GPU→CPU sync, so the caller
     gates on ``every_n_steps`` (default 1 = every step).
@@ -296,30 +304,27 @@ def survivorship_diagnostics(
     - ``{level}_zero_survivor_rate``, ``{level}_low_survivor_rate_lt5``,
       ``{level}_median_survivors``: per-sample survivor-count tails.
     """
-    if every_n_steps <= 1:
-        should_emit = True
-    else:
-        should_emit = (global_step % every_n_steps) == 0
+    should_emit = True if every_n_steps <= 1 else (global_step % every_n_steps) == 0
     if not should_emit:
         return {}
 
-    metrics: dict[str, float] = {}
+    metrics: dict[str, float | Tensor] = {}
     prefix = level
     ors = getattr(enc_out, "organic_rate_std", None)
     if ors is not None:
-        metrics[f"{prefix}_organic_rate_std"] = float(ors.item())
+        metrics[f"{prefix}_organic_rate_std"] = _metric_scalar(ors, sync=sync_metrics)
     uf = getattr(enc_out, "undecided_fraction", None)
     if uf is not None:
-        metrics[f"{prefix}_undecided_fraction"] = float(uf.item())
+        metrics[f"{prefix}_undecided_fraction"] = _metric_scalar(uf, sync=sync_metrics)
     ftr = getattr(enc_out, "floor_trigger_rate", None)
     if ftr is not None:
-        metrics[f"{prefix}_floor_trigger_rate"] = float(ftr.item())
+        metrics[f"{prefix}_floor_trigger_rate"] = _metric_scalar(ftr, sync=sync_metrics)
     npin = getattr(enc_out, "num_pinned", None)
     if npin is not None:
-        metrics[f"{prefix}_num_pinned"] = float(npin.item())
+        metrics[f"{prefix}_num_pinned"] = _metric_scalar(npin, sync=sync_metrics)
     theta_t = getattr(enc_out, "theta_tensor", None)
     if theta_t is not None:
-        metrics[f"{prefix}_theta"] = float(theta_t.item())
+        metrics[f"{prefix}_theta"] = _metric_scalar(theta_t, sync=sync_metrics)
 
     # Per-sample survivor-count diagnostics. A non-zero zero-survivor
     # rate and/or a long low-survivor tail pulls eval loss up
@@ -340,14 +345,17 @@ def survivorship_diagnostics(
         else:
             # Flat mask, no cu_seqlens: treat as a single sample.
             hard_counts = surv_mask.to(torch.float32).sum().unsqueeze(0)
-        metrics[f"{prefix}_zero_survivor_rate"] = float(
-            (hard_counts == 0).float().mean().item(),
+        metrics[f"{prefix}_zero_survivor_rate"] = _metric_scalar(
+            (hard_counts == 0).float().mean(),
+            sync=sync_metrics,
         )
-        metrics[f"{prefix}_low_survivor_rate_lt5"] = float(
-            (hard_counts < 5).float().mean().item(),
+        metrics[f"{prefix}_low_survivor_rate_lt5"] = _metric_scalar(
+            (hard_counts < 5).float().mean(),
+            sync=sync_metrics,
         )
-        metrics[f"{prefix}_median_survivors"] = float(
-            hard_counts.median().item(),
+        metrics[f"{prefix}_median_survivors"] = _metric_scalar(
+            hard_counts.median(),
+            sync=sync_metrics,
         )
     return metrics
 
@@ -394,7 +402,8 @@ def compute_survivorship_losses(
     content_cu_seqlens: Tensor | None,
     target_ratio: float,
     answer_position_mask: Tensor | None = None,
-) -> tuple[Tensor, dict[str, float]]:
+    sync_metrics: bool = True,
+) -> tuple[Tensor, dict[str, float | Tensor]]:
     """Compose ratio + decisiveness + moment_match + bce_warmup losses.
 
     All tensors are packed: ``base_raw`` and ``logits_for_op`` on
@@ -431,7 +440,7 @@ def compute_survivorship_losses(
     as fixed floats. Trained model has zero runtime ICE dependency — ICE
     can be freed via ice_teacher.unload() after warmup.
     """
-    metrics: dict[str, float] = {}
+    metrics: dict[str, float | Tensor] = {}
     base_raw = enc_out.base_raw
     logits_for_op = enc_out.logits_for_op
     device = (
@@ -502,8 +511,8 @@ def compute_survivorship_losses(
     if weights.ratio_loss_weight > 0.0 and probs_op is not None:
         mean_prob = probs_op.float().mean()
         ratio_loss = (mean_prob - target_ratio) ** 2
-        metrics["ratio_loss"] = float(ratio_loss.item())
-        metrics["mean_survive_prob"] = float(mean_prob.item())
+        metrics["ratio_loss"] = _metric_scalar(ratio_loss, sync=sync_metrics)
+        metrics["mean_survive_prob"] = _metric_scalar(mean_prob, sync=sync_metrics)
         total = total + weights.ratio_loss_weight * ratio_loss.to(total.dtype)
 
     # Decisiveness loss (operator-side): mean(4 · p · (1 − p)) penalizes p≈0.5.
@@ -513,7 +522,7 @@ def compute_survivorship_losses(
     effective_decisiveness_weight = _effective_decisiveness_weight(weights, global_step)
     if effective_decisiveness_weight > 0.0 and probs_op is not None:
         decisive = (4.0 * probs_op.float() * (1.0 - probs_op.float())).mean()
-        metrics["decisiveness_loss"] = float(decisive.item())
+        metrics["decisiveness_loss"] = _metric_scalar(decisive, sync=sync_metrics)
         metrics["decisiveness_weight"] = effective_decisiveness_weight
         total = total + effective_decisiveness_weight * decisive.to(total.dtype)
 
@@ -559,10 +568,17 @@ def compute_survivorship_losses(
         denom = target_min.clamp(min=1.0)
         deficit = (1.0 - soft_count_per_sample / denom).clamp(min=0.0)
         min_surv_loss = (deficit ** 2).mean()
-        metrics["min_survivors_loss"] = float(min_surv_loss.item())
-        metrics["min_survivors_target_mean"] = float(target_min.float().mean().item())
-        metrics["min_survivors_soft_count_mean"] = float(
-            soft_count_per_sample.float().mean().item(),
+        metrics["min_survivors_loss"] = _metric_scalar(
+            min_surv_loss,
+            sync=sync_metrics,
+        )
+        metrics["min_survivors_target_mean"] = _metric_scalar(
+            target_min.float().mean(),
+            sync=sync_metrics,
+        )
+        metrics["min_survivors_soft_count_mean"] = _metric_scalar(
+            soft_count_per_sample.float().mean(),
+            sync=sync_metrics,
         )
         total = total + weights.min_survivors_loss_weight * min_surv_loss.to(total.dtype)
 
@@ -585,7 +601,7 @@ def compute_survivorship_losses(
             base_raw.shape[:1], dtype=torch.bool, device=base_raw.device,
         )
         mm = moment_match_loss(base_raw, valid_all, ref_skew=ref_skew, ref_kurt=ref_kurt)
-        metrics["moment_match_loss"] = float(mm.item())
+        metrics["moment_match_loss"] = _metric_scalar(mm, sync=sync_metrics)
         total = total + weights.moment_match_weight * mm
 
     # QA position supervision (base-side). BCE-with-logits on base_raw with
@@ -621,8 +637,11 @@ def compute_survivorship_losses(
             base_raw.float(), target, reduction="none",
         )
         qa_loss = bce_per_pos.mean()
-        metrics["qa_position_loss"] = float(qa_loss.item())
-        metrics["qa_position_grounded_count"] = float(am.sum().item())
+        metrics["qa_position_loss"] = _metric_scalar(qa_loss, sync=sync_metrics)
+        metrics["qa_position_grounded_count"] = _metric_scalar(
+            am.sum(),
+            sync=sync_metrics,
+        )
         total = total + weights.qa_position_loss_weight * qa_loss.to(total.dtype)
 
     # BCE warmup (base-side): direct ICE-teacher supervision on base_raw.
@@ -647,7 +666,7 @@ def compute_survivorship_losses(
             x, teacher.float(), reduction="none",
         )
         bce = bce_per_pos.mean()
-        metrics["bce_warmup_loss"] = float(bce.item())
+        metrics["bce_warmup_loss"] = _metric_scalar(bce, sync=sync_metrics)
         metrics["bce_warmup_weight"] = ice_cfg.bce_warmup_weight
         total = total + ice_cfg.bce_warmup_weight * bce.to(total.dtype)
 
@@ -700,10 +719,7 @@ def calibrate_head_tanh_temperature(
     if batch_to_content is None:
         batch_to_content = _default_batch_to_content
 
-    if level == "l0":
-        lc = encoder.l0
-    else:
-        lc = encoder.l1
+    lc = encoder.l0 if level == "l0" else encoder.l1
     head = lc.head
     stds: list[float] = []
     was_training = encoder.training
@@ -743,7 +759,9 @@ def calibrate_head_tanh_temperature(
                     position_ids=position_ids,
                 )
                 target_hidden = l1_out.last_hidden_state
-            base_raw = head(target_hidden.to(dtype=head.head[0].weight.dtype).unsqueeze(0)).squeeze(0)
+            base_raw = head(
+                target_hidden.to(dtype=head.head[0].weight.dtype).unsqueeze(0),
+            ).squeeze(0)
             mean = base_raw.float().mean()
             var = (base_raw.float() - mean).pow(2).mean()
             stds.append(float(var.clamp(min=1e-8).sqrt().item()))
@@ -865,7 +883,8 @@ def utility_grad_bce_loss(
     pinned_mask: Tensor | None,
     target_ratio: float,
     content_cu_seqlens: Tensor | None = None,
-) -> tuple[Tensor, dict[str, float]]:
+    sync_metrics: bool = True,
+) -> tuple[Tensor, dict[str, float | Tensor]]:
     """Utility-gradient BCE distillation loss on the survivorship head.
 
     Packed inputs (FA4 varlen). ``base_raw_for_util`` is flat ``(N,)``,
@@ -908,18 +927,28 @@ def utility_grad_bce_loss(
             {},
         )
 
-    N = base_raw_for_util.shape[0]
-    if valid_mask is None:
-        valid_mask = torch.ones(N, dtype=torch.bool, device=device)
+    n_positions = base_raw_for_util.shape[0]
+    all_controllable = valid_mask is None and pinned_mask is None
+    if all_controllable:
+        controllable = None
+    elif valid_mask is None:
+        valid_mask = torch.ones(n_positions, dtype=torch.bool, device=device)
+        if pinned_mask is None:
+            controllable = valid_mask
+        else:
+            pinned_mask = pinned_mask.to(device=device, dtype=torch.bool)
+            controllable = valid_mask & ~pinned_mask
     else:
         valid_mask = valid_mask.to(device=device, dtype=torch.bool)
-    if pinned_mask is None:
-        controllable = valid_mask
-    else:
-        pinned_mask = pinned_mask.to(device=device, dtype=torch.bool)
-        controllable = valid_mask & ~pinned_mask
+        if pinned_mask is None:
+            controllable = valid_mask
+        else:
+            pinned_mask = pinned_mask.to(device=device, dtype=torch.bool)
+            controllable = valid_mask & ~pinned_mask
 
-    if not bool(controllable.any().item()):
+    if n_positions == 0 or (
+        controllable is not None and not bool(controllable.any().item())
+    ):
         return (
             torch.zeros((), device=device, dtype=base_raw_for_util.dtype),
             {},
@@ -927,15 +956,15 @@ def utility_grad_bce_loss(
 
     # util_i = -(grad · value)_i. Computed in fp32 for numerical headroom.
     util = -(content_grad.float() * content_values.float()).sum(dim=-1)  # (N,)
-    util_masked = util.masked_fill(~controllable, float("-inf"))
+    util_masked = util if all_controllable else util.masked_fill(~controllable, float("-inf"))
 
     # Build teacher via a segment-aware loop. Micro-batch count is small
     # (≤32) so Python overhead is negligible; a vectorized alternative
     # (torch.topk with per-segment offsets and scatter) buys nothing and
     # is harder to read.
-    teacher = torch.zeros(N, dtype=torch.bool, device=device)
+    teacher = torch.zeros(n_positions, dtype=torch.bool, device=device)
     cu_list = (
-        [0, N] if content_cu_seqlens is None
+        [0, n_positions] if content_cu_seqlens is None
         else content_cu_seqlens.to(torch.int64).tolist()
     )
 
@@ -945,12 +974,14 @@ def utility_grad_bce_loss(
         end = int(cu_list[b + 1])
         if end <= start:
             continue
-        ctrl_slice = controllable[start:end]
-        ctrl_count = int(ctrl_slice.sum().item())
+        if all_controllable:
+            ctrl_count = end - start
+        else:
+            ctrl_slice = controllable[start:end]
+            ctrl_count = int(ctrl_slice.sum().item())
         if ctrl_count == 0:
             continue
-        k = max(1, int(torch.ceil(torch.tensor(
-            ctrl_count * target_ratio, dtype=torch.float32)).item()))
+        k = max(1, math.ceil(ctrl_count * target_ratio))
         k = min(k, ctrl_count)  # never exceed controllable positions
         util_slice = util_masked[start:end]
         # Within-sample top-k.
@@ -960,26 +991,33 @@ def utility_grad_bce_loss(
 
     # Guard: scatter respected controllable masks since we picked from
     # ``util_masked`` with ``-inf`` fill; but re-apply to be defensive.
-    teacher = teacher & controllable
+    if controllable is not None:
+        teacher = teacher & controllable
 
-    ctrl_f = controllable.to(base_raw_for_util.dtype)
     bce_per_pos = F.binary_cross_entropy_with_logits(
         base_raw_for_util.float(),
         teacher.to(base_raw_for_util.dtype).float(),
         reduction="none",
     )
-    denom = ctrl_f.float().sum().clamp(min=1.0)
-    loss = (bce_per_pos * ctrl_f.float()).sum() / denom
+    if all_controllable:
+        loss = bce_per_pos.mean()
+    else:
+        ctrl_f = controllable.to(base_raw_for_util.dtype)
+        denom = ctrl_f.float().sum().clamp(min=1.0)
+        loss = (bce_per_pos * ctrl_f.float()).sum() / denom
     loss = loss.to(base_raw_for_util.dtype)
 
     metrics = {
-        "utility_grad_bce": float(loss.item()),
+        "utility_grad_bce": _metric_scalar(loss, sync=sync_metrics),
         # Teacher rate is fraction of FLAT positions selected as teacher
         # positives. In packed form this is ``teacher_positives / N`` —
         # slightly different from the padded convention's
         # ``teacher_positives / (B * L_max)`` because packed has no pad
         # slots. This is the correct packed semantic.
-        "utility_grad_teacher_rate": float(teacher.float().mean().item()),
+        "utility_grad_teacher_rate": _metric_scalar(
+            teacher.float().mean(),
+            sync=sync_metrics,
+        ),
     }
     return loss, metrics
 

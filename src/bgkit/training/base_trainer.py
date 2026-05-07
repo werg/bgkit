@@ -122,7 +122,10 @@ def _average_metrics(accum_metrics: list[dict[str, float]]) -> dict[str, float]:
         if values and isinstance(values[0], (int, float)):
             result[key] = sum(values) / len(values)
         elif values and hasattr(values[0], "item"):
-            result[key] = (sum(v.item() for v in values)) / len(values)
+            avg = values[0].detach().float() if hasattr(values[0], "detach") else values[0]
+            for value in values[1:]:
+                avg = avg + (value.detach().float() if hasattr(value, "detach") else value)
+            result[key] = (avg / len(values)).item()
         else:
             result[key] = values[-1] if values else 0.0
     return result
@@ -579,6 +582,48 @@ class BaseTrainer(ABC):
         )
         return True
 
+    def _optimizer_state_lookup_names(self, name: str) -> tuple[str, ...]:
+        """Return saved-state names that may correspond to current ``name``.
+
+        Decoder LoRA can be represented by PEFT or BgKIT's native wrapper.
+        Their parameter paths differ even though they point to the same logical
+        adapter tensors. Keep lookup aliases here so resumes preserve optimizer
+        moments when configs move between the two implementations.
+        """
+
+        prefixes = ("decoder.backbone.", "model.backbone.")
+        if not name.startswith(prefixes):
+            return (name,)
+
+        names = [name]
+        seen = {name}
+
+        def add(candidate: str) -> None:
+            if candidate not in seen:
+                seen.add(candidate)
+                names.append(candidate)
+
+        idx = 0
+        while idx < len(names):
+            current = names[idx]
+            for prefix in prefixes:
+                peft_prefix = f"{prefix}base_model.model."
+                if current.startswith(peft_prefix):
+                    add(prefix + current[len(peft_prefix) :])
+                elif current.startswith(prefix):
+                    add(peft_prefix + current[len(prefix) :])
+
+            for lora_name in ("lora_A", "lora_B"):
+                native_suffix = f".{lora_name}"
+                peft_suffix = f".{lora_name}.default.weight"
+                if current.endswith(peft_suffix):
+                    add(current[: -len(".default.weight")])
+                elif current.endswith(native_suffix):
+                    add(f"{current}.default.weight")
+            idx += 1
+
+        return tuple(names)
+
     def _restore_optimizer_state_by_name(self, state_by_name: dict) -> None:
         """Install name-keyed optimizer state into the current optimizer.
 
@@ -617,10 +662,20 @@ class BaseTrainer(ABC):
         matched_frozen = 0
         new_in_opt = 0
         new_frozen = 0
+        matched_saved_names: set[str] = set()
         for name, param in self._named_parameters_for_optimizer():
             in_opt = id(param) in opt_param_ids
-            if name in state_by_name:
-                saved = state_by_name[name]
+            saved_name = next(
+                (
+                    candidate
+                    for candidate in self._optimizer_state_lookup_names(name)
+                    if candidate in state_by_name
+                ),
+                None,
+            )
+            if saved_name is not None:
+                matched_saved_names.add(saved_name)
+                saved = state_by_name[saved_name]
                 device = param.device
                 moved = {
                     k: (v.to(device) if isinstance(v, torch.Tensor) else v)
@@ -636,7 +691,7 @@ class BaseTrainer(ABC):
                     new_in_opt += 1
                 else:
                     new_frozen += 1
-        skipped_from_save = len(state_by_name) - (matched_in_opt + matched_frozen)
+        skipped_from_save = len(state_by_name) - len(matched_saved_names)
         logger.info(
             "optimizer_state_restored_by_name",
             matched_in_optimizer=matched_in_opt,

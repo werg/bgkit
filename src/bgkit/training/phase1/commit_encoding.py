@@ -613,7 +613,13 @@ class CommitEncodingTrainer(BaseTrainer):
         if self._target_ratio_override is not None:
             ratio_l0 = self._target_ratio_override
 
-        return float(ratio_l0), float(ratio_l1), bool(l0_trainable), int(max_sample_length), int(max_batch_tokens)
+        return (
+            float(ratio_l0),
+            float(ratio_l1),
+            bool(l0_trainable),
+            int(max_sample_length),
+            int(max_batch_tokens),
+        )
 
     def _current_target_ratio(self) -> float:
         """Compatibility shim — returns current L0 ratio."""
@@ -1172,10 +1178,8 @@ class CommitEncodingTrainer(BaseTrainer):
         target_ratio: float,
         content_token_ids: torch.Tensor | None,
         content_cu_seqlens: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
         from bgkit.training.survivorship_helpers import (
-            LevelICECfg,
-            LevelLossCfg,
             accumulate,
             compute_survivorship_losses,
             init_state,
@@ -1206,6 +1210,7 @@ class CommitEncodingTrainer(BaseTrainer):
             content_token_ids=content_token_ids,
             content_cu_seqlens=content_cu_seqlens,
             target_ratio=target_ratio,
+            sync_metrics=False,
         )
         accumulate(state, l_out, target_ratio=target_ratio)
         out_metrics = {f"{level}_{k}": v for k, v in metrics.items()}
@@ -1214,6 +1219,7 @@ class CommitEncodingTrainer(BaseTrainer):
             survivorship_diagnostics(
                 l_out, level=level, global_step=self.global_step,
                 every_n_steps=diag_every_n,
+                sync_metrics=False,
             )
         )
         return loss, out_metrics
@@ -1269,9 +1275,7 @@ class CommitEncodingTrainer(BaseTrainer):
             return default_batch, True
         return small_batch, True
 
-    def _forward_backward(self, batch: dict) -> dict[str, float]:
-        from bgkit.training.survivorship_helpers import LevelLossCfg
-
+    def _forward_backward(self, batch: dict) -> dict[str, float | torch.Tensor]:
         target_ratio_l0, target_ratio_l1, want_l0_train, _, _ = self._curriculum_state(
             int(self.global_step),
         )
@@ -1283,7 +1287,7 @@ class CommitEncodingTrainer(BaseTrainer):
         cu_repo = batch["cu_repo_seqlens"].to(device)
         batch_size = int(cu_repo.shape[0]) - 1
         scale = 1.0 / (batch_size * self._accum_steps)
-        aux_metrics: dict[str, float] = {}
+        aux_metrics: dict[str, float | torch.Tensor] = {}
 
         self.decoder.train()
 
@@ -1357,6 +1361,7 @@ class CommitEncodingTrainer(BaseTrainer):
                 pinned_mask=None,
                 target_ratio=target_ratio_l0,
                 content_cu_seqlens=cu_file,
+                sync_metrics=False,
             )
             if util_loss.requires_grad:
                 (util_loss * util_w_l0 * batch_size * scale).backward()
@@ -1373,6 +1378,7 @@ class CommitEncodingTrainer(BaseTrainer):
                 pinned_mask=None,
                 target_ratio=target_ratio_l1,
                 content_cu_seqlens=l1_out.content_cu_seqlens,
+                sync_metrics=False,
             )
             if util_loss.requires_grad:
                 (util_loss * util_w_l1 * batch_size * scale).backward()
@@ -1384,7 +1390,7 @@ class CommitEncodingTrainer(BaseTrainer):
         actual_ratio = total_survivors / max(total_valid, 1)
 
         result = {
-            "loss": float(loss.item()),
+            "loss": loss.detach(),
             "target_ratio_l0": target_ratio_l0,
             "target_ratio_l1": target_ratio_l1,
             "actual_ratio": actual_ratio,
@@ -1394,8 +1400,6 @@ class CommitEncodingTrainer(BaseTrainer):
 
         l0_out.release()
         l1_out.release()
-        # Suppress unused-var warnings (LevelLossCfg only used to keep import).
-        _ = LevelLossCfg
         return result
 
     def _post_step(self, step: int) -> None:

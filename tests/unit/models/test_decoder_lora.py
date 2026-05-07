@@ -165,6 +165,71 @@ class TestApplyLora:
         assert isinstance(decoder.backbone, peft.PeftModel)
 
 
+class TestLoraStateDictCompatibility:
+    def test_native_loads_peft_lora_state_dict(self):
+        pytest.importorskip("peft")
+        torch.manual_seed(0)
+
+        source = ReconstructionDecoder(MockCausalLMBackbone(), hidden_dim=HIDDEN_DIM)
+        source.apply_lora({**LORA_CONFIG, "implementation": "peft"})
+        for name, param in source.named_parameters():
+            if "lora_" in name:
+                param.data.normal_(0, 0.01)
+        peft_state = source.state_dict()
+
+        target = ReconstructionDecoder(MockCausalLMBackbone(), hidden_dim=HIDDEN_DIM)
+        target.apply_lora(NATIVE_LORA_CONFIG)
+        result = target.load_state_dict(peft_state)
+
+        assert result.missing_keys == []
+        assert result.unexpected_keys == []
+        native_state = target.state_dict()
+        assert torch.equal(
+            native_state["backbone.model.q_proj.lora_A"],
+            peft_state[
+                "backbone.base_model.model.model.q_proj.lora_A.default.weight"
+            ],
+        )
+        assert torch.equal(
+            native_state["backbone.model.q_proj.lora_B"],
+            peft_state[
+                "backbone.base_model.model.model.q_proj.lora_B.default.weight"
+            ],
+        )
+
+    def test_peft_loads_native_lora_state_dict(self):
+        peft = pytest.importorskip("peft")
+        torch.manual_seed(0)
+
+        source = ReconstructionDecoder(MockCausalLMBackbone(), hidden_dim=HIDDEN_DIM)
+        source.apply_lora(NATIVE_LORA_CONFIG)
+        for name, param in source.named_parameters():
+            if "lora_" in name:
+                param.data.normal_(0, 0.01)
+        native_state = source.state_dict()
+
+        target = ReconstructionDecoder(MockCausalLMBackbone(), hidden_dim=HIDDEN_DIM)
+        target.apply_lora({**LORA_CONFIG, "implementation": "peft"})
+        result = target.load_state_dict(native_state)
+
+        assert isinstance(target.backbone, peft.PeftModel)
+        assert result.missing_keys == []
+        assert result.unexpected_keys == []
+        peft_state = target.state_dict()
+        assert torch.equal(
+            peft_state[
+                "backbone.base_model.model.model.q_proj.lora_A.default.weight"
+            ],
+            native_state["backbone.model.q_proj.lora_A"],
+        )
+        assert torch.equal(
+            peft_state[
+                "backbone.base_model.model.model.q_proj.lora_B.default.weight"
+            ],
+            native_state["backbone.model.q_proj.lora_B"],
+        )
+
+
 class TestMergeLora:
     def test_produces_clean_keys(self):
         """Merged state dict should have standard decoder keys (no peft prefixes)."""

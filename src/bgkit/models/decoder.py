@@ -26,6 +26,8 @@ constructed or passed.
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import structlog
@@ -1315,6 +1317,91 @@ class ReconstructionDecoder(nn.Module):
                     adapter.to(dtype=dtype)
                     count += sum(p.numel() for p in adapter.parameters())
         return count
+
+    def load_state_dict(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+        strict: bool = True,
+        assign: bool = False,
+    ):
+        """Load decoder weights, bridging PEFT/native LoRA checkpoint layouts.
+
+        BgKIT's training configs can use the lightweight native LoRA wrapper
+        while older checkpoints may have PEFT keys. Keep the migration here so
+        all trainers and eval scripts inherit the same compatibility behavior.
+        """
+
+        state_dict = self._remap_lora_state_dict_for_current_impl(state_dict)
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+    def _remap_lora_state_dict_for_current_impl(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+    ) -> Mapping[str, torch.Tensor]:
+        if not self._has_lora or self._lora_impl not in {"native", "peft"}:
+            return state_dict
+
+        keys = tuple(state_dict.keys())
+        has_peft_layout = any(
+            key.startswith("backbone.base_model.model.")
+            or ".lora_A.default.weight" in key
+            or ".lora_B.default.weight" in key
+            for key in keys
+        )
+        has_native_layout = any(
+            (key.endswith(".lora_A") or key.endswith(".lora_B"))
+            and ".default.weight" not in key
+            for key in keys
+        )
+        if self._lora_impl == "native" and has_peft_layout:
+            return self._remap_peft_lora_state_dict_to_native(state_dict)
+        if self._lora_impl == "peft" and has_native_layout:
+            return self._remap_native_lora_state_dict_to_peft(state_dict)
+        return state_dict
+
+    @staticmethod
+    def _copy_state_dict_metadata(
+        src: Mapping[str, torch.Tensor],
+        dst: OrderedDict[str, torch.Tensor],
+    ) -> OrderedDict[str, torch.Tensor]:
+        metadata = getattr(src, "_metadata", None)
+        if metadata is not None:
+            dst._metadata = metadata  # type: ignore[attr-defined]
+        return dst
+
+    @classmethod
+    def _remap_peft_lora_state_dict_to_native(
+        cls,
+        state_dict: Mapping[str, torch.Tensor],
+    ) -> OrderedDict[str, torch.Tensor]:
+        remapped: OrderedDict[str, torch.Tensor] = OrderedDict()
+        peft_prefix = "backbone.base_model.model."
+        native_prefix = "backbone."
+        for key, value in state_dict.items():
+            new_key = key
+            if new_key.startswith(peft_prefix):
+                new_key = native_prefix + new_key[len(peft_prefix) :]
+            new_key = new_key.replace(".lora_A.default.weight", ".lora_A")
+            new_key = new_key.replace(".lora_B.default.weight", ".lora_B")
+            remapped[new_key] = value
+        return cls._copy_state_dict_metadata(state_dict, remapped)
+
+    @classmethod
+    def _remap_native_lora_state_dict_to_peft(
+        cls,
+        state_dict: Mapping[str, torch.Tensor],
+    ) -> OrderedDict[str, torch.Tensor]:
+        remapped: OrderedDict[str, torch.Tensor] = OrderedDict()
+        native_prefix = "backbone."
+        peft_prefix = "backbone.base_model.model."
+        for key, value in state_dict.items():
+            new_key = key
+            if new_key.startswith(native_prefix) and not new_key.startswith(peft_prefix):
+                new_key = peft_prefix + new_key[len(native_prefix) :]
+            if new_key.endswith((".lora_A", ".lora_B")):
+                new_key = f"{new_key}.default.weight"
+            remapped[new_key] = value
+        return cls._copy_state_dict_metadata(state_dict, remapped)
 
     def merge_lora(self) -> dict:
         """Merge LoRA adapters into base weights and return a clean state dict.
