@@ -202,6 +202,10 @@ def _active_backend(requested: str, resolved: str | None) -> str:
     return "<unresolved>"
 
 
+def _cce_requested(impl: str) -> bool:
+    return impl not in {"auto", "chunked", "liger"}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
@@ -235,6 +239,11 @@ def parse_args() -> argparse.Namespace:
         ],
         default=os.environ.get("BGKIT_DECODER_CE_IMPL", "auto"),
         help="Decoder LM CE implementation for the packed-splice path.",
+    )
+    parser.add_argument(
+        "--ce-strict",
+        action="store_true",
+        help="Fail instead of falling back when an explicit CCE implementation is unavailable.",
     )
     parser.add_argument(
         "--decoder-lora",
@@ -298,8 +307,8 @@ def main() -> None:
     _set_toggle("FLA_GDR_FUSE_GATE_BWD", args.fuse_gate_bwd)
     _set_toggle("FLA_GDR_FUSE_KKT_WU", args.fuse_kkt_wu)
     _set_toggle("FLA_USE_SM121_CUSTOM_KERNEL", args.sm121_output)
-    if args.ce_impl not in {"auto", "chunked", "liger"}:
-        _set_env_default("BGKIT_DECODER_CE_STRICT", "1")
+    if args.ce_strict:
+        os.environ["BGKIT_DECODER_CE_STRICT"] = "1"
     if args.dqkwg_warps is not None:
         os.environ["FLA_DQKWG_TL_NUM_WARPS"] = str(args.dqkwg_warps)
     if args.dqkwg_bk is not None:
@@ -433,6 +442,13 @@ def main() -> None:
     env_dqkwg_bk = os.environ.get("FLA_DQKWG_TL_BK", "<default>")
     env_dqkwg_bv = os.environ.get("FLA_DQKWG_TL_BV", "<default>")
     env_ce_strict = os.environ.get("BGKIT_DECODER_CE_STRICT", "<default>")
+    cce_available: bool | None = None
+    expected_ce_path = args.ce_impl
+    if _cce_requested(args.ce_impl):
+        from bgkit.utils.cce_integration import is_cut_cross_entropy_available
+
+        cce_available = is_cut_cross_entropy_available()
+        expected_ce_path = "cut_cross_entropy" if cce_available else "chunked_fallback"
     print(
         textwrap.dedent(
             f"""
@@ -440,7 +456,8 @@ def main() -> None:
               model={args.model}
               device={torch.cuda.get_device_name()} capability={torch.cuda.get_device_capability()}
               dtype={args.dtype} batch={args.batch_size} seq_len={args.seq_len} tokens/step={tokens}
-              loss_path={args.loss_path} ce_impl={args.ce_impl} ce_chunk_size={args.ce_chunk_size}
+              loss_path={args.loss_path} ce_impl={args.ce_impl} expected_ce_path={expected_ce_path}
+              ce_chunk_size={args.ce_chunk_size} cce_available={cce_available}
               requested_backend={args.backend} active_backend={active_backend}
               gdr_layers={n_gdr}
               FLA_GDR_SAVE_INTERMEDIATES={env_save_intermediates}
@@ -489,7 +506,10 @@ def main() -> None:
         "dtype": args.dtype,
         "loss_path": args.loss_path,
         "ce_impl": args.ce_impl,
+        "ce_strict": args.ce_strict,
         "ce_chunk_size": args.ce_chunk_size,
+        "cce_available": cce_available,
+        "expected_ce_path": expected_ce_path,
         "decoder_lora": args.decoder_lora,
         "lora_implementation": args.lora_implementation,
         "lora_dropout": args.lora_dropout,
