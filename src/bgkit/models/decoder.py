@@ -251,6 +251,17 @@ class ReconstructionDecoder(nn.Module):
         """
         if self._use_te:
             return  # already converted
+        if (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_capability() == (12, 1)
+            and os.environ.get("BGKIT_ALLOW_NVFP4_SM121", "0") != "1"
+        ):
+            raise RuntimeError(
+                "decoder NVFP4 is disabled for the current sm_121 container. "
+                "TransformerEngine FP4 conversion requires an architecture-specific "
+                "sm_121a build; the current image emits device-side PTX errors. "
+                "Rebuild TE for sm_121a and set BGKIT_ALLOW_NVFP4_SM121=1 to opt in."
+            )
 
         from transformer_engine.common.recipe import NVFP4BlockScaling
 
@@ -498,12 +509,22 @@ class ReconstructionDecoder(nn.Module):
             all_prefix_ids = torch.cat(prefix_on_device, dim=0)
             emb_prefix_all = embed_fn(all_prefix_ids).to(dtype=target_dtype)
         else:
-            emb_prefix_all = torch.empty(0, embed_fn.weight.shape[1], dtype=target_dtype, device=device)
+            emb_prefix_all = torch.empty(
+                0,
+                embed_fn.weight.shape[1],
+                dtype=target_dtype,
+                device=device,
+            )
         if any(suffix_lens):
             all_suffix_ids = torch.cat(suffix_on_device, dim=0)
             emb_suffix_all = embed_fn(all_suffix_ids).to(dtype=target_dtype)
         else:
-            emb_suffix_all = torch.empty(0, embed_fn.weight.shape[1], dtype=target_dtype, device=device)
+            emb_suffix_all = torch.empty(
+                0,
+                embed_fn.weight.shape[1],
+                dtype=target_dtype,
+                device=device,
+            )
 
         # Assemble per-sample [emb_prefix | survivors | emb_suffix] via slice
         # concatenations into Python lists; one final torch.cat builds the
@@ -911,15 +932,18 @@ class ReconstructionDecoder(nn.Module):
         """Wrap backbone with LoRA adapters.
 
         Args:
-            lora_config: Dict with keys: r, alpha, dropout (optional, default 0.05),
-                target_modules (list of module name strings).
+            lora_config: Dict with keys: r, alpha, dropout (optional, default 0.0),
+                target_modules (list of module name strings), and optional
+                dtype/adapter_dtype. Decoder adapters default to the base
+                model dtype so PEFT does not cast every adapted projection
+                through fp32 on bf16 training runs.
         """
         from peft import LoraConfig, get_peft_model
 
         config = LoraConfig(
             r=lora_config.get("r", 16),
             lora_alpha=lora_config.get("alpha", 32),
-            lora_dropout=lora_config.get("dropout", 0.05),
+            lora_dropout=lora_config.get("dropout", 0.0),
             target_modules=list(
                 lora_config.get(
                     "target_modules",
@@ -937,8 +961,22 @@ class ReconstructionDecoder(nn.Module):
             bias="none",
             task_type="CAUSAL_LM",
         )
-        self.backbone = get_peft_model(self.backbone, config)
+        adapter_dtype = self._resolve_lora_adapter_dtype(
+            lora_config.get("adapter_dtype", lora_config.get("dtype"))
+        )
+        autocast_adapter_dtype = bool(
+            lora_config.get("autocast_adapter_dtype", adapter_dtype is None)
+        )
+        try:
+            self.backbone = get_peft_model(
+                self.backbone,
+                config,
+                autocast_adapter_dtype=autocast_adapter_dtype,
+            )
+        except TypeError:
+            self.backbone = get_peft_model(self.backbone, config)
         self._has_lora = True
+        cast_lora_params = self._cast_lora_adapters(adapter_dtype)
 
         trainable = sum(p.numel() for p in self.backbone.parameters() if p.requires_grad)
         total = sum(p.numel() for p in self.backbone.parameters())
@@ -949,7 +987,59 @@ class ReconstructionDecoder(nn.Module):
             ratio=f"{trainable / total:.4f}",
             r=config.r,
             alpha=config.lora_alpha,
+            adapter_dtype=str(adapter_dtype) if adapter_dtype is not None else "peft",
+            cast_lora_params=cast_lora_params,
         )
+
+    def _base_lora_dtype(self) -> torch.dtype:
+        """Return the decoder's compute dtype for LoRA adapter matmuls."""
+        try:
+            inner_model, _lm_head = self._get_inner_model_and_head()
+            return inner_model.get_input_embeddings().weight.dtype
+        except Exception:
+            return next(self.backbone.parameters()).dtype
+
+    def _resolve_lora_adapter_dtype(self, requested: object | None) -> torch.dtype | None:
+        """Resolve LoRA adapter dtype.
+
+        ``None`` means use ``BGKIT_DECODER_LORA_DTYPE`` or ``base``. Returning
+        ``None`` means keep PEFT's dtype, useful for legacy fp32-adapter runs.
+        """
+        value = requested
+        if value is None:
+            value = os.environ.get("BGKIT_DECODER_LORA_DTYPE", "base")
+        if isinstance(value, torch.dtype):
+            return value
+        key = str(value).strip().lower()
+        if key in {"", "base", "model", "auto"}:
+            return self._base_lora_dtype()
+        if key in {"peft", "keep", "legacy"}:
+            return None
+        if key in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+        if key in {"fp16", "float16", "half"}:
+            return torch.float16
+        if key in {"fp32", "float32", "full"}:
+            return torch.float32
+        raise ValueError(
+            "decoder LoRA dtype must be one of base, bf16, fp16, fp32, "
+            f"or peft; got {value!r}"
+        )
+
+    def _cast_lora_adapters(self, dtype: torch.dtype | None) -> int:
+        """Cast PEFT LoRA A/B modules to ``dtype`` and return parameter count."""
+        if dtype is None:
+            return 0
+        count = 0
+        for module in self.backbone.modules():
+            for attr in ("lora_A", "lora_B"):
+                adapters = getattr(module, attr, None)
+                if not isinstance(adapters, nn.ModuleDict):
+                    continue
+                for adapter in adapters.values():
+                    adapter.to(dtype=dtype)
+                    count += sum(p.numel() for p in adapter.parameters())
+        return count
 
     def merge_lora(self) -> dict:
         """Merge LoRA adapters into base weights and return a clean state dict.

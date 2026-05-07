@@ -118,6 +118,32 @@ class TestApplyLora:
         assert trainable_after < trainable_before
         assert trainable_after > 0
 
+    def test_adapters_follow_base_dtype_by_default(self):
+        backbone = MockCausalLMBackbone().to(dtype=torch.bfloat16)
+        decoder = ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
+
+        decoder.apply_lora(LORA_CONFIG)
+
+        lora_dtypes = {
+            p.dtype
+            for name, p in decoder.named_parameters()
+            if "lora_" in name
+        }
+        assert lora_dtypes == {torch.bfloat16}
+
+    def test_peft_dtype_opt_out_keeps_fp32_adapters(self):
+        backbone = MockCausalLMBackbone().to(dtype=torch.bfloat16)
+        decoder = ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
+
+        decoder.apply_lora({**LORA_CONFIG, "adapter_dtype": "peft"})
+
+        lora_dtypes = {
+            p.dtype
+            for name, p in decoder.named_parameters()
+            if "lora_" in name
+        }
+        assert lora_dtypes == {torch.float32}
+
 
 class TestMergeLora:
     def test_produces_clean_keys(self):

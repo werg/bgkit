@@ -13,12 +13,11 @@ import json
 import os
 import statistics
 import textwrap
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Callable, Iterable
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
 
 DEFAULT_TEXT = """
 BgKIT compresses long code and document contexts into a compact memory that a
@@ -220,7 +219,17 @@ def parse_args() -> argparse.Namespace:
         help="Use bgkit's packed decoder loss path, or raw HF causal-LM loss.",
     )
     parser.add_argument("--ce-chunk-size", type=int, default=1024)
-    parser.add_argument("--decoder-lora", action="store_true", help="Apply bgkit's default decoder LoRA setup.")
+    parser.add_argument(
+        "--decoder-lora",
+        action="store_true",
+        help="Apply bgkit's default decoder LoRA setup.",
+    )
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--decoder-nvfp4",
+        action="store_true",
+        help="Convert decoder base linears to TE NVFP4.",
+    )
     parser.add_argument("--save-intermediates", choices=["default", "on", "off"], default="default")
     parser.add_argument("--fuse-kkt-wu", choices=["default", "on", "off"], default="default")
     parser.add_argument("--sm121-output", choices=["default", "on", "off"], default="off")
@@ -232,7 +241,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text", default=None)
     parser.add_argument("--text-file", default=None)
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON summary.")
-    parser.add_argument("--profile", action="store_true", help="Profile one extra step after timing.")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Profile one extra step after timing.",
+    )
     parser.add_argument("--profile-topk", type=int, default=30)
     parser.add_argument("--profile-trace", default=None, help="Optional Chrome trace output path.")
     return parser.parse_args()
@@ -288,7 +301,7 @@ def main() -> None:
                 {
                     "r": 16,
                     "alpha": 32,
-                    "dropout": 0.05,
+                    "dropout": args.lora_dropout,
                     "target_modules": [
                         "q_proj",
                         "k_proj",
@@ -300,9 +313,13 @@ def main() -> None:
                     ],
                 }
             )
+        if args.decoder_nvfp4:
+            model.enable_nvfp4()
     else:
         if args.decoder_lora:
             raise ValueError("--decoder-lora currently requires --loss-path packed-splice.")
+        if args.decoder_nvfp4:
+            raise ValueError("--decoder-nvfp4 currently requires --loss-path packed-splice.")
         model = backbone
 
     if args.gradient_checkpointing:
@@ -358,6 +375,12 @@ def main() -> None:
     active_backend = _active_backend(args.backend, resolved_backend_name())
     n_gdr = _count_gdr_layers(model)
     tokens = args.batch_size * args.seq_len
+    env_save_intermediates = os.environ.get("FLA_GDR_SAVE_INTERMEDIATES", "<default>")
+    env_fuse_kkt_wu = os.environ.get("FLA_GDR_FUSE_KKT_WU", "<default>")
+    env_sm121_output = os.environ.get("FLA_USE_SM121_CUSTOM_KERNEL", "<default>")
+    env_dqkwg_warps = os.environ.get("FLA_DQKWG_TL_NUM_WARPS", "<default>")
+    env_dqkwg_bk = os.environ.get("FLA_DQKWG_TL_BK", "<default>")
+    env_dqkwg_bv = os.environ.get("FLA_DQKWG_TL_BV", "<default>")
     print(
         textwrap.dedent(
             f"""
@@ -368,14 +391,15 @@ def main() -> None:
               loss_path={args.loss_path} ce_chunk_size={args.ce_chunk_size}
               requested_backend={args.backend} active_backend={active_backend}
               gdr_layers={n_gdr}
-              FLA_GDR_SAVE_INTERMEDIATES={os.environ.get('FLA_GDR_SAVE_INTERMEDIATES', '<default>')}
-              FLA_GDR_FUSE_KKT_WU={os.environ.get('FLA_GDR_FUSE_KKT_WU', '<default>')}
-              FLA_USE_SM121_CUSTOM_KERNEL={os.environ.get('FLA_USE_SM121_CUSTOM_KERNEL', '<default>')}
-              FLA_DQKWG_TL_NUM_WARPS={os.environ.get('FLA_DQKWG_TL_NUM_WARPS', '<default>')}
-              FLA_DQKWG_TL_BK={os.environ.get('FLA_DQKWG_TL_BK', '<default>')}
-              FLA_DQKWG_TL_BV={os.environ.get('FLA_DQKWG_TL_BV', '<default>')}
+              FLA_GDR_SAVE_INTERMEDIATES={env_save_intermediates}
+              FLA_GDR_FUSE_KKT_WU={env_fuse_kkt_wu}
+              FLA_USE_SM121_CUSTOM_KERNEL={env_sm121_output}
+              FLA_DQKWG_TL_NUM_WARPS={env_dqkwg_warps}
+              FLA_DQKWG_TL_BK={env_dqkwg_bk}
+              FLA_DQKWG_TL_BV={env_dqkwg_bv}
               gradient_checkpointing={args.gradient_checkpointing} use_liger={args.use_liger}
-              decoder_lora={args.decoder_lora}
+              decoder_lora={args.decoder_lora} lora_dropout={args.lora_dropout}
+              decoder_nvfp4={args.decoder_nvfp4}
             """
         ).strip()
     )
@@ -407,6 +431,8 @@ def main() -> None:
         "loss_path": args.loss_path,
         "ce_chunk_size": args.ce_chunk_size,
         "decoder_lora": args.decoder_lora,
+        "lora_dropout": args.lora_dropout,
+        "decoder_nvfp4": args.decoder_nvfp4,
         "batch_size": args.batch_size,
         "seq_len": args.seq_len,
         "tokens_per_step": tokens,
@@ -420,12 +446,12 @@ def main() -> None:
         "peak_memory_gib": torch.cuda.max_memory_allocated() / 1024**3,
         "gdr_layers": n_gdr,
         "env": {
-            "FLA_GDR_SAVE_INTERMEDIATES": os.environ.get("FLA_GDR_SAVE_INTERMEDIATES", "<default>"),
-            "FLA_GDR_FUSE_KKT_WU": os.environ.get("FLA_GDR_FUSE_KKT_WU", "<default>"),
-            "FLA_USE_SM121_CUSTOM_KERNEL": os.environ.get("FLA_USE_SM121_CUSTOM_KERNEL", "<default>"),
-            "FLA_DQKWG_TL_NUM_WARPS": os.environ.get("FLA_DQKWG_TL_NUM_WARPS", "<default>"),
-            "FLA_DQKWG_TL_BK": os.environ.get("FLA_DQKWG_TL_BK", "<default>"),
-            "FLA_DQKWG_TL_BV": os.environ.get("FLA_DQKWG_TL_BV", "<default>"),
+            "FLA_GDR_SAVE_INTERMEDIATES": env_save_intermediates,
+            "FLA_GDR_FUSE_KKT_WU": env_fuse_kkt_wu,
+            "FLA_USE_SM121_CUSTOM_KERNEL": env_sm121_output,
+            "FLA_DQKWG_TL_NUM_WARPS": env_dqkwg_warps,
+            "FLA_DQKWG_TL_BK": env_dqkwg_bk,
+            "FLA_DQKWG_TL_BV": env_dqkwg_bv,
         },
     }
     print("summary=" + json.dumps(summary, sort_keys=True))
