@@ -39,6 +39,18 @@ class _CausalLMOutput:
         self.logits = logits
 
 
+class _MockMLP(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_dim, hidden_dim * 2, bias=False)
+        self.up_proj = nn.Linear(hidden_dim, hidden_dim * 2, bias=False)
+        self.down_proj = nn.Linear(hidden_dim * 2, hidden_dim, bias=False)
+        self.act_fn = nn.SiLU()
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
 class _MockInnerModel(nn.Module):
     def __init__(self, vocab_size: int, hidden_dim: int):
         super().__init__()
@@ -46,6 +58,7 @@ class _MockInnerModel(nn.Module):
         # Use named linear layers that match LoRA target module names
         self.q_proj = nn.Linear(hidden_dim, hidden_dim)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.mlp = _MockMLP(hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -54,6 +67,7 @@ class _MockInnerModel(nn.Module):
     def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
         x = self.q_proj(inputs_embeds)
         x = self.v_proj(x)
+        x = self.mlp(x)
         x = self.norm(x)
         return _ModelOutput(last_hidden_state=x)
 
@@ -182,6 +196,7 @@ class TestApplyLora:
         )
 
         assert decoder._lora_peft_fused_count == 2
+        assert decoder._lora_peft_gate_up_fused_count == 0
         assert hasattr(decoder.backbone.base_model.model.model.q_proj, "_bgkit_original_forward")
         assert any(".lora_A.default.weight" in key for key in decoder.state_dict())
         assert not any(key.endswith(".lora_A") for key in decoder.state_dict())
@@ -225,6 +240,58 @@ class TestApplyLora:
             ref_module.lora_B.default.weight.grad,
         )
 
+    def test_peft_gate_up_mlp_fusion_matches_peft_reference(self):
+        pytest.importorskip("peft")
+        torch.manual_seed(321)
+        lora_cfg = {
+            "r": 4,
+            "alpha": 8,
+            "dropout": 0.0,
+            "implementation": "peft",
+            "target_modules": ["gate_proj", "up_proj", "down_proj"],
+        }
+        backbone = MockCausalLMBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        ref.apply_lora({**lora_cfg, "peft_fused_backward": False})
+        fused.apply_lora(
+            {
+                **lora_cfg,
+                "peft_fused_backward": True,
+                "peft_fuse_gate_up": True,
+            }
+        )
+        fused.load_state_dict(ref.state_dict())
+
+        ref_mlp = ref.backbone.base_model.model.model.mlp
+        fused_mlp = fused.backbone.base_model.model.model.mlp
+        assert fused._lora_peft_fused_count == 3
+        assert fused._lora_peft_gate_up_fused_count == 1
+        assert hasattr(fused_mlp, "_bgkit_original_forward")
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        y_ref = ref_mlp(x_ref)
+        y_fused = fused_mlp(x)
+        grad = torch.randn_like(y_ref)
+
+        torch.testing.assert_close(y_fused, y_ref)
+        y_ref.backward(grad)
+        y_fused.backward(grad)
+
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            ref_module = getattr(ref_mlp, name)
+            fused_module = getattr(fused_mlp, name)
+            torch.testing.assert_close(
+                fused_module.lora_A.default.weight.grad,
+                ref_module.lora_A.default.weight.grad,
+            )
+            torch.testing.assert_close(
+                fused_module.lora_B.default.weight.grad,
+                ref_module.lora_B.default.weight.grad,
+            )
+
     def test_native_frozen_base_lora_backward_matches_reference(self):
         torch.manual_seed(123)
         base = nn.Linear(7, 5, bias=True).to(dtype=torch.float64)
@@ -258,6 +325,43 @@ class TestApplyLora:
         torch.testing.assert_close(x.grad, ref_x.grad)
         torch.testing.assert_close(wrapper.lora_A.grad, ref_a.grad)
         torch.testing.assert_close(wrapper.lora_B.grad, ref_b.grad)
+
+    def test_native_gate_up_fusion_matches_unfused_native_lora(self):
+        torch.manual_seed(123)
+        lora_cfg = {
+            "r": 4,
+            "alpha": 8,
+            "dropout": 0.0,
+            "implementation": "native",
+            "target_modules": ["gate_proj", "up_proj", "down_proj"],
+        }
+        backbone = MockCausalLMBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        ref.apply_lora({**lora_cfg, "fuse_gate_up": False})
+        fused.apply_lora({**lora_cfg, "fuse_gate_up": True})
+        fused.load_state_dict(ref.state_dict())
+
+        ref_mlp = ref.backbone.model.mlp
+        fused_mlp = fused.backbone.model.mlp
+        assert hasattr(fused_mlp, "_bgkit_original_forward")
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        y_ref = ref_mlp(x_ref)
+        y_fused = fused_mlp(x)
+        grad = torch.randn_like(y_ref)
+
+        torch.testing.assert_close(y_fused, y_ref)
+        y_ref.backward(grad)
+        y_fused.backward(grad)
+
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            ref_module = getattr(ref_mlp, name)
+            fused_module = getattr(fused_mlp, name)
+            torch.testing.assert_close(fused_module.lora_A.grad, ref_module.lora_A.grad)
+            torch.testing.assert_close(fused_module.lora_B.grad, ref_module.lora_B.grad)
 
     def test_triton_lora_dx_add_rejects_cpu_tensors(self):
         dx = torch.zeros(4, 8)

@@ -104,6 +104,9 @@ decoder_lora:
   # BgKIT's fused frozen-base autograd path. Fixed-batch Step5 profiling on
   # GB10/sm121 showed this faster than the PEFT module default.
   peft_fused_backward: true
+  # Experimental full-MLP fusion. Liger's SwiGLU patch is faster for the real
+  # Step5 workload, so keep this off unless explicitly re-benchmarking it.
+  peft_fuse_gate_up: false
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
 freeze:

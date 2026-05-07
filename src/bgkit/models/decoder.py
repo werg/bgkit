@@ -295,6 +295,379 @@ class _FrozenBaseLoRAFunction(torch.autograd.Function):
         )
 
 
+class _FrozenBaseGateUpLoRAFunction(torch.autograd.Function):
+    """Fused frozen-base LoRA autograd for Qwen MLP gate/up projections."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        base_weight_cat: torch.Tensor,
+        gate_a: torch.Tensor,
+        gate_b: torch.Tensor,
+        up_a: torch.Tensor,
+        up_b: torch.Tensor,
+        scaling: float,
+        out_features: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x_shape = tuple(x.shape)
+        x_2d = x.reshape(-1, x_shape[-1])
+        y_cat = F.linear(x_2d, base_weight_cat)
+        gate_y, up_y = y_cat.split(int(out_features), dim=-1)
+
+        a_cat = torch.cat((gate_a, up_a), dim=0)
+        h_cat = F.linear(x_2d, a_cat)
+        rank = int(gate_a.shape[0])
+        gate_h, up_h = h_cat.split(rank, dim=-1)
+        gate_y = torch.addmm(gate_y, gate_h, gate_b.t(), beta=1.0, alpha=float(scaling))
+        up_y = torch.addmm(up_y, up_h, up_b.t(), beta=1.0, alpha=float(scaling))
+
+        ctx.save_for_backward(x_2d, base_weight_cat, gate_a, gate_b, up_a, up_b, gate_h, up_h)
+        ctx.x_shape = x_shape
+        ctx.scaling = float(scaling)
+        ctx.out_features = int(out_features)
+        return (
+            gate_y.reshape(*x_shape[:-1], int(out_features)),
+            up_y.reshape(*x_shape[:-1], int(out_features)),
+        )
+
+    @staticmethod
+    def backward(ctx, grad_gate: torch.Tensor, grad_up: torch.Tensor):
+        x_2d, base_weight_cat, gate_a, gate_b, up_a, up_b, gate_h, up_h = ctx.saved_tensors
+        gate_grad = grad_gate.reshape(-1, grad_gate.shape[-1])
+        up_grad = grad_up.reshape(-1, grad_up.shape[-1])
+        scaling = ctx.scaling
+
+        grad_cat = torch.cat((gate_grad, up_grad), dim=-1)
+        grad_x_base = grad_cat.matmul(base_weight_cat)
+
+        gate_grad_h = gate_grad.matmul(gate_b).mul_(scaling)
+        up_grad_h = up_grad.matmul(up_b).mul_(scaling)
+        grad_h_cat = torch.cat((gate_grad_h, up_grad_h), dim=-1)
+        a_cat = torch.cat((gate_a, up_a), dim=0)
+        grad_x = torch.addmm(grad_x_base, grad_h_cat, a_cat)
+
+        grad_a_cat = grad_h_cat.t().matmul(x_2d)
+        rank = int(gate_a.shape[0])
+        grad_gate_a, grad_up_a = grad_a_cat.split(rank, dim=0)
+        grad_gate_b = gate_grad.t().matmul(gate_h).mul_(scaling)
+        grad_up_b = up_grad.t().matmul(up_h).mul_(scaling)
+
+        return (
+            grad_x.reshape(ctx.x_shape),
+            None,
+            grad_gate_a,
+            grad_gate_b,
+            grad_up_a,
+            grad_up_b,
+            None,
+            None,
+        )
+
+
+class _FrozenBaseMLPLoRAFunction(torch.autograd.Function):
+    """Fused frozen-base PEFT LoRA autograd for Qwen gate/up/down MLPs."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+        gate_a: torch.Tensor,
+        gate_b: torch.Tensor,
+        up_a: torch.Tensor,
+        up_b: torch.Tensor,
+        down_a: torch.Tensor,
+        down_b: torch.Tensor,
+        gate_scaling: float,
+        up_scaling: float,
+        down_scaling: float,
+    ) -> torch.Tensor:
+        x_shape = tuple(x.shape)
+        x_2d = x.reshape(-1, x_shape[-1])
+
+        gate_h = F.linear(x_2d, gate_a)
+        up_h = F.linear(x_2d, up_a)
+        gate_y = F.linear(x_2d, gate_weight)
+        up_y = F.linear(x_2d, up_weight)
+        gate_y = torch.addmm(gate_y, gate_h, gate_b.t(), beta=1.0, alpha=float(gate_scaling))
+        up_y = torch.addmm(up_y, up_h, up_b.t(), beta=1.0, alpha=float(up_scaling))
+
+        activated = F.silu(gate_y)
+        hidden = activated * up_y
+        down_h = F.linear(hidden, down_a)
+        out = F.linear(hidden, down_weight)
+        out = torch.addmm(out, down_h, down_b.t(), beta=1.0, alpha=float(down_scaling))
+
+        ctx.save_for_backward(
+            x_2d,
+            gate_weight,
+            up_weight,
+            down_weight,
+            gate_a,
+            gate_b,
+            up_a,
+            up_b,
+            down_a,
+            down_b,
+            gate_h,
+            up_h,
+            down_h,
+            gate_y,
+            up_y,
+            hidden,
+        )
+        ctx.x_shape = x_shape
+        ctx.gate_scaling = float(gate_scaling)
+        ctx.up_scaling = float(up_scaling)
+        ctx.down_scaling = float(down_scaling)
+        return out.reshape(*x_shape[:-1], down_weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (
+            x_2d,
+            gate_weight,
+            up_weight,
+            down_weight,
+            gate_a,
+            gate_b,
+            up_a,
+            up_b,
+            down_a,
+            down_b,
+            gate_h,
+            up_h,
+            down_h,
+            gate_y,
+            up_y,
+            hidden,
+        ) = ctx.saved_tensors
+        grad_out = grad_output.reshape(-1, grad_output.shape[-1])
+
+        down_grad_h = grad_out.matmul(down_b).mul_(ctx.down_scaling)
+        grad_hidden_base = grad_out.matmul(down_weight)
+        grad_hidden = torch.addmm(grad_hidden_base, down_grad_h, down_a)
+        grad_down_a = down_grad_h.t().matmul(hidden)
+        grad_down_b = grad_out.t().matmul(down_h).mul_(ctx.down_scaling)
+
+        sigmoid_gate = torch.sigmoid(gate_y)
+        silu_gate = gate_y * sigmoid_gate
+        grad_up = grad_hidden * silu_gate
+        grad_gate = grad_hidden * up_y * sigmoid_gate * (1.0 + gate_y * (1.0 - sigmoid_gate))
+
+        gate_grad_h = grad_gate.matmul(gate_b).mul_(ctx.gate_scaling)
+        up_grad_h = grad_up.matmul(up_b).mul_(ctx.up_scaling)
+        grad_x = grad_gate.matmul(gate_weight)
+        grad_x.addmm_(gate_grad_h, gate_a)
+        grad_x.addmm_(grad_up, up_weight)
+        grad_x.addmm_(up_grad_h, up_a)
+
+        grad_gate_a = gate_grad_h.t().matmul(x_2d)
+        grad_gate_b = grad_gate.t().matmul(gate_h).mul_(ctx.gate_scaling)
+        grad_up_a = up_grad_h.t().matmul(x_2d)
+        grad_up_b = grad_up.t().matmul(up_h).mul_(ctx.up_scaling)
+
+        return (
+            grad_x.reshape(ctx.x_shape),
+            None,
+            None,
+            None,
+            grad_gate_a,
+            grad_gate_b,
+            grad_up_a,
+            grad_up_b,
+            grad_down_a,
+            grad_down_b,
+            None,
+            None,
+            None,
+        )
+
+
+def _install_gate_up_lora_cache(module: nn.Module) -> torch.Tensor:
+    cached = getattr(module, "_bgkit_gate_up_base_weight", None)
+    gate = module.gate_proj
+    up = module.up_proj
+    expected_shape = (
+        gate.base_layer.weight.shape[0] + up.base_layer.weight.shape[0],
+        gate.base_layer.weight.shape[1],
+    )
+    if (
+        cached is not None
+        and cached.device == gate.base_layer.weight.device
+        and cached.dtype == gate.base_layer.weight.dtype
+        and tuple(cached.shape) == expected_shape
+    ):
+        return cached
+    base_weight_cat = torch.cat(
+        (gate.base_layer.weight.detach(), up.base_layer.weight.detach()),
+        dim=0,
+    ).contiguous()
+    if cached is not None:
+        module._buffers["_bgkit_gate_up_base_weight"] = base_weight_cat
+        return base_weight_cat
+    module.register_buffer("_bgkit_gate_up_base_weight", base_weight_cat, persistent=False)
+    return base_weight_cat
+
+
+def _fused_gate_up_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    gate = module.gate_proj
+    up = module.up_proj
+    if (
+        not isinstance(gate, DecoderLoRALinear)
+        or not isinstance(up, DecoderLoRALinear)
+        or not gate.fused
+        or not up.fused
+        or not isinstance(gate.dropout, nn.Identity)
+        or not isinstance(up.dropout, nn.Identity)
+        or gate.scaling != up.scaling
+        or gate.base_layer.bias is not None
+        or up.base_layer.bias is not None
+        or gate.base_layer.in_features != up.base_layer.in_features
+        or gate.base_layer.out_features != up.base_layer.out_features
+        or gate.lora_A.shape != up.lora_A.shape
+        or gate.lora_B.shape != up.lora_B.shape
+        or x.dtype != gate.base_layer.weight.dtype
+        or x.dtype != up.base_layer.weight.dtype
+        or x.dtype != gate.lora_A.dtype
+        or x.dtype != gate.lora_B.dtype
+        or x.dtype != up.lora_A.dtype
+        or x.dtype != up.lora_B.dtype
+    ):
+        return module.down_proj(module.act_fn(gate(x)) * up(x))
+
+    base_weight_cat = _install_gate_up_lora_cache(module)
+    gate_out, up_out = _FrozenBaseGateUpLoRAFunction.apply(
+        x,
+        base_weight_cat,
+        gate.lora_A,
+        gate.lora_B,
+        up.lora_A,
+        up.lora_B,
+        gate.scaling,
+        gate.base_layer.out_features,
+    )
+    return module.down_proj(module.act_fn(gate_out) * up_out)
+
+
+def _peft_fast_lora_tensors(module: nn.Module, x: torch.Tensor | torch.dtype):
+    input_dtype = x if isinstance(x, torch.dtype) else x.dtype
+    if bool(getattr(module, "disable_adapters", False)) or bool(getattr(module, "merged", False)):
+        return None
+
+    active_adapters = tuple(getattr(module, "active_adapters", ()))
+    if len(active_adapters) != 1:
+        return None
+    active_adapter = active_adapters[0]
+
+    lora_variant = getattr(module, "lora_variant", {})
+    if active_adapter in lora_variant:
+        return None
+
+    lora_a_modules = getattr(module, "lora_A", None)
+    lora_b_modules = getattr(module, "lora_B", None)
+    lora_dropout = getattr(module, "lora_dropout", None)
+    scaling_map = getattr(module, "scaling", None)
+    if (
+        lora_a_modules is None
+        or lora_b_modules is None
+        or lora_dropout is None
+        or scaling_map is None
+        or active_adapter not in lora_a_modules
+        or active_adapter not in lora_b_modules
+    ):
+        return None
+
+    dropout = lora_dropout[active_adapter]
+    dropout_is_noop = isinstance(dropout, nn.Identity) or (
+        isinstance(dropout, nn.Dropout) and float(dropout.p) == 0.0
+    )
+    if not dropout_is_noop:
+        return None
+
+    base_layer = getattr(module, "base_layer", None)
+    if not isinstance(base_layer, nn.Linear):
+        return None
+
+    lora_a = lora_a_modules[active_adapter].weight
+    lora_b = lora_b_modules[active_adapter].weight
+    if (
+        input_dtype != base_layer.weight.dtype
+        or input_dtype != lora_a.dtype
+        or input_dtype != lora_b.dtype
+    ):
+        return None
+
+    return base_layer, lora_a, lora_b, float(scaling_map[active_adapter])
+
+
+def _peft_fused_gate_up_mlp_forward(
+    module: nn.Module,
+    x: torch.Tensor,
+    *args,
+    **kwargs,
+) -> torch.Tensor:
+    original_forward = getattr(module, "_bgkit_original_forward", None)
+    if original_forward is None:
+        raise RuntimeError("PEFT fused MLP forward was installed without an original forward")
+
+    if args or kwargs:
+        return original_forward(x, *args, **kwargs)
+
+    gate = getattr(module, "gate_proj", None)
+    up = getattr(module, "up_proj", None)
+    down = getattr(module, "down_proj", None)
+    act_fn = getattr(module, "act_fn", None)
+    if gate is None or up is None or down is None or act_fn is None:
+        return original_forward(x)
+    act_name = getattr(act_fn, "__name__", act_fn.__class__.__name__).lower()
+    if "silu" not in act_name and "swish" not in act_name:
+        return original_forward(x)
+
+    gate_fast = _peft_fast_lora_tensors(gate, x)
+    up_fast = _peft_fast_lora_tensors(up, x)
+    down_fast = _peft_fast_lora_tensors(down, x.dtype)
+    if gate_fast is None or up_fast is None or down_fast is None:
+        return original_forward(x)
+
+    gate_base, gate_a, gate_b, gate_scaling = gate_fast
+    up_base, up_a, up_b, up_scaling = up_fast
+    down_base, down_a, down_b, down_scaling = down_fast
+    if (
+        gate_base.bias is not None
+        or up_base.bias is not None
+        or down_base.bias is not None
+        or gate_scaling != up_scaling
+        or gate_base.in_features != up_base.in_features
+        or gate_base.out_features != up_base.out_features
+        or down_base.in_features != gate_base.out_features
+        or gate_a.shape != up_a.shape
+        or gate_b.shape != up_b.shape
+        or down_a.shape[1] != down_base.in_features
+        or down_b.shape[0] != down_base.out_features
+    ):
+        return original_forward(x)
+
+    return _FrozenBaseMLPLoRAFunction.apply(
+        x,
+        gate_base.weight,
+        up_base.weight,
+        down_base.weight,
+        gate_a,
+        gate_b,
+        up_a,
+        up_b,
+        down_a,
+        down_b,
+        gate_scaling,
+        up_scaling,
+        down_scaling,
+    )
+
+
 def _peft_fused_lora_forward(module: nn.Module, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
     """PEFT-compatible fast path for frozen-base decoder LoRA.
 
@@ -309,50 +682,11 @@ def _peft_fused_lora_forward(module: nn.Module, x: torch.Tensor, *args, **kwargs
 
     if args or kwargs:
         return original_forward(x, *args, **kwargs)
-    if bool(getattr(module, "disable_adapters", False)) or bool(getattr(module, "merged", False)):
-        return original_forward(x)
 
-    active_adapters = tuple(getattr(module, "active_adapters", ()))
-    if len(active_adapters) != 1:
+    fast = _peft_fast_lora_tensors(module, x)
+    if fast is None:
         return original_forward(x)
-    active_adapter = active_adapters[0]
-
-    lora_variant = getattr(module, "lora_variant", {})
-    if active_adapter in lora_variant:
-        return original_forward(x)
-
-    lora_a_modules = getattr(module, "lora_A", None)
-    lora_b_modules = getattr(module, "lora_B", None)
-    lora_dropout = getattr(module, "lora_dropout", None)
-    scaling_map = getattr(module, "scaling", None)
-    if (
-        lora_a_modules is None
-        or lora_b_modules is None
-        or lora_dropout is None
-        or scaling_map is None
-        or active_adapter not in lora_a_modules
-        or active_adapter not in lora_b_modules
-    ):
-        return original_forward(x)
-
-    dropout = lora_dropout[active_adapter]
-    dropout_is_noop = isinstance(dropout, nn.Identity) or (
-        isinstance(dropout, nn.Dropout) and float(dropout.p) == 0.0
-    )
-    if not dropout_is_noop:
-        return original_forward(x)
-
-    base_layer = getattr(module, "base_layer", None)
-    lora_a = lora_a_modules[active_adapter].weight
-    lora_b = lora_b_modules[active_adapter].weight
-    if not isinstance(base_layer, nn.Linear):
-        return original_forward(x)
-    if (
-        x.dtype != base_layer.weight.dtype
-        or x.dtype != lora_a.dtype
-        or x.dtype != lora_b.dtype
-    ):
-        return original_forward(x)
+    base_layer, lora_a, lora_b, scaling = fast
 
     return _FrozenBaseLoRAFunction.apply(
         x,
@@ -360,7 +694,7 @@ def _peft_fused_lora_forward(module: nn.Module, x: torch.Tensor, *args, **kwargs
         base_layer.bias,
         lora_a,
         lora_b,
-        float(scaling_map[active_adapter]),
+        scaling,
     )
 
 
@@ -462,6 +796,8 @@ class ReconstructionDecoder(nn.Module):
         self._lora_target_modules: tuple[str, ...] = ()
         self._lora_scaling: float | None = None
         self._lora_peft_fused_count = 0
+        self._lora_peft_gate_up_fused_count = 0
+        self._lora_native_gate_up_fused_count = 0
         # Opt-in flag for Liger-fused linear+CE. Trainers toggle this via
         # ``enable_liger_ce(True)`` when the Liger Kernel package is available;
         # the default is off so CPU host tests and un-installed environments
@@ -1330,10 +1666,24 @@ class ReconstructionDecoder(nn.Module):
             lora_config.get("fused", os.environ.get("BGKIT_DECODER_LORA_FUSED", "1")),
             default=True,
         )
+        native_fuse_gate_up = _coerce_bool(
+            lora_config.get(
+                "fuse_gate_up",
+                os.environ.get("BGKIT_DECODER_LORA_FUSE_GATE_UP", "0"),
+            ),
+            default=False,
+        )
         peft_fused_backward = _coerce_bool(
             lora_config.get(
                 "peft_fused_backward",
                 os.environ.get("BGKIT_DECODER_PEFT_FUSED_BACKWARD", "0"),
+            ),
+            default=False,
+        )
+        peft_fuse_gate_up = _coerce_bool(
+            lora_config.get(
+                "peft_fuse_gate_up",
+                os.environ.get("BGKIT_DECODER_PEFT_FUSE_GATE_UP", "0"),
             ),
             default=False,
         )
@@ -1345,6 +1695,7 @@ class ReconstructionDecoder(nn.Module):
                 dropout=dropout,
                 adapter_dtype=adapter_dtype or torch.float32,
                 fused=native_fused,
+                fuse_gate_up=native_fuse_gate_up,
             )
             cast_lora_params = wrapped
             self._lora_impl = "native"
@@ -1359,6 +1710,7 @@ class ReconstructionDecoder(nn.Module):
                     lora_config.get("autocast_adapter_dtype", adapter_dtype is None)
                 ),
                 fused_backward=peft_fused_backward,
+                fuse_gate_up=peft_fuse_gate_up,
             )
             self._lora_impl = "peft"
         else:
@@ -1384,8 +1736,16 @@ class ReconstructionDecoder(nn.Module):
             adapter_dtype=str(adapter_dtype) if adapter_dtype is not None else "peft",
             cast_lora_params=cast_lora_params,
             native_fused=native_fused if self._lora_impl == "native" else None,
+            native_fuse_gate_up=native_fuse_gate_up if self._lora_impl == "native" else None,
+            native_gate_up_fused_modules=(
+                self._lora_native_gate_up_fused_count if self._lora_impl == "native" else None
+            ),
             peft_fused_backward=peft_fused_backward if self._lora_impl == "peft" else None,
             peft_fused_modules=self._lora_peft_fused_count if self._lora_impl == "peft" else None,
+            peft_fuse_gate_up=peft_fuse_gate_up if self._lora_impl == "peft" else None,
+            peft_gate_up_fused_modules=(
+                self._lora_peft_gate_up_fused_count if self._lora_impl == "peft" else None
+            ),
         )
 
     def _apply_peft_lora(
@@ -1398,6 +1758,7 @@ class ReconstructionDecoder(nn.Module):
         adapter_dtype: torch.dtype | None,
         autocast_adapter_dtype: bool,
         fused_backward: bool,
+        fuse_gate_up: bool,
     ) -> int:
         from peft import LoraConfig, get_peft_model
 
@@ -1421,6 +1782,11 @@ class ReconstructionDecoder(nn.Module):
         self._lora_peft_fused_count = (
             self._enable_peft_fused_lora_backward() if fused_backward else 0
         )
+        self._lora_peft_gate_up_fused_count = (
+            self._enable_peft_gate_up_mlp_fusion()
+            if fused_backward and fuse_gate_up and dropout == 0.0
+            else 0
+        )
         return cast_count
 
     def _enable_peft_fused_lora_backward(self) -> int:
@@ -1441,6 +1807,28 @@ class ReconstructionDecoder(nn.Module):
             count += 1
         return count
 
+    def _enable_peft_gate_up_mlp_fusion(self) -> int:
+        """Patch Qwen-style MLP modules to fuse PEFT gate/up LoRA projections."""
+
+        try:
+            from peft.tuners.lora import Linear as PeftLoraLinear
+        except ImportError:
+            return 0
+
+        count = 0
+        for module in self.backbone.modules():
+            if (
+                isinstance(getattr(module, "gate_proj", None), PeftLoraLinear)
+                and isinstance(getattr(module, "up_proj", None), PeftLoraLinear)
+                and hasattr(module, "down_proj")
+                and hasattr(module, "act_fn")
+                and not hasattr(module, "_bgkit_original_forward")
+            ):
+                module._bgkit_original_forward = module.forward
+                module.forward = types.MethodType(_peft_fused_gate_up_mlp_forward, module)
+                count += 1
+        return count
+
     def _apply_native_lora(
         self,
         *,
@@ -1450,6 +1838,7 @@ class ReconstructionDecoder(nn.Module):
         dropout: float,
         adapter_dtype: torch.dtype,
         fused: bool,
+        fuse_gate_up: bool,
     ) -> int:
         self.backbone.requires_grad_(False)
         targets = set(target_modules)
@@ -1472,7 +1861,25 @@ class ReconstructionDecoder(nn.Module):
             raise ValueError(
                 f"decoder LoRA found no nn.Linear target modules in {sorted(targets)!r}"
             )
+        if fused and fuse_gate_up and dropout == 0.0:
+            self._install_native_gate_up_lora_fusion()
         return wrapped_params
+
+    def _install_native_gate_up_lora_fusion(self) -> int:
+        fused_count = 0
+        for module in self.backbone.modules():
+            if (
+                isinstance(getattr(module, "gate_proj", None), DecoderLoRALinear)
+                and isinstance(getattr(module, "up_proj", None), DecoderLoRALinear)
+                and hasattr(module, "down_proj")
+                and hasattr(module, "act_fn")
+                and not hasattr(module, "_bgkit_original_forward")
+            ):
+                module._bgkit_original_forward = module.forward
+                module.forward = types.MethodType(_fused_gate_up_mlp_forward, module)
+                fused_count += 1
+        self._lora_native_gate_up_fused_count = fused_count
+        return fused_count
 
     def _base_lora_dtype(self) -> torch.dtype:
         """Return the decoder's compute dtype for LoRA adapter matmuls."""
