@@ -18,7 +18,7 @@ from pathlib import Path
 
 import hydra
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 _src = str(Path(__file__).resolve().parent.parent / "src")
 if _src not in sys.path:
@@ -191,6 +191,39 @@ def _next_batch(trainer, dataloader_iter):
         return batch, dataloader_iter
 
 
+def _batch_profile_stats(batch: dict, prefix: str) -> dict[str, float]:
+    stats: dict[str, float] = {}
+
+    content = batch.get("content_token_ids")
+    if content is not None:
+        stats[f"{prefix}_content_tokens"] = float(content.numel())
+    target = batch.get("target_token_ids")
+    if target is not None:
+        stats[f"{prefix}_target_tokens"] = float(target.numel())
+    prompt = batch.get("prompt_token_ids")
+    if prompt is not None:
+        stats[f"{prefix}_prompt_tokens"] = float(prompt.numel())
+
+    target_cu = batch.get("target_cu_seqlens")
+    if target_cu is not None and target_cu.numel() > 1:
+        target_lengths = target_cu[1:] - target_cu[:-1]
+        stats[f"{prefix}_samples"] = float(target_lengths.numel())
+        stats[f"{prefix}_max_target_len"] = float(target_lengths.max().item())
+        stats[f"{prefix}_target_l2_cost"] = float(
+            (target_lengths.to(torch.float64) ** 2).sum().item(),
+        )
+
+    return stats
+
+
+def _accumulate_batch_stats(total: dict[str, float], stats: dict[str, float]) -> None:
+    for key, value in stats.items():
+        if key.endswith("_max_content_len") or key.endswith("_max_target_len"):
+            total[key] = max(total.get(key, 0.0), value)
+        else:
+            total[key] = total.get(key, 0.0) + value
+
+
 def _run_optimizer_step(
     trainer,
     dataloader_iter,
@@ -214,9 +247,14 @@ def _run_optimizer_step(
 
     trainer.optimizer.zero_grad()
     accum_metrics = []
+    batch_stats: dict[str, float] = {}
     for micro_idx in range(accum_steps):
         with torch.profiler.record_function(f"microbatch_{micro_idx:02d}/fetch"):
             batch, dataloader_iter = _next_batch(trainer, dataloader_iter)
+            _accumulate_batch_stats(
+                batch_stats,
+                _batch_profile_stats(batch, "batch"),
+            )
         with torch.profiler.record_function(f"microbatch_{micro_idx:02d}/forward_backward"):
             accum_metrics.append(trainer._forward_backward(batch))
 
@@ -235,6 +273,7 @@ def _run_optimizer_step(
             torch.cuda.empty_cache()
 
     metrics = _average_metrics(accum_metrics)
+    metrics.update(batch_stats)
     metrics["grad_norm"] = grad_norm
     metrics["lr"] = trainer.optimizer.param_groups[0]["lr"]
     if len(trainer.optimizer.param_groups) > 1:
@@ -372,6 +411,17 @@ def main(cfg: DictConfig) -> None:
         "topk": topk,
         "profile_table": table,
         "trace_path": str(trace_path) if trace_path is not None else None,
+        "training_shape": {
+            "decoder_lora": OmegaConf.to_container(
+                cfg.training.get("decoder_lora", {}),
+                resolve=True,
+            ),
+            "gradient_accumulation_steps": int(
+                cfg.training.get("gradient_accumulation_steps", 1),
+            ),
+            "max_batch_tokens": int(cfg.training.get("max_batch_tokens", 0)),
+            "max_sample_length": int(cfg.training.get("max_sample_length", 0)),
+        },
         "env": {
             "BGKIT_DECODER_CE_IMPL": os.environ.get("BGKIT_DECODER_CE_IMPL"),
             "BGKIT_GDN_BACKEND": os.environ.get("BGKIT_GDN_BACKEND"),
