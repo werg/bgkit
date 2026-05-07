@@ -1804,6 +1804,10 @@ class BaseTrainer(ABC):
                         )
                     self.optimizer.step()
                     self._post_optimizer_step(step)
+                    # Heartbeat for the step-level deadlock watchdog. Imported
+                    # at use to avoid a hot-path import (cached after first call).
+                    from bgkit.utils.step_watchdog import heartbeat as _hb
+                    _hb()
 
                     # Release cached-but-unused CUDA allocator blocks back
                     # to the OS each optimizer step. The DGX Spark's
@@ -1889,10 +1893,17 @@ class BaseTrainer(ABC):
                     # Eval
                     if eval_every > 0 and step > 0 and step % eval_every == 0:
                         self._release_training_transients()
+                        from bgkit.utils.step_watchdog import (
+                            pause as _wd_pause, resume as _wd_resume,
+                        )
                         with memory_budget_scope(
                             "evaluate", cap_gb=self._scope_cap("evaluate"),
                         ):
-                            eval_metrics = self.evaluate()
+                            _wd_pause()
+                            try:
+                                eval_metrics = self.evaluate()
+                            finally:
+                                _wd_resume()
                         eval_metrics = {
                             f"eval/{k}": v for k, v in eval_metrics.items()
                         }
@@ -2007,13 +2018,20 @@ class BaseTrainer(ABC):
                         )
                         parent = self._registry_parent()
                         self._release_training_transients()
+                        from bgkit.utils.step_watchdog import (
+                            pause as _wd_pause, resume as _wd_resume,
+                        )
                         with memory_budget_scope(
                             "save_checkpoint",
                             cap_gb=self._scope_cap("save_checkpoint"),
                         ):
-                            ckpt_path = self.save_checkpoint(
-                                checkpoint_dir, metrics=step_metrics
-                            )
+                            _wd_pause()
+                            try:
+                                ckpt_path = self.save_checkpoint(
+                                    checkpoint_dir, metrics=step_metrics
+                                )
+                            finally:
+                                _wd_resume()
                         registry.register(self._build_registry_entry(
                             ckpt_path, step_metrics, wandb_run,
                             parent_checkpoint=parent,
@@ -2064,10 +2082,17 @@ class BaseTrainer(ABC):
 
                 # Final eval + checkpoint
                 self._release_training_transients()
+                from bgkit.utils.step_watchdog import (
+                    pause as _wd_pause, resume as _wd_resume,
+                )
                 with memory_budget_scope(
                     "evaluate", cap_gb=self._scope_cap("evaluate"),
                 ):
-                    eval_metrics = self.evaluate()
+                    _wd_pause()
+                    try:
+                        eval_metrics = self.evaluate()
+                    finally:
+                        _wd_resume()
                 eval_metrics = {
                     f"eval/{k}": v for k, v in eval_metrics.items()
                 }
