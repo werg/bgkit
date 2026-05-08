@@ -16,6 +16,8 @@ WORKDIR /workspace/bgkit
 # Install third-party deps (cached until pyproject.toml changes)
 COPY pyproject.toml ./
 COPY docs/01_overview.md docs/
+ARG TILELANG_VERSION=0.1.8
+ARG APACHE_TVM_FFI_VERSION=0.1.9
 RUN mkdir -p src/bgkit && \
     echo '__version__ = "0.1.0"' > src/bgkit/__init__.py && \
     pip install --no-cache-dir ".[gpu]" && \
@@ -32,6 +34,13 @@ RUN mkdir -p src/bgkit && \
     pip install --no-cache-dir --force-reinstall "nvidia-cutlass-dsl-libs-base==4.4.2" && \
     pip uninstall -y bgkit && \
     rm -rf src/
+
+# FlashQLA is bind-mounted at runtime, but its JIT toolchain belongs in the
+# training image so parity/profiling services do not reinstall TileLang into a
+# throwaway writable layer on every run.
+RUN pip install --no-cache-dir \
+    "tilelang==${TILELANG_VERSION}" \
+    "apache-tvm-ffi==${APACHE_TVM_FFI_VERSION}"
 
 # fla (flash-linear-attention): stock PyPI fla 0.4.2 is installed via [gpu] extra.
 #
@@ -85,13 +94,15 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/li
     LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
     python -c "import accelerate; print(f'accelerate {accelerate.__version__}')" && \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+    python -c "import importlib.metadata as m; print(f'tilelang {m.version(\"tilelang\")}, apache-tvm-ffi {m.version(\"apache-tvm-ffi\")}')" && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
     python -c "from causal_conv1d import causal_conv1d_fn; print('causal_conv1d OK')" && \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
     python -c "from cutlass._mlir.dialects import nvvm; import inspect; params = list(inspect.signature(nvvm.atomicrmw).parameters); print(f'cutlass-dsl atomicrmw first param: {params[0]!r}'); assert params[0] in ('res', 'op'), f'unrecognized atomicrmw signature: {params}'"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages \
+    PYTHONPATH=/workspace/flashqla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages \
     DATA_DIR=/workspace/data \
     HF_HOME=/workspace/hf_cache \
     CHECKPOINT_DIR=/workspace/checkpoints
@@ -100,14 +111,16 @@ ENV PYTHONUNBUFFERED=1 \
 # Ref: https://github.com/eugr/spark-vllm-docker
 ENV TORCH_CUDA_ARCH_LIST="12.1a" \
     TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
+    TILELANG_CACHE_DIR=/workspace/.cache/tilelang \
+    TVM_CACHE_DIR=/workspace/.cache/tvm \
     DG_JIT_USE_NVRTC=1 \
     USE_CUDNN=1 \
     MAX_JOBS=16 \
     CMAKE_BUILD_PARALLEL_LEVEL=16
 
 # Ensure writable dirs for non-root user (container runs as host uid via compose)
-RUN mkdir -p /workspace/bgkit /workspace/.cache /workspace/.triton && \
-    chmod 777 /workspace /workspace/bgkit /workspace/.cache /workspace/.triton
+RUN mkdir -p /workspace/bgkit /workspace/.cache /workspace/.cache/tilelang /workspace/.cache/tvm /workspace/.triton && \
+    chmod 777 /workspace /workspace/bgkit /workspace/.cache /workspace/.cache/tilelang /workspace/.cache/tvm /workspace/.triton
 
 # Startup script verifies mounts exist before running anything
 COPY --chmod=755 docker/entrypoint.sh /entrypoint.sh

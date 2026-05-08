@@ -28,7 +28,12 @@ import os
 import sys
 import time
 import traceback
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from flashqla_env_smoke import classify_exception
+
+if TYPE_CHECKING:
+    import torch
 
 # Tolerances chosen for bf16 GDN: an additive error of ~2e-2 is typical
 # across long sequences with chained chunked products. Headroom for
@@ -40,9 +45,7 @@ ATOL_BWD = 5e-2  # backward accumulates more error
 RTOL_BWD = 2e-2
 
 
-def _summary(name: str, a: "torch.Tensor", b: "torch.Tensor") -> str:  # noqa: F821
-    import torch
-
+def _summary(name: str, a: torch.Tensor, b: torch.Tensor) -> str:
     diff = (a.float() - b.float()).abs()
     return (
         f"  {name:>14s}: shape={tuple(a.shape)} dtype={a.dtype} "
@@ -54,16 +57,16 @@ def _summary(name: str, a: "torch.Tensor", b: "torch.Tensor") -> str:  # noqa: F
 
 
 def _make_inputs(
-    B: int,
-    T: int,
-    H: int,
-    HV: int,
-    Dk: int,
-    Dv: int,
-    cu_seqlens: "torch.Tensor | None",  # noqa: F821
+    batch: int,
+    seq_len: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    head_dim_k: int,
+    head_dim_v: int,
+    cu_seqlens: torch.Tensor | None,
     *,
     device: str = "cuda",
-    dtype: "torch.dtype | None" = None,  # noqa: F821
+    dtype: torch.dtype | None = None,
     seed: int = 17,
 ) -> dict[str, Any]:
     import torch
@@ -75,24 +78,35 @@ def _make_inputs(
     torch.manual_seed(seed)
     if cu_seqlens is not None:
         # Packed/varlen: B == 1, T == sum(L_i).
-        T_packed = int(cu_seqlens[-1].item())
-        q = torch.randn(1, T_packed, H, Dk, dtype=dtype, device=device)
+        t_packed = int(cu_seqlens[-1].item())
+        q = torch.randn(1, t_packed, num_q_heads, head_dim_k, dtype=dtype, device=device)
         k = F.normalize(
-            torch.randn(1, T_packed, H, Dk, dtype=dtype, device=device).float(), p=2, dim=-1
+            torch.randn(1, t_packed, num_q_heads, head_dim_k, dtype=dtype, device=device).float(),
+            p=2,
+            dim=-1,
         ).to(dtype)
-        v = torch.randn(1, T_packed, HV, Dv, dtype=dtype, device=device)
-        beta = torch.rand(1, T_packed, HV, dtype=dtype, device=device).sigmoid()
+        v = torch.randn(1, t_packed, num_v_heads, head_dim_v, dtype=dtype, device=device)
+        beta = torch.rand(1, t_packed, num_v_heads, dtype=dtype, device=device).sigmoid()
         # Modest decay magnitudes to avoid float32 exp overflow in fla bwd
         # (the deltanet_patch clamp lives downstream; here we keep g sane).
-        g = F.logsigmoid(torch.rand(1, T_packed, HV, dtype=dtype, device=device))
+        g = F.logsigmoid(torch.rand(1, t_packed, num_v_heads, dtype=dtype, device=device))
     else:
-        q = torch.randn(B, T, H, Dk, dtype=dtype, device=device)
+        q = torch.randn(batch, seq_len, num_q_heads, head_dim_k, dtype=dtype, device=device)
         k = F.normalize(
-            torch.randn(B, T, H, Dk, dtype=dtype, device=device).float(), p=2, dim=-1
+            torch.randn(
+                batch,
+                seq_len,
+                num_q_heads,
+                head_dim_k,
+                dtype=dtype,
+                device=device,
+            ).float(),
+            p=2,
+            dim=-1,
         ).to(dtype)
-        v = torch.randn(B, T, HV, Dv, dtype=dtype, device=device)
-        beta = torch.rand(B, T, HV, dtype=dtype, device=device).sigmoid()
-        g = F.logsigmoid(torch.rand(B, T, HV, dtype=dtype, device=device))
+        v = torch.randn(batch, seq_len, num_v_heads, head_dim_v, dtype=dtype, device=device)
+        beta = torch.rand(batch, seq_len, num_v_heads, dtype=dtype, device=device).sigmoid()
+        g = F.logsigmoid(torch.rand(batch, seq_len, num_v_heads, dtype=dtype, device=device))
     return {
         "q": q.requires_grad_(True),
         "k": k.requires_grad_(True),
@@ -102,15 +116,16 @@ def _make_inputs(
     }
 
 
-def _clone_inputs(d: dict[str, "torch.Tensor"]) -> dict[str, "torch.Tensor"]:  # noqa: F821
+def _clone_inputs(d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {k: v.detach().clone().requires_grad_(True) for k, v in d.items()}
 
 
 def _run_one(
     fn,
-    inputs: dict[str, "torch.Tensor"],  # noqa: F821
-    cu_seqlens: "torch.Tensor | None",  # noqa: F821
+    inputs: dict[str, torch.Tensor],
+    cu_seqlens: torch.Tensor | None,
     label: str,
+    grad_seed: int,
 ) -> dict[str, Any]:
     import torch
 
@@ -131,6 +146,7 @@ def _run_one(
     t_fwd = time.perf_counter() - t0
     print(f"[{label}] forward done in {t_fwd*1000:.2f} ms")
 
+    torch.manual_seed(grad_seed)
     do = torch.randn_like(o)
     t0 = time.perf_counter()
     o.backward(do)
@@ -182,17 +198,42 @@ def main() -> int:
         return 3
 
     cap = torch.cuda.get_device_capability()
+    props = torch.cuda.get_device_properties(0)
     print(f"CUDA device: {torch.cuda.get_device_name(0)} (capability {cap[0]}.{cap[1]})")
     print(f"PyTorch: {torch.__version__}")
+    print(
+        "CUDA limits: "
+        f"shared/block={props.shared_memory_per_block} "
+        f"shared/block_optin={getattr(props, 'shared_memory_per_block_optin', None)} "
+        f"shared/SM={getattr(props, 'shared_memory_per_multiprocessor', None)} "
+        f"regs/SM={getattr(props, 'regs_per_multiprocessor', None)}"
+    )
     print(f"BGKIT_GDN_BACKEND={os.environ.get('BGKIT_GDN_BACKEND', '<unset>')}")
+    print(f"TILELANG_CACHE_DIR={os.environ.get('TILELANG_CACHE_DIR', '<unset>')}")
+
+    try:
+        import importlib.metadata as importlib_metadata
+
+        from tilelang.contrib import nvcc as tilelang_nvcc
+
+        print(
+            "TileLang: "
+            f"{importlib_metadata.version('tilelang')} "
+            f"target_compute_version={tilelang_nvcc.get_target_compute_version()}"
+        )
+    except Exception as exc:
+        print(
+            f"WARNING: TileLang diagnostic failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
 
     # 2. fla import.
     try:
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_gdr
         import fla
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_gdr
 
         print(f"fla loaded from {fla.__file__}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"FATAL: fla import failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         traceback.print_exc()
         return 3
@@ -226,8 +267,8 @@ def main() -> int:
             return 2
 
     try:
-        from flash_qla import chunk_gated_delta_rule as flashqla_gdr
         import flash_qla
+        from flash_qla import chunk_gated_delta_rule as flashqla_gdr
 
         print(f"flash_qla loaded from {flash_qla.__file__}")
     except ValueError as exc:
@@ -244,9 +285,10 @@ def main() -> int:
         print(f"FATAL: flash_qla import failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         traceback.print_exc()
         return 2
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(
-            f"FATAL: flash_qla import raised unexpected error: {type(exc).__name__}: {exc}",
+            "FATAL: flash_qla import raised unexpected error "
+            f"({classify_exception(exc)}): {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
         traceback.print_exc()
@@ -258,23 +300,37 @@ def main() -> int:
     #      linear_num_value_heads = 16
     #      linear_key_head_dim = 128
     #      linear_value_head_dim = 128
-    H, HV, Dk, Dv = 16, 16, 128, 128
+    num_q_heads, num_v_heads, head_dim_k, head_dim_v = 16, 16, 128, 128
 
     print("\n=== Test 1: fixed-length, B=2 T=2048 ===")
-    in_fla = _make_inputs(B=2, T=2048, H=H, HV=HV, Dk=Dk, Dv=Dv, cu_seqlens=None)
+    in_fla = _make_inputs(
+        batch=2,
+        seq_len=2048,
+        num_q_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+        head_dim_k=head_dim_k,
+        head_dim_v=head_dim_v,
+        cu_seqlens=None,
+    )
     in_fq = _clone_inputs(in_fla)
     try:
-        out_fla = _run_one(fla_gdr, in_fla, cu_seqlens=None, label="fla")
-    except Exception as exc:  # noqa: BLE001
+        out_fla = _run_one(fla_gdr, in_fla, cu_seqlens=None, label="fla", grad_seed=101)
+    except Exception as exc:
         print(f"FATAL: fla forward/backward crashed: {type(exc).__name__}: {exc}", file=sys.stderr)
         traceback.print_exc()
         return 4
     try:
-        out_fq = _run_one(flashqla_gdr, in_fq, cu_seqlens=None, label="flashqla")
-    except Exception as exc:  # noqa: BLE001
+        out_fq = _run_one(
+            flashqla_gdr,
+            in_fq,
+            cu_seqlens=None,
+            label="flashqla",
+            grad_seed=101,
+        )
+    except Exception as exc:
         print(
             f"\nFlashQLA execution FAILED on sm_{cap[0]}{cap[1]}: "
-            f"{type(exc).__name__}: {exc}",
+            f"{classify_exception(exc)}: {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
         traceback.print_exc()
@@ -290,20 +346,41 @@ def main() -> int:
     # ----- Test 2: varlen / cu_seqlens path -----
     print("\n=== Test 2: varlen, cu_seqlens=[0,512,1536,2048] (B=3 packed) ===")
     cu = torch.tensor([0, 512, 1536, 2048], dtype=torch.long, device="cuda")
-    in_fla2 = _make_inputs(B=1, T=2048, H=H, HV=HV, Dk=Dk, Dv=Dv, cu_seqlens=cu, seed=23)
+    in_fla2 = _make_inputs(
+        batch=1,
+        seq_len=2048,
+        num_q_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+        head_dim_k=head_dim_k,
+        head_dim_v=head_dim_v,
+        cu_seqlens=cu,
+        seed=23,
+    )
     in_fq2 = _clone_inputs(in_fla2)
     try:
-        out_fla2 = _run_one(fla_gdr, in_fla2, cu_seqlens=cu, label="fla-varlen")
-    except Exception as exc:  # noqa: BLE001
+        out_fla2 = _run_one(
+            fla_gdr,
+            in_fla2,
+            cu_seqlens=cu,
+            label="fla-varlen",
+            grad_seed=202,
+        )
+    except Exception as exc:
         print(f"FATAL: fla varlen crashed: {type(exc).__name__}: {exc}", file=sys.stderr)
         traceback.print_exc()
         return 4
     try:
-        out_fq2 = _run_one(flashqla_gdr, in_fq2, cu_seqlens=cu, label="flashqla-varlen")
-    except Exception as exc:  # noqa: BLE001
+        out_fq2 = _run_one(
+            flashqla_gdr,
+            in_fq2,
+            cu_seqlens=cu,
+            label="flashqla-varlen",
+            grad_seed=202,
+        )
+    except Exception as exc:
         print(
             f"\nFlashQLA varlen execution FAILED on sm_{cap[0]}{cap[1]}: "
-            f"{type(exc).__name__}: {exc}",
+            f"{classify_exception(exc)}: {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
         traceback.print_exc()

@@ -7,7 +7,7 @@ export
 # reading the file itself for ${VAR} interpolation in the YAML).
 DC := docker compose --env-file .env -f docker/docker-compose.yaml
 
-.PHONY: install install-gpu install-fa4-local install-gpu-local-fa4 test test-unit test-gpu test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos train-phase1-step1 train-phase1-step2 train-phase1-step3 train-phase1-step4 train-phase1-step5 train-phase1-step6 ckpt-backfill extract-structural generate-descriptions extract-commits prepare-commit-encoding convert-tokens convert-structural convert-descriptions convert-commits convert-commit-encoding generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full prepare-data-all
+.PHONY: install install-gpu install-fa4-local install-gpu-local-fa4 test test-unit test-gpu test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos train-phase1-step1 train-phase1-step2 train-phase1-step3 train-phase1-step4 train-phase1-step5 train-phase1-step6 flashqla-smoke flashqla-parity flashqla-profile flashqla-shell ckpt-backfill extract-structural generate-descriptions extract-commits prepare-commit-encoding convert-tokens convert-structural convert-descriptions convert-commits convert-commit-encoding generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full prepare-data-all
 
 FLASH_ATTN_DIR ?= ../flash-attention
 
@@ -99,6 +99,18 @@ docker-build-data:
 
 docker-build-llama:
 	$(DC) build llama-large llama-small llama-tiny
+
+flashqla-smoke:
+	$(DC) run --rm smoke-flashqla
+
+flashqla-parity:
+	$(DC) run --rm parity-flashqla
+
+flashqla-profile:
+	$(DC) run --rm profile-flashqla
+
+flashqla-shell:
+	$(DC) run --rm shell-flashqla
 
 download-models:
 	scripts/download-model.sh LiquidAI/LFM2-8B-A1B-GGUF LFM2-8B-A1B-Q4_K_M.gguf
