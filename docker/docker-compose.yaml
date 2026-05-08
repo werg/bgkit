@@ -135,6 +135,10 @@ x-gpu-common: &gpu-common
     # Default 0 (refuse). Same pattern for BGKIT_CUDA_MEM_FRACTION (0.65).
     - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
     - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.65}
+    # Step watchdog timeout (seconds). Default 60s catches real hangs but
+    # is too tight for first-step JIT compile + autotune after a restart.
+    # Raise via shell env (e.g. 300) for resume runs after kernel changes.
+    - BGKIT_STEP_TIMEOUT=${BGKIT_STEP_TIMEOUT:-60.0}
   volumes:
     - ${DATA_DIR}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
@@ -258,13 +262,13 @@ services:
 
   train-phase1-step5:
     <<: *gpu-common
-    # Bumped from gpu-common's 80g default to 100g on 2026-05-06 to give
-    # batch=8192 (or future larger batches) room. Leaves ~28g for the host
-    # OS + Claude Code harness on 128 GB unified memory; still bounded so a
-    # runaway CUDA alloc gets container-OOM'd rather than host-OOM-killing
-    # the harness.
-    mem_limit: 100g
-    memswap_limit: 100g
+    # Bumped 100g -> 115g on 2026-05-07 after long-tail OOM with
+    # gradient_checkpointing=false. Leaves ~13g for the host OS + Claude
+    # Code harness on 128 GB unified memory; still bounded so a runaway
+    # CUDA alloc gets container-OOM'd rather than host-OOM-killing the
+    # harness.
+    mem_limit: 115g
+    memswap_limit: 115g
     command: ["scripts/train.py", "+experiment=phase1_step5"]
 
   # Phase 1 Step 4.7: bridge distillation. Teacher = frozen Step 4 L0-only

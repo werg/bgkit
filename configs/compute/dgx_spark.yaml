@@ -58,7 +58,10 @@ memory:
   log_every_steps: 10
   # Hard floor on system-wide used GB. Hit → emergency checkpoint +
   # SystemExit. Leaves headroom for save_checkpoint + ssh. 0 disables.
-  system_abort_gb: 110
+  # 2026-05-08: bumped 110 → 114 to align with mem_limit=115g + cuda
+  # fraction 0.87 (113.7 GB CUDA). Old 110 fired before CUDA cap was
+  # reached on megatron mode (which keeps reserved pool ~76+ GB).
+  system_abort_gb: 114
   # Per-scope CUDA peak caps for memory_budget_scope (phase-boundary
   # enforcement; complements the periodic poll above).  Calibrated from
   # the 2026-04-20 Phase 1 Step 3 run (cuda_max_allocated ~14 GB at
