@@ -43,3 +43,7 @@ Thumbs.db
 
 # uv
 .uv/
+
+# Claude Code per-agent worktrees + scheduler lock (local only)
+.claude/worktrees/
+.claude/scheduled_tasks.lock
