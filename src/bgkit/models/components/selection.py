@@ -370,10 +370,23 @@ class ThresholdCurveController(nn.Module):
         ratio_space: str = "log",
         init_target_ratio: float | None = None,
         default_query_ratio: float = 0.10,
+        kernel_bandwidth: float | None = None,
     ):
         super().__init__()
         self.lr = float(lr)
         self.momentum = float(momentum)
+        # Gaussian-kernel update bandwidth in the chosen ratio_space.
+        # When set, ``step()`` distributes the dual-ascent delta across ALL
+        # anchors via a Gaussian kernel centered at the target ratio rather
+        # than just the two interpolation neighbors. This breaks the monotone
+        # projection's tendency to clamp updates against neighboring anchors
+        # that the curriculum hasn't visited recently (diagnosed 2026-05-08:
+        # anchor[5]=0.64 was monotone-capped at anchor[4]=-0.017 for 780+
+        # steps with target_rate=0.69, blocking actual_ratio convergence).
+        # ``None`` preserves the legacy 2-anchor update.
+        self.kernel_bandwidth = (
+            float(kernel_bandwidth) if kernel_bandwidth is not None else None
+        )
         self.clamp_val = float(clamp)
         self.ratio_space = str(ratio_space).lower()
         if self.ratio_space not in {"linear", "log", "logit"}:
@@ -539,24 +552,32 @@ class ThresholdCurveController(nn.Module):
 
     @torch.no_grad()
     def step(self, current_rate: float, target_rate: float) -> None:
-        """Apply one dual-ascent update to the local anchors around ``target_rate``."""
+        """Apply one dual-ascent update to the anchors around ``target_rate``.
+
+        With ``kernel_bandwidth`` set, the gap is distributed across ALL anchors
+        via a Gaussian kernel in ``ratio_space``; otherwise only the two
+        interpolation neighbors are updated (legacy behavior).
+        """
         if current_rate != current_rate:  # NaN guard
             return
         target_rate = float(target_rate)
         self._last_target_rate.fill_(target_rate)
         gap = float(current_rate) - float(target_rate)
-        left, right, left_w, right_w = self._interpolation_state(target_rate)
-        updates = [(left, left_w)]
-        if right != left:
-            updates.append((right, right_w))
-        denom = sum(weight * weight for _, weight in updates)
-        if denom <= 0.0:
-            denom = 1.0
+
+        if self.kernel_bandwidth is not None:
+            updates = self._gaussian_kernel_updates(target_rate)
+        else:
+            left, right, left_w, right_w = self._interpolation_state(target_rate)
+            pairs = [(left, left_w)]
+            if right != left:
+                pairs.append((right, right_w))
+            denom = sum(w * w for _, w in pairs)
+            if denom <= 0.0:
+                denom = 1.0
+            updates = [(idx, w / denom) for idx, w in pairs if w > 0.0]
 
         for idx, weight in updates:
-            if weight <= 0.0:
-                continue
-            scaled_gap = gap * (weight / denom)
+            scaled_gap = gap * weight
             if self.momentum > 0.0:
                 prev_v = float(self._anchor_velocity[idx].item())
                 new_velocity = self.momentum * prev_v + (1.0 - self.momentum) * scaled_gap
@@ -568,6 +589,28 @@ class ThresholdCurveController(nn.Module):
             self.anchor_thetas[idx].fill_(new_theta)
 
         self._project_monotone_()
+
+    def _gaussian_kernel_updates(self, target_rate: float) -> list[tuple[int, float]]:
+        """Return ``[(anchor_idx, weight), ...]`` for a Gaussian kernel
+        centered at ``target_rate`` in ``ratio_space``, normalized to sum to 1.
+
+        Spreading the dual-ascent delta across all anchors lets updates
+        propagate through the monotone-projection chain instead of being
+        clamped against unmoving neighbors. The total update magnitude across
+        all anchors stays at ``lr * gap`` (vs. the legacy code's
+        ``sum(w/denom)`` which boosts above 1 for uneven weights).
+        """
+        sigma = max(float(self.kernel_bandwidth), 1e-6)
+        target_t = float(self._transform_ratio(target_rate))
+        anchor_t = self._transform_ratio(self.anchor_ratios.float()).cpu().tolist()
+        log_weights = [-((t - target_t) ** 2) / (2.0 * sigma * sigma) for t in anchor_t]
+        # Stable softmax so far-away anchors round to 0 cleanly.
+        max_lw = max(log_weights)
+        exps = [pow(2.718281828, lw - max_lw) for lw in log_weights]
+        total = sum(exps)
+        if total <= 0.0:
+            return []
+        return [(i, e / total) for i, e in enumerate(exps) if e / total > 1e-9]
 
     @property
     def theta(self) -> Tensor:

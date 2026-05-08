@@ -263,7 +263,7 @@ class LevelCompressor(nn.Module):
             if k in {
                 "init_theta", "lr", "momentum", "clamp",
                 "anchor_ratios", "ratio_space", "init_target_ratio",
-                "default_query_ratio",
+                "default_query_ratio", "kernel_bandwidth",
             }
         }
         self.threshold = DualThresholdController(**ctrl_kwargs)

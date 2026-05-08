@@ -20,12 +20,20 @@ threshold_controller:
   # Interpolate the threshold curve in this ratio space. "log" gives extra
   # resolution where aggressive compression is most sensitive.
   ratio_space: log
-  # lr raised 0.02 → 0.05 on 2026-04-21: the 0.02 value was under-damped
-  # for active-ramp tracking (docs/theta_controller_investigation_2026_04_21.md).
-  # Steady-state tracking lag was |target_rate|/(lr·k) ≈ 0.1 with k ≈ −0.25;
-  # 2.5× gain reduces lag proportionally.
+  # lr history:
+  #   0.02 → 0.05 (2026-04-21): under-damped for active-ramp tracking.
+  #   0.05 → 0.20 (2026-05-08): paired with kernel_bandwidth=1.0; observed
+  #     wild oscillation (ratio 0.04 ↔ 1.0 within 10 steps) — too aggressive.
+  #   0.20 → 0.05 (2026-05-08): keep the kernel spread but revert lr. The
+  #     kernel alone breaks the monotone-projection clamp; lr need not change.
   lr: 0.05                    # dual-ascent lr in tanh-logit space
   momentum: 0.0               # tune up if nearby anchors sawtooth
+  # Gaussian-kernel bandwidth (in ratio_space units; 0.5 in log space spans
+  # ~2-3 anchors meaningfully — narrower than 1.0 to avoid PAVA averaging
+  # collapsing the upper anchor curve under sustained gap). When set,
+  # dual-ascent updates touch all anchors weighted by distance from
+  # target_rate. Fixes the monotone-projection clamp diagnosed 2026-05-08.
+  kernel_bandwidth: 0.5
   # Clamp applies to each anchor individually. Allowing anchors past ±1 lets
   # the curve saturate cleanly when the requested ratio is temporarily
   # infeasible under the current head distribution.
