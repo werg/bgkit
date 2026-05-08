@@ -8,8 +8,8 @@ encoder_lr: 1.0e-5
 decoder_lr: 5.0e-5
 warmup_steps: 500
 bidi_warmup_steps: 0           # already bidirectional from previous steps
-gradient_checkpointing: false  # GB10 Step 5 profile: ~18-22% faster, <27 GiB peak at stage-0 budget
-cuda_empty_cache_every_step: false  # Avoid per-step allocator sync; measured peak stays <27 GiB
+gradient_checkpointing: megatron  # 2026-05-08: per-op selective recompute (Korthikanti et al. 2022). MUST_SAVE matmul + SDPA outputs, RECOMPUTE layernorm + silu + elementwise. Replaces the legacy DeltaNet-skip "selective" hack.
+cuda_empty_cache_every_step: 10     # 2026-05-08: every-10-steps cadence to bound CUDA reserved pool. Long-tail batches push reserved up across ~170 steps; flushing every 10 steps caps growth to one cycle (≈200 s of training) of accumulation before reset. ~10x lower sync overhead than per-step flush. Accepts bool (false=off, true=every step) or int N (every N steps).
 
 # ---- Three-phase curriculum (all live-tunable via control.json) ----
 # Stage transitions (steps).

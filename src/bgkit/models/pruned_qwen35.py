@@ -178,6 +178,9 @@ class PrunedBidirectionalQwen35(nn.Module):
     def gradient_checkpointing_enable(self, **kwargs):
         self._gradient_checkpointing = True
 
+    def gradient_checkpointing_disable(self) -> None:
+        self._gradient_checkpointing = False
+
     def step_bidi_warmup(self) -> None:
         self._step += 1
 

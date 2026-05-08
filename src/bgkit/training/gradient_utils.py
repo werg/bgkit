@@ -7,8 +7,57 @@ from typing import Any
 import structlog
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import (
+    CheckpointPolicy,
+    checkpoint,
+    create_selective_checkpoint_contexts,
+)
 
 logger = structlog.get_logger()
+
+
+# Megatron-style selective recomputation policy: SAVE matmul + attention outputs,
+# RECOMPUTE everything else (layernorms, elementwise, residuals, dropout).
+# Reference: Korthikanti et al. 2022 "Reducing Activation Recomputation in
+# Large Transformer Models" — recomputing softmax + dropout is ~5% of FLOPs but
+# saves the O(N²) attention matrix; storing matmul outputs avoids re-running
+# the FLOP-dense projections.
+#
+# We extend the paper's idea by also dropping LoRA-input saves: LoRA-wrapped
+# linears must save `x` for `dA = dy.T @ x`, but if the upstream op is cheap
+# (layernorm, residual add), that `x` is recomputed for free along with the
+# RECOMPUTE chain. The matmul output we MUST_SAVE is what the next layer needs.
+_MEGATRON_SAVE_OPS: set = {
+    torch.ops.aten.mm.default,
+    torch.ops.aten.addmm.default,
+    torch.ops.aten.bmm.default,
+    # SDPA backends — saving the attention output avoids re-running attention
+    # on backward. FA's own custom autograd Function controls Q/K/V/softmax-stat
+    # save/recompute internally; this policy operates one level up.
+    torch.ops.aten._scaled_dot_product_flash_attention.default,
+    torch.ops.aten._scaled_dot_product_efficient_attention.default,
+}
+
+
+def _megatron_policy_fn(ctx, op, *args, **kwargs):
+    if op in _MEGATRON_SAVE_OPS:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def _megatron_checkpoint_func(forward, *args, **kwargs):
+    """Drop-in replacement for ``functools.partial(checkpoint, use_reentrant=False)``
+    that selectively saves matmul + SDPA outputs and recomputes everything else.
+
+    HF v5's ``GradientCheckpointingLayer.__call__`` invokes this as
+    ``self._gradient_checkpointing_func(partial(super().__call__, **kwargs), *args)``,
+    so the signature must match: first arg is the forward callable, remaining
+    positional args are the layer's positional inputs.
+    """
+    context_fn = lambda: create_selective_checkpoint_contexts(_megatron_policy_fn)  # noqa: E731
+    return checkpoint(
+        forward, *args, use_reentrant=False, context_fn=context_fn, **kwargs,
+    )
 
 
 def enable_gradient_checkpointing(model: nn.Module) -> None:
@@ -58,17 +107,12 @@ def maybe_enable_gradient_checkpointing(model: nn.Module, cfg: Any) -> bool:
     ``compute.gradient_checkpointing: false`` knob actually takes effect.
 
     When ``cfg.training.gradient_checkpointing`` (or ``cfg.compute....``) is
-    set to the string ``"selective"``, this enables checkpointing then
-    swaps the model's ``_gradient_checkpointing_func`` for a layer-aware
-    variant that **skips checkpointing on Qwen3.5 DeltaNet layers** (those
-    that own a ``linear_attn`` submodule) and applies checkpointing to all
-    other decoder layers (FullAttention).
-
-    Why: per the 2026-04-26 perf investigation, DeltaNet's recompute under
-    checkpointing dominates the per-step wall clock (3 of every 4 Qwen3.5
-    decoder layers are DeltaNet). Skipping recompute on DeltaNet specifically
-    trades ~2 GB of extra activation memory for the recompute cost of the
-    expensive layers, while keeping cheaper FullAttention checkpointed.
+    set to the string ``"megatron"``, this enables checkpointing then swaps
+    each layer's ``_gradient_checkpointing_func`` for a per-op selective
+    variant that MUST_SAVE matmul + SDPA outputs and PREFER_RECOMPUTE
+    everything else (layernorms, silu, mul, residual adds). Reference:
+    Korthikanti et al. 2022 "Reducing Activation Recomputation in Large
+    Transformer Models".
     """
     requested = _resolve_gradient_checkpointing_mode(cfg)
     if requested is False or requested is None:
@@ -79,14 +123,14 @@ def maybe_enable_gradient_checkpointing(model: nn.Module, cfg: Any) -> bool:
         )
         return False
     enable_gradient_checkpointing(model)
-    selective_disabled_layers = 0
-    if requested == "selective":
-        selective_disabled_layers = _install_selective_checkpoint_func(model)
+    megatron_layers = 0
+    if requested == "megatron":
+        megatron_layers = _install_megatron_checkpoint_func(model)
     logger.info(
         "gradient_checkpointing_enabled",
         model=model.__class__.__name__,
         mode=requested,
-        selective_disabled_layers=selective_disabled_layers,
+        megatron_layers=megatron_layers,
     )
     return True
 
@@ -111,8 +155,8 @@ def _resolve_gradient_checkpointing_mode(cfg: Any) -> bool | str | None:
 def _coerce_gradient_checkpointing_value(val: Any) -> bool | str:
     if isinstance(val, str):
         normalized = val.strip().lower()
-        if normalized in {"selective", "deltanet_off", "skip_deltanet"}:
-            return "selective"
+        if normalized in {"megatron", "selective", "selective_ops", "selective_v2"}:
+            return "megatron"
         if normalized in {"true", "1", "on", "yes"}:
             return True
         if normalized in {"false", "0", "off", "no"}:
@@ -120,42 +164,90 @@ def _coerce_gradient_checkpointing_value(val: Any) -> bool | str:
     return bool(val)
 
 
-def _install_selective_checkpoint_func(model: nn.Module) -> int:
-    """Disable per-layer ``gradient_checkpointing`` on DeltaNet decoder layers.
+def set_gradient_checkpointing_mode(model: nn.Module, mode: str) -> dict:
+    """Flip a model's gradient-checkpointing mode at runtime.
 
-    HF transformers v5+ implements gradient checkpointing in
-    ``transformers.modeling_layers.GradientCheckpointingLayer.__call__``:
-    each layer carries its own ``gradient_checkpointing`` flag (set by
-    ``model.gradient_checkpointing_enable()``) and decides per-call whether
-    to wrap its forward in ``self._gradient_checkpointing_func``. So
-    "selective" mode walks every submodule and unsets the flag on the
-    18 of 24 Qwen3.5 decoder layers that own a ``linear_attn``
-    submodule (DeltaNet). The remaining 6 FullAttention layers keep
-    checkpointing on.
+    Modes:
+        "off"       — no checkpointing; all activations saved (max memory, max speed)
+        "full"      — HF default ``partial(checkpoint, use_reentrant=False)``
+                      on every ``GradientCheckpointingLayer``
+        "megatron"  — selective per-op SAVE/RECOMPUTE policy (matmul + SDPA saved)
 
-    Returns the number of layers that had checkpointing disabled.
+    Idempotent. Used by the compression-aware ckpt scheduler in the trainer:
+    as ``actual_ratio`` drops, the decoder's working set shrinks and we can
+    afford to recompute less. Walks both pure HF v5+ ``GradientCheckpointingLayer``
+    instances and our custom ``PrunedBidirectionalQwen35`` (which uses a
+    sibling ``_gradient_checkpointing`` attribute).
+
+    Returns a metrics dict for logging:
+        {"mode": str, "layers_with_ckpt": int, "megatron_layers": int,
+         "uses_legacy_ckpt_attr": bool}
     """
-    disabled = 0
+    if mode not in {"off", "full", "megatron"}:
+        raise ValueError(f"mode must be off|full|megatron, got {mode!r}")
+
+    # First, disable everywhere — covers both HF v5+ standard API and our
+    # custom PrunedBidirectionalQwen35.
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+
+    # Custom encoder backbone (PrunedBidirectionalQwen35) sets a sibling
+    # ``_gradient_checkpointing`` attr that its forward consults — used for
+    # diagnostics, doesn't change behavior here.
+    uses_legacy = hasattr(model, "_gradient_checkpointing")
+
+    if mode == "off":
+        return {
+            "mode": mode,
+            "layers_with_ckpt": 0,
+            "megatron_layers": 0,
+            "uses_legacy_ckpt_attr": uses_legacy,
+        }
+
+    enable_gradient_checkpointing(model)
+    layers_with_ckpt = sum(
+        1
+        for m in model.modules()
+        if getattr(m, "gradient_checkpointing", False)
+    )
+    megatron_layers = 0
+    if mode == "megatron":
+        megatron_layers = _install_megatron_checkpoint_func(model)
+    return {
+        "mode": mode,
+        "layers_with_ckpt": layers_with_ckpt,
+        "megatron_layers": megatron_layers,
+        "uses_legacy_ckpt_attr": uses_legacy,
+    }
+
+
+def _install_megatron_checkpoint_func(model: nn.Module) -> int:
+    """Replace each layer's ``_gradient_checkpointing_func`` with one that uses
+    ``torch.utils.checkpoint.create_selective_checkpoint_contexts`` to apply a
+    per-op SAVE/RECOMPUTE policy (Megatron-style selective recomputation).
+
+    Memory savings vs. full ckpt: small (already saving heavy matmul outputs
+    means we keep almost as much as no-ckpt for the LoRA-input chain).
+    Speed gains vs. full ckpt: large for layer types where most ops are cheap
+    (layernorm, silu, mul, add) and only a few are FLOP-dense (matmul, attn).
+    The expected per-step throughput recovers ~50-90% of no-ckpt while peak
+    memory stays close to no-ckpt's matmul-saved baseline.
+
+    Walks every ``GradientCheckpointingLayer`` in the model that has
+    ``gradient_checkpointing=True`` and overwrites its
+    ``_gradient_checkpointing_func`` with our selective context wrapper.
+
+    Returns the number of layers that had the func swapped.
+    """
+    swapped = 0
     for module in model.modules():
-        if not _is_deltanet_layer(module):
+        if not hasattr(module, "_gradient_checkpointing_func"):
             continue
-        if not hasattr(module, "gradient_checkpointing"):
+        if not getattr(module, "gradient_checkpointing", False):
             continue
-        # Only flip layers that actually had checkpointing enabled — avoids
-        # masking real misconfiguration where the model never enabled ckpt.
-        if module.gradient_checkpointing:
-            module.gradient_checkpointing = False
-            disabled += 1
-    return disabled
-
-
-def _is_deltanet_layer(layer: nn.Module) -> bool:
-    """A Qwen3.5 decoder layer is DeltaNet iff it owns a ``linear_attn`` submodule.
-
-    Full-attention layers expose ``self_attn`` instead. See the Qwen3.5
-    architecture notes in CLAUDE.md.
-    """
-    return hasattr(layer, "linear_attn") and layer.linear_attn is not None
+        module._gradient_checkpointing_func = _megatron_checkpoint_func
+        swapped += 1
+    return swapped
 
 
 def clip_grad_norm(
