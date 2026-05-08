@@ -240,8 +240,9 @@ class ProjectionRepairTrainer(BaseTrainer):
         max_eval_samples = tcfg.get("max_eval_samples", 1000)
         eval_size = min(max(1, int(len(full_dataset) * 0.1)), max_eval_samples)
         train_size = len(full_dataset) - eval_size
+        split_generator = torch.Generator().manual_seed(int(self.cfg.get("seed", 42)))
         self.train_dataset, self.eval_dataset = random_split(
-            full_dataset, [train_size, eval_size],
+            full_dataset, [train_size, eval_size], generator=split_generator,
         )
 
         max_batch_tokens = tcfg.get("max_batch_tokens", 32768)

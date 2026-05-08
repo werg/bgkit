@@ -355,8 +355,9 @@ class CompressionTrainer(BaseTrainer):
                 f"Dataset too small for train/eval split (got {total} samples, "
                 "need at least 2)"
             )
+        split_generator = torch.Generator().manual_seed(int(seed))
         self.train_dataset, self.eval_dataset = random_split(
-            self.compression_dataset, [train_size, eval_size],
+            self.compression_dataset, [train_size, eval_size], generator=split_generator,
         )
 
         # --- Sampler + DataLoader ---

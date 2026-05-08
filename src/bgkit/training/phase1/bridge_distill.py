@@ -142,7 +142,13 @@ class BridgeDistillTrainer(BaseTrainer):
         # is preserved from whatever checkpoint we loaded (typically the
         # student's), so resuming Step 5 from this run keeps decoder
         # adaptation intact (modulo re-aligning to the new projection).
+        # Both ``decoder`` (PEFT-wrapped state) and ``decoder_merged``
+        # (full state with LoRA merged into base) are passed through;
+        # Step 5's resume loader prefers ``decoder_merged`` and fails to
+        # load the bare-key state dict it expects from PEFT-wrapped
+        # ``decoder.pt`` alone.
         self._decoder_state_dict = state_dicts.get("decoder")
+        self._decoder_merged_state_dict = state_dicts.get("decoder_merged")
 
         encoder_state = state_dicts["encoder"]
 
@@ -248,8 +254,9 @@ class BridgeDistillTrainer(BaseTrainer):
             raise ValueError(
                 f"Dataset too small for train/eval split (got {total} samples)"
             )
+        split_generator = torch.Generator().manual_seed(int(seed))
         self.train_dataset, self.eval_dataset = random_split(
-            self.commit_dataset, [train_size, eval_size],
+            self.commit_dataset, [train_size, eval_size], generator=split_generator,
         )
 
         num_workers = self.cfg.compute.get("num_workers", 4)
@@ -791,6 +798,8 @@ class BridgeDistillTrainer(BaseTrainer):
         )
         if self._decoder_state_dict is not None:
             save_kwargs["decoder"] = self._decoder_state_dict
+        if self._decoder_merged_state_dict is not None:
+            save_kwargs["decoder_merged"] = self._decoder_merged_state_dict
         ckpt_path = save_checkpoint(checkpoint_dir, metadata, **save_kwargs)
         self._last_checkpoint_path = str(ckpt_path)
         return ckpt_path

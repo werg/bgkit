@@ -489,9 +489,11 @@ class DecoderInitTrainer(BaseTrainer):
                 f"Dataset too small for train/eval split (got {len(full_dataset)} samples, "
                 "need at least 2)"
             )
+        seed = self.cfg.get("seed", 42)
         self.chat_dataset = full_dataset
+        split_generator = torch.Generator().manual_seed(int(seed))
         self.train_dataset, self.eval_dataset = random_split(
-            full_dataset, [train_size, eval_size]
+            full_dataset, [train_size, eval_size], generator=split_generator,
         )
         self._eval_count = 0
 
@@ -502,7 +504,6 @@ class DecoderInitTrainer(BaseTrainer):
         max_batch_tokens_eval = self._resolve_eval_batch_budget(tcfg, max_batch_tokens)
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
-        seed = self.cfg.get("seed", 42)
 
         train_lengths = full_dataset.lengths[np.array(self.train_dataset.indices)]
         eval_lengths = full_dataset.lengths[np.array(self.eval_dataset.indices)]
@@ -574,8 +575,9 @@ class DecoderInitTrainer(BaseTrainer):
                     )
                     qa_train_size = len(qa_full) - qa_eval_size
                     self._qa_dataset = qa_full
+                    qa_split_generator = torch.Generator().manual_seed(int(seed) + 1)
                     qa_train_ds, qa_eval_ds = random_split(
-                        qa_full, [qa_train_size, qa_eval_size]
+                        qa_full, [qa_train_size, qa_eval_size], generator=qa_split_generator,
                     )
 
                     qa_train_lengths = qa_full.lengths[np.array(qa_train_ds.indices)]
