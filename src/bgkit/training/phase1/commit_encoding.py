@@ -294,8 +294,9 @@ class CommitEncodingTrainer(BaseTrainer):
             raise ValueError(
                 f"Dataset too small for train/eval split (got {total} samples)"
             )
+        split_generator = torch.Generator().manual_seed(int(seed))
         self.train_dataset, self.eval_dataset = random_split(
-            self.commit_dataset, [train_size, eval_size],
+            self.commit_dataset, [train_size, eval_size], generator=split_generator,
         )
 
         num_workers = self.cfg.compute.get("num_workers", 4)
@@ -425,11 +426,53 @@ class CommitEncodingTrainer(BaseTrainer):
         # Configure freeze flags + optimizer.
         self._configure_trainable_state()
 
-        # Calibrate per-level head_tanh_temperature.
-        self._calibrate_head_tanh_temperatures()
+        # NOTE: head_tanh_temperature calibration was moved to _pre_train_loop
+        # so it runs AFTER checkpoint load. The legacy setup-time calibration
+        # was overwritten by the checkpoint's saved T, which had drifted from
+        # the live base_raw distribution (bridge + projection_block remain
+        # trainable across resumes, shifting L0's effective output even when
+        # the L0 backbone is frozen). See diagnosis 2026-05-08:
+        # saved_T=105.5 → actual_ratio stuck at 0.99 because tanh(score/T)
+        # saturated and θ lost discriminative leverage.
 
         self._profile_enabled = os.environ.get("BGKIT_PROFILE", "") == "1"
         self._last_sampled_target_ratio: float | None = None
+
+        # ---- Compression-aware dynamic ckpt scheduler ----
+        # As actual_ratio drops over the curriculum, the decoder's working set
+        # shrinks. Trade that growing memory headroom for throughput by
+        # downshifting checkpoint mode.
+        from collections import deque
+        dyn_cfg = tcfg.get("dynamic_ckpt", {}) or {}
+        self._dyn_ckpt_enabled = bool(dyn_cfg.get("enabled", False))
+        self._dyn_ckpt_window_size = int(dyn_cfg.get("window", 50))
+        self._dyn_ckpt_full_to_megatron_ratio = float(
+            dyn_cfg.get("full_to_megatron_ratio", 0.7)
+        )
+        self._dyn_ckpt_megatron_to_off_ratio = float(
+            dyn_cfg.get("megatron_to_off_ratio", 0.3)
+        )
+        self._dyn_ckpt_memory_snap_back_gb = float(
+            dyn_cfg.get("memory_snap_back_gb", 90.0)
+        )
+        self._dyn_ckpt_min_steps_in_mode = int(
+            dyn_cfg.get("min_steps_in_mode", 50)
+        )
+        # Initial mode = whatever gradient_checkpointing yaml resolved to.
+        # `enabled=False` and `enabled=True/megatron` map respectively to
+        # "off"/"full"/"megatron".
+        from bgkit.training.gradient_utils import (
+            _resolve_gradient_checkpointing_mode,
+        )
+        resolved = _resolve_gradient_checkpointing_mode(self.cfg)
+        if resolved is False or resolved is None:
+            self._ckpt_mode = "off"
+        elif resolved == "megatron":
+            self._ckpt_mode = "megatron"
+        else:
+            self._ckpt_mode = "full"
+        self._ratio_window: deque = deque(maxlen=self._dyn_ckpt_window_size)
+        self._steps_in_current_mode = 0
 
         logger.info(
             "commit_encoding_trainer_setup",
@@ -437,6 +480,8 @@ class CommitEncodingTrainer(BaseTrainer):
             eval_samples=eval_size,
             device=str(device),
             stage0_end_step=self._stage0_end_step,
+            dyn_ckpt_enabled=self._dyn_ckpt_enabled,
+            ckpt_mode_init=self._ckpt_mode,
         )
 
     # ------------------------------------------------------------------
@@ -994,6 +1039,41 @@ class CommitEncodingTrainer(BaseTrainer):
                     error=str(exc),
                 )
 
+    def _pre_train_loop(self) -> None:
+        """Re-calibrate ``head_tanh_temperature`` AFTER the resume-checkpoint
+        load has overwritten the buffer.
+
+        Setup-time calibration is overwritten by ``load_checkpoint``; the saved
+        T may have drifted because trainable components downstream of L0 (the
+        bridge ``auto_repro_head`` and ``projection_block``) shift L0's
+        effective output distribution between resumes. Recalibrating here
+        re-fits T to the current distribution and prevents the head from
+        losing discriminative leverage (diagnosed 2026-05-08: stale T=105.5
+        saturated tanh and stuck actual_ratio at 0.99 vs target 0.69).
+
+        Idempotent and safe on fresh runs (no-op effective: re-runs the same
+        calibration that setup just did).
+        """
+        super()._pre_train_loop()
+        old_T = {
+            "l0": float(self.encoder.l0.head_tanh_temperature.item()),
+            "l1": float(self.encoder.l1.head_tanh_temperature.item()),
+        }
+        self._calibrate_head_tanh_temperatures()
+        new_T = {
+            "l0": float(self.encoder.l0.head_tanh_temperature.item()),
+            "l1": float(self.encoder.l1.head_tanh_temperature.item()),
+        }
+        for level in ("l0", "l1"):
+            if abs(new_T[level] - old_T[level]) / max(old_T[level], 1e-6) > 0.05:
+                logger.info(
+                    "head_tanh_temperature_recalibrated_after_resume",
+                    level=level,
+                    saved=old_T[level],
+                    fresh=new_T[level],
+                    delta_pct=100.0 * (new_T[level] - old_T[level]) / old_T[level],
+                )
+
     # ------------------------------------------------------------------
     # Two-level encoder forward
     # ------------------------------------------------------------------
@@ -1433,6 +1513,97 @@ class CommitEncodingTrainer(BaseTrainer):
         )
         if unloaded:
             logger.info("ice_teacher_unloaded", step=step)
+
+        if self._dyn_ckpt_enabled:
+            mean_rate_l0 = merged.get("mean_rate")
+            if mean_rate_l0 is not None:
+                self._maybe_transition_ckpt_mode(float(mean_rate_l0), step)
+
+    def _maybe_transition_ckpt_mode(self, ratio_signal: float, step: int) -> None:
+        """Compression-aware ckpt scheduler. Downshift mode as ratio drops.
+
+        Uses the median over a sliding window of recent ``mean_rate_l0`` values
+        for stability. Transitions to a less-aggressive (faster, more memory)
+        mode require ``min_steps_in_mode`` consecutive steps in the new band.
+        Snap-back to a safer mode (full ckpt) is immediate when system memory
+        crosses ``memory_snap_back_gb`` — we'd rather lose throughput than OOM.
+
+        Modes (decreasing memory pressure / increasing throughput):
+            ``full``     — checkpoint every layer (CLAUDE.md default)
+            ``megatron`` — selective per-op SAVE/RECOMPUTE
+            ``off``      — no checkpointing; all activations saved
+        """
+        try:
+            import psutil
+            sys_used_gb = (psutil.virtual_memory().used) / 1e9
+        except Exception:
+            sys_used_gb = 0.0  # psutil missing → skip snap-back guard
+
+        # Snap-back path: bypass hysteresis on memory pressure.
+        if (
+            sys_used_gb > self._dyn_ckpt_memory_snap_back_gb
+            and self._ckpt_mode != "full"
+        ):
+            self._apply_ckpt_mode("full", step, reason="memory_pressure",
+                                  ratio=ratio_signal, system_used_gb=sys_used_gb)
+            return
+
+        # Sliding-window median for ratio.
+        self._ratio_window.append(float(ratio_signal))
+        self._steps_in_current_mode += 1
+        if len(self._ratio_window) < self._dyn_ckpt_window_size:
+            return  # warming up
+        if self._steps_in_current_mode < self._dyn_ckpt_min_steps_in_mode:
+            return  # don't flap immediately after a transition
+
+        sorted_w = sorted(self._ratio_window)
+        median = sorted_w[len(sorted_w) // 2]
+
+        # Pick target mode by thresholds.
+        if median < self._dyn_ckpt_megatron_to_off_ratio:
+            target = "off"
+        elif median < self._dyn_ckpt_full_to_megatron_ratio:
+            target = "megatron"
+        else:
+            target = "full"
+
+        if target != self._ckpt_mode:
+            self._apply_ckpt_mode(target, step, reason="ratio_threshold",
+                                  ratio=median, system_used_gb=sys_used_gb)
+
+    def _apply_ckpt_mode(
+        self, target: str, step: int, *, reason: str,
+        ratio: float, system_used_gb: float,
+    ) -> None:
+        from bgkit.training.gradient_utils import set_gradient_checkpointing_mode
+        prev = self._ckpt_mode
+        # Apply to all three backbones consistently.
+        for label, model in (
+            ("encoder.l0", self.encoder.l0.backbone),
+            ("encoder.l1", self.encoder.l1.backbone),
+            ("decoder", self.decoder.backbone),
+        ):
+            try:
+                set_gradient_checkpointing_mode(model, target)
+            except Exception as exc:
+                logger.warning(
+                    "ckpt_mode_transition_failed",
+                    component=label,
+                    target=target,
+                    error=str(exc),
+                )
+                return
+        self._ckpt_mode = target
+        self._steps_in_current_mode = 0
+        logger.info(
+            "ckpt_mode_transition",
+            step=step,
+            from_mode=prev,
+            to_mode=target,
+            reason=reason,
+            ratio_median=ratio,
+            system_used_gb=system_used_gb,
+        )
 
     def _add_step_metrics(self, metrics: dict[str, float]) -> None:
         if self._last_sampled_target_ratio is not None:

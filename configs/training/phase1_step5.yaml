@@ -11,6 +11,25 @@ bidi_warmup_steps: 0           # already bidirectional from previous steps
 gradient_checkpointing: megatron  # 2026-05-08: per-op selective recompute (Korthikanti et al. 2022). MUST_SAVE matmul + SDPA outputs, RECOMPUTE layernorm + silu + elementwise. Replaces the legacy DeltaNet-skip "selective" hack.
 cuda_empty_cache_every_step: 10     # 2026-05-08: every-10-steps cadence to bound CUDA reserved pool. Long-tail batches push reserved up across ~170 steps; flushing every 10 steps caps growth to one cycle (≈200 s of training) of accumulation before reset. ~10x lower sync overhead than per-step flush. Accepts bool (false=off, true=every step) or int N (every N steps).
 
+# ---- Compression-aware dynamic gradient-checkpointing ----
+# As actual_ratio drops over the L0 curriculum, the decoder's working set
+# shrinks. Convert that growing memory headroom into throughput by
+# downshifting the ckpt mode: full → megatron → off. Hysteresis (50-step
+# window + 50 steps in mode) prevents flapping. Snap back to full ckpt
+# immediately when system_used > memory_snap_back_gb (would rather lose
+# throughput than OOM).
+#
+# Disabled by default — enable once the θ controller has been observed to
+# track curriculum_target_ratio_l0 cleanly (otherwise the scheduler stays
+# in "full" mode anyway because median ratio never crosses thresholds).
+dynamic_ckpt:
+  enabled: false
+  window: 50                      # sliding window over recent mean_rate_l0
+  full_to_megatron_ratio: 0.7     # below this → switch full → megatron
+  megatron_to_off_ratio: 0.3      # below this → switch megatron → off
+  memory_snap_back_gb: 90.0       # above this → snap back to full (bypass hysteresis)
+  min_steps_in_mode: 50           # min steps before allowing next transition
+
 # ---- Three-phase curriculum (all live-tunable via control.json) ----
 # Stage transitions (steps).
 auto_repro_warmup_steps: 0      # Step 4.7 (BridgeDistillTrainer) re-anchors
