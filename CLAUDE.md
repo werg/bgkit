@@ -190,6 +190,7 @@ Example control file (one block per active phase):
 | `eval_every` | All | Changes eval cadence (steps) |
 | `save_every` | All | Changes checkpoint cadence (steps) |
 | `early_stopping_patience` | All | Adjusts early-stopping patience |
+| `cuda_empty_cache_every_step` | All | Allocator-flush cadence (bool or int N). `0`/`false` off, `1`/`true` every step, `N` every N steps. Bounds CUDA reserved-pool growth |
 | `max_batch_tokens` | All Phase 1 + Phase 3 | Rebuilds `PackedTokenBudgetSampler` + train dataloader; preserves epoch cursor |
 | `max_batch_tokens_eval` | All Phase 1 + Phase 3 | Rebuilds eval dataloader with new budget |
 | `min_sample_length` | All Phase 1 + Phase 3 | Wraps train dataset in `Subset` filtering samples shorter than `val` tokens; `0` disables. Reuses the `_rebuild_train_dataloader_with_budget` path |

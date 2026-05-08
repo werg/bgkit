@@ -13,7 +13,7 @@ import math
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import structlog
 import torch
@@ -91,6 +91,28 @@ class _DevicePrefetcher:
         batch = self._next_batch
         self._prefetch()
         return batch
+
+
+def _coerce_empty_cache_cadence(training_val: Any, compute_default: Any) -> int:
+    """Resolve ``cuda_empty_cache_every_step`` into an integer cadence.
+
+    Accepts bool or int from either training-scope cfg or compute-scope
+    cfg fallback:
+        False / 0 / None → 0 (off)
+        True / 1         → 1 (every step)
+        N (int > 1)      → N (every N steps)
+
+    Used by both ``BaseTrainer.train`` startup and the live-config branch
+    so behavior is identical on first read and on hot updates.
+    """
+    val = training_val if training_val is not None else compute_default
+    if isinstance(val, bool):
+        return 1 if val else 0
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, n)
 
 
 def _average_metrics(accum_metrics: list[dict[str, float]]) -> dict[str, float]:
@@ -1496,6 +1518,10 @@ class BaseTrainer(ABC):
             )
         eval_every = tcfg.eval_every
         save_every = tcfg.save_every
+        empty_cache_cadence = _coerce_empty_cache_cadence(
+            tcfg.get("cuda_empty_cache_every_step", None),
+            self.cfg.compute.get("cuda_empty_cache_every_step", False),
+        )
         checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
 
         # Checkpoint registry
@@ -1864,15 +1890,9 @@ class BaseTrainer(ABC):
                     from bgkit.utils.step_watchdog import heartbeat as _hb
                     _hb()
 
-                    # Optional allocator flush. GB10 defaults this off at
-                    # compute scope; memory-risky phases can opt back in at
-                    # training scope.
-                    empty_cache_every_step = tcfg.get("cuda_empty_cache_every_step", None)
-                    if empty_cache_every_step is None:
-                        empty_cache_every_step = self.cfg.compute.get(
-                            "cuda_empty_cache_every_step", False
-                        )
-                    if empty_cache_every_step:
+                    # Optional allocator flush at the configured cadence.
+                    # ``empty_cache_cadence`` is live-tunable via control.json.
+                    if empty_cache_cadence > 0 and (self.global_step % empty_cache_cadence == 0):
                         import torch as _t
                         if _t.cuda.is_available():
                             _t.cuda.empty_cache()
@@ -2042,6 +2062,15 @@ class BaseTrainer(ABC):
                             if isinstance(val, int) and val > 0:
                                 save_every = val
                                 logger.info("live_save_every_update", save_every=val)
+                        if "cuda_empty_cache_every_step" in changes:
+                            val = changes["cuda_empty_cache_every_step"]
+                            new_cadence = _coerce_empty_cache_cadence(val, 0)
+                            if new_cadence != empty_cache_cadence:
+                                empty_cache_cadence = new_cadence
+                                logger.info(
+                                    "live_cuda_empty_cache_cadence_update",
+                                    cadence=new_cadence,
+                                )
                         if "max_steps" in changes:
                             val = changes["max_steps"]
                             if isinstance(val, int) and val > step:
