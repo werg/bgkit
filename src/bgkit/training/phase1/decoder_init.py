@@ -1158,7 +1158,8 @@ class DecoderInitTrainer(BaseTrainer):
         return []
 
     def _muon_excluded_param_ids(self) -> frozenset[int]:
-        """Return param IDs of embedding/lm_head — 2D but should not use Muon.
+        """Return param IDs of embedding/lm_head + LoRA factors — 2D but
+        should not use Muon.
 
         Handles both bare CausalLM and PeftModel-wrapped decoder.
         """
@@ -1177,6 +1178,9 @@ class DecoderInitTrainer(BaseTrainer):
         if lm_head is not None:
             for p in lm_head.parameters():
                 exclude.add(id(p))
+        # LoRA factors must use AdamW (not Muon) — see
+        # ``BaseTrainer._lora_param_ids`` docstring.
+        exclude |= set(self._lora_param_ids(self.decoder))
         return frozenset(exclude)
 
     def _setup_optimizer(self) -> None:

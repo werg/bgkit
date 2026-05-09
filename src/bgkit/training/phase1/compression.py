@@ -582,6 +582,9 @@ class CompressionTrainer(BaseTrainer):
             for p in lm_head.parameters():
                 if p.requires_grad:
                     exclude.add(id(p))
+        # LoRA factors must use AdamW (not Muon) — see
+        # ``BaseTrainer._lora_param_ids`` docstring.
+        exclude |= set(self._lora_param_ids(self.decoder))
         return frozenset(exclude)
 
     def _setup_optimizer(self) -> None:
@@ -886,9 +889,9 @@ class CompressionTrainer(BaseTrainer):
         content_emb = bgkit_embed(content_ids)
         prompt_emb = bgkit_embed(prompt_ids)
 
-        util_active = getattr(
-            self, "_surv_l0", LevelLossCfg(),
-        ).utility_grad_loss_weight > 0.0
+        surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
+        surv_l1 = getattr(self, "_surv_l1", LevelLossCfg())
+        util_active = surv_l0.utility_grad_loss_weight > 0.0
         return self.encoder(
             content_embeddings=content_emb,
             content_cu_seqlens=content_cu,
@@ -898,6 +901,8 @@ class CompressionTrainer(BaseTrainer):
             prompt_position_ids=prompt_position_ids,
             target_ratio_l0=target_ratio,
             utility_grad_active_l0=util_active,
+            min_per_sample_l0=int(surv_l0.min_survivors_absolute_min),
+            min_per_sample_l1=int(surv_l1.min_survivors_absolute_min),
         )
 
     def _compress_repo_l0_packed(self, batch: dict, target_ratio: float):
@@ -923,9 +928,8 @@ class CompressionTrainer(BaseTrainer):
         content_emb = bgkit_embed(file_ids)
         prompt_emb = bgkit_embed(prompt_ids)
 
-        util_active = getattr(
-            self, "_surv_l0", LevelLossCfg(),
-        ).utility_grad_loss_weight > 0.0
+        surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
+        util_active = surv_l0.utility_grad_loss_weight > 0.0
         return self.encoder.l0(
             content_embeddings=content_emb,
             content_cu_seqlens=cu_file,
@@ -935,6 +939,7 @@ class CompressionTrainer(BaseTrainer):
             prompt_position_ids=prompt_position_ids,
             target_ratio=target_ratio,
             utility_grad_active=util_active,
+            min_per_sample=int(surv_l0.min_survivors_absolute_min),
         )
 
     @staticmethod
@@ -1224,9 +1229,8 @@ class CompressionTrainer(BaseTrainer):
             n_surv_total = int(l1_input_bridged.shape[0])
             l1_input_positions = position_ids_from_cu(l1_input_cu, n_surv_total)
 
-            util_w_l1 = getattr(
-                self, "_surv_l1", LevelLossCfg(),
-            ).utility_grad_loss_weight
+            surv_l1 = getattr(self, "_surv_l1", LevelLossCfg())
+            util_w_l1 = surv_l1.utility_grad_loss_weight
 
             # --- Step 3: packed L1 forward across all repos ---
             l1_out = self.encoder.l1(
@@ -1235,6 +1239,7 @@ class CompressionTrainer(BaseTrainer):
                 content_position_ids=l1_input_positions,
                 target_ratio=target_ratio,
                 utility_grad_active=util_w_l1 > 0.0,
+                min_per_sample=int(surv_l1.min_survivors_absolute_min),
             )
 
             l1_surv_loss = None
@@ -1677,6 +1682,7 @@ class CompressionTrainer(BaseTrainer):
         training step. ``persample`` in the name is legacy — we no longer
         loop over samples.
         """
+        from bgkit.training.survivorship_helpers import LevelLossCfg
         from bgkit.utils.packing import position_ids_from_cu
 
         device = self.device
@@ -1701,11 +1707,13 @@ class CompressionTrainer(BaseTrainer):
             n_surv_total = int(l1_input_bridged.shape[0])
             l1_input_positions = position_ids_from_cu(l1_input_cu, n_surv_total)
 
+            surv_l1 = getattr(self, "_surv_l1", LevelLossCfg())
             l1_out = self.encoder.l1(
                 content_embeddings=l1_input_bridged,
                 content_cu_seqlens=l1_input_cu,
                 content_position_ids=l1_input_positions,
                 target_ratio=target_ratio,
+                min_per_sample=int(surv_l1.min_survivors_absolute_min),
             )
             from bgkit.utils.packing import lengths_from_cu
             proj_cu = l1_out.survivor_cu_seqlens

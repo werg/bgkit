@@ -41,6 +41,14 @@ class ResidualConv1d(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # hidden_states: (B, L, D)
+        # Edge case: when L1 receives a packed batch where every sample
+        # produced 0 (or very few) L0 survivors, the conv cannot operate
+        # (padded input < kernel_size). Skip the conv contribution and
+        # return the residual unchanged — its mixing role is moot when
+        # there's nothing to mix anyway. Diagnosed 2026-05-09 on Step 6
+        # at target_ratio=0.10 with sampling: L1 conv received N=0.
+        if hidden_states.shape[1] < self.kernel_size:
+            return hidden_states
         normed = self.norm(hidden_states)
         # Conv1d expects (B, D, L)
         x = normed.transpose(1, 2)

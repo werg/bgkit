@@ -62,6 +62,49 @@ memory:
   # fraction 0.87 (113.7 GB CUDA). Old 110 fired before CUDA cap was
   # reached on megatron mode (which keeps reserved pool ~76+ GB).
   system_abort_gb: 114
+  # Memory-driven adaptive memory management.
+  #
+  # Signal: ``torch.cuda.mem_get_info()[0] / 1e9`` = free GB the CUDA
+  # allocator can still claim from the host. Stating thresholds as "free
+  # room remaining" makes the policy:
+  #   * adaptive to total host memory (same config works on a 64 GB or
+  #     a 200 GB box without tuning),
+  #   * consistent with the abort semantics (abort = no room left),
+  #   * tight — the policy only acts when room is genuinely scarce, not
+  #     when reserved happens to grow during normal operation.
+  #
+  # Two-tier response, both keyed off the same signal:
+  #   1. Adaptive cache flush — fires only when free is low AND there's
+  #      slack worth recovering (``reserved − allocated > flush_min_slack_gb``).
+  #      The slack guard prevents the wasted-sync case where the pool is
+  #      fully in-use and ``empty_cache()`` would return nothing.
+  #   2. Mode flip — expensive, requires trainer to register managed
+  #      models via ``_dynamic_ckpt_managed_models()``. Upshift on first
+  #      breach (no hysteresis); downshift after window-MIN free stays
+  #      above ``target_threshold + downshift_margin_gb`` for
+  #      ``min_steps_in_mode`` steps.
+  #
+  # Default on host-wide. Trainers that haven't registered managed models
+  # get only the adaptive flush. Explicit per-phase disable via
+  # ``training.dynamic_ckpt.enabled: false``.
+  dynamic_ckpt:
+    enabled: true
+    window: 50                                 # sliding window of cuda_free readings
+    # Mode-flip thresholds (free GB below which we upshift).
+    megatron_upshift_when_free_below_gb: 15.0  # off → megatron
+    full_upshift_when_free_below_gb: 8.0       # megatron → full
+    # Hysteresis: window-MIN free must exceed (threshold + margin) before
+    # downshifting, so a transient dip won't immediately upshift again.
+    downshift_margin_gb: 5.0
+    min_steps_in_mode: 50
+    # Adaptive cache-flush thresholds. Tight by design: flush only when
+    # free room is genuinely low AND there's slack worth recovering.
+    # The slack guard alone handles back-to-back-flush prevention (after
+    # a flush, slack drops to ~0 and the next step won't flush). No
+    # cooldown — cooldown blocked productive flushes during transient
+    # post-eval pressure (observed 2026-05-08).
+    flush_when_free_below_gb: 20.0   # flush only when free < this
+    flush_min_slack_gb: 3.0          # AND slack (reserved − allocated) > this
   # Per-scope CUDA peak caps for memory_budget_scope (phase-boundary
   # enforcement; complements the periodic poll above).  Calibrated from
   # the 2026-04-20 Phase 1 Step 3 run (cuda_max_allocated ~14 GB at

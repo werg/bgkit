@@ -135,6 +135,17 @@ x-gpu-common: &gpu-common
     # Default 0 (refuse). Same pattern for BGKIT_CUDA_MEM_FRACTION (0.65).
     - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
     - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.65}
+    # FA4 SM12x extension toggle. Default unset = entrypoint's auto-build
+    # logic decides (set to 1 if extension imports cleanly). Override via
+    # shell env to 0 to disable (e.g. when the extension's reshape logic
+    # mishandles unusual head/kv-head configs in projection_block).
+    - FLASH_ATTENTION_SM12X_USE_EXTENSION=${FLASH_ATTENTION_SM12X_USE_EXTENSION:-}
+    # FA4 fork rebuild parallelism. entrypoint.sh sets MAX_JOBS=2 inline,
+    # but ninja can ignore that under some pip versions and default to
+    # nproc — `flash_bwd_hdim*_bf16_sm80.cu` jobs are ~3-5 GB RSS each, so
+    # 16 parallel nvccs SIGKILLs on a 115 GB cap. Force here to override.
+    - MAX_JOBS=${MAX_JOBS:-2}
+    - NVCC_THREADS=${NVCC_THREADS:-1}
     # Step watchdog timeout (seconds). Default 60s catches real hangs but
     # is too tight for first-step JIT compile + autotune after a restart.
     # Raise via shell env (e.g. 300) for resume runs after kernel changes.

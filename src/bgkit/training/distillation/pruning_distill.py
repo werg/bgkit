@@ -365,11 +365,20 @@ class PruningDistillTrainer(BaseTrainer):
     # ------------------------------------------------------------------
 
     def _muon_excluded_param_ids(self) -> frozenset[int]:
-        """Return param IDs of encoder embed_tokens — 2D but should not use Muon."""
+        """Return param IDs of encoder embed_tokens + any LoRA factors —
+        2D but should not use Muon.
+        """
         exclude = set()
         embed = self.student_encoder.l0.backbone.get_input_embeddings()
         for p in embed.parameters():
             exclude.add(id(p))
+        # LoRA factors must use AdamW (not Muon) — see
+        # ``BaseTrainer._lora_param_ids`` docstring. Pruning-distill currently
+        # has no decoder LoRA but this is harmless if absent.
+        for attr in ("student_encoder", "decoder"):
+            model = getattr(self, attr, None)
+            if model is not None:
+                exclude |= set(self._lora_param_ids(model))
         return frozenset(exclude)
 
     def _setup_optimizer(self) -> None:

@@ -334,6 +334,248 @@ class BaseTrainer(ABC):
         Override for resume-time rebuilds (e.g. L1 dataloader rebuild).
         """
 
+    def _dynamic_ckpt_managed_models(self) -> list[tuple[str, "nn.Module"]]:
+        """Models managed by the memory-driven dynamic ckpt scheduler.
+
+        Subclasses override to return ``[(label, model), ...]`` pairs whose
+        gradient-checkpointing mode the scheduler is allowed to flip at
+        runtime. Default returns ``[]`` (scheduler is a no-op).
+
+        Each registered model must support either HF v5+ ``GradientCheckpointingLayer``
+        semantics or our ``PrunedBidirectionalQwen35.gradient_checkpointing_{enable,disable}``
+        API. ``set_gradient_checkpointing_mode`` in
+        ``bgkit.training.gradient_utils`` handles both.
+        """
+        return []
+
+    def _init_dynamic_ckpt_scheduler(self) -> None:
+        """Resolve config + initialize per-step state for the memory-driven
+        ckpt scheduler.
+
+        Reads (in priority order): ``training.dynamic_ckpt`` (per-phase
+        override) > ``compute.memory.dynamic_ckpt`` (host-level default) >
+        built-in defaults. Default ``enabled: true`` host-wide; trainers that
+        haven't registered any models in ``_dynamic_ckpt_managed_models``
+        get a quiet no-op.
+        """
+        from collections import deque
+
+        tcfg = self.cfg.training
+        compute_mem = self.cfg.compute.get("memory", {}) or {}
+        compute_dyn = compute_mem.get("dynamic_ckpt", {}) or {}
+        train_dyn = tcfg.get("dynamic_ckpt", {}) or {}
+
+        def _get(key, default):
+            v = train_dyn.get(key, None) if hasattr(train_dyn, "get") else None
+            if v is None:
+                v = (
+                    compute_dyn.get(key, default)
+                    if hasattr(compute_dyn, "get")
+                    else default
+                )
+            return v
+
+        self._dyn_ckpt_enabled = bool(_get("enabled", True))
+        self._dyn_ckpt_window = int(_get("window", 50))
+        # Signal: ``torch.cuda.mem_get_info()[0] / 1e9`` = free GB the CUDA
+        # allocator can still claim. Stating thresholds as "free room
+        # remaining" makes the policy adaptive to total host memory and
+        # consistent with the abort semantics (abort = no room).
+        # All thresholds are in GB of free memory the trigger requires:
+        #   * upshift to megatron when free < megatron_upshift_when_free_below_gb
+        #   * upshift to full when free < full_upshift_when_free_below_gb
+        #   * downshift requires the worst-case (min) free over the window
+        #     to be above target_threshold + downshift_margin_gb (hysteresis)
+        self._dyn_megatron_upshift_when_free_below = float(
+            _get("megatron_upshift_when_free_below_gb", 15.0)
+        )
+        self._dyn_full_upshift_when_free_below = float(
+            _get("full_upshift_when_free_below_gb", 8.0)
+        )
+        self._dyn_downshift_margin = float(_get("downshift_margin_gb", 5.0))
+        self._dyn_ckpt_min_steps_in_mode = int(_get("min_steps_in_mode", 50))
+        # Adaptive CUDA cache flush. ``flush_when_free_below_gb`` is the
+        # outer ceiling — flush only triggers when room is genuinely scarce.
+        # ``flush_min_slack_gb`` skips the sync when there's nothing to
+        # actually reclaim (slack = reserved − allocated; if slack ≈ 0 the
+        # pool is fully in-use and ``empty_cache()`` returns nothing).
+        self._dyn_flush_when_free_below = float(
+            _get("flush_when_free_below_gb", 20.0)
+        )
+        self._dyn_flush_min_slack = float(_get("flush_min_slack_gb", 3.0))
+        self._dyn_cache_clear_cooldown = int(_get("cache_clear_cooldown_steps", 5))
+        self._last_cache_clear_step = -10**9
+
+        self._dyn_ckpt_models = self._dynamic_ckpt_managed_models()
+        self._dyn_ckpt_window_data: deque = deque(maxlen=self._dyn_ckpt_window)
+        self._dyn_ckpt_steps_in_mode = 0
+
+        # Initial mode mirrors the resolved gradient_checkpointing config so
+        # the runtime mode and the static config agree on first step.
+        from bgkit.training.gradient_utils import (
+            _resolve_gradient_checkpointing_mode,
+        )
+        resolved = _resolve_gradient_checkpointing_mode(self.cfg)
+        if resolved is False or resolved is None:
+            self._ckpt_mode = "off"
+        elif resolved == "megatron":
+            self._ckpt_mode = "megatron"
+        else:
+            self._ckpt_mode = "full"
+
+        if self._dyn_ckpt_enabled and self._dyn_ckpt_models:
+            logger.info(
+                "dynamic_ckpt_scheduler_armed",
+                mode=self._ckpt_mode,
+                managed=[label for label, _ in self._dyn_ckpt_models],
+                signal="cuda_free_gb",
+                flush_when_free_below_gb=self._dyn_flush_when_free_below,
+                flush_min_slack_gb=self._dyn_flush_min_slack,
+                megatron_upshift_when_free_below_gb=self._dyn_megatron_upshift_when_free_below,
+                full_upshift_when_free_below_gb=self._dyn_full_upshift_when_free_below,
+                downshift_margin_gb=self._dyn_downshift_margin,
+                window=self._dyn_ckpt_window,
+            )
+
+    def _dynamic_ckpt_step(self, step: int) -> None:
+        """Memory-driven scheduler tick. Called once per optimizer step.
+
+        Signal: ``torch.cuda.mem_get_info()[0] / 1e9`` = free GB the
+        allocator can still claim. Thresholds are stated as "free room
+        remaining" so the same config adapts across hosts of different
+        total memory and remains consistent with the abort semantics
+        (abort = no room left).
+
+        Two-tier response:
+
+        1. **Adaptive cache flush** (cheap first response): when free is
+           tight (``free_gb < flush_when_free_below_gb``) AND there's
+           slack worth recovering (``reserved − allocated > flush_min_slack_gb``)
+           AND cooldown has elapsed, call ``empty_cache()``. The slack
+           guard skips the sync when the pool is fully in-use and a flush
+           would return nothing.
+        2. **Mode flip** (expensive, requires managed models): upshift on
+           first breach (no hysteresis); downshift requires the window's
+           **min** free to stay above ``target_threshold + downshift_margin``
+           for ``min_steps_in_mode`` consecutive steps.
+        """
+        if not getattr(self, "_dyn_ckpt_enabled", False):
+            return
+        import torch as _t
+        if not _t.cuda.is_available():
+            return
+        free_bytes, _total_bytes = _t.cuda.mem_get_info()
+        # CRITICAL: ``free_pre`` is the actual memory pressure before any
+        # rescue. Use this for ALL mode-flip decisions. Using post-flush
+        # free would hide the pressure (flush rescues to ~113 GB free, mode
+        # flip then sees no problem, scheduler stays in off-mode forever
+        # while flush keeps rescuing every step). Pre-flush free reveals
+        # the true working-set demand.
+        free_pre_gb = free_bytes / 1e9
+
+        # Tier 1: adaptive cache flush. Slack-driven, cooldown-free.
+        if free_pre_gb < self._dyn_flush_when_free_below:
+            slack_gb = (
+                _t.cuda.memory_reserved() - _t.cuda.memory_allocated()
+            ) / 1e9
+            if slack_gb >= self._dyn_flush_min_slack:
+                _t.cuda.empty_cache()
+                self._last_cache_clear_step = step
+                new_free_gb = _t.cuda.mem_get_info()[0] / 1e9
+                logger.info(
+                    "cuda_cache_cleared_adaptive",
+                    step=step,
+                    pre_free_gb=free_pre_gb,
+                    post_free_gb=new_free_gb,
+                    reclaimed_gb=new_free_gb - free_pre_gb,
+                    slack_gb=slack_gb,
+                )
+
+        # Tier 2: mode flip — only when managed models are registered.
+        # IMPORTANT: window + threshold checks use ``free_pre_gb`` (pre-flush),
+        # not the post-flush value. Otherwise frequent flushes mask sustained
+        # pressure and the scheduler never upshifts.
+        if not getattr(self, "_dyn_ckpt_models", None):
+            return
+
+        self._dyn_ckpt_window_data.append(free_pre_gb)
+        self._dyn_ckpt_steps_in_mode += 1
+
+        # Upshift: snap back on memory pressure (low free), no hysteresis.
+        if (
+            self._ckpt_mode == "off"
+            and free_pre_gb < self._dyn_megatron_upshift_when_free_below
+        ):
+            self._apply_ckpt_mode(
+                "megatron", step, "free_below_threshold", free_pre_gb,
+            )
+            return
+        if (
+            self._ckpt_mode == "megatron"
+            and free_pre_gb < self._dyn_full_upshift_when_free_below
+        ):
+            self._apply_ckpt_mode(
+                "full", step, "free_below_threshold", free_pre_gb,
+            )
+            return
+
+        # Downshift: only after the window is full and we've dwelled enough.
+        # Window-MIN over pre-flush readings: the worst-case sustained
+        # pressure. If even the worst sample stays well above the
+        # downshift target, the workload genuinely fits the safer mode.
+        if len(self._dyn_ckpt_window_data) < self._dyn_ckpt_window:
+            return
+        if self._dyn_ckpt_steps_in_mode < self._dyn_ckpt_min_steps_in_mode:
+            return
+
+        worst_recent_free = min(self._dyn_ckpt_window_data)
+        if (
+            self._ckpt_mode == "full"
+            and worst_recent_free
+            > self._dyn_full_upshift_when_free_below + self._dyn_downshift_margin
+        ):
+            self._apply_ckpt_mode(
+                "megatron", step, "free_above_threshold", free_pre_gb,
+            )
+        elif (
+            self._ckpt_mode == "megatron"
+            and worst_recent_free
+            > self._dyn_megatron_upshift_when_free_below + self._dyn_downshift_margin
+        ):
+            self._apply_ckpt_mode(
+                "off", step, "free_above_threshold", free_pre_gb,
+            )
+
+    def _apply_ckpt_mode(
+        self, target: str, step: int, reason: str, free_gb: float,
+    ) -> None:
+        """Flip the mode across all managed models. Idempotent on no-change."""
+        from bgkit.training.gradient_utils import set_gradient_checkpointing_mode
+        if target == self._ckpt_mode:
+            return
+        prev = self._ckpt_mode
+        for label, model in self._dyn_ckpt_models:
+            try:
+                set_gradient_checkpointing_mode(model, target)
+            except Exception as exc:
+                logger.warning(
+                    "ckpt_mode_transition_failed",
+                    component=label,
+                    target=target,
+                    error=str(exc),
+                )
+                return
+        self._ckpt_mode = target
+        self._dyn_ckpt_steps_in_mode = 0
+        logger.info(
+            "ckpt_mode_transition",
+            step=step,
+            from_mode=prev,
+            to_mode=target,
+            reason=reason,
+            cuda_free_gb=free_gb,
+        )
+
     @staticmethod
     def _validate_accum_steps(value) -> int:
         """Validate gradient_accumulation_steps config value."""
@@ -431,6 +673,38 @@ class BaseTrainer(ABC):
             f"Unknown optimizer type: {optimizer_type!r}. "
             "Supported: 'adamw', 'adamw8bit', 'muon'."
         )
+
+    @staticmethod
+    def _lora_param_ids(model) -> frozenset[int]:
+        """Return param IDs of LoRA factors (``lora_A``, ``lora_B``) in ``model``.
+
+        These MUST be excluded from Muon: Muon's Newton-Schulz orthogonalization
+        plus its ``sqrt(d_out/d_in)`` rectangular rescaler is wrong for low-rank
+        factors. For typical Qwen3.5 LoRA shapes (``r=16``, intermediate=3584),
+        the rescaler over-amplifies ``lora_B`` (3584,16) updates by ~15× while
+        leaving ``lora_A`` (16,1024) at 1×. Empirically (diagnosed 2026-05-09
+        on Step 5 checkpoints): ``lora_B`` weight-norm drift was ~100× that
+        of ``lora_A`` — effective rank-1 collapse — driving eval/loss creep
+        while train loss stayed flat.
+
+        LoRA factors should run through AdamW. Apply this helper alongside any
+        per-trainer embed_tokens / lm_head exclusions.
+        """
+        ids = set()
+        if model is None:
+            return frozenset()
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            # PEFT names contain ``.lora_A.`` or ``.lora_B.`` when the LoRA
+            # factor is a child Module; native fused implementations may use
+            # bare ``lora_a``/``lora_b`` parameter attrs.
+            n = name.lower()
+            if ".lora_a." in n or ".lora_b." in n or n.endswith(".lora_a.weight") or n.endswith(".lora_b.weight"):
+                ids.add(id(p))
+            elif name.split(".")[-1] in {"lora_a", "lora_b"}:
+                ids.add(id(p))
+        return frozenset(ids)
 
     def _split_for_muon(
         self, param_groups: list[dict], exclude_ids: frozenset[int] = frozenset()
@@ -1673,6 +1947,12 @@ class BaseTrainer(ABC):
         # Subclass hook for resume-time setup (e.g. L1 dataloader rebuild)
         self._pre_train_loop()
 
+        # Memory-driven dynamic ckpt scheduler (default-on host-wide via
+        # compute config). Initializes after _pre_train_loop so subclass
+        # registration of managed models — done in setup() or _pre_train_loop —
+        # is visible. Cheap no-op when no models registered.
+        self._init_dynamic_ckpt_scheduler()
+
         # Restore the dataloader cursor on resume so the model sees
         # samples from roughly where it was trained, not epoch 0 batch 0.
         # Without this, a length-sorted sampler (or any sampler where
@@ -1885,13 +2165,23 @@ class BaseTrainer(ABC):
                         )
                     self.optimizer.step()
                     self._post_optimizer_step(step)
+                    # Memory-driven dynamic ckpt scheduler — flips
+                    # gradient-checkpointing mode based on observed
+                    # system_used_gb, not curriculum ratio. No-op when
+                    # the trainer hasn't registered managed models.
+                    self._dynamic_ckpt_step(step)
                     # Heartbeat for the step-level deadlock watchdog. Imported
                     # at use to avoid a hot-path import (cached after first call).
                     from bgkit.utils.step_watchdog import heartbeat as _hb
                     _hb()
 
-                    # Optional allocator flush at the configured cadence.
-                    # ``empty_cache_cadence`` is live-tunable via control.json.
+                    # Legacy fallback: unconditional cadence flush. The
+                    # adaptive flush in ``_dynamic_ckpt_step`` is the
+                    # primary mechanism (default-on); this branch only
+                    # fires when the user explicitly sets
+                    # ``cuda_empty_cache_every_step`` to a positive value
+                    # AND wants the cadence behavior regardless of
+                    # measured memory pressure.
                     if empty_cache_cadence > 0 and (self.global_step % empty_cache_cadence == 0):
                         import torch as _t
                         if _t.cuda.is_available():
