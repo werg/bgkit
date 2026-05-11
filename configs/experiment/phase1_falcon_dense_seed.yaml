@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - /config
+  - /training/phase1_falcon_dense_seed
+  - _self_
+
+run_name: phase1_falcon_dense_seed
+bgkit_checkpoint: auto
+
+model:
+  decoder:
+    family: falcon_h1
+    backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+    hidden_dim: 512

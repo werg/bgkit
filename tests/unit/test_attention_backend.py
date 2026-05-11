@@ -78,6 +78,44 @@ def test_resolve_attention_implementation_unknown_raises():
         raise AssertionError("expected unknown backend to raise ValueError")
 
 
+def test_resolve_decoder_attention_implementation_keeps_qwen_on_bgkit_fa4():
+    with (
+        patch.object(ab, "install_bgkit_attention_backend", return_value=True),
+        patch.object(ab, "require_sm12x_owned_backend", return_value=None),
+    ):
+        assert (
+            ab.resolve_decoder_attention_implementation(
+                "auto",
+                decoder_family="qwen35",
+            )
+            == ab.BGKIT_FA4_ATTENTION_IMPL
+        )
+
+
+def test_resolve_decoder_attention_implementation_uses_sdpa_for_falcon():
+    with patch.object(ab, "configure_torch_sdp_flash_only") as configure:
+        assert (
+            ab.resolve_decoder_attention_implementation(
+                "auto",
+                decoder_family="falcon_h1",
+            )
+            == "sdpa"
+        )
+    configure.assert_called_once_with()
+
+
+def test_resolve_decoder_attention_implementation_rejects_bgkit_fa4_for_falcon():
+    try:
+        ab.resolve_decoder_attention_implementation(
+            ab.BGKIT_FA4_ATTENTION_IMPL,
+            decoder_family="falcon_h1",
+        )
+    except ValueError as exc:
+        assert "packed-varlen only" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected Falcon-H1 + BgKIT FA4 to fail")
+
+
 def test_require_sm12x_owned_backend_noops_off_cuda():
     with patch.object(ab.torch.cuda, "is_available", return_value=False):
         ab.require_sm12x_owned_backend()

@@ -145,6 +145,18 @@ class TestSerializeAndTokenize:
         expected = tokenizer.encode(text)
         assert token_ids == expected
 
+    def test_skips_pathological_long_line_before_tokenization(self, tokenizer):
+        commit = _make_commit(diff_hunks=[["+" + ("A" * 40000) + "\n"]])
+        result = serialize_and_tokenize_commit(commit, tokenizer, max_tokens=4096)
+        assert result is None
+        tokenizer.encode.assert_not_called()
+
+    def test_skips_base64ish_payload_before_tokenization(self, tokenizer):
+        commit = _make_commit(diff_hunks=[["+" + ("A" * 9000) + "\n"]])
+        result = serialize_and_tokenize_commit(commit, tokenizer, max_tokens=4096)
+        assert result is None
+        tokenizer.encode.assert_not_called()
+
 
 class TestSerializerWithDivergentCounts:
     def test_mismatched_paths_and_hunks_raises(self):

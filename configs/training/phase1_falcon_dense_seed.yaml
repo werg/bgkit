@@ -1,0 +1,33 @@
+phase: phase1_falcon_dense_seed
+optimizer: adamw
+max_steps: 4000
+lr: 3.0e-4
+projection_lr: 3.0e-4
+warmup_steps: 200
+max_batch_tokens: 32768
+gradient_accumulation_steps: 1
+max_eval_samples: 1000
+eval_every: 200
+save_every: 500
+
+adapt_encoder: false
+
+data:
+  falcon_companion_dir: ${oc.env:DATA_DIR}/processed/tokens_falcon_h1
+
+anchor_weight: 1.0
+cos_weight: 0.5
+norm_weight: 0.2
+survivor_bce_weight: 0.0
+
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+
+model:
+  decoder:
+    family: falcon_h1
+    backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+    hidden_dim: 512

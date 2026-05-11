@@ -26,22 +26,26 @@ from torch.utils.data import DataLoader, random_split
 from bgkit.data.collators import collate_compression
 from bgkit.data.datasets.compression_dataset import CompressionDataset
 from bgkit.data.samplers import PackedTokenBudgetSampler
-from bgkit.models.decoder import ReconstructionDecoder
+from bgkit.models.decoder import ReconstructionDecoder, normalize_decoder_family
 from bgkit.models.encoder import BgKITEncoder
+from bgkit.models.projection_block import effective_projection_cu
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
+from bgkit.training.objectives.commit_reproduction import commit_reproduction_loss
+from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
+from bgkit.training.objectives.description_generation import description_generation_loss
+from bgkit.training.objectives.structural_relational import structural_relational_loss
 from bgkit.training.ratio_sampling import (
     build_ratio_sampler_config,
     resolve_anchor_grid,
     sample_ratio,
 )
-from bgkit.training.objectives.commit_reproduction import commit_reproduction_loss
-from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
-from bgkit.training.objectives.description_generation import description_generation_loss
-from bgkit.training.objectives.structural_relational import structural_relational_loss
-from bgkit.utils.attention_backend import resolve_attention_implementation
+from bgkit.utils.attention_backend import (
+    resolve_attention_implementation,
+    resolve_decoder_attention_implementation,
+)
 
 logger = structlog.get_logger()
 
@@ -176,7 +180,13 @@ class CompressionTrainer(BaseTrainer):
         )
 
         # --- Decoder (trainable, with drift monitoring) ---
-        decoder_cfg = self.cfg.model.decoder
+        decoder_cfg = tcfg.get("model", {}).get("decoder", self.cfg.model.decoder)
+        decoder_family = normalize_decoder_family(decoder_cfg.get("family", "qwen35"))
+        self.encoder.set_active_decoder_family(decoder_family)
+        decoder_attention_impl = resolve_decoder_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto"),
+            decoder_family=decoder_family,
+        )
         decoder_name = decoder_cfg.backbone_name
         decoder_revision = decoder_cfg.get("backbone_revision", None)
         logger.info("loading_decoder", model=decoder_name, revision=decoder_revision)
@@ -189,10 +199,15 @@ class CompressionTrainer(BaseTrainer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=decoder_revision,
-            attn_implementation=attention_impl,
+            attn_implementation=decoder_attention_impl,
             device_map=device,
         )
-        self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
+        decoder_hidden = int(decoder_backbone.get_input_embeddings().weight.shape[1])
+        self.decoder = ReconstructionDecoder(
+            decoder_backbone,
+            hidden_dim=decoder_hidden,
+            decoder_family=decoder_family,
+        )
         self.decoder.set_lm_ce_impl(
             tcfg.get("decoder_ce_impl", self.cfg.compute.get("decoder_ce_impl", None))
         )
@@ -231,18 +246,23 @@ class CompressionTrainer(BaseTrainer):
         # re-recording overhead. PeftModel isinstance fix landed in decoder.py
         # for when this becomes viable.
 
-        # Optional Liger Kernel fused kernels (RMSNorm / SwiGLU / RoPE, plus
-        # Liger CE only when decoder_ce_impl is auto/liger). Gated on
-        # ``training.use_liger`` (default True); no-op when liger-kernel is not
-        # installed.
+        # Optional Liger Kernel fused kernels. The module patcher is
+        # Qwen-specific; Falcon-H1 uses stateful Mamba blocks and should rely
+        # on the HF Mamba/causal-conv fast path plus the generic LM CE kernel.
         if tcfg.get("use_liger", True):
-            from bgkit.utils.liger_integration import apply_liger_to_qwen35
+            from bgkit.utils.liger_integration import (
+                apply_liger_to_decoder,
+                apply_liger_to_qwen35,
+            )
 
             patch_rmsnorm = bool(tcfg.get("use_liger_rmsnorm", False))
             patch_swiglu = bool(tcfg.get("use_liger_swiglu", True))
             patch_rope = bool(tcfg.get("use_liger_rope", True))
+            decoder_family = getattr(self.decoder, "decoder_family", "qwen35")
+            decoder_qwen_liger = decoder_family == "qwen35"
             use_liger_ce = (
                 bool(tcfg.get("use_liger_ce", True))
+                and decoder_qwen_liger
                 and self.decoder.lm_ce_impl in {"auto", "liger"}
             )
             enc_patched = apply_liger_to_qwen35(
@@ -251,7 +271,9 @@ class CompressionTrainer(BaseTrainer):
                 patch_swiglu=patch_swiglu,
                 patch_rope=patch_rope,
             )
-            dec_patched = apply_liger_to_qwen35(
+            # apply_liger_to_decoder no-ops on Falcon, matching the
+            # decoder_qwen_liger gate.
+            dec_patched = apply_liger_to_decoder(
                 self.decoder,
                 patch_rmsnorm=patch_rmsnorm,
                 patch_swiglu=patch_swiglu,
@@ -263,6 +285,7 @@ class CompressionTrainer(BaseTrainer):
                 "liger_kernel_applied",
                 encoder_modules=enc_patched,
                 decoder_modules=dec_patched,
+                decoder_qwen_liger=decoder_qwen_liger,
                 patch_rmsnorm=patch_rmsnorm,
                 patch_swiglu=patch_swiglu,
                 patch_rope=patch_rope,
@@ -280,6 +303,23 @@ class CompressionTrainer(BaseTrainer):
             tokenizer_name,
             trust_remote_code=True,
             revision=tokenizer_revision,
+        )
+        encoder_tokenizer_name = bgkit_cfg.get("backbone_name", backbone_name)
+        encoder_tokenizer_revision = bgkit_cfg.get("backbone_revision", backbone_revision)
+        if encoder_tokenizer_name == tokenizer_name and (
+            encoder_tokenizer_revision == tokenizer_revision
+        ):
+            self.encoder_tokenizer = self.tokenizer
+        else:
+            self.encoder_tokenizer = AutoTokenizer.from_pretrained(
+                encoder_tokenizer_name,
+                trust_remote_code=True,
+                revision=encoder_tokenizer_revision,
+            )
+        logger.info(
+            "tokenizers_loaded",
+            decoder_tokenizer=tokenizer_name,
+            encoder_tokenizer=encoder_tokenizer_name,
         )
 
         # --- Survivorship head config (per-level) ---
@@ -322,11 +362,19 @@ class CompressionTrainer(BaseTrainer):
         self._ref_moments_l1 = None
         # OmegaConf's DictConfig is not a dict subclass; use duck-typed access.
         _l0_block = mm_ref.get("l0", None) if hasattr(mm_ref, "get") else None
-        l0_path = _l0_block.get("path", None) if _l0_block is not None and hasattr(_l0_block, "get") else None
+        l0_path = (
+            _l0_block.get("path", None)
+            if _l0_block is not None and hasattr(_l0_block, "get")
+            else None
+        )
         if self._surv_l0.moment_match_weight > 0 and l0_path:
             self._ref_moments_l0 = load_reference_moments(l0_path)
         _l1_block = mm_ref.get("l1", None) if hasattr(mm_ref, "get") else None
-        l1_path = _l1_block.get("path", None) if _l1_block is not None and hasattr(_l1_block, "get") else None
+        l1_path = (
+            _l1_block.get("path", None)
+            if _l1_block is not None and hasattr(_l1_block, "get")
+            else None
+        )
         if self._surv_l1.moment_match_weight > 0 and l1_path:
             self._ref_moments_l1 = load_reference_moments(l1_path)
 
@@ -343,6 +391,7 @@ class CompressionTrainer(BaseTrainer):
         self.compression_dataset = CompressionDataset.from_config(
             data_cfg, self.tokenizer, seed=seed,
             objective_weights=objective_weights,
+            encoder_tokenizer=self.encoder_tokenizer,
         )
 
         # Train/eval split
@@ -365,9 +414,12 @@ class CompressionTrainer(BaseTrainer):
         # full dataset.  Subset[i] maps to compression_dataset[subset.indices[i]],
         # so lengths must be gathered for the Subset's own index space.
         max_batch_tokens = tcfg.get("max_batch_tokens", 65536)
-        # Eval defaults to 2× train budget (no backward → lower peak at
+        # Eval defaults to 2x train budget (no backward -> lower peak at
         # same budget). Overridable via training.max_batch_tokens_eval.
         max_batch_tokens_eval = self._resolve_eval_batch_budget(tcfg, max_batch_tokens)
+        sampler_cost_multiplier, sampler_eval_cost_multiplier = (
+            self._resolve_sampler_cost_multipliers(tcfg)
+        )
         num_workers = self.cfg.compute.get("num_workers", 4)
         pin_memory = self.cfg.compute.get("pin_memory", False)
 
@@ -397,6 +449,8 @@ class CompressionTrainer(BaseTrainer):
         self._pin_memory = pin_memory
         self._max_batch_tokens = max_batch_tokens
         self._max_batch_tokens_eval = max_batch_tokens_eval
+        self._sampler_cost_multiplier = sampler_cost_multiplier
+        self._sampler_eval_cost_multiplier = sampler_eval_cost_multiplier
 
         self.train_sampler = PackedTokenBudgetSampler(
             self.train_dataset,
@@ -404,6 +458,7 @@ class CompressionTrainer(BaseTrainer):
             max_batch_tokens=max_batch_tokens,
             shuffle=True,
             seed=seed,
+            cost_multiplier=sampler_cost_multiplier,
         )
         self.train_dataloader = DataLoader(
             self.train_dataset,
@@ -418,6 +473,7 @@ class CompressionTrainer(BaseTrainer):
             lengths=eval_lengths,
             max_batch_tokens=max_batch_tokens_eval,
             shuffle=False,
+            cost_multiplier=sampler_eval_cost_multiplier,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
@@ -511,25 +567,31 @@ class CompressionTrainer(BaseTrainer):
             calibrate_head_tanh_temperature,
         )
         for level in ("l0", "l1"):
-            calibrated_T = calibrate_head_tanh_temperature(
-            self.encoder,
+            calibrated_t = calibrate_head_tanh_temperature(
+                self.encoder,
                 self.train_dataloader,
                 self.device,
                 level=level,
                 n_probe_batches=n_probe_batches,
             )
-            if calibrated_T is not None:
+            if calibrated_t is not None:
                 logger.info(
                     "head_tanh_temperature_calibrated",
                     level=level,
-                    T=calibrated_T,
+                    T=calibrated_t,
                 )
 
     def _resolve_step1_checkpoint(self) -> str | None:
-        """Resolve step1_checkpoint: auto -> best phase1_step5 checkpoint.
+        """Resolve step1_checkpoint.
 
-        Step 4 expects a checkpoint from step 3 (commit encoding), which has
-        both a trained encoder and decoder.
+        The candidate phase chain depends on the *decoder family* under
+        training, not on the literal phase name: Qwen runs walk the
+        Qwen-family Phase 1 ladder (step5 best) while Falcon runs walk
+        their Falcon-family ladder so the Falcon projection block is not
+        accidentally reinitialized from Qwen-only Phase 1 state. The
+        per-stage entry point is still keyed on ``training.phase`` so a
+        stage that runs *during* (e.g. phase1_falcon_l1) doesn't try to
+        load itself.
         """
         step1_checkpoint = self.cfg.get("step1_checkpoint", None)
 
@@ -538,13 +600,63 @@ class CompressionTrainer(BaseTrainer):
 
         if step1_checkpoint == "auto":
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
-            resolved = resolve_checkpoint(
-                checkpoint_dir,
-                phase="phase1_step5",
-                metric="eval/loss",
-                label="step1_checkpoint",
+            # Read decoder family from training override first, then top-level
+            # model.decoder, then default to qwen35. Tolerant of test fixtures
+            # that don't construct the full config tree.
+            decoder_cfg = (
+                self.cfg.training.get("model", {}).get("decoder", None)
+                or (self.cfg.get("model", {}) or {}).get("decoder", None)
+                or {}
             )
-            step1_checkpoint = str(resolved)
+            decoder_family = normalize_decoder_family(
+                decoder_cfg.get("family", "qwen35"),
+            )
+            training_phase = self.cfg.get("training", {}).get("phase", "")
+            # Phase-name fallback: legacy configs (and unit tests) set the
+            # phase to a Falcon stage without setting model.decoder.family.
+            # Treat that as an implicit "falcon_h1" family.
+            if (
+                decoder_family == "qwen35"
+                and isinstance(training_phase, str)
+                and training_phase.startswith("phase1_falcon_")
+            ):
+                decoder_family = "falcon_h1"
+            if decoder_family == "falcon_h1":
+                # Avoid loading from a stage that includes the current one.
+                if training_phase == "phase1_falcon_l0":
+                    candidate_phases = (
+                        "phase1_falcon_forced_adapt",
+                        "phase1_falcon_dense_seed",
+                    )
+                else:  # phase1_falcon_l1 and any future Falcon stage
+                    candidate_phases = (
+                        "phase1_falcon_l0",
+                        "phase1_falcon_forced_adapt",
+                        "phase1_falcon_dense_seed",
+                    )
+            else:
+                candidate_phases = ("phase1_step5",)
+
+            errors: list[str] = []
+            for phase in candidate_phases:
+                try:
+                    resolved = resolve_checkpoint(
+                        checkpoint_dir,
+                        phase=phase,
+                        metric="eval/loss",
+                        label="step1_checkpoint",
+                    )
+                    step1_checkpoint = str(resolved)
+                    break
+                except ValueError as exc:
+                    errors.append(str(exc))
+            else:
+                raise ValueError(
+                    f"step1_checkpoint=auto could not resolve any candidate "
+                    f"phase for decoder_family={decoder_family!r} "
+                    f"(phase={training_phase!r}): {', '.join(candidate_phases)}. "
+                    + " | ".join(errors)
+                )
 
         if step1_checkpoint is not None:
             self._input_sources["step1"] = Path(step1_checkpoint).name
@@ -723,6 +835,19 @@ class CompressionTrainer(BaseTrainer):
             override_active=self._target_ratio_override is not None,
         )
 
+    @staticmethod
+    def _resolve_sampler_cost_multipliers(tcfg) -> tuple[float, float]:
+        sampler_cfg = tcfg.get("sampler", {}) or {}
+        train_multiplier = sampler_cfg.get(
+            "cost_multiplier",
+            tcfg.get("sampler_cost_multiplier", 1.0),
+        )
+        eval_multiplier = sampler_cfg.get(
+            "eval_cost_multiplier",
+            tcfg.get("sampler_eval_cost_multiplier", train_multiplier),
+        )
+        return float(train_multiplier), float(eval_multiplier)
+
     def _perform_l1_rebuild(self) -> None:
         """Rebuild dataset and dataloader for L1 phase."""
         import numpy as np
@@ -745,8 +870,11 @@ class CompressionTrainer(BaseTrainer):
             for i in self.train_dataset.indices
         ], dtype=np.int64)
         max_batch_tokens = self.cfg.training.get("max_batch_tokens", 65536)
-        max_batch_tokens_eval = self.cfg.training.get(
-            "max_batch_tokens_eval", max_batch_tokens,
+        max_batch_tokens_eval = self._resolve_eval_batch_budget(
+            self.cfg.training, max_batch_tokens,
+        )
+        sampler_cost_multiplier, sampler_eval_cost_multiplier = (
+            self._resolve_sampler_cost_multipliers(self.cfg.training)
         )
         seed = self.cfg.get("seed", 42)
         # Update stashes so any subsequent live rebuild sees fresh L1 lengths.
@@ -754,6 +882,10 @@ class CompressionTrainer(BaseTrainer):
         # re-snapshots from the L1-updated lengths/dataset.
         self._train_lengths = train_lengths
         self._train_content_lengths = train_content_lengths
+        self._max_batch_tokens = max_batch_tokens
+        self._max_batch_tokens_eval = max_batch_tokens_eval
+        self._sampler_cost_multiplier = sampler_cost_multiplier
+        self._sampler_eval_cost_multiplier = sampler_eval_cost_multiplier
         for cached in ("_train_dataset_full", "_train_lengths_full", "_train_content_lengths_full"):
             if hasattr(self, cached):
                 delattr(self, cached)
@@ -763,6 +895,7 @@ class CompressionTrainer(BaseTrainer):
             max_batch_tokens=max_batch_tokens,
             shuffle=True,
             seed=seed,
+            cost_multiplier=sampler_cost_multiplier,
         )
 
         # Rebuild dataloader
@@ -782,11 +915,13 @@ class CompressionTrainer(BaseTrainer):
             self.compression_dataset.token_length(i)
             for i in self.eval_dataset.indices
         ], dtype=np.int64)
+        self._eval_lengths = eval_lengths
         eval_sampler = PackedTokenBudgetSampler(
             self.eval_dataset,
             lengths=eval_lengths,
             max_batch_tokens=max_batch_tokens_eval,
             shuffle=False,
+            cost_multiplier=sampler_eval_cost_multiplier,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
@@ -992,59 +1127,23 @@ class CompressionTrainer(BaseTrainer):
         batch (e.g. for mixed file+repo batches).
         """
         device = self.device
-        target_ids_flat = batch["target_token_ids"].to(device)
-        target_cu = batch["target_cu_seqlens"].to(device)
-        splice_start = batch["bgkit_splice_start"].to(device)
-        splice_len = batch["bgkit_splice_len"].to(device)
+        target_ids_flat = batch["target_token_ids"]
+        target_cu = batch["target_cu_seqlens"]
+        splice_start = batch["bgkit_splice_start"]
+        splice_len = batch["bgkit_splice_len"]
         loss_mask_flat = batch.get("target_loss_mask")
         if loss_mask_flat is not None:
-            loss_mask_flat = loss_mask_flat.to(device).to(torch.bool)
+            loss_mask_flat = loss_mask_flat.to(device=device, dtype=torch.bool)
 
-        batch_size = int(target_cu.shape[0]) - 1
-        if sample_indices is None:
-            sample_indices = list(range(batch_size))
-        tok_cu_list = target_cu.to(torch.int64).tolist()
-        surv_cu_list = survivor_cu_seqlens.to(torch.int64).tolist()
-
-        prefix_ids: list[torch.Tensor] = []
-        suffix_ids: list[torch.Tensor] = []
-        per_segment_loss_masks: list[torch.Tensor] = []
-        for out_idx, b in enumerate(sample_indices):
-            sample_start = int(tok_cu_list[b])
-            sample_end = int(tok_cu_list[b + 1])
-            sample_tokens = target_ids_flat[sample_start:sample_end]
-            splice_b_start = int(splice_start[b].item())
-            splice_b_len = int(splice_len[b].item())
-            if splice_b_start < 0:
-                splice_b_start = sample_tokens.shape[0]
-                splice_b_len = 0
-            pre = sample_tokens[:splice_b_start]
-            suf = sample_tokens[splice_b_start + splice_b_len :]
-            prefix_ids.append(pre)
-            suffix_ids.append(suf)
-
-            k_i = int(surv_cu_list[out_idx + 1]) - int(surv_cu_list[out_idx])
-            surv_mask = torch.zeros(k_i, dtype=torch.bool, device=device)
-            if loss_mask_flat is not None:
-                sample_loss = loss_mask_flat[sample_start:sample_end]
-                pre_mask = sample_loss[:splice_b_start]
-                suf_mask = sample_loss[splice_b_start + splice_b_len :]
-            else:
-                # Default: suffix positions bear loss (matches decoder default).
-                pre_mask = torch.zeros(pre.shape[0], dtype=torch.bool, device=device)
-                suf_mask = torch.ones(suf.shape[0], dtype=torch.bool, device=device)
-            per_segment_loss_masks.append(torch.cat([pre_mask, surv_mask, suf_mask], dim=0))
-
-        flat_loss_mask = (
-            torch.cat(per_segment_loss_masks, dim=0)
-            if per_segment_loss_masks else None
-        )
-        return self.decoder.forward_with_single_splice(
+        return self.decoder.forward_with_packed_target_splice(
             survivor_embeddings=survivors,
             survivor_cu_seqlens=survivor_cu_seqlens,
-            prefix_ids=prefix_ids,
-            suffix_ids=suffix_ids,
-            loss_mask=flat_loss_mask,
+            target_ids_flat=target_ids_flat,
+            target_cu_seqlens=target_cu,
+            splice_start=splice_start,
+            splice_len=splice_len,
+            loss_mask_flat=loss_mask_flat,
+            sample_indices=sample_indices,
         )
 
     # ------------------------------------------------------------------
@@ -1267,11 +1366,12 @@ class CompressionTrainer(BaseTrainer):
                 position_ids=proj_pos,
                 survivor_mask=None,
             )
+            projected_cu = effective_projection_cu(proj_out, proj_cu)
 
             # --- Step 4: packed decoder across all repos ---
             loss = self._decoder_forward_single_splice(
                 proj_out.projected_embeddings,
-                proj_cu,
+                projected_cu,
                 batch,
             )
 
@@ -1687,7 +1787,6 @@ class CompressionTrainer(BaseTrainer):
 
         device = self.device
         cu_repo = batch["cu_repo_seqlens"].to(device)
-        batch_size = int(cu_repo.shape[0]) - 1
 
         loss_mask_flat = batch.get("target_loss_mask")
         if loss_mask_flat is not None:
@@ -1727,9 +1826,10 @@ class CompressionTrainer(BaseTrainer):
                 position_ids=proj_pos,
                 survivor_mask=None,
             )
+            projected_cu = effective_projection_cu(proj_out, proj_cu)
             loss = self._decoder_forward_single_splice(
                 proj_out.projected_embeddings,
-                proj_cu,
+                projected_cu,
                 batch,
             )
 

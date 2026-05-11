@@ -67,6 +67,15 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         name="GPT-OSS",
         _extra_body=(("include_reasoning", False), ("reasoning_effort", "low")),
     ),
+    "Gemma": ModelProfile(
+        name="Gemma",
+    ),
+    "Nemotron": ModelProfile(
+        name="Nemotron",
+    ),
+    "LFM": ModelProfile(
+        name="LFM",
+    ),
 }
 
 DEFAULT_PROFILE = ModelProfile(name="default")

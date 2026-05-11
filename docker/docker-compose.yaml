@@ -79,14 +79,20 @@ x-gpu-common: &gpu-common
     # ~2.8 GiB lower peak memory than BgKIT chunked CE. Set =chunked for
     # fallback/bisecting; missing CCE package falls back safely.
     - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
-    # PYTHONPATH override: prepend the local flash-linear-attention fork so
-    # `import fla` resolves to the bind-mounted blackwell-sm121-compat
-    # branch (sm_121 detection + global_scratch allocator) instead of the
-    # pip-installed PyPI fla 0.4.2 in dist-packages. Must include the
-    # Dockerfile's existing entries (FlashAttention, bgkit src, cutlass-dsl)
-    # because compose `environment` replaces, not augments, the image ENV.
-    # Entrypoint may further prepend the FA native cache repo.
-    - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+    # Local mamba-ssm fork: skip GB10/sm_121 Triton autotune configs that
+    # repeatedly exceed the 101 KB shared-memory cap on Falcon-H1 shapes.
+    - MAMBA_SM121_SAFE_AUTOTUNE=${MAMBA_SM121_SAFE_AUTOTUNE:-1}
+    # Prefer measured Falcon-H1 GB10 configs in the local mamba fork. Set to 0
+    # to restore full Triton autotune for A/B runs.
+    - MAMBA_SM121_STATIC_CONFIGS=${MAMBA_SM121_STATIC_CONFIGS:-1}
+    # PYTHONPATH override: prepend local kernel forks so ad-hoc Docker runs
+    # exercise the same in-situ code we are tuning. The mamba fork is first
+    # because Falcon-H1 imports pure-Python/Triton mamba_ssm ops from there;
+    # causal-conv1d remains the binary wheel from the image. Must include the
+    # Dockerfile's existing entries because compose `environment` replaces,
+    # not augments, the image ENV. Entrypoint may further prepend the FA native
+    # cache repo.
+    - PYTHONPATH=/workspace/mamba-falcon-sm121:/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
     # Triton kernel dump (off by default; opt-in via host env to capture
     # PTX/SASS for TMA / cp.async.bulk verification on Blackwell sm_121).
     # See plans/ for the perf investigation context.
@@ -161,6 +167,10 @@ x-gpu-common: &gpu-common
     - ../scripts:/workspace/bgkit/scripts:ro
     # Local FlashAttention checkout: mounted read-only and preferred via PYTHONPATH.
     - ../../flash-attention:/workspace/flash-attention:ro
+    # Local mamba-ssm fork overlay for Falcon-H1 kernel work. The image still
+    # installs mamba-ssm for package metadata and any compiled optional pieces,
+    # but Python/Triton sources resolve from this checkout first.
+    - ../../mamba-falcon-sm121:/workspace/mamba-falcon-sm121:ro
     # Local flash-linear-attention fork (branch blackwell-sm121-compat):
     # broadens IS_NVIDIA_BLACKWELL gate to capability >= 10 (covers sm_121
     # / DGX Spark) and registers the global_scratch allocator on Blackwell
@@ -321,6 +331,102 @@ services:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_step6", "++training.reset_wandb=true"]
 
+  train-falcon-dense-seed:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_falcon_dense_seed"]
+
+  train-falcon-forced-adapt:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_falcon_forced_adapt"]
+
+  train-falcon-l0:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_falcon_l0"]
+
+  train-falcon-l1:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_falcon_l1"]
+
+  # Docker-native Falcon-H1 kernel harness. This is the reusable check for
+  # mamba-ssm fork overlays and attention fallback guards; override args by
+  # passing the script path plus flags to `docker compose run --rm ...`.
+  benchmark-falcon-h1-kernels:
+    <<: *gpu-common
+    restart: "no"
+    command:
+      [
+        "scripts/benchmark_falcon_h1_kernels.py",
+        "--shape",
+        "smoke",
+        "--modes",
+        "train,prefill,decode",
+        "--batch-size",
+        "1",
+        "--seq-len",
+        "128",
+        "--warmup",
+        "1",
+        "--iters",
+        "3",
+      ]
+
+  benchmark-falcon-h1-cache-sweep:
+    <<: *gpu-common
+    restart: "no"
+    command:
+      [
+        "scripts/benchmark_falcon_h1_kernels.py",
+        "--shape",
+        "smoke",
+        "--modes",
+        "prefill,decode",
+        "--batch-sizes",
+        "1,2",
+        "--seq-lens",
+        "32,128,512",
+        "--warmup",
+        "1",
+        "--iters",
+        "3",
+      ]
+
+  benchmark-falcon-h1-attention:
+    <<: *gpu-common
+    restart: "no"
+    command:
+      [
+        "scripts/benchmark_falcon_h1_kernels.py",
+        "--shape",
+        "smoke",
+        "--modes",
+        "attention",
+        "--batch-sizes",
+        "1,2",
+        "--seq-lens",
+        "128,512",
+        "--warmup",
+        "1",
+        "--iters",
+        "3",
+      ]
+
+  profile-falcon-h1-training:
+    <<: *gpu-common
+    restart: "no"
+    command:
+      [
+        "scripts/profile_training_step.py",
+        "+experiment=phase1_falcon_l0",
+        "++step1_checkpoint=null",
+        "++training.decoder_lora.enabled=false",
+        "+profile.warmup_steps=1",
+        "+profile.steps=2",
+        "+profile.topk=40",
+        "+profile.fixed_batches=true",
+        "+profile.repeat_first_fixed_step=true",
+        "+profile.capture_profiler=false",
+      ]
+
   # Phase 1 Step 2.5: projection-only embed-anchor repair. Loads Step 2
   # checkpoint, freezes compressor + decoder, re-trains only the
   # projection block so its output lands on decoder.embed_tokens
@@ -337,6 +443,14 @@ services:
   train-phase2-kb-stage-b:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase2_kb_stage_b"]
+
+  train-phase2-kb-stage-a-falcon:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase2_kb_stage_a_falcon"]
+
+  train-phase2-kb-stage-b-falcon:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase2_kb_stage_b_falcon"]
 
   # Packed-attention memory profiler for Phase 1 Step 3. Hard memory cap
   # prevents the unified-memory OOM from cascading to the host (DGX Spark
@@ -613,6 +727,62 @@ services:
       --max-model-len 32768
       --enable-prefix-caching
       --enable-chunked-prefill
+
+  # --- Atlas inference (single-server, replaces vllm primary+fast) ---
+  # Switch model via ATLAS_MODEL env var or by using the named presets below.
+  # Uses network_mode: host per Atlas requirements (shared GPU memory access).
+  atlas:
+    image: "${ATLAS_IMAGE:-avarok/atlas-gb10:latest}"
+    network_mode: host
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    volumes:
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:${ATLAS_PORT:-8888}/v1/models"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 300s
+    command: >-
+      serve ${ATLAS_MODEL:-bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4A16}
+      --port ${ATLAS_PORT:-8888}
+      --kv-cache-dtype turbo4
+      --max-batch-size 8
+
+  # Pure-attention MoE — batching scales linearly; target for description generation.
+  atlas-gemma:
+    image: "${ATLAS_IMAGE:-avarok/atlas-gb10:latest}"
+    network_mode: host
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: "no"
+    volumes:
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:${ATLAS_PORT:-8888}/v1/models"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 300s
+    command: >-
+      serve bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4A16
+      --port ${ATLAS_PORT:-8888}
+      --kv-cache-dtype turbo4
+      --max-batch-size 8
 
 volumes:
   bgkit-compile-cache:

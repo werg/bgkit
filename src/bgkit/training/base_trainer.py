@@ -253,6 +253,7 @@ class BaseTrainer(ABC):
 
         .. deprecated:: Use ``_post_optimizer_step`` instead.
         """
+        del step
 
     def _post_optimizer_step(self, step: int) -> None:
         """Hook called after optimizer.step(). Override for per-step bookkeeping."""
@@ -264,6 +265,7 @@ class BaseTrainer(ABC):
         Override for dataloader rebuilds, curriculum transitions, etc.
         Return value is ignored.
         """
+        return None
 
     def _post_lr_schedule(self, step: int) -> None:
         """Hook called after the LR schedule is applied, before the accumulation loop.
@@ -271,6 +273,7 @@ class BaseTrainer(ABC):
         Override to apply per-param-group LR adjustments (e.g. local warmup ramps
         for newly added param groups at stage transitions).
         """
+        del step
 
     def _add_step_metrics(self, metrics: dict[str, float]) -> None:
         """Add trainer-specific metrics to the step dict before logging.
@@ -278,6 +281,7 @@ class BaseTrainer(ABC):
         Override to inject metrics like bidi_alpha, compression ratio, etc.
         Modify ``metrics`` in place.
         """
+        del metrics
 
     def _build_training_state(
         self,
@@ -333,8 +337,9 @@ class BaseTrainer(ABC):
 
         Override for resume-time rebuilds (e.g. L1 dataloader rebuild).
         """
+        return None
 
-    def _dynamic_ckpt_managed_models(self) -> list[tuple[str, "nn.Module"]]:
+    def _dynamic_ckpt_managed_models(self) -> list[tuple[str, torch.nn.Module]]:
         """Models managed by the memory-driven dynamic ckpt scheduler.
 
         Subclasses override to return ``[(label, model), ...]`` pairs whose
@@ -395,9 +400,9 @@ class BaseTrainer(ABC):
         self._dyn_downshift_margin = float(_get("downshift_margin_gb", 5.0))
         self._dyn_ckpt_min_steps_in_mode = int(_get("min_steps_in_mode", 50))
         # Adaptive CUDA cache flush. ``flush_when_free_below_gb`` is the
-        # outer ceiling — flush only triggers when room is genuinely scarce.
+        # outer ceiling - flush only triggers when room is genuinely scarce.
         # ``flush_min_slack_gb`` skips the sync when there's nothing to
-        # actually reclaim (slack = reserved − allocated; if slack ≈ 0 the
+        # actually reclaim (slack = reserved - allocated; if slack ~= 0 the
         # pool is fully in-use and ``empty_cache()`` returns nothing).
         self._dyn_flush_when_free_below = float(
             _get("flush_when_free_below_gb", 20.0)
@@ -450,7 +455,7 @@ class BaseTrainer(ABC):
 
         1. **Adaptive cache flush** (cheap first response): when free is
            tight (``free_gb < flush_when_free_below_gb``) AND there's
-           slack worth recovering (``reserved − allocated > flush_min_slack_gb``)
+           slack worth recovering (``reserved - allocated > flush_min_slack_gb``)
            AND cooldown has elapsed, call ``empty_cache()``. The slack
            guard skips the sync when the pool is fully in-use and a flush
            would return nothing.
@@ -681,9 +686,9 @@ class BaseTrainer(ABC):
         These MUST be excluded from Muon: Muon's Newton-Schulz orthogonalization
         plus its ``sqrt(d_out/d_in)`` rectangular rescaler is wrong for low-rank
         factors. For typical Qwen3.5 LoRA shapes (``r=16``, intermediate=3584),
-        the rescaler over-amplifies ``lora_B`` (3584,16) updates by ~15× while
-        leaving ``lora_A`` (16,1024) at 1×. Empirically (diagnosed 2026-05-09
-        on Step 5 checkpoints): ``lora_B`` weight-norm drift was ~100× that
+        the rescaler over-amplifies ``lora_B`` (3584,16) updates by ~15x while
+        leaving ``lora_A`` (16,1024) at 1x. Empirically (diagnosed 2026-05-09
+        on Step 5 checkpoints): ``lora_B`` weight-norm drift was ~100x that
         of ``lora_A`` — effective rank-1 collapse — driving eval/loss creep
         while train loss stayed flat.
 
@@ -700,9 +705,9 @@ class BaseTrainer(ABC):
             # factor is a child Module; native fused implementations may use
             # bare ``lora_a``/``lora_b`` parameter attrs.
             n = name.lower()
-            if ".lora_a." in n or ".lora_b." in n or n.endswith(".lora_a.weight") or n.endswith(".lora_b.weight"):
-                ids.add(id(p))
-            elif name.split(".")[-1] in {"lora_a", "lora_b"}:
+            lora_suffix = n.endswith((".lora_a.weight", ".lora_b.weight"))
+            native_attr = name.split(".")[-1] in {"lora_a", "lora_b"}
+            if ".lora_a." in n or ".lora_b." in n or lora_suffix or native_attr:
                 ids.add(id(p))
         return frozenset(ids)
 
@@ -1128,6 +1133,7 @@ class BaseTrainer(ABC):
         on ``self._training_state`` and restored
         ``_microbatches_in_epoch`` before this hook fires.
         """
+        del training_state
 
     def _post_weight_load_hook(self) -> None:
         """Run after weights + step + training_state are restored,
@@ -1138,6 +1144,7 @@ class BaseTrainer(ABC):
         distillation stage from ``training_state`` or a freeze schedule
         keyed off ``global_step``).
         """
+        return None
 
     def _log_restore(self) -> None:
         """Emit the restore log line.  Override to include extra
@@ -1393,6 +1400,9 @@ class BaseTrainer(ABC):
 
         seed = getattr(self.train_sampler, "_seed", None)
         epoch = getattr(self.train_sampler, "_epoch", 0)
+        cost_multiplier = float(
+            getattr(self, "_sampler_cost_multiplier", 1.0) or 1.0
+        )
 
         # If the train_dataloader is currently wrapped (e.g. by
         # ``_InterleavingDataLoader`` in DecoderInitTrainer for QA mixing),
@@ -1417,6 +1427,7 @@ class BaseTrainer(ABC):
             max_batch_tokens=new_budget,
             shuffle=True,
             seed=seed,
+            cost_multiplier=cost_multiplier,
         )
         # Restore epoch so shuffle order is deterministic on resume.
         self.train_sampler.set_epoch(epoch)
@@ -1448,6 +1459,7 @@ class BaseTrainer(ABC):
             min_sample_length=min_len,
             max_sample_length=max_len,
             n_samples=len(ds),
+            cost_multiplier=cost_multiplier,
         )
 
     def _rebuild_eval_dataloader_with_budget(self, new_budget: int) -> None:
@@ -1475,11 +1487,20 @@ class BaseTrainer(ABC):
         from bgkit.data.samplers import PackedTokenBudgetSampler
 
         old_budget = self._max_batch_tokens_eval
+        cost_multiplier = float(
+            getattr(
+                self,
+                "_sampler_eval_cost_multiplier",
+                getattr(self, "_sampler_cost_multiplier", 1.0),
+            )
+            or 1.0
+        )
         eval_sampler = PackedTokenBudgetSampler(
             self.eval_dataset,
             lengths=self._eval_lengths,
             max_batch_tokens=new_budget,
             shuffle=False,
+            cost_multiplier=cost_multiplier,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
@@ -1492,6 +1513,7 @@ class BaseTrainer(ABC):
             "live_max_batch_tokens_eval_update",
             old=old_budget,
             new=new_budget,
+            cost_multiplier=cost_multiplier,
         )
 
     @staticmethod
@@ -1760,6 +1782,15 @@ class BaseTrainer(ABC):
             parent_checkpoint=parent_checkpoint,
             input_sources=self._input_sources,
         )
+
+    @staticmethod
+    def _normalize_eval_metrics(metrics: dict[str, float]) -> dict[str, float]:
+        """Return eval metrics with exactly one ``eval/`` prefix."""
+
+        return {
+            key if str(key).startswith("eval/") else f"eval/{key}": value
+            for key, value in metrics.items()
+        }
 
     def train(self) -> None:
         """Main training loop.
@@ -2254,9 +2285,9 @@ class BaseTrainer(ABC):
                     # Eval
                     if eval_every > 0 and step > 0 and step % eval_every == 0:
                         self._release_training_transients()
-                        from bgkit.utils.step_watchdog import (
-                            pause as _wd_pause, resume as _wd_resume,
-                        )
+                        from bgkit.utils.step_watchdog import pause as _wd_pause
+                        from bgkit.utils.step_watchdog import resume as _wd_resume
+
                         with memory_budget_scope(
                             "evaluate", cap_gb=self._scope_cap("evaluate"),
                         ):
@@ -2265,9 +2296,7 @@ class BaseTrainer(ABC):
                                 eval_metrics = self.evaluate()
                             finally:
                                 _wd_resume()
-                        eval_metrics = {
-                            f"eval/{k}": v for k, v in eval_metrics.items()
-                        }
+                        eval_metrics = self._normalize_eval_metrics(eval_metrics)
                         logger.info("eval", step=step, **eval_metrics)
                         if wandb_run is not None:
                             wandb_run.log(eval_metrics, step=step)
@@ -2388,9 +2417,9 @@ class BaseTrainer(ABC):
                         )
                         parent = self._registry_parent()
                         self._release_training_transients()
-                        from bgkit.utils.step_watchdog import (
-                            pause as _wd_pause, resume as _wd_resume,
-                        )
+                        from bgkit.utils.step_watchdog import pause as _wd_pause
+                        from bgkit.utils.step_watchdog import resume as _wd_resume
+
                         with memory_budget_scope(
                             "save_checkpoint",
                             cap_gb=self._scope_cap("save_checkpoint"),
@@ -2452,9 +2481,9 @@ class BaseTrainer(ABC):
 
                 # Final eval + checkpoint
                 self._release_training_transients()
-                from bgkit.utils.step_watchdog import (
-                    pause as _wd_pause, resume as _wd_resume,
-                )
+                from bgkit.utils.step_watchdog import pause as _wd_pause
+                from bgkit.utils.step_watchdog import resume as _wd_resume
+
                 with memory_budget_scope(
                     "evaluate", cap_gb=self._scope_cap("evaluate"),
                 ):
@@ -2463,9 +2492,7 @@ class BaseTrainer(ABC):
                         eval_metrics = self.evaluate()
                     finally:
                         _wd_resume()
-                eval_metrics = {
-                    f"eval/{k}": v for k, v in eval_metrics.items()
-                }
+                eval_metrics = self._normalize_eval_metrics(eval_metrics)
                 logger.info("final_eval", **eval_metrics)
                 self._training_state = self._build_training_state(
                     es_best, es_evals_without_improvement, wandb_run,

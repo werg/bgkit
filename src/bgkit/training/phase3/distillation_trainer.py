@@ -32,9 +32,9 @@ from torch.utils.data import DataLoader
 
 from bgkit.data.datasets.swe_trajectory_dataset import SWETrajectoryDataset
 from bgkit.data.samplers import PackedTokenBudgetSampler
-from bgkit.models.decoder import ReconstructionDecoder
+from bgkit.models.decoder import ReconstructionDecoder, normalize_decoder_family
 from bgkit.training.base_trainer import BaseTrainer
-from bgkit.utils.attention_backend import resolve_attention_implementation
+from bgkit.utils.attention_backend import resolve_decoder_attention_implementation
 from bgkit.utils.packing import position_ids_from_cu
 
 logger = structlog.get_logger()
@@ -118,22 +118,25 @@ class DistillationTrainer(BaseTrainer):
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        attention_impl = resolve_attention_implementation(
-            self.cfg.compute.get("attention_implementation", "auto")
-        )
-
         # Load decoder (student model)
-        decoder_name = self.cfg.model.decoder.backbone_name
+        decoder_cfg = self.cfg.model.decoder
+        decoder_family = normalize_decoder_family(decoder_cfg.get("family", "qwen35"))
+        decoder_attention_impl = resolve_decoder_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto"),
+            decoder_family=decoder_family,
+        )
+        decoder_name = decoder_cfg.backbone_name
         decoder_backbone = AutoModelForCausalLM.from_pretrained(
             decoder_name,
             trust_remote_code=True,
             torch_dtype=torch.bfloat16 if self.device.type == "cuda" else torch.float32,
-            attn_implementation=attention_impl,
+            attn_implementation=decoder_attention_impl,
         )
         decoder_backbone.to(self.device)
         self.decoder = ReconstructionDecoder(
             decoder_backbone,
             hidden_dim=decoder_backbone.get_input_embeddings().weight.shape[1],
+            decoder_family=decoder_family,
         )
         self.decoder.set_lm_ce_impl(
             self.cfg.training.get(
@@ -225,7 +228,7 @@ class DistillationTrainer(BaseTrainer):
         )
 
         max_batch_tokens = int(self.cfg.training.get("max_batch_tokens", 16384))
-        # Eval defaults to 2× train budget (no backward → lower peak at
+        # Eval defaults to 2x train budget (no backward -> lower peak at
         # same budget). Overridable via training.max_batch_tokens_eval.
         max_batch_tokens_eval = self._resolve_eval_batch_budget(
             self.cfg.training, max_batch_tokens,

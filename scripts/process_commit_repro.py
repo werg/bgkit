@@ -35,11 +35,14 @@ def main(cfg: DictConfig) -> None:
 
     log.info(
         "Starting commit reproduction pipeline: tokenizer=%s, output=%s, "
-        "max_diff_tokens=%d, max_commits_per_repo=%d",
+        "max_diff_tokens=%d, max_commits_per_repo=%d, num_workers=%d, "
+        "verify_repo_list=%s",
         repro_cfg.tokenizer_name,
         repro_cfg.output_dir,
         repro_cfg.max_diff_tokens,
         repro_cfg.max_commits_per_repo,
+        repro_cfg.get("num_workers", 1),
+        repro_cfg.get("verify_repo_list", True),
     )
 
     stats = process_commit_reproduction(
@@ -49,6 +52,8 @@ def main(cfg: DictConfig) -> None:
         max_diff_tokens=repro_cfg.max_diff_tokens,
         max_commits_per_repo=repro_cfg.max_commits_per_repo,
         max_repos=repro_cfg.max_repos,
+        num_workers=repro_cfg.get("num_workers", 1),
+        verify_repo_list=repro_cfg.get("verify_repo_list", True),
         seed=cfg.seed,
         filter_config=filter_config,
     )

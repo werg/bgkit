@@ -215,6 +215,7 @@ def _make_client(
         sys.exit(1)
     profile = resolve_profile(model_id)
     client.apply_profile(profile)
+    client.config.model_name = model_id
     _tier_models[label] = model_id
     logger.info(
         "server_ready", label=label, model=model_id,
@@ -268,6 +269,35 @@ def init_local_client(
     _client_fast = _make_client(
         resolved_fast, concurrent_fast, readiness_timeout, "fast"
     )
+
+
+def init_atlas_client(
+    url: str | None = None,
+    readiness_timeout: float = 300.0,
+) -> None:
+    """Initialize a single Atlas inference client used for all tiers.
+
+    Atlas (avarok/atlas-gb10) is a single-server backend fast enough to handle
+    all file complexity levels.  Start with: make atlas-server
+    """
+    global _client_primary, _client_fast
+
+    try:
+        concurrent = int(os.environ.get("ATLAS_CONCURRENT", 4))
+    except ValueError:
+        concurrent = 4
+
+    resolved = (
+        url
+        or os.environ.get("ATLAS_URL")
+        or f"http://localhost:{os.environ.get('ATLAS_PORT', '8888')}"
+    )
+
+    client = _make_client(resolved, concurrent, readiness_timeout, "primary")
+    # Both tiers served by the same Atlas instance.
+    _tier_models["fast"] = _tier_models["primary"]
+    _client_primary = client
+    _client_fast = client
 
 
 def _pick_tier(
@@ -399,7 +429,7 @@ def generate_description(
     if chosen == "haiku":
         result = call_claude(prompt)
         return (result, "haiku")
-    elif chosen == "local":
+    elif chosen in ("local", "atlas"):
         return call_local(
             prompt, file_path=file_path,
             language=language, size_bytes=size_bytes,
@@ -834,8 +864,8 @@ def main() -> None:
         help="Output directory for per-repo JSONL files",
     )
     parser.add_argument(
-        "--backend", type=str, choices=["haiku", "local", "mixed"], default="mixed",
-        help="Description generation backend (default: mixed)",
+        "--backend", type=str, choices=["haiku", "local", "atlas", "mixed"], default="mixed",
+        help="Description generation backend (default: mixed). Use 'atlas' for Atlas single-server.",
     )
     parser.add_argument(
         "--server-url-primary", type=str, default=None,
@@ -844,6 +874,10 @@ def main() -> None:
     parser.add_argument(
         "--server-url-fast", type=str, default=None,
         help="URL for the fast model server (default: VLLM_URL_FAST env or http://localhost:8091)",
+    )
+    parser.add_argument(
+        "--server-url-atlas", type=str, default=None,
+        help="URL for Atlas inference server (default: ATLAS_URL env or http://localhost:8888)",
     )
     # Deprecated aliases (kept for backwards compatibility)
     parser.add_argument("--llama-url-large", type=str, default=None, help=argparse.SUPPRESS)
@@ -901,6 +935,8 @@ def main() -> None:
             logger.warning("deprecated_arg", arg="--llama-url-tiny", use="--server-url-fast")
             url_fast = args.llama_url_tiny
         init_local_client(url_primary=url_primary, url_fast=url_fast)
+    elif args.backend == "atlas":
+        init_atlas_client(url=args.server_url_atlas)
 
     # Set up backend cycle for mixed mode
     backend_cycle: itertools.cycle | None = None

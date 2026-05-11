@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import hydra
 import numpy as np
@@ -90,6 +91,15 @@ def _find_completed_shard_batches(output_dir: Path) -> set[int]:
     return completed
 
 
+def _repo_hash_key(repo_path: Path, repos_path: Path) -> str:
+    rel = str(repo_path.relative_to(repos_path))
+    try:
+        head_sha = str(pygit2.Repository(str(repo_path)).head.target)
+    except Exception:
+        head_sha = "unknown"
+    return f"{rel}:{head_sha}"
+
+
 def _cap_commits(
     commits: list[ExtractedCommit],
     max_commits: int,
@@ -118,7 +128,15 @@ def _cap_commits(
 
 def _write_shard_atomic(shard_path: Path, rows: list[dict]) -> None:
     """Write a Parquet shard atomically via tmp+rename."""
-    table = pa.table({
+    table = _rows_to_table(rows) if rows else _empty_shard_table()
+
+    tmp_path = shard_path.with_suffix(".parquet.tmp")
+    pq.write_table(table, tmp_path, compression="zstd")
+    os.rename(tmp_path, shard_path)
+
+
+def _rows_to_table(rows: list[dict]) -> pa.Table:
+    return pa.table({
         "repo_path": pa.array([r["repo_path"] for r in rows], type=pa.string()),
         "sha": pa.array([r["sha"] for r in rows], type=pa.string()),
         "message": pa.array([r["message"] for r in rows], type=pa.string()),
@@ -137,9 +155,130 @@ def _write_shard_atomic(shard_path: Path, rows: list[dict]) -> None:
         ),
     })
 
-    tmp_path = shard_path.with_suffix(".parquet.tmp")
-    pq.write_table(table, tmp_path, compression="zstd")
-    os.rename(tmp_path, shard_path)
+
+def _empty_shard_table() -> pa.Table:
+    return pa.table({
+        "repo_path": pa.array([], type=pa.string()),
+        "sha": pa.array([], type=pa.string()),
+        "message": pa.array([], type=pa.string()),
+        "num_files": pa.array([], type=pa.int32()),
+        "file_paths": pa.array([], type=pa.list_(pa.string())),
+        "file_diff_tokens": pa.array([], type=pa.list_(pa.list_(pa.int32()))),
+        "full_commit_tokens": pa.array([], type=pa.list_(pa.int32())),
+    })
+
+
+class _StreamingShardWriter:
+    def __init__(self, shard_path: Path):
+        self.shard_path = shard_path
+        self.tmp_path = shard_path.with_suffix(".parquet.tmp")
+        self.writer: pq.ParquetWriter | None = None
+        self.num_rows = 0
+
+    def append(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        table = _rows_to_table(rows)
+        if self.writer is None:
+            self.writer = pq.ParquetWriter(
+                self.tmp_path,
+                table.schema,
+                compression="zstd",
+            )
+        self.writer.write_table(table)
+        self.num_rows += len(rows)
+
+    def close(self) -> int:
+        if self.writer is None:
+            pq.write_table(_empty_shard_table(), self.tmp_path, compression="zstd")
+        else:
+            self.writer.close()
+            self.writer = None
+        os.rename(self.tmp_path, self.shard_path)
+        return self.num_rows
+
+
+def _process_repo_for_encoding(
+    repo_dir: Path,
+    *,
+    tokenizer: object,
+    max_diff_tokens_per_file: int,
+    max_diff_tokens: int,
+    max_commits_per_repo: int,
+    extraction_walk_multiplier: int,
+    filter_config: CommitFilterConfig,
+    rng_seed: int,
+) -> tuple[list[dict], dict[str, int], str | None, bool]:
+    counters = {
+        "discarded_full": 0,
+        "files_skipped": 0,
+        "cross_file_only_filtered": 0,
+    }
+    try:
+        # Bound the expensive git walk itself. The old path extracted every
+        # qualifying commit in large repos, then kept only 200 after the fact.
+        # Oversample accepted commits and walked commits so the final cap still
+        # has room to find cross-file examples without mining the full history.
+        walk_multiplier = max(1, int(extraction_walk_multiplier))
+        commits = extract_commits(
+            str(repo_dir),
+            max_commits=max_commits_per_repo * walk_multiplier,
+            max_walked_commits=max_commits_per_repo * walk_multiplier,
+            config=filter_config,
+        )
+    except Exception:
+        log.warning("Failed to extract commits from %s", repo_dir, exc_info=True)
+        return [], counters, str(repo_dir), False
+
+    if not commits:
+        return [], counters, None, False
+
+    rng = random.Random(rng_seed)
+    commits = _cap_commits(commits, max_commits_per_repo, True, rng)
+
+    # Filter to cross-file only (num_files >= 2)
+    cross_file_commits = [c for c in commits if c.is_cross_file]
+    counters["cross_file_only_filtered"] += len(commits) - len(cross_file_commits)
+
+    rows: list[dict] = []
+    for commit in cross_file_commits:
+        # Tokenize full serialized commit (decoder target)
+        full_text = serialize_commit(commit)
+        full_tokens = tokenizer.encode(full_text, add_special_tokens=False)
+        if len(full_tokens) > max_diff_tokens:
+            counters["discarded_full"] += 1
+            continue
+
+        # Tokenize per-file diffs
+        file_paths: list[str] = []
+        file_diff_tokens: list[list[int]] = []
+        for path, file_hunks in zip(
+            commit.diff_paths, commit.diff_hunks, strict=True
+        ):
+            diff_text = f"--- {path}\n" + "\n".join(file_hunks)
+            file_tokens = tokenizer.encode(diff_text, add_special_tokens=False)
+            if len(file_tokens) > max_diff_tokens_per_file:
+                counters["files_skipped"] += 1
+                continue
+            file_paths.append(path)
+            file_diff_tokens.append(file_tokens)
+
+        # After file filtering, ensure we still have >= 2 files
+        if len(file_paths) < 2:
+            counters["discarded_full"] += 1
+            continue
+
+        rows.append({
+            "repo_path": commit.repo_path,
+            "sha": commit.sha,
+            "message": commit.message,
+            "num_files": len(file_paths),
+            "file_paths": file_paths,
+            "file_diff_tokens": file_diff_tokens,
+            "full_commit_tokens": full_tokens,
+        })
+
+    return rows, counters, None, True
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +293,9 @@ def process_commit_encoding(
     max_diff_tokens: int = 8192,
     max_commits_per_repo: int = 200,
     max_repos: int | None = None,
+    num_workers: int = 1,
+    extraction_walk_multiplier: int = 10,
+    verify_repo_list: bool = True,
     seed: int = 42,
     filter_config: CommitFilterConfig | None = None,
     tokenizer: object | None = None,
@@ -172,6 +314,11 @@ def process_commit_encoding(
         max_diff_tokens: Discard commits whose full serialized form exceeds this.
         max_commits_per_repo: Cap commits per repo.
         max_repos: Process at most this many repos.
+        num_workers: Number of repos to process concurrently within each shard.
+        extraction_walk_multiplier: Maximum accepted/walked commits per repo is
+            max_commits_per_repo multiplied by this value before final capping.
+        verify_repo_list: If True, verify existing shards against the current
+            repo list and HEAD SHAs before resuming.
         seed: Random seed for deterministic sampling.
         filter_config: Commit filter config. Uses defaults if None.
         tokenizer: Pre-loaded tokenizer instance. If None, loads from tokenizer_name.
@@ -190,22 +337,28 @@ def process_commit_encoding(
 
     if filter_config is None:
         filter_config = CommitFilterConfig()
+    num_workers = max(1, int(num_workers))
+    extraction_walk_multiplier = max(1, int(extraction_walk_multiplier))
 
     repo_paths = _collect_repo_paths(repos_path, max_repos, shuffle_seed=seed)
     log.info("Processing %d repos from %s", len(repo_paths), repos_dir)
 
     # Repo list hash for resume safety (includes HEAD SHA)
-    repo_keys = []
-    for p in repo_paths:
-        rel = str(p.relative_to(repos_path))
-        try:
-            head_sha = str(pygit2.Repository(str(p)).head.target)
-        except Exception:
-            head_sha = "unknown"
-        repo_keys.append(f"{rel}:{head_sha}")
-    repo_list_hash = hashlib.sha256("\n".join(repo_keys).encode()).hexdigest()[:16]
     repo_list_file = out_path / "repo_list_hash.txt"
-
+    if verify_repo_list:
+        if num_workers == 1:
+            repo_keys = [_repo_hash_key(p, repos_path) for p in repo_paths]
+        else:
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                repo_keys = list(
+                    executor.map(lambda p: _repo_hash_key(p, repos_path), repo_paths),
+                )
+        repo_list_hash = hashlib.sha256("\n".join(repo_keys).encode()).hexdigest()[:16]
+    elif repo_list_file.exists():
+        repo_list_hash = repo_list_file.read_text().strip()
+    else:
+        repo_keys = [str(p.relative_to(repos_path)) for p in repo_paths]
+        repo_list_hash = hashlib.sha256("\n".join(repo_keys).encode()).hexdigest()[:16]
     completed_batches: set[int] = set()
     if repo_list_file.exists():
         saved_hash = repo_list_file.read_text().strip()
@@ -262,74 +415,75 @@ def process_commit_encoding(
             total_repos_skipped += len(batch_repos)
             continue
 
-        shard_rows: list[dict] = []
         failed_repos: list[str] = []
-        batch_rng = random.Random(seed + batch_idx)
-
-        for repo_dir in batch_repos:
-            try:
-                commits = extract_commits(str(repo_dir), config=filter_config)
-            except Exception:
-                log.warning("Failed to extract commits from %s", repo_dir, exc_info=True)
-                failed_repos.append(str(repo_dir))
-                continue
-
-            if not commits:
-                continue
-
-            # Cap commits per repo with cross-file preference
-            commits = _cap_commits(commits, max_commits_per_repo, True, batch_rng)
-
-            # Filter to cross-file only (num_files >= 2)
-            cross_file_commits = [c for c in commits if c.is_cross_file]
-            total_cross_file_only_filtered += len(commits) - len(cross_file_commits)
-
-            for commit in cross_file_commits:
-                # Tokenize full serialized commit (decoder target)
-                full_text = serialize_commit(commit)
-                full_tokens = tokenizer.encode(full_text, add_special_tokens=False)
-                if len(full_tokens) > max_diff_tokens:
-                    total_discarded_full += 1
-                    continue
-
-                # Tokenize per-file diffs
-                file_paths: list[str] = []
-                file_diff_tokens: list[list[int]] = []
-                for path, file_hunks in zip(
-                    commit.diff_paths, commit.diff_hunks, strict=True
-                ):
-                    diff_text = f"--- {path}\n" + "\n".join(file_hunks)
-                    file_tokens = tokenizer.encode(diff_text, add_special_tokens=False)
-                    if len(file_tokens) > max_diff_tokens_per_file:
-                        total_files_skipped += 1
-                        continue
-                    file_paths.append(path)
-                    file_diff_tokens.append(file_tokens)
-
-                # After file filtering, ensure we still have >= 2 files
-                if len(file_paths) < 2:
-                    total_discarded_full += 1
-                    continue
-
-                shard_rows.append({
-                    "repo_path": commit.repo_path,
-                    "sha": commit.sha,
-                    "message": commit.message,
-                    "num_files": len(file_paths),
-                    "file_paths": file_paths,
-                    "file_diff_tokens": file_diff_tokens,
-                    "full_commit_tokens": full_tokens,
-                })
-
-            total_repos_processed += 1
-
         shard_path = out_path / f"shard_{batch_idx:05d}.parquet"
-        _write_shard_atomic(shard_path, shard_rows)
-        total_commits += len(shard_rows)
+        shard_writer = _StreamingShardWriter(shard_path)
+        tasks = [
+            (
+                repo_dir,
+                {
+                    "tokenizer": tokenizer,
+                    "max_diff_tokens_per_file": max_diff_tokens_per_file,
+                    "max_diff_tokens": max_diff_tokens,
+                    "max_commits_per_repo": max_commits_per_repo,
+                    "extraction_walk_multiplier": extraction_walk_multiplier,
+                    "filter_config": filter_config,
+                    "rng_seed": seed + batch_idx * REPOS_PER_SHARD + repo_idx,
+                },
+            )
+            for repo_idx, repo_dir in enumerate(batch_repos)
+        ]
+        try:
+            if num_workers == 1:
+                result_iter = (
+                    _process_repo_for_encoding(repo_dir, **kwargs)
+                    for repo_dir, kwargs in tasks
+                )
+                for rows, counters, failed_repo, processed in result_iter:
+                    shard_writer.append(rows)
+                    total_discarded_full += counters["discarded_full"]
+                    total_files_skipped += counters["files_skipped"]
+                    total_cross_file_only_filtered += counters[
+                        "cross_file_only_filtered"
+                    ]
+                    if failed_repo is not None:
+                        failed_repos.append(failed_repo)
+                    if processed:
+                        total_repos_processed += 1
+            else:
+                with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    futures = [
+                        executor.submit(
+                            _process_repo_for_encoding,
+                            repo_dir,
+                            **kwargs,
+                        )
+                        for repo_dir, kwargs in tasks
+                    ]
+                    for future in as_completed(futures):
+                        rows, counters, failed_repo, processed = future.result()
+                        shard_writer.append(rows)
+                        total_discarded_full += counters["discarded_full"]
+                        total_files_skipped += counters["files_skipped"]
+                        total_cross_file_only_filtered += counters[
+                            "cross_file_only_filtered"
+                        ]
+                        if failed_repo is not None:
+                            failed_repos.append(failed_repo)
+                        if processed:
+                            total_repos_processed += 1
+            shard_num_rows = shard_writer.close()
+        except Exception:
+            if shard_writer.writer is not None:
+                shard_writer.writer.close()
+            if shard_writer.tmp_path.exists():
+                shard_writer.tmp_path.unlink()
+            raise
+        total_commits += shard_num_rows
 
         meta_path = out_path / f"shard_{batch_idx:05d}.meta.json"
         meta_path.write_text(json.dumps({
-            "num_rows": len(shard_rows),
+            "num_rows": shard_num_rows,
             "failed_repos": failed_repos,
         }))
 
@@ -396,12 +550,17 @@ def main(cfg: DictConfig) -> None:
 
     log.info(
         "Starting commit encoding pipeline: tokenizer=%s, output=%s, "
-        "max_diff_tokens_per_file=%d, max_diff_tokens=%d, max_commits_per_repo=%d",
+        "max_diff_tokens_per_file=%d, max_diff_tokens=%d, "
+        "max_commits_per_repo=%d, num_workers=%d, "
+        "extraction_walk_multiplier=%d, verify_repo_list=%s",
         enc_cfg.tokenizer_name,
         enc_cfg.output_dir,
         enc_cfg.max_diff_tokens_per_file,
         enc_cfg.max_diff_tokens,
         enc_cfg.max_commits_per_repo,
+        enc_cfg.get("num_workers", 1),
+        enc_cfg.get("extraction_walk_multiplier", 10),
+        enc_cfg.get("verify_repo_list", True),
     )
 
     stats = process_commit_encoding(
@@ -412,6 +571,9 @@ def main(cfg: DictConfig) -> None:
         max_diff_tokens=enc_cfg.max_diff_tokens,
         max_commits_per_repo=enc_cfg.max_commits_per_repo,
         max_repos=enc_cfg.max_repos,
+        num_workers=enc_cfg.get("num_workers", 1),
+        extraction_walk_multiplier=enc_cfg.get("extraction_walk_multiplier", 10),
+        verify_repo_list=enc_cfg.get("verify_repo_list", True),
         seed=cfg.seed,
         filter_config=filter_config,
     )

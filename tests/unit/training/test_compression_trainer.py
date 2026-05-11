@@ -11,17 +11,16 @@ tests remain skipped — they need multi-level L0 → L1 packing + the
 
 from __future__ import annotations
 
+import copy
+from pathlib import Path
+from unittest.mock import patch
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from pathlib import Path
-from unittest.mock import patch
-
 from omegaconf import OmegaConf
 from torch import nn
-
-import copy
 
 from bgkit.data.collators import _collate_file_samples
 from bgkit.data.datasets.compression_dataset import FileCompressionSample
@@ -683,3 +682,49 @@ class TestResolveStep1Checkpoint:
         result = trainer._resolve_step1_checkpoint()
         assert result is None
         assert "step1" not in trainer._input_sources
+
+    def test_falcon_l0_auto_prefers_forced_adapt_then_dense_seed(self, trainer):
+        trainer.cfg = OmegaConf.merge(trainer.cfg, {
+            "training": {"phase": "phase1_falcon_l0"},
+            "step1_checkpoint": "auto",
+            "checkpoint_dir": "/tmp/ckpts",
+        })
+
+        dense_path = Path("/tmp/ckpts/phase1_falcon_dense_seed_step4000_20260501")
+        with patch(
+            "bgkit.training.phase1.compression.resolve_checkpoint",
+            side_effect=[
+                ValueError("no forced adapt"),
+                dense_path,
+            ],
+        ) as mock_resolve:
+            result = trainer._resolve_step1_checkpoint()
+
+        assert result == str(dense_path)
+        assert [call.kwargs["phase"] for call in mock_resolve.call_args_list] == [
+            "phase1_falcon_forced_adapt",
+            "phase1_falcon_dense_seed",
+        ]
+        assert trainer._input_sources["step1"] == dense_path.name
+
+    def test_falcon_l1_auto_resolves_l0_stage(self, trainer):
+        trainer.cfg = OmegaConf.merge(trainer.cfg, {
+            "training": {"phase": "phase1_falcon_l1"},
+            "step1_checkpoint": "auto",
+            "checkpoint_dir": "/tmp/ckpts",
+        })
+
+        l0_path = Path("/tmp/ckpts/phase1_falcon_l0_step12000_20260501")
+        with patch(
+            "bgkit.training.phase1.compression.resolve_checkpoint",
+            return_value=l0_path,
+        ) as mock_resolve:
+            result = trainer._resolve_step1_checkpoint()
+
+        mock_resolve.assert_called_once_with(
+            Path("/tmp/ckpts"),
+            phase="phase1_falcon_l0",
+            metric="eval/loss",
+            label="step1_checkpoint",
+        )
+        assert result == str(l0_path)

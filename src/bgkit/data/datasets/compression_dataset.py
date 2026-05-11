@@ -25,6 +25,7 @@ from bgkit.data.chat_template import (
     select_variant,
     tokenize_with_sentinel,
 )
+from bgkit.data.datasets.tokenizer_compat import assert_subset_tokenizers_compatible
 
 logger = logging.getLogger(__name__)
 
@@ -212,17 +213,48 @@ class DataReconstructionSubset(Dataset):
         variant_bank: list[dict[str, str]],
         config: ChatTemplateConfig,
         seed: int = 42,
+        encoder_tokenizer=None,
     ):
         self._token_ds = token_dataset
         self._tokenizer = tokenizer
+        self._encoder_tokenizer = encoder_tokenizer or tokenizer
         self._variants = variant_bank
         self._config = config
         self._base_seed = seed
         self._epoch_seed = seed
 
+        # When a Falcon companion is loaded, drop chunks that the converter
+        # marked pathological / alignment-skipped — they remain
+        # ``__getitem__``-addressable on MmapTokenDataset with zero falcon
+        # tokens or zero forced survivors, which would feed an empty target
+        # into the decoder. ``companion_valid_indices`` returns None when no
+        # companion is loaded, in which case every chunk is valid.
+        valid_indices = getattr(token_dataset, "companion_valid_indices", None)
+        self._valid_indices = (
+            np.asarray(valid_indices, dtype=np.int64)
+            if valid_indices is not None
+            else None
+        )
+
         # Precompute max template overhead for length estimates
         self._max_overhead = _compute_max_overhead(tokenizer, variant_bank, config)
-        self._cached_lengths = self._token_ds.lengths + self._max_overhead
+        content_lengths = np.asarray(self._token_ds.lengths, dtype=np.int64)
+        decoder_lengths = np.asarray(
+            getattr(self._token_ds, "decoder_lengths", content_lengths),
+            dtype=np.int64,
+        )
+        if self._valid_indices is not None:
+            content_lengths = content_lengths[self._valid_indices]
+            decoder_lengths = decoder_lengths[self._valid_indices]
+        self._cached_content_lengths = content_lengths
+        self._cached_lengths = np.maximum(content_lengths, decoder_lengths) + (
+            self._max_overhead
+        )
+
+    def _inner_index(self, idx: int) -> int:
+        if self._valid_indices is None:
+            return int(idx)
+        return int(self._valid_indices[idx])
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch_seed = self._base_seed + epoch
@@ -230,19 +262,26 @@ class DataReconstructionSubset(Dataset):
     def token_length(self, idx: int) -> int:
         return int(self._cached_lengths[idx])
 
+    def content_token_length(self, idx: int) -> int:
+        return int(self._cached_content_lengths[idx])
+
     def __len__(self) -> int:
+        if self._valid_indices is not None:
+            return int(self._valid_indices.size)
         return len(self._token_ds)
 
     def __getitem__(self, idx: int) -> FileCompressionSample:
-        inner = self._token_ds[idx]
+        inner = self._token_ds[self._inner_index(idx)]
         content_ids = inner["token_ids"]
+        decoder_content_ids = inner.get("decoder_content_token_ids", content_ids)
         file_path = inner.get("file_path", "unknown.txt")
         language = inner.get("language", "")
 
         variant = select_variant(self._variants, idx, self._epoch_seed)
         result = tokenize_with_sentinel(
             self._tokenizer, variant, self._config,
-            file_path, language, content_ids,
+            file_path, language, decoder_content_ids,
+            encoder_tokenizer=self._encoder_tokenizer,
         )
 
         content_mask = torch.ones(content_ids.size(0), dtype=torch.bool)
@@ -281,11 +320,19 @@ class DescriptionSubset(Dataset):
         max_files_per_repo: int = DEFAULT_MAX_FILES_PER_REPO,
         max_tokens_per_file: int = DEFAULT_MAX_TOKENS_PER_FILE,
         repo_description_dataset=None,
+        encoder_tokenizer=None,
     ):
         self._token_ds = token_dataset
         self._desc_ds = description_dataset
         self._repo_desc_ds = repo_description_dataset
         self._tokenizer = tokenizer
+        self._encoder_tokenizer = encoder_tokenizer or tokenizer
+        assert_subset_tokenizers_compatible(
+            subset_name="DescriptionSubset",
+            encoder_tokenizer=self._encoder_tokenizer,
+            decoder_tokenizer=self._tokenizer,
+            objective="description_generation",
+        )
         self._variants = variant_bank
         self._config = config
         self._base_seed = seed
@@ -399,6 +446,7 @@ class DescriptionSubset(Dataset):
             result = tokenize_with_sentinel(
                 self._tokenizer, variant, self._config,
                 file_path, language, desc_ids,
+                encoder_tokenizer=self._encoder_tokenizer,
             )
 
             content_mask = torch.ones(content_ids.size(0), dtype=torch.bool)
@@ -448,6 +496,7 @@ class DescriptionSubset(Dataset):
             result = tokenize_with_sentinel(
                 self._tokenizer, variant, self._config,
                 rp, "", desc_ids,
+                encoder_tokenizer=self._encoder_tokenizer,
             )
         else:
             # Fallback to file-level description
@@ -456,6 +505,7 @@ class DescriptionSubset(Dataset):
             result = tokenize_with_sentinel(
                 self._tokenizer, variant, self._config,
                 file_path, language, desc_ids,
+                encoder_tokenizer=self._encoder_tokenizer,
             )
 
         return RepoCompressionSample(
@@ -492,10 +542,18 @@ class StructuralSubset(Dataset):
         seed: int = 42,
         max_files_per_repo: int = DEFAULT_MAX_FILES_PER_REPO,
         max_tokens_per_file: int = DEFAULT_MAX_TOKENS_PER_FILE,
+        encoder_tokenizer=None,
     ):
         self._token_ds = token_dataset
         self._struct_ds = structural_dataset
         self._tokenizer = tokenizer
+        self._encoder_tokenizer = encoder_tokenizer or tokenizer
+        assert_subset_tokenizers_compatible(
+            subset_name="StructuralSubset",
+            encoder_tokenizer=self._encoder_tokenizer,
+            decoder_tokenizer=self._tokenizer,
+            objective="structural_relational",
+        )
         self._variants = variant_bank
         self._config = config
         self._base_seed = seed
@@ -611,6 +669,7 @@ class StructuralSubset(Dataset):
         result = tokenize_with_sentinel(
             self._tokenizer, variant, self._config,
             file_path, language, struct_ids,
+            encoder_tokenizer=self._encoder_tokenizer,
         )
 
         if not self._l1_enabled:
@@ -682,9 +741,17 @@ class CommitReproSubset(Dataset):
         variant_bank: list[dict[str, str]],
         config: ChatTemplateConfig,
         seed: int = 42,
+        encoder_tokenizer=None,
     ):
         self._commit_ds = commit_dataset
         self._tokenizer = tokenizer
+        self._encoder_tokenizer = encoder_tokenizer or tokenizer
+        assert_subset_tokenizers_compatible(
+            subset_name="CommitReproSubset",
+            encoder_tokenizer=self._encoder_tokenizer,
+            decoder_tokenizer=self._tokenizer,
+            objective="commit_reproduction",
+        )
         self._variants = variant_bank
         self._config = config
         self._base_seed = seed
@@ -714,6 +781,7 @@ class CommitReproSubset(Dataset):
         result = tokenize_with_sentinel(
             self._tokenizer, variant, self._config,
             "commit", "", commit_ids,
+            encoder_tokenizer=self._encoder_tokenizer,
         )
 
         # Commit reproduction uses the commit tokens as a single "file"
@@ -780,22 +848,29 @@ class CompressionDataset(Dataset):
 
     def _build_index(self) -> None:
         """Compute sub-dataset sizes proportional to weights and build offset table."""
-        total_natural = sum(len(self._subsets[k]) for k in self._subsets)
-        if total_natural == 0:
+        total_available = sum(len(self._subsets[k]) for k in self._subsets)
+        if total_available == 0:
             self._offsets = [0]
             self._objective_order = []
             self._effective_sizes = []
             return
 
-        # Normalize weights for present objectives only (skip empty subsets)
+        # Normalize weights for present objectives only. Explicitly zero or
+        # omitted objectives are skipped; they must not leak a minimum sample
+        # into decoder-family-specific runs such as Falcon data reconstruction.
         present_keys = [k for k in self.OBJECTIVE_ORDER
-                        if k in self._subsets and len(self._subsets[k]) > 0]
+                        if (
+                            k in self._subsets
+                            and len(self._subsets[k]) > 0
+                            and self._weights.get(k, 0.0) > 0.0
+                        )]
         weight_sum = sum(self._weights.get(k, 0.0) for k in present_keys)
         if weight_sum == 0:
             weight_sum = 1.0
 
-        # Target total size = total natural size (maintain overall dataset size)
-        target_total = total_natural
+        # Target total size = included natural size. Zero-weight objectives
+        # should not affect sampling composition or epoch length.
+        target_total = sum(len(self._subsets[k]) for k in present_keys)
         target_sizes: dict[str, int] = {}
         for k in present_keys:
             w = self._weights.get(k, 0.0) / weight_sum
@@ -817,16 +892,20 @@ class CompressionDataset(Dataset):
         tokenizer,
         seed: int = 42,
         objective_weights: dict[str, float] | None = None,
+        encoder_tokenizer=None,
     ) -> CompressionDataset:
         """Factory: build from config, loading all sub-datasets.
 
         Args:
             cfg: The ``data:`` section of the training config (contains
                 file_tokens_path, etc.).
-            tokenizer: HuggingFace tokenizer for chat template encoding.
+            tokenizer: HuggingFace tokenizer for decoder-side chat template encoding.
             seed: Random seed.
             objective_weights: Objective weight dict (from ``training.objectives``
                 in the YAML). Falls back to DEFAULT_WEIGHTS if None.
+            encoder_tokenizer: Optional tokenizer for encoder-side compression
+                prompts. Defaults to ``tokenizer`` when encoder and decoder
+                token families match.
         """
         from bgkit.data.datasets.commit_repro_dataset import CommitReproDataset
         from bgkit.data.datasets.description_dataset import (
@@ -838,6 +917,7 @@ class CompressionDataset(Dataset):
 
         subsets: dict[str, Dataset] = {}
         weights = objective_weights or cls.DEFAULT_WEIGHTS
+        encoder_tokenizer = encoder_tokenizer or tokenizer
 
         variant_banks: dict[str, list] = {}
         variant_dir = getattr(cfg, "prompt_variants_dir", None)
@@ -875,6 +955,11 @@ class CompressionDataset(Dataset):
         token_ds = None
 
         file_tokens_path = getattr(cfg, "file_tokens_path", None)
+        companion_dir = getattr(cfg, "falcon_companion_dir", None) or getattr(
+            cfg,
+            "companion_dir",
+            None,
+        )
         if file_tokens_path and Path(file_tokens_path).exists():
             try:
                 token_ds = MmapTokenDataset(
@@ -882,6 +967,7 @@ class CompressionDataset(Dataset):
                     max_seq_len=max_seq_len,
                     include_metadata=True,
                     require_commit_sha=True,
+                    companion_dir=companion_dir,
                 )
             except (FileNotFoundError, ValueError) as e:
                 logger.warning("Could not load token dataset: %s", e)
@@ -914,6 +1000,7 @@ class CompressionDataset(Dataset):
                 token_ds, tokenizer,
                 variant_banks.get("file_read_repro", _DEFAULT_VARIANT_BANKS["file_read_repro"]),
                 config, seed=seed,
+                encoder_tokenizer=encoder_tokenizer,
             )
 
         # Objective 2: Description generation
@@ -946,6 +1033,7 @@ class CompressionDataset(Dataset):
                     variant_banks.get("description_gen", _DEFAULT_VARIANT_BANKS["description_gen"]),
                     config, seed=seed,
                     repo_description_dataset=repo_desc_ds,
+                    encoder_tokenizer=encoder_tokenizer,
                 )
             except (FileNotFoundError, ValueError) as e:
                 logger.warning("Could not load description dataset: %s", e)
@@ -963,6 +1051,7 @@ class CompressionDataset(Dataset):
                         _DEFAULT_VARIANT_BANKS["structural_repro"],
                     ),
                     config, seed=seed,
+                    encoder_tokenizer=encoder_tokenizer,
                 )
             except (FileNotFoundError, ValueError) as e:
                 logger.warning("Could not load structural dataset: %s", e)
@@ -977,6 +1066,7 @@ class CompressionDataset(Dataset):
                     commit_ds, tokenizer,
                     variant_banks.get("commit_repro", _DEFAULT_VARIANT_BANKS["commit_repro"]),
                     config, seed=seed,
+                    encoder_tokenizer=encoder_tokenizer,
                 )
             except (FileNotFoundError, ValueError) as e:
                 logger.warning("Could not load commit dataset: %s", e)
@@ -992,7 +1082,11 @@ class CompressionDataset(Dataset):
 
                 qa_ds = MmapQAConditionedDataset(qa_path, max_seq_len=2048)
                 subsets["query_conditioned"] = QAConditionedSubset(
-                    token_ds, qa_ds, tokenizer, seed=seed,
+                    token_ds,
+                    qa_ds,
+                    tokenizer,
+                    seed=seed,
+                    encoder_tokenizer=encoder_tokenizer,
                 )
             except (FileNotFoundError, ValueError) as e:
                 logger.warning("Could not load QA conditioned dataset: %s", e)
@@ -1040,6 +1134,8 @@ class CompressionDataset(Dataset):
         """
         obj_name, local_idx = self._map_index(idx)
         subset = self._subsets[obj_name]
+        if hasattr(subset, "content_token_length"):
+            return int(subset.content_token_length(local_idx))
         overhead = getattr(subset, "_max_overhead", 0)
         return max(0, self.token_length(idx) - int(overhead))
 

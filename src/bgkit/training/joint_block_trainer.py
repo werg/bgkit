@@ -31,11 +31,15 @@ from bgkit.data.chat_template import (
 from bgkit.data.collators import collate_token_ids
 from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
 from bgkit.data.samplers import PackedTokenBudgetSampler
+from bgkit.models.decoder import normalize_decoder_family
 from bgkit.models.encoder import BgKITEncoder, _resolve_layers
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpointing import CheckpointMetadata, save_checkpoint
 from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
-from bgkit.utils.attention_backend import resolve_attention_implementation
+from bgkit.utils.attention_backend import (
+    resolve_attention_implementation,
+    resolve_decoder_attention_implementation,
+)
 from bgkit.utils.model_utils import count_parameters, slerp_merge
 from bgkit.utils.packing import position_ids_from_cu
 
@@ -82,6 +86,13 @@ class JointBlockTrainer(BaseTrainer):
         attention_impl = resolve_attention_implementation(
             self.cfg.compute.get("attention_implementation", "auto")
         )
+        decoder_family = normalize_decoder_family(
+            self.cfg.model.decoder.get("family", "qwen35")
+        )
+        decoder_attention_impl = resolve_decoder_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto"),
+            decoder_family=decoder_family,
+        )
 
         # Load backbone
         backbone_name = self.cfg.model.bgkit.backbone_name
@@ -108,7 +119,7 @@ class JointBlockTrainer(BaseTrainer):
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
                 revision=decoder_revision,
-                attn_implementation=attention_impl,
+                attn_implementation=decoder_attention_impl,
             )
 
             sd_a = backbone.state_dict()
@@ -149,7 +160,7 @@ class JointBlockTrainer(BaseTrainer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=decoder_revision,
-            attn_implementation=attention_impl,
+            attn_implementation=decoder_attention_impl,
         )
         self.decoder_embed = decoder_model.get_input_embeddings()
         self.decoder_embed.requires_grad_(False)
@@ -201,7 +212,7 @@ class JointBlockTrainer(BaseTrainer):
         )
 
         max_batch_tokens = tcfg.get("max_batch_tokens", 65536)
-        # Eval defaults to 2× train budget (no backward → lower peak at
+        # Eval defaults to 2x train budget (no backward -> lower peak at
         # same budget). Overridable via training.max_batch_tokens_eval.
         max_batch_tokens_eval = self._resolve_eval_batch_budget(tcfg, max_batch_tokens)
         num_workers = self.cfg.compute.get("num_workers", 4)

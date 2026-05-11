@@ -76,6 +76,21 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu13torch26.02cxx11abiTRUE-cp312-cp312-linux_aarch64.whl"
 
+# mamba-ssm: install the Python/Triton package after causal-conv1d is present.
+# Falcon-H1's Transformers fast path imports Triton functions from mamba_ssm
+# plus causal_conv1d_fn/update. We intentionally skip mamba_ssm's own CUDA
+# extension build here: its setup.py currently compiles every CUDA 13 arch on
+# aarch64, which is slow and memory-heavy, while Falcon-H1 does not use that
+# selective_scan_cuda extension in the HF path.
+#
+# Do not install Hugging Face's `kernels` package in this image yet. On NGC
+# 26.03 / torch 2.11 / CUDA 13 / aarch64, the current kernels-community
+# mamba-ssm artifact fails at import with an undefined c10 CUDAStream symbol.
+# Leaving `kernels` absent makes Transformers use the local mamba_ssm +
+# causal-conv1d route instead.
+RUN MAMBA_SKIP_CUDA_BUILD=TRUE \
+    pip install --no-cache-dir --no-build-isolation --no-deps "mamba-ssm==2.3.2.post1"
+
 # Verify key deps are importable and that the cutlass-dsl install-order fight
 # left libs-base's `_nvvm_ops_gen.py` shim on disk (FA4 atomic_add_fp32 also
 # handles the libs-cu13 shim via try/except, so this is a fail-loud guardrail,
@@ -96,7 +111,11 @@ RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/li
     LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
     python -c "import importlib.metadata as m; print(f'tilelang {m.version(\"tilelang\")}, apache-tvm-ffi {m.version(\"apache-tvm-ffi\")}')" && \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
-    python -c "from causal_conv1d import causal_conv1d_fn; print('causal_conv1d OK')" && \
+    python -c "from cut_cross_entropy import linear_cross_entropy; print('cut_cross_entropy OK')" && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+    python -c "from causal_conv1d import causal_conv1d_fn, causal_conv1d_update; print('causal_conv1d OK')" && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+    python -c "from mamba_ssm.ops.triton.selective_state_update import selective_state_update; from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined; print('mamba_ssm Falcon-H1 Triton ops OK')" && \
     LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
     python -c "from cutlass._mlir.dialects import nvvm; import inspect; params = list(inspect.signature(nvvm.atomicrmw).parameters); print(f'cutlass-dsl atomicrmw first param: {params[0]!r}'); assert params[0] in ('res', 'op'), f'unrecognized atomicrmw signature: {params}'"
 

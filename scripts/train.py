@@ -45,6 +45,12 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.projection_repair import ProjectionRepairTrainer
 
         return ProjectionRepairTrainer(cfg)
+    elif phase in ("phase1_falcon_dense_seed", "phase1_falcon_forced_adapt"):
+        from bgkit.training.phase1.projection_seed_falcon import (
+            FalconProjectionSeedTrainer,
+        )
+
+        return FalconProjectionSeedTrainer(cfg)
     elif phase == "phase1_step3":
         # Pruned reconstruction with compression curriculum (post Step 2.5).
         from bgkit.training.phase1.decoder_init import DecoderInitTrainer
@@ -78,7 +84,7 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.commit_encoding import CommitEncodingTrainer
 
         return CommitEncodingTrainer(cfg)
-    elif phase == "phase1_step6":
+    elif phase in ("phase1_step6", "phase1_falcon_l0", "phase1_falcon_l1"):
         from bgkit.training.phase1.compression import CompressionTrainer
 
         return CompressionTrainer(cfg)

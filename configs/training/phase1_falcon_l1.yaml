@@ -1,0 +1,88 @@
+phase: phase1_falcon_l1
+optimizer: muon
+max_steps: 20000
+lr: 6.0e-5
+warmup_steps: 500
+bidi_warmup_steps: 0
+max_batch_tokens: 6144
+gradient_accumulation_steps: 8
+min_sample_length: 256
+max_sample_length: 800
+max_eval_samples: 1000
+eval_every: 2000
+save_every: 10000
+
+sampler:
+  # Falcon companion mmaps expose decoder-token lengths directly, so keep the
+  # multiplier at 1.0 and spend memory with a larger token budget instead.
+  cost_multiplier: 1.0
+  eval_cost_multiplier: 1.0
+
+objectives:
+  data_reconstruction: 1.0
+
+target_ratio_start: 0.10
+target_ratio_end: 0.10
+target_ratio_ramp_steps: 1
+sample_target_ratio_during_training: true
+target_ratio_sampling_mode: window
+target_ratio_sampling_window_above: 0.10
+target_ratio_anchor_sampling_prob: 0.0
+l1_introduction_step: 0
+
+survivorship:
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.05
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+
+ice_distillation:
+  l0:
+    enabled: false
+  l1:
+    enabled: false
+
+moment_match_reference:
+  l0:
+    path: ${oc.env:DATA_DIR}/diagnostics/ice_reference_moments.json
+  l1:
+    path: null
+
+decoder_lora:
+  # Falcon-H1 Tiny is small enough to full-finetune, and PEFT LoRA rejects
+  # Falcon/Mamba targets such as out_proj. Keep decoder LoRA off for Falcon.
+  enabled: false
+  implementation: peft
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  peft_fused_backward: true
+
+freeze:
+  bgkit: false
+  decoder: false
+
+data:
+  file_tokens_path: ${oc.env:DATA_DIR}/processed/tokens
+  falcon_companion_dir: ${oc.env:DATA_DIR}/processed/tokens_falcon_h1
+  prompt_variants_dir: configs/prompt_variants
+
+model:
+  decoder:
+    family: falcon_h1
+    backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+    hidden_dim: 512

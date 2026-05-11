@@ -69,6 +69,7 @@ def _get_diff_paths_and_hunks(
 def extract_commits(
     repo_path: str,
     max_commits: int | None = None,
+    max_walked_commits: int | None = None,
     config: CommitFilterConfig | None = None,
 ) -> list[ExtractedCommit]:
     """Extract and filter commits from a git repo.
@@ -76,6 +77,8 @@ def extract_commits(
     Args:
         repo_path: Path to the git repo.
         max_commits: Maximum number of commits to extract.
+        max_walked_commits: Maximum number of commits to inspect before
+            stopping, including commits rejected by filters.
         config: Filter configuration. Uses defaults if None.
 
     Returns:
@@ -93,8 +96,12 @@ def extract_commits(
 
     results = []
     count = 0
+    walked = 0
 
     for commit in repo.walk(head_oid, pygit2.GIT_SORT_TOPOLOGICAL):
+        walked += 1
+        if max_walked_commits is not None and walked > max_walked_commits:
+            break
 
         # Skip merges
         if config.exclude_merges and len(commit.parents) > 1:

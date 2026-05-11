@@ -161,6 +161,14 @@ def test_handle_max_batch_tokens_updates_budget():
     assert t.train_sampler._max_batch_tokens == 30000
 
 
+def test_handle_max_batch_tokens_preserves_sampler_cost_multiplier():
+    """Train rebuild keeps decoder-aware sampler cost settings."""
+    t = _make_trainer(budget=50000)
+    t._sampler_cost_multiplier = 1.75
+    t._handle_max_batch_tokens(30000)
+    assert t.train_sampler._cost_multiplier == 1.75
+
+
 def test_handle_max_batch_tokens_rebuilds_dataloader():
     """Rebuilt dataloader can be iterated and yields non-empty batches."""
     t = _make_trainer(n=20, default_len=100, budget=50000)
@@ -242,6 +250,15 @@ def test_handle_max_batch_tokens_eval_updates_budget():
     t.setup()
     t._handle_max_batch_tokens_eval(40000)
     assert t._max_batch_tokens_eval == 40000
+
+
+def test_handle_max_batch_tokens_eval_preserves_sampler_cost_multiplier():
+    """Eval rebuild keeps its independent sampler cost setting."""
+    t = _MinimalTrainer([100] * 20, budget=50000, budget_eval=80000)
+    t.setup()
+    t._sampler_eval_cost_multiplier = 2.25
+    t._handle_max_batch_tokens_eval(40000)
+    assert t.eval_dataloader.batch_sampler._cost_multiplier == 2.25
 
 
 def test_handle_max_batch_tokens_eval_rebuilds_eval_dataloader():

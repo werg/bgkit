@@ -20,6 +20,8 @@ commits:
     output_dir: ${oc.env:DATA_DIR}/processed/commit_reproduction
     max_commits_per_repo: 200
     max_repos: null
+    num_workers: 1
+    verify_repo_list: true
     tokenizer_name: Qwen/Qwen3.5-0.8B
   # Commit encoding data: per-file diffs + full commit for two-level compression
   commit_encoding:
@@ -30,3 +32,13 @@ commits:
     max_diff_tokens: 8192
     max_commits_per_repo: 200
     max_repos: null
+    # Repo-level preprocessing parallelism. This is a thread pool inside each
+    # 100-repo shard, so tokenizer state is shared and no dataloader-style fork
+    # memory blowup occurs.
+    num_workers: 8
+    # Bound the expensive git history walk before the final per-repo cap.
+    # 10x keeps room to find cross-file commits without mining full histories.
+    extraction_walk_multiplier: 10
+    # Resume speed: trust the saved repo_list_hash.txt unless explicitly
+    # rebuilding after repo corpus changes.
+    verify_repo_list: false

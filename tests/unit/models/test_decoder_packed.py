@@ -101,6 +101,49 @@ class MockCausalLM(nn.Module):
         return type("_LMOut", (), {"last_hidden_state": out.last_hidden_state})()
 
 
+class _StatefulInnerModel(nn.Module):
+    """Toy stateful sequence mixer.
+
+    It deliberately accumulates along the sequence axis. Flattening multiple
+    samples into one row makes later samples depend on earlier samples, while
+    a padded batch keeps state independent per row.
+    """
+
+    def __init__(self, vocab_size: int, hidden_dim: int):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_dim)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
+
+    def forward(
+        self,
+        input_ids=None,
+        inputs_embeds=None,
+        attention_mask=None,
+        **kwargs,
+    ) -> _ModelOut:
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+        if attention_mask is not None:
+            inputs_embeds = inputs_embeds * attention_mask.to(inputs_embeds.dtype).unsqueeze(-1)
+        return _ModelOut(last_hidden_state=torch.cumsum(inputs_embeds, dim=1))
+
+
+class StatefulCausalLM(nn.Module):
+    def __init__(self, vocab_size: int = VOCAB_SIZE, hidden_dim: int = HIDDEN_DIM):
+        super().__init__()
+        self.model = _StatefulInnerModel(vocab_size, hidden_dim)
+        self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
+    def forward(self, inputs_embeds=None, attention_mask=None, **kwargs):
+        out = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        return type("_LMOut", (), {"last_hidden_state": out.last_hidden_state})()
+
+
 # ---------------------------------------------------------------------------
 # Helper: convert padded (B, K_max, D) survivors to packed form
 # ---------------------------------------------------------------------------
@@ -294,6 +337,48 @@ class TestPackedForwardParity:
         assert torch.isfinite(loss_a)
         assert torch.isfinite(loss_b)
 
+    def test_packed_target_splice_matches_single_splice_api(self, decoder):
+        """Trainer-facing packed target API matches the list-based API."""
+
+        torch.manual_seed(23)
+        target_rows = [
+            torch.tensor([1, 2, 99, 7, 8], dtype=torch.long),
+            torch.tensor([3, 4, 88, 9], dtype=torch.long),
+        ]
+        target_ids_flat = torch.cat(target_rows, dim=0)
+        target_cu = torch.tensor([0, 5, 9], dtype=torch.int32)
+        splice_start = torch.tensor([2, 2], dtype=torch.int64)
+        splice_len = torch.tensor([1, 1], dtype=torch.int64)
+        survivors = torch.randn(3, HIDDEN_DIM)
+        survivor_cu = torch.tensor([0, 1, 3], dtype=torch.int32)
+        loss_mask_flat = torch.tensor(
+            [False, True, True, True, False, True, False, True, True],
+            dtype=torch.bool,
+        )
+
+        packed = decoder.forward_with_packed_target_splice(
+            survivor_embeddings=survivors,
+            survivor_cu_seqlens=survivor_cu,
+            target_ids_flat=target_ids_flat,
+            target_cu_seqlens=target_cu,
+            splice_start=splice_start,
+            splice_len=splice_len,
+            loss_mask_flat=loss_mask_flat,
+        )
+        manual_loss_mask = torch.tensor(
+            [False, True, False, True, False, True, False, False, False, True],
+            dtype=torch.bool,
+        )
+        listed = decoder.forward_with_single_splice(
+            survivor_embeddings=survivors,
+            survivor_cu_seqlens=survivor_cu,
+            prefix_ids=[target_rows[0][:2], target_rows[1][:2]],
+            suffix_ids=[target_rows[0][3:], target_rows[1][3:]],
+            loss_mask=manual_loss_mask,
+        )
+
+        torch.testing.assert_close(packed, listed, atol=1e-5, rtol=1e-5)
+
     def test_return_hidden_states(self, decoder):
         """return_hidden_states=True returns InterleavedForwardOutput."""
         torch.manual_seed(31)
@@ -340,6 +425,143 @@ class TestPackedForwardParity:
         # states that predict the first suffix token).
         assert surv.grad is not None
         assert surv.grad.abs().sum() > 0
+
+    def test_stateful_decoder_family_uses_padded_batch(self):
+        """Falcon-style decoders must not flatten samples into one sequence."""
+
+        torch.manual_seed(41)
+        decoder = ReconstructionDecoder(
+            StatefulCausalLM(VOCAB_SIZE, HIDDEN_DIM),
+            hidden_dim=HIDDEN_DIM,
+            decoder_family="falcon_h1",
+        )
+        survivors = torch.zeros(2, HIDDEN_DIM)
+        survivors[0, 0] = 3.0
+        survivors[1, 0] = 5.0
+        cu = torch.tensor([0, 1, 2], dtype=torch.int32)
+        suffix_ids = [
+            torch.tensor([7, 8], dtype=torch.long),
+            torch.tensor([9], dtype=torch.long),
+        ]
+
+        out = decoder.forward_with_single_splice(
+            survivor_embeddings=survivors,
+            survivor_cu_seqlens=cu,
+            prefix_ids=[torch.zeros(0, dtype=torch.long), torch.zeros(0, dtype=torch.long)],
+            suffix_ids=suffix_ids,
+            return_hidden_states=True,
+        )
+
+        assert out.hidden_states.shape == (2, 3, HIDDEN_DIM)
+        assert out.attention_mask.tolist() == [
+            [True, True, True],
+            [True, True, False],
+        ]
+        # If sample 2 had been flattened after sample 1, the first hidden row
+        # would include sample 1's survivor value (3 + 5). Padded batching keeps
+        # state local to sample 2.
+        assert out.hidden_states[1, 0, 0].item() == pytest.approx(5.0)
+
+    def test_stateful_decoder_family_respects_explicit_loss_mask(self):
+        """Direct padded stateful path maps flat masks back to padded rows."""
+
+        torch.manual_seed(43)
+        decoder = ReconstructionDecoder(
+            StatefulCausalLM(VOCAB_SIZE, HIDDEN_DIM),
+            hidden_dim=HIDDEN_DIM,
+            decoder_family="falcon_h1",
+        )
+        survivors = torch.randn(2, HIDDEN_DIM)
+        cu = torch.tensor([0, 1, 2], dtype=torch.int32)
+        prefix_ids = [
+            torch.tensor([1, 2], dtype=torch.long),
+            torch.tensor([3], dtype=torch.long),
+        ]
+        suffix_ids = [
+            torch.tensor([7, 8], dtype=torch.long),
+            torch.tensor([9], dtype=torch.long),
+        ]
+        loss_mask = torch.tensor(
+            [False, True, False, True, False, True, False, True],
+            dtype=torch.bool,
+        )
+
+        out = decoder.forward_with_single_splice(
+            survivor_embeddings=survivors,
+            survivor_cu_seqlens=cu,
+            prefix_ids=prefix_ids,
+            suffix_ids=suffix_ids,
+            loss_mask=loss_mask,
+            return_hidden_states=True,
+        )
+
+        assert out.loss_mask.tolist() == [
+            [False, True, False, True, False],
+            [True, False, True, False, False],
+        ]
+
+    def test_stateful_packed_target_splice_matches_single_splice_api(self):
+        """Packed target API keeps Falcon-style padded layout semantics."""
+
+        torch.manual_seed(47)
+        decoder = ReconstructionDecoder(
+            StatefulCausalLM(VOCAB_SIZE, HIDDEN_DIM),
+            hidden_dim=HIDDEN_DIM,
+            decoder_family="falcon_h1",
+        )
+        target_rows = [
+            torch.tensor([1, 2, 99, 7, 8], dtype=torch.long),
+            torch.tensor([3, 88, 9], dtype=torch.long),
+        ]
+        target_ids_flat = torch.cat(target_rows, dim=0)
+        target_cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+        splice_start = torch.tensor([2, 1], dtype=torch.int64)
+        splice_len = torch.tensor([1, 1], dtype=torch.int64)
+        survivors = torch.randn(3, HIDDEN_DIM)
+        survivor_cu = torch.tensor([0, 1, 3], dtype=torch.int32)
+        loss_mask_flat = torch.tensor(
+            [False, True, True, True, False, True, False, True],
+            dtype=torch.bool,
+        )
+        manual_loss_mask = torch.tensor(
+            [False, True, False, True, False, True, False, False, True],
+            dtype=torch.bool,
+        )
+
+        packed = decoder.forward_with_packed_target_splice(
+            survivor_embeddings=survivors,
+            survivor_cu_seqlens=survivor_cu,
+            target_ids_flat=target_ids_flat,
+            target_cu_seqlens=target_cu,
+            splice_start=splice_start,
+            splice_len=splice_len,
+            loss_mask_flat=loss_mask_flat,
+            return_hidden_states=True,
+        )
+        listed = decoder.forward_with_single_splice(
+            survivor_embeddings=survivors,
+            survivor_cu_seqlens=survivor_cu,
+            prefix_ids=[target_rows[0][:2], target_rows[1][:1]],
+            suffix_ids=[target_rows[0][3:], target_rows[1][2:]],
+            loss_mask=manual_loss_mask,
+            return_hidden_states=True,
+        )
+
+        torch.testing.assert_close(packed.loss, listed.loss, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(
+            packed.hidden_states,
+            listed.hidden_states,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        assert packed.loss_mask.tolist() == [
+            [False, True, False, True, False],
+            [True, False, False, True, False],
+        ]
+        assert packed.attention_mask.tolist() == [
+            [True, True, True, True, True],
+            [True, True, True, True, False],
+        ]
 
 
 # ---------------------------------------------------------------------------

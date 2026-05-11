@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 """Profile one real BgKIT optimizer step from a resumed checkpoint.
 
-This is a kernel-level profiler, not a memory sweep. It restores the selected
-training phase, runs a configurable number of warmup optimizer steps to get JIT
-compilation out of the measured path, then captures one or more real optimizer
-steps with ``torch.profiler``.
+This is a step-level timing and optional kernel profiler, not a memory sweep.
+It restores the selected training phase, runs a configurable number of warmup
+optimizer steps to get JIT compilation out of the measured path, then measures
+one or more real optimizer steps. Set ``+profile.capture_profiler=true`` when a
+full ``torch.profiler`` table or Chrome trace is needed; the default keeps
+timing overhead low.
 """
 
 from __future__ import annotations
@@ -17,10 +19,14 @@ import os
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import hydra
 import torch
+import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 
 _src = str(Path(__file__).resolve().parent.parent / "src")
@@ -67,6 +73,12 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
         return DecoderInitTrainer(cfg)
+    if phase in ("phase1_falcon_dense_seed", "phase1_falcon_forced_adapt"):
+        from bgkit.training.phase1.projection_seed_falcon import (
+            FalconProjectionSeedTrainer,
+        )
+
+        return FalconProjectionSeedTrainer(cfg)
     if phase in ("phase1_step4p7", "phase1_step4p7_v2", "phase1_step4p7_v3"):
         from bgkit.training.phase1.bridge_distill import BridgeDistillTrainer
 
@@ -75,11 +87,18 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.commit_encoding import CommitEncodingTrainer
 
         return CommitEncodingTrainer(cfg)
-    if phase == "phase1_step6":
+    if phase in ("phase1_step6", "phase1_falcon_l0", "phase1_falcon_l1"):
         from bgkit.training.phase1.compression import CompressionTrainer
 
         return CompressionTrainer(cfg)
-    if phase in ("phase2", "phase2_kb"):
+    if phase in (
+        "phase2",
+        "phase2_kb",
+        "phase2_kb_stage_a",
+        "phase2_kb_stage_b",
+        "phase2_kb_stage_a_falcon",
+        "phase2_kb_stage_b_falcon",
+    ):
         from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
 
         return KRKBTrainer(cfg)
@@ -124,6 +143,7 @@ def _prepare_trainer(cfg: DictConfig):
 
     trainer._sync_epoch(trainer.epoch)
     trainer._pre_train_loop()
+    _apply_initial_length_filters(trainer, cfg)
 
     dataloader_iter = None
     cursor_restored = False
@@ -149,6 +169,20 @@ def _prepare_trainer(cfg: DictConfig):
     if dataloader_iter is None:
         dataloader_iter = trainer._create_dataloader_iter()
     return trainer, dataloader_iter, checkpoint
+
+
+def _apply_initial_length_filters(trainer, cfg: DictConfig) -> None:
+    """Mirror BaseTrainer.train()'s initial length filters for profile runs."""
+
+    tcfg = cfg.training
+    if not hasattr(trainer, "_max_batch_tokens"):
+        return
+    min_len = int(tcfg.get("min_sample_length", 0) or 0)
+    max_len = int(tcfg.get("max_sample_length", 0) or 0)
+    if min_len > 0 and hasattr(trainer, "_handle_min_sample_length"):
+        trainer._handle_min_sample_length(min_len)
+    if max_len > 0 and hasattr(trainer, "_handle_max_sample_length"):
+        trainer._handle_max_sample_length(max_len)
 
 
 def _schedule_values(trainer, cfg: DictConfig) -> tuple[int, float, int]:
@@ -417,6 +451,29 @@ def _fixed_step_batches(
     return prefetched_batches[replay_idx]
 
 
+def _optimizer_step_profile_stats(
+    micro_batches: list[dict],
+    prefix: str,
+) -> dict[str, float]:
+    stats: dict[str, float] = {}
+    for batch in micro_batches:
+        _accumulate_batch_stats(stats, _batch_profile_stats(batch, prefix))
+    return stats
+
+
+def _fixed_step_batch_stats(
+    fixed_stats: list[dict[str, float]] | None,
+    replay_idx: int,
+    *,
+    repeat_first_fixed_step: bool,
+) -> dict[str, float] | None:
+    if fixed_stats is None:
+        return None
+    if repeat_first_fixed_step:
+        return fixed_stats[0]
+    return fixed_stats[replay_idx]
+
+
 def _cuda_graph_forward_backward_probe(
     trainer,
     fixed_batches: list[list[dict]] | None,
@@ -467,6 +524,7 @@ def _run_optimizer_step(
     base_lr: float,
     accum_steps: int,
     fixed_batches: list[dict] | None = None,
+    fixed_batch_stats: dict[str, float] | None = None,
 ) -> tuple[object, dict[str, float]]:
     if fixed_batches is not None and len(fixed_batches) != accum_steps:
         raise ValueError(
@@ -488,17 +546,22 @@ def _run_optimizer_step(
 
     trainer.optimizer.zero_grad()
     accum_metrics = []
-    batch_stats: dict[str, float] = {}
+    batch_stats: dict[str, float] = dict(fixed_batch_stats or {})
     for micro_idx in range(accum_steps):
         with torch.profiler.record_function(f"microbatch_{micro_idx:02d}/fetch"):
             if fixed_batches is None:
                 batch, dataloader_iter = _next_batch(trainer, dataloader_iter)
+                _accumulate_batch_stats(
+                    batch_stats,
+                    _batch_profile_stats(batch, "batch"),
+                )
             else:
                 batch = fixed_batches[micro_idx]
-            _accumulate_batch_stats(
-                batch_stats,
-                _batch_profile_stats(batch, "batch"),
-            )
+                if fixed_batch_stats is None:
+                    _accumulate_batch_stats(
+                        batch_stats,
+                        _batch_profile_stats(batch, "batch"),
+                    )
         with torch.profiler.record_function(f"microbatch_{micro_idx:02d}/forward_backward"):
             accum_metrics.append(trainer._forward_backward(batch))
 
@@ -559,6 +622,189 @@ def _empty_cache_every_step(cfg: DictConfig) -> bool:
     return bool(compute_cfg.get("cuda_empty_cache_every_step", False))
 
 
+@contextmanager
+def _falcon_kernel_counters() -> Iterable[dict[str, int]]:
+    counts = {
+        "mixer_torch_forward": 0,
+        "mixer_cuda_kernels_forward": 0,
+        "mamba_split_conv1d_scan_combined": 0,
+        "mamba_chunk_scan_combined": 0,
+        "causal_conv1d_fn": 0,
+        "causal_conv1d_update": 0,
+        "selective_state_update": 0,
+        "scaled_dot_product_attention": 0,
+    }
+    try:
+        import transformers.models.falcon_h1.modeling_falcon_h1 as falcon_h1
+    except Exception:
+        yield counts
+        return
+
+    originals = {
+        "torch_forward": falcon_h1.FalconH1Mixer.torch_forward,
+        "cuda_kernels_forward": falcon_h1.FalconH1Mixer.cuda_kernels_forward,
+        "mamba_split_conv1d_scan_combined": falcon_h1.mamba_split_conv1d_scan_combined,
+        "mamba_chunk_scan_combined": falcon_h1.mamba_chunk_scan_combined,
+        "causal_conv1d_fn": falcon_h1.causal_conv1d_fn,
+        "causal_conv1d_update": falcon_h1.causal_conv1d_update,
+        "selective_state_update": falcon_h1.selective_state_update,
+        "scaled_dot_product_attention": F.scaled_dot_product_attention,
+    }
+
+    def counted_torch_forward(self, *args: Any, **kwargs: Any) -> Any:
+        counts["mixer_torch_forward"] += 1
+        with torch.profiler.record_function("falcon_mamba/mixer_torch_forward"):
+            return originals["torch_forward"](self, *args, **kwargs)
+
+    def counted_cuda_forward(self, *args: Any, **kwargs: Any) -> Any:
+        counts["mixer_cuda_kernels_forward"] += 1
+        with torch.profiler.record_function("falcon_mamba/mixer_cuda_kernels_forward"):
+            return originals["cuda_kernels_forward"](self, *args, **kwargs)
+
+    def wrap_global(name: str) -> Callable[..., Any] | None:
+        original = originals[name]
+        if original is None:
+            return None
+
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            counts[name] += 1
+            with torch.profiler.record_function(f"falcon_mamba/{name}"):
+                return original(*args, **kwargs)
+
+        return counted
+
+    def counted_sdpa(*args: Any, **kwargs: Any) -> Any:
+        counts["scaled_dot_product_attention"] += 1
+        with torch.profiler.record_function(
+            "falcon_attention/scaled_dot_product_attention"
+        ):
+            return originals["scaled_dot_product_attention"](*args, **kwargs)
+
+    falcon_h1.FalconH1Mixer.torch_forward = counted_torch_forward
+    falcon_h1.FalconH1Mixer.cuda_kernels_forward = counted_cuda_forward
+    falcon_h1.mamba_split_conv1d_scan_combined = wrap_global(
+        "mamba_split_conv1d_scan_combined"
+    )
+    falcon_h1.mamba_chunk_scan_combined = wrap_global("mamba_chunk_scan_combined")
+    falcon_h1.causal_conv1d_fn = wrap_global("causal_conv1d_fn")
+    falcon_h1.causal_conv1d_update = wrap_global("causal_conv1d_update")
+    falcon_h1.selective_state_update = wrap_global("selective_state_update")
+    F.scaled_dot_product_attention = counted_sdpa
+
+    try:
+        yield counts
+    finally:
+        falcon_h1.FalconH1Mixer.torch_forward = originals["torch_forward"]
+        falcon_h1.FalconH1Mixer.cuda_kernels_forward = originals["cuda_kernels_forward"]
+        falcon_h1.mamba_split_conv1d_scan_combined = originals[
+            "mamba_split_conv1d_scan_combined"
+        ]
+        falcon_h1.mamba_chunk_scan_combined = originals["mamba_chunk_scan_combined"]
+        falcon_h1.causal_conv1d_fn = originals["causal_conv1d_fn"]
+        falcon_h1.causal_conv1d_update = originals["causal_conv1d_update"]
+        falcon_h1.selective_state_update = originals["selective_state_update"]
+        F.scaled_dot_product_attention = originals["scaled_dot_product_attention"]
+
+
+def _reset_counts(counts: dict[str, int]) -> None:
+    for key in counts:
+        counts[key] = 0
+
+
+def _event_time_us(event: object, attr: str) -> float:
+    return float(
+        getattr(
+            event,
+            attr,
+            getattr(event, attr.replace("cuda", "device"), 0.0),
+        )
+        or 0.0
+    )
+
+
+def _profile_bucket_for_key(key: str) -> str:
+    lowered = key.lower()
+    if (
+        "falcon_mamba/" in lowered
+        or "mamba" in lowered
+        or "causal_conv1d" in lowered
+        or "selective_state" in lowered
+        or "chunk_scan" in lowered
+        or "chunk_state" in lowered
+        or "state_passing" in lowered
+        or "ssd_" in lowered
+    ):
+        return "mamba"
+    if (
+        "falcon_attention/" in lowered
+        or "scaled_dot_product_attention" in lowered
+        or "flash_attention" in lowered
+        or "attention" in lowered
+        or "fmha" in lowered
+    ):
+        return "attention"
+    if (
+        "cross_entropy" in lowered
+        or "linear_cross_entropy" in lowered
+        or "nll_loss" in lowered
+        or "log_softmax" in lowered
+    ):
+        return "cross_entropy"
+    if "optimizer_step" in lowered or "adam" in lowered or "muon" in lowered:
+        return "optimizer"
+    if "forward_backward" in lowered or "microbatch_" in lowered:
+        return "forward_backward"
+    if "/fetch" in lowered or "dataloader" in lowered:
+        return "fetch"
+    return "uncategorized"
+
+
+def _profile_bucket_summary(prof, *, topk: int = 30) -> dict[str, object]:
+    buckets: dict[str, dict[str, float]] = {}
+    top_events: list[dict[str, object]] = []
+    for event in prof.key_averages():
+        key = str(getattr(event, "key", ""))
+        cuda_us = _event_time_us(event, "cuda_time_total")
+        self_cuda_us = _event_time_us(event, "self_cuda_time_total")
+        cpu_us = float(getattr(event, "cpu_time_total", 0.0) or 0.0)
+        count = int(getattr(event, "count", 0) or 0)
+        bucket = _profile_bucket_for_key(key)
+        target = buckets.setdefault(
+            bucket,
+            {
+                "cuda_ms": 0.0,
+                "self_cuda_ms": 0.0,
+                "cpu_ms": 0.0,
+                "events": 0.0,
+            },
+        )
+        target["cuda_ms"] += cuda_us / 1000.0
+        target["self_cuda_ms"] += self_cuda_us / 1000.0
+        target["cpu_ms"] += cpu_us / 1000.0
+        target["events"] += float(count)
+        top_events.append(
+            {
+                "key": key,
+                "bucket": bucket,
+                "cuda_ms": cuda_us / 1000.0,
+                "self_cuda_ms": self_cuda_us / 1000.0,
+                "cpu_ms": cpu_us / 1000.0,
+                "count": count,
+            }
+        )
+    total_cuda_ms = sum(value["cuda_ms"] for value in buckets.values())
+    for value in buckets.values():
+        value["cuda_pct"] = (
+            100.0 * value["cuda_ms"] / total_cuda_ms if total_cuda_ms > 0 else 0.0
+        )
+    top_events.sort(key=lambda item: (-float(item["cuda_ms"]), str(item["key"])))
+    return {
+        "total_cuda_ms": total_cuda_ms,
+        "buckets": buckets,
+        "top_events": top_events[:topk],
+    }
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig) -> None:
     patch_triton_allocator()
@@ -584,6 +830,7 @@ def main(cfg: DictConfig) -> None:
     topk = int(profile_cfg.get("topk", 60))
     record_shapes = bool(profile_cfg.get("record_shapes", False))
     profile_memory = bool(profile_cfg.get("profile_memory", False))
+    capture_profiler = bool(profile_cfg.get("capture_profiler", False))
     fixed_batches = bool(profile_cfg.get("fixed_batches", False))
     repeat_first_fixed_step = bool(profile_cfg.get("repeat_first_fixed_step", False))
     static_device_batches = bool(profile_cfg.get("static_device_batches", False))
@@ -601,6 +848,7 @@ def main(cfg: DictConfig) -> None:
 
     start_step = int(trainer.global_step)
     prefetched_batches: list[list[dict]] | None = None
+    prefetched_batch_stats: list[dict[str, float]] | None = None
     prefetch_stats: dict[str, float] = {}
     static_bucket_report: dict | None = None
     if fixed_batches:
@@ -618,6 +866,10 @@ def main(cfg: DictConfig) -> None:
                 prefetched_batches,
                 trainer.device,
             )
+        prefetched_batch_stats = [
+            _optimizer_step_profile_stats(step_batches, "batch")
+            for step_batches in prefetched_batches
+        ]
         if static_bucket_summary:
             static_bucket_report = _summarize_static_buckets(
                 _batch_bucket_signatures(prefetched_batches),
@@ -651,6 +903,7 @@ def main(cfg: DictConfig) -> None:
                 "warmup_steps": warmup_profile_steps,
                 "profile_steps": measured_steps,
                 "accum_steps": accum_steps,
+                "capture_profiler": capture_profiler,
                 "fixed_batches": fixed_batches,
                 "repeat_first_fixed_step": repeat_first_fixed_step,
                 "static_device_batches": static_device_batches,
@@ -666,31 +919,7 @@ def main(cfg: DictConfig) -> None:
     step = start_step
     warmup_metrics: list[dict[str, float]] = []
     replay_idx = 0
-    for _ in range(warmup_profile_steps):
-        t0 = time.perf_counter()
-        dataloader_iter, metrics = _run_optimizer_step(
-            trainer,
-            dataloader_iter,
-            step=step,
-            max_steps=max_steps,
-            warmup_steps=warmup_steps,
-            base_lr=base_lr,
-            accum_steps=accum_steps,
-            fixed_batches=_fixed_step_batches(
-                prefetched_batches,
-                replay_idx,
-                repeat_first_fixed_step=repeat_first_fixed_step,
-            ),
-        )
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        metrics = dict(metrics)
-        metrics["wall_ms"] = (time.perf_counter() - t0) * 1000.0
-        metrics["step"] = step
-        warmup_metrics.append(metrics)
-        print(json.dumps({"event": "warmup_step", **metrics}, sort_keys=True), flush=True)
-        step += 1
-        replay_idx += 1
+    prof = None
 
     from torch.profiler import ProfilerActivity, profile
 
@@ -699,13 +928,8 @@ def main(cfg: DictConfig) -> None:
         activities.append(ProfilerActivity.CUDA)
 
     measured_metrics: list[dict[str, float]] = []
-    with profile(
-        activities=activities,
-        record_shapes=record_shapes,
-        profile_memory=profile_memory,
-        with_stack=False,
-    ) as prof:
-        for _ in range(measured_steps):
+    with _falcon_kernel_counters() as kernel_counts:
+        for _ in range(warmup_profile_steps):
             t0 = time.perf_counter()
             dataloader_iter, metrics = _run_optimizer_step(
                 trainer,
@@ -720,20 +944,135 @@ def main(cfg: DictConfig) -> None:
                     replay_idx,
                     repeat_first_fixed_step=repeat_first_fixed_step,
                 ),
+                fixed_batch_stats=_fixed_step_batch_stats(
+                    prefetched_batch_stats,
+                    replay_idx,
+                    repeat_first_fixed_step=repeat_first_fixed_step,
+                ),
             )
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             metrics = dict(metrics)
             metrics["wall_ms"] = (time.perf_counter() - t0) * 1000.0
             metrics["step"] = step
-            measured_metrics.append(metrics)
-            print(json.dumps({"event": "profiled_step", **metrics}, sort_keys=True), flush=True)
+            warmup_metrics.append(metrics)
+            print(json.dumps({"event": "warmup_step", **metrics}, sort_keys=True), flush=True)
             step += 1
             replay_idx += 1
-            prof.step()
 
-    table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=topk)
-    print(table)
+        _reset_counts(kernel_counts)
+        if capture_profiler:
+            with profile(
+                activities=activities,
+                record_shapes=record_shapes,
+                profile_memory=profile_memory,
+                with_stack=False,
+            ) as prof:
+                for _ in range(measured_steps):
+                    t0 = time.perf_counter()
+                    dataloader_iter, metrics = _run_optimizer_step(
+                        trainer,
+                        dataloader_iter,
+                        step=step,
+                        max_steps=max_steps,
+                        warmup_steps=warmup_steps,
+                        base_lr=base_lr,
+                        accum_steps=accum_steps,
+                        fixed_batches=_fixed_step_batches(
+                            prefetched_batches,
+                            replay_idx,
+                            repeat_first_fixed_step=repeat_first_fixed_step,
+                        ),
+                        fixed_batch_stats=_fixed_step_batch_stats(
+                            prefetched_batch_stats,
+                            replay_idx,
+                            repeat_first_fixed_step=repeat_first_fixed_step,
+                        ),
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    metrics = dict(metrics)
+                    metrics["wall_ms"] = (time.perf_counter() - t0) * 1000.0
+                    metrics["step"] = step
+                    measured_metrics.append(metrics)
+                    print(
+                        json.dumps({"event": "profiled_step", **metrics}, sort_keys=True),
+                        flush=True,
+                    )
+                    step += 1
+                    replay_idx += 1
+                    prof.step()
+        else:
+            for _ in range(measured_steps):
+                t0 = time.perf_counter()
+                dataloader_iter, metrics = _run_optimizer_step(
+                    trainer,
+                    dataloader_iter,
+                    step=step,
+                    max_steps=max_steps,
+                    warmup_steps=warmup_steps,
+                    base_lr=base_lr,
+                    accum_steps=accum_steps,
+                    fixed_batches=_fixed_step_batches(
+                        prefetched_batches,
+                        replay_idx,
+                        repeat_first_fixed_step=repeat_first_fixed_step,
+                    ),
+                    fixed_batch_stats=_fixed_step_batch_stats(
+                        prefetched_batch_stats,
+                        replay_idx,
+                        repeat_first_fixed_step=repeat_first_fixed_step,
+                    ),
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                metrics = dict(metrics)
+                metrics["wall_ms"] = (time.perf_counter() - t0) * 1000.0
+                metrics["step"] = step
+                measured_metrics.append(metrics)
+                print(
+                    json.dumps({"event": "profiled_step", **metrics}, sort_keys=True),
+                    flush=True,
+                )
+                step += 1
+                replay_idx += 1
+        measured_kernel_counts = dict(kernel_counts)
+
+    print(
+        json.dumps(
+            {"event": "profile_kernel_counts", **measured_kernel_counts},
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+    if prof is not None:
+        table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=topk)
+        print(table)
+        profiler_buckets = _profile_bucket_summary(prof, topk=topk)
+        print(
+            json.dumps(
+                {"event": "profile_bucket_summary", **profiler_buckets},
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+    else:
+        table = ""
+        profiler_buckets = {
+            "enabled": False,
+            "reason": "capture_profiler_false",
+            "total_cuda_ms": 0.0,
+            "buckets": [],
+            "top_events": [],
+        }
+        print(
+            json.dumps(
+                {"event": "profile_bucket_summary", **profiler_buckets},
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
     cuda_graph_probe_report: dict[str, object] | None = None
     if cuda_graph_probe:
@@ -754,10 +1093,44 @@ def main(cfg: DictConfig) -> None:
     ts = time.strftime("%Y%m%d_%H%M%S")
     report_path = checkpoint_dir / f"profile_training_step_{cfg.training.phase}_{ts}.json"
     trace_path = Path(str(trace_path_raw)) if trace_path_raw else None
-    if trace_path is not None:
+    if trace_path is not None and prof is not None:
         prof.export_chrome_trace(str(trace_path))
+    elif trace_path is not None:
+        print(
+            json.dumps(
+                {
+                    "event": "profile_trace_skipped",
+                    "reason": "capture_profiler_false",
+                    "trace_path": str(trace_path),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
+    # Profile-report schema (top-level keys; consumers should treat this dict
+    # as forward-compatible — new keys may appear, existing keys keep meaning):
+    #   schema_version      str   — bump when an existing key's meaning changes
+    #   phase               str   — cfg.training.phase
+    #   checkpoint          str?  — resolved input checkpoint, or null
+    #   start_step          int   — global step at warmup start
+    #   end_step_exclusive  int   — global step after the final measured step
+    #   warmup_metrics      list  — per-warmup-step metric dicts
+    #   measured_metrics    list  — per-measured-step metric dicts (timing,
+    #                               cuda_max_allocated_gib, peak_memory_gib —
+    #                               peak resets PER STEP, not run-wide)
+    #   topk                list  — top-K profiler events by CUDA self time
+    #   profile_table       str   — full torch profiler text table
+    #   profile_buckets     dict  — coarse buckets (attention/mamba/mlp/ce/optimizer/uncategorized)
+    #   falcon_kernel_counts dict — per-kernel call counts captured via the
+    #                               functional-namespace monkey-patch in
+    #                               _collect_kernel_counts; keys: mamba_split_*,
+    #                               causal_conv1d_*, scaled_dot_product_attention, ...
+    #   trace_path          str?  — chrome trace path, or null
+    #   training_shape      dict  — config knobs that affect timing
+    #   env                 dict  — captured environment variables
     report = {
+        "schema_version": "1",
         "phase": cfg.training.phase,
         "checkpoint": str(checkpoint) if checkpoint is not None else None,
         "start_step": start_step,
@@ -766,12 +1139,15 @@ def main(cfg: DictConfig) -> None:
         "measured_metrics": measured_metrics,
         "topk": topk,
         "profile_table": table,
+        "profile_buckets": profiler_buckets,
+        "falcon_kernel_counts": measured_kernel_counts,
         "trace_path": str(trace_path) if trace_path is not None else None,
         "training_shape": {
             "decoder_lora": OmegaConf.to_container(
                 cfg.training.get("decoder_lora", {}),
                 resolve=True,
             ),
+            "capture_profiler": capture_profiler,
             "fixed_batches": fixed_batches,
             "repeat_first_fixed_step": repeat_first_fixed_step,
             "static_device_batches": static_device_batches,
@@ -790,6 +1166,9 @@ def main(cfg: DictConfig) -> None:
             "FLA_GDR_FUSE_GATE_BWD": os.environ.get("FLA_GDR_FUSE_GATE_BWD"),
             "FLA_GDR_FUSE_DQKG_WY": os.environ.get("FLA_GDR_FUSE_DQKG_WY"),
             "FLA_GDR_RECOMPUTE_WY_DW": os.environ.get("FLA_GDR_RECOMPUTE_WY_DW"),
+            "MAMBA_SM121_SAFE_AUTOTUNE": os.environ.get("MAMBA_SM121_SAFE_AUTOTUNE"),
+            "MAMBA_SM121_STATIC_CONFIGS": os.environ.get("MAMBA_SM121_STATIC_CONFIGS"),
+            "TRITON_CACHE_DIR": os.environ.get("TRITON_CACHE_DIR"),
         },
     }
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True))

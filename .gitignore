@@ -36,6 +36,7 @@ htmlcov/
 /checkpoints/
 /outputs/
 /wandb/
+/logs/
 
 # OS
 .DS_Store

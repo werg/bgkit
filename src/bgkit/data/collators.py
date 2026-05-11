@@ -119,6 +119,7 @@ def collate_chat_repro(batch: list[dict]) -> dict:
         "cu_seqlens": tok_cu,
         "max_seqlen": max(tok_lengths) if tok_lengths else 0,
         "loss_mask": _cat_tensors(loss_seqs),
+        "encoder_content_token_ids": _cat_tensors(content_seqs),
         "content_token_ids": _cat_tensors(content_seqs),
         "content_position_ids": position_ids_from_cu(content_cu, content_total),
         "content_cu_seqlens": content_cu,
@@ -226,6 +227,7 @@ def _collate_file_samples(samples: list) -> dict:
     return {
         "sample_type": "file",
         "objectives": [s.objective for s in samples],
+        "encoder_content_token_ids": _cat_tensors(content_seqs),
         "content_token_ids": _cat_tensors(content_seqs),
         "content_cu_seqlens": content_cu,
         "content_position_ids": position_ids_from_cu(content_cu, content_total),
@@ -324,6 +326,7 @@ def _collate_repo_samples(samples: list) -> dict:
     return {
         "sample_type": "repo",
         "objectives": [s.objective for s in samples],
+        "encoder_content_token_ids": _cat_tensors(all_file_seqs) if all_file_seqs else empty_long,
         "content_token_ids": _cat_tensors(all_file_seqs) if all_file_seqs else empty_long,
         "cu_file_seqlens": cu_file,
         "content_position_ids": position_ids_from_cu(cu_file, content_total),

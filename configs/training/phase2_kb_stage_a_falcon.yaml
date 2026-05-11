@@ -1,0 +1,102 @@
+phase: phase2_kb
+stage: A
+optimizer: adamw
+warmup_steps: 500
+lr: 1.0e-4
+decoder_lr: 5.0e-5
+l0_lr: 2.0e-4
+l1_lr: 2.0e-4
+eval_every: 500
+save_every: 2000
+max_steps: null
+batch_size: 4
+
+datasets:
+  - pubmedqa
+  - narrativeqa
+  - git_history
+  - memory
+
+max_samples_per_dataset_default: 1500
+live_l0: true
+
+l0_retention:
+  kilt_wikipedia: 0.05
+  pubmedqa: 0.20
+  narrativeqa: 0.20
+  newsqa: 0.10
+  git_history: 0.20
+  memory: 0.40
+
+l1_retention: 0.15
+
+l0_retention_jitter:
+  enabled: true
+  mode: jitter
+  jitter_abs: 0.01
+  jitter_rel: 0.10
+  anchor_sampling_prob: 0.30
+
+l1_retention_jitter:
+  enabled: true
+  mode: jitter
+  jitter_abs: 0.01
+  jitter_rel: 0.10
+  anchor_sampling_prob: 0.30
+
+lora:
+  # Falcon-family Phase 2 uses direct encoder training. Encoder LoRA adds
+  # adapter indirection and checkpoint/cache provenance complexity without a
+  # clear benefit on this path.
+  enabled: false
+  train_l1_direct: true
+  l0_rank: 32
+  l1_rank: 32
+  alpha: 64
+  dropout: 0.0
+
+survivorship:
+  relevance_loss_weight: 0.05
+  relevance_gold_boost: 1.5
+  relevance_distractor_damp: 0.5
+  n_distractors: 3
+  ratio_loss_weight: 0.1
+  decisiveness_loss_weight: 0.05
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.05
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+
+ice_distillation:
+  l0:
+    enabled: false
+  l1:
+    enabled: false
+
+moment_match_reference:
+  l0:
+    path: ${oc.env:DATA_DIR}/diagnostics/ice_reference_moments.json
+  l1:
+    path: null
+
+phase1_checkpoint: auto
+
+model:
+  decoder:
+    family: falcon_h1
+    backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+    hidden_dim: 512

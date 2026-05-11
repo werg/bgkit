@@ -385,6 +385,7 @@ def tokenize_with_sentinel(
     file_path: str,
     language: str,
     content_token_ids: torch.Tensor,
+    encoder_tokenizer=None,
 ) -> dict[str, torch.Tensor]:
     """Tokenize a sample using sentinel-based boundary detection.
 
@@ -450,9 +451,15 @@ def tokenize_with_sentinel(
     content_end = content_start + len(content_ids)
     loss_mask[content_start:content_end] = 1
 
-    # Tokenize compression prompt as ChatML prefix for BgKIT conditioning
+    # Tokenize compression prompt as ChatML prefix for BgKIT conditioning.
+    # ``tokenizer`` owns decoder-side target/prefix/suffix IDs, while
+    # ``encoder_tokenizer`` owns IDs that are embedded by BgKIT's encoder.
+    encoder_tokenizer = encoder_tokenizer or tokenizer
     compression_prompt = variant["compression_prompt"]
-    compression_prompt_ids = build_encoder_prefix_ids(tokenizer, compression_prompt)
+    compression_prompt_ids = build_encoder_prefix_ids(
+        encoder_tokenizer,
+        compression_prompt,
+    )
 
     return {
         "token_ids": token_ids,

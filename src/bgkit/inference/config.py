@@ -22,3 +22,4 @@ class InferenceConfig:
     temperature: float = 0.0
     model_profile: ModelProfile | None = None
     backend_type: str = "auto"  # "llama", "vllm", or "auto" (probe /version)
+    model_name: str | None = None  # included in request payload when set (required by Atlas)

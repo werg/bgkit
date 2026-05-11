@@ -5,8 +5,10 @@ Runs a single Qwen3.5 full-attention layer bidirectionally on the packed
 positions via a flat bool mask. No padding, no ``extract_survivors`` /
 ``pad_survivors`` helpers.
 
-bgkit's decoder is Qwen3.5-0.8B throughout, so input and output hidden
-dims both stay at 1024.
+The block normally returns one decoder input position per survivor.  Decoder
+families with narrower embeddings can request ``output_split_factor > 1``:
+the block still runs and projects in encoder hidden space, then reshapes each
+projected survivor row into multiple decoder-width positions.
 """
 
 from __future__ import annotations
@@ -39,6 +41,34 @@ class ProjectionOutput:
     survivor_counts: torch.Tensor | None
 
 
+def effective_projection_cu(
+    proj_out: ProjectionOutput,
+    input_cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Return the segmentation that matches ``proj_out.projected_embeddings``.
+
+    Legacy no-compression Qwen callers may receive
+    ``proj_out.survivor_cu_seqlens is None`` because the input segmentation
+    carries over unchanged.  Split projections always return explicit
+    post-projection boundaries because the flat buffer length changes.
+    """
+
+    if proj_out.survivor_cu_seqlens is not None:
+        return proj_out.survivor_cu_seqlens
+    return input_cu_seqlens
+
+
+def effective_projection_counts(
+    proj_out: ProjectionOutput,
+    input_cu_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """Return per-sample counts matching ``effective_projection_cu``."""
+
+    if proj_out.survivor_counts is not None:
+        return proj_out.survivor_counts
+    return lengths_from_cu(input_cu_seqlens).to(torch.int64)
+
+
 class ProjectionBlock(nn.Module):
     """Single transformer layer for context-aware projection into decoder space.
 
@@ -58,11 +88,31 @@ class ProjectionBlock(nn.Module):
         output_norm: nn.Module,
         rotary_emb: nn.Module,
         hidden_dim: int = 1024,
+        output_split_factor: int = 1,
+        output_dim: int | None = None,
     ):
         super().__init__()
+        if output_split_factor < 1:
+            raise ValueError(
+                f"output_split_factor must be >= 1; got {output_split_factor}"
+            )
+        if output_dim is None:
+            if hidden_dim % output_split_factor != 0:
+                raise ValueError(
+                    f"hidden_dim={hidden_dim} must be divisible by "
+                    f"output_split_factor={output_split_factor}"
+                )
+            output_dim = hidden_dim // output_split_factor
+        if output_dim * output_split_factor != hidden_dim:
+            raise ValueError(
+                f"output_dim * output_split_factor must equal hidden_dim; got "
+                f"{output_dim} * {output_split_factor} != {hidden_dim}"
+            )
         self.transformer_layer = transformer_layer
         self.output_norm = output_norm
         self.hidden_dim = hidden_dim
+        self.output_split_factor = int(output_split_factor)
+        self.output_dim = int(output_dim)
         self.projection_head = nn.Linear(hidden_dim, hidden_dim)
 
         object.__setattr__(self, "_rotary_emb", rotary_emb)
@@ -94,7 +144,8 @@ class ProjectionBlock(nn.Module):
             :class:`ProjectionOutput` with projected embeddings. When
             ``survivor_mask`` is provided, the output is flat-sliced to
             survivors only and ``survivor_cu_seqlens`` is recomputed from
-            per-sample survivor counts.
+            per-sample survivor counts.  Split projections return boundaries
+            after expansion, even when ``survivor_mask`` is ``None``.
         """
         if hidden_states.ndim != 2:
             raise ValueError(
@@ -122,6 +173,26 @@ class ProjectionBlock(nn.Module):
         h = self.transformer_layer.mlp(h)
         all_out = residual + h  # (N, D)
 
+        def _split_projected(projected: torch.Tensor) -> torch.Tensor:
+            if self.output_split_factor == 1:
+                return projected
+            n = projected.shape[0]
+            return (
+                projected.reshape(n, self.output_split_factor, self.output_dim)
+                .reshape(n * self.output_split_factor, self.output_dim)
+                .contiguous()
+            )
+
+        def _split_cu(cu: torch.Tensor) -> torch.Tensor:
+            if self.output_split_factor == 1:
+                return cu
+            return (cu.to(torch.int32) * self.output_split_factor).to(torch.int32)
+
+        def _split_counts(counts: torch.Tensor) -> torch.Tensor:
+            if self.output_split_factor == 1:
+                return counts
+            return counts.to(torch.int64) * self.output_split_factor
+
         if survivor_mask is not None:
             if survivor_mask.shape[0] != all_out.shape[0]:
                 raise ValueError(
@@ -140,9 +211,20 @@ class ProjectionBlock(nn.Module):
             survivor_cu = torch.zeros(num_segs + 1, dtype=torch.int32, device=all_out.device)
             torch.cumsum(counts.to(torch.int32), dim=0, out=survivor_cu[1:])
             projected = self.projection_head(self.output_norm(survivors))
-            return ProjectionOutput(projected, survivor_cu, counts)
+            return ProjectionOutput(
+                _split_projected(projected),
+                _split_cu(survivor_cu),
+                _split_counts(counts),
+            )
 
         # No compression: return all positions with counts = original lengths.
         projected = self.projection_head(self.output_norm(all_out))
         counts = lengths_from_cu(cu_seqlens).to(torch.int64)
-        return ProjectionOutput(projected, None, counts)
+        projected = _split_projected(projected)
+        if self.output_split_factor == 1:
+            return ProjectionOutput(projected, None, counts)
+        return ProjectionOutput(
+            projected,
+            _split_cu(cu_seqlens),
+            _split_counts(counts),
+        )

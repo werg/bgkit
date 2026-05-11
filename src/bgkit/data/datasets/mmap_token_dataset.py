@@ -6,6 +6,9 @@ page cache instead of each building independent Arrow table caches.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 from pathlib import Path
 from typing import ClassVar
 
@@ -20,6 +23,16 @@ from bgkit.data.datasets.base_mmap_dataset import (
     load_and_validate_manifest,
     validate_manifest_counts,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 class MmapTokenDataset(Dataset):
@@ -43,9 +56,11 @@ class MmapTokenDataset(Dataset):
         max_seq_len: int = 8192,
         include_metadata: bool = True,
         require_commit_sha: bool = False,
+        companion_dir: str | None = None,
     ):
         data_path = Path(data_dir)
         self._include_metadata = include_metadata
+        self._companion_path = Path(companion_dir) if companion_dir is not None else None
 
         # Preflight: fail fast with actionable error
         required_files = list(self.REQUIRED_FILES)
@@ -73,6 +88,7 @@ class MmapTokenDataset(Dataset):
         self._data_path = data_path
         self._metadata: pa.Table | None = None  # lazy-loaded, NOT pickled
         self._max_seq_len = max_seq_len
+        self._companion_arrays: dict[str, np.ndarray] = {}
 
         validate_manifest_counts(manifest, offsets, self._tokens)
 
@@ -113,11 +129,26 @@ class MmapTokenDataset(Dataset):
         self._chunk_lengths = np.minimum(
             chunk_file_lengths - offsets_within * max_seq_len, max_seq_len,
         ).astype(np.int32)
+        self._decoder_lengths = self._chunk_lengths
+
+        if self._companion_path is not None:
+            self._load_companion_arrays()
 
     @property
     def lengths(self) -> np.ndarray:
         """Return token count for each chunk (for TokenBudgetBatchSampler)."""
         return self._chunk_lengths
+
+    @property
+    def decoder_lengths(self) -> np.ndarray:
+        """Return per-chunk decoder content lengths.
+
+        For ordinary Qwen-tokenized data this is identical to
+        :attr:`lengths`.  When a Falcon companion stream is loaded, the
+        decoder sees Falcon tokens instead, and those chunk lengths are the
+        right batching estimate for decoder-dominated training.
+        """
+        return self._decoder_lengths
 
     @property
     def has_commit_sha(self) -> bool:
@@ -129,6 +160,57 @@ class MmapTokenDataset(Dataset):
     def chunk_file_indices(self) -> np.ndarray | None:
         """Per-chunk file index array (int32). None when metadata disabled."""
         return self._chunk_file_idx
+
+    @property
+    def companion_forced_counts(self) -> np.ndarray | None:
+        """Per-chunk forced survivor row counts when a companion stream is loaded."""
+
+        if self._companion_path is None or not self._companion_arrays:
+            return None
+        offsets = self._companion_arrays["forced_survivor_offsets"]
+        return (offsets[1:] - offsets[:-1]).astype(np.int64)
+
+    @property
+    def companion_valid_indices(self) -> np.ndarray | None:
+        """Indices of chunks with non-zero falcon tokens AND non-zero forced rows.
+
+        Pathological-skipped and alignment-skipped chunks remain
+        ``__getitem__``-addressable but carry empty falcon-token / forced
+        rows; consumers that iterate them blindly will feed zero-length
+        sequences into the decoder. Filter with this index before training.
+        Returns ``None`` when no companion stream is loaded.
+        """
+
+        if self._companion_path is None or not self._companion_arrays:
+            return None
+        forced_counts = (
+            self._companion_arrays["forced_survivor_offsets"][1:]
+            - self._companion_arrays["forced_survivor_offsets"][:-1]
+        )
+        falcon_lengths = (
+            self._companion_arrays["falcon_offsets"][1:]
+            - self._companion_arrays["falcon_offsets"][:-1]
+        )
+        return np.flatnonzero((forced_counts > 0) & (falcon_lengths > 0)).astype(np.int64)
+
+    @property
+    def companion_alignment_quality(self) -> np.ndarray | None:
+        """Per-chunk alignment quality byte from the companion converter.
+
+        Codes (see scripts/convert_tokens_to_falcon_mmap.py):
+            0 = real DP alignment, byte-stable from source-root offsets
+            1 = artificial offsets in fast mode — alignment_scores are
+                approximate monotone-pairing signals only
+            2 = artificial fallback in dp mode (source path missing / unreadable)
+            3 = pathological skip (zero rows)
+            4 = alignment skip (falcon tokens present, no forced rows)
+        Returns ``None`` if no companion is loaded or the array predates
+        this field.
+        """
+
+        if self._companion_path is None or not self._companion_arrays:
+            return None
+        return self._companion_arrays.get("alignment_quality")
 
     def get_metadata_table(self) -> pa.Table:
         """Return the metadata Arrow table (lazy-loaded).
@@ -180,28 +262,162 @@ class MmapTokenDataset(Dataset):
         state = self.__dict__.copy()
         state["_tokens"] = None
         state["_metadata"] = None
+        state["_companion_arrays"] = {}
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._tokens = np.load(self._data_path / "tokens.npy", mmap_mode="r")
+        if self._companion_path is not None:
+            self._load_companion_arrays()
+
+    def _load_companion_arrays(self) -> None:
+        """Load chunk-aligned decoder-family companion artifacts."""
+
+        assert self._companion_path is not None
+        required = [
+            "falcon_tokens.npy",
+            "falcon_offsets.npy",
+            "forced_survivor_indices.npy",
+            "forced_survivor_offsets.npy",
+            "target_falcon_pair_ids.npy",
+            "target_pair_loss_mask.npy",
+            "alignment_scores.npy",
+        ]
+        check_required_files(
+            self._companion_path,
+            required,
+            "Build Falcon companions with: python scripts/convert_tokens_to_falcon_mmap.py",
+        )
+
+        # Verify the companion was built against this base manifest. The
+        # converter writes source_manifest_sha256 into manifest.json; if the
+        # base manifest changed (re-tokenization, schema drift) the companion
+        # offsets are no longer chunk-aligned with our base offsets and the
+        # only safe action is to fail fast and rebuild.
+        companion_manifest_path = self._companion_path / "manifest.json"
+        base_manifest_path = self._data_path / "manifest.json"
+        if companion_manifest_path.exists() and base_manifest_path.exists():
+            companion_manifest = json.loads(companion_manifest_path.read_text())
+            recorded_sha = companion_manifest.get("source_manifest_sha256")
+            if recorded_sha:
+                actual_sha = _sha256_file(base_manifest_path)
+                if actual_sha != recorded_sha:
+                    raise ValueError(
+                        "Falcon companion was built against a different base "
+                        "manifest:\n"
+                        f"  base manifest:      {base_manifest_path}\n"
+                        f"  base manifest sha:  {actual_sha}\n"
+                        f"  companion expected: {recorded_sha}\n"
+                        "Rebuild the companion with "
+                        "scripts/convert_tokens_to_falcon_mmap.py"
+                    )
+        arrays: dict[str, np.ndarray] = {
+            "falcon_tokens": np.load(
+                self._companion_path / "falcon_tokens.npy", mmap_mode="r"
+            ),
+            "falcon_offsets": np.load(self._companion_path / "falcon_offsets.npy"),
+            "forced_survivor_indices": np.load(
+                self._companion_path / "forced_survivor_indices.npy", mmap_mode="r"
+            ),
+            "forced_survivor_offsets": np.load(
+                self._companion_path / "forced_survivor_offsets.npy"
+            ),
+            "target_falcon_pair_ids": np.load(
+                self._companion_path / "target_falcon_pair_ids.npy", mmap_mode="r"
+            ),
+            "target_pair_loss_mask": np.load(
+                self._companion_path / "target_pair_loss_mask.npy", mmap_mode="r"
+            ),
+            "alignment_scores": np.load(
+                self._companion_path / "alignment_scores.npy", mmap_mode="r"
+            ),
+        }
+        # Optional: alignment_quality.npy was added 2026-05-10; older
+        # companions don't have it. Loaders should treat its absence as
+        # "all unknown" (None) rather than fail.
+        quality_path = self._companion_path / "alignment_quality.npy"
+        if quality_path.exists():
+            arrays["alignment_quality"] = np.load(quality_path)
+
+        n_chunks = len(self._chunk_lengths)
+        if arrays["falcon_offsets"].shape[0] != n_chunks + 1:
+            raise ValueError(
+                f"Falcon companion has {arrays['falcon_offsets'].shape[0] - 1} "
+                f"chunks, but base Qwen chunk index has {n_chunks}"
+            )
+        if arrays["forced_survivor_offsets"].shape[0] != n_chunks + 1:
+            raise ValueError(
+                "forced_survivor_offsets must have one boundary per base chunk "
+                f"({n_chunks + 1}); got {arrays['forced_survivor_offsets'].shape[0]}"
+            )
+        n_forced = int(arrays["forced_survivor_offsets"][-1])
+        for name in ("target_falcon_pair_ids", "target_pair_loss_mask", "alignment_scores"):
+            if arrays[name].shape[0] != n_forced:
+                raise ValueError(
+                    f"{name} has first dimension {arrays[name].shape[0]}, "
+                    f"expected {n_forced} forced survivor rows"
+                )
+        if arrays["target_falcon_pair_ids"].ndim != 2 or arrays[
+            "target_falcon_pair_ids"
+        ].shape[1] != 2:
+            raise ValueError("target_falcon_pair_ids must have shape (N, 2)")
+        if arrays["target_pair_loss_mask"].ndim != 2 or arrays[
+            "target_pair_loss_mask"
+        ].shape[1] != 2:
+            raise ValueError("target_pair_loss_mask must have shape (N, 2)")
+        self._companion_arrays = arrays
+        self._decoder_lengths = (
+            arrays["falcon_offsets"][1:] - arrays["falcon_offsets"][:-1]
+        ).astype(np.int64)
 
     def __getitem__(self, idx: int) -> dict:
         start = int(self._chunk_offset[idx])
         length = int(self._chunk_lengths[idx])
         # Copy from mmap into owned array, cast to int64 for torch
         tokens = self._tokens[start : start + length].astype(np.int64)
+        result = {"token_ids": torch.from_numpy(tokens)}
+        if self._companion_path is not None:
+            f0 = int(self._companion_arrays["falcon_offsets"][idx])
+            f1 = int(self._companion_arrays["falcon_offsets"][idx + 1])
+            s0 = int(self._companion_arrays["forced_survivor_offsets"][idx])
+            s1 = int(self._companion_arrays["forced_survivor_offsets"][idx + 1])
+            result.update({
+                "falcon_token_ids": torch.from_numpy(
+                    self._companion_arrays["falcon_tokens"][f0:f1].astype(np.int64)
+                ),
+                "decoder_content_token_ids": torch.from_numpy(
+                    self._companion_arrays["falcon_tokens"][f0:f1].astype(np.int64)
+                ),
+                "forced_survivor_indices": torch.from_numpy(
+                    self._companion_arrays["forced_survivor_indices"][s0:s1].astype(
+                        np.int64
+                    )
+                ),
+                "target_falcon_pair_ids": torch.from_numpy(
+                    self._companion_arrays["target_falcon_pair_ids"][s0:s1].astype(
+                        np.int64
+                    )
+                ),
+                "target_pair_loss_mask": torch.from_numpy(
+                    self._companion_arrays["target_pair_loss_mask"][s0:s1].astype(
+                        np.bool_
+                    )
+                ),
+                "alignment_scores": torch.from_numpy(
+                    self._companion_arrays["alignment_scores"][s0:s1].astype(np.float32)
+                ),
+            })
         if not self._include_metadata:
-            return {"token_ids": torch.from_numpy(tokens)}
+            return result
 
         assert self._chunk_file_idx is not None
         file_idx = int(self._chunk_file_idx[idx])
         meta = self._get_metadata()
-        result = {
-            "token_ids": torch.from_numpy(tokens),
+        result.update({
             "file_path": str(meta.column("file_path")[file_idx].as_py()),
             "language": str(meta.column("language")[file_idx].as_py()),
-        }
+        })
         if "repo_path" in meta.column_names:
             result["repo_path"] = str(meta.column("repo_path")[file_idx].as_py())
         if "commit_sha" in meta.column_names:

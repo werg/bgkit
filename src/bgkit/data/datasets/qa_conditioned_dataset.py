@@ -14,6 +14,8 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
+from bgkit.data.datasets.tokenizer_compat import tokenizers_share_vocab
+
 from bgkit.data.chat_template import (
     TOOL_CONFIGS,
     build_messages,
@@ -153,12 +155,35 @@ class QAConditionedSubset(Dataset):
     Only joins to single-chunk files for correctness.
     """
 
-    def __init__(self, token_dataset, qa_dataset, tokenizer, seed=42):
+    def __init__(
+        self,
+        token_dataset,
+        qa_dataset,
+        tokenizer,
+        seed=42,
+        encoder_tokenizer=None,
+    ):
         self._token_ds = token_dataset
         self._qa_ds = qa_dataset
         self._tokenizer = tokenizer
+        self._encoder_tokenizer = encoder_tokenizer or tokenizer
         self._base_seed = seed
         self._epoch_seed = seed
+        # The QA mmap was tokenized with the encoder tokenizer. When
+        # encoder ≠ decoder (e.g. Falcon decoder + Qwen encoder), feeding
+        # encoder-vocab IDs into a decoder target sequence produces
+        # vocab-mixed garbage. Fail fast at construction time rather than
+        # silently emit bad samples.
+        if self._encoder_tokenizer is not self._tokenizer and not tokenizers_share_vocab(
+            self._encoder_tokenizer, self._tokenizer,
+        ):
+            raise ValueError(
+                "QAConditionedSubset received encoder and decoder tokenizers "
+                "with different vocabularies. The QA mmap is encoder-tokenized; "
+                "wiring it into a different-family decoder target would mix "
+                "vocabularies. Build a decoder-side QA mmap before enabling "
+                "the query_conditioned objective on cross-family runs."
+            )
 
         # Build reverse index: file key -> (first_chunk_idx, n_chunks)
         file_key_to_chunk_info: dict[tuple[str, str, str], tuple[int, int]] = {}
@@ -232,9 +257,14 @@ class QAConditionedSubset(Dataset):
         source = self._token_ds[tok_idx]
         qa = self._qa_ds[qa_idx]
 
-        # Build a variant dict using the question as compression_prompt
+        # Build a variant dict using the question as compression_prompt.
+        # ``question_ids`` come from the QA mmap, which was tokenized with the
+        # encoder tokenizer — decode with the same tokenizer to recover the
+        # original string before re-encoding for the (encoder-side) prompt.
         question_ids = qa["question_token_ids"]
-        question_text = self._tokenizer.decode(question_ids, skip_special_tokens=True)
+        question_text = self._encoder_tokenizer.decode(
+            question_ids, skip_special_tokens=True,
+        )
 
         variant = {
             "system_prompt": "You are an AI coding assistant with access to the "
@@ -255,6 +285,7 @@ class QAConditionedSubset(Dataset):
             file_path,
             language,
             qa["answer_token_ids"],
+            encoder_tokenizer=self._encoder_tokenizer,
         )
 
         content_ids = source["token_ids"]

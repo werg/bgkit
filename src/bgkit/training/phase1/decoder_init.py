@@ -30,7 +30,7 @@ from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
 from bgkit.data.samplers import PackedTokenBudgetSampler
 from bgkit.eval.metrics.embedding_health import embedding_drift_metrics
 from bgkit.eval.metrics.reconstruction import parse_success_rate
-from bgkit.models.decoder import ReconstructionDecoder
+from bgkit.models.decoder import ReconstructionDecoder, normalize_decoder_family
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
@@ -42,7 +42,10 @@ from bgkit.training.ratio_sampling import (
     sample_ratio,
 )
 from bgkit.training.scheduling import cosine_with_warmup
-from bgkit.utils.attention_backend import resolve_attention_implementation
+from bgkit.utils.attention_backend import (
+    resolve_attention_implementation,
+    resolve_decoder_attention_implementation,
+)
 from bgkit.utils.memory_budget import memory_budget_scope
 
 logger = structlog.get_logger()
@@ -179,7 +182,7 @@ class DecoderInitTrainer(BaseTrainer):
         self._projection_only_steps = tcfg.get("projection_only_steps", 0)
 
         # Threshold-controller config. Derive init_theta from target_ratio_start
-        # under the tanh-bounded-logit convention: θ = 1 − 2·target_ratio so a
+        # under the tanh-bounded-logit convention: theta = 1 - 2 * target_ratio so a
         # symmetric base distribution produces ~target_ratio initial keep-rate.
         # Config init_theta wins if set explicitly (e.g., to tune the warmup
         # bias); otherwise it's computed.
@@ -269,7 +272,13 @@ class DecoderInitTrainer(BaseTrainer):
         self.encoder.eval()
 
         # --- Decoder (trainable) ---
-        decoder_cfg = self.cfg.model.decoder
+        decoder_cfg = tcfg.get("model", {}).get("decoder", self.cfg.model.decoder)
+        decoder_family = normalize_decoder_family(decoder_cfg.get("family", "qwen35"))
+        self.encoder.set_active_decoder_family(decoder_family)
+        decoder_attention_impl = resolve_decoder_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto"),
+            decoder_family=decoder_family,
+        )
         decoder_name = decoder_cfg.backbone_name
         decoder_revision = decoder_cfg.get("backbone_revision", None)
         logger.info("loading_decoder", model=decoder_name, revision=decoder_revision)
@@ -278,10 +287,15 @@ class DecoderInitTrainer(BaseTrainer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=decoder_revision,
-            attn_implementation=attention_impl,
+            attn_implementation=decoder_attention_impl,
             device_map=device,  # load directly to CUDA, avoid CPU staging copy
         )
-        self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
+        decoder_hidden = int(decoder_backbone.get_input_embeddings().weight.shape[1])
+        self.decoder = ReconstructionDecoder(
+            decoder_backbone,
+            hidden_dim=decoder_hidden,
+            decoder_family=decoder_family,
+        )
         self.decoder.set_lm_ce_impl(
             tcfg.get("decoder_ce_impl", self.cfg.compute.get("decoder_ce_impl", None))
         )
@@ -320,7 +334,10 @@ class DecoderInitTrainer(BaseTrainer):
         # ``training.use_liger`` (default True); no-op when liger-kernel is not
         # installed.
         if tcfg.get("use_liger", True):
-            from bgkit.utils.liger_integration import apply_liger_to_qwen35
+            from bgkit.utils.liger_integration import (
+                apply_liger_to_decoder,
+                apply_liger_to_qwen35,
+            )
 
             # Per-kernel toggles for bisecting which Liger component
             # regressed. ``use_liger_rmsnorm`` defaults to False
@@ -331,8 +348,10 @@ class DecoderInitTrainer(BaseTrainer):
             patch_rmsnorm = bool(tcfg.get("use_liger_rmsnorm", False))
             patch_swiglu = bool(tcfg.get("use_liger_swiglu", True))
             patch_rope = bool(tcfg.get("use_liger_rope", True))
+            decoder_family = getattr(self.decoder, "decoder_family", "qwen35")
             use_liger_ce = (
                 bool(tcfg.get("use_liger_ce", True))
+                and decoder_family == "qwen35"
                 and self.decoder.lm_ce_impl in {"auto", "liger"}
             )
             enc_patched = apply_liger_to_qwen35(
@@ -341,7 +360,8 @@ class DecoderInitTrainer(BaseTrainer):
                 patch_swiglu=patch_swiglu,
                 patch_rope=patch_rope,
             )
-            dec_patched = apply_liger_to_qwen35(
+            # apply_liger_to_decoder is family-aware (no-op on Falcon).
+            dec_patched = apply_liger_to_decoder(
                 self.decoder,
                 patch_rmsnorm=patch_rmsnorm,
                 patch_swiglu=patch_swiglu,
@@ -442,7 +462,11 @@ class DecoderInitTrainer(BaseTrainer):
         self._ref_moments_l0 = None
         self._ref_moments_l1 = None
         _l0_block = mm_ref.get("l0", None) if hasattr(mm_ref, "get") else None
-        l0_path = _l0_block.get("path", None) if _l0_block is not None and hasattr(_l0_block, "get") else None
+        l0_path = (
+            _l0_block.get("path", None)
+            if _l0_block is not None and hasattr(_l0_block, "get")
+            else None
+        )
         if self._surv_l0.moment_match_weight > 0 and l0_path:
             self._ref_moments_l0 = load_reference_moments(l0_path)
             logger.info("moment_match_ref_l0_loaded", path=l0_path,
@@ -454,7 +478,11 @@ class DecoderInitTrainer(BaseTrainer):
                 "scripts/probe_ice_distribution.py to generate the file."
             )
         _l1_block = mm_ref.get("l1", None) if hasattr(mm_ref, "get") else None
-        l1_path = _l1_block.get("path", None) if _l1_block is not None and hasattr(_l1_block, "get") else None
+        l1_path = (
+            _l1_block.get("path", None)
+            if _l1_block is not None and hasattr(_l1_block, "get")
+            else None
+        )
         if self._surv_l1.moment_match_weight > 0 and l1_path:
             self._ref_moments_l1 = load_reference_moments(l1_path)
 
@@ -499,7 +527,7 @@ class DecoderInitTrainer(BaseTrainer):
 
         # Token-budget batching (based on chat-formatted lengths)
         max_batch_tokens = tcfg.get("max_batch_tokens", 65536)
-        # Eval defaults to 2× train budget (no backward → lower peak at
+        # Eval defaults to 2x train budget (no backward -> lower peak at
         # same budget). Overridable via training.max_batch_tokens_eval.
         max_batch_tokens_eval = self._resolve_eval_batch_budget(tcfg, max_batch_tokens)
         num_workers = self.cfg.compute.get("num_workers", 4)
@@ -672,18 +700,18 @@ class DecoderInitTrainer(BaseTrainer):
         from bgkit.training.survivorship_helpers import (
             calibrate_head_tanh_temperature,
         )
-        calibrated_T = calibrate_head_tanh_temperature(
+        calibrated_t = calibrate_head_tanh_temperature(
             self.encoder,
             self.train_dataloader,
             self.device,
             level="l0",
             n_probe_batches=n_probe_batches,
         )
-        if calibrated_T is not None:
+        if calibrated_t is not None:
             logger.info(
                 "head_tanh_temperature_calibrated",
                 level="l0",
-                T=calibrated_T,
+                T=calibrated_t,
             )
 
     # ------------------------------------------------------------------

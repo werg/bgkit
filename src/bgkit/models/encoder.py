@@ -1,4 +1,4 @@
-"""BgKIT encoder: two independent ``LevelCompressor`` stages + projection block.
+"""BgKIT encoder: two independent ``LevelCompressor`` stages + projection blocks.
 
 Packed FA4 form. The L0 compressor consumes raw content embeddings (with an
 optional prompt prefix), runs its own complete backbone with a mid-backbone
@@ -9,8 +9,8 @@ survivors are projected back into input-embedding space by L0's
 ``auto_repro_head`` (the L0->L1 bridge — pretrained during Joint Block
 Pretrain and kept trainable downstream) and fed to L1's independent backbone
 for a second compression pass. The final survivor embeddings (from L1 when
-active, otherwise from L0) flow through the shared ``projection_block`` into
-the decoder's embedding space.
+active, otherwise from L0) flow through the active decoder-family
+``projection_block`` into the decoder's embedding space.
 
 L1's backbone is initialized at construction by deep-copying L0's backbone
 state, then evolves independently. L1 has no ``embed_tokens`` (its input is
@@ -28,7 +28,11 @@ import torch.nn as nn
 
 from bgkit.models.bidirectional_qwen35 import BidirectionalQwen35
 from bgkit.models.level_compressor import LevelCompressor, LevelOutput
-from bgkit.models.projection_block import ProjectionBlock
+from bgkit.models.projection_block import (
+    ProjectionBlock,
+    effective_projection_counts,
+    effective_projection_cu,
+)
 from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
 from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.packing import lengths_from_cu, position_ids_from_cu
@@ -85,6 +89,70 @@ def _strip_embed_tokens(backbone: nn.Module) -> None:
         backbone.embed_tokens = nn.Identity()
 
 
+# Per-decoder-family projection-block split factors. The encoder backbone
+# operates in ``hidden_dim``; each surviving row is reshaped into
+# ``split_factor`` decoder-width rows of dim ``hidden_dim // split_factor``.
+# The first family in the dict reuses the encoder's actual last layer
+# references (zero-cost). Every other family deep-copies them so its
+# parameters can train independently.
+#
+# Add a new family by extending this dict and pointing the trainer at it
+# via ``cfg.training.model.decoder.family`` (canonicalized through
+# ``normalize_decoder_family``).
+_PROJECTION_FAMILY_SPLIT_FACTORS: dict[str, int] = {
+    "qwen35": 1,
+    "falcon_h1": 2,
+}
+
+
+def _make_projection_blocks(
+    projection_layer: nn.Module,
+    projection_norm: nn.Module,
+    rotary_emb: nn.Module,
+    hidden_dim: int,
+) -> nn.ModuleDict:
+    blocks: dict[str, nn.Module] = {}
+    is_first = True
+    for family, split in _PROJECTION_FAMILY_SPLIT_FACTORS.items():
+        if hidden_dim % split != 0:
+            raise ValueError(
+                f"projection family {family!r}: encoder hidden_dim={hidden_dim} "
+                f"must be divisible by split_factor={split}"
+            )
+        decoder_hidden = hidden_dim // split
+        if is_first:
+            layer, norm = projection_layer, projection_norm
+            is_first = False
+        else:
+            layer, norm = copy.deepcopy(projection_layer), copy.deepcopy(projection_norm)
+        blocks[family] = ProjectionBlock(
+            layer,
+            norm,
+            rotary_emb,
+            hidden_dim=hidden_dim,
+            output_split_factor=split,
+            output_dim=decoder_hidden,
+        )
+    return nn.ModuleDict(blocks)
+
+
+def _migrate_projection_state_keys(state_dict: dict) -> tuple[dict, bool]:
+    """Route legacy ``projection_block.*`` keys to ``projection_blocks.qwen35.*``."""
+
+    migrated = dict(state_dict)
+    changed = False
+    for key in list(migrated):
+        if key.startswith("projection_block."):
+            new_key = key.replace(
+                "projection_block.",
+                "projection_blocks.qwen35.",
+                1,
+            )
+            migrated[new_key] = migrated.pop(key)
+            changed = True
+    return migrated, changed
+
+
 def is_pruned_encoder_state_dict(state_dict: dict) -> bool:
     """Detect whether an encoder state dict came from a pruned backbone.
 
@@ -131,18 +199,60 @@ def _max_from_cu(cu_seqlens: torch.Tensor) -> int:
 
 
 class BgKITEncoder(nn.Module):
-    """L0 compressor + L1 compressor + projection block (packed)."""
+    """L0 compressor + L1 compressor + per-decoder projection blocks (packed)."""
 
     def __init__(
         self,
         l0: LevelCompressor,
         l1: LevelCompressor,
-        projection_block: ProjectionBlock,
+        projection_block: ProjectionBlock | dict[str, ProjectionBlock] | nn.ModuleDict,
+        active_decoder_family: str = "qwen35",
     ):
         super().__init__()
         self.l0 = l0
         self.l1 = l1
-        self.projection_block = projection_block
+        if isinstance(projection_block, ProjectionBlock):
+            self.projection_blocks = nn.ModuleDict({"qwen35": projection_block})
+        elif isinstance(projection_block, nn.ModuleDict):
+            self.projection_blocks = projection_block
+        else:
+            self.projection_blocks = nn.ModuleDict(projection_block)
+        self.active_family = active_decoder_family
+        if self.active_family not in self.projection_blocks:
+            raise KeyError(
+                f"Unknown decoder family {self.active_family!r}; available "
+                f"families: {sorted(self.projection_blocks.keys())}"
+            )
+
+    @property
+    def projection_block(self) -> ProjectionBlock:
+        """Backward-compatible alias for the active projection block."""
+
+        return self.get_active_projection_block()
+
+    def set_active_decoder_family(self, name: str) -> None:
+        if name not in self.projection_blocks:
+            raise KeyError(
+                f"Unknown decoder family {name!r}; available families: "
+                f"{sorted(self.projection_blocks.keys())}"
+            )
+        self.active_family = str(name)
+
+    def get_active_projection_block(self) -> ProjectionBlock:
+        return self.projection_blocks[self.active_family]
+
+    @property
+    def active_projection_output_dim(self) -> int:
+        return int(self.get_active_projection_block().output_dim)
+
+    def clone_projection_family(self, source: str, target: str) -> None:
+        if source not in self.projection_blocks:
+            raise KeyError(f"Cannot clone missing projection family {source!r}")
+        if target not in self.projection_blocks:
+            raise KeyError(f"Cannot clone into missing projection family {target!r}")
+        src = self.projection_blocks[source]
+        dst = self.projection_blocks[target]
+        dst.load_state_dict(src.state_dict(), strict=True)
 
     def forward(
         self,
@@ -211,7 +321,7 @@ class BgKITEncoder(nn.Module):
 
         proj_max = _max_from_cu(proj_cu)
         proj_pos = position_ids_from_cu(proj_cu, proj_input.shape[0])
-        proj_out = self.projection_block(
+        proj_out = self.get_active_projection_block()(
             proj_input,
             cu_seqlens=proj_cu,
             max_seqlen=proj_max,
@@ -219,13 +329,12 @@ class BgKITEncoder(nn.Module):
             survivor_mask=None,
         )
 
-        counts = proj_out.survivor_counts
-        if counts is None:
-            counts = lengths_from_cu(proj_cu).to(torch.int64)
+        out_cu = effective_projection_cu(proj_out, proj_cu)
+        counts = effective_projection_counts(proj_out, proj_cu)
 
         return EncoderOutput(
             survivor_embeddings=proj_out.projected_embeddings,
-            survivor_cu_seqlens=proj_cu,
+            survivor_cu_seqlens=out_cu,
             survivor_counts=counts,
             l0=l0_out,
             l1=l1_out,
@@ -250,6 +359,7 @@ class BgKITEncoder(nn.Module):
         conv_kernel_size: int = 16,
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
+        active_decoder_family: str = "qwen35",
     ) -> BgKITEncoder:
         if isinstance(backbone_name_or_module, str):
             from transformers import AutoModel
@@ -278,6 +388,7 @@ class BgKITEncoder(nn.Module):
                 conv_kernel_size,
                 survivorship_inner_dim,
                 threshold_controller_cfg,
+                active_decoder_family,
             )
 
         if not isinstance(raw_model, BidirectionalQwen35) and _is_qwen35_model(raw_model):
@@ -312,14 +423,14 @@ class BgKITEncoder(nn.Module):
             with_prompt=False,
             with_auto_repro=False,
         )
-        projection_block = ProjectionBlock(
+        projection_blocks = _make_projection_blocks(
             projection_layer,
             projection_norm,
             rotary_emb,
             hidden_dim=hidden_dim,
         )
 
-        encoder = cls(l0, l1, projection_block)
+        encoder = cls(l0, l1, projection_blocks, active_decoder_family=active_decoder_family)
         encoder.to(dtype=torch_dtype)
         return encoder
 
@@ -333,6 +444,7 @@ class BgKITEncoder(nn.Module):
         conv_kernel_size: int,
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
+        active_decoder_family: str = "qwen35",
     ) -> BgKITEncoder:
         layers = _resolve_layers(text_model)
         projection_layer = layers[-1]
@@ -367,14 +479,14 @@ class BgKITEncoder(nn.Module):
             with_prompt=False,
             with_auto_repro=False,
         )
-        projection_block = ProjectionBlock(
+        projection_blocks = _make_projection_blocks(
             projection_layer,
             projection_norm,
             rotary_emb,
             hidden_dim=hidden_dim,
         )
 
-        encoder = cls(l0, l1, projection_block)
+        encoder = cls(l0, l1, projection_blocks, active_decoder_family=active_decoder_family)
         encoder.to(dtype=torch_dtype)
         return encoder
 
@@ -392,6 +504,7 @@ class BgKITEncoder(nn.Module):
         conv_kernel_size: int = 16,
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
+        active_decoder_family: str = "qwen35",
     ) -> BgKITEncoder:
         """Construct an encoder and load a state dict in the new split-L0/L1 layout.
 
@@ -414,11 +527,12 @@ class BgKITEncoder(nn.Module):
             conv_kernel_size=conv_kernel_size,
             survivorship_inner_dim=survivorship_inner_dim,
             threshold_controller_cfg=threshold_controller_cfg,
+            active_decoder_family=active_decoder_family,
         )
 
         # One-shot migration: if a checkpoint was saved with the broken
         # ``l{0,1}.backbone.norm.*`` keys, re-route them to ``l{0,1}.norm.*``.
-        migrated = dict(encoder_state_dict)
+        migrated, projection_migrated = _migrate_projection_state_keys(encoder_state_dict)
         broken_keys = [
             k for k in migrated
             if k.startswith("l0.backbone.norm.") or k.startswith("l1.backbone.norm.")
@@ -437,9 +551,51 @@ class BgKITEncoder(nn.Module):
                 "(fixes the double-norm regression introduced in the rebuild)",
                 len(broken_keys),
             )
-
-        result = encoder.load_state_dict(migrated, strict=False)
         import logging
+
+        if projection_migrated:
+            logging.getLogger(__name__).info(
+                "Auto-migrated legacy projection_block.* keys to "
+                "projection_blocks.qwen35.*",
+            )
+
+        present_families = {
+            family
+            for family in encoder.projection_blocks
+            if any(
+                k.startswith(f"projection_blocks.{family}.")
+                for k in migrated
+            )
+        }
+        result = encoder.load_state_dict(migrated, strict=False)
+        # If the active family is missing from the checkpoint AND another
+        # family IS present, fall back to cloning *and* warn loudly: the
+        # active family's projection block has never been trained against
+        # this decoder family, so the first few hundred steps may diverge
+        # until the projection adapter catches up.
+        active = encoder.active_family
+        if active not in present_families:
+            available = present_families & set(encoder.projection_blocks.keys())
+            logger_local = logging.getLogger(__name__)
+            if available:
+                source = "qwen35" if "qwen35" in available else next(iter(available))
+                encoder.clone_projection_family(source, active)
+                logger_local.warning(
+                    "projection_block_family_stale: active family %r was "
+                    "absent from the checkpoint; cloned weights from %r. "
+                    "These weights have NOT been trained against the active "
+                    "decoder family — expect higher initial loss. Train a "
+                    "Falcon dense seed / forced adapt stage to repair.",
+                    active,
+                    source,
+                )
+            else:
+                logger_local.warning(
+                    "projection_block_family_missing: active family %r "
+                    "absent from checkpoint and no source family available "
+                    "to clone from. Active block is at random init.",
+                    active,
+                )
 
         logger = logging.getLogger(__name__)
         if result.missing_keys:
@@ -468,6 +624,7 @@ class BgKITEncoder(nn.Module):
         conv_kernel_size: int = 16,
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
+        active_decoder_family: str = "qwen35",
     ) -> BgKITEncoder:
         """Construct an encoder and load ONLY the ``l0.*`` keys from the
         state dict.
@@ -493,6 +650,7 @@ class BgKITEncoder(nn.Module):
             conv_kernel_size=conv_kernel_size,
             survivorship_inner_dim=survivorship_inner_dim,
             threshold_controller_cfg=threshold_controller_cfg,
+            active_decoder_family=active_decoder_family,
         )
 
     @classmethod
@@ -509,6 +667,7 @@ class BgKITEncoder(nn.Module):
         conv_kernel_size: int = 16,
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
+        active_decoder_family: str = "qwen35",
     ) -> BgKITEncoder:
         """Migrate a legacy ``compressor.*`` Step-4 state dict into the new layout.
 
@@ -533,7 +692,7 @@ class BgKITEncoder(nn.Module):
         - ``compressor.threshold_l1.*`` → ``l1.threshold.*``
         - ``compressor.head_base_l0.*`` → ``l0.head.*``
         - ``compressor.head_base_l1.*`` → ``l1.head.*``
-        - ``projection_block.*`` → unchanged.
+        - ``projection_block.*`` → ``projection_blocks.qwen35.*``.
         """
         pruned = any(
             k.startswith("compressor.backbone.blocks.")
@@ -551,6 +710,7 @@ class BgKITEncoder(nn.Module):
             conv_kernel_size=conv_kernel_size,
             survivorship_inner_dim=survivorship_inner_dim,
             threshold_controller_cfg=threshold_controller_cfg,
+            active_decoder_family=active_decoder_family,
         )
 
         migrated: dict[str, torch.Tensor] = {}
@@ -612,12 +772,47 @@ class BgKITEncoder(nn.Module):
                 continue
             if k.startswith("compressor."):
                 continue
+            if k.startswith("projection_block."):
+                migrated[
+                    k.replace("projection_block.", "projection_blocks.qwen35.", 1)
+                ] = v
+                continue
             migrated[k] = v
 
+        present_families = {
+            family
+            for family in encoder.projection_blocks
+            if any(
+                k.startswith(f"projection_blocks.{family}.")
+                for k in migrated
+            )
+        }
         result = encoder.load_state_dict(migrated, strict=False)
         import logging
 
         logger = logging.getLogger(__name__)
+        active = encoder.active_family
+        if active not in present_families:
+            available = present_families & set(encoder.projection_blocks.keys())
+            if available:
+                source = "qwen35" if "qwen35" in available else next(iter(available))
+                encoder.clone_projection_family(source, active)
+                logger.warning(
+                    "projection_block_family_stale_legacy_migration: "
+                    "active family %r was absent from the legacy checkpoint; "
+                    "cloned weights from %r. Train a stage that targets %r "
+                    "before relying on these weights.",
+                    active,
+                    source,
+                    active,
+                )
+            else:
+                logger.warning(
+                    "projection_block_family_missing_legacy_migration: "
+                    "active family %r absent and no source family available "
+                    "to clone from. Active block is at random init.",
+                    active,
+                )
         if result.missing_keys:
             logger.info(
                 "Missing keys after legacy Step-4 migration: %s",

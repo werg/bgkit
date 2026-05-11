@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - /config
+  - /training/phase2_kb_stage_b_falcon
+  - _self_
+
+run_name: phase2_kb_stage_b_falcon
+
+model:
+  decoder:
+    family: falcon_h1
+    backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+    hidden_dim: 512

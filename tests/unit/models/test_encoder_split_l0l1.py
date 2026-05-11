@@ -163,6 +163,38 @@ def test_l0_only_mode_skips_l1_and_bridge():
     assert out.survivor_embeddings.shape == (8, 16)
 
 
+def test_active_decoder_family_controls_projection_shape(monkeypatch):
+    from bgkit.models import projection_block as pb
+
+    monkeypatch.setattr(
+        pb,
+        "_packed_full_attention",
+        lambda _self_attn, hidden_states, *_args, **_kwargs: torch.zeros_like(hidden_states),
+    )
+    enc = _make_encoder().eval()
+    enc.projection_blocks["falcon_h1"] = ProjectionBlock(
+        _MockTransformerLayer(16),
+        nn.LayerNorm(16),
+        _MockRotaryEmb(16),
+        hidden_dim=16,
+        output_split_factor=2,
+    )
+    enc.set_active_decoder_family("falcon_h1")
+    content, cu, pos = _make_packed_content(B=1, lengths=[5])
+
+    out = enc(
+        content_embeddings=content,
+        content_cu_seqlens=cu,
+        content_position_ids=pos,
+        target_ratio_l0=None,
+        target_ratio_l1=None,
+    )
+
+    assert out.survivor_embeddings.shape == (10, 8)
+    assert out.survivor_cu_seqlens.tolist() == [0, 10]
+    assert enc.active_projection_output_dim == 8
+
+
 def test_l0_compression_only_passes_through_projection():
     torch.manual_seed(42)
     enc = _make_encoder().eval()

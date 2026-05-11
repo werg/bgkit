@@ -56,6 +56,29 @@ def _create_mmap_data(
     (data_dir / "manifest.json").write_text(json.dumps(manifest))
 
 
+def _create_falcon_companion(
+    companion_dir: Path,
+    falcon_chunk_token_ids: list[list[int]],
+) -> None:
+    companion_dir.mkdir()
+    falcon_tokens = []
+    falcon_offsets = [0]
+    for tids in falcon_chunk_token_ids:
+        falcon_tokens.extend(tids)
+        falcon_offsets.append(len(falcon_tokens))
+
+    np.save(companion_dir / "falcon_tokens.npy", np.array(falcon_tokens, dtype=np.int32))
+    np.save(companion_dir / "falcon_offsets.npy", np.array(falcon_offsets, dtype=np.int64))
+    np.save(companion_dir / "forced_survivor_indices.npy", np.array([], dtype=np.int32))
+    np.save(companion_dir / "forced_survivor_offsets.npy", np.zeros(
+        len(falcon_chunk_token_ids) + 1,
+        dtype=np.int64,
+    ))
+    np.save(companion_dir / "target_falcon_pair_ids.npy", np.empty((0, 2), dtype=np.int32))
+    np.save(companion_dir / "target_pair_loss_mask.npy", np.empty((0, 2), dtype=np.bool_))
+    np.save(companion_dir / "alignment_scores.npy", np.array([], dtype=np.float32))
+
+
 @pytest.fixture
 def token_data_dir(tmp_path: Path) -> Path:
     """Create a small mmap token dataset."""
@@ -107,6 +130,37 @@ class TestMmapTokenDataset:
     def test_lengths(self, token_data_dir: Path):
         ds = MmapTokenDataset(str(token_data_dir), max_seq_len=8192)
         np.testing.assert_array_equal(ds.lengths, [10, 5, 3])
+
+    def test_decoder_lengths_default_to_source_lengths(self, token_data_dir: Path):
+        ds = MmapTokenDataset(str(token_data_dir), max_seq_len=8192)
+        np.testing.assert_array_equal(ds.decoder_lengths, ds.lengths)
+
+    def test_decoder_lengths_use_falcon_companion(self, tmp_path: Path):
+        d = tmp_path / "tokens"
+        d.mkdir()
+        _create_mmap_data(
+            d,
+            file_token_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            file_paths=["a.py", "b.py"],
+            languages=["python", "python"],
+        )
+        companion = tmp_path / "tokens_falcon_h1"
+        _create_falcon_companion(
+            companion,
+            falcon_chunk_token_ids=[
+                [101, 102, 103, 104, 105],
+                [201, 202],
+            ],
+        )
+
+        ds = MmapTokenDataset(str(d), max_seq_len=8192, companion_dir=str(companion))
+
+        np.testing.assert_array_equal(ds.lengths, [3, 4])
+        np.testing.assert_array_equal(ds.decoder_lengths, [5, 2])
+        assert torch.equal(
+            ds[0]["decoder_content_token_ids"],
+            torch.tensor([101, 102, 103, 104, 105], dtype=torch.int64),
+        )
 
     def test_chunking(self, tmp_path: Path):
         """Files longer than max_seq_len should be split into chunks."""

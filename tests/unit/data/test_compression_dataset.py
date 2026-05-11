@@ -13,9 +13,11 @@ torch = pytest.importorskip("torch")
 
 from torch.utils.data import Dataset
 
+from bgkit.data.chat_template import TOOL_CONFIGS
 from bgkit.data.collators import collate_compression
 from bgkit.data.datasets.compression_dataset import (
     CompressionDataset,
+    DataReconstructionSubset,
     DescriptionSubset,
     FileCompressionSample,
     RepoCompressionSample,
@@ -156,6 +158,26 @@ class TestCompressionDataset:
         assert seen_objectives == {"data_reconstruction", "description_generation",
                                     "commit_reproduction"}
 
+    def test_zero_weight_objectives_are_excluded(self):
+        """Explicit zero weights should not leak minimum samples into a run."""
+        subsets = {
+            "data_reconstruction": MockFileSubset(40, objective="data_reconstruction"),
+            "description_generation": MockFileSubset(20, objective="description_generation"),
+            "commit_reproduction": MockRepoSubset(25, objective="commit_reproduction"),
+        }
+        weights = {
+            "data_reconstruction": 1.0,
+            "description_generation": 0.0,
+            "commit_reproduction": 0.0,
+        }
+        ds = CompressionDataset(subsets=subsets, weights=weights)
+
+        assert ds._objective_order == ["data_reconstruction"]
+        assert len(ds) == 40
+        assert {ds.objective_for_idx(i) for i in range(len(ds))} == {
+            "data_reconstruction",
+        }
+
     def test_index_mapping_contiguous_ranges(self):
         """Each objective should occupy a contiguous range of indices."""
         subsets = {
@@ -187,6 +209,21 @@ class TestCompressionDataset:
             l1 = ds.token_length(i)
             l2 = ds.token_length(i)
             assert l1 == l2, f"token_length({i}) returned {l1} then {l2}"
+
+    def test_content_token_length_prefers_subset_method(self):
+        """Content filters should use source lengths when sampler lengths differ."""
+
+        class _DecoderHeavySubset(MockFileSubset):
+            def token_length(self, idx: int) -> int:
+                return 500 + idx
+
+            def content_token_length(self, idx: int) -> int:
+                return 100 + idx
+
+        ds = CompressionDataset(subsets={"data_reconstruction": _DecoderHeavySubset(3)})
+
+        assert ds.token_length(2) == 502
+        assert ds.content_token_length(2) == 102
 
     def test_getitem_returns_correct_type(self):
         """File subsets should return FileCompressionSample."""
@@ -561,6 +598,58 @@ class _MockTokenDataset(Dataset):
         }
 
 
+class _MockDecoderAwareTokenDataset(Dataset):
+    """Token dataset whose decoder stream has different per-sample lengths."""
+
+    def __init__(self, source_lengths: list[int], decoder_lengths: list[int]):
+        self._source_lengths = np.array(source_lengths, dtype=np.int64)
+        self._decoder_lengths = np.array(decoder_lengths, dtype=np.int64)
+
+    @property
+    def lengths(self):
+        return self._source_lengths
+
+    @property
+    def decoder_lengths(self):
+        return self._decoder_lengths
+
+    def __len__(self):
+        return len(self._source_lengths)
+
+    def __getitem__(self, idx):
+        source_len = int(self._source_lengths[idx])
+        decoder_len = int(self._decoder_lengths[idx])
+        return {
+            "token_ids": torch.arange(source_len, dtype=torch.long),
+            "decoder_content_token_ids": torch.arange(decoder_len, dtype=torch.long),
+            "file_path": f"f{idx}.py",
+            "language": "python",
+        }
+
+
+def test_data_reconstruction_length_uses_decoder_stream_for_budgeting():
+    token_ds = _MockDecoderAwareTokenDataset(
+        source_lengths=[100, 300],
+        decoder_lengths=[250, 120],
+    )
+    subset = DataReconstructionSubset(
+        token_ds,
+        _MockTokenizer(),
+        [{
+            "system_prompt": "You are a helpful assistant.",
+            "user_prompt": "Read {file_path}",
+            "compression_prompt": "Return the file.",
+            "response_prefix": "Contents:",
+        }],
+        TOOL_CONFIGS["file_read_repro"],
+    )
+
+    assert subset.token_length(0) == 250 + subset._max_overhead
+    assert subset.token_length(1) == 300 + subset._max_overhead
+    assert subset.content_token_length(0) == 100
+    assert subset.content_token_length(1) == 300
+
+
 class _MockDescDataset(Dataset):
     """Mock file-level description dataset."""
 
@@ -722,9 +811,25 @@ class TestDescriptionSubsetL1Targets:
 
         original_tws = ct_module.tokenize_with_sentinel
 
-        def tracking_tws(tokenizer, variant, config, file_path, language, content_ids):
+        def tracking_tws(
+            tokenizer,
+            variant,
+            config,
+            file_path,
+            language,
+            content_ids,
+            **kwargs,
+        ):
             captured_calls.append((file_path, language))
-            return original_tws(tokenizer, variant, config, file_path, language, content_ids)
+            return original_tws(
+                tokenizer,
+                variant,
+                config,
+                file_path,
+                language,
+                content_ids,
+                **kwargs,
+            )
 
         with patch.object(ct_module, "tokenize_with_sentinel", tracking_tws):
             # Also need to patch the import in compression_dataset module

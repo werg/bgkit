@@ -52,8 +52,9 @@ from torch.utils.data import DataLoader, random_split
 from bgkit.data.collators import collate_compression
 from bgkit.data.datasets.commit_encoding_dataset import CommitEncodingDataset
 from bgkit.data.samplers import PackedTokenBudgetSampler
-from bgkit.models.decoder import ReconstructionDecoder
+from bgkit.models.decoder import ReconstructionDecoder, normalize_decoder_family
 from bgkit.models.encoder import BgKITEncoder
+from bgkit.models.projection_block import effective_projection_cu
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
@@ -62,7 +63,10 @@ from bgkit.training.ratio_sampling import (
     build_ratio_sampler_config,
     resolve_anchor_grid,
 )
-from bgkit.utils.attention_backend import resolve_attention_implementation
+from bgkit.utils.attention_backend import (
+    resolve_attention_implementation,
+    resolve_decoder_attention_implementation,
+)
 from bgkit.utils.packing import position_ids_from_cu
 
 logger = structlog.get_logger()
@@ -182,7 +186,13 @@ class CommitEncodingTrainer(BaseTrainer):
         self.encoder.to(device)
 
         # ---- Decoder ----
-        decoder_cfg = self.cfg.model.decoder
+        decoder_cfg = tcfg.get("model", {}).get("decoder", self.cfg.model.decoder)
+        decoder_family = normalize_decoder_family(decoder_cfg.get("family", "qwen35"))
+        self.encoder.set_active_decoder_family(decoder_family)
+        decoder_attention_impl = resolve_decoder_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto"),
+            decoder_family=decoder_family,
+        )
         decoder_name = decoder_cfg.backbone_name
         decoder_revision = decoder_cfg.get("backbone_revision", None)
         logger.info("loading_decoder", model=decoder_name, revision=decoder_revision)
@@ -194,10 +204,15 @@ class CommitEncodingTrainer(BaseTrainer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=decoder_revision,
-            attn_implementation=attention_impl,
+            attn_implementation=decoder_attention_impl,
             device_map=device,
         )
-        self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
+        decoder_hidden = int(decoder_backbone.get_input_embeddings().weight.shape[1])
+        self.decoder = ReconstructionDecoder(
+            decoder_backbone,
+            hidden_dim=decoder_hidden,
+            decoder_family=decoder_family,
+        )
         self.decoder.set_lm_ce_impl(
             tcfg.get("decoder_ce_impl", self.cfg.compute.get("decoder_ce_impl", None))
         )
@@ -221,13 +236,18 @@ class CommitEncodingTrainer(BaseTrainer):
         maybe_enable_gradient_checkpointing(self.decoder.backbone, self.cfg)
 
         if tcfg.get("use_liger", True):
-            from bgkit.utils.liger_integration import apply_liger_to_qwen35
+            from bgkit.utils.liger_integration import (
+                apply_liger_to_decoder,
+                apply_liger_to_qwen35,
+            )
 
             patch_rmsnorm = bool(tcfg.get("use_liger_rmsnorm", False))
             patch_swiglu = bool(tcfg.get("use_liger_swiglu", True))
             patch_rope = bool(tcfg.get("use_liger_rope", True))
+            decoder_family = getattr(self.decoder, "decoder_family", "qwen35")
             use_liger_ce = (
                 bool(tcfg.get("use_liger_ce", True))
+                and decoder_family == "qwen35"
                 and self.decoder.lm_ce_impl in {"auto", "liger"}
             )
             enc_patched = apply_liger_to_qwen35(
@@ -236,7 +256,8 @@ class CommitEncodingTrainer(BaseTrainer):
                 patch_swiglu=patch_swiglu,
                 patch_rope=patch_rope,
             )
-            dec_patched = apply_liger_to_qwen35(
+            # apply_liger_to_decoder is family-aware (no-op on Falcon).
+            dec_patched = apply_liger_to_decoder(
                 self.decoder,
                 patch_rmsnorm=patch_rmsnorm,
                 patch_swiglu=patch_swiglu,
@@ -999,7 +1020,7 @@ class CommitEncodingTrainer(BaseTrainer):
         from bgkit.training.survivorship_helpers import calibrate_head_tanh_temperature
         for level in ("l0", "l1"):
             try:
-                T = calibrate_head_tanh_temperature(
+                calibrated_t = calibrate_head_tanh_temperature(
                     self.encoder,
                     self.train_dataloader,
                     self.device,
@@ -1007,8 +1028,12 @@ class CommitEncodingTrainer(BaseTrainer):
                     n_probe_batches=n_probe_batches,
                     batch_to_content=_commit_batch_to_content,
                 )
-                if T is not None:
-                    logger.info("head_tanh_temperature_calibrated", level=level, T=T)
+                if calibrated_t is not None:
+                    logger.info(
+                        "head_tanh_temperature_calibrated",
+                        level=level,
+                        T=calibrated_t,
+                    )
             except Exception as exc:
                 logger.warning(
                     "head_tanh_temperature_calibration_failed",
@@ -1117,10 +1142,11 @@ class CommitEncodingTrainer(BaseTrainer):
             position_ids=proj_pos,
             survivor_mask=None,
         )
+        projected_cu = effective_projection_cu(proj_out, proj_cu)
 
         return (
             proj_out.projected_embeddings,
-            proj_cu,
+            projected_cu,
             l0_out,
             l1_out,
             cu_file,

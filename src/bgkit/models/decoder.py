@@ -64,6 +64,65 @@ LM_CE_IMPLS = frozenset(
 )
 
 
+def normalize_decoder_family(family: str | None) -> str:
+    normalized = str(family or "qwen35").strip().lower()
+    if normalized in {"qwen", "qwen35", "qwen3_5", "qwen3.5"}:
+        return "qwen35"
+    if normalized in {"falcon_h1", "falcon-h1", "falcon"}:
+        return "falcon_h1"
+    raise ValueError(
+        f"Unsupported decoder family {family!r}; expected 'qwen35' or 'falcon_h1'"
+    )
+
+
+def _decoder_family_has_stateful_mixer(family: str | None) -> bool:
+    """Whether sequence state can leak across flattened sample boundaries."""
+
+    return normalize_decoder_family(family) in {"falcon_h1"}
+
+
+def _default_lora_targets(family: str) -> tuple[str, ...]:
+    """Return stable decoder LoRA targets for a supported decoder family."""
+
+    normalized = normalize_decoder_family(family)
+    if normalized == "qwen35":
+        return (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        )
+    if normalized == "falcon_h1":
+        return (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "in_proj",
+            "out_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        )
+    raise AssertionError(f"unhandled decoder family: {normalized}")
+
+
+def _ensure_decoder_lora_supported(family: str) -> None:
+    """Fail fast for decoder families where LoRA is not a supported path."""
+
+    normalized = normalize_decoder_family(family)
+    if normalized == "falcon_h1":
+        raise ValueError(
+            "Falcon-H1 decoder LoRA is disabled. Falcon-H1 Tiny is small enough "
+            "for full decoder fine-tuning, and PEFT LoRA currently rejects "
+            "Falcon/Mamba targets such as out_proj. Set training.decoder_lora."
+            "enabled=false for Falcon runs."
+        )
+
+
 def _resolve_ce_chunk_size(chunk_size: int | None) -> int:
     return DEFAULT_LM_CE_CHUNK_SIZE if chunk_size is None else int(chunk_size)
 
@@ -903,14 +962,16 @@ class DecoderLoRALinear(nn.Module):
 class ReconstructionDecoder(nn.Module):
     """Causal LM decoder for reconstructing content from BgKIT survivors.
 
-    Wraps Qwen3.5-0.8B and exposes interleaved survivor-injection helpers.
+    Wraps a causal decoder and exposes interleaved survivor-injection helpers.
 
     Supports optional NVFP4 quantization via TransformerEngine and decoder
     LoRA. Setup order: construct → load checkpoint → enable_nvfp4() →
     apply_lora().
 
-    Attention regime: packed (varlen) only.  No padded / masked path.
-    ``forward_with_single_splice`` accepts flat packed inputs;
+    ``forward_with_single_splice`` accepts flat survivor inputs and dispatches
+    to a decoder-family-appropriate sequence layout. Attention-only families
+    use the packed varlen path; stateful SSM/Mamba hybrids use a padded batch
+    so recurrent state resets at sample boundaries.
     ``generate_with_single_splice`` uses a custom B=1 autoregressive loop
     driven by ``backbone.forward`` — not ``backbone.generate``.
     """
@@ -920,10 +981,12 @@ class ReconstructionDecoder(nn.Module):
         backbone: nn.Module,
         hidden_dim: int = 1024,
         nvfp4: bool = False,
+        decoder_family: str = "qwen35",
     ):
         super().__init__()
         self.backbone = backbone
         self.hidden_dim = hidden_dim
+        self.decoder_family = normalize_decoder_family(decoder_family)
         self._use_te = False
         self._use_native_nvfp4 = False
         self._te_recipe = None
@@ -943,6 +1006,12 @@ class ReconstructionDecoder(nn.Module):
 
         if nvfp4:
             self.enable_nvfp4()
+
+    @property
+    def uses_stateful_sequence_mixer(self) -> bool:
+        """True when flattened packed samples would leak sequence state."""
+
+        return _decoder_family_has_stateful_mixer(self.decoder_family)
 
     def enable_liger_ce(self, enabled: bool = True) -> None:
         """Toggle the fused linear+CE path used inside ``forward_interleaved_with_loss``.
@@ -1231,6 +1300,370 @@ class ReconstructionDecoder(nn.Module):
 
         return hidden, seq_pad
 
+    def _forward_single_splice_padded_batch(
+        self,
+        *,
+        sample_embeds: list[torch.Tensor],
+        sample_token_ids: list[torch.Tensor],
+        sample_loss_masks: list[torch.Tensor],
+        lm_head: nn.Module,
+        chunk_size: int | None,
+        return_hidden_states: bool,
+    ) -> torch.Tensor | InterleavedForwardOutput:
+        """Single-splice forward using a real batch dimension.
+
+        Stateful sequence mixers such as Mamba update hidden state along the
+        time axis. They cannot consume ``[sample0 | sample1 | ...]`` flattened
+        as one sequence because no attention-style ``cu_seqlens`` can reset
+        that recurrent state. Padding keeps samples in separate batch rows and
+        lets the model's ordinary ``attention_mask`` / Mamba mask plumbing
+        handle ragged lengths.
+        """
+
+        batch_size = len(sample_embeds)
+        if batch_size == 0:
+            raise ValueError("single-splice batch must contain at least one sample")
+
+        max_len = max(int(e.shape[0]) for e in sample_embeds)
+        hidden_dim = int(sample_embeds[0].shape[-1])
+        device = sample_embeds[0].device
+        dtype = sample_embeds[0].dtype
+
+        inputs_embeds = sample_embeds[0].new_zeros(
+            batch_size,
+            max_len,
+            hidden_dim,
+        )
+        token_ids = sample_token_ids[0].new_zeros(batch_size, max_len)
+        attention_mask = torch.zeros(
+            batch_size,
+            max_len,
+            dtype=torch.bool,
+            device=device,
+        )
+        loss_mask_2d = torch.zeros(
+            batch_size,
+            max_len,
+            dtype=torch.bool,
+            device=device,
+        )
+
+        for b, (emb, ids, mask) in enumerate(
+            zip(sample_embeds, sample_token_ids, sample_loss_masks, strict=True)
+        ):
+            length = int(emb.shape[0])
+            inputs_embeds[b, :length] = emb.to(dtype=dtype)
+            token_ids[b, :length] = ids.to(device=device, dtype=torch.long)
+            attention_mask[b, :length] = True
+            loss_mask_2d[b, :length] = mask.to(device=device, dtype=torch.bool)
+
+        return self._forward_single_splice_padded_tensors(
+            inputs_embeds=inputs_embeds,
+            token_ids=token_ids,
+            attention_mask=attention_mask,
+            loss_mask_2d=loss_mask_2d,
+            lm_head=lm_head,
+            chunk_size=chunk_size,
+            return_hidden_states=return_hidden_states,
+        )
+
+    def _forward_single_splice_padded_tensors(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        token_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask_2d: torch.Tensor,
+        lm_head: nn.Module,
+        chunk_size: int | None,
+        return_hidden_states: bool,
+    ) -> torch.Tensor | InterleavedForwardOutput:
+        """Run a stateful decoder on already padded single-splice tensors."""
+
+        hidden, seq_pad = self._inner_forward(inputs_embeds, attention_mask)
+        if seq_pad > 0:
+            hidden = hidden[:, :-seq_pad, :]
+
+        loss = self._compute_lm_ce(
+            lm_head=lm_head,
+            hidden_states=hidden,
+            token_ids_full=token_ids,
+            attention_mask=attention_mask,
+            loss_mask_full=loss_mask_2d,
+            chunk_size=chunk_size,
+        )
+
+        if return_hidden_states:
+            return InterleavedForwardOutput(
+                loss=loss,
+                hidden_states=hidden,
+                token_ids=token_ids,
+                loss_mask=loss_mask_2d,
+                attention_mask=attention_mask,
+                lm_head=lm_head,
+            )
+        return loss
+
+    def forward_with_packed_target_splice(
+        self,
+        *,
+        survivor_embeddings: torch.Tensor,
+        survivor_cu_seqlens: torch.Tensor,
+        target_ids_flat: torch.Tensor,
+        target_cu_seqlens: torch.Tensor,
+        splice_start: torch.Tensor,
+        splice_len: torch.Tensor,
+        loss_mask_flat: torch.Tensor | None = None,
+        sample_indices: list[int] | None = None,
+        chunk_size: int | None = None,
+        return_hidden_states: bool = False,
+    ) -> torch.Tensor | InterleavedForwardOutput:
+        """Forward + loss from packed target tensors and explicit splice metadata.
+
+        This is the trainer-facing single-splice API. It consumes the collator's
+        flat target representation directly instead of forcing callers to build
+        Python lists of per-sample prefix/suffix tensors. Attention-only decoder
+        families delegate to ``forward_with_single_splice`` after deriving those
+        views. Stateful mixer families build the padded batch directly, which
+        avoids an otherwise wasted pack-then-pad round trip and keeps recurrent
+        state isolated per sample.
+        """
+
+        device = survivor_embeddings.device
+        target_ids_flat = target_ids_flat.to(device=device, dtype=torch.long)
+        if loss_mask_flat is not None:
+            loss_mask_flat = loss_mask_flat.to(device=device, dtype=torch.bool)
+
+        target_cu_list = target_cu_seqlens.detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        ).tolist()
+        splice_start_list = splice_start.detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        ).tolist()
+        splice_len_list = splice_len.detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        ).tolist()
+        survivor_cu_list = survivor_cu_seqlens.detach().to(
+            device="cpu",
+            dtype=torch.int64,
+        ).tolist()
+
+        target_batch_size = len(target_cu_list) - 1
+        if sample_indices is None:
+            selected_samples = list(range(target_batch_size))
+        else:
+            selected_samples = [int(index) for index in sample_indices]
+        batch_size = len(selected_samples)
+        if batch_size == 0:
+            raise ValueError("packed target splice batch must contain at least one sample")
+        if len(survivor_cu_list) != batch_size + 1:
+            raise ValueError(
+                f"survivor_cu_seqlens must have shape (selected_B+1,) = "
+                f"({batch_size + 1},); got {tuple(survivor_cu_seqlens.shape)}"
+            )
+
+        prefix_lens: list[int] = []
+        suffix_lens: list[int] = []
+        survivor_lens: list[int] = []
+        sample_starts: list[int] = []
+        sample_ends: list[int] = []
+        splice_starts: list[int] = []
+        splice_lens: list[int] = []
+        for out_idx, sample_idx in enumerate(selected_samples):
+            if sample_idx < 0 or sample_idx >= target_batch_size:
+                raise IndexError(
+                    f"sample index {sample_idx} is outside target batch size "
+                    f"{target_batch_size}"
+                )
+            sample_start = int(target_cu_list[sample_idx])
+            sample_end = int(target_cu_list[sample_idx + 1])
+            sample_len = sample_end - sample_start
+            splice_b_start = int(splice_start_list[sample_idx])
+            splice_b_len = int(splice_len_list[sample_idx])
+            if splice_b_start < 0:
+                splice_b_start = sample_len
+                splice_b_len = 0
+            if splice_b_start > sample_len or splice_b_start + splice_b_len > sample_len:
+                raise ValueError(
+                    f"splice range ({splice_b_start}, {splice_b_len}) exceeds "
+                    f"sample {sample_idx} target length {sample_len}"
+                )
+
+            sample_starts.append(sample_start)
+            sample_ends.append(sample_end)
+            splice_starts.append(splice_b_start)
+            splice_lens.append(splice_b_len)
+            prefix_lens.append(splice_b_start)
+            suffix_lens.append(sample_len - splice_b_start - splice_b_len)
+            survivor_lens.append(
+                int(survivor_cu_list[out_idx + 1]) - int(survivor_cu_list[out_idx])
+            )
+
+        if not self.uses_stateful_sequence_mixer:
+            prefix_ids: list[torch.Tensor] = []
+            suffix_ids: list[torch.Tensor] = []
+            segment_loss_masks: list[torch.Tensor] = []
+            for out_idx, _sample_idx in enumerate(selected_samples):
+                sample_start = sample_starts[out_idx]
+                sample_end = sample_ends[out_idx]
+                splice_b_start = splice_starts[out_idx]
+                splice_b_len = splice_lens[out_idx]
+                prefix_ids.append(
+                    target_ids_flat[sample_start : sample_start + splice_b_start]
+                )
+                suffix_ids.append(
+                    target_ids_flat[sample_start + splice_b_start + splice_b_len : sample_end]
+                )
+                if loss_mask_flat is not None:
+                    sample_loss = loss_mask_flat[sample_start:sample_end]
+                    pre_mask = sample_loss[:splice_b_start]
+                    suf_mask = sample_loss[splice_b_start + splice_b_len :]
+                    surv_mask = pre_mask.new_zeros(survivor_lens[out_idx])
+                    segment_loss_masks.append(
+                        torch.cat([pre_mask, surv_mask, suf_mask], dim=0)
+                    )
+
+            return self.forward_with_single_splice(
+                survivor_embeddings=survivor_embeddings,
+                survivor_cu_seqlens=survivor_cu_seqlens,
+                prefix_ids=prefix_ids,
+                suffix_ids=suffix_ids,
+                loss_mask=(
+                    torch.cat(segment_loss_masks, dim=0)
+                    if segment_loss_masks
+                    else None
+                ),
+                chunk_size=chunk_size,
+                return_hidden_states=return_hidden_states,
+            )
+
+        inner_model, lm_head = self._get_inner_model_and_head()
+        embed_fn = inner_model.get_input_embeddings()
+        try:
+            target_dtype = embed_fn.weight.dtype
+            hidden_dim = int(embed_fn.weight.shape[1])
+        except AttributeError:
+            target_dtype = survivor_embeddings.dtype
+            hidden_dim = int(survivor_embeddings.shape[-1])
+
+        prefix_views = [
+            target_ids_flat[start : start + length]
+            for start, length in zip(sample_starts, prefix_lens, strict=True)
+            if length > 0
+        ]
+        suffix_views = [
+            target_ids_flat[
+                sample_starts[idx] + splice_starts[idx] + splice_lens[idx] : sample_ends[idx]
+            ]
+            for idx in range(batch_size)
+            if suffix_lens[idx] > 0
+        ]
+        if prefix_views:
+            prefix_embeds = embed_fn(torch.cat(prefix_views, dim=0)).to(dtype=target_dtype)
+        else:
+            prefix_embeds = survivor_embeddings.new_empty(0, hidden_dim).to(
+                dtype=target_dtype,
+            )
+        if suffix_views:
+            suffix_embeds = embed_fn(torch.cat(suffix_views, dim=0)).to(dtype=target_dtype)
+        else:
+            suffix_embeds = survivor_embeddings.new_empty(0, hidden_dim).to(
+                dtype=target_dtype,
+            )
+
+        segment_lengths = [
+            prefix_lens[idx] + survivor_lens[idx] + suffix_lens[idx]
+            for idx in range(batch_size)
+        ]
+        max_len = max(segment_lengths) if segment_lengths else 0
+        inputs_embeds = torch.zeros(
+            batch_size,
+            max_len,
+            hidden_dim,
+            dtype=target_dtype,
+            device=device,
+        )
+        token_ids = torch.zeros(
+            batch_size,
+            max_len,
+            dtype=torch.long,
+            device=device,
+        )
+        attention_mask = torch.zeros(
+            batch_size,
+            max_len,
+            dtype=torch.bool,
+            device=device,
+        )
+        loss_mask_2d = torch.zeros(
+            batch_size,
+            max_len,
+            dtype=torch.bool,
+            device=device,
+        )
+
+        prefix_offset = 0
+        suffix_offset = 0
+        for out_idx in range(batch_size):
+            l_pre = prefix_lens[out_idx]
+            l_suf = suffix_lens[out_idx]
+            k_i = survivor_lens[out_idx]
+            seg_len = segment_lengths[out_idx]
+            sample_start = sample_starts[out_idx]
+            sample_end = sample_ends[out_idx]
+            splice_b_start = splice_starts[out_idx]
+            splice_b_len = splice_lens[out_idx]
+            surv_start = int(survivor_cu_list[out_idx])
+            surv_end = int(survivor_cu_list[out_idx + 1])
+            survivor_end = l_pre + k_i
+
+            if l_pre:
+                inputs_embeds[out_idx, :l_pre] = prefix_embeds[
+                    prefix_offset : prefix_offset + l_pre
+                ]
+                token_ids[out_idx, :l_pre] = target_ids_flat[
+                    sample_start : sample_start + l_pre
+                ]
+            if k_i:
+                inputs_embeds[out_idx, l_pre:survivor_end] = survivor_embeddings[
+                    surv_start:surv_end
+                ]
+            if l_suf:
+                inputs_embeds[out_idx, survivor_end:seg_len] = suffix_embeds[
+                    suffix_offset : suffix_offset + l_suf
+                ]
+                token_ids[out_idx, survivor_end:seg_len] = target_ids_flat[
+                    sample_start + splice_b_start + splice_b_len : sample_end
+                ]
+
+            attention_mask[out_idx, :seg_len] = True
+            if loss_mask_flat is not None:
+                sample_loss = loss_mask_flat[sample_start:sample_end]
+                if l_pre:
+                    loss_mask_2d[out_idx, :l_pre] = sample_loss[:l_pre]
+                if l_suf:
+                    loss_mask_2d[out_idx, survivor_end:seg_len] = sample_loss[
+                        splice_b_start + splice_b_len :
+                    ]
+            elif l_suf:
+                loss_mask_2d[out_idx, survivor_end:seg_len] = True
+
+            prefix_offset += l_pre
+            suffix_offset += l_suf
+
+        return self._forward_single_splice_padded_tensors(
+            inputs_embeds=inputs_embeds,
+            token_ids=token_ids,
+            attention_mask=attention_mask,
+            loss_mask_2d=loss_mask_2d,
+            lm_head=lm_head,
+            chunk_size=chunk_size,
+            return_hidden_states=return_hidden_states,
+        )
+
     def forward_with_single_splice(
         self,
         *,
@@ -1343,6 +1776,94 @@ class ReconstructionDecoder(nn.Module):
                 device=device,
             )
 
+        n_total = int(sum(seg_lengths))
+        if loss_mask is not None and loss_mask.shape != (n_total,):
+            raise ValueError(
+                f"loss_mask shape {tuple(loss_mask.shape)} does not match N_total={n_total}"
+            )
+
+        if self.uses_stateful_sequence_mixer:
+            max_len = max(seg_lengths) if seg_lengths else 0
+            hidden_dim = int(survivor_embeddings.shape[-1])
+            inputs_embeds = torch.zeros(
+                batch_size,
+                max_len,
+                hidden_dim,
+                dtype=target_dtype,
+                device=device,
+            )
+            token_ids = torch.zeros(
+                batch_size,
+                max_len,
+                dtype=torch.long,
+                device=device,
+            )
+            attention_mask = torch.zeros(
+                batch_size,
+                max_len,
+                dtype=torch.bool,
+                device=device,
+            )
+            loss_mask_2d = torch.zeros(
+                batch_size,
+                max_len,
+                dtype=torch.bool,
+                device=device,
+            )
+            caller_loss_mask = (
+                loss_mask.to(device=device, dtype=torch.bool)
+                if loss_mask is not None
+                else None
+            )
+
+            p_off = 0
+            s_off = 0
+            flat_off = 0
+            for b in range(batch_size):
+                l_pre = prefix_lens[b]
+                l_suf = suffix_lens[b]
+                k_i = surv_lens[b]
+                seg_len = seg_lengths[b]
+                surv_start = int(surv_cu_list[b])
+                surv_end = int(surv_cu_list[b + 1])
+                mid_start = l_pre
+                suffix_start = l_pre + k_i
+
+                if l_pre:
+                    inputs_embeds[b, :l_pre] = emb_prefix_all[p_off : p_off + l_pre]
+                    token_ids[b, :l_pre] = prefix_on_device[b]
+                if k_i:
+                    inputs_embeds[b, mid_start:suffix_start] = survivor_embeddings[
+                        surv_start:surv_end
+                    ]
+                if l_suf:
+                    inputs_embeds[b, suffix_start:seg_len] = emb_suffix_all[
+                        s_off : s_off + l_suf
+                    ]
+                    token_ids[b, suffix_start:seg_len] = suffix_on_device[b]
+
+                attention_mask[b, :seg_len] = True
+                if caller_loss_mask is not None:
+                    loss_mask_2d[b, :seg_len] = caller_loss_mask[
+                        flat_off : flat_off + seg_len
+                    ]
+                else:
+                    loss_mask_2d[b, suffix_start:seg_len] = True
+
+                p_off += l_pre
+                s_off += l_suf
+                flat_off += seg_len
+
+            return self._forward_single_splice_padded_tensors(
+                inputs_embeds=inputs_embeds,
+                token_ids=token_ids,
+                attention_mask=attention_mask,
+                loss_mask_2d=loss_mask_2d,
+                lm_head=lm_head,
+                chunk_size=chunk_size,
+                return_hidden_states=return_hidden_states,
+            )
+
         # Assemble per-sample [emb_prefix | survivors | emb_suffix] via slice
         # concatenations into Python lists; one final torch.cat builds the
         # flat tensors. No per-element kernel launches inside the loop.
@@ -1383,7 +1904,6 @@ class ReconstructionDecoder(nn.Module):
         token_ids_flat = torch.cat(sample_token_ids, dim=0)  # (N_total,)
         default_loss_mask = torch.cat(sample_loss, dim=0)  # (N_total,)
 
-        n_total = int(inputs_embeds.shape[1])
         # Build cu via cumulative sum on a Python list (cheap; no GPU sync).
         cu_list = [0]
         running = 0
@@ -1396,10 +1916,6 @@ class ReconstructionDecoder(nn.Module):
 
         # Apply caller-supplied loss_mask if provided; otherwise use default.
         if loss_mask is not None:
-            if loss_mask.shape != (n_total,):
-                raise ValueError(
-                    f"loss_mask shape {tuple(loss_mask.shape)} does not match N_total={n_total}"
-                )
             final_loss_mask = loss_mask.to(device=device, dtype=torch.bool)
         else:
             final_loss_mask = default_loss_mask
@@ -1775,19 +2291,12 @@ class ReconstructionDecoder(nn.Module):
         rank = int(lora_config.get("r", 16))
         alpha = float(lora_config.get("alpha", 32))
         dropout = float(lora_config.get("dropout", 0.0))
+        decoder_family = normalize_decoder_family(self.decoder_family)
+        family = normalize_decoder_family(lora_config.get("family", decoder_family))
+        _ensure_decoder_lora_supported(decoder_family)
+        _ensure_decoder_lora_supported(family)
         target_modules = tuple(
-            lora_config.get(
-                "target_modules",
-                [
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "o_proj",
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                ],
-            )
+            lora_config.get("target_modules", _default_lora_targets(family))
         )
         adapter_dtype = self._resolve_lora_adapter_dtype(
             lora_config.get("adapter_dtype", lora_config.get("dtype"))

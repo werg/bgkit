@@ -169,6 +169,8 @@ class LlamaClient:
             "max_tokens": max_tokens or self.config.max_new_tokens,
             "temperature": temperature if temperature is not None else self.config.temperature,
         }
+        if self.config.model_name is not None:
+            payload["model"] = self.config.model_name
         # llama-server accepts chat_template_kwargs in the request body;
         # vLLM does not (it uses server-level --chat-template-kwargs).
         if self._chat_template_kwargs is not None and not self.is_vllm:

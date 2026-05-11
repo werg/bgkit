@@ -7,7 +7,7 @@ export
 # reading the file itself for ${VAR} interpolation in the YAML).
 DC := docker compose --env-file .env -f docker/docker-compose.yaml
 
-.PHONY: install install-gpu install-fa4-local install-gpu-local-fa4 test test-unit test-gpu test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos train-phase1-step1 train-phase1-step2 train-phase1-step3 train-phase1-step4 train-phase1-step5 train-phase1-step6 flashqla-smoke flashqla-parity flashqla-profile flashqla-shell ckpt-backfill extract-structural generate-descriptions extract-commits prepare-commit-encoding convert-tokens convert-structural convert-descriptions convert-commits convert-commit-encoding generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs prepare-data prepare-data-full prepare-data-all
+.PHONY: install install-gpu install-fa4-local install-gpu-local-fa4 test test-unit test-gpu test-integration test-smoke lint format train eval ablation docker-build-deps docker-build-data docker-build-llama process-repos train-phase1-step1 train-phase1-step2 train-phase1-step3 train-phase1-step4 train-phase1-step5 train-phase1-step6 flashqla-smoke flashqla-parity flashqla-profile flashqla-shell ckpt-backfill extract-structural generate-descriptions generate-descriptions-atlas extract-commits prepare-commit-encoding convert-tokens convert-tokens-falcon convert-structural convert-descriptions convert-commits convert-commit-encoding generate-variants generate-qa-pairs convert-qa-pairs download-models download-models-hf llama-server llama-server-stop llama-server-logs llama-bench vllm-server vllm-server-stop vllm-server-logs atlas-server atlas-server-stop atlas-server-logs prepare-data prepare-data-full prepare-data-all
 
 FLASH_ATTN_DIR ?= ../flash-attention
 
@@ -157,6 +157,18 @@ vllm-server-stop:
 vllm-server-logs:
 	$(DC) logs -f vllm-primary vllm-fast
 
+atlas-server:
+	$(DC) up -d atlas
+	@echo "Waiting for Atlas health..."
+	@timeout 300 bash -c 'until curl -sf http://localhost:$${ATLAS_PORT:-8888}/v1/models; do sleep 3; done' && echo " OK" || { echo " TIMEOUT"; exit 1; }
+
+atlas-server-stop:
+	$(DC) stop atlas
+	$(DC) rm -f atlas
+
+atlas-server-logs:
+	$(DC) logs -f atlas
+
 ckpt-backfill:
 	.venv/bin/bgkit-ckpt backfill
 
@@ -169,6 +181,11 @@ generate-descriptions: vllm-server
 	.venv/bin/python scripts/generate_descriptions.py \
 		--structural-dir $(DATA_DIR)/structural/ --backend local --workers 2 $(ARGS)
 
+generate-descriptions-atlas: atlas-server
+	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
+	.venv/bin/python scripts/generate_descriptions.py \
+		--structural-dir $(DATA_DIR)/structural/ --backend atlas --workers 2 $(ARGS)
+
 extract-commits:
 	.venv/bin/python scripts/process_commit_repro.py $(ARGS)
 
@@ -179,6 +196,13 @@ convert-tokens:
 	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
 	.venv/bin/python scripts/convert_tokens_to_npy.py \
 		--input-dir $(DATA_DIR)/processed/tokens/
+
+convert-tokens-falcon:
+	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }
+	.venv/bin/python scripts/convert_tokens_to_falcon_mmap.py \
+		--input-dir $(DATA_DIR)/processed/tokens \
+		--output-dir $(DATA_DIR)/processed/tokens_falcon_h1 \
+		$(ARGS)
 
 convert-structural:
 	@test -n "$(DATA_DIR)" || { echo "ERROR: DATA_DIR not set — copy .env.example to .env"; exit 1; }

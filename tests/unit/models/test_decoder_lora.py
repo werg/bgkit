@@ -126,6 +126,26 @@ NATIVE_LORA_CONFIG = {**LORA_CONFIG, "implementation": "native"}
 
 
 class TestApplyLora:
+    def test_falcon_h1_lora_is_disabled_even_with_explicit_targets(self):
+        backbone = MockCausalLMBackbone()
+        decoder = ReconstructionDecoder(
+            backbone,
+            hidden_dim=HIDDEN_DIM,
+            decoder_family="falcon_h1",
+        )
+
+        with pytest.raises(ValueError, match="Falcon-H1 decoder LoRA is disabled"):
+            decoder.apply_lora(
+                {
+                    **LORA_CONFIG,
+                    "family": "qwen35",
+                    "target_modules": ["q_proj"],
+                    "implementation": "native",
+                }
+            )
+
+        assert not decoder._has_lora
+
     def test_default_wraps_with_peft(self):
         peft = pytest.importorskip("peft")
         backbone = MockCausalLMBackbone()

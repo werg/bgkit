@@ -175,6 +175,31 @@ class TestProcessCommitReproduction:
         tmp_files = list(output_dir.glob("*.tmp"))
         assert tmp_files == []
 
+    def test_parallel_workers_end_to_end(self, tmp_path):
+        """Parallel repo workers should produce the same shard schema."""
+        repos_dir = tmp_path / "repos"
+        owner_dir = repos_dir / "test-owner"
+        for repo_name in ["repo-a", "repo-b", "repo-c"]:
+            _create_test_repo(str(owner_dir / repo_name), num_commits=3)
+
+        output_dir = tmp_path / "output"
+        stats = process_commit_reproduction(
+            repos_dir=str(repos_dir),
+            tokenizer_name="unused",
+            output_dir=str(output_dir),
+            max_diff_tokens=4096,
+            max_commits_per_repo=10,
+            num_workers=2,
+            seed=42,
+            tokenizer=_make_mock_tokenizer(),
+        )
+
+        assert stats["total_repos_processed"] == 3
+        assert stats["total_commits"] > 0
+        table = pq.read_table(sorted(output_dir.glob("shard_*.parquet"))[0])
+        expected_cols = {"repo_path", "sha", "message", "num_files", "is_cross_file", "token_ids"}
+        assert set(table.column_names) == expected_cols
+
 
 class TestResumeAfterInterrupt:
     def test_skips_completed_shards(self, tmp_path):

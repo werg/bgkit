@@ -508,6 +508,40 @@ def apply_liger_to_qwen35(
     return total
 
 
+def apply_liger_to_decoder(
+    decoder,
+    patch_rmsnorm: bool = False,
+    patch_swiglu: bool = True,
+    patch_rope: bool = True,
+) -> int:
+    """Family-aware decoder Liger patcher.
+
+    The unconditional ``apply_liger_to_qwen35(decoder, …)`` was a footgun:
+    ``_patch_swiglu_mlp_modules`` matches any module whose class name
+    contains ``"MLP"`` and exposes ``gate_proj`` / ``up_proj`` /
+    ``down_proj``. ``FalconH1MLP`` matches all three conditions but applies
+    ``gate_multiplier`` and ``down_multiplier`` constants that
+    ``LigerSwiGLUMLP.forward`` drops silently — corrupting the decoder
+    forward.
+
+    This helper inspects ``decoder.decoder_family`` (set by
+    ``ReconstructionDecoder.__init__``) and only applies Liger when the
+    decoder is in the Qwen family. Non-Qwen decoders return 0 patches.
+    """
+
+    if decoder is None:
+        return 0
+    family = getattr(decoder, "decoder_family", "qwen35")
+    if str(family).strip().lower() not in {"qwen35", "qwen", "qwen3_5", "qwen3.5"}:
+        return 0
+    return apply_liger_to_qwen35(
+        decoder,
+        patch_rmsnorm=patch_rmsnorm,
+        patch_swiglu=patch_swiglu,
+        patch_rope=patch_rope,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fused linear + cross-entropy
 # ---------------------------------------------------------------------------

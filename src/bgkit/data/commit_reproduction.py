@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -98,9 +99,8 @@ def _find_completed_shard_batches(output_dir: Path) -> set[int]:
     return completed
 
 
-def _write_shard_atomic(shard_path: Path, rows: list[dict]) -> None:
-    """Write a Parquet shard atomically via tmp+rename."""
-    table = pa.table({
+def _rows_to_table(rows: list[dict]) -> pa.Table:
+    return pa.table({
         "repo_path": pa.array([r["repo_path"] for r in rows], type=pa.string()),
         "sha": pa.array([r["sha"] for r in rows], type=pa.string()),
         "message": pa.array([r["message"] for r in rows], type=pa.string()),
@@ -112,9 +112,120 @@ def _write_shard_atomic(shard_path: Path, rows: list[dict]) -> None:
         ),
     })
 
+
+def _empty_shard_table() -> pa.Table:
+    return pa.table({
+        "repo_path": pa.array([], type=pa.string()),
+        "sha": pa.array([], type=pa.string()),
+        "message": pa.array([], type=pa.string()),
+        "num_files": pa.array([], type=pa.int32()),
+        "is_cross_file": pa.array([], type=pa.bool_()),
+        "token_ids": pa.array([], type=pa.list_(pa.int32())),
+    })
+
+
+def _write_shard_atomic(shard_path: Path, rows: list[dict]) -> None:
+    """Write a Parquet shard atomically via tmp+rename."""
+    table = _rows_to_table(rows) if rows else _empty_shard_table()
     tmp_path = shard_path.with_suffix(".parquet.tmp")
     pq.write_table(table, tmp_path, compression="zstd")
     os.rename(tmp_path, shard_path)
+
+
+class _StreamingShardWriter:
+    def __init__(self, shard_path: Path):
+        self.shard_path = shard_path
+        self.tmp_path = shard_path.with_suffix(".parquet.tmp")
+        self.writer: pq.ParquetWriter | None = None
+        self.num_rows = 0
+
+    def append(self, rows: list[dict]) -> None:
+        if not rows:
+            return
+        table = _rows_to_table(rows)
+        if self.writer is None:
+            self.writer = pq.ParquetWriter(
+                self.tmp_path,
+                table.schema,
+                compression="zstd",
+            )
+        self.writer.write_table(table)
+        self.num_rows += len(rows)
+
+    def close(self) -> int:
+        if self.writer is None:
+            pq.write_table(_empty_shard_table(), self.tmp_path, compression="zstd")
+        else:
+            self.writer.close()
+            self.writer = None
+        os.rename(self.tmp_path, self.shard_path)
+        return self.num_rows
+
+
+def _repo_hash_key(repo_path: Path, repos_path: Path) -> str:
+    rel = str(repo_path.relative_to(repos_path))
+    try:
+        head_sha = str(pygit2.Repository(str(repo_path)).head.target)
+    except Exception:
+        head_sha = "unknown"
+    return f"{rel}:{head_sha}"
+
+
+def _process_repo_for_reproduction(
+    repo_dir: Path,
+    *,
+    tokenizer: object,
+    max_diff_tokens: int,
+    max_commits_per_repo: int,
+    prefer_cross_file: bool,
+    filter_config: CommitFilterConfig,
+    rng_seed: int,
+) -> tuple[list[dict], int, str | None, bool]:
+    try:
+        # Bound extraction itself, not just the post-filter sample. Some repos
+        # have very large histories, and walking all accepted commits before
+        # capping can make preprocessing effectively unbounded. Oversample
+        # accepted commits when cross-file preference is enabled so the later
+        # cap still has room to prefer cross-file examples.
+        extract_limit = (
+            max_commits_per_repo * 4
+            if prefer_cross_file
+            else max_commits_per_repo
+        )
+        commits = extract_commits(
+            str(repo_dir),
+            max_commits=extract_limit,
+            max_walked_commits=max_commits_per_repo,
+            config=filter_config,
+        )
+    except Exception:
+        log.warning("Failed to extract commits from %s", repo_dir, exc_info=True)
+        return [], 0, str(repo_dir), False
+
+    if not commits:
+        return [], 0, None, False
+
+    rng = random.Random(rng_seed)
+    commits = _cap_commits(commits, max_commits_per_repo, prefer_cross_file, rng)
+
+    rows: list[dict] = []
+    discarded = 0
+    for commit in commits:
+        token_ids = serialize_and_tokenize_commit(commit, tokenizer, max_diff_tokens)
+        if token_ids is None:
+            discarded += 1
+            continue
+
+        rows.append({
+            "repo_path": commit.repo_path,
+            "sha": commit.sha,
+            "message": commit.message,
+            "num_files": len(commit.diff_paths),
+            "is_cross_file": commit.is_cross_file,
+            "token_ids": token_ids,
+        })
+
+    return rows, discarded, None, True
 
 
 def process_commit_reproduction(
@@ -124,6 +235,8 @@ def process_commit_reproduction(
     max_diff_tokens: int = 4096,
     max_commits_per_repo: int = 200,
     max_repos: int | None = None,
+    num_workers: int = 1,
+    verify_repo_list: bool = True,
     seed: int = 42,
     filter_config: CommitFilterConfig | None = None,
     tokenizer: object | None = None,
@@ -137,6 +250,9 @@ def process_commit_reproduction(
         max_diff_tokens: Discard commits exceeding this token count.
         max_commits_per_repo: Cap commits per repo.
         max_repos: Process at most this many repos.
+        num_workers: Number of repos to process concurrently within each shard.
+        verify_repo_list: If True, verify existing shards against the current
+            repo list and HEAD SHAs before resuming.
         seed: Random seed for deterministic sampling.
         filter_config: Commit filter config. Uses defaults if None.
         tokenizer: Pre-loaded tokenizer instance. If None, loads from tokenizer_name.
@@ -157,22 +273,28 @@ def process_commit_reproduction(
         filter_config = CommitFilterConfig()
 
     prefer_cross_file = filter_config.prefer_cross_file
+    num_workers = max(1, int(num_workers))
 
     repo_paths = _collect_repo_paths(repos_path, max_repos, shuffle_seed=seed)
     log.info("Processing %d repos from %s", len(repo_paths), repos_dir)
 
-    # Verify repo list + content consistency for resume safety.
-    # Include each repo's HEAD SHA so new commits invalidate the cache.
-    repo_keys = []
-    for p in repo_paths:
-        rel = str(p.relative_to(repos_path))
-        try:
-            head_sha = str(pygit2.Repository(str(p)).head.target)
-        except Exception:
-            head_sha = "unknown"
-        repo_keys.append(f"{rel}:{head_sha}")
-    repo_list_hash = hashlib.sha256("\n".join(repo_keys).encode()).hexdigest()[:16]
     repo_list_file = out_path / "repo_list_hash.txt"
+    if verify_repo_list:
+        # Verify repo list + content consistency for resume safety.
+        # Include each repo's HEAD SHA so new commits invalidate the cache.
+        if num_workers == 1:
+            repo_keys = [_repo_hash_key(p, repos_path) for p in repo_paths]
+        else:
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                repo_keys = list(
+                    executor.map(lambda p: _repo_hash_key(p, repos_path), repo_paths),
+                )
+        repo_list_hash = hashlib.sha256("\n".join(repo_keys).encode()).hexdigest()[:16]
+    elif repo_list_file.exists():
+        repo_list_hash = repo_list_file.read_text().strip()
+    else:
+        repo_keys = [str(p.relative_to(repos_path)) for p in repo_paths]
+        repo_list_hash = hashlib.sha256("\n".join(repo_keys).encode()).hexdigest()[:16]
 
     completed_batches: set[int] = set()
     if repo_list_file.exists():
@@ -230,54 +352,71 @@ def process_commit_reproduction(
             total_repos_skipped += len(batch_repos)
             continue
 
-        shard_rows: list[dict] = []
+        tasks = [
+            (
+                repo_dir,
+                {
+                    "tokenizer": tokenizer,
+                    "max_diff_tokens": max_diff_tokens,
+                    "max_commits_per_repo": max_commits_per_repo,
+                    "prefer_cross_file": prefer_cross_file,
+                    "filter_config": filter_config,
+                    "rng_seed": seed + batch_idx * REPOS_PER_SHARD + repo_idx,
+                },
+            )
+            for repo_idx, repo_dir in enumerate(batch_repos)
+        ]
+        # Stream rows into the shard as each repo finishes. Keeping all rows for
+        # a 100-repo shard in Python can spike memory when a batch contains many
+        # near-max-token commits.
         failed_repos: list[str] = []
-        # Per-batch RNG so skipped batches don't affect determinism of later ones
-        batch_rng = random.Random(seed + batch_idx)
-
-        for repo_dir in batch_repos:
-            try:
-                commits = extract_commits(str(repo_dir), config=filter_config)
-            except Exception:
-                log.warning("Failed to extract commits from %s", repo_dir, exc_info=True)
-                failed_repos.append(str(repo_dir))
-                continue
-
-            if not commits:
-                continue
-
-            # Cap commits per repo with cross-file preference
-            commits = _cap_commits(commits, max_commits_per_repo, prefer_cross_file, batch_rng)
-
-            for commit in commits:
-                token_ids = serialize_and_tokenize_commit(
-                    commit, tokenizer, max_diff_tokens
-                )
-                if token_ids is None:
-                    total_discarded += 1
-                    continue
-
-                shard_rows.append({
-                    "repo_path": commit.repo_path,
-                    "sha": commit.sha,
-                    "message": commit.message,
-                    "num_files": len(commit.diff_paths),
-                    "is_cross_file": commit.is_cross_file,
-                    "token_ids": token_ids,
-                })
-
-            total_repos_processed += 1
-
-        # Always write a shard (even if empty) so the batch is marked complete
-        # for resume. Empty shards are valid Parquet and are skipped by the dataset.
         shard_path = out_path / f"shard_{batch_idx:05d}.parquet"
-        _write_shard_atomic(shard_path, shard_rows)
-        total_commits += len(shard_rows)
+        shard_writer = _StreamingShardWriter(shard_path)
+        try:
+            if num_workers == 1:
+                result_iter = (
+                    _process_repo_for_reproduction(repo_dir, **kwargs)
+                    for repo_dir, kwargs in tasks
+                )
+                for rows, discarded, failed_repo, processed in result_iter:
+                    shard_writer.append(rows)
+                    total_discarded += discarded
+                    if failed_repo is not None:
+                        failed_repos.append(failed_repo)
+                    if processed:
+                        total_repos_processed += 1
+            else:
+                with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    futures = [
+                        executor.submit(
+                            _process_repo_for_reproduction,
+                            repo_dir,
+                            **kwargs,
+                        )
+                        for repo_dir, kwargs in tasks
+                    ]
+                    for future in as_completed(futures):
+                        rows, discarded, failed_repo, processed = future.result()
+                        shard_writer.append(rows)
+                        total_discarded += discarded
+                        if failed_repo is not None:
+                            failed_repos.append(failed_repo)
+                        if processed:
+                            total_repos_processed += 1
+            shard_num_rows = shard_writer.close()
+        except Exception:
+            if shard_writer.writer is not None:
+                shard_writer.writer.close()
+            if shard_writer.tmp_path.exists():
+                shard_writer.tmp_path.unlink()
+            raise
+
+        total_commits += shard_num_rows
 
         # Write companion metadata — batches with failures will be re-processed
         meta_path = out_path / f"shard_{batch_idx:05d}.meta.json"
         meta_path.write_text(json.dumps({
-            "num_rows": len(shard_rows),
+            "num_rows": shard_num_rows,
             "failed_repos": failed_repos,
         }))
 

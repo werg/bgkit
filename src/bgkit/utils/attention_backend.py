@@ -26,8 +26,17 @@ BGKIT_FA4_ATTENTION_IMPL = "bgkit_fa4"
 # Aliases let configs / env vars request FA4 by any reasonable synonym and get
 # our FA4-aware wrapper rather than transformers' native flash_attention_4 path.
 _FA4_ALIASES = frozenset({"fa4", "flash_attention_4", BGKIT_FA4_ATTENTION_IMPL})
+_SDPA_ALIASES = frozenset({"sdpa", "torch_sdpa"})
+_FLASH_ATTN_2_ALIASES = frozenset({"flash_attention_2", "flash_attn_2", "fa2"})
 
 logger = logging.getLogger(__name__)
+
+
+def _is_falcon_h1_family(family: str | None) -> bool:
+    if family is None:
+        return False
+    normalized = str(family).strip().lower().replace("-", "_")
+    return normalized in {"falcon", "falcon_h1"}
 
 
 def _sm12x_native_true_gqa_ready() -> bool:
@@ -188,8 +197,16 @@ def bgkit_flash_attention_4_forward(
     cu_k = cu_seqlens_k
     if cu_k is None:
         cu_k = hf_cu_k if hf_cu_k is not None else cu_seqlens
-    m_q = max_seqlen_q if max_seqlen_q is not None else (hf_max_q if hf_max_q is not None else max_seqlen)
-    m_k = max_seqlen_k if max_seqlen_k is not None else (hf_max_k if hf_max_k is not None else max_seqlen)
+    m_q = (
+        max_seqlen_q
+        if max_seqlen_q is not None
+        else (hf_max_q if hf_max_q is not None else max_seqlen)
+    )
+    m_k = (
+        max_seqlen_k
+        if max_seqlen_k is not None
+        else (hf_max_k if hf_max_k is not None else max_seqlen)
+    )
 
     if cu_q is None or cu_k is None or m_q is None or m_k is None:
         # Fallback for B=1 cached decode: HF's generation path calls the
@@ -397,3 +414,52 @@ def resolve_attention_implementation(requested: str | None = None) -> str:
         f"Unsupported attention implementation {requested!r}. "
         "Valid values: 'auto', 'fa4', 'flash_attention_4', 'bgkit_fa4'."
     )
+
+
+def configure_torch_sdp_flash_only() -> None:
+    """Require PyTorch SDPA to use its flash backend when CUDA is available.
+
+    Falcon-H1 uses normal padded decoder attention rather than BgKIT's packed
+    varlen attention contract, so the correct strict path is PyTorch SDPA with
+    non-flash SDPA kernels disabled. If flash SDPA cannot handle a shape/dtype,
+    the next forward fails loudly instead of silently using math attention.
+    """
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(False)
+
+
+def resolve_decoder_attention_implementation(
+    requested: str | None = None,
+    *,
+    decoder_family: str | None = None,
+) -> str:
+    """Resolve attention implementation for decoder backbones.
+
+    Qwen-family decoders use BgKIT's packed FA4 backend. Falcon-H1 does not:
+    its HF attention module calls the attention interface with normal batched
+    Q/K/V tensors and no packed ``cu_seqlens`` metadata. Use SDPA there and
+    configure SDPA to flash-only on CUDA so fallbacks are fail-loud.
+    """
+    requested = requested or os.getenv("BGKIT_ATTENTION_IMPL", "auto")
+
+    if _is_falcon_h1_family(decoder_family):
+        if requested == "auto" or requested in _SDPA_ALIASES:
+            configure_torch_sdp_flash_only()
+            return "sdpa"
+        if requested in _FA4_ALIASES:
+            raise ValueError(
+                "Falcon-H1 decoder attention cannot use BgKIT FA4: that backend "
+                "is packed-varlen only and Falcon-H1 supplies normal batched "
+                "decoder attention tensors. Use 'auto' or 'sdpa'."
+            )
+        if requested in _FLASH_ATTN_2_ALIASES:
+            return "flash_attention_2"
+        raise ValueError(
+            f"Unsupported Falcon-H1 decoder attention implementation {requested!r}. "
+            "Valid values: 'auto', 'sdpa', or 'flash_attention_2'."
+        )
+
+    return resolve_attention_implementation(requested)

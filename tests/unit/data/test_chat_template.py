@@ -457,6 +457,28 @@ class TestTokenizeWithSentinel:
         )
         assert len(result["compression_prompt_ids"]) > 0
 
+    def test_compression_prompt_uses_encoder_tokenizer_when_split(self):
+        decoder_tokenizer = MockTokenizer()
+        encoder_tokenizer = MockTokenizer()
+        encoder_tokenizer._next_id = 1000
+        config = TOOL_CONFIGS["file_read_repro"]
+        content_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+
+        result = tokenize_with_sentinel(
+            decoder_tokenizer,
+            SEED_VARIANT,
+            config,
+            "test.py",
+            "python",
+            content_ids,
+            encoder_tokenizer=encoder_tokenizer,
+        )
+
+        prompt_ids = result["compression_prompt_ids"].tolist()
+        assert min(prompt_ids) >= 1000
+        assert "Return the file contents verbatim" in encoder_tokenizer.decode(prompt_ids)
+        assert "Return the file contents verbatim" not in decoder_tokenizer.decode(prompt_ids)
+
     def test_works_for_all_configs(self):
         """tokenize_with_sentinel should work for all task configs."""
         tokenizer = MockTokenizer()

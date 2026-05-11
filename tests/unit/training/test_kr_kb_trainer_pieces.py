@@ -277,7 +277,6 @@ def test_kb_model_lora_state_dict_roundtrip():
     # Model 1: fresh build, install LoRA, randomize adapter weights.
     enc1 = _MiniEncoder()
     dec1 = _MiniDecoder()
-    ice1 = _MiniIce()
     router1 = LoRARouter.install(
         enc1,
         target_names=DEFAULT_LORA_TARGETS,
@@ -298,7 +297,6 @@ def test_kb_model_lora_state_dict_roundtrip():
     # Model 2: fresh rebuild, install LoRA same way, load the state dict.
     enc2 = _MiniEncoder()
     dec2 = _MiniDecoder()
-    ice2 = _MiniIce()
     router2 = LoRARouter.install(
         enc2,
         target_names=DEFAULT_LORA_TARGETS,
@@ -384,6 +382,84 @@ def test_load_checkpoint_remap_pre_lora_keys_defensive():
         assert ".adapters." in k and ("lora_A" in k or "lora_B" in k)
     # Verify the remap actually produced base_layer keys in the remapped dict
     assert any("base_layer.weight" in k for k in remapped)
+
+
+def test_kr_kb_lora_disabled_trains_encoder_levels_directly():
+    from bgkit.models.lora_encoder import LoRALinearWrapper
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    class _Level(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = torch.nn.Linear(4, 4, bias=False)
+            self.other = torch.nn.Linear(4, 4, bias=False)
+
+    class _Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l0 = _Level()
+            self.l1 = _Level()
+
+    trainer = KRKBTrainer.__new__(KRKBTrainer)
+    trainer.encoder = _Encoder()
+    trainer.decoder = torch.nn.Linear(4, 4, bias=False)
+    trainer.topic_embeddings = None
+    trainer._live_l0 = True
+    trainer.step_cfg = {
+        "lr": 1.0e-4,
+        "decoder_lr": 5.0e-5,
+        "l0_lr": 2.0e-4,
+        "l1_lr": 3.0e-4,
+        "lora": {"enabled": False, "train_l1_direct": True},
+    }
+
+    trainer._install_lora()
+
+    assert trainer.lora_router is None
+    assert not any(
+        isinstance(module, LoRALinearWrapper)
+        for module in trainer.encoder.modules()
+    )
+    assert any(p.requires_grad for p in trainer.encoder.l0.parameters())
+    assert any(p.requires_grad for p in trainer.encoder.l1.parameters())
+
+    groups = trainer._build_optimizer_groups()
+    assert [group["lr"] for group in groups] == [5.0e-5, 2.0e-4, 3.0e-4]
+
+
+def test_kr_kb_lora_disabled_can_freeze_l1_explicitly():
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    class _Level(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = torch.nn.Linear(4, 4, bias=False)
+
+    class _Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l0 = _Level()
+            self.l1 = _Level()
+
+    trainer = KRKBTrainer.__new__(KRKBTrainer)
+    trainer.encoder = _Encoder()
+    trainer.decoder = torch.nn.Linear(4, 4, bias=False)
+    trainer.topic_embeddings = None
+    trainer._live_l0 = False
+    trainer.step_cfg = {
+        "lr": 1.0e-4,
+        "decoder_lr": 5.0e-5,
+        "l1_lr": 3.0e-4,
+        "lora": {"enabled": False, "train_l1_direct": False},
+    }
+
+    trainer._install_lora()
+
+    assert trainer.lora_router is None
+    assert not any(p.requires_grad for p in trainer.encoder.l0.parameters())
+    assert not any(p.requires_grad for p in trainer.encoder.l1.parameters())
+    groups = trainer._build_optimizer_groups()
+    assert [group["lr"] for group in groups] == [5.0e-5]
 
 
 def test_topic_embeddings_from_browse_tree_integration():
@@ -751,7 +827,10 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
 
     class _StubProjection(torch.nn.Module):
         def __call__(self, x, **_kw):
-            return types.SimpleNamespace(projected_embeddings=x)
+            return types.SimpleNamespace(
+                projected_embeddings=x,
+                survivor_cu_seqlens=None,
+            )
 
     class _StubEncoder(torch.nn.Module):
         def __init__(self):
@@ -759,6 +838,10 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
             self.l0 = _StubLevel()
             self.l1 = _StubLevel()
             self.projection_block = _StubProjection()
+
+        @property
+        def active_projection_output_dim(self):
+            return hidden_dim
 
         @property
         def calls(self):
@@ -784,7 +867,9 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
     # Ratio-sampling state for the l1 path — tests skip setup() so wire
     # up a disabled sampler + rng directly.
     import random as _stdlib_random
+
     from bgkit.training.ratio_sampling import build_ratio_sampler_config
+
     trainer._l1_ratio_sampler_cfg = build_ratio_sampler_config(
         {"enabled": False, "mode": "jitter"},
         anchor_grid=(trainer._l1_retention,),

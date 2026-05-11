@@ -4,11 +4,11 @@ Targeted follow-up to Step 2. Re-trains ONLY the encoder's projection
 block so that its output lands on the decoder's token-embedding
 manifold, fixing the large norm / orthogonal direction drift discovered
 by ``scripts/analyze_embedding_deviation.py`` (projected output has
-‖q‖ ≈ 112× the decoder embedding norm and cosine ≈ 0 to
+norm roughly 112x the decoder embedding norm and cosine roughly 0 to
 ``decoder.embed_tokens``).
 
 Rationale: Step 1/2's only supervision for the projection is end-to-end
-CE through the decoder (Step 1) plus student↔teacher proj MSE (Step 2).
+CE through the decoder (Step 1) plus student-teacher proj MSE (Step 2).
 Neither anchors the projection to ``decoder.embed_tokens``. The decoder
 adapted by rescaling off-manifold vectors in its lower layers. The
 diagnostic's identity upper bound (feed ``decoder.embed_tokens(ids)``
@@ -53,13 +53,16 @@ from bgkit.data.collators import collate_chat_repro
 from bgkit.data.datasets.chat_repro_dataset import ChatReproDataset
 from bgkit.data.datasets.mmap_token_dataset import MmapTokenDataset
 from bgkit.data.samplers import PackedTokenBudgetSampler
-from bgkit.models.decoder import ReconstructionDecoder
+from bgkit.models.decoder import ReconstructionDecoder, normalize_decoder_family
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
 from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
-from bgkit.utils.attention_backend import resolve_attention_implementation
+from bgkit.utils.attention_backend import (
+    resolve_attention_implementation,
+    resolve_decoder_attention_implementation,
+)
 
 logger = structlog.get_logger()
 
@@ -95,7 +98,7 @@ class ProjectionRepairTrainer(BaseTrainer):
         hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
 
         logger.info("loading_source_checkpoint", path=src_ckpt)
-        metadata, state_dicts = load_checkpoint(Path(src_ckpt))
+        _metadata, state_dicts = load_checkpoint(Path(src_ckpt))
         if "encoder" not in state_dicts:
             raise ValueError(f"checkpoint {src_ckpt} missing 'encoder' key")
 
@@ -156,7 +159,13 @@ class ProjectionRepairTrainer(BaseTrainer):
         self._decoder_state_dict = state_dicts.get("decoder", None)
 
         # --- Decoder: load fresh weights then overlay from checkpoint ---
-        decoder_cfg = self.cfg.model.decoder
+        decoder_cfg = tcfg.get("model", {}).get("decoder", self.cfg.model.decoder)
+        decoder_family = normalize_decoder_family(decoder_cfg.get("family", "qwen35"))
+        self.encoder.set_active_decoder_family(decoder_family)
+        decoder_attention_impl = resolve_decoder_attention_implementation(
+            self.cfg.compute.get("attention_implementation", "auto"),
+            decoder_family=decoder_family,
+        )
         decoder_name = decoder_cfg.backbone_name
         logger.info("loading_decoder", model=decoder_name)
         decoder_backbone = AutoModelForCausalLM.from_pretrained(
@@ -164,10 +173,15 @@ class ProjectionRepairTrainer(BaseTrainer):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
             revision=decoder_cfg.get("backbone_revision", None),
-            attn_implementation=attention_impl,
+            attn_implementation=decoder_attention_impl,
             device_map=device,
         )
-        self.decoder = ReconstructionDecoder(decoder_backbone, hidden_dim=hidden_dim)
+        decoder_hidden = int(decoder_backbone.get_input_embeddings().weight.shape[1])
+        self.decoder = ReconstructionDecoder(
+            decoder_backbone,
+            hidden_dim=decoder_hidden,
+            decoder_family=decoder_family,
+        )
         self.decoder.set_lm_ce_impl(
             tcfg.get("decoder_ce_impl", self.cfg.compute.get("decoder_ce_impl", None))
         )
@@ -180,7 +194,10 @@ class ProjectionRepairTrainer(BaseTrainer):
 
         # Optional Liger kernels (matches other Phase 1 steps).
         if tcfg.get("use_liger", True):
-            from bgkit.utils.liger_integration import apply_liger_to_qwen35
+            from bgkit.utils.liger_integration import (
+                apply_liger_to_decoder,
+                apply_liger_to_qwen35,
+            )
 
             patch_rmsnorm = bool(tcfg.get("use_liger_rmsnorm", False))
             patch_swiglu = bool(tcfg.get("use_liger_swiglu", True))
@@ -191,14 +208,20 @@ class ProjectionRepairTrainer(BaseTrainer):
                 patch_swiglu=patch_swiglu,
                 patch_rope=patch_rope,
             )
-            dec_patched = apply_liger_to_qwen35(
+            # apply_liger_to_decoder is family-aware: it no-ops on
+            # non-Qwen decoders (e.g. Falcon-H1) to prevent
+            # LigerSwiGLUMLP from silently dropping
+            # FalconH1MLP.gate_multiplier / down_multiplier.
+            dec_patched = apply_liger_to_decoder(
                 self.decoder,
                 patch_rmsnorm=patch_rmsnorm,
                 patch_swiglu=patch_swiglu,
                 patch_rope=patch_rope,
             )
+            decoder_family = getattr(self.decoder, "decoder_family", "qwen35")
             use_liger_ce = (
                 bool(tcfg.get("use_liger_ce", True))
+                and decoder_family == "qwen35"
                 and self.decoder.lm_ce_impl in {"auto", "liger"}
             )
             if use_liger_ce:
@@ -246,7 +269,7 @@ class ProjectionRepairTrainer(BaseTrainer):
         )
 
         max_batch_tokens = tcfg.get("max_batch_tokens", 32768)
-        # Eval defaults to 2× train budget (no backward → lower peak at
+        # Eval defaults to 2x train budget (no backward -> lower peak at
         # same budget). Overridable via training.max_batch_tokens_eval.
         max_batch_tokens_eval = self._resolve_eval_batch_budget(tcfg, max_batch_tokens)
         num_workers = self.cfg.compute.get("num_workers", 4)
@@ -562,9 +585,13 @@ class ProjectionRepairTrainer(BaseTrainer):
 
             totals["anchor_mse"] = totals.get("anchor_mse", 0.0) + float(mse.item())
             totals["anchor_cos"] = totals.get("anchor_cos", 0.0) + float(cos_loss.item())
-            totals["anchor_norm_log"] = totals.get("anchor_norm_log", 0.0) + float(norm_loss.item())
+            totals["anchor_norm_log"] = totals.get("anchor_norm_log", 0.0) + float(
+                norm_loss.item()
+            )
             totals["cos_sim"] = totals.get("cos_sim", 0.0) + float(stats["cos_sim_mean"].item())
-            totals["norm_ratio"] = totals.get("norm_ratio", 0.0) + float(stats["norm_ratio_mean"].item())
+            totals["norm_ratio"] = totals.get("norm_ratio", 0.0) + float(
+                stats["norm_ratio_mean"].item()
+            )
             if ce_val is not None:
                 totals["ce"] = totals.get("ce", 0.0) + float(ce_val.item())
             count += 1
