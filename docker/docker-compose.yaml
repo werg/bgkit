@@ -152,10 +152,18 @@ x-gpu-common: &gpu-common
     # 16 parallel nvccs SIGKILLs on a 115 GB cap. Force here to override.
     - MAX_JOBS=${MAX_JOBS:-2}
     - NVCC_THREADS=${NVCC_THREADS:-1}
-    # Step watchdog timeout (seconds). Default 60s catches real hangs but
-    # is too tight for first-step JIT compile + autotune after a restart.
-    # Raise via shell env (e.g. 300) for resume runs after kernel changes.
-    - BGKIT_STEP_TIMEOUT=${BGKIT_STEP_TIMEOUT:-60.0}
+    # Step watchdog timeout (seconds). 60s is too tight for first-step JIT
+    # compile + autotune after a restart AND for trainers running with
+    # ``num_workers=0`` on /mnt/external (spinning disk) where cold mmap
+    # page faults on first batches take tens of seconds. 300s still
+    # catches real hangs while leaving room for warm-up I/O.
+    - BGKIT_STEP_TIMEOUT=${BGKIT_STEP_TIMEOUT:-300.0}
+  # DataLoader workers (num_workers > 0) exchange tensors with the main
+  # process via shared memory. Docker's default 64 MB /dev/shm fills
+  # quickly when batches are large (cached dense_seed batches are ~10 MB
+  # of bf16 embeddings each), producing "Resource temporarily unavailable"
+  # errors. 8 GB is plenty for any current training service.
+  shm_size: "8gb"
   volumes:
     - ${DATA_DIR}:/workspace/data
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
@@ -330,6 +338,18 @@ services:
   train-phase1-step6:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_step6", "++training.reset_wandb=true"]
+
+  # One-time pre-compute of encoder.l0 survivor embeddings for the dense_seed
+  # phase. Runs the frozen encoder forward across a subsample of chunks (default
+  # 30K, override with --max-chunks N) and writes a static cache to
+  # ${DATA_DIR}/processed/falcon_dense_seed_cache/. The downstream
+  # train-falcon-dense-seed service consumes this cache and runs projection-only
+  # training (no encoder forward in the loop), ~50x faster than the live
+  # encoder path. Restart policy is ``no`` because cache build is a one-shot.
+  build-falcon-dense-seed-cache:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/build_dense_seed_cache.py"]
 
   train-falcon-dense-seed:
     <<: *gpu-common

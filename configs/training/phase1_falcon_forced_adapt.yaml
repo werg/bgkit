@@ -5,7 +5,10 @@ lr: 1.0e-4
 projection_lr: 1.0e-4
 encoder_lr: 2.0e-5
 warmup_steps: 100
-max_batch_tokens: 16384
+# Matches phase1_step5's quadratic budget. The original 16384 was 16x
+# Step 5's effective work per batch with no measured justification.
+max_batch_tokens: 4096
+max_batch_tokens_eval: 8192
 gradient_accumulation_steps: 2
 max_eval_samples: 1000
 eval_every: 100
@@ -15,6 +18,10 @@ adapt_encoder: true
 
 data:
   falcon_companion_dir: ${oc.env:DATA_DIR}/processed/tokens_falcon_h1
+  # The Falcon companion was built at max_seq_len=8192; the base
+  # MmapTokenDataset must mirror that so per-chunk indices align.
+  tokens:
+    max_seq_len: 8192
 
 anchor_weight: 1.0
 cos_weight: 0.5

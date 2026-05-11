@@ -180,8 +180,21 @@ class FalconProjectionSeedTrainer(BaseTrainer):
         self._norm_weight = float(tcfg.get("norm_weight", 0.2))
         self._survivor_bce_weight = float(tcfg.get("survivor_bce_weight", 0.0))
 
-        data_dir = self.cfg.data.tokens.input_dir
-        companion_dir = self.cfg.data.get("falcon_companion_dir", None)
+        # Prefer training-scoped data overrides (consistent with the l0/l1
+        # CompressionTrainer); fall back to the global data section. This
+        # lets the dense_seed YAML self-contain its data wiring without
+        # mutating the shared data/tokens.yaml defaults.
+        training_data = tcfg.get("data", None) or {}
+        training_tokens = training_data.get("tokens", None) or {}
+        data_dir = (
+            training_tokens.get("input_dir", None)
+            or training_data.get("file_tokens_path", None)
+            or self.cfg.data.tokens.input_dir
+        )
+        companion_dir = (
+            training_data.get("falcon_companion_dir", None)
+            or self.cfg.data.get("falcon_companion_dir", None)
+        )
         # Deprecated locations — accept with a warning so old configs
         # still resolve, but encourage migration to data.falcon_companion_dir.
         if not companion_dir:
@@ -208,7 +221,13 @@ class FalconProjectionSeedTrainer(BaseTrainer):
                 "point at the output of "
                 "scripts/convert_tokens_to_falcon_mmap.py"
             )
-        max_seq_len = int(self.cfg.data.tokens.get("max_seq_len", 8192))
+        # max_seq_len must match the value the Falcon companion was built
+        # at — the companion is chunk-aligned at that length and
+        # MmapTokenDataset's strict count check otherwise rejects load.
+        max_seq_len = int(
+            training_tokens.get("max_seq_len", None)
+            or self.cfg.data.tokens.get("max_seq_len", 8192)
+        )
         inner_dataset = MmapTokenDataset(
             data_dir,
             max_seq_len=max_seq_len,
@@ -246,19 +265,27 @@ class FalconProjectionSeedTrainer(BaseTrainer):
         )
         num_workers = int(self.cfg.compute.get("num_workers", 4))
         pin_memory = bool(self.cfg.compute.get("pin_memory", False))
+        # persistent_workers=True keeps the worker fork alive across
+        # epochs — important on unified memory because the per-fork CoW
+        # cost would otherwise repeat at every epoch boundary. Only
+        # meaningful when num_workers > 0.
+        dataloader_kwargs = {
+            "collate_fn": collate_falcon_dense_seed,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+        }
+        if num_workers > 0:
+            dataloader_kwargs["persistent_workers"] = True
+            dataloader_kwargs["prefetch_factor"] = 2
         self.train_dataloader = DataLoader(
             self.train_dataset,
             batch_sampler=self.train_sampler,
-            collate_fn=collate_falcon_dense_seed,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
+            **dataloader_kwargs,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
             batch_sampler=eval_sampler,
-            collate_fn=collate_falcon_dense_seed,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
+            **dataloader_kwargs,
         )
 
         proj_params = [

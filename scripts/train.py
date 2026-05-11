@@ -45,7 +45,21 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.projection_repair import ProjectionRepairTrainer
 
         return ProjectionRepairTrainer(cfg)
-    elif phase in ("phase1_falcon_dense_seed", "phase1_falcon_forced_adapt"):
+    elif phase == "phase1_falcon_dense_seed":
+        # Cache-based: the encoder is frozen and the forced-survivor mask is
+        # fixed, so pre-projection survivor embeddings are deterministic and
+        # are pre-computed once by scripts/build_dense_seed_cache.py. Training
+        # is then pure projection_block forward+backward over the cache,
+        # ~50x faster than running the encoder every step.
+        from bgkit.training.phase1.projection_seed_falcon_cached import (
+            FalconProjectionCachedTrainer,
+        )
+
+        return FalconProjectionCachedTrainer(cfg)
+    elif phase == "phase1_falcon_forced_adapt":
+        # forced_adapt unfreezes encoder.l0 (adapter learning), so we can't
+        # use the cache there — the encoder forward is part of the trainable
+        # graph. The original trainer drives that phase.
         from bgkit.training.phase1.projection_seed_falcon import (
             FalconProjectionSeedTrainer,
         )

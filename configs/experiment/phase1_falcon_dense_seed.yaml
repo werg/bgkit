@@ -7,6 +7,12 @@ defaults:
 run_name: phase1_falcon_dense_seed
 bgkit_checkpoint: auto
 
+# Cache-based dense_seed: no encoder forward in the loop, so we can run small
+# batches with workers absorbing the cache reads.
+compute:
+  num_workers: 2
+  pin_memory: false
+
 model:
   decoder:
     family: falcon_h1

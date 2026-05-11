@@ -7,6 +7,13 @@ defaults:
 run_name: phase1_falcon_forced_adapt
 bgkit_checkpoint: auto
 
+# forced_adapt unfreezes encoder.l0 so it runs the live encoder every step.
+# With async dataloader workers the encoder backbone gets to run at near
+# full GPU utilization, dropping the I/O-bound 100s/step we saw at workers=0.
+compute:
+  num_workers: 2
+  pin_memory: false
+
 model:
   decoder:
     family: falcon_h1
