@@ -279,6 +279,17 @@ class LevelLossCfg:
     # or the mask is absent — so single-decoder-family Qwen runs are
     # unaffected.
     forced_survivor_bce_weight: float = 0.0
+    # Ratio-gated fade of forced_survivor_bce_weight. At target_ratio at
+    # (or above) ``forced_survivor_bce_anchor_ratio`` the BCE weight is
+    # the full configured value — appropriate while the curriculum is
+    # still keeping enough positions that "select forced positions"
+    # matches "select target_ratio positions." Below the anchor the
+    # weight fades linearly toward zero so the head can sub-select
+    # within the forced set (driven by utility-gradient BCE) without
+    # being pulled to also keep all forced positions high. Setting the
+    # anchor to 0 disables the gate (constant weight). The 0.6 default
+    # matches the typical Falcon forced-mask fraction.
+    forced_survivor_bce_anchor_ratio: float = 0.6
 
 
 def _metric_scalar(value: Tensor, *, sync: bool):
@@ -685,11 +696,25 @@ def compute_survivorship_losses(
             base_raw.float(), target, reduction="none",
         )
         forced_bce = bce_per_pos.mean()
+        # Ratio-gated fade. At target_ratio>=anchor (typically the forced
+        # fraction ~0.6) the head should bias toward keeping all forced
+        # positions — full BCE weight. As the curriculum tightens
+        # compression below the anchor, fade the weight linearly so
+        # utility-grad BCE can sub-select the most decoder-useful
+        # positions within the forced set without being pulled to keep
+        # *all* forced positions high. anchor<=0 disables the gate.
+        anchor = float(weights.forced_survivor_bce_anchor_ratio)
+        if anchor > 0.0:
+            gate = max(0.0, min(1.0, float(target_ratio) / anchor))
+        else:
+            gate = 1.0
+        effective_weight = weights.forced_survivor_bce_weight * gate
         metrics["forced_survivor_bce"] = _metric_scalar(forced_bce, sync=sync_metrics)
         metrics["forced_survivor_pos_fraction"] = _metric_scalar(
             fm.float().mean(), sync=sync_metrics,
         )
-        total = total + weights.forced_survivor_bce_weight * forced_bce.to(total.dtype)
+        metrics["forced_survivor_bce_effective_weight"] = effective_weight
+        total = total + effective_weight * forced_bce.to(total.dtype)
 
     # BCE warmup (base-side): direct ICE-teacher supervision on base_raw.
     # Cuts off hard at bce_warmup_steps. ICE can be unloaded after.
@@ -920,6 +945,9 @@ def resolve_level_loss_cfg(cfg_block: dict | None) -> LevelLossCfg:
         qa_position_loss_weight=float(cfg.get("qa_position_loss_weight", 0.0)),
         qa_non_answer_target=float(cfg.get("qa_non_answer_target", 0.10)),
         forced_survivor_bce_weight=float(cfg.get("forced_survivor_bce_weight", 0.0)),
+        forced_survivor_bce_anchor_ratio=float(
+            cfg.get("forced_survivor_bce_anchor_ratio", 0.6),
+        ),
     )
 
 
