@@ -74,9 +74,11 @@ survivorship:
     # the head's base_raw against the forced selection. Keeps the head's
     # natural choice matched to the well-aligned tokenizer-pair positions
     # the projection/decoder were trained against, so the start of
-    # compression is smooth for the decoder. Inert when target_ratio>=0.999
-    # (head bypassed, no base_raw).
-    forced_survivor_bce_weight: 0.2
+    # compression is smooth for the decoder. Live-tunable via
+    # ``forced_survivor_bce_weight_l0``; auto-gated by target_ratio /
+    # ``forced_survivor_bce_anchor_ratio`` so the weight fades as the
+    # curriculum tightens below the forced fraction.
+    forced_survivor_bce_weight: 1.0
   l1:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0

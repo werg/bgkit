@@ -88,6 +88,25 @@ class CompressionTrainer(BaseTrainer):
         "target_ratio_sampling_window_above": "_handle_ratio_sampling_window_above",
         "sample_target_ratio_during_training": "_handle_ratio_sampling_enabled",
         "target_ratio_anchor_sampling_prob": "_handle_ratio_sampling_anchor_prob",
+        # Phase C/D head-supervision and head-aux weight knobs. Targets the
+        # ``self._surv_l0`` / ``self._surv_l1`` LevelLossCfg dataclasses
+        # populated at setup; updates take effect on the next batch.
+        "forced_survivor_bce_weight_l0": "_handle_surv_l0_forced_bce_weight",
+        "forced_survivor_bce_weight_l1": "_handle_surv_l1_forced_bce_weight",
+        "forced_survivor_bce_anchor_ratio_l0": "_handle_surv_l0_forced_bce_anchor",
+        "forced_survivor_bce_anchor_ratio_l1": "_handle_surv_l1_forced_bce_anchor",
+        "utility_grad_loss_weight_l0": "_handle_surv_l0_utility_grad_weight",
+        "utility_grad_loss_weight_l1": "_handle_surv_l1_utility_grad_weight",
+        "decisiveness_loss_weight_l0": "_handle_surv_l0_decisiveness_weight",
+        "decisiveness_loss_weight_l1": "_handle_surv_l1_decisiveness_weight",
+        "moment_match_weight_l0": "_handle_surv_l0_moment_match_weight",
+        "moment_match_weight_l1": "_handle_surv_l1_moment_match_weight",
+        "min_survivors_loss_weight_l0": "_handle_surv_l0_min_survivors_weight",
+        "min_survivors_loss_weight_l1": "_handle_surv_l1_min_survivors_weight",
+        # Switch between Phase C (forced-mask override) and Phase D
+        # (head selects). Read each step via cfg.training.get, so we
+        # update the OmegaConf node directly.
+        "use_forced_survivor_mask_l0": "_handle_use_forced_survivor_mask_l0",
     }
 
     def setup(self) -> None:
@@ -676,6 +695,113 @@ class CompressionTrainer(BaseTrainer):
             self._input_sources["step1"] = Path(step1_checkpoint).name
 
         return step1_checkpoint
+
+    # ------------------------------------------------------------------
+    # Live-config handlers for survivorship knobs
+    # ------------------------------------------------------------------
+    # Update the mutable LevelLossCfg dataclasses populated at setup.
+    # ``_surv_l0`` / ``_surv_l1`` are read fresh by
+    # ``_compute_survivorship_losses`` each batch via ``getattr(self, ...)``,
+    # so a field-level mutation is picked up on the next step without any
+    # rewiring.
+
+    def _update_surv_field(self, level: str, field_name: str, val) -> None:
+        """Shared body for survivorship-weight live handlers.
+
+        ``level`` is "l0" or "l1"; mutates the corresponding
+        ``self._surv_<level>`` LevelLossCfg field. Coerces ``val`` to
+        float with non-negative validation; rejects with a warning
+        otherwise.
+        """
+        from bgkit.training.survivorship_helpers import LevelLossCfg
+
+        attr_name = f"_surv_{level}"
+        cfg_obj = getattr(self, attr_name, None)
+        if cfg_obj is None:
+            cfg_obj = LevelLossCfg()
+            setattr(self, attr_name, cfg_obj)
+        if not isinstance(val, (int, float)) or float(val) < 0:
+            logger.warning(
+                "live_surv_field_invalid",
+                level=level,
+                field=field_name,
+                value=val,
+                expected="non-negative float",
+            )
+            return
+        old = getattr(cfg_obj, field_name)
+        new_val = float(val)
+        setattr(cfg_obj, field_name, new_val)
+        logger.info(
+            "live_surv_field_update",
+            level=level,
+            field=field_name,
+            old=old,
+            new=new_val,
+        )
+
+    def _handle_surv_l0_forced_bce_weight(self, val) -> None:
+        self._update_surv_field("l0", "forced_survivor_bce_weight", val)
+
+    def _handle_surv_l1_forced_bce_weight(self, val) -> None:
+        self._update_surv_field("l1", "forced_survivor_bce_weight", val)
+
+    def _handle_surv_l0_forced_bce_anchor(self, val) -> None:
+        self._update_surv_field("l0", "forced_survivor_bce_anchor_ratio", val)
+
+    def _handle_surv_l1_forced_bce_anchor(self, val) -> None:
+        self._update_surv_field("l1", "forced_survivor_bce_anchor_ratio", val)
+
+    def _handle_surv_l0_utility_grad_weight(self, val) -> None:
+        self._update_surv_field("l0", "utility_grad_loss_weight", val)
+
+    def _handle_surv_l1_utility_grad_weight(self, val) -> None:
+        self._update_surv_field("l1", "utility_grad_loss_weight", val)
+
+    def _handle_surv_l0_decisiveness_weight(self, val) -> None:
+        self._update_surv_field("l0", "decisiveness_loss_weight", val)
+
+    def _handle_surv_l1_decisiveness_weight(self, val) -> None:
+        self._update_surv_field("l1", "decisiveness_loss_weight", val)
+
+    def _handle_surv_l0_moment_match_weight(self, val) -> None:
+        self._update_surv_field("l0", "moment_match_weight", val)
+
+    def _handle_surv_l1_moment_match_weight(self, val) -> None:
+        self._update_surv_field("l1", "moment_match_weight", val)
+
+    def _handle_surv_l0_min_survivors_weight(self, val) -> None:
+        self._update_surv_field("l0", "min_survivors_loss_weight", val)
+
+    def _handle_surv_l1_min_survivors_weight(self, val) -> None:
+        self._update_surv_field("l1", "min_survivors_loss_weight", val)
+
+    def _handle_use_forced_survivor_mask_l0(self, val) -> None:
+        """Toggle the forced-mask override mid-run.
+
+        Switches between Phase C (encoder uses companion forced_mask as
+        the survivor selector) and Phase D (head selects). Mutates the
+        OmegaConf node in ``self.cfg.training`` because
+        ``_compress_file_batch`` reads the value fresh each step. The
+        DualThresholdController will rediscover its theta under the new
+        regime via dual-ascent over the next several steps.
+        """
+        bool_val = bool(val)
+        try:
+            old = bool(self.cfg.training.get("use_forced_survivor_mask_l0", False))
+            self.cfg.training.use_forced_survivor_mask_l0 = bool_val
+        except Exception as exc:
+            logger.warning(
+                "live_use_forced_survivor_mask_l0_failed",
+                value=val,
+                error=repr(exc),
+            )
+            return
+        logger.info(
+            "live_use_forced_survivor_mask_l0_update",
+            old=old,
+            new=bool_val,
+        )
 
     def _muon_excluded_param_ids(self) -> frozenset[int]:
         """Return param IDs of decoder embedding/lm_head — 2D but should not use Muon.

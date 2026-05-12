@@ -65,7 +65,12 @@ survivorship:
     utility_grad_loss_weight: 0.0
     moment_match_weight: 0.0
     min_survivors_loss_weight: 0.0
-    forced_survivor_bce_weight: 0.2
+    # Bumped from 0.2: at 0.2 the supervised gradient was being swamped
+    # by the dominant decoder-reconstruction loss and the head's
+    # base_raw wasn't moving. 1.0 is strong enough to shape the head
+    # in parallel with reconstruction. Live-tunable now via
+    # ``forced_survivor_bce_weight_l0``.
+    forced_survivor_bce_weight: 1.0
   l1:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
