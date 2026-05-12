@@ -148,6 +148,16 @@ class FileCompressionSample:
     compression_prompt_ids: torch.Tensor
     bgkit_splice_start: int = -1
     bgkit_splice_len: int = 0
+    # Optional per-position bool mask aligned 1:1 with content_token_ids.
+    # When non-None and ``survivorship.l0.forced_survivor_bce_weight > 0``,
+    # ``compute_survivorship_losses`` adds a BCE loss on the head's
+    # ``base_raw`` against this mask. Populated by DataReconstructionSubset
+    # from the Falcon companion's ``forced_survivor_indices`` so during
+    # Phase D's compression ramp the head's natural selection stays aligned
+    # with the (well-aligned-tokenizer-pair) positions the projection
+    # learned in Phase A/B/C. ``None`` when the underlying token dataset
+    # has no companion or the chunk has no forced indices.
+    forced_survivor_mask: torch.Tensor | None = None
 
 
 @dataclass
@@ -286,6 +296,19 @@ class DataReconstructionSubset(Dataset):
 
         content_mask = torch.ones(content_ids.size(0), dtype=torch.bool)
 
+        # Build per-position forced-survivor bool mask if the underlying
+        # MmapTokenDataset has a Falcon companion. Used downstream by
+        # ``compute_survivorship_losses`` to BCE-supervise the head against
+        # the forced selection (Phase D head re-alignment).
+        forced_indices = inner.get("forced_survivor_indices", None)
+        forced_mask: torch.Tensor | None = None
+        if forced_indices is not None and forced_indices.numel() > 0:
+            forced_mask = torch.zeros(content_ids.size(0), dtype=torch.bool)
+            # Indices are chunk-local Qwen positions; clamp defensively in
+            # case a stale companion ever drifts past the chunk length.
+            valid = (forced_indices >= 0) & (forced_indices < content_ids.size(0))
+            forced_mask[forced_indices[valid].to(torch.long)] = True
+
         return FileCompressionSample(
             objective="data_reconstruction",
             content_token_ids=content_ids,
@@ -299,6 +322,7 @@ class DataReconstructionSubset(Dataset):
             compression_prompt_ids=result["compression_prompt_ids"],
             bgkit_splice_start=int(result["bgkit_splice_start"].item()),
             bgkit_splice_len=int(result["bgkit_splice_len"].item()),
+            forced_survivor_mask=forced_mask,
         )
 
 

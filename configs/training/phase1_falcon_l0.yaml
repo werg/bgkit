@@ -36,7 +36,9 @@ objectives:
 
 # Slow compression curriculum: linear ramp 1.0 → 0.10 over 15k steps.
 # Combined with the held tail at 0.10 for the remaining 5k.
-target_ratio_start: 1.0
+# DualThresholdController rejects exactly 1.0; 0.999 is the upper
+# bound that still triggers LevelCompressor's compression_off branch.
+target_ratio_start: 0.999
 target_ratio_end: 0.10
 target_ratio_ramp_steps: 15000
 sample_target_ratio_during_training: true
@@ -55,6 +57,15 @@ survivorship:
     min_survivors_floor_ratio: 0.02
     min_survivors_absolute_min: 1
     min_survivors_tau: 0.3
+    # Head re-alignment during the compression ramp. The Falcon companion's
+    # forced_survivor mask threads through CompressionDataset → collator
+    # → trainer → compute_survivorship_losses, where it BCE-supervises
+    # the head's base_raw against the forced selection. Keeps the head's
+    # natural choice matched to the well-aligned tokenizer-pair positions
+    # the projection/decoder were trained against, so the start of
+    # compression is smooth for the decoder. Inert when target_ratio>=0.999
+    # (head bypassed, no base_raw).
+    forced_survivor_bce_weight: 0.2
   l1:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0

@@ -267,6 +267,18 @@ class LevelLossCfg:
     # back through the decoder.
     qa_position_loss_weight: float = 0.0
     qa_non_answer_target: float = 0.10
+    # Head BCE against an externally-provided forced-survivor mask. Used
+    # by the Falcon Phase D compression ramp: as compression starts the
+    # head fires for the first time (it was bypassed at ratio=1.0 during
+    # Phase C); without this term the head's selection drifts from the
+    # well-aligned tokenizer-pair positions the projection/decoder were
+    # trained against. ``forced_survivor_mask`` is a flat ``(N_content,)``
+    # bool tensor (same shape contract as ``answer_position_mask``);
+    # supervises ``base_raw`` with BCE-with-logits (target = 1.0 at
+    # forced positions, 0.0 elsewhere). Disabled when the weight is zero
+    # or the mask is absent — so single-decoder-family Qwen runs are
+    # unaffected.
+    forced_survivor_bce_weight: float = 0.0
 
 
 def _metric_scalar(value: Tensor, *, sync: bool):
@@ -402,6 +414,7 @@ def compute_survivorship_losses(
     content_cu_seqlens: Tensor | None,
     target_ratio: float,
     answer_position_mask: Tensor | None = None,
+    forced_survivor_mask: Tensor | None = None,
     sync_metrics: bool = True,
 ) -> tuple[Tensor, dict[str, float | Tensor]]:
     """Compose ratio + decisiveness + moment_match + bce_warmup losses.
@@ -644,6 +657,40 @@ def compute_survivorship_losses(
         )
         total = total + weights.qa_position_loss_weight * qa_loss.to(total.dtype)
 
+    # Forced-survivor head supervision. Same shape contract as
+    # ``answer_position_mask``: flat ``(N_content,)`` bool. BCE-with-logits
+    # on ``base_raw`` with target = 1.0 at forced positions, 0.0 elsewhere.
+    # This is the Falcon Phase D head-realignment term that keeps the
+    # head's natural selection matched to the well-aligned-tokenizer-pair
+    # positions the projection/decoder were trained against. Skipped when
+    # the weight is zero, the mask is absent, or the head was bypassed
+    # (no ``base_raw`` because compression was off).
+    forced_active = (
+        weights.forced_survivor_bce_weight > 0.0
+        and forced_survivor_mask is not None
+        and base_raw is not None
+        and n_valid > 0
+    )
+    if forced_active:
+        fm = forced_survivor_mask.to(device=base_raw.device, dtype=torch.bool)
+        if fm.shape[0] != base_raw.shape[0]:
+            raise ValueError(
+                "Forced-survivor BCE: forced_survivor_mask shape "
+                f"{tuple(fm.shape)} does not match base_raw shape "
+                f"{tuple(base_raw.shape)}. Mask and base_raw must be flat "
+                "(N_content,) tensors over the same packed axis."
+            )
+        target = fm.to(dtype=torch.float32)
+        bce_per_pos = F.binary_cross_entropy_with_logits(
+            base_raw.float(), target, reduction="none",
+        )
+        forced_bce = bce_per_pos.mean()
+        metrics["forced_survivor_bce"] = _metric_scalar(forced_bce, sync=sync_metrics)
+        metrics["forced_survivor_pos_fraction"] = _metric_scalar(
+            fm.float().mean(), sync=sync_metrics,
+        )
+        total = total + weights.forced_survivor_bce_weight * forced_bce.to(total.dtype)
+
     # BCE warmup (base-side): direct ICE-teacher supervision on base_raw.
     # Cuts off hard at bce_warmup_steps. ICE can be unloaded after.
     # Teacher is produced per-sample by ICE; in packed form the teacher
@@ -872,6 +919,7 @@ def resolve_level_loss_cfg(cfg_block: dict | None) -> LevelLossCfg:
         min_survivors_tau=float(cfg.get("min_survivors_tau", 0.3)),
         qa_position_loss_weight=float(cfg.get("qa_position_loss_weight", 0.0)),
         qa_non_answer_target=float(cfg.get("qa_non_answer_target", 0.10)),
+        forced_survivor_bce_weight=float(cfg.get("forced_survivor_bce_weight", 0.0)),
     )
 
 

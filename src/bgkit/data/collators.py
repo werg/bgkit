@@ -224,6 +224,17 @@ def _collate_file_samples(samples: list) -> dict:
     prompt_lengths = [int(t.size(0)) for t in prompt_seqs]
     prompt_cu = _make_cu_seqlens(prompt_lengths)
 
+    # Forced-survivor mask propagation: only emit a packed mask if every
+    # sample in the batch has one (Falcon companion is loaded), otherwise
+    # set to None so downstream survivorship_losses skips the forced BCE
+    # term cleanly. The packed shape is ``(N_content,)`` bool — same flat
+    # axis as ``content_token_ids``.
+    if all(getattr(s, "forced_survivor_mask", None) is not None for s in samples):
+        forced_seqs = [s.forced_survivor_mask for s in samples]
+        forced_packed = _cat_tensors(forced_seqs).to(torch.bool)
+    else:
+        forced_packed = None
+
     return {
         "sample_type": "file",
         "objectives": [s.objective for s in samples],
@@ -250,6 +261,7 @@ def _collate_file_samples(samples: list) -> dict:
         "bgkit_splice_len": torch.tensor(
             [getattr(s, "bgkit_splice_len", 0) for s in samples], dtype=torch.long,
         ),
+        "forced_survivor_mask_l0": forced_packed,
     }
 
 

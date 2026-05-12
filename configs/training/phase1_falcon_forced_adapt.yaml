@@ -8,7 +8,10 @@ warmup_steps: 100
 # Matches phase1_step5's quadratic budget. The original 16384 was 16x
 # Step 5's effective work per batch with no measured justification.
 max_batch_tokens: 4096
-max_batch_tokens_eval: 8192
+# Eval batches were 2x train (8192); under the 3-layer projection memory
+# pressure they push past the CUDA cap right before the next train step
+# OOMs. Match eval to train so eval doesn't move the memory ceiling.
+max_batch_tokens_eval: 4096
 gradient_accumulation_steps: 2
 max_eval_samples: 1000
 eval_every: 100
@@ -18,9 +21,10 @@ adapt_encoder: true
 
 # Cap content length so the full Qwen3.5 bidi encoder backbone (now trainable
 # with autograd retained) doesn't blow the 65% per-process CUDA budget on
-# long-tail chunks. Companion p95 content length ≈ 4600; 4096 trims the
-# worst of the tail while keeping the bulk of the data.
-max_sample_length: 4096
+# long-tail chunks. With the 3-layer projection_block adding ~37M params
+# plus Adam state, 4096 OOMs; 3072 still OOMs intermittently on solo
+# long-chunk batches; 2048 leaves clear headroom.
+max_sample_length: 2048
 min_sample_length: 32
 
 data:

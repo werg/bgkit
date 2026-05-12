@@ -8,8 +8,6 @@ run_name: phase1_falcon_l1
 step1_checkpoint: auto
 
 model:
-  bgkit:
-    projection_num_layers: 3
   decoder:
     family: falcon_h1
     backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct

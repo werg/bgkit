@@ -960,6 +960,7 @@ class CompressionTrainer(BaseTrainer):
         level: str = "l0",
         content_token_ids: torch.Tensor | None = None,
         content_cu_seqlens: torch.Tensor | None = None,
+        forced_survivor_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Delegate to the shared helpers. Accumulate microbatch state."""
         from bgkit.training.survivorship_helpers import (
@@ -999,6 +1000,7 @@ class CompressionTrainer(BaseTrainer):
             content_token_ids=content_token_ids,
             content_cu_seqlens=content_cu_seqlens,
             target_ratio=target_ratio,
+            forced_survivor_mask=forced_survivor_mask,
         )
         accumulate(state, enc_out, target_ratio=target_ratio)
         out_metrics = {f"{level}_{k}": v for k, v in metrics.items()}
@@ -1202,11 +1204,21 @@ class CompressionTrainer(BaseTrainer):
             # Survivorship auxiliary losses (L0 — file compression path)
             surv_metrics: dict[str, float] = {}
             if enc_out.l0.logits_for_op is not None:
+                # Forced-survivor mask from the Falcon companion (when
+                # present); flows to ``compute_survivorship_losses`` as
+                # head-BCE supervision under ``forced_survivor_bce_weight``.
+                # ``_collate_file_samples`` emits this key as ``None`` if
+                # any sample in the batch lacks the mask, in which case the
+                # forced-BCE branch in the helper stays inert.
+                forced_mask_l0 = batch.get("forced_survivor_mask_l0", None)
+                if forced_mask_l0 is not None:
+                    forced_mask_l0 = forced_mask_l0.to(self.device)
                 surv_loss, surv_metrics = self._compute_survivorship_losses(
                     enc_out.l0, target_ratio,
                     level="l0",
                     content_token_ids=batch["content_token_ids"].to(self.device),
                     content_cu_seqlens=batch["content_cu_seqlens"].to(self.device),
+                    forced_survivor_mask=forced_mask_l0,
                 )
                 total_loss_t = total_loss_t + surv_loss
 

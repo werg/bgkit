@@ -33,9 +33,13 @@ sampler:
 objectives:
   data_reconstruction: 1.0
 
-# Compression disabled for the entire phase.
-target_ratio_start: 1.0
-target_ratio_end: 1.0
+# Compression disabled for the entire phase. DualThresholdController
+# rejects exactly 1.0 (must be in (0, 1)); 0.999 hits LevelCompressor's
+# ``compression_off`` branch (target_ratio >= 0.999) so the head is
+# bypassed and all positions survive — identical behavior to "ratio=1.0"
+# without the constructor's strict-bound check failing.
+target_ratio_start: 0.999
+target_ratio_end: 0.999
 target_ratio_ramp_steps: 1
 sample_target_ratio_during_training: false
 l1_introduction_step: 999999999
