@@ -1024,6 +1024,17 @@ class CompressionTrainer(BaseTrainer):
 
         The collator gives us flat content embeddings with per-sample
         ``content_cu_seqlens`` and aligned per-sample prompts.
+
+        When ``training.use_forced_survivor_mask_l0`` is True AND the
+        batch carries a ``forced_survivor_mask_l0`` (Falcon companion
+        loaded), the mask is passed to the encoder so survivors = forced
+        positions instead of the head's selection. This is the Phase C
+        regime: filter the bogus 2-Falcon-token expansions at positions
+        where Qwen→Falcon alignment is heuristic, so the decoder only
+        sees the well-aligned subset while everything else trains
+        end-to-end. The head still fires for diagnostic + BCE supervision
+        because forced_mask triggers ``compression_off=False`` in
+        LevelCompressor regardless of target_ratio.
         """
         from bgkit.training.survivorship_helpers import LevelLossCfg
         from bgkit.utils.packing import position_ids_from_cu
@@ -1043,6 +1054,13 @@ class CompressionTrainer(BaseTrainer):
         surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
         surv_l1 = getattr(self, "_surv_l1", LevelLossCfg())
         util_active = surv_l0.utility_grad_loss_weight > 0.0
+
+        forced_mask_l0: torch.Tensor | None = None
+        if bool(self.cfg.training.get("use_forced_survivor_mask_l0", False)):
+            raw_forced = batch.get("forced_survivor_mask_l0", None)
+            if raw_forced is not None:
+                forced_mask_l0 = raw_forced.to(device=device, dtype=torch.bool)
+
         return self.encoder(
             content_embeddings=content_emb,
             content_cu_seqlens=content_cu,
@@ -1054,6 +1072,7 @@ class CompressionTrainer(BaseTrainer):
             utility_grad_active_l0=util_active,
             min_per_sample_l0=int(surv_l0.min_survivors_absolute_min),
             min_per_sample_l1=int(surv_l1.min_survivors_absolute_min),
+            forced_survivor_mask_l0=forced_mask_l0,
         )
 
     def _compress_repo_l0_packed(self, batch: dict, target_ratio: float):

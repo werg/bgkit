@@ -27,6 +27,13 @@ max_eval_samples: 1000
 eval_every: 1000
 save_every: 2000
 
+# Head takes over here: encoder's natural selection is used (no
+# forced-mask override). Head was BCE-trained to predict forced in
+# Phase C, so its initial selection ≈ forced positions; the curriculum
+# then tightens compression below that baseline. The continuing
+# forced_survivor_bce_weight below keeps the head from drifting.
+use_forced_survivor_mask_l0: false
+
 sampler:
   cost_multiplier: 1.0
   eval_cost_multiplier: 1.0
@@ -36,9 +43,13 @@ objectives:
 
 # Slow compression curriculum: linear ramp 1.0 → 0.10 over 15k steps.
 # Combined with the held tail at 0.10 for the remaining 5k.
-# DualThresholdController rejects exactly 1.0; 0.999 is the upper
-# bound that still triggers LevelCompressor's compression_off branch.
-target_ratio_start: 0.999
+# Curriculum starts at the forced-mask baseline (~0.6 = typical fraction
+# of well-aligned forced positions) so Phase D picks up where Phase C
+# left off. The head selects naturally (use_forced_survivor_mask_l0=false
+# below) — it was trained in Phase C to predict forced positions, so its
+# initial selection should approximate the forced subset, and the
+# curriculum tightens compression *beyond* that baseline.
+target_ratio_start: 0.6
 target_ratio_end: 0.10
 target_ratio_ramp_steps: 15000
 sample_target_ratio_during_training: true

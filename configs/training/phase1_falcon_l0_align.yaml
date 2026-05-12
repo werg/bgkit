@@ -1,17 +1,21 @@
 phase: phase1_falcon_l0_align
 optimizer: muon
-# End-to-end alignment at *no* compression (target_ratio=1.0). All four
-# trainable parts (encoder.l0, l0 head, projection_blocks.falcon_h1,
-# decoder) run together; decoder learns to reconstruct from the
-# uncompressed projection output before any compression is introduced.
-# The head is dormant here — it only fires once target_ratio < 1.0 —
-# but its weights from forced_adapt persist and remain matched to the
-# forced mask so the transition into Phase D (slow ramp) is smooth.
+# Phase C: end-to-end alignment at the *minimum-necessary* compression.
 #
-# This phase is the load-bearing prerequisite to compression. Without
-# it the decoder enters compression underaligned and either learns
-# very slowly or never learns to disentangle the compressed encoder
-# input (see [[feedback_pre_compression_alignment]]).
+# Falcon's projection_block.output_split_factor=2 means every Qwen
+# survivor produces 2 Falcon-space embeddings; at non-forced positions
+# (where Qwen→Falcon tokenizer alignment is heuristic) those 2-token
+# expansions are bogus. Feeding the decoder ratio=1.0 (compression off,
+# all positions survive) would teach the decoder to either decode bogus
+# stream-noise or learn to ignore it — neither is useful. So instead we
+# run "compression effectively off" as "*forced* compression only" —
+# the encoder uses the companion's forced_survivor_mask to filter out
+# the non-aligned positions, and the decoder sees a clean ~60% subset
+# (the well-aligned tokenizer-pair positions the projection was actually
+# trained against in dense_seed/forced_adapt). The survivor head fires
+# for diagnostic + BCE supervision so it learns to predict the forced
+# mask under the live encoder.l0 representation — that's the
+# starting-point the Phase D ramp inherits.
 max_steps: 8000
 lr: 4.0e-5
 encoder_lr: 1.5e-5
@@ -26,6 +30,11 @@ max_eval_samples: 1000
 eval_every: 500
 save_every: 1000
 
+# Engage the forced-mask path: encoder uses batch["forced_survivor_mask_l0"]
+# as the survivor selector (overrides head). Decoder receives only the
+# well-aligned subset of projected embeddings.
+use_forced_survivor_mask_l0: true
+
 sampler:
   cost_multiplier: 1.0
   eval_cost_multiplier: 1.0
@@ -33,19 +42,22 @@ sampler:
 objectives:
   data_reconstruction: 1.0
 
-# Compression disabled for the entire phase. DualThresholdController
-# rejects exactly 1.0 (must be in (0, 1)); 0.999 hits LevelCompressor's
-# ``compression_off`` branch (target_ratio >= 0.999) so the head is
-# bypassed and all positions survive — identical behavior to "ratio=1.0"
-# without the constructor's strict-bound check failing.
-target_ratio_start: 0.999
-target_ratio_end: 0.999
+# target_ratio is mostly cosmetic when forced_mask is provided (head
+# selection is overridden). It still configures the DualThresholdController
+# init and the curriculum bookkeeping. ~0.6 matches the typical forced
+# survivor fraction so the head's threshold sits near the natural data
+# distribution.
+target_ratio_start: 0.6
+target_ratio_end: 0.6
 target_ratio_ramp_steps: 1
 sample_target_ratio_during_training: false
 l1_introduction_step: 999999999
 
-# Head is bypassed at ratio>=0.999, so survivorship aux losses don't fire
-# meaningfully here. Keep weights at zero (no head training during align).
+# Survivorship aux losses + forced-mask head supervision. The forced
+# BCE is the load-bearing one in this phase: it keeps the head matched
+# to the forced selection under the live encoder, so Phase D can drop
+# the forced-mask override and the head still picks approximately the
+# right positions.
 survivorship:
   l0:
     ratio_loss_weight: 0.0
@@ -53,6 +65,7 @@ survivorship:
     utility_grad_loss_weight: 0.0
     moment_match_weight: 0.0
     min_survivors_loss_weight: 0.0
+    forced_survivor_bce_weight: 0.2
   l1:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
