@@ -1,6 +1,6 @@
 phase: phase1_falcon_forced_adapt
 optimizer: adamw
-max_steps: 1500
+max_steps: 2500
 lr: 1.0e-4
 projection_lr: 1.0e-4
 encoder_lr: 2.0e-5
@@ -15,6 +15,13 @@ eval_every: 100
 save_every: 500
 
 adapt_encoder: true
+
+# Cap content length so the full Qwen3.5 bidi encoder backbone (now trainable
+# with autograd retained) doesn't blow the 65% per-process CUDA budget on
+# long-tail chunks. Companion p95 content length ≈ 4600; 4096 trims the
+# worst of the tail while keeping the bulk of the data.
+max_sample_length: 4096
+min_sample_length: 32
 
 data:
   falcon_companion_dir: ${oc.env:DATA_DIR}/processed/tokens_falcon_h1

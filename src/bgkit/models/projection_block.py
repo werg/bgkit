@@ -84,7 +84,7 @@ class ProjectionBlock(nn.Module):
 
     def __init__(
         self,
-        transformer_layer: nn.Module,
+        transformer_layers: nn.Module | nn.ModuleList | list[nn.Module],
         output_norm: nn.Module,
         rotary_emb: nn.Module,
         hidden_dim: int = 1024,
@@ -108,7 +108,25 @@ class ProjectionBlock(nn.Module):
                 f"output_dim * output_split_factor must equal hidden_dim; got "
                 f"{output_dim} * {output_split_factor} != {hidden_dim}"
             )
-        self.transformer_layer = transformer_layer
+        # Accept either a single nn.Module (legacy) or a list / ModuleList of
+        # layers. The forward stacks them with per-layer residual + RMSNorm
+        # (same Qwen3.5 block structure for every layer).
+        if isinstance(transformer_layers, nn.ModuleList):
+            layers = list(transformer_layers)
+        elif isinstance(transformer_layers, nn.Sequential):
+            layers = list(transformer_layers)
+        elif isinstance(transformer_layers, (list, tuple)):
+            layers = list(transformer_layers)
+        elif isinstance(transformer_layers, nn.Module):
+            layers = [transformer_layers]
+        else:
+            raise TypeError(
+                "transformer_layers must be an nn.Module, ModuleList, or "
+                f"list/tuple of Modules; got {type(transformer_layers).__name__}"
+            )
+        if not layers:
+            raise ValueError("ProjectionBlock requires at least one transformer layer")
+        self.transformer_layers = nn.ModuleList(layers)
         self.output_norm = output_norm
         self.hidden_dim = hidden_dim
         self.output_split_factor = int(output_split_factor)
@@ -116,6 +134,15 @@ class ProjectionBlock(nn.Module):
         self.projection_head = nn.Linear(hidden_dim, hidden_dim)
 
         object.__setattr__(self, "_rotary_emb", rotary_emb)
+
+    @property
+    def num_layers(self) -> int:
+        return len(self.transformer_layers)
+
+    @property
+    def transformer_layer(self) -> nn.Module:
+        """Back-compat shim: most callers want the head layer's modules."""
+        return self.transformer_layers[0]
 
     def _apply(self, fn):
         super()._apply(fn)
@@ -156,22 +183,25 @@ class ProjectionBlock(nn.Module):
         pos_2d = position_ids.unsqueeze(0)  # (1, N)
         position_embeddings = self._rotary_emb(hidden_states, pos_2d)
 
-        residual = hidden_states
-        h = self.transformer_layer.input_layernorm(hidden_states)
-        h = _packed_full_attention(
-            self.transformer_layer.self_attn,
-            h,
-            position_embeddings,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            position_ids=position_ids,
-            is_causal=False,
-        )
-        h = residual + h
-        residual = h
-        h = self.transformer_layer.post_attention_layernorm(h)
-        h = self.transformer_layer.mlp(h)
-        all_out = residual + h  # (N, D)
+        h = hidden_states
+        for layer in self.transformer_layers:
+            residual = h
+            x = layer.input_layernorm(h)
+            x = _packed_full_attention(
+                layer.self_attn,
+                x,
+                position_embeddings,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                position_ids=position_ids,
+                is_causal=False,
+            )
+            h = residual + x
+            residual = h
+            x = layer.post_attention_layernorm(h)
+            x = layer.mlp(x)
+            h = residual + x
+        all_out = h  # (N, D)
 
         def _split_projected(projected: torch.Tensor) -> torch.Tensor:
             if self.output_split_factor == 1:

@@ -36,15 +36,32 @@ class _FalconSeedModel(nn.Module):
 
 
 class _ValidCompanionSubset(Dataset):
-    def __init__(self, dataset: MmapTokenDataset):
+    def __init__(
+        self,
+        dataset: MmapTokenDataset,
+        max_sample_length: int | None = None,
+        min_sample_length: int | None = None,
+    ):
         valid = dataset.companion_valid_indices
         if valid is None:
             raise ValueError("Falcon dense seed requires MmapTokenDataset(companion_dir=...)")
         self.dataset = dataset
+        lengths = dataset.lengths[valid]
+        if max_sample_length or min_sample_length:
+            keep = np.ones(valid.size, dtype=bool)
+            if max_sample_length:
+                keep &= lengths <= int(max_sample_length)
+            if min_sample_length:
+                keep &= lengths >= int(min_sample_length)
+            valid = valid[keep]
+            lengths = lengths[keep]
         self.indices = valid
         if self.indices.size == 0:
-            raise ValueError("Falcon companion stream has no non-degenerate chunks")
-        self.lengths = dataset.lengths[self.indices]
+            raise ValueError(
+                "Falcon companion stream has no non-degenerate chunks "
+                "(or all were filtered by min/max_sample_length)"
+            )
+        self.lengths = lengths
 
     def __len__(self) -> int:
         return int(self.indices.size)
@@ -119,6 +136,7 @@ class FalconProjectionSeedTrainer(BaseTrainer):
         if "encoder" not in state_dicts:
             raise ValueError(f"checkpoint {src_ckpt} missing 'encoder' key")
 
+        projection_num_layers = int(bgkit_cfg.get("projection_num_layers", 1))
         self.encoder = BgKITEncoder.from_pretrained_with_state_dict(
             bgkit_cfg.backbone_name,
             state_dicts["encoder"],
@@ -129,6 +147,7 @@ class FalconProjectionSeedTrainer(BaseTrainer):
             attn_implementation=attention_impl,
             bidi_warmup_steps=0,
             active_decoder_family="falcon_h1",
+            projection_num_layers=projection_num_layers,
         ).to(self.device)
         self.encoder.set_active_decoder_family("falcon_h1")
 
@@ -234,7 +253,19 @@ class FalconProjectionSeedTrainer(BaseTrainer):
             include_metadata=True,
             companion_dir=str(companion_dir),
         )
-        full_dataset = _ValidCompanionSubset(inner_dataset)
+        # forced_adapt unfreezes encoder.l0, so the full Qwen3.5 bidi backbone
+        # runs with autograd at every step. Memory then scales with content
+        # length; long-tail chunks (p95 ~4600 content tokens) push the 65%
+        # per-process CUDA budget over its cap and OOM. Filter both ends:
+        # max_sample_length caps the worst-case batch memory, min_sample_length
+        # drops degenerate short chunks. Both default to None (no filtering).
+        max_sample_length = tcfg.get("max_sample_length", None)
+        min_sample_length = tcfg.get("min_sample_length", None)
+        full_dataset = _ValidCompanionSubset(
+            inner_dataset,
+            max_sample_length=max_sample_length,
+            min_sample_length=min_sample_length,
+        )
 
         max_eval_samples = int(tcfg.get("max_eval_samples", 1000))
         eval_size = min(max(1, int(len(full_dataset) * 0.1)), max_eval_samples)

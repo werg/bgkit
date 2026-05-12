@@ -5,7 +5,7 @@ optimizer: adamw
 # forward in the loop; each step is forward+backward through ~19M params
 # of the projection block, so we can afford many fast steps with small
 # batches.
-max_steps: 4000
+max_steps: 6000
 lr: 5.0e-4
 projection_lr: 5.0e-4
 warmup_steps: 100

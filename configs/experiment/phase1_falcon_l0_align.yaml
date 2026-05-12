@@ -1,10 +1,10 @@
 # @package _global_
 defaults:
   - /config
-  - /training/phase1_falcon_l0
+  - /training/phase1_falcon_l0_align
   - _self_
 
-run_name: phase1_falcon_l0
+run_name: phase1_falcon_l0_align
 step1_checkpoint: auto
 
 model:

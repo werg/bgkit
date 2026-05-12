@@ -110,9 +110,24 @@ def _make_projection_blocks(
     projection_norm: nn.Module,
     rotary_emb: nn.Module,
     hidden_dim: int,
+    num_layers: int = 1,
 ) -> nn.ModuleDict:
+    """Build one ProjectionBlock per decoder family.
+
+    ``num_layers`` controls how deep each projection block is. Extra layers
+    beyond the head are deepcopies of the popped backbone layer, so they
+    start from the same parametric distribution as the original backbone
+    block. This is materially useful when the projection block is the only
+    bridge between encoder hidden space and a decoder family with a
+    different vocab (Falcon-H1): a single transformer layer plus linear
+    head plateaus at moderate cosine similarity against the target
+    embed_tokens; deeper stacks have enough capacity to learn the
+    cross-tokenizer mapping more tightly.
+    """
+    if num_layers < 1:
+        raise ValueError(f"num_layers must be >= 1; got {num_layers}")
     blocks: dict[str, nn.Module] = {}
-    is_first = True
+    is_first_family = True
     for family, split in _PROJECTION_FAMILY_SPLIT_FACTORS.items():
         if hidden_dim % split != 0:
             raise ValueError(
@@ -120,13 +135,21 @@ def _make_projection_blocks(
                 f"must be divisible by split_factor={split}"
             )
         decoder_hidden = hidden_dim // split
-        if is_first:
-            layer, norm = projection_layer, projection_norm
-            is_first = False
+        # First family gets the popped backbone layer + norm directly; later
+        # families get deepcopies (so each family's projection has independent
+        # weights for fine-tuning).
+        if is_first_family:
+            head_layer, norm = projection_layer, projection_norm
+            is_first_family = False
         else:
-            layer, norm = copy.deepcopy(projection_layer), copy.deepcopy(projection_norm)
+            head_layer = copy.deepcopy(projection_layer)
+            norm = copy.deepcopy(projection_norm)
+        # Build the stack: head_layer for layer 0, deepcopies for the rest.
+        layers: list[nn.Module] = [head_layer]
+        for _ in range(num_layers - 1):
+            layers.append(copy.deepcopy(head_layer))
         blocks[family] = ProjectionBlock(
-            layer,
+            layers,
             norm,
             rotary_emb,
             hidden_dim=hidden_dim,
@@ -137,7 +160,20 @@ def _make_projection_blocks(
 
 
 def _migrate_projection_state_keys(state_dict: dict) -> tuple[dict, bool]:
-    """Route legacy ``projection_block.*`` keys to ``projection_blocks.qwen35.*``."""
+    """Normalize projection-block state-dict keys.
+
+    Two legacy layouts are migrated:
+
+    1. ``projection_block.*`` (single-family, pre-2026-05) →
+       ``projection_blocks.qwen35.*``.
+    2. ``projection_blocks.{family}.transformer_layer.*`` (single-layer
+       projection, pre-2026-05-12) →
+       ``projection_blocks.{family}.transformer_layers.0.*``. The deepened
+       projection stacks N transformer layers (configurable via
+       ``projection_num_layers``); legacy single-layer checkpoints load
+       into layer 0 and the remaining layers stay at their fresh
+       deepcopy-of-head init.
+    """
 
     migrated = dict(state_dict)
     changed = False
@@ -147,6 +183,18 @@ def _migrate_projection_state_keys(state_dict: dict) -> tuple[dict, bool]:
                 "projection_block.",
                 "projection_blocks.qwen35.",
                 1,
+            )
+            migrated[new_key] = migrated.pop(key)
+            changed = True
+    # Second pass: handle the transformer_layer → transformer_layers.0 rename.
+    for key in list(migrated):
+        if (
+            key.startswith("projection_blocks.")
+            and ".transformer_layer." in key
+            and ".transformer_layers." not in key
+        ):
+            new_key = key.replace(
+                ".transformer_layer.", ".transformer_layers.0.", 1
             )
             migrated[new_key] = migrated.pop(key)
             changed = True
@@ -360,6 +408,7 @@ class BgKITEncoder(nn.Module):
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
         active_decoder_family: str = "qwen35",
+        projection_num_layers: int = 1,
     ) -> BgKITEncoder:
         if isinstance(backbone_name_or_module, str):
             from transformers import AutoModel
@@ -389,6 +438,7 @@ class BgKITEncoder(nn.Module):
                 survivorship_inner_dim,
                 threshold_controller_cfg,
                 active_decoder_family,
+                projection_num_layers=projection_num_layers,
             )
 
         if not isinstance(raw_model, BidirectionalQwen35) and _is_qwen35_model(raw_model):
@@ -428,6 +478,7 @@ class BgKITEncoder(nn.Module):
             projection_norm,
             rotary_emb,
             hidden_dim=hidden_dim,
+            num_layers=projection_num_layers,
         )
 
         encoder = cls(l0, l1, projection_blocks, active_decoder_family=active_decoder_family)
@@ -445,6 +496,7 @@ class BgKITEncoder(nn.Module):
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
         active_decoder_family: str = "qwen35",
+        projection_num_layers: int = 1,
     ) -> BgKITEncoder:
         layers = _resolve_layers(text_model)
         projection_layer = layers[-1]
@@ -484,6 +536,7 @@ class BgKITEncoder(nn.Module):
             projection_norm,
             rotary_emb,
             hidden_dim=hidden_dim,
+            num_layers=projection_num_layers,
         )
 
         encoder = cls(l0, l1, projection_blocks, active_decoder_family=active_decoder_family)
@@ -505,6 +558,7 @@ class BgKITEncoder(nn.Module):
         survivorship_inner_dim: int = 256,
         threshold_controller_cfg: dict | None = None,
         active_decoder_family: str = "qwen35",
+        projection_num_layers: int = 1,
     ) -> BgKITEncoder:
         """Construct an encoder and load a state dict in the new split-L0/L1 layout.
 
@@ -513,6 +567,11 @@ class BgKITEncoder(nn.Module):
         when the L0/L1 split rebuild dropped ``_set_norm_to_identity`` and
         the legacy migration mistakenly routed the trained final-norm
         weights into the backbone's Identity slot).
+
+        ``projection_num_layers`` controls projection-block depth. Legacy
+        checkpoints saved with a single layer load cleanly into layer 0 of
+        a deeper stack (see ``_migrate_projection_state_keys``); the
+        remaining layers stay at deepcopy-of-head init until trained.
         """
         pruned = any(k.startswith("l0.backbone.blocks.") for k in encoder_state_dict)
         encoder = cls.from_pretrained(
@@ -528,6 +587,7 @@ class BgKITEncoder(nn.Module):
             survivorship_inner_dim=survivorship_inner_dim,
             threshold_controller_cfg=threshold_controller_cfg,
             active_decoder_family=active_decoder_family,
+            projection_num_layers=projection_num_layers,
         )
 
         # One-shot migration: if a checkpoint was saved with the broken

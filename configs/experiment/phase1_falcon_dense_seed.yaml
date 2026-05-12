@@ -14,6 +14,15 @@ compute:
   pin_memory: false
 
 model:
+  bgkit:
+    # 3-layer projection stack — single-layer + linear head plateaus at
+    # cos_sim ≈ 0.53 against falcon embed_tokens because of the
+    # contextualized-vs-token-embedding mismatch. Going to 3 layers gives
+    # the projection real capacity to learn the cross-tokenizer mapping;
+    # legacy 1-layer checkpoints load into layer 0 via
+    # ``_migrate_projection_state_keys`` and the remaining layers stay
+    # at deepcopy-of-head init.
+    projection_num_layers: 3
   decoder:
     family: falcon_h1
     backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct

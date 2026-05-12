@@ -98,7 +98,18 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.commit_encoding import CommitEncodingTrainer
 
         return CommitEncodingTrainer(cfg)
-    elif phase in ("phase1_step6", "phase1_falcon_l0", "phase1_falcon_l1"):
+    elif phase in (
+        "phase1_step6",
+        "phase1_falcon_l0_align",
+        "phase1_falcon_l0",
+        "phase1_falcon_l1",
+    ):
+        # phase1_falcon_l0_align runs the CompressionTrainer at target_ratio=1.0
+        # for end-to-end no-compression alignment; phase1_falcon_l0 is then the
+        # slow compression ramp 1.0 → 0.10. The resolver chain in
+        # compression.py (`_resolve_step1_checkpoint`) walks
+        # l0 → l0_align → forced_adapt → dense_seed so each phase resumes from
+        # the most recent prior stage automatically.
         from bgkit.training.phase1.compression import CompressionTrainer
 
         return CompressionTrainer(cfg)

@@ -1,7 +1,22 @@
 phase: phase1_falcon_l0
 optimizer: muon
-max_steps: 12000
-lr: 6.0e-5
+# Phase D: slow compression ramp from no-compression (1.0) to the
+# target retention ratio (0.10) over many thousands of steps.
+# Resumes from phase1_falcon_l0_align where the decoder learned to
+# reconstruct from the uncompressed projection output. The head was
+# trained against the forced mask during forced_adapt; it has been
+# dormant through l0_align (ratio=1.0 bypasses the head) and its
+# weights still reflect the forced selection. As compression turns on
+# the head's natural choice should approximate the forced mask, giving
+# the decoder a smooth runway.
+#
+# The Falcon-H1 Tiny decoder is much smaller (90M) than Qwen3.5-0.8B,
+# so the ramp is generous — 5k steps held at 1.0 → 0.50 (gentle
+# introduction), then 10k more 0.50 → 0.10, then 5k holding at 0.10.
+max_steps: 20000
+lr: 5.0e-5
+encoder_lr: 2.0e-5
+decoder_lr: 6.0e-5
 warmup_steps: 500
 bidi_warmup_steps: 0
 max_batch_tokens: 6144
@@ -10,23 +25,23 @@ min_sample_length: 256
 max_sample_length: 800
 max_eval_samples: 1000
 eval_every: 1000
-save_every: 4000
+save_every: 2000
 
 sampler:
-  # Falcon companion mmaps expose decoder-token lengths directly, so keep the
-  # multiplier at 1.0 and spend memory with a larger token budget instead.
   cost_multiplier: 1.0
   eval_cost_multiplier: 1.0
 
 objectives:
   data_reconstruction: 1.0
 
-target_ratio_start: 0.25
+# Slow compression curriculum: linear ramp 1.0 → 0.10 over 15k steps.
+# Combined with the held tail at 0.10 for the remaining 5k.
+target_ratio_start: 1.0
 target_ratio_end: 0.10
-target_ratio_ramp_steps: 3000
+target_ratio_ramp_steps: 15000
 sample_target_ratio_during_training: true
 target_ratio_sampling_mode: window
-target_ratio_sampling_window_above: 0.10
+target_ratio_sampling_window_above: 0.05
 target_ratio_anchor_sampling_prob: 0.0
 l1_introduction_step: 999999999
 
@@ -77,6 +92,8 @@ data:
   file_tokens_path: ${oc.env:DATA_DIR}/processed/tokens
   falcon_companion_dir: ${oc.env:DATA_DIR}/processed/tokens_falcon_h1
   prompt_variants_dir: configs/prompt_variants
+  tokens:
+    max_seq_len: 8192
 
 model:
   decoder:

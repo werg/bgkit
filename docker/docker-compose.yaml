@@ -359,6 +359,14 @@ services:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_falcon_forced_adapt"]
 
+  # Phase C: end-to-end alignment at no compression. Encoder.l0 + projection
+  # + decoder all train; target_ratio=1.0 holds compression off so the
+  # decoder learns to reconstruct from the uncompressed projection output
+  # before any compression curriculum kicks in.
+  train-falcon-l0-align:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_falcon_l0_align"]
+
   train-falcon-l0:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_falcon_l0"]

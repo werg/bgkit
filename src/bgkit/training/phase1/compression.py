@@ -106,6 +106,7 @@ class CompressionTrainer(BaseTrainer):
         backbone_name = bgkit_cfg.backbone_name
         backbone_revision = bgkit_cfg.get("backbone_revision", None)
         hidden_dim = bgkit_cfg.get("hidden_dim", 1024)
+        projection_num_layers = int(bgkit_cfg.get("projection_num_layers", 1))
         bidi_warmup = self.cfg.training.get("bidi_warmup_steps", 1000)
         model_cfg = self.cfg.model
         ctrl_src = model_cfg.get("threshold_controller", {})
@@ -153,6 +154,7 @@ class CompressionTrainer(BaseTrainer):
                 attn_implementation=attention_impl,
                 bidi_warmup_steps=bidi_warmup,
                 threshold_controller_cfg=threshold_controller_cfg,
+                projection_num_layers=projection_num_layers,
             )
         else:
             logger.info(
@@ -168,6 +170,7 @@ class CompressionTrainer(BaseTrainer):
                 attn_implementation=attention_impl,
                 bidi_warmup_steps=bidi_warmup,
                 threshold_controller_cfg=threshold_controller_cfg,
+                projection_num_layers=projection_num_layers,
             )
         self.encoder.to(device)
         gc.collect()
@@ -623,14 +626,25 @@ class CompressionTrainer(BaseTrainer):
                 decoder_family = "falcon_h1"
             if decoder_family == "falcon_h1":
                 # Avoid loading from a stage that includes the current one.
-                if training_phase == "phase1_falcon_l0":
+                if training_phase == "phase1_falcon_l0_align":
+                    # Align stage: resume from forced_adapt or dense_seed.
                     candidate_phases = (
+                        "phase1_falcon_forced_adapt",
+                        "phase1_falcon_dense_seed",
+                    )
+                elif training_phase == "phase1_falcon_l0":
+                    # Slow ramp: prefer l0_align (end-to-end no-compression
+                    # alignment) over forced_adapt (projection-only with
+                    # forced mask).
+                    candidate_phases = (
+                        "phase1_falcon_l0_align",
                         "phase1_falcon_forced_adapt",
                         "phase1_falcon_dense_seed",
                     )
                 else:  # phase1_falcon_l1 and any future Falcon stage
                     candidate_phases = (
                         "phase1_falcon_l0",
+                        "phase1_falcon_l0_align",
                         "phase1_falcon_forced_adapt",
                         "phase1_falcon_dense_seed",
                     )

@@ -76,6 +76,7 @@ class FalconProjectionCachedTrainer(BaseTrainer):
         if "encoder" not in state_dicts:
             raise ValueError(f"checkpoint {src_ckpt} missing 'encoder' key")
 
+        projection_num_layers = int(bgkit_cfg.get("projection_num_layers", 1))
         self.encoder = BgKITEncoder.from_pretrained_with_state_dict(
             bgkit_cfg.backbone_name,
             state_dicts["encoder"],
@@ -86,6 +87,7 @@ class FalconProjectionCachedTrainer(BaseTrainer):
             attn_implementation=attention_impl,
             bidi_warmup_steps=0,
             active_decoder_family="falcon_h1",
+            projection_num_layers=projection_num_layers,
         ).to(self.device)
 
         # We only need the projection block from the encoder; freeze everything

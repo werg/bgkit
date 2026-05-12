@@ -1,0 +1,94 @@
+phase: phase1_falcon_l0_align
+optimizer: muon
+# End-to-end alignment at *no* compression (target_ratio=1.0). All four
+# trainable parts (encoder.l0, l0 head, projection_blocks.falcon_h1,
+# decoder) run together; decoder learns to reconstruct from the
+# uncompressed projection output before any compression is introduced.
+# The head is dormant here — it only fires once target_ratio < 1.0 —
+# but its weights from forced_adapt persist and remain matched to the
+# forced mask so the transition into Phase D (slow ramp) is smooth.
+#
+# This phase is the load-bearing prerequisite to compression. Without
+# it the decoder enters compression underaligned and either learns
+# very slowly or never learns to disentangle the compressed encoder
+# input (see [[feedback_pre_compression_alignment]]).
+max_steps: 8000
+lr: 4.0e-5
+encoder_lr: 1.5e-5
+decoder_lr: 6.0e-5
+warmup_steps: 500
+bidi_warmup_steps: 0
+max_batch_tokens: 6144
+gradient_accumulation_steps: 8
+min_sample_length: 256
+max_sample_length: 800
+max_eval_samples: 1000
+eval_every: 500
+save_every: 1000
+
+sampler:
+  cost_multiplier: 1.0
+  eval_cost_multiplier: 1.0
+
+objectives:
+  data_reconstruction: 1.0
+
+# Compression disabled for the entire phase.
+target_ratio_start: 1.0
+target_ratio_end: 1.0
+target_ratio_ramp_steps: 1
+sample_target_ratio_during_training: false
+l1_introduction_step: 999999999
+
+# Head is bypassed at ratio>=0.999, so survivorship aux losses don't fire
+# meaningfully here. Keep weights at zero (no head training during align).
+survivorship:
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    utility_grad_loss_weight: 0.0
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.0
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    utility_grad_loss_weight: 0.0
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.0
+
+ice_distillation:
+  l0:
+    enabled: false
+  l1:
+    enabled: false
+
+moment_match_reference:
+  l0:
+    path: ${oc.env:DATA_DIR}/diagnostics/ice_reference_moments.json
+  l1:
+    path: null
+
+decoder_lora:
+  enabled: false
+  implementation: peft
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  peft_fused_backward: true
+
+freeze:
+  bgkit: false
+  decoder: false
+
+data:
+  file_tokens_path: ${oc.env:DATA_DIR}/processed/tokens
+  falcon_companion_dir: ${oc.env:DATA_DIR}/processed/tokens_falcon_h1
+  prompt_variants_dir: configs/prompt_variants
+  tokens:
+    max_seq_len: 8192
+
+model:
+  decoder:
+    family: falcon_h1
+    backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+    hidden_dim: 512
