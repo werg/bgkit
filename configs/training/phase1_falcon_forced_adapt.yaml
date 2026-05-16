@@ -1,10 +1,20 @@
 phase: phase1_falcon_forced_adapt
 optimizer: adamw
-max_steps: 2500
+# Re-run: 20k steps with reweighted loss to push cos_sim past the
+# 0.52 plateau the 2.5k-step run hit. The previous setup had
+# anchor MSE at 2× cos_loss in weight even though cos is what
+# matters for decoder readability; encoder LR was 5× slower than
+# projection LR so the "unfrozen encoder" capacity premium went
+# unused (forced_adapt only beat dense_seed by +0.001 cos). New
+# weights bias toward direction-matching; encoder + projection
+# train at comparable rates. Head BCE disabled (the
+# tanh-saturated supervision was noise-injection into the
+# encoder backbone).
+max_steps: 40000
 lr: 1.0e-4
 projection_lr: 1.0e-4
-encoder_lr: 2.0e-5
-warmup_steps: 100
+encoder_lr: 8.0e-5
+warmup_steps: 500
 # Matches phase1_step5's quadratic budget. The original 16384 was 16x
 # Step 5's effective work per batch with no measured justification.
 max_batch_tokens: 4096
@@ -14,36 +24,85 @@ max_batch_tokens: 4096
 max_batch_tokens_eval: 4096
 gradient_accumulation_steps: 2
 max_eval_samples: 1000
-eval_every: 100
-save_every: 500
+# Eval-leak diagnosis 2026-05-13: eval loop's per-iteration tensors stayed
+# Python-bound across iterations while the DataLoader (prefetch_factor=2)
+# staged the next batch — two encoder forwards' worth of bf16 activations
+# overlapped at peak, +22 GB reserved per eval cycle, compounding to OOM /
+# 40x slowdown after 2-3 cycles. Patched in projection_seed_falcon.py:540-553
+# (explicit del + release per iteration + empty_cache in finally).
+eval_every: 1000
+save_every: 1000
 
 adapt_encoder: true
 
-# Cap content length so the full Qwen3.5 bidi encoder backbone (now trainable
-# with autograd retained) doesn't blow the 65% per-process CUDA budget on
-# long-tail chunks. With the 3-layer projection_block adding ~37M params
-# plus Adam state, 4096 OOMs; 3072 still OOMs intermittently on solo
-# long-chunk batches; 2048 leaves clear headroom.
+# Cap content length to limit peak activation memory. The original
+# 20k-step rerun OOM'd at step 3500 with 2048 because the eval path
+# was leaking ~22 GB per cycle; with the leak patched (projection_seed_falcon.py
+# del-and-empty_cache fix, 2026-05-13) 2048 should be safe again.
+# 2048 doubles the dataset slice (~402k → ~928k samples) at the
+# memory cost of larger activations. Combined with
+# BGKIT_CUDA_MEM_FRACTION=0.80 the cap is ~97 GB.
 max_sample_length: 2048
 min_sample_length: 32
+# Per-repo cap: the raw corpus is power-law skewed — top repo has 6,151
+# chunks vs median 31 (198× upweight under uniform sampling). After 20+
+# epochs eval cos_sim plateau'd at ~0.58 while train cos kept climbing
+# (~0.08 gap, classic overfitting on the heavy tail). Capping each repo
+# to 200 chunks reduces dataset to ~586k chunks (47% of original) but
+# brings the top-1% repo share from ~17% down to ~3% — much more
+# balanced effective exposure across repos.
+max_chunks_per_repo: 200
+# exclude_files_metadata_path was used with the fast companion to test
+# the overfitting hypothesis. Now we're on the containment companion
+# with completely different per-position targets — the model has not
+# trained against THESE specific (qwen_pos, pair_id) pairs even on
+# files it has seen, so the exclusion is no longer needed (and would
+# starve the dataset further when only 7% of chunks survived). All
+# v2 files are in scope.
+# exclude_files_metadata_path: ${oc.env:DATA_DIR}/processed/tokens/metadata.parquet
 
 data:
-  falcon_companion_dir: ${oc.env:DATA_DIR}/processed/tokens_falcon_h1
-  # The Falcon companion was built at max_seq_len=8192; the base
-  # MmapTokenDataset must mirror that so per-chunk indices align.
+  # Containment-alignment companion: each forced_survivor is a Qwen
+  # position whose char range contains EXACTLY 2 Falcon tokens — clean
+  # byte-level targets, no heuristic best-guess. ~7% of chunks survive
+  # (Qwen and Falcon BPE are similar granularity so most Qwens contain
+  # just 1 Falcon, not 2). Surviving chunks have dense forced positions
+  # (~154/chunk avg). 18.8M total forced positions, all with unambiguous
+  # targets — vs fast-mode's 1.38B positions where half had ZERO char
+  # overlap with their assigned pair.
+  falcon_companion_dir: ${oc.env:DATA_DIR}/processed_v2/tokens_falcon_h1_containment
   tokens:
+    input_dir: ${oc.env:DATA_DIR}/processed_v2/tokens
     max_seq_len: 8192
 
-anchor_weight: 1.0
-cos_weight: 0.5
-norm_weight: 0.2
-survivor_bce_weight: 0.2
+# Loss reweighting: cos_loss is what matters for decoder readability.
+# Previously anchor (MSE) had weight 1.0 vs cos 0.5; MSE was effectively
+# pulling toward "match the norm" while cos was responsible for
+# "match the direction". At plateau MSE=0.015 and cos_loss=0.53,
+# meaning direction matching was the hard part. Boost cos, attenuate
+# the others to keep them as soft regularizers.
+anchor_weight: 0.1
+cos_weight: 2.0
+norm_weight: 0.1
+# Disabled: the head BCE was applied to tanh-saturated logits, gradient
+# died instantly. Worse, with adapt_encoder=true that broken signal
+# back-propagates through the encoder backbone — noise injection at
+# 0.2 weight. Set to 0 so the encoder receives clean signal only from
+# the anchor losses.
+survivor_bce_weight: 0.0
 
 checkpoint_pruning:
   enabled: true
-  keep_best: 3
-  keep_latest: 2
-  metric: eval/loss
+  # Bumped from 3: the previous 3 best slots filled with pre-reweighting
+  # eval/loss values (0.25 absolute) and held those long after the
+  # reweighted run's actual best (post-step-6000, eval/loss ~0.83 absolute,
+  # eval/cos ~0.58) was wiped. Switching the metric to eval/cos_sim
+  # (lower_is_better=false) avoids that sign-flip pitfall — cos_sim
+  # has the same direction-of-better regardless of loss reweighting.
+  keep_best: 8
+  keep_latest: 4
+  metric: eval/cos_sim
+  lower_is_better: false
 
 model:
   decoder:

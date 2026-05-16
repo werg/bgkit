@@ -1,19 +1,17 @@
 phase: phase1_falcon_l0
 optimizer: muon
-# Phase D: slow compression ramp from no-compression (1.0) to the
-# target retention ratio (0.10) over many thousands of steps.
-# Resumes from phase1_falcon_l0_align where the decoder learned to
-# reconstruct from the uncompressed projection output. The head was
-# trained against the forced mask during forced_adapt; it has been
-# dormant through l0_align (ratio=1.0 bypasses the head) and its
-# weights still reflect the forced selection. As compression turns on
-# the head's natural choice should approximate the forced mask, giving
-# the decoder a smooth runway.
-#
-# The Falcon-H1 Tiny decoder is much smaller (90M) than Qwen3.5-0.8B,
-# so the ramp is generous — 5k steps held at 1.0 → 0.50 (gentle
-# introduction), then 10k more 0.50 → 0.10, then 5k holding at 0.10.
-max_steps: 20000
+# Phase D: head-driven compression. Resumes from phase1_falcon_l0_align
+# where the head learned asymmetric "doom-the-bogus" BCE (target=0 at
+# non-forced positions only, no supervision at forced positions). The
+# encoder no longer overrides selection (``use_forced_survivor_mask_l0:
+# false``); the head selects organically. The companion's
+# forced_survivor_mask is still threaded into the batch and consumed by
+# the survivorship BCE — at any ratio ≤ forced fraction (~0.6) the head
+# is mathematically guaranteed to keep dooming non-forced positions
+# while utility-grad ranks within the forced set. The forced fraction
+# therefore acts as a soft upper bound (ratio>0.6 would force the head
+# to accept some bogus positions, which we do NOT do).
+max_steps: 40000
 lr: 5.0e-5
 encoder_lr: 2.0e-5
 decoder_lr: 6.0e-5
@@ -41,17 +39,16 @@ sampler:
 objectives:
   data_reconstruction: 1.0
 
-# Slow compression curriculum: linear ramp 1.0 → 0.10 over 15k steps.
-# Combined with the held tail at 0.10 for the remaining 5k.
-# Curriculum starts at the forced-mask baseline (~0.6 = typical fraction
-# of well-aligned forced positions) so Phase D picks up where Phase C
-# left off. The head selects naturally (use_forced_survivor_mask_l0=false
-# below) — it was trained in Phase C to predict forced positions, so its
-# initial selection should approximate the forced subset, and the
-# curriculum tightens compression *beyond* that baseline.
+# Slow compression curriculum: ramp from the forced-fraction baseline
+# (0.6) down to the final target retention (0.10) over 30k steps, then
+# hold at 0.10 for the remaining 10k. The head's asymmetric BCE
+# (carried forward from Phase C) guarantees the selection stays inside
+# the forced set throughout; utility-grad BCE sub-selects within the
+# forced set. The slow ramp gives the head time to adapt at each
+# ratio so the decoder never sees a sudden distribution shift.
 target_ratio_start: 0.6
 target_ratio_end: 0.10
-target_ratio_ramp_steps: 15000
+target_ratio_ramp_steps: 30000
 sample_target_ratio_during_training: true
 target_ratio_sampling_mode: window
 target_ratio_sampling_window_above: 0.05
@@ -68,16 +65,13 @@ survivorship:
     min_survivors_floor_ratio: 0.02
     min_survivors_absolute_min: 1
     min_survivors_tau: 0.3
-    # Head re-alignment during the compression ramp. The Falcon companion's
-    # forced_survivor mask threads through CompressionDataset → collator
-    # → trainer → compute_survivorship_losses, where it BCE-supervises
-    # the head's base_raw against the forced selection. Keeps the head's
-    # natural choice matched to the well-aligned tokenizer-pair positions
-    # the projection/decoder were trained against, so the start of
-    # compression is smooth for the decoder. Live-tunable via
-    # ``forced_survivor_bce_weight_l0``; auto-gated by target_ratio /
-    # ``forced_survivor_bce_anchor_ratio`` so the weight fades as the
-    # curriculum tightens below the forced fraction.
+    # Asymmetric "doom-the-bogus" head BCE (target=0 at non-forced
+    # positions, no supervision at forced). Always-on — the signal is
+    # ratio-independent. Live-tunable via ``forced_survivor_bce_weight_l0``.
+    # Utility-grad BCE (above, weight=0.3) sub-selects within the forced
+    # set: ranks forced positions by their downstream effect on decoder
+    # loss, gives the head a learnable target as ratio tightens below
+    # the forced fraction.
     forced_survivor_bce_weight: 1.0
   l1:
     ratio_loss_weight: 0.0

@@ -41,6 +41,9 @@ class _ValidCompanionSubset(Dataset):
         dataset: MmapTokenDataset,
         max_sample_length: int | None = None,
         min_sample_length: int | None = None,
+        max_chunks_per_repo: int | None = None,
+        per_repo_subsample_seed: int = 17,
+        exclude_files_metadata_path: str | None = None,
     ):
         valid = dataset.companion_valid_indices
         if valid is None:
@@ -55,11 +58,94 @@ class _ValidCompanionSubset(Dataset):
                 keep &= lengths >= int(min_sample_length)
             valid = valid[keep]
             lengths = lengths[keep]
+        # Exclude (repo_path, file_path) tuples that appear in a
+        # previously-trained dataset's metadata.parquet. Used to filter
+        # out already-seen content when switching to a superset corpus —
+        # avoids re-training on the heavily-cycled overlap. Match is
+        # exact on the (repo, file) key; chunks within a file are all
+        # kept-or-dropped together.
+        if exclude_files_metadata_path:
+            import pyarrow.parquet as pq
+            exclude_table = pq.read_table(
+                str(exclude_files_metadata_path),
+                columns=["repo_path", "file_path"],
+            )
+            exclude_keys = set(zip(
+                exclude_table.column("repo_path").to_pylist(),
+                exclude_table.column("file_path").to_pylist(),
+                strict=True,
+            ))
+            meta = dataset.get_metadata_table()
+            chunk_file_idx_full = dataset.chunk_file_indices
+            if chunk_file_idx_full is None:
+                raise ValueError(
+                    "exclude_files_metadata_path requires "
+                    "MmapTokenDataset(include_metadata=True)"
+                )
+            repo_per_file = meta.column("repo_path").to_pylist()
+            file_per_file = meta.column("file_path").to_pylist()
+            valid_file_idx = chunk_file_idx_full[valid]
+            keep = np.fromiter(
+                (
+                    (repo_per_file[i], file_per_file[i]) not in exclude_keys
+                    for i in valid_file_idx.tolist()
+                ),
+                dtype=bool,
+                count=valid_file_idx.size,
+            )
+            kept_count = int(keep.sum())
+            logger.info(
+                "exclude_files_filter_applied",
+                excluded_keys=len(exclude_keys),
+                kept_chunks=kept_count,
+                dropped_chunks=int(keep.size - kept_count),
+            )
+            valid = valid[keep]
+            lengths = lengths[keep]
+        # Per-repo subsampling to break heavy-tail overfitting. The raw
+        # corpus is power-law skewed (top 1% of repos contribute ~17% of
+        # chunks, top repo has 6,151 chunks vs median 31 — a 198x upweight
+        # under uniform sampling). Cap each repo to ``max_chunks_per_repo``
+        # via a deterministic per-repo random subset.
+        #
+        # Indexing: metadata.parquet has ONE row per file; chunks (which is
+        # what ``valid`` and ``dataset.lengths`` are indexed over) can have
+        # multiple per file. ``chunk_file_indices`` maps chunk -> file row.
+        if max_chunks_per_repo is not None and int(max_chunks_per_repo) > 0:
+            cap = int(max_chunks_per_repo)
+            meta = dataset.get_metadata_table()
+            repo_per_file = meta.column("repo_path").to_numpy(zero_copy_only=False)
+            chunk_file_idx = dataset.chunk_file_indices
+            if chunk_file_idx is None:
+                raise ValueError(
+                    "max_chunks_per_repo requires dataset.chunk_file_indices "
+                    "(MmapTokenDataset must be built with include_metadata=True)."
+                )
+            repo_for_chunk = repo_per_file[chunk_file_idx[valid]]
+            rng = np.random.default_rng(int(per_repo_subsample_seed))
+            keep_idx_in_valid: list[int] = []
+            unique_repos, inverse = np.unique(repo_for_chunk, return_inverse=True)
+            for repo_id in range(unique_repos.size):
+                in_repo = np.flatnonzero(inverse == repo_id)
+                if in_repo.size <= cap:
+                    keep_idx_in_valid.extend(in_repo.tolist())
+                else:
+                    chosen = rng.choice(in_repo, size=cap, replace=False)
+                    keep_idx_in_valid.extend(chosen.tolist())
+            keep_idx_in_valid = np.array(sorted(keep_idx_in_valid), dtype=np.int64)
+            valid = valid[keep_idx_in_valid]
+            lengths = lengths[keep_idx_in_valid]
+            logger.info(
+                "per_repo_cap_applied",
+                cap=cap,
+                unique_repos=int(unique_repos.size),
+                kept_chunks=int(valid.size),
+            )
         self.indices = valid
         if self.indices.size == 0:
             raise ValueError(
                 "Falcon companion stream has no non-degenerate chunks "
-                "(or all were filtered by min/max_sample_length)"
+                "(or all were filtered by min/max_sample_length / per-repo cap)"
             )
         self.lengths = lengths
 
@@ -261,10 +347,15 @@ class FalconProjectionSeedTrainer(BaseTrainer):
         # drops degenerate short chunks. Both default to None (no filtering).
         max_sample_length = tcfg.get("max_sample_length", None)
         min_sample_length = tcfg.get("min_sample_length", None)
+        max_chunks_per_repo = tcfg.get("max_chunks_per_repo", None)
+        exclude_files_metadata_path = tcfg.get("exclude_files_metadata_path", None)
         full_dataset = _ValidCompanionSubset(
             inner_dataset,
             max_sample_length=max_sample_length,
             min_sample_length=min_sample_length,
+            max_chunks_per_repo=max_chunks_per_repo,
+            per_repo_subsample_seed=int(self.cfg.get("seed", 42)),
+            exclude_files_metadata_path=exclude_files_metadata_path,
         )
 
         max_eval_samples = int(tcfg.get("max_eval_samples", 1000))
@@ -527,12 +618,30 @@ class FalconProjectionSeedTrainer(BaseTrainer):
                 for name, value in stats.items():
                     totals[name] = totals.get(name, 0.0) + float(value.item())
                 count += 1
+                # Leak fix: drop the EncoderOutput payload (release wipes the L0
+                # ``content_embeddings`` + survivor tensors) AND hard-clear the
+                # loop-locals before the dataloader advances.  Without this the
+                # previous-iter encoder activations + Falcon target_emb stay
+                # GPU-resident until Python rebinds locals at the NEXT
+                # iteration, overlapping with the prefetcher's next batch and
+                # the next encoder forward — eval runs at 2x batch tokens *and*
+                # without gradient checkpointing (``self.training=False``
+                # disables it), so the overlap balloons the reserved pool by
+                # ~20 GB per eval.
                 enc_out.release()
+                del enc_out, target_ids, target_mask, target_emb, total, stats, batch
             if count:
                 totals = {k: v / count for k, v in totals.items()}
             return totals
         finally:
             self._set_training_modes()
+            # Eval ran with bigger budget + no gradient checkpointing, so its
+            # peak reserved pool is larger than the training steady-state.
+            # Hand the headroom back before training resumes; otherwise the
+            # next train step has to fight the eval-sized pool for allocation
+            # and pace collapses (60 s/step vs 1.6 s/step observed).
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def save_checkpoint(
         self,

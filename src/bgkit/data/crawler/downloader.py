@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -241,7 +242,7 @@ class RepoDownloader:
         return result
 
     async def download_batch(
-        self, repos: list[RepoMetadata], progress_callback: callable | None = None
+        self, repos: list[RepoMetadata], progress_callback: Callable | None = None
     ) -> list[DownloadResult]:
         """Download multiple repos in parallel.
 
@@ -269,7 +270,7 @@ class RepoDownloader:
     async def download_all_queued(
         self,
         batch_size: int = 100,
-        progress_callback: callable | None = None,
+        progress_callback: Callable | None = None,
         randomize: bool = False,
     ) -> dict:
         """Download all queued repositories.

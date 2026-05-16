@@ -7,6 +7,7 @@ Coordinates discovery and download phases with:
 """
 
 import json
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import datetime
 
@@ -107,7 +108,7 @@ class CrawlOrchestrator:
     async def download_repos(
         self,
         batch_size: int = 100,
-        progress_callback: callable | None = None,
+        progress_callback: Callable | None = None,
         randomize: bool = False,
     ) -> dict:
         """Download all queued repositories.

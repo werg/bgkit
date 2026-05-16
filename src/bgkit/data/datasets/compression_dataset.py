@@ -158,6 +158,13 @@ class FileCompressionSample:
     # learned in Phase A/B/C. ``None`` when the underlying token dataset
     # has no companion or the chunk has no forced indices.
     forced_survivor_mask: torch.Tensor | None = None
+    # Per-forced-position Falcon pair token ids ``(N_forced, 2)``, sourced
+    # from the companion's ``target_falcon_pair_ids``. Used by Phase C's
+    # "ablation eval" (perfect-projection baseline): the decoder receives
+    # ``embed_tokens(target_falcon_pair_ids)`` in place of the projection
+    # output at survivor positions, isolating projection-quality cost vs
+    # decoder LM cost. None when no companion is loaded.
+    target_falcon_pair_ids: torch.Tensor | None = None
 
 
 @dataclass
@@ -224,6 +231,7 @@ class DataReconstructionSubset(Dataset):
         config: ChatTemplateConfig,
         seed: int = 42,
         encoder_tokenizer=None,
+        max_chunks_per_repo: int | None = None,
     ):
         self._token_ds = token_dataset
         self._tokenizer = tokenizer
@@ -246,6 +254,22 @@ class DataReconstructionSubset(Dataset):
             else None
         )
 
+        # Per-repo cap (heavy-tail rebalancing). Mirrors the cap that
+        # forced_adapt's ``_ValidCompanionSubset`` introduced: the raw
+        # corpus is power-law skewed (top 1% of repos = ~17% of chunks,
+        # top repo has 198× the median's chunk count). Capping each
+        # repo to ``max_chunks_per_repo`` brings the top-1% share down
+        # to ~3% and gives every repo roughly comparable exposure
+        # across an epoch. None disables (default).
+        if max_chunks_per_repo is not None and int(max_chunks_per_repo) > 0:
+            cap = int(max_chunks_per_repo)
+            self._valid_indices = self._apply_per_repo_cap(
+                token_dataset,
+                self._valid_indices,
+                cap=cap,
+                seed=seed,
+            )
+
         # Precompute max template overhead for length estimates
         self._max_overhead = _compute_max_overhead(tokenizer, variant_bank, config)
         content_lengths = np.asarray(self._token_ds.lengths, dtype=np.int64)
@@ -260,6 +284,53 @@ class DataReconstructionSubset(Dataset):
         self._cached_lengths = np.maximum(content_lengths, decoder_lengths) + (
             self._max_overhead
         )
+
+    @staticmethod
+    def _apply_per_repo_cap(
+        token_dataset,
+        valid_indices: np.ndarray | None,
+        *,
+        cap: int,
+        seed: int,
+    ) -> np.ndarray:
+        """Subsample chunk indices so no repo contributes more than ``cap``.
+
+        Operates on chunk indices into ``token_dataset`` (length = n_chunks).
+        Returns a sorted ndarray of selected chunk indices. If
+        ``valid_indices`` is provided, only those are eligible.
+        """
+        meta = token_dataset.get_metadata_table()
+        repo_col = meta.column("repo_path").to_numpy(zero_copy_only=False)
+        chunk_file_idx = token_dataset.chunk_file_indices
+        if chunk_file_idx is None:
+            raise ValueError(
+                "max_chunks_per_repo requires MmapTokenDataset(include_metadata=True)"
+            )
+        if valid_indices is None:
+            eligible = np.arange(len(token_dataset), dtype=np.int64)
+        else:
+            eligible = np.asarray(valid_indices, dtype=np.int64)
+        repo_for_chunk = repo_col[chunk_file_idx[eligible]]
+        rng = np.random.default_rng(int(seed))
+        unique_repos, inverse = np.unique(repo_for_chunk, return_inverse=True)
+        keep_local: list[int] = []
+        for repo_id in range(unique_repos.size):
+            in_repo = np.flatnonzero(inverse == repo_id)
+            if in_repo.size <= cap:
+                keep_local.extend(in_repo.tolist())
+            else:
+                chosen = rng.choice(in_repo, size=cap, replace=False)
+                keep_local.extend(chosen.tolist())
+        keep_local_arr = np.array(sorted(keep_local), dtype=np.int64)
+        result = eligible[keep_local_arr]
+        logger.info(
+            "compression_dataset_per_repo_cap_applied",
+            cap=cap,
+            unique_repos=int(unique_repos.size),
+            kept_chunks=int(result.size),
+            dropped_chunks=int(eligible.size - result.size),
+        )
+        return result
 
     def _inner_index(self, idx: int) -> int:
         if self._valid_indices is None:
@@ -302,12 +373,23 @@ class DataReconstructionSubset(Dataset):
         # the forced selection (Phase D head re-alignment).
         forced_indices = inner.get("forced_survivor_indices", None)
         forced_mask: torch.Tensor | None = None
+        target_pair_ids: torch.Tensor | None = None
         if forced_indices is not None and forced_indices.numel() > 0:
             forced_mask = torch.zeros(content_ids.size(0), dtype=torch.bool)
             # Indices are chunk-local Qwen positions; clamp defensively in
             # case a stale companion ever drifts past the chunk length.
             valid = (forced_indices >= 0) & (forced_indices < content_ids.size(0))
-            forced_mask[forced_indices[valid].to(torch.long)] = True
+            valid_positions = forced_indices[valid].to(torch.long)
+            forced_mask[valid_positions] = True
+            # Per-forced-position Falcon pair IDs aligned with the mask.
+            # forced_survivor_indices may not be sorted, but downstream
+            # ``content[forced_mask]`` enumerates in content-position order,
+            # so we sort pair_ids by chunk-local position too — that way
+            # the i-th pair_id always matches the i-th survivor.
+            pair_ids_full = inner.get("target_falcon_pair_ids", None)
+            if pair_ids_full is not None and pair_ids_full.numel() > 0:
+                sort_order = valid_positions.argsort()
+                target_pair_ids = pair_ids_full[valid][sort_order].to(torch.long)
 
         return FileCompressionSample(
             objective="data_reconstruction",
@@ -323,6 +405,7 @@ class DataReconstructionSubset(Dataset):
             bgkit_splice_start=int(result["bgkit_splice_start"].item()),
             bgkit_splice_len=int(result["bgkit_splice_len"].item()),
             forced_survivor_mask=forced_mask,
+            target_falcon_pair_ids=target_pair_ids,
         )
 
 
@@ -1020,11 +1103,13 @@ class CompressionDataset(Dataset):
         # Objective 1: Data reconstruction
         if token_ds is not None:
             config = TOOL_CONFIGS["file_read_repro"]
+            max_chunks_per_repo = getattr(cfg, "max_chunks_per_repo", None)
             subsets["data_reconstruction"] = DataReconstructionSubset(
                 token_ds, tokenizer,
                 variant_banks.get("file_read_repro", _DEFAULT_VARIANT_BANKS["file_read_repro"]),
                 config, seed=seed,
                 encoder_tokenizer=encoder_tokenizer,
+                max_chunks_per_repo=max_chunks_per_repo,
             )
 
         # Objective 2: Description generation

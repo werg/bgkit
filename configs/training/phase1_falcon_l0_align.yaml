@@ -22,6 +22,13 @@ encoder_lr: 1.5e-5
 decoder_lr: 6.0e-5
 warmup_steps: 500
 bidi_warmup_steps: 0
+# Profiled 2026-05-15 against max_batch_tokens=12288 / accum=4: per-step
+# went from 44 s to 53 s and peak 43.8→72.2 GB. Doubling the microbatch
+# does not reduce per-step time because per-microbatch fwd_backward
+# overhead scales super-linearly (attention quadratic, Mamba state
+# growth, dispatch on bigger tensors). The Python overhead lives in
+# the per-LAYER op count, not the per-microbatch loop count. Keep
+# 6144/8.
 max_batch_tokens: 6144
 gradient_accumulation_steps: 8
 min_sample_length: 256
@@ -102,9 +109,24 @@ freeze:
   bgkit: false
   decoder: false
 
+# Pace optimization (2026-05-15): the default ``flush_when_free_below_gb=20``
+# from compute/dgx_spark.yaml fires every step in Phase C — peak allocated
+# is only ~28-30 GB but per-process cap is 97 GB (under
+# BGKIT_CUDA_MEM_FRACTION=0.80), so free dips into the [5,15] GB band
+# every step and triggers an expensive allocator-flush (~OS-mmap under
+# expandable_segments). Phase C has plenty of headroom; only flush
+# under real pressure. Lower the threshold so flush fires only when
+# we're genuinely tight, not just because the pool is healthily full.
+dynamic_ckpt:
+  flush_when_free_below_gb: 6.0
+
 data:
-  file_tokens_path: ${oc.env:DATA_DIR}/processed/tokens
-  falcon_companion_dir: ${oc.env:DATA_DIR}/processed/tokens_falcon_h1
+  # Switch to v2: 1.73M chunks vs 1.24M in old processed/tokens. Use the
+  # fast-mode companion (not containment — Phase C wants the full corpus
+  # for decoder LM CE diversity; containment's 7% chunk acceptance is too
+  # sparse for end-to-end training).
+  file_tokens_path: ${oc.env:DATA_DIR}/processed_v2/tokens
+  falcon_companion_dir: ${oc.env:DATA_DIR}/processed_v2/tokens_falcon_h1
   prompt_variants_dir: configs/prompt_variants
   tokens:
     max_seq_len: 8192

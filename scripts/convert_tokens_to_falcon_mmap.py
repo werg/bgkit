@@ -483,6 +483,93 @@ def _chunk_text_and_qwen_offsets(
     return chunk_text, chunk_offsets
 
 
+def containment_pair_alignment(
+    qwen_offsets: list[tuple[int, int]] | np.ndarray,
+    falcon_ids: list[int],
+    falcon_offsets: list[tuple[int, int]],
+    *,
+    falcon_pad_id: int = 0,
+) -> DensePairAlignment:
+    """Strict containment-based alignment (no heuristic overlap scoring).
+
+    For each Qwen position ``i`` with char range ``[s_q, e_q]``, find the
+    Falcon tokens whose char range falls ENTIRELY inside ``[s_q, e_q]``
+    (i.e. ``falcon_start[j] >= s_q`` AND ``falcon_end[j] <= e_q``). Keep
+    Qwen positions where EXACTLY 2 Falcon tokens are contained; those
+    become forced_survivors with ``pair_ids = (a, b)`` where a, b are
+    the two contained Falcon token IDs.
+
+    Why strict count==2: ``projection_block.output_split_factor=2`` means
+    each Qwen survivor's projection output is exactly 2 Falcon embeddings.
+    Keeping only count==2 Qwen positions ensures every forced_survivor has
+    a clean, fully-determined target with no padding or partial-loss
+    masking — every projected vector is supervised against a real
+    Falcon-embedding-space target.
+
+    Result: fewer forced_survivors than the monotone-DP alignment, but
+    every kept position has a target that's unambiguous from the bytes.
+    No char-overlap penalty: the heuristic "best-guess" pair assignment
+    that capped cos_sim at ~0.6 is replaced with exact byte-level
+    containment.
+    """
+    q = np.asarray(qwen_offsets, dtype=np.int64)
+    if q.ndim == 1:
+        q = q.reshape(-1, 2)
+    n_qwen = int(q.shape[0])
+    n_falcon = len(falcon_ids)
+    if n_falcon == 0 or n_qwen == 0:
+        return DensePairAlignment(
+            forced_survivor_indices=np.zeros(0, dtype=np.int64),
+            target_falcon_pair_ids=np.zeros((0, 2), dtype=np.int64),
+            target_pair_loss_mask=np.zeros((0, 2), dtype=np.bool_),
+            alignment_scores=np.zeros(0, dtype=np.float32),
+        )
+
+    f = np.asarray(falcon_offsets, dtype=np.int64)
+    if f.ndim == 1:
+        f = f.reshape(-1, 2)
+    falcon_starts = f[:, 0]
+    falcon_ends = f[:, 1]
+    falcon_ids_arr = np.asarray(falcon_ids, dtype=np.int64)
+    qwen_starts = q[:, 0]
+    qwen_ends = q[:, 1]
+
+    # Vectorized: per Qwen i, find the index range [j_start, j_end] of
+    # Falcon tokens with falcon_start >= qwen_start AND falcon_end <= qwen_end.
+    # Tokens are in order, so falcon_starts is non-decreasing.
+    j_start = np.searchsorted(falcon_starts, qwen_starts, side="left")
+    # searchsorted on falcon_ends (also non-decreasing for normal tokenizers)
+    j_end_exclusive = np.searchsorted(falcon_ends, qwen_ends, side="right")
+    counts = j_end_exclusive - j_start
+    keep_mask = counts == 2
+    if not np.any(keep_mask):
+        return DensePairAlignment(
+            forced_survivor_indices=np.zeros(0, dtype=np.int64),
+            target_falcon_pair_ids=np.zeros((0, 2), dtype=np.int64),
+            target_pair_loss_mask=np.zeros((0, 2), dtype=np.bool_),
+            alignment_scores=np.zeros(0, dtype=np.float32),
+            skipped=True,
+            skip_reason="no_qwen_position_contains_exactly_2_falcon_tokens",
+        )
+
+    selected_qwen = np.flatnonzero(keep_mask).astype(np.int64)
+    selected_j_start = j_start[keep_mask]
+    a_ids = falcon_ids_arr[selected_j_start]
+    b_ids = falcon_ids_arr[selected_j_start + 1]
+    pair_ids = np.stack([a_ids, b_ids], axis=1)
+    # alignment_score = char span covered by the pair (analogous to old
+    # raw_overlap so downstream metrics keep meaning).
+    a_starts = falcon_starts[selected_j_start]
+    b_ends = falcon_ends[selected_j_start + 1]
+    scores = (b_ends - a_starts).astype(np.float32)
+    return DensePairAlignment(
+        forced_survivor_indices=selected_qwen,
+        target_falcon_pair_ids=pair_ids,
+        target_pair_loss_mask=np.ones_like(pair_ids, dtype=np.bool_),
+        alignment_scores=scores,
+    )
+
+
 def _select_alignment(
     mode: str,
     qwen_offsets: np.ndarray,
@@ -493,6 +580,13 @@ def _select_alignment(
 ) -> DensePairAlignment:
     if mode == "dp":
         return monotone_dense_pair_alignment(
+            qwen_offsets,
+            falcon_ids,
+            falcon_offsets,
+            falcon_pad_id=falcon_pad_id,
+        )
+    if mode == "containment":
+        return containment_pair_alignment(
             qwen_offsets,
             falcon_ids,
             falcon_offsets,
@@ -942,9 +1036,15 @@ def main() -> None:
     parser.add_argument("--falcon-revision", default=None)
     parser.add_argument(
         "--alignment-mode",
-        choices=["fast", "dp"],
+        choices=["fast", "dp", "containment"],
         default="fast",
-        help="Use vectorized fast alignment for full corpora or exact DP for diagnostics.",
+        help=(
+            "fast: vectorized monotone-DP best-overlap heuristic (default). "
+            "dp: exact DP, slower, for diagnostics. "
+            "containment: strict — only Qwen positions whose char range "
+            "contains EXACTLY 2 Falcon tokens; targets become unambiguous. "
+            "Fewer forced_survivors but every target is byte-clean."
+        ),
     )
     parser.add_argument(
         "--strict-alignment",

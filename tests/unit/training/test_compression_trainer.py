@@ -652,6 +652,7 @@ class TestResolveStep1Checkpoint:
             Path("/tmp/ckpts"),
             phase="phase1_step5",
             metric="eval/loss",
+            lower_is_better=True,
             label="step1_checkpoint",
         )
         assert result == str(mock_path)
@@ -683,7 +684,9 @@ class TestResolveStep1Checkpoint:
         assert result is None
         assert "step1" not in trainer._input_sources
 
-    def test_falcon_l0_auto_prefers_forced_adapt_then_dense_seed(self, trainer):
+    def test_falcon_l0_auto_prefers_l0_align_then_forced_adapt_then_dense_seed(
+        self, trainer
+    ):
         trainer.cfg = OmegaConf.merge(trainer.cfg, {
             "training": {"phase": "phase1_falcon_l0"},
             "step1_checkpoint": "auto",
@@ -694,6 +697,7 @@ class TestResolveStep1Checkpoint:
         with patch(
             "bgkit.training.phase1.compression.resolve_checkpoint",
             side_effect=[
+                ValueError("no l0 align"),
                 ValueError("no forced adapt"),
                 dense_path,
             ],
@@ -702,9 +706,15 @@ class TestResolveStep1Checkpoint:
 
         assert result == str(dense_path)
         assert [call.kwargs["phase"] for call in mock_resolve.call_args_list] == [
+            "phase1_falcon_l0_align",
             "phase1_falcon_forced_adapt",
             "phase1_falcon_dense_seed",
         ]
+        assert all(
+            call.kwargs["metric"] == "eval/cos_sim"
+            and call.kwargs["lower_is_better"] is False
+            for call in mock_resolve.call_args_list
+        )
         assert trainer._input_sources["step1"] == dense_path.name
 
     def test_falcon_l1_auto_resolves_l0_stage(self, trainer):
@@ -724,7 +734,8 @@ class TestResolveStep1Checkpoint:
         mock_resolve.assert_called_once_with(
             Path("/tmp/ckpts"),
             phase="phase1_falcon_l0",
-            metric="eval/loss",
+            metric="eval/cos_sim",
+            lower_is_better=False,
             label="step1_checkpoint",
         )
         assert result == str(l0_path)

@@ -1574,6 +1574,138 @@ class BaseTrainer(ABC):
         self._max_batch_tokens_eval = val
         self._rebuild_eval_dataloader_with_budget(val)
 
+    def evaluate_ablation_hook(
+        self, sub_batch, enc_out, sub_tokens,
+    ) -> tuple[float, float, str]:
+        """First-class ablation hook for eval (always-on when conditions match).
+
+        Subclasses override to compute an alternative "supremum" / floor
+        loss alongside the normal eval loss — typically by substituting
+        an idealized input at some pipeline stage (e.g. perfect projection,
+        gold encoder output, etc.). The gap ``eval/loss − eval/ablation_*_loss``
+        measures the cost of that pipeline stage.
+
+        Called once per eval sub-batch from the trainer's eval loop with:
+
+        - ``sub_batch``: the sliced packed batch the normal forward used,
+          carrying whatever extra companion fields (pair_ids, gold
+          embeddings, etc.) the override needs.
+        - ``enc_out``: the trainer-specific encoder output from the
+          normal forward (so the override can reuse survivor cu_seqlens
+          / shapes without re-running the encoder).
+        - ``sub_tokens``: the token denominator used for the normal
+          loss on this sub-batch — passed in so the override returns
+          a token-weighted sum on the same scale.
+
+        Returns ``(ablation_loss_sum, ablation_tokens, suffix)``:
+
+        - If conditions for ablation are not met on this sub-batch
+          (e.g. companion data missing, config flag off), return
+          ``(0.0, 0.0, "")`` and the caller skips accumulation.
+        - Otherwise return the loss × tokens sum, the token count, and
+          the metric-name suffix (e.g. ``"perfect_projection"``). The
+          eval loop accumulates across sub-batches and the suffix is
+          used to emit ``eval/ablation_<suffix>_loss`` and
+          ``eval/<suffix>_quality_gap`` once at the end.
+
+        Default no-op returns ``(0.0, 0.0, "")``.
+        """
+        return 0.0, 0.0, ""
+
+    def _apply_sample_length_filter_to_eval(self) -> None:
+        """Apply min/max sample-length filter to ``eval_dataset`` too.
+
+        2026-05-15: previously the sample-length filter applied only to
+        the TRAIN dataset; eval saw the unfiltered random_split which
+        included samples below ``min_sample_length``. With min=256 the
+        train set has 256+ token samples; eval was avg ~44 token
+        samples — different distributions, making eval loss look much
+        worse than train. Eval must use the SAME filter to give a
+        comparable loss measurement.
+        """
+        import numpy as np
+        from torch.utils.data import DataLoader, Subset
+        from bgkit.data.samplers import PackedTokenBudgetSampler
+
+        if not hasattr(self, "_eval_lengths"):
+            return  # subclass doesn't support eval rebuild
+
+        # Snapshot unfiltered eval state once.
+        if not hasattr(self, "_eval_dataset_full"):
+            self._eval_dataset_full = self.eval_dataset
+            self._eval_lengths_full = np.asarray(self._eval_lengths)
+            # Try to get content lengths from the compression_dataset
+            # via the subset's indices, same way setup() did.
+            try:
+                cd = getattr(self, "compression_dataset", None)
+                if cd is not None and hasattr(self.eval_dataset, "indices"):
+                    self._eval_content_lengths_full = np.array(
+                        [cd.content_token_length(i) for i in self.eval_dataset.indices],
+                        dtype=np.int64,
+                    )
+                else:
+                    self._eval_content_lengths_full = self._eval_lengths_full
+            except Exception:
+                self._eval_content_lengths_full = self._eval_lengths_full
+
+        min_len = int(getattr(self, "_min_sample_length", 0) or 0)
+        max_len = int(getattr(self, "_max_sample_length", 0) or 0)
+        if min_len > 0 or max_len > 0:
+            content = self._eval_content_lengths_full
+            mask = np.ones(len(content), dtype=bool)
+            if min_len > 0:
+                mask &= content >= min_len
+            if max_len > 0:
+                mask &= content <= max_len
+            valid_idx = np.where(mask)[0]
+            if len(valid_idx) == 0:
+                logger.warning(
+                    "eval_sample_length_filter_drops_all",
+                    min_sample_length=min_len,
+                    max_sample_length=max_len,
+                )
+                return
+            ds = Subset(self._eval_dataset_full, valid_idx.tolist())
+            lengths = self._eval_lengths_full[valid_idx]
+        else:
+            ds = self._eval_dataset_full
+            lengths = self._eval_lengths_full
+
+        self.eval_dataset = ds
+        self._eval_lengths = lengths
+        budget = getattr(self, "_max_batch_tokens_eval", None)
+        cost_multiplier = float(
+            getattr(
+                self, "_sampler_eval_cost_multiplier",
+                getattr(self, "_sampler_cost_multiplier", 1.0),
+            ) or 1.0
+        )
+        if budget is None:
+            return
+        eval_sampler = PackedTokenBudgetSampler(
+            self.eval_dataset,
+            lengths=self._eval_lengths,
+            max_batch_tokens=int(budget),
+            shuffle=False,
+            cost_multiplier=cost_multiplier,
+        )
+        self.eval_dataloader = DataLoader(
+            self.eval_dataset,
+            batch_sampler=eval_sampler,
+            collate_fn=self._train_collate_fn,
+            num_workers=self._num_workers,
+            pin_memory=self._pin_memory,
+        )
+        logger.info(
+            "eval_sample_length_filter_applied",
+            min_sample_length=min_len,
+            max_sample_length=max_len,
+            kept=int(len(self._eval_lengths)),
+            dropped=int(
+                len(self._eval_lengths_full) - len(self._eval_lengths),
+            ),
+        )
+
     def _handle_min_sample_length(self, val) -> None:
         """Live-config handler for ``min_sample_length``.
 
@@ -1581,6 +1713,8 @@ class BaseTrainer(ABC):
         the dataset in a ``Subset`` and rebuilding sampler + dataloader
         via :meth:`_rebuild_train_dataloader_with_budget`. ``val=0``
         disables the filter (returns to the unfiltered dataset).
+        Also re-applies the filter to ``eval_dataset`` so train and
+        eval see the same length distribution.
         """
         if not isinstance(val, int) or isinstance(val, bool) or val < 0:
             logger.warning(
@@ -1601,6 +1735,7 @@ class BaseTrainer(ABC):
             )
             return
         self._rebuild_train_dataloader_with_budget(int(budget))
+        self._apply_sample_length_filter_to_eval()
         logger.info("live_min_sample_length_update", old=old, new=val)
 
     def _handle_max_sample_length(self, val) -> None:
@@ -1633,6 +1768,7 @@ class BaseTrainer(ABC):
             )
             return
         self._rebuild_train_dataloader_with_budget(int(budget))
+        self._apply_sample_length_filter_to_eval()
         logger.info("live_max_sample_length_update", old=old, new=val)
 
     # ------------------------------------------------------------------

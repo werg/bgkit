@@ -5,6 +5,7 @@ API calls. Only subdivides queries when results exceed GitHub's 1000-result limi
 """
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -248,7 +249,7 @@ class RepoDiscovery:
         target_count: int = 100000,
         min_stars: int = 100,
         exclude_forks: bool = True,
-        progress_callback: callable | None = None,
+        progress_callback: Callable | None = None,
     ) -> DiscoveryResult:
         """Discover top repositories by stars.
 
@@ -313,7 +314,7 @@ class RepoDiscovery:
         seen_names: set,
         target_count: int,
         language: str | None = None,
-        progress_callback: callable | None = None,
+        progress_callback: Callable | None = None,
     ) -> list[RepoMetadata]:
         """Recursively subdivide star ranges when results exceed 1000.
 

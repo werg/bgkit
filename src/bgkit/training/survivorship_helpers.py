@@ -273,23 +273,27 @@ class LevelLossCfg:
     # Phase C); without this term the head's selection drifts from the
     # well-aligned tokenizer-pair positions the projection/decoder were
     # trained against. ``forced_survivor_mask`` is a flat ``(N_content,)``
-    # bool tensor (same shape contract as ``answer_position_mask``);
-    # supervises ``base_raw`` with BCE-with-logits (target = 1.0 at
-    # forced positions, 0.0 elsewhere). Disabled when the weight is zero
-    # or the mask is absent — so single-decoder-family Qwen runs are
-    # unaffected.
+    # bool tensor (same shape contract as ``answer_position_mask``).
+    #
+    # ASYMMETRIC "doom-the-bogus" BCE: target = 0.0 at non-forced
+    # positions only (no supervision at forced positions). This pushes
+    # the head's ``base_raw`` strongly negative at non-forced positions
+    # — which are bogus expansions under projection_block's
+    # output_split_factor=2 — while leaving forced positions free to be
+    # ranked by aggregate-ratio + utility-grad BCE. The signal is
+    # always valid (bogus is bogus regardless of target_ratio), so
+    # there is no ratio-gated fade. Utility-grad sub-selects within
+    # the forced set when target_ratio drops below the forced fraction;
+    # the doomed non-forced positions stay doomed, so the forced
+    # fraction is the natural upper bound on survival.
+    # Disabled when the weight is zero or the mask is absent — so
+    # single-decoder-family Qwen runs are unaffected.
     forced_survivor_bce_weight: float = 0.0
-    # Ratio-gated fade of forced_survivor_bce_weight. At target_ratio at
-    # (or above) ``forced_survivor_bce_anchor_ratio`` the BCE weight is
-    # the full configured value — appropriate while the curriculum is
-    # still keeping enough positions that "select forced positions"
-    # matches "select target_ratio positions." Below the anchor the
-    # weight fades linearly toward zero so the head can sub-select
-    # within the forced set (driven by utility-gradient BCE) without
-    # being pulled to also keep all forced positions high. Setting the
-    # anchor to 0 disables the gate (constant weight). The 0.6 default
-    # matches the typical Falcon forced-mask fraction.
-    forced_survivor_bce_anchor_ratio: float = 0.6
+    # DEPRECATED: kept for config-schema compatibility but no longer
+    # consulted. Asymmetric BCE has no fade — the signal is always
+    # valid. Live-tuning handler still accepts updates so old
+    # control.json files don't error, but the value has no effect.
+    forced_survivor_bce_anchor_ratio: float = 0.0
 
 
 def _metric_scalar(value: Tensor, *, sync: bool):
@@ -668,14 +672,18 @@ def compute_survivorship_losses(
         )
         total = total + weights.qa_position_loss_weight * qa_loss.to(total.dtype)
 
-    # Forced-survivor head supervision. Same shape contract as
-    # ``answer_position_mask``: flat ``(N_content,)`` bool. BCE-with-logits
-    # on ``base_raw`` with target = 1.0 at forced positions, 0.0 elsewhere.
-    # This is the Falcon Phase D head-realignment term that keeps the
-    # head's natural selection matched to the well-aligned-tokenizer-pair
-    # positions the projection/decoder were trained against. Skipped when
-    # the weight is zero, the mask is absent, or the head was bypassed
-    # (no ``base_raw`` because compression was off).
+    # Asymmetric "doom-the-bogus" head supervision. flat ``(N_content,)``
+    # bool ``forced_survivor_mask`` marks well-aligned Qwen→Falcon pair
+    # positions; the complement is "bogus" (projection_block's
+    # output_split_factor=2 produces unreliable expansions there). We
+    # BCE-supervise ``base_raw`` with target=0 ONLY at non-forced
+    # (bogus) positions — pushing the head to reject them with
+    # confidence — and leave forced positions UNSUPERVISED so the head
+    # is free to rank them by utility-grad / aggregate-ratio pressure.
+    # Result: non-forced are reliably doomed; forced are sub-selected
+    # by utility-grad as target_ratio tightens below the forced
+    # fraction. Skipped when the weight is zero, the mask is absent,
+    # or the head was bypassed (no ``base_raw``).
     forced_active = (
         weights.forced_survivor_bce_weight > 0.0
         and forced_survivor_mask is not None
@@ -691,24 +699,14 @@ def compute_survivorship_losses(
                 f"{tuple(base_raw.shape)}. Mask and base_raw must be flat "
                 "(N_content,) tensors over the same packed axis."
             )
-        target = fm.to(dtype=torch.float32)
+        neg = (~fm).to(dtype=torch.float32)
+        target = torch.zeros_like(base_raw, dtype=torch.float32)
         bce_per_pos = F.binary_cross_entropy_with_logits(
             base_raw.float(), target, reduction="none",
         )
-        forced_bce = bce_per_pos.mean()
-        # Ratio-gated fade. At target_ratio>=anchor (typically the forced
-        # fraction ~0.6) the head should bias toward keeping all forced
-        # positions — full BCE weight. As the curriculum tightens
-        # compression below the anchor, fade the weight linearly so
-        # utility-grad BCE can sub-select the most decoder-useful
-        # positions within the forced set without being pulled to keep
-        # *all* forced positions high. anchor<=0 disables the gate.
-        anchor = float(weights.forced_survivor_bce_anchor_ratio)
-        if anchor > 0.0:
-            gate = max(0.0, min(1.0, float(target_ratio) / anchor))
-        else:
-            gate = 1.0
-        effective_weight = weights.forced_survivor_bce_weight * gate
+        denom = neg.sum().clamp(min=1.0)
+        forced_bce = (bce_per_pos * neg).sum() / denom
+        effective_weight = float(weights.forced_survivor_bce_weight)
         metrics["forced_survivor_bce"] = _metric_scalar(forced_bce, sync=sync_metrics)
         metrics["forced_survivor_pos_fraction"] = _metric_scalar(
             fm.float().mean(), sync=sync_metrics,

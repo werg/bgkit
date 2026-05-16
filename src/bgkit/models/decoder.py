@@ -1007,6 +1007,32 @@ class ReconstructionDecoder(nn.Module):
         if nvfp4:
             self.enable_nvfp4()
 
+        # ----- Falcon-H1 training-path optimizations -----
+        # Strip no-op unit multipliers from Falcon-H1 attention / MLP / mixer /
+        # layer forwards when the loaded config has them set to 1.0. On
+        # Falcon-H1-Tiny-90M every per-layer scaling is unit and the patch
+        # eliminates ~216 muls per layer-forward (and their backward graph
+        # plus saved-tensor copies). Set ``BGKIT_FALCON_H1_PATCH=0`` to
+        # disable. Generation / KV-cache decode paths run on the unpatched
+        # path (the patched mixer raises if called with cache_params).
+        if (
+            self.decoder_family == "falcon_h1"
+            and os.environ.get("BGKIT_FALCON_H1_PATCH", "1") not in ("0", "false", "False")
+        ):
+            try:
+                from bgkit.utils.falcon_h1_patch import patch_falcon_h1_decoder
+
+                self._falcon_h1_patch_report = patch_falcon_h1_decoder(self.backbone)
+                logger.info(
+                    "falcon_h1_patch_applied",
+                    counts=self._falcon_h1_patch_report.as_dict(),
+                )
+            except Exception as exc:
+                logger.warning("falcon_h1_patch_failed", error=str(exc))
+                self._falcon_h1_patch_report = None
+        else:
+            self._falcon_h1_patch_report = None
+
     @property
     def uses_stateful_sequence_mixer(self) -> bool:
         """True when flattened packed samples would leak sequence state."""
@@ -1289,12 +1315,14 @@ class ReconstructionDecoder(nn.Module):
                 hidden = inner_model(
                     inputs_embeds=padded_embeds,
                     position_ids=pos_ids_2d,
+                    use_cache=False,
                     **packed_attn_kwargs,
                 ).last_hidden_state
         else:
             hidden = inner_model(
                 inputs_embeds=padded_embeds,
                 position_ids=pos_ids_2d,
+                use_cache=False,
                 **packed_attn_kwargs,
             ).last_hidden_state
 
@@ -1434,22 +1462,14 @@ class ReconstructionDecoder(nn.Module):
         if loss_mask_flat is not None:
             loss_mask_flat = loss_mask_flat.to(device=device, dtype=torch.bool)
 
-        target_cu_list = target_cu_seqlens.detach().to(
-            device="cpu",
-            dtype=torch.int64,
-        ).tolist()
-        splice_start_list = splice_start.detach().to(
-            device="cpu",
-            dtype=torch.int64,
-        ).tolist()
-        splice_len_list = splice_len.detach().to(
-            device="cpu",
-            dtype=torch.int64,
-        ).tolist()
-        survivor_cu_list = survivor_cu_seqlens.detach().to(
-            device="cpu",
-            dtype=torch.int64,
-        ).tolist()
+        _tc = target_cu_seqlens.detach().to(device="cpu", dtype=torch.int64).flatten()
+        _ss = splice_start.detach().to(device="cpu", dtype=torch.int64).flatten()
+        _sl = splice_len.detach().to(device="cpu", dtype=torch.int64).flatten()
+        _sc = survivor_cu_seqlens.detach().to(device="cpu", dtype=torch.int64).flatten()
+        target_cu_list = _tc.tolist()
+        splice_start_list = _ss.tolist()
+        splice_len_list = _sl.tolist()
+        survivor_cu_list = _sc.tolist()
 
         target_batch_size = len(target_cu_list) - 1
         if sample_indices is None:
@@ -2179,11 +2199,13 @@ class ReconstructionDecoder(nn.Module):
                 hidden = inner_model(
                     inputs_embeds=padded_embeds,
                     attention_mask=padded_mask,
+                    use_cache=False,
                 ).last_hidden_state
         else:
             hidden = inner_model(
                 inputs_embeds=padded_embeds,
                 attention_mask=padded_mask,
+                use_cache=False,
             ).last_hidden_state
         return hidden, seq_pad
 

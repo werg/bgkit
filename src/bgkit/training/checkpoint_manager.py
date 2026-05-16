@@ -111,6 +111,36 @@ class CheckpointManager:
         for rec in scored[: self.keep_best]:
             keep.add(rec.path)
 
+        # Loss-reweighting sanity check: if the metric values across the
+        # CURRENT candidate set span >5x in magnitude, the metric scale
+        # likely changed mid-run (e.g. loss reweighting). Ranking older
+        # pre-reweight checkpoints against newer post-reweight ones by
+        # raw value is misleading and was the 2026-05-12 / 2026-05-14
+        # Phase C pitfall. Warn loudly.
+        if len(scored) >= 2:
+            vals = [r.metrics[self.metric] for r in scored]
+            non_zero_vals = [abs(v) for v in vals if v != 0]
+            if non_zero_vals:
+                scale = max(non_zero_vals) / max(min(non_zero_vals), 1e-9)
+                if scale > 5.0:
+                    logger.warning(
+                        "checkpoint_metric_scale_shift_detected",
+                        metric=self.metric,
+                        scale_ratio=scale,
+                        min_value=min(vals),
+                        max_value=max(vals),
+                        hint=(
+                            "Magnitude of the pruning metric varies >5x across "
+                            "registered checkpoints — likely a loss reweighting "
+                            "happened mid-run. Pruning by this metric will favor "
+                            "the regime with the smaller absolute value, which "
+                            "may NOT be the better-trained checkpoint. Consider "
+                            "switching the metric to a sign/scale-stable signal "
+                            "like eval/cos_sim or eval/perplexity, or manually "
+                            "delete pre-reweighting registry entries."
+                        ),
+                    )
+
         # Delete the rest
         deleted: list[Path] = []
         surviving: list[_CheckpointRecord] = []

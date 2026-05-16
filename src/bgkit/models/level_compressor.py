@@ -376,17 +376,30 @@ class LevelCompressor(nn.Module):
             content_hidden = hidden[content_pos_mask]  # (N_content, D)
             base_raw = self.head(content_hidden.unsqueeze(0)).squeeze(0)  # (N_content,)
 
-            if utility_grad_active and content_hidden.requires_grad:
+            if utility_grad_active and hidden.requires_grad:
                 base_raw_for_util = self.head(
                     content_hidden.detach().unsqueeze(0),
                 ).squeeze(0)
                 hook_state["base_raw_for_util"] = base_raw_for_util
                 hook_state["post_head_content_values"] = content_hidden.detach().clone()
 
-                def _save_content_grad(grad, _state=util_state):
-                    _state["post_head_content_grad"] = grad.detach()
+                # Register the grad hook on the full ``hidden`` tensor and
+                # slice at content positions when capturing. Under the
+                # ``forced_survivor_mask`` path ``content_hidden`` is a
+                # dead branch (the head's ``base_raw`` is not used for the
+                # selection decision), so a hook on ``content_hidden``
+                # never fires. ``hidden`` IS in the backward graph because
+                # the survive_embedding scatter modifies it, and that
+                # modification flows through the remaining backbone
+                # blocks to the decoder loss.
+                def _save_content_grad(
+                    grad,
+                    _state=util_state,
+                    _mask=content_pos_mask,
+                ):
+                    _state["post_head_content_grad"] = grad[_mask].detach()
 
-                content_hidden.register_hook(_save_content_grad)
+                hidden.register_hook(_save_content_grad)
 
             T = self.head_tanh_temperature.to(base_raw.dtype)  # noqa: N806
             logits_for_op = torch.tanh(base_raw / T)
@@ -578,21 +591,27 @@ def _gather_survivors_packed(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gather survivor positions and rebuild per-sample cu_seqlens.
 
+    Vectorized: per-sample survivor counts come from a segmented sum of
+    the bool mask using ``segment_ids_from_cu`` + ``index_add_``, with no
+    Python-side loop and no CPU↔GPU syncs. The previous implementation
+    ran a ``for i in range(B)`` loop with ``.item()`` per iteration,
+    forcing ~B syncs per encoder forward (audit finding B4).
+
     Returns:
         survivor_embeddings: ``(N_surv, D)``
         survivor_cu_seqlens: ``(B+1,)`` int32
         survivor_counts: ``(B,)`` int64
     """
+    from bgkit.utils.packing import segment_ids_from_cu
+
     device = content_embeddings.device
     survivor_embeddings = content_embeddings[survivor_mask]
 
     B = int(content_cu_seqlens.shape[0]) - 1
+    n_total = int(survivor_mask.shape[0])
+    seg_ids = segment_ids_from_cu(content_cu_seqlens, n_total)
     counts = torch.zeros(B, dtype=torch.int64, device=device)
-    cu_int = content_cu_seqlens.to(torch.int64)
-    for i in range(B):
-        s = int(cu_int[i].item())
-        e = int(cu_int[i + 1].item())
-        counts[i] = survivor_mask[s:e].sum()
+    counts.index_add_(0, seg_ids, survivor_mask.to(torch.int64))
     cu = torch.zeros(B + 1, dtype=torch.int32, device=device)
     cu[1:] = counts.to(torch.int32).cumsum(0)
     return survivor_embeddings, cu, counts

@@ -344,6 +344,79 @@ class CompressionTrainer(BaseTrainer):
             encoder_tokenizer=encoder_tokenizer_name,
         )
 
+        # Falcon-H1-Tiny-Instruct's chat template has an off-by-one
+        # indexing bug at the tool-message branch (closing <|im_end|>
+        # after </tool_response> is skipped when followed by an
+        # assistant turn — malformed ChatML, decoder confused). Patch
+        # the loaded tokenizer in-place; no-op for tokenizers that
+        # don't carry the buggy pattern.
+        from bgkit.data.chat_template import patch_falcon_h1_chat_template
+
+        if patch_falcon_h1_chat_template(self.tokenizer):
+            logger.info(
+                "falcon_chat_template_patched",
+                decoder_tokenizer=tokenizer_name,
+            )
+
+        # B3 diagnostic: render the decoder's chat template once at setup
+        # so we can verify that Falcon-H1 (or any non-Qwen decoder)
+        # honors the Qwen-style tool_calls structure cleanly. A mangled
+        # render makes the decoder predict suffix tokens conditioned on
+        # garbage prefix tokens — a candidate contributor to the
+        # 179-nat starting loss in the Falcon stages. We don't fail
+        # training on this; it's logged for inspection.
+        try:
+            from bgkit.data.chat_template import (
+                BGKIT_TOOL_RESPONSE_SENTINEL,
+                TOOL_CONFIGS,
+                build_messages,
+                build_tools,
+            )
+
+            probe_cfg = TOOL_CONFIGS["file_read_repro"]
+            probe_variant = {
+                "system_prompt": (
+                    "You are an AI coding assistant with access to the "
+                    "bgkit_read_file tool for reading file contents."
+                ),
+                "user_prompt": "Read the file `{file_path}`",
+                "compression_prompt": "Return the file contents verbatim",
+                "response_prefix": "Here are the contents of `{file_path}`:",
+            }
+            probe_msgs = build_messages(
+                probe_variant,
+                probe_cfg,
+                file_path="src/example/placeholder.py",
+                language="python",
+                content_placeholder="X",
+                tool_response_content=BGKIT_TOOL_RESPONSE_SENTINEL,
+            )
+            probe_tools = build_tools(probe_cfg)
+            template_str = self.tokenizer.apply_chat_template(
+                probe_msgs,
+                tokenize=False,
+                add_generation_prompt=False,
+                tools=probe_tools,
+            )
+            template_tokens = self.tokenizer.encode(
+                template_str, add_special_tokens=False,
+            )
+            logger.info(
+                "decoder_chat_template_probe",
+                decoder_family=decoder_family,
+                template_token_count=len(template_tokens),
+                template_chars=len(template_str),
+                template_preview=template_str[:500],
+                template_tail=template_str[-300:] if len(template_str) > 500 else "",
+                has_bgkit_sentinel=(BGKIT_TOOL_RESPONSE_SENTINEL in template_str),
+                sentinel_count=template_str.count(BGKIT_TOOL_RESPONSE_SENTINEL),
+            )
+        except Exception as probe_exc:
+            logger.warning(
+                "decoder_chat_template_probe_failed",
+                error=str(probe_exc),
+            )
+
         # --- Survivorship head config (per-level) ---
         from bgkit.training.survivorship_helpers import (
             init_state,
@@ -644,17 +717,21 @@ class CompressionTrainer(BaseTrainer):
             ):
                 decoder_family = "falcon_h1"
             if decoder_family == "falcon_h1":
-                # Avoid loading from a stage that includes the current one.
+                # Source-checkpoint preference (latest stage first that's
+                # not the current one). 2026-05-14 update: re-prefer
+                # forced_adapt over dense_seed for l0_align. After the
+                # B1/B3 fixes (asymmetric BCE, chat-template patch, eval-
+                # leak fix) and the reweighted-loss rerun (cos_sim 0.52→
+                # 0.58 trained), forced_adapt's projection+encoder state
+                # is a strictly better warm-start than dense_seed for
+                # Phase C end-to-end. dense_seed remains a last-resort
+                # fallback if no forced_adapt checkpoint is registered.
                 if training_phase == "phase1_falcon_l0_align":
-                    # Align stage: resume from forced_adapt or dense_seed.
                     candidate_phases = (
                         "phase1_falcon_forced_adapt",
                         "phase1_falcon_dense_seed",
                     )
                 elif training_phase == "phase1_falcon_l0":
-                    # Slow ramp: prefer l0_align (end-to-end no-compression
-                    # alignment) over forced_adapt (projection-only with
-                    # forced mask).
                     candidate_phases = (
                         "phase1_falcon_l0_align",
                         "phase1_falcon_forced_adapt",
@@ -671,12 +748,21 @@ class CompressionTrainer(BaseTrainer):
                 candidate_phases = ("phase1_step5",)
 
             errors: list[str] = []
+            # For Falcon family, use eval/cos_sim (higher-is-better) to avoid
+            # the sign-flip trap: forced_adapt's eval/loss switched magnitude
+            # under the cos-weight reweighting (0.25 pre, 0.84 post), so
+            # ranking by eval/loss picks the worse pre-reweighting checkpoint.
+            # eval/cos_sim has the same direction-of-better in both regimes.
+            falcon_metric = decoder_family == "falcon_h1"
+            metric_key = "eval/cos_sim" if falcon_metric else "eval/loss"
+            lower_better = not falcon_metric
             for phase in candidate_phases:
                 try:
                     resolved = resolve_checkpoint(
                         checkpoint_dir,
                         phase=phase,
-                        metric="eval/loss",
+                        metric=metric_key,
+                        lower_is_better=lower_better,
                         label="step1_checkpoint",
                     )
                     step1_checkpoint = str(resolved)
@@ -1183,7 +1269,7 @@ class CompressionTrainer(BaseTrainer):
 
         forced_mask_l0: torch.Tensor | None = None
         if bool(self.cfg.training.get("use_forced_survivor_mask_l0", False)):
-            raw_forced = batch.get("forced_survivor_mask_l0", None)
+            raw_forced = batch.get("forced_survivor_mask_l0")
             if raw_forced is not None:
                 forced_mask_l0 = raw_forced.to(device=device, dtype=torch.bool)
 
@@ -1355,7 +1441,7 @@ class CompressionTrainer(BaseTrainer):
                 # ``_collate_file_samples`` emits this key as ``None`` if
                 # any sample in the batch lacks the mask, in which case the
                 # forced-BCE branch in the helper stays inert.
-                forced_mask_l0 = batch.get("forced_survivor_mask_l0", None)
+                forced_mask_l0 = batch.get("forced_survivor_mask_l0")
                 if forced_mask_l0 is not None:
                     forced_mask_l0 = forced_mask_l0.to(self.device)
                 surv_loss, surv_metrics = self._compute_survivorship_losses(
@@ -1761,8 +1847,28 @@ class CompressionTrainer(BaseTrainer):
         memory efficiency. Token-weighted loss accumulation preserved for
         comparable perplexity across runs.
         """
+        encoder_was_training = self.encoder.training
+        decoder_was_training = self.decoder.training
         self.encoder.eval()
-        self.decoder.eval()
+        decoder_family = getattr(self.decoder, "decoder_family", "qwen35")
+        # Falcon-H1 Mamba has two completely different code paths gated
+        # by ``self.training``: the fused training kernel
+        # ``mamba_split_conv1d_scan_combined`` vs the unfused inference
+        # path (softplus + causal_conv1d + selective_scan with
+        # ``apply_mask_to_padding_states`` applied to ``projected_states``).
+        # The two paths produce numerically different forward outputs
+        # (verified via investigation 2026-05-15) — and the inference
+        # path exists upstream to support autoregressive single-token
+        # generation with a KV-style cache, which we never use. For
+        # full-sequence teacher-forced LM CE eval the fused training
+        # kernel is the correct and consistent choice. Keep the decoder
+        # in training mode during evaluate(); ``@torch.no_grad()``
+        # disables gradient computation regardless of model.training, so
+        # this is safe.
+        if decoder_family == "falcon_h1":
+            self.decoder.train()
+        else:
+            self.decoder.eval()
         self._is_evaluating = True
         self._eval_count += 1
 
@@ -1772,6 +1878,38 @@ class CompressionTrainer(BaseTrainer):
             per_objective_loss_sum: dict[str, float] = {}
             per_objective_tokens: dict[str, float] = {}
             mixed_batches = 0
+            # First-class always-on eval accumulators (reset per call).
+            # Populated by _evaluate_file_batch via _record_eval_sub_batch_stats
+            # and evaluate_ablation_hook.
+            self._eval_sample_stats = {
+                "n_samples": 0,
+                "content_total": 0,
+                "target_total": 0,
+                "lm_total": 0,
+                "survivor_total": 0,
+                # list of (loss_value, sub_tokens) tuples, one per sub-batch
+                "loss_points": [],
+            }
+            self._eval_ablation_state: dict[str, dict[str, float]] = {}
+
+            # Periodic unsliced-vs-sliced check. Defaults to every 10th
+            # eval; configurable via training.eval_unsliced_every_n_evals.
+            unsliced_every = int(
+                self.cfg.training.get("eval_unsliced_every_n_evals", 10),
+            )
+            # _eval_count was incremented above. Fire on the first eval
+            # (eval_count == 1) and every Nth thereafter so the signal
+            # appears early in training, not only after N evals.
+            self._run_unsliced_this_eval = (
+                unsliced_every > 0
+                and (
+                    self._eval_count == 1
+                    or self._eval_count % unsliced_every == 0
+                )
+            )
+            self._eval_unsliced_consumed = False
+            self._eval_unsliced_loss_sum = 0.0
+            self._eval_unsliced_tokens = 0.0
 
             num_batches = len(self.eval_dataloader)
             for batch_idx, batch in enumerate(self.eval_dataloader):
@@ -1826,12 +1964,146 @@ class CompressionTrainer(BaseTrainer):
                 metrics[f"{obj}_loss"] = loss_sum / max(obj_tokens, 1.0)
                 metrics[f"{obj}_tokens"] = obj_tokens
                 metrics[f"{obj}_token_fraction"] = obj_tokens / max(total_tokens, 1.0)
+
+            # ----- Always-on per-sample distribution stats -----
+            # Cheap reductions, emitted every eval into the ``eval/``
+            # namespace so wandb plots them alongside ``eval/loss``.
+            stats = self._eval_sample_stats
+            n_samples = max(1, int(stats["n_samples"]))
+            metrics["n_samples"] = float(stats["n_samples"])
+            metrics["avg_content_len"] = stats["content_total"] / n_samples
+            metrics["avg_target_len"] = stats["target_total"] / n_samples
+            metrics["avg_lm_tokens"] = stats["lm_total"] / n_samples
+            metrics["avg_survivors"] = stats["survivor_total"] / n_samples
+            loss_points = stats["loss_points"]
+            if loss_points:
+                losses_t = torch.tensor(
+                    [lp[0] for lp in loss_points], dtype=torch.float64,
+                )
+                weights_t = torch.tensor(
+                    [lp[1] for lp in loss_points], dtype=torch.float64,
+                )
+                metrics["per_sample_loss_min"] = float(losses_t.min().item())
+                metrics["per_sample_loss_max"] = float(losses_t.max().item())
+                # Unweighted mean of per-sub-batch losses (denominator =
+                # number of sub-batches, not tokens). For the canonical
+                # token-weighted mean see ``eval/loss``.
+                metrics["per_sample_loss_mean"] = float(losses_t.mean().item())
+                if losses_t.numel() >= 2:
+                    metrics["per_sample_loss_std"] = float(
+                        losses_t.std(unbiased=False).item(),
+                    )
+                else:
+                    metrics["per_sample_loss_std"] = 0.0
+                # Token-weighted std as a sanity check: weight each
+                # sub-batch by its token count.
+                tw = float(weights_t.sum().item())
+                if tw > 0 and losses_t.numel() >= 2:
+                    weighted_mean = float(
+                        (losses_t * weights_t).sum().item() / tw,
+                    )
+                    weighted_var = float(
+                        ((losses_t - weighted_mean) ** 2 * weights_t).sum().item()
+                        / tw,
+                    )
+                    metrics["per_sample_loss_std_token_weighted"] = (
+                        weighted_var ** 0.5
+                    )
+
+            # ----- Ablation metrics from accumulator -----
+            # Default suffix from CompressionTrainer is
+            # ``perfect_projection``; emit existing metric names for
+            # wandb continuity.
+            for suffix, accum in self._eval_ablation_state.items():
+                ab_tokens = float(accum["tokens"])
+                if ab_tokens <= 0:
+                    continue
+                ab_avg = float(accum["loss_sum"]) / ab_tokens
+                metrics[f"ablation_{suffix}_loss"] = ab_avg
+                metrics[f"ablation_{suffix}_tokens"] = ab_tokens
+                metrics[f"{suffix}_quality_gap"] = avg_loss - ab_avg
+
+            # ----- Periodic unsliced-vs-sliced agreement (every Nth eval) -----
+            if (
+                self._run_unsliced_this_eval
+                and self._eval_unsliced_tokens > 0
+            ):
+                metrics["unsliced_loss"] = (
+                    self._eval_unsliced_loss_sum / self._eval_unsliced_tokens
+                )
+                metrics["unsliced_tokens"] = self._eval_unsliced_tokens
+
+            # ----- Always-on train-subset comparison -----
+            # One mini-batch forward (~8 samples) — trivial cost. If
+            # ``eval/train_subset_loss`` ever drifts away from
+            # ``eval/loss``, train and eval pipelines have diverged
+            # again (the 2026-05-14 bug class).
+            train_ts = self._compute_train_subset_loss()
+            if train_ts is not None:
+                ts_loss, ts_tokens = train_ts
+                metrics["train_subset_loss"] = ts_loss
+                metrics["train_subset_tokens"] = ts_tokens
+                metrics["train_eval_gap"] = avg_loss - ts_loss
         finally:
             self._is_evaluating = False
-            self.encoder.train()
-            self.decoder.train()
+            self.encoder.train(encoder_was_training)
+            self.decoder.train(decoder_was_training)
 
         return metrics
+
+    def _compute_train_subset_loss(
+        self, n_samples: int = 8,
+    ) -> tuple[float, float] | None:
+        """Run ``n_samples`` train chunks through the eval forward path.
+
+        Always-on diagnostic: if this drifts from ``eval/loss``, the
+        train and eval pipelines have diverged (different collator
+        path, missing field in slicing, different ratio handling, etc.).
+        Returns ``(avg_loss, token_count)`` or ``None`` on failure /
+        when train_dataset isn't available. Cost: one ~8-sample forward
+        per eval — trivial.
+        """
+        try:
+            import random as _random
+
+            from bgkit.data.collators import collate_compression
+
+            train_ds = getattr(self, "train_dataset", None)
+            if train_ds is None or len(train_ds) == 0:
+                return None
+            n_train = len(train_ds)
+            # Seed deterministically per-eval so the same chunks
+            # aren't sampled every time (would over-fit the signal to
+            # a fixed subset) but the eval is reproducible at a step.
+            rng = _random.Random(42 + int(self._eval_count))
+            pick = rng.sample(range(n_train), min(n_samples, n_train))
+            synth_samples = [train_ds[i] for i in pick]
+            synth_batch = collate_compression(synth_samples)
+            for k, v in synth_batch.items():
+                if torch.is_tensor(v):
+                    synth_batch[k] = v.to(self.device)
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16,
+                enabled=self.device.type == "cuda",
+            ):
+                synth_enc = self._compress_file_batch(
+                    synth_batch, target_ratio=self._current_target_ratio(),
+                )
+                synth_loss = self._decoder_forward_single_splice(
+                    synth_enc.survivor_embeddings,
+                    synth_enc.survivor_cu_seqlens,
+                    synth_batch,
+                )
+            synth_lm = synth_batch.get("target_loss_mask")
+            synth_tokens = (
+                int(synth_lm.sum().item()) if synth_lm is not None
+                else int(synth_batch["target_token_ids"].shape[0])
+            )
+            del synth_enc
+            return float(synth_loss.item()), float(synth_tokens)
+        except Exception as exc:
+            logger.warning("eval_train_subset_failed", error=str(exc))
+            return None
 
     def _batch_size(self, batch: dict) -> int:
         """Return the number of samples represented by a collated batch."""
@@ -1848,6 +2120,16 @@ class CompressionTrainer(BaseTrainer):
         Packed tensors (flat token buffers) must be re-packed from the
         per-sample segments; non-packed per-sample fields (e.g.
         ``bgkit_splice_start``, ``compression_ratios``) are plain indexed.
+
+        Postcondition (asserted): every key present in ``batch`` is also
+        present in the returned ``sliced`` dict. This guards against the
+        2026-05-15 bug where new fields added to the collator (e.g.
+        ``forced_survivor_mask_l0``, ``target_falcon_pair_ids_per_survivor``)
+        were silently dropped during eval slicing because they were
+        missed in _slice_batch's hand-maintained allow-list. The dropped
+        fields turned eval into a different setup than train, hiding
+        for weeks. The assert raises so future regressions surface
+        immediately.
         """
         from bgkit.data.collators import _make_cu_seqlens
         from bgkit.utils.packing import position_ids_from_cu
@@ -1881,6 +2163,9 @@ class CompressionTrainer(BaseTrainer):
                 **scalar_passthrough,
                 "sample_type": "file",
                 "content_token_ids": c_flat,
+                # alias of content_token_ids from the collator; preserve
+                # so the slice-completeness assert stays clean
+                "encoder_content_token_ids": c_flat,
                 "content_cu_seqlens": c_cu,
                 "content_position_ids": position_ids_from_cu(c_cu, int(c_flat.shape[0])),
                 "content_max_seqlen": max(
@@ -1904,6 +2189,66 @@ class CompressionTrainer(BaseTrainer):
                     sliced[k] = batch[k][indices]
             if "objectives" in batch and isinstance(batch["objectives"], list):
                 sliced["objectives"] = [batch["objectives"][i] for i in indices]
+
+            # Slice forced_survivor_mask_l0 (flat over content axis) along
+            # the same per-sample segments as content_token_ids. CRITICAL
+            # for eval correctness: without this, encoder's eval path
+            # never receives the forced mask, falls back to head's
+            # natural selection, and eval measures a different setup than
+            # train (looks like overfitting; actually train/eval pipeline
+            # divergence). Fix landed 2026-05-14 after misleading eval
+            # loss climb.
+            forced_full = batch.get("forced_survivor_mask_l0")
+            if forced_full is not None:
+                content_cu_in = batch["content_cu_seqlens"].to(torch.int64)
+                content_starts = content_cu_in[:-1]
+                content_ends = content_cu_in[1:]
+                forced_parts = [
+                    forced_full[int(content_starts[i]) : int(content_ends[i])]
+                    for i in indices
+                ]
+                sliced["forced_survivor_mask_l0"] = (
+                    torch.cat(forced_parts, dim=0) if forced_parts
+                    else forced_full.new_zeros(0)
+                )
+
+            # Slice target_falcon_pair_ids_per_survivor by per-sample
+            # forced counts. Each sample's forced count = forced_mask
+            # sum within that sample's content segment.
+            pair_ids_full = batch.get("target_falcon_pair_ids_per_survivor")
+            if pair_ids_full is not None and forced_full is not None:
+                # Per-sample forced counts in ORIGINAL batch order.
+                content_cu_in2 = batch["content_cu_seqlens"].to(torch.int64)
+                per_sample_forced = []
+                for i in range(int(content_cu_in2.shape[0]) - 1):
+                    s = int(content_cu_in2[i])
+                    e = int(content_cu_in2[i + 1])
+                    per_sample_forced.append(int(forced_full[s:e].sum().item()))
+                # Cumulative offsets into pair_ids_full per original sample.
+                cum_forced = [0]
+                for c in per_sample_forced:
+                    cum_forced.append(cum_forced[-1] + c)
+                pair_id_parts = []
+                for i in indices:
+                    a = cum_forced[i]
+                    b = cum_forced[i + 1]
+                    pair_id_parts.append(pair_ids_full[a:b])
+                sliced["target_falcon_pair_ids_per_survivor"] = (
+                    torch.cat(pair_id_parts, dim=0) if pair_id_parts
+                    else pair_ids_full.new_zeros((0, 2))
+                )
+
+            # Postcondition: every key in the input batch must appear in
+            # the sliced output. If a new key was added to the collator
+            # without updating _slice_batch, this assert fires loudly.
+            missing_keys = set(batch.keys()) - set(sliced.keys())
+            if missing_keys:
+                raise RuntimeError(
+                    f"_slice_batch dropped keys {sorted(missing_keys)!r} "
+                    "from the sliced batch. Any new field added to the "
+                    "collator must also be sliced here. See compression.py:"
+                    "_slice_batch docstring for the 2026-05-15 incident."
+                )
             return sliced
 
         # Repo sample type — slicing requires cu_repo/cu_file surgery.
@@ -1914,11 +2259,67 @@ class CompressionTrainer(BaseTrainer):
         )
 
     def _evaluate_file_batch(self, batch: dict) -> tuple[float, float]:
-        """Token-weighted eval forward for a packed file batch."""
+        """Token-weighted eval forward for a packed file batch.
+
+        Always-on signals (collected for every batch, aggregated by
+        ``evaluate()``):
+
+        - Per-sample survivor / content / target / loss-mask counts,
+          fed into ``self._eval_sample_stats`` for distribution summary.
+        - Per-sub-batch loss values, fed into the same accumulator so
+          ``evaluate()`` can report per-sample loss min/max/std/mean.
+        - Ablation hook ``evaluate_ablation_hook(sub_batch, enc_out,
+          sub_tokens)`` — runs by default; the no-op base returns zero
+          tokens and is skipped. ``CompressionTrainer`` overrides it to
+          emit the perfect-projection floor.
+
+        Periodic signal (every ``eval_unsliced_every_n_evals`` evals,
+        default 10):
+
+        - Full-batch unsliced forward; logged into ``_eval_unsliced_*``
+          accumulators so ``evaluate()`` can emit ``eval/unsliced_loss``
+          on those evals. Confirms the sliced/unsliced numerics agree
+          (the 2026-05-14 bug class).
+        """
         eval_sub = 4
         n_file = int(batch["content_cu_seqlens"].shape[0]) - 1
         file_loss_sum = 0.0
         file_tokens = 0.0
+
+        # Periodic unsliced-vs-sliced comparison (every Nth eval). The
+        # full-batch forward is non-trivial so we don't pay it every
+        # eval. Cadence configurable via training.eval_unsliced_every_n_evals
+        # (default 10). The accumulator is filled lazily — first eval
+        # batch where _run_unsliced_this_eval is True does the work.
+        run_unsliced = bool(getattr(self, "_run_unsliced_this_eval", False))
+        if run_unsliced and n_file >= 2 and not self._eval_unsliced_consumed:
+            self._eval_unsliced_consumed = True
+            try:
+                with torch.autocast(
+                    "cuda", dtype=torch.bfloat16,
+                    enabled=self.device.type == "cuda",
+                ):
+                    diag_enc = self._compress_file_batch(
+                        batch, target_ratio=self._current_target_ratio(),
+                    )
+                    diag_loss = self._decoder_forward_single_splice(
+                        diag_enc.survivor_embeddings,
+                        diag_enc.survivor_cu_seqlens,
+                        batch,
+                    )
+                diag_lm = batch.get("target_loss_mask")
+                diag_tokens = (
+                    int(diag_lm.sum().item()) if diag_lm is not None
+                    else int(batch["target_token_ids"].shape[0])
+                )
+                self._eval_unsliced_loss_sum = (
+                    float(diag_loss.item()) * float(diag_tokens)
+                )
+                self._eval_unsliced_tokens = float(diag_tokens)
+                del diag_enc
+            except Exception as exc:
+                logger.warning("eval_unsliced_check_failed", error=str(exc))
+
         for fs in range(0, n_file, eval_sub):
             fe = min(fs + eval_sub, n_file)
             sub_batch = self._slice_batch(batch, list(range(fs, fe)))
@@ -1939,9 +2340,133 @@ class CompressionTrainer(BaseTrainer):
                 sub_tokens = eval_loss_mask.sum().item()
             else:
                 sub_tokens = sub_batch["target_token_ids"].shape[0]
-            file_loss_sum += loss.item() * sub_tokens
-            file_tokens += sub_tokens
+            sub_loss_value = float(loss.item())
+            sub_tokens_f = float(sub_tokens)
+            file_loss_sum += sub_loss_value * sub_tokens_f
+            file_tokens += sub_tokens_f
+
+            # Always-on per-sub-batch distribution signal. The
+            # sub-batch is the granularity we already have token
+            # counts for; aggregating across sub-batches gives
+            # min/max/std on the eval-loss distribution + averages
+            # on content / target / survivor lengths.
+            self._record_eval_sub_batch_stats(
+                sub_batch, enc_out, sub_loss_value, sub_tokens_f,
+            )
+
+            # Always-on ablation hook. Default base returns
+            # (0.0, 0.0, ""); CompressionTrainer overrides to compute
+            # the perfect-projection floor when companion data + config
+            # flag are present.
+            ab_sum, ab_tokens, ab_suffix = self.evaluate_ablation_hook(
+                sub_batch, enc_out, sub_tokens_f,
+            )
+            if ab_suffix and ab_tokens > 0:
+                state = self._eval_ablation_state.setdefault(
+                    ab_suffix, {"loss_sum": 0.0, "tokens": 0.0},
+                )
+                state["loss_sum"] += float(ab_sum)
+                state["tokens"] += float(ab_tokens)
+
         return file_loss_sum, file_tokens
+
+    def _record_eval_sub_batch_stats(
+        self,
+        sub_batch: dict,
+        enc_out,
+        sub_loss_value: float,
+        sub_tokens: float,
+    ) -> None:
+        """Accumulate always-on per-sub-batch eval stats.
+
+        Cheap reductions on existing tensors; no extra forward passes.
+        Aggregated and reported by ``evaluate()`` as ``eval/avg_*`` /
+        ``eval/per_sample_loss_*`` metrics.
+        """
+        try:
+            ccu = sub_batch["content_cu_seqlens"].to(torch.int64)
+            tcu = sub_batch["target_cu_seqlens"].to(torch.int64)
+            scu = enc_out.survivor_cu_seqlens.to(torch.int64)
+            n = int(ccu.shape[0]) - 1
+            content_total = int((ccu[-1] - ccu[0]).item())
+            target_total = int((tcu[-1] - tcu[0]).item())
+            survivor_total = int((scu[-1] - scu[0]).item())
+            lm = sub_batch.get("target_loss_mask")
+            lm_total = int(lm.sum().item()) if lm is not None else target_total
+
+            stats = self._eval_sample_stats
+            stats["n_samples"] += n
+            stats["content_total"] += content_total
+            stats["target_total"] += target_total
+            stats["lm_total"] += lm_total
+            stats["survivor_total"] += survivor_total
+            # Per-sub-batch loss point (weighted by token count when
+            # we compute std). Granularity = sub-batch (~4 samples).
+            stats["loss_points"].append((sub_loss_value, sub_tokens))
+        except Exception as exc:
+            # Never let diagnostics break eval.
+            logger.warning("eval_sample_stats_failed", error=str(exc))
+
+    def evaluate_ablation_hook(
+        self, sub_batch: dict, enc_out, sub_tokens: float,
+    ) -> tuple[float, float, str]:
+        """Perfect-projection ablation: substitute decoder.embed_tokens(
+        target_falcon_pair_ids) for the projection output at survivor
+        positions, decoder runs as normal. Isolates projection-quality
+        cost from the floor that decoder + compression impose.
+
+        Conditions for the ablation to fire (all required):
+
+        - ``target_falcon_pair_ids_per_survivor`` present on the batch
+          (Falcon companion loaded).
+        - ``training.use_forced_survivor_mask_l0`` is True (survivor
+          count matches pair-id count by construction).
+        - The survivor / pair-id arithmetic checks out
+          (``n_surv == 2 * N_forced``).
+
+        Returns ``(loss_sum, tokens, "perfect_projection")`` on success,
+        ``(0.0, 0.0, "")`` when conditions fail. The caller emits
+        ``eval/ablation_perfect_projection_loss`` and
+        ``eval/projection_quality_gap`` from the accumulated values.
+        """
+        pair_ids_full = sub_batch.get("target_falcon_pair_ids_per_survivor")
+        forced_mask_full = sub_batch.get("forced_survivor_mask_l0")
+        if pair_ids_full is None or forced_mask_full is None:
+            return 0.0, 0.0, ""
+        if not bool(
+            self.cfg.training.get("use_forced_survivor_mask_l0", False),
+        ):
+            return 0.0, 0.0, ""
+        n_surv = int(enc_out.survivor_embeddings.shape[0])
+        # When use_forced_survivor_mask_l0=True the encoder selects
+        # exactly the forced positions, so 2*N_forced survivor
+        # projection slots are produced (output_split=2). pair_ids_full
+        # is (N_forced, 2) → embed → (N_forced, 2, D) → flatten →
+        # (2*N_forced, D). The flat order matches survivor_embeddings.
+        if pair_ids_full.shape[0] * 2 != n_surv:
+            return 0.0, 0.0, ""
+        with torch.autocast(
+            "cuda", dtype=torch.bfloat16,
+            enabled=self.device.type == "cuda",
+        ):
+            inner_model, _ = self.decoder._get_inner_model_and_head()
+            falcon_embed = inner_model.get_input_embeddings()
+            pair_ids_dev = pair_ids_full.to(self.device).long()
+            perfect_emb = falcon_embed(pair_ids_dev)
+            perfect_flat = perfect_emb.reshape(-1, perfect_emb.shape[-1])
+            perfect_flat = perfect_flat.to(
+                enc_out.survivor_embeddings.dtype,
+            )
+            ablation_loss = self._decoder_forward_single_splice(
+                perfect_flat,
+                enc_out.survivor_cu_seqlens,
+                sub_batch,
+            )
+        return (
+            float(ablation_loss.item()) * float(sub_tokens),
+            float(sub_tokens),
+            "perfect_projection",
+        )
 
     def _evaluate_repo_batch_persample(
         self,

@@ -21,6 +21,40 @@ CONTENT_SENTINEL = "<<<BGKIT_CONTENT_a7f3b2e1>>>"
 BGKIT_TOOL_RESPONSE_SENTINEL = "<<<BGKIT_TOOL_RESPONSE_4c91d7e5>>>"
 
 
+def patch_falcon_h1_chat_template(tokenizer) -> bool:
+    """Fix an off-by-one bug in Falcon-H1's chat template for tool messages.
+
+    Falcon-H1-Tiny-Instruct's chat template iterates over
+    ``remaining_messages`` (= ``messages[1:]`` when a system prompt is
+    present) but the tool-branch checks neighbor roles via
+    ``messages[loop.index0 + 1]`` / ``messages[loop.index0 - 1]`` —
+    indexing into the ORIGINAL ``messages`` list with the wrong offset.
+    The downstream effect: when a ``role: tool`` message is followed by
+    a ``role: assistant`` message, the closing ``<|im_end|>`` after
+    ``</tool_response>`` is skipped, producing malformed ChatML that
+    the pretrained decoder doesn't recognize.
+
+    This patch rewrites the buggy indices to use ``remaining_messages``,
+    which is the correct iterable. Returns True if a patch was applied,
+    False if the template doesn't look like Falcon-H1's buggy version
+    (e.g. already fixed upstream, or a different model).
+    """
+    template = getattr(tokenizer, "chat_template", None)
+    if not isinstance(template, str):
+        return False
+    needle_plus = "messages[loop.index0 + 1]"
+    needle_minus = "messages[loop.index0 - 1]"
+    if needle_plus not in template and needle_minus not in template:
+        return False
+    patched = (
+        template
+        .replace(needle_plus, "remaining_messages[loop.index0 + 1]")
+        .replace(needle_minus, "remaining_messages[loop.index0 - 1]")
+    )
+    tokenizer.chat_template = patched
+    return True
+
+
 @dataclass
 class ChatTemplateConfig:
     """Configuration for a specific task's chat template."""
@@ -431,12 +465,50 @@ def tokenize_with_sentinel(
     # Tokenize each piece separately (no special tokens per piece)
     prefix_ids = tokenizer.encode(prefix_str, add_special_tokens=False)
     suffix_ids = tokenizer.encode(suffix_str, add_special_tokens=False)
-    bgkit_splice_start = len(
-        tokenizer.encode(prefix_before_bgkit, add_special_tokens=False),
+
+    # Splice metadata: avoid BPE boundary drift. Previously we computed
+    # ``bgkit_splice_start`` and ``bgkit_splice_len`` by encoding the
+    # SUBSTRINGS ``prefix_before_bgkit`` and ``BGKIT_TOOL_RESPONSE_SENTINEL``
+    # separately — but BPE tokenization is not concat-distributive, so
+    # ``encode(A) + encode(B) != encode(A + B)``. The splice indices
+    # could drift by 1-2 tokens from where the sentinel actually sits
+    # inside ``prefix_ids``. Instead, encode the sentinel once and
+    # SEARCH for its (token-id) subsequence inside ``prefix_ids``. This
+    # guarantees the splice indices are exact relative to the actual
+    # rendered token stream the decoder will splice into.
+    sentinel_ids = tokenizer.encode(
+        BGKIT_TOOL_RESPONSE_SENTINEL, add_special_tokens=False,
     )
-    bgkit_splice_len = len(
-        tokenizer.encode(BGKIT_TOOL_RESPONSE_SENTINEL, add_special_tokens=False),
-    )
+    bgkit_splice_start = -1
+    bgkit_splice_len = len(sentinel_ids)
+    sentinel_len = len(sentinel_ids)
+    for i in range(len(prefix_ids) - sentinel_len + 1):
+        if prefix_ids[i : i + sentinel_len] == sentinel_ids:
+            bgkit_splice_start = i
+            break
+    if bgkit_splice_start < 0:
+        # Boundary drift: the sentinel's tokenization inside the full
+        # prefix differs from its standalone tokenization. Fall back to
+        # character-level: find where the sentinel character span sits
+        # inside ``prefix_str``, then count tokens in the substring
+        # before it. This is BPE-stable since we encode the same
+        # rendered prefix_str.
+        sentinel_char_start = prefix_str.index(BGKIT_TOOL_RESPONSE_SENTINEL)
+        sentinel_char_end = sentinel_char_start + len(BGKIT_TOOL_RESPONSE_SENTINEL)
+        bgkit_splice_start = len(
+            tokenizer.encode(
+                prefix_str[:sentinel_char_start], add_special_tokens=False,
+            ),
+        )
+        bgkit_splice_len = (
+            len(prefix_ids)
+            - bgkit_splice_start
+            - len(
+                tokenizer.encode(
+                    prefix_str[sentinel_char_end:], add_special_tokens=False,
+                ),
+            )
+        )
 
     # Content token IDs from the inner dataset (already tokenized)
     content_ids = content_token_ids.tolist()

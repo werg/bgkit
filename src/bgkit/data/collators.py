@@ -235,6 +235,20 @@ def _collate_file_samples(samples: list) -> dict:
     else:
         forced_packed = None
 
+    # Pair-id targets per forced-survivor position, already sorted by
+    # chunk-local position in the dataset so they align with the
+    # ``content[forced_mask]`` enumeration order downstream. Phase C's
+    # ablation eval uses these as "perfect projection" embed_tokens
+    # lookups. Only emit if every sample has them.
+    if all(
+        getattr(s, "target_falcon_pair_ids", None) is not None for s in samples
+    ):
+        target_falcon_pair_ids_packed = _cat_tensors(
+            [s.target_falcon_pair_ids for s in samples],
+        ).to(torch.long)
+    else:
+        target_falcon_pair_ids_packed = None
+
     return {
         "sample_type": "file",
         "objectives": [s.objective for s in samples],
@@ -262,6 +276,7 @@ def _collate_file_samples(samples: list) -> dict:
             [getattr(s, "bgkit_splice_len", 0) for s in samples], dtype=torch.long,
         ),
         "forced_survivor_mask_l0": forced_packed,
+        "target_falcon_pair_ids_per_survivor": target_falcon_pair_ids_packed,
     }
 
 
