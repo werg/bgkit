@@ -35,7 +35,13 @@ from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
-from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
+from bgkit.training.gradient_utils import (
+    configure_decoder_layerwise_split,
+    maybe_enable_decoder_gradient_checkpointing,
+    maybe_enable_frozen_decoder_kernels,
+    maybe_enable_gradient_checkpointing,
+    validate_decoder_lora_freeze_contract,
+)
 from bgkit.training.ratio_sampling import (
     build_ratio_sampler_config,
     resolve_anchor_grid,
@@ -76,7 +82,9 @@ class _InterleavingDataLoader:
 
     def __iter__(self):
         return _InterleavingIterator(
-            self._primary, self._secondary, self._ratio,
+            self._primary,
+            self._secondary,
+            self._ratio,
         )
 
     def __len__(self):
@@ -231,14 +239,14 @@ class DecoderInitTrainer(BaseTrainer):
             # decoder applied LoRA LATER in setup (see line ~285), so the target
             # at load time is always the base shape. Step 2 checkpoints only
             # carry "decoder" (no LoRA trained yet) so the fallback is correct.
-            self._bgkit_decoder_state = (
-                bgkit_state_dicts.get("decoder_merged")
-                or bgkit_state_dicts.get("decoder")
-            )
+            self._bgkit_decoder_state = bgkit_state_dicts.get(
+                "decoder_merged"
+            ) or bgkit_state_dicts.get("decoder")
             # Optional: load a pre-distilled l0.head sidecar as a warm
             # start. Produced by scripts/pretrain_survivorship_head.py.
             sidecar_path = self.cfg.training.get(
-                "survivorship_head_sidecar", None,
+                "survivorship_head_sidecar",
+                None,
             )
             if sidecar_path:
                 sidecar = torch.load(sidecar_path, map_location="cpu", weights_only=True)
@@ -299,7 +307,15 @@ class DecoderInitTrainer(BaseTrainer):
         self.decoder.set_lm_ce_impl(
             tcfg.get("decoder_ce_impl", self.cfg.compute.get("decoder_ce_impl", None))
         )
-        logger.info("decoder_ce_impl_selected", impl=self.decoder.lm_ce_impl)
+        self.decoder.set_lm_ce_strict(
+            tcfg.get("decoder_ce_strict", self.cfg.compute.get("decoder_ce_strict", None))
+        )
+        logger.info(
+            "decoder_ce_impl_selected",
+            impl=self.decoder.lm_ce_impl,
+            strict=self.decoder.lm_ce_strict,
+        )
+        configure_decoder_layerwise_split(self.decoder, self.cfg)
 
         # Load decoder weights from bgkit checkpoint if available (step 2 includes decoder).
         # ``load_decoder_from_bgkit_checkpoint: false`` skips this and keeps the
@@ -323,11 +339,12 @@ class DecoderInitTrainer(BaseTrainer):
         # Optional LoRA wrapping for decoder (step 3 uses this for parameter-efficient adaptation)
         self._decoder_lora = False
         lora_cfg = tcfg.get("decoder_lora", {})
+        validate_decoder_lora_freeze_contract(self.cfg)
         if lora_cfg.get("enabled", False):
             self.decoder.apply_lora(lora_cfg)
             self._decoder_lora = True
 
-        maybe_enable_gradient_checkpointing(self.decoder.backbone, self.cfg)
+        maybe_enable_decoder_gradient_checkpointing(self.decoder.backbone, self.cfg)
 
         # Optional Liger Kernel fused kernels (RMSNorm / SwiGLU / RoPE, plus
         # Liger CE only when decoder_ce_impl is auto/liger). Gated on
@@ -433,9 +450,8 @@ class DecoderInitTrainer(BaseTrainer):
             self._ice_l1.bce_warmup_steps if self._ice_l1.enabled else 0,
         )
         self._ice_teacher = None
-        if (
-            (self._ice_l0.enabled and self._ice_l0.bce_warmup_weight > 0)
-            or (self._ice_l1.enabled and self._ice_l1.bce_warmup_weight > 0)
+        if (self._ice_l0.enabled and self._ice_l0.bce_warmup_weight > 0) or (
+            self._ice_l1.enabled and self._ice_l1.bce_warmup_weight > 0
         ):
             from bgkit.models.ice_teacher import ICETeacher
 
@@ -469,8 +485,12 @@ class DecoderInitTrainer(BaseTrainer):
         )
         if self._surv_l0.moment_match_weight > 0 and l0_path:
             self._ref_moments_l0 = load_reference_moments(l0_path)
-            logger.info("moment_match_ref_l0_loaded", path=l0_path,
-                        skew=self._ref_moments_l0[0], kurt=self._ref_moments_l0[1])
+            logger.info(
+                "moment_match_ref_l0_loaded",
+                path=l0_path,
+                skew=self._ref_moments_l0[0],
+                kurt=self._ref_moments_l0[1],
+            )
         elif self._surv_l0.moment_match_weight > 0:
             raise ValueError(
                 "survivorship.l0.moment_match_weight > 0 requires "
@@ -499,7 +519,8 @@ class DecoderInitTrainer(BaseTrainer):
         qa_data_dir = getattr(self.cfg.data, "qa_data_dir", None)
         qa_ratio = tcfg.get("qa_ratio", 0.0)
         inner_dataset = MmapTokenDataset(
-            data_dir, max_seq_len=max_seq_len,
+            data_dir,
+            max_seq_len=max_seq_len,
             include_metadata=True,
         )
         full_dataset = ChatReproDataset(
@@ -521,7 +542,9 @@ class DecoderInitTrainer(BaseTrainer):
         self.chat_dataset = full_dataset
         split_generator = torch.Generator().manual_seed(int(seed))
         self.train_dataset, self.eval_dataset = random_split(
-            full_dataset, [train_size, eval_size], generator=split_generator,
+            full_dataset,
+            [train_size, eval_size],
+            generator=split_generator,
         )
         self._eval_count = 0
 
@@ -538,9 +561,7 @@ class DecoderInitTrainer(BaseTrainer):
         # Content lengths are pre-template; the chat-formatted `lengths` add
         # ~_max_template_overhead tokens of decoder overhead. The min_sample_length
         # filter cares about *encoder* content size, so it operates on this.
-        train_content_lengths = full_dataset.content_lengths[
-            np.array(self.train_dataset.indices)
-        ]
+        train_content_lengths = full_dataset.content_lengths[np.array(self.train_dataset.indices)]
 
         # Stash for live-tunable budget rebuild (see BaseTrainer._handle_max_batch_tokens)
         self._train_lengths = train_lengths
@@ -594,18 +615,24 @@ class DecoderInitTrainer(BaseTrainer):
             try:
                 qa_mmap = MmapQAConditionedDataset(qa_data_dir, max_seq_len=2048)
                 qa_full = QAChatReproDataset(
-                    qa_mmap, inner_dataset, self.tokenizer, seed=seed,
+                    qa_mmap,
+                    inner_dataset,
+                    self.tokenizer,
+                    seed=seed,
                 )
 
                 if len(qa_full) > 0:
                     qa_eval_size = min(
-                        max(1, int(len(qa_full) * 0.1)), max_eval_samples // 3,
+                        max(1, int(len(qa_full) * 0.1)),
+                        max_eval_samples // 3,
                     )
                     qa_train_size = len(qa_full) - qa_eval_size
                     self._qa_dataset = qa_full
                     qa_split_generator = torch.Generator().manual_seed(int(seed) + 1)
                     qa_train_ds, qa_eval_ds = random_split(
-                        qa_full, [qa_train_size, qa_eval_size], generator=qa_split_generator,
+                        qa_full,
+                        [qa_train_size, qa_eval_size],
+                        generator=qa_split_generator,
                     )
 
                     qa_train_lengths = qa_full.lengths[np.array(qa_train_ds.indices)]
@@ -700,6 +727,7 @@ class DecoderInitTrainer(BaseTrainer):
         from bgkit.training.survivorship_helpers import (
             calibrate_head_tanh_temperature,
         )
+
         calibrated_t = calibrate_head_tanh_temperature(
             self.encoder,
             self.train_dataloader,
@@ -740,7 +768,8 @@ class DecoderInitTrainer(BaseTrainer):
                 "mode": tcfg.get("target_ratio_sampling_mode", "window"),
                 "window_above": tcfg.get("target_ratio_sampling_window_above", 0.10),
                 "anchor_sampling_prob": tcfg.get(
-                    "target_ratio_anchor_sampling_prob", 0.30,
+                    "target_ratio_anchor_sampling_prob",
+                    0.30,
                 ),
                 "jitter_abs": tcfg.get("target_ratio_jitter_abs", 0.0),
                 "jitter_rel": tcfg.get("target_ratio_jitter_rel", 0.0),
@@ -828,9 +857,7 @@ class DecoderInitTrainer(BaseTrainer):
             checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
             phase = self.cfg.training.get("phase", "phase1_step1")
             if phase == "phase1_step3":
-                resolved = self._resolve_step2p5_with_step2_fallback(
-                    checkpoint_dir, phase
-                )
+                resolved = self._resolve_step2p5_with_step2_fallback(checkpoint_dir, phase)
             elif phase == "phase1_step4":
                 try:
                     resolved = resolve_checkpoint(
@@ -849,9 +876,7 @@ class DecoderInitTrainer(BaseTrainer):
                         "no_phase1_step3_checkpoint_falling_back_to_2p5_or_2",
                         phase=phase,
                     )
-                    resolved = self._resolve_step2p5_with_step2_fallback(
-                        checkpoint_dir, phase
-                    )
+                    resolved = self._resolve_step2p5_with_step2_fallback(checkpoint_dir, phase)
             else:
                 resolved = resolve_checkpoint(
                     checkpoint_dir,
@@ -867,9 +892,7 @@ class DecoderInitTrainer(BaseTrainer):
 
         return bgkit_checkpoint
 
-    def _resolve_step2p5_with_step2_fallback(
-        self, checkpoint_dir: Path, phase: str
-    ) -> Path:
+    def _resolve_step2p5_with_step2_fallback(self, checkpoint_dir: Path, phase: str) -> Path:
         """Prefer phase1_step2p5, fall back to phase1_step2.
 
         Step 2.5 re-anchors the projection to decoder.embed_tokens;
@@ -916,8 +939,15 @@ class DecoderInitTrainer(BaseTrainer):
         ``trainable_state_configured decoder_params=758782784`` was
         logged alongside ``decoder_lora_applied ratio=0.0084``).
 
-        When LoRA is not applied, behave as before: unfreeze everything.
+        When LoRA is not applied, behave as before: unfreeze everything unless
+        the training config freezes the decoder.
         """
+        freeze_cfg = self.cfg.training.get("freeze", {})
+        if bool(freeze_cfg.get("decoder", False)):
+            self.decoder.requires_grad_(False)
+            logger.info("decoder_frozen_by_config")
+            return
+
         if getattr(self.decoder, "_has_lora", False):
             n_adapter = 0
             n_total = 0
@@ -964,27 +994,31 @@ class DecoderInitTrainer(BaseTrainer):
             self.encoder.projection_block.requires_grad_(True)
             self.encoder.projection_block.train()
 
-        # Decoder: frozen during projection-only warmup, unfrozen after
-        self._decoder_frozen = (
-            self._projection_only_steps > 0
-            and self.global_step < self._projection_only_steps
+        # Decoder: frozen during projection-only warmup, or permanently when
+        # requested by the training config.
+        freeze_cfg = self.cfg.training.get("freeze", {})
+        freeze_decoder = bool(freeze_cfg.get("decoder", False))
+        self._decoder_frozen = freeze_decoder or (
+            self._projection_only_steps > 0 and self.global_step < self._projection_only_steps
         )
         if self._decoder_frozen:
             self.decoder.requires_grad_(False)
+            if freeze_decoder:
+                maybe_enable_frozen_decoder_kernels(self.decoder, self.cfg)
         else:
             self._unfreeze_decoder_respecting_lora()
             self._apply_freeze()
 
         # Encoder: frozen until encoder_unfreeze_step
         self._encoder_frozen = (
-            self._encoder_unfreeze_step is None
-            or self.global_step < self._encoder_unfreeze_step
+            self._encoder_unfreeze_step is None or self.global_step < self._encoder_unfreeze_step
         )
         if not self._encoder_frozen:
             self.encoder.l0.requires_grad_(True)
             self.encoder.l0.train()
             maybe_enable_gradient_checkpointing(
-                self.encoder.l0.backbone, self.cfg,
+                self.encoder.l0.backbone,
+                self.cfg,
             )
         else:
             self.encoder.l0.requires_grad_(False)
@@ -1004,9 +1038,7 @@ class DecoderInitTrainer(BaseTrainer):
             p.numel() for p in self.encoder.projection_block.parameters() if p.requires_grad
         )
         dec_params = sum(p.numel() for p in self.decoder.parameters() if p.requires_grad)
-        enc_params = sum(
-            p.numel() for p in self.encoder.l0.parameters() if p.requires_grad
-        )
+        enc_params = sum(p.numel() for p in self.encoder.l0.parameters() if p.requires_grad)
         logger.info(
             "trainable_state_configured",
             step=self.global_step,
@@ -1067,7 +1099,8 @@ class DecoderInitTrainer(BaseTrainer):
         self.encoder.l0.requires_grad_(True)
         self.encoder.l0.train()
         maybe_enable_gradient_checkpointing(
-            self.encoder.l0.backbone, self.cfg,
+            self.encoder.l0.backbone,
+            self.cfg,
         )
         self._encoder_frozen = False
 
@@ -1116,7 +1149,8 @@ class DecoderInitTrainer(BaseTrainer):
         decoder_lr = tcfg.get("decoder_lr", tcfg.lr)
         if tcfg.get("freeze_top_layer", False):
             return self._build_layerwise_param_groups(
-                decoder_lr, tcfg.get("lr_scale_bottom", 0.1),
+                decoder_lr,
+                tcfg.get("lr_scale_bottom", 0.1),
             )
         else:
             params = [p for p in self.decoder.parameters() if p.requires_grad]
@@ -1125,7 +1159,9 @@ class DecoderInitTrainer(BaseTrainer):
             return []
 
     def _build_layerwise_param_groups(
-        self, base_lr: float, lr_scale_bottom: float,
+        self,
+        base_lr: float,
+        lr_scale_bottom: float,
     ) -> list[dict]:
         """Build optimizer param groups with rising LR from bottom to top.
 
@@ -1142,22 +1178,24 @@ class DecoderInitTrainer(BaseTrainer):
             group_lr = base_lr * scale
             params = [p for p in layers[i].parameters() if p.requires_grad]
             if params:
-                param_groups.append({
-                    "params": params,
-                    "lr": group_lr,
-                    "base_lr": group_lr,
-                })
+                param_groups.append(
+                    {
+                        "params": params,
+                        "lr": group_lr,
+                        "base_lr": group_lr,
+                    }
+                )
 
         # Final norm
-        norm_params = [
-            p for p in self.decoder.backbone.model.norm.parameters() if p.requires_grad
-        ]
+        norm_params = [p for p in self.decoder.backbone.model.norm.parameters() if p.requires_grad]
         if norm_params:
-            param_groups.append({
-                "params": norm_params,
-                "lr": base_lr,
-                "base_lr": base_lr,
-            })
+            param_groups.append(
+                {
+                    "params": norm_params,
+                    "lr": base_lr,
+                    "base_lr": base_lr,
+                }
+            )
 
         return param_groups
 
@@ -1167,9 +1205,7 @@ class DecoderInitTrainer(BaseTrainer):
         proj_lr = tcfg.get("projection_lr")
         if proj_lr is None:
             proj_lr = tcfg.lr
-        proj_params = [
-            p for p in self.encoder.projection_block.parameters() if p.requires_grad
-        ]
+        proj_params = [p for p in self.encoder.projection_block.parameters() if p.requires_grad]
         if proj_params:
             return [{"params": proj_params, "lr": proj_lr, "base_lr": proj_lr}]
         return []
@@ -1178,9 +1214,7 @@ class DecoderInitTrainer(BaseTrainer):
         """Build encoder compressor param groups (excludes projection block)."""
         tcfg = self.cfg.training
         encoder_lr = tcfg.get("encoder_lr", tcfg.lr)
-        compressor_params = [
-            p for p in self.encoder.l0.parameters() if p.requires_grad
-        ]
+        compressor_params = [p for p in self.encoder.l0.parameters() if p.requires_grad]
         if compressor_params:
             return [{"params": compressor_params, "lr": encoder_lr, "base_lr": encoder_lr}]
         return []
@@ -1195,6 +1229,7 @@ class DecoderInitTrainer(BaseTrainer):
         backbone = self.decoder.backbone
         try:
             from peft import PeftModel
+
             causal_lm = backbone.base_model.model if isinstance(backbone, PeftModel) else backbone
         except ImportError:
             causal_lm = backbone
@@ -1230,13 +1265,9 @@ class DecoderInitTrainer(BaseTrainer):
     def trainable_parameters(self) -> list:
         params = [p for p in self.decoder.parameters() if p.requires_grad]
         if self._train_projection:
-            params += [
-                p for p in self.encoder.projection_block.parameters() if p.requires_grad
-            ]
+            params += [p for p in self.encoder.projection_block.parameters() if p.requires_grad]
         if not self._encoder_frozen:
-            params += [
-                p for p in self.encoder.l0.parameters() if p.requires_grad
-            ]
+            params += [p for p in self.encoder.l0.parameters() if p.requires_grad]
         return params
 
     # ------------------------------------------------------------------
@@ -1262,7 +1293,8 @@ class DecoderInitTrainer(BaseTrainer):
         floor = self._current_target_ratio()
         anchor_max = (
             max(self._target_ratio_sampler_cfg.anchor_grid)
-            if self._target_ratio_sampler_cfg.anchor_grid else 0.95
+            if self._target_ratio_sampler_cfg.anchor_grid
+            else 0.95
         )
         if (
             self._target_ratio_sampler_cfg.mode == "window"
@@ -1274,7 +1306,7 @@ class DecoderInitTrainer(BaseTrainer):
                 floor=round(floor, 4),
                 anchor_max=round(anchor_max, 4),
                 hint="Threshold curve has no calibrated anchors for ratios "
-                     "this high; θ(r) saturates to the top-anchor value.",
+                "this high; θ(r) saturates to the top-anchor value.",
             )
             self._warned_floor_past_anchor_grid = True
         return sample_ratio(
@@ -1420,7 +1452,9 @@ class DecoderInitTrainer(BaseTrainer):
         return enc_out
 
     def _decoder_forward_packed(
-        self, batch: dict, enc_out,
+        self,
+        batch: dict,
+        enc_out,
     ) -> torch.Tensor:
         """Run the packed decoder forward from a chat-repro batch.
 
@@ -1439,48 +1473,14 @@ class DecoderInitTrainer(BaseTrainer):
         survivors = enc_out.survivor_embeddings
         survivor_cu = enc_out.survivor_cu_seqlens
 
-        batch_size = int(tok_cu.shape[0]) - 1
-        # Pull the four small int tensors to CPU once each (4 syncs total)
-        # instead of doing per-sample `.item()` calls inside the loop
-        # (was 2*B = ~16 syncs/microbatch on ARM unified memory). The
-        # trailing assembly stays on-device — only the loop's control
-        # variables are CPU ints.
-        tok_cu_list = tok_cu.cpu().to(torch.int64).tolist()
-        surv_cu_list = survivor_cu.cpu().to(torch.int64).tolist()
-        splice_start_list = splice_start.cpu().to(torch.int64).tolist()
-        splice_len_list = splice_len.cpu().to(torch.int64).tolist()
-
-        prefix_ids: list[torch.Tensor] = []
-        suffix_ids: list[torch.Tensor] = []
-        per_segment_loss_masks: list[torch.Tensor] = []
-        for b in range(batch_size):
-            sample_start = tok_cu_list[b]
-            sample_end = tok_cu_list[b + 1]
-            sample_tokens = token_ids_flat[sample_start:sample_end]
-            sample_loss = loss_mask_flat[sample_start:sample_end]
-            splice_b_start = splice_start_list[b]
-            splice_b_len = splice_len_list[b]
-            if splice_b_start < 0:
-                splice_b_start = sample_end - sample_start
-                splice_b_len = 0
-            pre = sample_tokens[:splice_b_start]
-            suf = sample_tokens[splice_b_start + splice_b_len :]
-            prefix_ids.append(pre)
-            suffix_ids.append(suf)
-
-            pre_mask = sample_loss[:splice_b_start]
-            suf_mask = sample_loss[splice_b_start + splice_b_len :]
-            k_i = surv_cu_list[b + 1] - surv_cu_list[b]
-            surv_mask = pre_mask.new_zeros(k_i)
-            per_segment_loss_masks.append(torch.cat([pre_mask, surv_mask, suf_mask], dim=0))
-
-        flat_loss_mask = torch.cat(per_segment_loss_masks, dim=0)
-        return self.decoder.forward_with_single_splice(
+        return self.decoder.forward_with_packed_target_splice(
             survivor_embeddings=survivors,
             survivor_cu_seqlens=survivor_cu,
-            prefix_ids=prefix_ids,
-            suffix_ids=suffix_ids,
-            loss_mask=flat_loss_mask,
+            target_ids_flat=token_ids_flat,
+            target_cu_seqlens=tok_cu,
+            splice_start=splice_start,
+            splice_len=splice_len,
+            loss_mask_flat=loss_mask_flat,
         )
 
     def _forward_backward(self, batch) -> dict[str, float]:
@@ -1536,9 +1536,7 @@ class DecoderInitTrainer(BaseTrainer):
             # Heavy diagnostic metrics require .item() syncs; gate them on
             # a modest interval to keep them off the hot path.
             diag_interval = int(self._diagnostic_metrics_every_n_steps)
-            emit_diag = (
-                diag_interval <= 1 or self.global_step % diag_interval == 0
-            )
+            emit_diag = diag_interval <= 1 or self.global_step % diag_interval == 0
             if enc_out.l0.survivor_mask is not None:
                 metrics["min_target_ratio"] = target_ratio
                 metrics["sampled_target_ratio"] = target_ratio
@@ -1560,7 +1558,7 @@ class DecoderInitTrainer(BaseTrainer):
                     # Head health
                     if enc_out.l0.base_raw is not None:
                         base = enc_out.l0.base_raw.detach()
-                        base_norm = float(base.norm().item()) / max(n_valid ** 0.5, 1.0)
+                        base_norm = float(base.norm().item()) / max(n_valid**0.5, 1.0)
                         metrics["base_norm"] = base_norm
                     if enc_out.l0.logits_for_op is not None:
                         logits = enc_out.l0.logits_for_op.detach()
@@ -1704,9 +1702,7 @@ class DecoderInitTrainer(BaseTrainer):
 
                 combined_tokens = total_content_tokens + qa_tokens
                 if combined_tokens > 0:
-                    metrics["combined_loss"] = (
-                        total_loss + qa_loss
-                    ) / combined_tokens
+                    metrics["combined_loss"] = (total_loss + qa_loss) / combined_tokens
 
             # Generation metrics (expensive -- only every Nth eval).
             # Scoped separately from outer ``evaluate`` because the KV
@@ -1718,7 +1714,8 @@ class DecoderInitTrainer(BaseTrainer):
             # instance attr yet (light-weight test fixtures that bypass
             # ``setup`` still construct the trainer directly).
             gen_every_default = self.cfg.training.get("eval", {}).get(
-                "generation_eval_every", 4,
+                "generation_eval_every",
+                4,
             )
             gen_every = max(
                 1,
@@ -1731,7 +1728,8 @@ class DecoderInitTrainer(BaseTrainer):
                 # metrics and keep training rather than tearing down the run.
                 try:
                     with memory_budget_scope(
-                        "gen_eval", cap_gb=self._scope_cap("gen_eval"),
+                        "gen_eval",
+                        cap_gb=self._scope_cap("gen_eval"),
                     ):
                         gen_metrics = self._run_generation_eval()
                     metrics.update(gen_metrics)
@@ -1799,7 +1797,9 @@ class DecoderInitTrainer(BaseTrainer):
                 pre_start, pre_end = pre_cu_list[b], pre_cu_list[b + 1]
                 surv_slice = survivors[k_start:k_end]
                 cu_single = torch.tensor(
-                    [0, k_end - k_start], dtype=torch.int32, device=self.device,
+                    [0, k_end - k_start],
+                    dtype=torch.int32,
+                    device=self.device,
                 )
                 gen_output = self.decoder.generate_with_single_splice(
                     survivor_embeddings=surv_slice,
@@ -1821,15 +1821,14 @@ class DecoderInitTrainer(BaseTrainer):
         # Parse success rate
         if generated_texts:
             gen_metrics["parse_success_rate"] = parse_success_rate(
-                generated_texts, languages=generated_languages,
+                generated_texts,
+                languages=generated_languages,
             )
 
         # Embedding health
         if all_survivors:
             combined_survivors = torch.cat(all_survivors, dim=0)
-            token_emb = (
-                self.encoder.l0.backbone.get_input_embeddings().weight.detach()
-            )
+            token_emb = self.encoder.l0.backbone.get_input_embeddings().weight.detach()
             health = embedding_drift_metrics(combined_survivors, token_emb)
             gen_metrics["mean_max_cosine_sim"] = health["mean_max_cosine_sim"]
             gen_metrics["std_max_cosine_sim"] = health["std_max_cosine_sim"]
@@ -1919,19 +1918,23 @@ class DecoderInitTrainer(BaseTrainer):
     ) -> dict:
         """Build training state dict with curriculum fields."""
         state = super()._build_training_state(
-            es_best, es_evals_without_improvement, wandb_run,
+            es_best,
+            es_evals_without_improvement,
+            wandb_run,
         )
-        state.update({
-            "decoder_frozen": self._decoder_frozen,
-            "encoder_frozen": self._encoder_frozen,
-            "compression_active": self._compression_active,
-            "target_ratio_override": self._target_ratio_override,
-            # Round-trip the ratio-sampling RNG so resume continues the
-            # same pseudo-random sequence of requested ratios.
-            # ``random.Random.getstate()`` returns a tuple that's safely
-            # pickled by torch.save.
-            "target_ratio_rng_state": self._target_ratio_rng.getstate(),
-        })
+        state.update(
+            {
+                "decoder_frozen": self._decoder_frozen,
+                "encoder_frozen": self._encoder_frozen,
+                "compression_active": self._compression_active,
+                "target_ratio_override": self._target_ratio_override,
+                # Round-trip the ratio-sampling RNG so resume continues the
+                # same pseudo-random sequence of requested ratios.
+                # ``random.Random.getstate()`` returns a tuple that's safely
+                # pickled by torch.save.
+                "target_ratio_rng_state": self._target_ratio_rng.getstate(),
+            }
+        )
         return state
 
     # ------------------------------------------------------------------
@@ -1947,10 +1950,14 @@ class DecoderInitTrainer(BaseTrainer):
         self._training_state["decoder_frozen"] = getattr(self, "_decoder_frozen", False)
         self._training_state["encoder_frozen"] = getattr(self, "_encoder_frozen", True)
         self._training_state["compression_active"] = getattr(
-            self, "_compression_active", False,
+            self,
+            "_compression_active",
+            False,
         )
         self._training_state["target_ratio_override"] = getattr(
-            self, "_target_ratio_override", None,
+            self,
+            "_target_ratio_override",
+            None,
         )
 
         metadata = CheckpointMetadata(
@@ -2025,7 +2032,7 @@ class DecoderInitTrainer(BaseTrainer):
                 logger.warning(
                     "target_ratio_rng_state_restore_failed",
                     hint="Keeping freshly seeded RNG — ratio sampling sequence "
-                         "will diverge from the pre-restart run",
+                    "will diverge from the pre-restart run",
                 )
 
     def _post_weight_load_hook(self) -> None:

@@ -29,6 +29,29 @@ resume_checkpoint: null  # null = auto-resume latest; "none" = fresh start; or e
 
 control_file: null  # optional path to live HP control JSON
 
+training:
+  # Shared decoder-training contract. Phases may override this only for named
+  # diagnostics or legacy baselines.
+  decoder_lora:
+    enabled: false
+    implementation: peft
+    r: 16
+    alpha: 32
+    dropout: 0.0
+    peft_fused_backward: true
+    peft_fuse_gate_up: false
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  freeze:
+    bgkit: false
+    decoder: false
+  decoder_gradient_checkpointing: false
+  decoder_layerwise_split:
+    mode: "0"
+    min_ratio: 3.0
+    min_prefix: 1536
+    packed_deltanet: false
+  decoder_ce_strict: true
+
 retry:
   enabled: false
   max_retries: 3

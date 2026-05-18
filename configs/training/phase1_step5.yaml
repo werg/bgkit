@@ -8,7 +8,14 @@ encoder_lr: 1.0e-5
 decoder_lr: 5.0e-5
 warmup_steps: 500
 bidi_warmup_steps: 0           # already bidirectional from previous steps
-gradient_checkpointing: megatron  # 2026-05-08: per-op selective recompute (Korthikanti et al. 2022). MUST_SAVE matmul + SDPA outputs, RECOMPUTE layernorm + silu + elementwise. Replaces the legacy DeltaNet-skip "selective" hack.
+gradient_checkpointing: megatron
+# Keep the trainable encoder-side checkpointing default. 2026-05-18 fixed/static
+# reruns showed disabling it is memory-safe but not a stable speed win on the
+# Step 5 gate.
+decoder_gradient_checkpointing: false
+# Trainable Qwen3.5 packed decoder backward currently fails PyTorch checkpoint
+# recompute checks; keep decoder activations explicit until the packed path is
+# checkpoint-stable.
 # cuda_empty_cache_every_step removed: the memory-driven scheduler
 # (compute.memory.dynamic_ckpt) now does adaptive cache flushes only on
 # observed memory pressure. Setting cuda_empty_cache_every_step to a
@@ -103,23 +110,107 @@ moment_match_reference:
     path: null
 
 decoder_lora:
-  enabled: true
+  enabled: false
   implementation: peft
   r: 16
   alpha: 32
   dropout: 0.0
-  # Preserves PEFT checkpoint keys while replacing PEFT's LoRA graph with
-  # BgKIT's fused frozen-base autograd path. Fixed-batch Step5 profiling on
-  # GB10/sm121 showed this faster than the PEFT module default.
+  # Legacy LoRA baseline settings are retained for explicit A/B presets, but
+  # the default Step 5 training contract is full-decoder/no-LoRA.
   peft_fused_backward: true
-  # Experimental full-MLP fusion. Liger's SwiGLU patch is faster for the real
-  # Step5 workload, so keep this off unless explicitly re-benchmarking it.
+  # Experimental full-MLP fusion for LoRA A/B runs only.
   peft_fuse_gate_up: false
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
 freeze:
   bgkit: false
   decoder: false
+
+decoder_layerwise_split:
+  # Default Step 5 trains the full decoder, so keep the no-grad-prefix split
+  # path off. Use an explicit A/B or frozen-decoder preset for split-schedule
+  # diagnostics.
+  mode: "0"
+  min_ratio: 3.0
+  min_prefix: 1536
+  # Packed DeltaNet is still diagnostic-only because full-decoder survivor
+  # gradients drift even when single-layer activations look close.
+  packed_deltanet: false
+
+frozen_decoder_kernels:
+  # Opt-in while real Step 5 profiles are gathered. This keeps Qwen3.5
+  # DeltaNet qkv causal conv channel-last and preserves the stock FLA GDR graph.
+  deltanet_channel_last_conv: false
+  # Sub-options for the stock-GDR channel-last path. These keep the normal FLA
+  # GDR boundary but fuse qkv causal-conv + q/k L2Norm and push q/k L2Norm
+  # backward into FLA's fused dq/kg/wy kernel. Split dX avoids materializing a
+  # concatenated q/k/v gradient before the qkv causal-conv dX.
+  deltanet_stock_fused_qkv_conv_l2norm: false
+  deltanet_stock_fused_qkv_conv_l2norm_dx: false
+  deltanet_stock_fused_qkv_conv_split_dx: false
+  deltanet_fuse_qk_l2norm_bwd: false
+  # Opt-in deeper frozen DeltaNet autograd boundary. This uses BgKIT's custom
+  # GDR dproj/direct-input-gradient path and must be A/B profiled on real fixed
+  # Step 5 batches before promotion.
+  deltanet_core_bwd: false
+  # Wider linear-attention layer boundary: input RMSNorm + DeltaNet + residual
+  # dX-only autograd. The optional MLP flag also owns the post-attention
+  # RMSNorm + MLP + residual tail for those same linear-attention layers. This
+  # is the first production-config surface for the deeper block rewrite path;
+  # keep default-off until parity plus fixed-step profiling beat stock.
+  deltanet_residual_bwd: false
+  deltanet_residual_mlp_bwd: false
+  # Optional custom-core/residual sub-kernel: fuse input RMSNorm dX and residual
+  # dX into one Triton launch. This only affects deltanet_core_bwd or
+  # deltanet_residual_bwd and remains default-off until decoder timing wins.
+  deltanet_input_rmsnorm_dx: false
+  # Opt-in lower-level gate path. Stock Qwen keeps computing the Python gate
+  # expression before BgKIT swaps in raw a-gates at the FLA call boundary; the
+  # channel-last DeltaNet forward rewrite skips that Python gate work and lets
+  # FLA compute raw a-gate decay/clamp directly. It remains mutually exclusive
+  # with deltanet_core_bwd and must clear focused parity/real-step profiling.
+  # BGKIT_FROZEN_DELTANET_CHANNEL_LAST_RESET_CONV=1 is an explicit diagnostic
+  # mode only: stock Step 5 keeps qkv causal conv continuous across packed
+  # segments and passes cu_seqlens only to GDR.
+  deltanet_raw_gate_in_kernel: false
+  # Stock FLA paired q/k L2Norm forward. A same-command fixed Step 5 A/B showed
+  # a small positive signal but not enough to make it a default kernel path.
+  deltanet_pair_qk_l2norm_fwd: false
+  # Opt-in full-attention sibling projection fuse. This affects only the six
+  # Qwen full-attention layers; keep default-off unless it improves real Step 5
+  # when composed with wider decoder-kernel experiments.
+  attention_qkv: false
+  # Optional internal layout variant for deltanet_core_bwd. Synthetic decoder
+  # runs like it, but the fixed Step 5 transfer is weak, so keep it explicit.
+  deltanet_core_channel_last_conv: false
+  deltanet_core_channel_last_conv_dx: false
+  # Deeper custom-core forward boundary: fuse channel-last qkv causal conv,
+  # q/k split, q/k L2Norm, and v split. Requires deltanet_core_channel_last_conv.
+  deltanet_core_fused_qkv_conv_l2norm: false
+  # Shape guards for deltanet_core_bwd. The custom core has only shown useful
+  # signal on longer decoder rows, so the lower guard lets A/B runs skip short
+  # microbatches without editing environment variables.
+  deltanet_core_min_seq_len: 0
+  deltanet_core_max_seq_len: 544
+  # Opt-in long-sequence MLP activation boundary. Seq512 Step 5-shaped runs do
+  # not justify this as a default, but seq2048 decoder benchmarks benefit when
+  # the Triton forward helper is enabled.
+  mlp_swiglu: false
+  mlp_swiglu_triton_forward: false
+  # Opt-in full frozen MLP autograd boundary. The adaptive dX mode uses the
+  # direct fused SwiGLU+gate/up dX kernel only for small row counts where it
+  # beats the cat+cuBLAS path, and falls back to cat+cuBLAS otherwise.
+  mlp_base: false
+  mlp_base_dx: adaptive
+  mlp_base_direct_dx_max_rows: 256
+  # Opt-in wider frozen RMSNorm+MLP residual autograd boundary. This owns more
+  # of the decoder layer tail than mlp_swiglu but must beat real fixed-step
+  # profiling before it is considered for training.
+  mlp_residual: false
+  # Opt-in long-shape CUTE/CUTLASS-backed full frozen-MLP wrapper. This is
+  # guarded internally by BGKIT_DECODER_MLP_QUACK_MIN_ROWS and remains
+  # default-off until repeated real-step profiles beat the stock path.
+  mlp_quack: false
 
 data:
   commit_encoding_dir: ${oc.env:DATA_DIR}/processed/commit_encoding

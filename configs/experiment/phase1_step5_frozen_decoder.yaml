@@ -1,0 +1,26 @@
+# @package _global_
+# Phase 1 Step 5 with a frozen Qwen decoder.
+#
+# Explicit frozen/no-LoRA decoder-kernel preset. This is not the default Step 5
+# training setup because the default trains the decoder.
+defaults:
+  - /config
+  - /training/phase1_step5
+  - _self_
+
+run_name: phase1_step5_frozen_decoder
+step1_checkpoint: auto
+
+training:
+  decoder_ce_impl: cce
+  decoder_ce_strict: true
+  decoder_gradient_checkpointing: false
+  decoder_lora:
+    enabled: false
+  freeze:
+    decoder: true
+  decoder_layerwise_split:
+    mode: auto
+    min_ratio: 3.0
+    min_prefix: 1536
+    packed_deltanet: false

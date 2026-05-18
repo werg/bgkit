@@ -200,9 +200,9 @@ moment_match_reference:
   l1:
     path: null                       # unused at L1
 
-# LoRA config for decoder — small adapter, fast adaptation
+# Default decoder contract: full decoder training, no adapter-only shortcut.
 decoder_lora:
-  enabled: true
+  enabled: false
   implementation: peft
   r: 16
   alpha: 32

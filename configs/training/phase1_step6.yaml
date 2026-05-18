@@ -83,7 +83,7 @@ moment_match_reference:
     path: null
 
 decoder_lora:
-  enabled: true
+  enabled: false
   implementation: peft
   r: 16
   alpha: 32

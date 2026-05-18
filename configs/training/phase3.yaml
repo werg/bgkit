@@ -47,9 +47,9 @@ phase2_checkpoint: auto
 # TODO: set DATA_DIR/swe_embeddings once encode_swe_repos.py has run.
 bgkit_cache_dir: ${oc.env:DATA_DIR}/swe_embeddings
 
-# LoRA on decoder for parameter efficiency (same config as Phase 1 Step 3+).
+# Default decoder contract: full decoder training, no adapter-only shortcut.
 decoder_lora:
-  enabled: true
+  enabled: false
   implementation: peft
   r: 16
   alpha: 32
