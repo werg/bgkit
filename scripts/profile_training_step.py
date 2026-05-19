@@ -43,6 +43,7 @@ from bgkit.utils.deltanet_patch import (
     patch_fused_rms_norm_gated_for_sm121,
     patch_gated_delta_rule_numerics,
 )
+from bgkit.utils.falcon_h1_defaults import effective_falcon_h1_fast_env
 from bgkit.utils.logging import setup_logging
 from bgkit.utils.reproducibility import set_seed
 from bgkit.utils.step_watchdog import install_step_watchdog
@@ -2510,31 +2511,7 @@ def main(cfg: DictConfig) -> None:
             "BGKIT_DECODER_MLP_SWIGLU_TRITON_FWD": os.environ.get(
                 "BGKIT_DECODER_MLP_SWIGLU_TRITON_FWD"
             ),
-            "BGKIT_FALCON_H1_MAMBA_SAVE_OUT": os.environ.get(
-                "BGKIT_FALCON_H1_MAMBA_SAVE_OUT"
-            ),
-            "BGKIT_FALCON_H1_MAMBA_SAVE_CONV": os.environ.get(
-                "BGKIT_FALCON_H1_MAMBA_SAVE_CONV"
-            ),
-            "BGKIT_FALCON_H1_MAMBA_INPROJ_AUTOGRAD": os.environ.get(
-                "BGKIT_FALCON_H1_MAMBA_INPROJ_AUTOGRAD"
-            ),
-            "BGKIT_FALCON_H1_SPECIALIZED_MAMBA": os.environ.get(
-                "BGKIT_FALCON_H1_SPECIALIZED_MAMBA"
-            ),
-            "BGKIT_FALCON_H1_DIRECT_FLASH_ATTN": os.environ.get(
-                "BGKIT_FALCON_H1_DIRECT_FLASH_ATTN"
-            ),
-            "BGKIT_FALCON_H1_DIRECT_FA4_ATTN": os.environ.get(
-                "BGKIT_FALCON_H1_DIRECT_FA4_ATTN"
-            ),
-            "BGKIT_FALCON_H1_DIRECT_HF_FLASH_ATTN": os.environ.get(
-                "BGKIT_FALCON_H1_DIRECT_HF_FLASH_ATTN"
-            ),
-            "BGKIT_FALCON_H1_DIRECT_SDPA": os.environ.get("BGKIT_FALCON_H1_DIRECT_SDPA"),
-            "BGKIT_FALCON_H1_TRAINABLE_MLP_AUTOGRAD": os.environ.get(
-                "BGKIT_FALCON_H1_TRAINABLE_MLP_AUTOGRAD"
-            ),
+            "BGKIT_FALCON_H1_FAST_DEFAULTS": effective_falcon_h1_fast_env(),
             "BGKIT_FALCON_H1_PROFILE_INTERNALS": os.environ.get(
                 "BGKIT_FALCON_H1_PROFILE_INTERNALS"
             ),

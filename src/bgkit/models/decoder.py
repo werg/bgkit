@@ -37,6 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
+from bgkit.utils.falcon_h1_defaults import falcon_h1_env_truthy
 from bgkit.utils.packing import position_ids_from_cu
 
 try:
@@ -104,12 +105,7 @@ def _decoder_family_has_stateful_mixer(family: str | None) -> bool:
 
 
 def _falcon_h1_packed_mamba_seqidx_enabled() -> bool:
-    return os.environ.get("BGKIT_FALCON_H1_PACKED_MAMBA_SEQIDX", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
+    return falcon_h1_env_truthy("BGKIT_FALCON_H1_PACKED_MAMBA_SEQIDX")
 
 
 def _default_lora_targets(family: str) -> tuple[str, ...]:
@@ -4733,9 +4729,9 @@ class ReconstructionDecoder(nn.Module):
         # plus saved-tensor copies). Set ``BGKIT_FALCON_H1_PATCH=0`` to
         # disable. Generation / KV-cache decode paths run on the unpatched
         # path (the patched mixer raises if called with cache_params).
-        if self.decoder_family == "falcon_h1" and os.environ.get(
-            "BGKIT_FALCON_H1_PATCH", "1"
-        ) not in ("0", "false", "False"):
+        if self.decoder_family == "falcon_h1" and falcon_h1_env_truthy(
+            "BGKIT_FALCON_H1_PATCH"
+        ):
             try:
                 from bgkit.utils.falcon_h1_patch import patch_falcon_h1_decoder
 

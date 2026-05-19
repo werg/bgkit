@@ -89,6 +89,31 @@ x-gpu-common: &gpu-common
     # BgKIT-owned Falcon-H1 training fast path in the local mamba fork. Skips
     # generic stride guards and pins the teacher-forced Mamba2 contract.
     - MAMBA_FALCON_SM121_FASTPATH=${MAMBA_FALCON_SM121_FASTPATH:-1}
+    # Falcon-H1 Tiny trainable decoder defaults. These are the measured-fast
+    # real-training settings from the Falcon L0 optimization pass: keep the
+    # patch active, use packed QKV and packed gate/up MLP params, use the
+    # BgKIT-owned trainable MLP/Mamba backward boundaries, save the Mamba
+    # intermediates that avoid slower recompute, and keep rejected attention /
+    # wider layer-loop probes off unless an explicit A/B run overrides them.
+    - BGKIT_FALCON_H1_PATCH=${BGKIT_FALCON_H1_PATCH:-1}
+    - BGKIT_FALCON_H1_PACKED_MAMBA_SEQIDX=${BGKIT_FALCON_H1_PACKED_MAMBA_SEQIDX:-1}
+    - BGKIT_FALCON_H1_PACKED_QKV=${BGKIT_FALCON_H1_PACKED_QKV:-1}
+    - BGKIT_FALCON_H1_ATTENTION_CAT_QKV=${BGKIT_FALCON_H1_ATTENTION_CAT_QKV:-0}
+    - BGKIT_FALCON_H1_DIRECT_FLASH_ATTN=${BGKIT_FALCON_H1_DIRECT_FLASH_ATTN:-0}
+    - BGKIT_FALCON_H1_DIRECT_FA4_ATTN=${BGKIT_FALCON_H1_DIRECT_FA4_ATTN:-0}
+    - BGKIT_FALCON_H1_DIRECT_HF_FLASH_ATTN=${BGKIT_FALCON_H1_DIRECT_HF_FLASH_ATTN:-0}
+    - BGKIT_FALCON_H1_DIRECT_SDPA=${BGKIT_FALCON_H1_DIRECT_SDPA:-0}
+    - BGKIT_FALCON_H1_PACKED_MLP=${BGKIT_FALCON_H1_PACKED_MLP:-1}
+    - BGKIT_FALCON_H1_MLP_CAT_GATE_UP=${BGKIT_FALCON_H1_MLP_CAT_GATE_UP:-0}
+    - BGKIT_FALCON_H1_TRAINABLE_MLP_AUTOGRAD=${BGKIT_FALCON_H1_TRAINABLE_MLP_AUTOGRAD:-1}
+    - BGKIT_FALCON_H1_SPECIALIZED_MAMBA=${BGKIT_FALCON_H1_SPECIALIZED_MAMBA:-1}
+    - BGKIT_FALCON_H1_MAMBA_INPROJ_AUTOGRAD=${BGKIT_FALCON_H1_MAMBA_INPROJ_AUTOGRAD:-1}
+    - BGKIT_FALCON_H1_MAMBA_SAVE_OUT=${BGKIT_FALCON_H1_MAMBA_SAVE_OUT:-1}
+    - BGKIT_FALCON_H1_MAMBA_SAVE_CONV=${BGKIT_FALCON_H1_MAMBA_SAVE_CONV:-1}
+    - BGKIT_FALCON_H1_MAMBA_SAVE_SCAN=${BGKIT_FALCON_H1_MAMBA_SAVE_SCAN:-1}
+    - BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL=${BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL:-1}
+    - BGKIT_FALCON_H1_FUSED_INPUT_PROJ=${BGKIT_FALCON_H1_FUSED_INPUT_PROJ:-0}
+    - BGKIT_FALCON_H1_FUSED_LAYER_LOOP=${BGKIT_FALCON_H1_FUSED_LAYER_LOOP:-0}
     # PYTHONPATH override: prepend local kernel forks so ad-hoc Docker runs
     # exercise the same in-situ code we are tuning. The mamba fork is first
     # because Falcon-H1 imports pure-Python/Triton mamba_ssm ops from there;

@@ -120,10 +120,12 @@ Correctness:
 Idempotency:
   Each patcher checks for a `_bgkit_patched` marker before patching.
 
-This is OPT-IN via `patch_falcon_h1_decoder(...)`. Call it after the model
-is constructed from `from_pretrained(...)` and before `forward()` is called
-in training/eval. Generation paths (KV-cache decode) MUST NOT call this —
-the no-op mul strip preserves training-mode semantics only.
+`ReconstructionDecoder` applies this by default for Falcon-H1 training
+(`BGKIT_FALCON_H1_PATCH=1`). Standalone harnesses can call
+`patch_falcon_h1_decoder(...)` after the model is constructed from
+`from_pretrained(...)` and before `forward()` is called in training/eval.
+Generation paths (KV-cache decode) MUST NOT call this — the no-op mul strip
+preserves training-mode semantics only.
 """
 
 from __future__ import annotations
@@ -136,6 +138,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from bgkit.utils.falcon_h1_defaults import falcon_h1_env_truthy
 
 logger = logging.getLogger(__name__)
 
@@ -268,15 +272,6 @@ def _direct_sdpa_attention_forward(
     return attn_output.transpose(1, 2).contiguous(), None
 
 
-def _env_truthy(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
-
-
 # ---------------------------------------------------------------------------
 # 1. Attention forward: drop key_multiplier when == 1.0
 # ---------------------------------------------------------------------------
@@ -302,28 +297,24 @@ def _patch_attention_unit_key_multiplier(attn: nn.Module) -> bool:
     apply_rotary_pos_emb = fh1.apply_rotary_pos_emb
     all_attention_functions = fh1.ALL_ATTENTION_FUNCTIONS
     eager_attention_forward = fh1.eager_attention_forward
-    use_cat_qkv = os.environ.get(
-        "BGKIT_FALCON_H1_ATTENTION_CAT_QKV", "0"
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    use_packed_qkv = os.environ.get(
-        "BGKIT_FALCON_H1_PACKED_QKV", "1"
-    ).strip().lower() not in {"0", "false", "no", "off"}
+    use_cat_qkv = falcon_h1_env_truthy("BGKIT_FALCON_H1_ATTENTION_CAT_QKV")
+    use_packed_qkv = falcon_h1_env_truthy("BGKIT_FALCON_H1_PACKED_QKV")
     direct_flash_attn_fn = (
         _try_import_flash_attn_varlen_func()
-        if _env_truthy("BGKIT_FALCON_H1_DIRECT_FLASH_ATTN", "0")
+        if falcon_h1_env_truthy("BGKIT_FALCON_H1_DIRECT_FLASH_ATTN")
         else None
     )
     direct_fa4_attn_fn = (
         _try_import_bgkit_fa4_attention_forward()
-        if _env_truthy("BGKIT_FALCON_H1_DIRECT_FA4_ATTN", "0")
+        if falcon_h1_env_truthy("BGKIT_FALCON_H1_DIRECT_FA4_ATTN")
         else None
     )
     direct_hf_flash_attn_fn = (
         _try_import_hf_flash_attention_forward()
-        if _env_truthy("BGKIT_FALCON_H1_DIRECT_HF_FLASH_ATTN", "0")
+        if falcon_h1_env_truthy("BGKIT_FALCON_H1_DIRECT_HF_FLASH_ATTN")
         else None
     )
-    use_direct_sdpa = _env_truthy("BGKIT_FALCON_H1_DIRECT_SDPA", "0")
+    use_direct_sdpa = falcon_h1_env_truthy("BGKIT_FALCON_H1_DIRECT_SDPA")
 
     if (
         use_packed_qkv
@@ -647,11 +638,10 @@ def _patch_mlp_unit_multipliers(mlp: nn.Module) -> bool:
     if not _is_unit_scalar(getattr(mlp, "down_multiplier", None)):
         return False
 
-    use_packed_gate_up = _env_truthy("BGKIT_FALCON_H1_PACKED_MLP", "1")
-    use_cat_gate_up = _env_truthy("BGKIT_FALCON_H1_MLP_CAT_GATE_UP", "0")
-    use_trainable_mlp_autograd = _env_truthy(
-        "BGKIT_FALCON_H1_TRAINABLE_MLP_AUTOGRAD",
-        "1",
+    use_packed_gate_up = falcon_h1_env_truthy("BGKIT_FALCON_H1_PACKED_MLP")
+    use_cat_gate_up = falcon_h1_env_truthy("BGKIT_FALCON_H1_MLP_CAT_GATE_UP")
+    use_trainable_mlp_autograd = falcon_h1_env_truthy(
+        "BGKIT_FALCON_H1_TRAINABLE_MLP_AUTOGRAD"
     )
     silu_mul_fn = _try_import_liger_silu_mul()
     trainable_packed_mlp_fn = (
@@ -892,21 +882,18 @@ def _patch_mixer_unit_scalings(mixer: nn.Module) -> bool:
     specialized_mamba_fn = _try_import_falcon_h1_mamba_specialized()
     use_specialized_mamba = (
         specialized_mamba_fn is not None
-        and os.environ.get("BGKIT_FALCON_H1_SPECIALIZED_MAMBA", "1").strip().lower()
-        not in {"0", "false", "no", "off"}
+        and falcon_h1_env_truthy("BGKIT_FALCON_H1_SPECIALIZED_MAMBA")
         and int(getattr(mixer, "n_groups", -1)) == 1
         and int(getattr(mixer, "intermediate_size", -1))
         == int(getattr(mixer, "num_heads", 0)) * int(getattr(mixer, "head_dim", 0))
         and not bool(getattr(mixer, "mamba_rms_norm", False))
         and str(getattr(mixer, "activation", "")) in {"silu", "swish"}
     )
-    use_mamba_inproj_autograd = use_specialized_mamba and _env_truthy(
-        "BGKIT_FALCON_H1_MAMBA_INPROJ_AUTOGRAD",
-        "1",
+    use_mamba_inproj_autograd = use_specialized_mamba and falcon_h1_env_truthy(
+        "BGKIT_FALCON_H1_MAMBA_INPROJ_AUTOGRAD"
     )
-    use_mamba_save_scan = use_specialized_mamba and _env_truthy(
-        "BGKIT_FALCON_H1_MAMBA_SAVE_SCAN",
-        "1",
+    use_mamba_save_scan = use_specialized_mamba and falcon_h1_env_truthy(
+        "BGKIT_FALCON_H1_MAMBA_SAVE_SCAN"
     )
 
     # Snapshot the stock forward so the slow / cache branches stay
@@ -1068,7 +1055,7 @@ def _patch_decoder_layer_unit_multipliers(layer: nn.Module) -> bool:
     ):
         return False
 
-    use_fused_input_proj = _env_truthy("BGKIT_FALCON_H1_FUSED_INPUT_PROJ", "0")
+    use_fused_input_proj = falcon_h1_env_truthy("BGKIT_FALCON_H1_FUSED_INPUT_PROJ")
 
     def _fused_input_projection(self, hidden_states):
         if not use_fused_input_proj or not hidden_states.is_cuda:
@@ -1282,12 +1269,7 @@ def _patch_model_fused_training_loop(model: nn.Module) -> bool:
     """
     if getattr(model, _MARKER, False):
         return False
-    if os.environ.get("BGKIT_FALCON_H1_FUSED_LAYER_LOOP", "0").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    if not falcon_h1_env_truthy("BGKIT_FALCON_H1_FUSED_LAYER_LOOP"):
         return False
 
     fused_add_rmsnorm_fn = _try_import_liger_fused_add_rmsnorm_fn()

@@ -25,6 +25,7 @@ from transformers import AutoConfig
 from transformers.models.falcon_h1 import FalconH1Config, FalconH1ForCausalLM
 
 from bgkit.utils.attention_backend import resolve_decoder_attention_implementation
+from bgkit.utils.falcon_h1_defaults import effective_falcon_h1_fast_env, falcon_h1_env_truthy
 from bgkit.utils.falcon_h1_patch import patch_falcon_h1_decoder
 
 DEFAULT_MODEL_ID = "tiiuae/Falcon-H1-Tiny-90M-Instruct"
@@ -154,10 +155,7 @@ def env_record() -> dict[str, Any]:
         "mamba_sm121_safe_autotune": os.environ.get("MAMBA_SM121_SAFE_AUTOTUNE"),
         "mamba_sm121_static_configs": os.environ.get("MAMBA_SM121_STATIC_CONFIGS"),
         "mamba_falcon_sm121_fastpath": os.environ.get("MAMBA_FALCON_SM121_FASTPATH"),
-        "bgkit_falcon_h1_mamba_skip_d_in_dx_kernel": os.environ.get(
-            "BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL",
-            "1",
-        ),
+        "falcon_h1_fast_env": effective_falcon_h1_fast_env(),
         "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR"),
     }
 
@@ -330,12 +328,7 @@ def make_model(cfg: FalconH1Config, dtype: torch.dtype) -> FalconH1ForCausalLM:
     )
     model = FalconH1ForCausalLM(cfg)
     model = model.to(device="cuda" if torch.cuda.is_available() else "cpu", dtype=dtype)
-    if os.environ.get("BGKIT_FALCON_H1_PATCH", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }:
+    if falcon_h1_env_truthy("BGKIT_FALCON_H1_PATCH"):
         model._bgkit_falcon_h1_patch_report = patch_falcon_h1_decoder(model)  # type: ignore[attr-defined]
     return model
 

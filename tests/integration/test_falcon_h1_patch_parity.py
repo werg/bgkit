@@ -34,6 +34,33 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+_FALCON_H1_FAST_ENV_KEYS = (
+    "BGKIT_FALCON_H1_PATCH",
+    "BGKIT_FALCON_H1_PACKED_MAMBA_SEQIDX",
+    "BGKIT_FALCON_H1_PACKED_QKV",
+    "BGKIT_FALCON_H1_ATTENTION_CAT_QKV",
+    "BGKIT_FALCON_H1_DIRECT_FLASH_ATTN",
+    "BGKIT_FALCON_H1_DIRECT_FA4_ATTN",
+    "BGKIT_FALCON_H1_DIRECT_HF_FLASH_ATTN",
+    "BGKIT_FALCON_H1_DIRECT_SDPA",
+    "BGKIT_FALCON_H1_PACKED_MLP",
+    "BGKIT_FALCON_H1_MLP_CAT_GATE_UP",
+    "BGKIT_FALCON_H1_TRAINABLE_MLP_AUTOGRAD",
+    "BGKIT_FALCON_H1_SPECIALIZED_MAMBA",
+    "BGKIT_FALCON_H1_MAMBA_INPROJ_AUTOGRAD",
+    "BGKIT_FALCON_H1_MAMBA_SAVE_OUT",
+    "BGKIT_FALCON_H1_MAMBA_SAVE_CONV",
+    "BGKIT_FALCON_H1_MAMBA_SAVE_SCAN",
+    "BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL",
+    "BGKIT_FALCON_H1_FUSED_INPUT_PROJ",
+    "BGKIT_FALCON_H1_FUSED_LAYER_LOOP",
+)
+
+
+def _clear_falcon_h1_fast_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in _FALCON_H1_FAST_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
 
 def _build_small_falcon(num_layers: int = 2):
     """Return a `FalconH1ForCausalLM` with ``num_hidden_layers=num_layers``.
@@ -88,6 +115,45 @@ def test_cpu_forward_parity_eval_mode():
 
     diff = (out_p - out_ref).abs().max().item()
     assert diff < 1e-5, f"max abs diff = {diff:.3e}"
+
+
+def test_default_fast_training_patch_report(monkeypatch):
+    """Unset Falcon env vars resolve to the measured-fast training contract."""
+    _clear_falcon_h1_fast_env(monkeypatch)
+    from bgkit.utils.falcon_h1_defaults import effective_falcon_h1_fast_env
+    from bgkit.utils.falcon_h1_patch import patch_falcon_h1_decoder
+
+    model, _cfg = _build_small_falcon(num_layers=2)
+    report = patch_falcon_h1_decoder(model)
+
+    expected_env = effective_falcon_h1_fast_env()
+    assert expected_env["BGKIT_FALCON_H1_PATCH"] == "1"
+    assert expected_env["BGKIT_FALCON_H1_PACKED_QKV"] == "1"
+    assert expected_env["BGKIT_FALCON_H1_PACKED_MLP"] == "1"
+    assert expected_env["BGKIT_FALCON_H1_SPECIALIZED_MAMBA"] == "1"
+    assert expected_env["BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL"] == "1"
+    assert expected_env["BGKIT_FALCON_H1_DIRECT_SDPA"] == "0"
+    assert expected_env["BGKIT_FALCON_H1_FUSED_INPUT_PROJ"] == "0"
+    assert expected_env["BGKIT_FALCON_H1_FUSED_LAYER_LOOP"] == "0"
+
+    assert report.attention == 2, report
+    assert report.attention_packed_qkv == 2, report
+    assert report.attention_cat_qkv == 0, report
+    assert report.attention_direct_flash == 0, report
+    assert report.attention_direct_fa4 == 0, report
+    assert report.attention_direct_hf_flash == 0, report
+    assert report.attention_direct_sdpa == 0, report
+    assert report.mlp == 2, report
+    assert report.mlp_packed_gate_up == 2, report
+    assert report.mlp_cat_gate_up == 0, report
+    assert report.mlp_trainable_autograd == 2, report
+    assert report.mixer == 2, report
+    assert report.mixer_specialized_mamba == 2, report
+    assert report.mixer_save_scan == 2, report
+    assert report.mixer_inproj_autograd == 2, report
+    assert report.packed_seqidx_loop == 1, report
+    assert report.layer_fused_input_proj == 0, report
+    assert report.fused_layer_loop == 0, report
 
 
 def test_cpu_forward_parity_train_mode():

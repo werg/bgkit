@@ -41,24 +41,19 @@ upstream kernel for comparison.
 
 from __future__ import annotations
 
-import os
 import sys
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 
-
-def _env_truthy(name: str, default: str = "1") -> bool:
-    raw = os.environ.get(name, default).strip().lower()
-    return raw in {"1", "true", "yes", "on"}
-
+from bgkit.utils.falcon_h1_defaults import falcon_h1_env_truthy
 
 _PROFILE_EVENTS: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
 
 
 def _profile_enabled() -> bool:
-    return _env_truthy("BGKIT_FALCON_H1_PROFILE_INTERNALS", "0")
+    return falcon_h1_env_truthy("BGKIT_FALCON_H1_PROFILE_INTERNALS", "0")
 
 
 def _record_start(tensor: torch.Tensor):
@@ -290,7 +285,7 @@ def _scan_bwd_from_saved_intermediates(
     states_for_bwd = _ssd_rearrange(ssd, states_for_bwd, "... (p n) -> ... p n", n=dstate)
     dstates = _ssd_rearrange(ssd, dstates, "... (p n) -> ... p n", n=dstate)
 
-    skip_d_in_dx_kernel = _env_truthy("BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL", "1")
+    skip_d_in_dx_kernel = falcon_h1_env_truthy("BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL")
     timer = _record_start(dout)
     dx, ddt_from_x, dd_from_x = ssd._chunk_scan_chunk_state_bwd_dx(
         x,
@@ -554,7 +549,7 @@ class _FalconH1MambaSplitConv1dScanFn(torch.autograd.Function):
             )
         )
         _record_end("mamba_fwd_conv", timer)
-        save_conv_for_bwd = _env_truthy("BGKIT_FALCON_H1_MAMBA_SAVE_CONV", "1")
+        save_conv_for_bwd = falcon_h1_env_truthy("BGKIT_FALCON_H1_MAMBA_SAVE_CONV")
         saved_xbc_conv = xbc_conv if save_conv_for_bwd else None
         x, b, c = torch.split(xbc_conv, [dim, dstate, dstate], dim=-1)
         x = x.view(batch, seqlen, nheads, headdim)
@@ -562,7 +557,7 @@ class _FalconH1MambaSplitConv1dScanFn(torch.autograd.Function):
         c = c.view(batch, seqlen, 1, dstate)
         z = z.view(batch, seqlen, nheads, headdim)
 
-        save_scan_for_bwd = _env_truthy("BGKIT_FALCON_H1_MAMBA_SAVE_SCAN", "1")
+        save_scan_for_bwd = falcon_h1_env_truthy("BGKIT_FALCON_H1_MAMBA_SAVE_SCAN")
         timer = _record_start(x)
         if save_scan_for_bwd:
             out, out_x, dt_scan, da_cumsum, states, cb, _final_states = (
@@ -613,7 +608,7 @@ class _FalconH1MambaSplitConv1dScanFn(torch.autograd.Function):
         ctx.has_inproj = has_inproj
         ctx.has_inproj_bias = inproj_bias is not None
         ctx.input_shape = input_shape
-        save_out_for_bwd = _env_truthy("BGKIT_FALCON_H1_MAMBA_SAVE_OUT", "1")
+        save_out_for_bwd = falcon_h1_env_truthy("BGKIT_FALCON_H1_MAMBA_SAVE_OUT")
         if torch.is_autocast_enabled():
             dtype = torch.get_autocast_gpu_dtype()
             out_for_linear = out_for_linear.to(dtype)
