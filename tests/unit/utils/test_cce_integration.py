@@ -42,12 +42,18 @@ def _reset_cce_state():
     cce_integration._CCE_AVAILABLE = None
     cce_integration._CCE_IMPORT_ATTEMPTED = False
     cce_integration._CCE_LINEAR_CROSS_ENTROPY = None
+    cce_integration._CCE_STATIC_PRIVATE = None
+    cce_integration._CCE_STATIC_PRIVATE_ATTEMPTED = False
+    cce_integration._CCE_STATIC_CACHE.clear()
     cce_integration._CCE_WARNED = False
     cce_integration._CCE_RUNTIME_WARNED = False
     yield
     cce_integration._CCE_AVAILABLE = None
     cce_integration._CCE_IMPORT_ATTEMPTED = False
     cce_integration._CCE_LINEAR_CROSS_ENTROPY = None
+    cce_integration._CCE_STATIC_PRIVATE = None
+    cce_integration._CCE_STATIC_PRIVATE_ATTEMPTED = False
+    cce_integration._CCE_STATIC_CACHE.clear()
     cce_integration._CCE_WARNED = False
     cce_integration._CCE_RUNTIME_WARNED = False
 
@@ -103,16 +109,60 @@ def test_cut_cross_entropy_fallback_matches_reference_on_cpu(monkeypatch):
     ref = _reference_ce(hidden, head, labels, attention_mask, loss_mask)
     torch.testing.assert_close(loss, ref, atol=1e-5, rtol=1e-4)
 
+    compact_loss = cut_cross_entropy_lm_ce(
+        hidden_states=hidden,
+        lm_head_weight=head.weight,
+        lm_head_bias=head.bias,
+        labels=labels,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        impl="cce_compact",
+        chunk_size=4,
+    )
+    torch.testing.assert_close(compact_loss, ref, atol=1e-5, rtol=1e-4)
+
+    static_loss = cut_cross_entropy_lm_ce(
+        hidden_states=hidden,
+        lm_head_weight=head.weight,
+        lm_head_bias=head.bias,
+        labels=labels,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        impl="cce_static",
+        chunk_size=4,
+    )
+    torch.testing.assert_close(static_loss, ref, atol=1e-5, rtol=1e-4)
+
 
 def test_decoder_ce_impl_setter_validates_values():
     from bgkit.models.decoder import ReconstructionDecoder
 
     dec = ReconstructionDecoder.__new__(ReconstructionDecoder)
     nn.Module.__init__(dec)
+    dec.set_lm_ce_impl("cce_compact")
+    assert dec._lm_ce_impl == "cce_compact"
+    dec.set_lm_ce_impl("cce_static")
+    assert dec._lm_ce_impl == "cce_static"
     dec.set_lm_ce_impl("cce_exact")
     assert dec._lm_ce_impl == "cce_exact"
     with pytest.raises(ValueError, match="Unsupported decoder CE implementation"):
         dec.set_lm_ce_impl("not-a-ce")
+
+
+def test_decoder_ce_strict_setter_uses_explicit_or_env(monkeypatch):
+    from bgkit.models.decoder import ReconstructionDecoder
+
+    dec = ReconstructionDecoder.__new__(ReconstructionDecoder)
+    nn.Module.__init__(dec)
+
+    monkeypatch.setenv("BGKIT_DECODER_CE_STRICT", "1")
+    dec.set_lm_ce_strict(None)
+    assert dec.lm_ce_strict is True
+
+    dec.set_lm_ce_strict(False)
+    assert dec.lm_ce_strict is False
+    dec.set_lm_ce_strict(True)
+    assert dec.lm_ce_strict is True
 
 
 def test_decoder_ce_impl_default_is_cce():

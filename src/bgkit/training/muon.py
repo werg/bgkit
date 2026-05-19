@@ -102,6 +102,7 @@ class Muon(torch.optim.Optimizer):
         if group["use_muon"]:
             group.setdefault("lr", 0.02)
             group.setdefault("momentum", 0.95)
+            group.setdefault("ns_steps", 5)
             group.setdefault("weight_decay", 0)
         else:
             group.setdefault("lr", 3e-4)
@@ -130,7 +131,10 @@ class Muon(torch.optim.Optimizer):
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
                     update = _muon_update(
-                        p.grad, state["momentum_buffer"], beta=group["momentum"]
+                        p.grad,
+                        state["momentum_buffer"],
+                        beta=group["momentum"],
+                        ns_steps=group["ns_steps"],
                     )
                     p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update.reshape(p.shape), alpha=-group["lr"])

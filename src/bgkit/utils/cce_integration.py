@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -16,6 +17,8 @@ import torch.nn as nn
 CCE_IMPLS = frozenset(
     {
         "cce",
+        "cce_static",
+        "cce_compact",
         "cce_exact",
         "cce_kahan_full",
         "cce_kahan_full_c",
@@ -30,6 +33,12 @@ _CCE_IMPORT_ATTEMPTED = False
 _CCE_LINEAR_CROSS_ENTROPY: Callable[..., torch.Tensor] | None = None
 _CCE_WARNED = False
 _CCE_RUNTIME_WARNED = False
+_CCE_STATIC_PRIVATE: tuple[Any, Any, Any, Any, Any] | None = None
+_CCE_STATIC_PRIVATE_ATTEMPTED = False
+_CCE_STATIC_CACHE: dict[
+    tuple[object, ...],
+    tuple[torch.Tensor, torch.Tensor | None],
+] = {}
 
 
 def _warn_once(message: str) -> None:
@@ -54,6 +63,16 @@ def _try_import_linear_cross_entropy() -> Callable[..., torch.Tensor] | None:
     return linear_cross_entropy
 
 
+def _try_import_cce_static_private() -> tuple[Any, Any, Any, Any, Any] | None:
+    try:
+        from cut_cross_entropy.cce import CCEParams, linear_cross_entropy_apply  # type: ignore
+        from cut_cross_entropy.cce_utils import CCEPreset, CCEPresets  # type: ignore
+        from cut_cross_entropy.utils import _handle_eps  # type: ignore
+    except Exception:
+        return None
+    return CCEParams, linear_cross_entropy_apply, CCEPreset, CCEPresets, _handle_eps
+
+
 def is_cut_cross_entropy_available() -> bool:
     """Return whether ``cut_cross_entropy`` can be imported."""
 
@@ -69,6 +88,162 @@ def _get_linear_cross_entropy() -> Callable[..., torch.Tensor] | None:
         _CCE_LINEAR_CROSS_ENTROPY = _try_import_linear_cross_entropy()
         _CCE_IMPORT_ATTEMPTED = True
     return _CCE_LINEAR_CROSS_ENTROPY
+
+
+def _get_cce_static_private() -> tuple[Any, Any, Any, Any, Any] | None:
+    global _CCE_STATIC_PRIVATE, _CCE_STATIC_PRIVATE_ATTEMPTED
+    if not _CCE_STATIC_PRIVATE_ATTEMPTED:
+        _CCE_STATIC_PRIVATE = _try_import_cce_static_private()
+        _CCE_STATIC_PRIVATE_ATTEMPTED = True
+    return _CCE_STATIC_PRIVATE
+
+
+def _tensor_cache_identity(tensor: torch.Tensor | None) -> tuple[object, ...]:
+    if tensor is None:
+        return (None,)
+    # ``cce_static`` is a graph-capture diagnostic for fixed batches. The
+    # decoder rebuilds concatenated labels/masks each forward, so pointer-based
+    # keys miss during capture even though the layout and contents are static.
+    return (
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+        tensor.device,
+    )
+
+
+def _build_static_flat_valids(
+    targets: torch.Tensor,
+    *,
+    ignore_index: int,
+    shift: int,
+) -> torch.Tensor | None:
+    shifted = targets[..., shift:] if shift != 0 else targets.flatten()
+
+    valids = (shifted != ignore_index).nonzero().to(torch.int32)
+    if shift == 0:
+        return valids.squeeze(1) if valids.numel() != shifted.numel() else None
+
+    for i in range(shifted.ndim - 1):
+        valids[:, i] *= shifted.stride(i)
+    return valids.sum(1)
+
+
+def _get_static_cce_labels_and_valids(
+    *,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    loss_mask: torch.Tensor | None,
+    ignore_index: int,
+    shift: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    cache_key = (
+        _tensor_cache_identity(labels),
+        _tensor_cache_identity(attention_mask),
+        _tensor_cache_identity(loss_mask),
+        int(ignore_index),
+        int(shift),
+    )
+    cached = _CCE_STATIC_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    cce_labels = cce_labels_from_masks(
+        labels,
+        attention_mask,
+        loss_mask,
+        ignore_index=ignore_index,
+    )
+    valids = _build_static_flat_valids(
+        cce_labels,
+        ignore_index=ignore_index,
+        shift=shift,
+    )
+    cached = (cce_labels, valids)
+    _CCE_STATIC_CACHE.clear()
+    _CCE_STATIC_CACHE[cache_key] = cached
+    return cached
+
+
+def _linear_cross_entropy_static_valids(
+    *,
+    hidden_states: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    lm_head_bias: torch.Tensor | None,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor,
+    loss_mask: torch.Tensor | None,
+    ignore_index: int,
+) -> torch.Tensor:
+    private = _get_cce_static_private()
+    if private is None:
+        raise RuntimeError(
+            "cut-cross-entropy static-valids private API is not available."
+        )
+    cce_params_cls, linear_cross_entropy_apply, cce_preset_cls, cce_presets, handle_eps = private
+
+    shift = 1
+    cce_labels, valids = _get_static_cce_labels_and_valids(
+        labels=labels,
+        attention_mask=attention_mask,
+        loss_mask=loss_mask,
+        ignore_index=ignore_index,
+        shift=shift,
+    )
+    e = hidden_states.contiguous()
+    if e.size()[0:-1] != cce_labels.size():
+        raise ValueError(
+            f"CCE static path expected hidden batch shape {tuple(e.size()[0:-1])} "
+            f"to match labels {tuple(cce_labels.size())}."
+        )
+    if e.size(-1) != lm_head_weight.size(1):
+        raise ValueError(
+            f"CCE static path expected hidden dim {e.size(-1)} to match "
+            f"LM-head dim {lm_head_weight.size(1)}."
+        )
+
+    batch_shape = cce_labels.size()
+    e = e.flatten(0, -2)
+    flat_labels = cce_labels.contiguous().flatten()
+    if (flat_labels.data_ptr() % 16) != 0:
+        flat_labels = torch.nn.functional.pad(flat_labels, (0, 1))[:-1]
+
+    cce_opts = cce_presets.build_for_impl(
+        "cce",
+        cce_preset_cls(
+            filter_eps="auto",
+            accum_e_fp32=False,
+            accum_c_fp32=False,
+            filter_e_grad=True,
+            filter_c_grad=True,
+        ),
+    )
+    filter_eps = handle_eps(
+        cce_opts["filter_eps"],
+        torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else e.dtype,
+    )
+    params = cce_params_cls(
+        flat_labels,
+        valids,
+        None,
+        "mean",
+        filter_eps,
+        shift,
+        batch_shape,
+        cce_opts["accum_e_fp32"],
+        cce_opts["accum_c_fp32"],
+        filter_e_grad=cce_opts["filter_e_grad"] and filter_eps is not None,
+        filter_c_grad=cce_opts["filter_c_grad"] and filter_eps is not None,
+        vocab_parallel_options=None,
+        return_lse=False,
+    )
+    loss, _lse = linear_cross_entropy_apply(
+        e,
+        lm_head_weight,
+        lm_head_bias,
+        params,
+    )
+    return loss
 
 
 def cce_labels_from_masks(
@@ -187,6 +362,73 @@ def cut_cross_entropy_lm_ce(
         loss_mask,
         ignore_index=ignore_index,
     )
+    cce_impl = "cce" if impl in {"cce_compact", "cce_static"} else impl
+
+    if impl == "cce_static":
+        try:
+            return _linear_cross_entropy_static_valids(
+                hidden_states=hidden_states,
+                lm_head_weight=lm_head_weight,
+                lm_head_bias=lm_head_bias,
+                labels=labels,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask,
+                ignore_index=ignore_index,
+            )
+        except Exception as exc:
+            if strict:
+                raise
+            _warn_runtime_once(
+                f"cut-cross-entropy {impl!r} failed ({type(exc).__name__}: {exc}); "
+                "falling back to chunked decoder CE."
+            )
+            return _fallback_chunked_ce_loss(
+                hidden_states,
+                lm_head_weight,
+                lm_head_bias,
+                labels,
+                attention_mask,
+                loss_mask,
+                chunk_size,
+            )
+
+    if impl == "cce_compact":
+        shift_hidden = hidden_states[:, :-1, :]
+        shift_labels = cce_labels[:, 1:]
+        valid = shift_labels.ne(ignore_index)
+        if not valid.any():
+            return hidden_states.sum() * 0.0
+        compact_hidden = shift_hidden.reshape(-1, shift_hidden.shape[-1])[
+            valid.reshape(-1)
+        ].contiguous()
+        compact_labels = shift_labels.reshape(-1)[valid.reshape(-1)].contiguous()
+        try:
+            return linear_cross_entropy(
+                compact_hidden,
+                lm_head_weight,
+                compact_labels,
+                bias=lm_head_bias,
+                ignore_index=ignore_index,
+                reduction="mean",
+                shift=0,
+                impl=cce_impl,
+            )
+        except Exception as exc:
+            if strict:
+                raise
+            _warn_runtime_once(
+                f"cut-cross-entropy {impl!r} failed ({type(exc).__name__}: {exc}); "
+                "falling back to chunked decoder CE."
+            )
+            return _fallback_chunked_ce_loss(
+                hidden_states,
+                lm_head_weight,
+                lm_head_bias,
+                labels,
+                attention_mask,
+                loss_mask,
+                chunk_size,
+            )
 
     try:
         return linear_cross_entropy(
@@ -197,7 +439,7 @@ def cut_cross_entropy_lm_ce(
             ignore_index=ignore_index,
             reduction="mean",
             shift=1,
-            impl=impl,
+            impl=cce_impl,
         )
     except Exception as exc:
         if strict:

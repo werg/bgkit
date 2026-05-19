@@ -50,8 +50,8 @@ from bgkit.utils.triton_alloc_patch import patch_triton_allocator
 from bgkit.utils.triton_patch import patch_triton_autotuner
 
 
-class _ProfiledFrozenDecoderLinearFunction(torch.autograd.Function):
-    """Diagnostic frozen-linear autograd with CUDA event timing."""
+class _ProfiledDecoderLinearFunction(torch.autograd.Function):
+    """Diagnostic linear autograd with CUDA event timing."""
 
     @staticmethod
     def forward(
@@ -62,8 +62,9 @@ class _ProfiledFrozenDecoderLinearFunction(torch.autograd.Function):
         name: str,
         stats: dict[str, dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]]],
     ) -> torch.Tensor:
-        ctx.save_for_backward(weight)
+        ctx.save_for_backward(x, weight)
         ctx.x_shape = tuple(x.shape)
+        ctx.has_bias = bias is not None
         ctx.name = name
         ctx.stats = stats
         if x.is_cuda:
@@ -78,21 +79,26 @@ class _ProfiledFrozenDecoderLinearFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        (weight,) = ctx.saved_tensors
+        x, weight = ctx.saved_tensors
+        x_2d = x.reshape(-1, x.shape[-1])
         grad_out = grad_output.reshape(-1, grad_output.shape[-1])
         if grad_out.is_cuda:
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
             grad_x = grad_out.matmul(weight)
+            grad_weight = grad_out.transpose(0, 1).matmul(x_2d)
+            grad_bias = grad_out.sum(0) if ctx.has_bias else None
             end.record()
             ctx.stats.setdefault(ctx.name, {"fwd": [], "bwd": []})["bwd"].append((start, end))
         else:
             grad_x = grad_out.matmul(weight)
-        return grad_x.reshape(ctx.x_shape), None, None, None, None
+            grad_weight = grad_out.transpose(0, 1).matmul(x_2d)
+            grad_bias = grad_out.sum(0) if ctx.has_bias else None
+        return grad_x.reshape(ctx.x_shape), grad_weight, grad_bias, None, None
 
 
-class _ProfiledFrozenDecoderLinear(nn.Module):
+class _ProfiledDecoderLinear(nn.Module):
     def __init__(
         self,
         base: nn.Linear,
@@ -109,11 +115,9 @@ class _ProfiledFrozenDecoderLinear(nn.Module):
         self._bgkit_profile_stats = stats
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.weight.requires_grad or (self.bias is not None and self.bias.requires_grad):
-            return F.linear(x, self.weight, self.bias)
         if not x.requires_grad:
             return F.linear(x, self.weight, self.bias)
-        return _ProfiledFrozenDecoderLinearFunction.apply(
+        return _ProfiledDecoderLinearFunction.apply(
             x,
             self.weight,
             self.bias,
@@ -124,13 +128,16 @@ class _ProfiledFrozenDecoderLinear(nn.Module):
 
 _DECODER_LINEAR_PROFILE_TARGETS = {
     "q_proj",
+    "qkv_proj",
     "k_proj",
     "v_proj",
     "o_proj",
     "gate_proj",
+    "gate_up_proj",
     "up_proj",
     "down_proj",
     "in_proj_qkv",
+    "in_proj",
     "in_proj_z",
     "in_proj_b",
     "in_proj_a",
@@ -371,15 +378,13 @@ def _install_decoder_linear_profiler(
                 continue
             if not isinstance(child, nn.Linear):
                 continue
-            if child.weight.requires_grad or (child.bias is not None and child.bias.requires_grad):
-                continue
-            if isinstance(child, _ProfiledFrozenDecoderLinear):
+            if isinstance(child, _ProfiledDecoderLinear):
                 continue
             full_name = f"{parent_name}.{child_name}" if parent_name else child_name
             setattr(
                 parent,
                 child_name,
-                _ProfiledFrozenDecoderLinear(child, name=full_name, stats=stats),
+                _ProfiledDecoderLinear(child, name=full_name, stats=stats),
             )
             count += 1
     return stats, count
@@ -391,6 +396,10 @@ def _decoder_layer_family(module: nn.Module) -> str:
         return "deltanet_layer"
     if layer_type == "full_attention":
         return "full_attention_layer"
+    if layer_type == "unknown":
+        cls_name = module.__class__.__name__.lower()
+        if "falcon" in cls_name and "decoderlayer" in cls_name:
+            return "falcon_h1_layer"
     return f"{layer_type}_layer"
 
 
@@ -465,11 +474,21 @@ def _install_decoder_layer_profiler(
         if getattr(module, "_bgkit_profile_layer_forward", False):
             count += 1
             continue
-        if not (
+        has_norm_pair = (
             hasattr(module, "input_layernorm")
-            and hasattr(module, "post_attention_layernorm")
-            and hasattr(module, "mlp")
-            and hasattr(module, "layer_type")
+            and (
+                hasattr(module, "post_attention_layernorm")
+                or hasattr(module, "pre_ff_layernorm")
+            )
+        )
+        if not (
+            has_norm_pair
+            and (hasattr(module, "mlp") or hasattr(module, "feed_forward"))
+            and (
+                hasattr(module, "layer_type")
+                or hasattr(module, "self_attn")
+                or hasattr(module, "mamba")
+            )
         ):
             continue
         module._bgkit_original_profile_layer_forward = module.forward
@@ -482,6 +501,125 @@ def _install_decoder_layer_profiler(
             _decoder_layer_backward_hook,
         )
         module.forward = types.MethodType(_profiled_decoder_layer_forward, module)
+        count += 1
+    return stats, count
+
+
+_DECODER_MODULE_PROFILE_TARGETS = {
+    "input_layernorm",
+    "mamba",
+    "self_attn",
+    "pre_ff_layernorm",
+    "post_attention_layernorm",
+    "feed_forward",
+    "mlp",
+    "final_layernorm",
+    "norm",
+}
+
+
+def _profiled_decoder_module_forward(module: nn.Module, *args, **kwargs):
+    original_forward = getattr(module, "_bgkit_original_profile_module_forward", None)
+    if original_forward is None:
+        raise RuntimeError("decoder module profiler installed without original forward")
+
+    name = str(getattr(module, "_bgkit_profile_module_name", module.__class__.__name__))
+    family = str(getattr(module, "_bgkit_profile_module_family", "decoder_module"))
+    stats = getattr(module, "_bgkit_profile_module_stats", None)
+    if stats is None:
+        return original_forward(*args, **kwargs)
+
+    uses_cuda = _contains_cuda_tensor(args) or _contains_cuda_tensor(kwargs)
+    if uses_cuda:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        out = original_forward(*args, **kwargs)
+        end.record()
+        stats.setdefault(name, {"family": family, "fwd": [], "bwd": []})["fwd"].append(
+            (start, end)
+        )
+    else:
+        out = original_forward(*args, **kwargs)
+
+    tensor = out if isinstance(out, torch.Tensor) else None
+    if tensor is None and isinstance(out, (tuple, list)) and out:
+        first = out[0]
+        tensor = first if isinstance(first, torch.Tensor) else None
+
+    if tensor is not None and tensor.is_cuda and tensor.requires_grad:
+        bwd_start = torch.cuda.Event(enable_timing=True)
+        bwd_end = torch.cuda.Event(enable_timing=True)
+        pending = getattr(module, "_bgkit_profile_module_pending_bwd_events", None)
+        if pending is None:
+            pending = []
+            module._bgkit_profile_module_pending_bwd_events = pending
+
+        def _record_bwd_start(grad):
+            bwd_start.record()
+            pending.append((bwd_start, bwd_end))
+            return grad
+
+        tensor.register_hook(_record_bwd_start)
+
+    return out
+
+
+def _decoder_module_backward_hook(module: nn.Module, _grad_input, _grad_output) -> None:
+    name = str(getattr(module, "_bgkit_profile_module_name", module.__class__.__name__))
+    family = str(getattr(module, "_bgkit_profile_module_family", "decoder_module"))
+    stats = getattr(module, "_bgkit_profile_module_stats", None)
+    pending = getattr(module, "_bgkit_profile_module_pending_bwd_events", None)
+    if stats is None or not pending:
+        return
+    start, end = pending.pop(0)
+    end.record()
+    stats.setdefault(name, {"family": family, "fwd": [], "bwd": []})["bwd"].append((start, end))
+
+
+def _install_decoder_module_profiler(
+    trainer,
+) -> tuple[dict[str, dict[str, object]], int]:
+    decoder = getattr(trainer, "decoder", None)
+    root = getattr(decoder, "backbone", decoder)
+    if root is None:
+        return {}, 0
+
+    stats: dict[str, dict[str, object]] = {}
+    count = 0
+    modules = dict(root.named_modules())
+    for name, module in list(modules.items()):
+        if not name:
+            continue
+        child_name = name.rsplit(".", 1)[-1]
+        if child_name not in _DECODER_MODULE_PROFILE_TARGETS:
+            continue
+        parent_name = name.rsplit(".", 1)[0] if "." in name else ""
+        parent = modules.get(parent_name)
+        is_layer_child = parent is not None and (
+            hasattr(parent, "input_layernorm")
+            and (
+                hasattr(parent, "post_attention_layernorm")
+                or hasattr(parent, "pre_ff_layernorm")
+            )
+            and (hasattr(parent, "mlp") or hasattr(parent, "feed_forward"))
+        )
+        is_model_norm = child_name in {"final_layernorm", "norm"} and hasattr(parent, "layers")
+        if not (is_layer_child or is_model_norm):
+            continue
+        if getattr(module, "_bgkit_profile_module_forward", False):
+            count += 1
+            continue
+        module._bgkit_original_profile_module_forward = module.forward
+        module._bgkit_profile_module_forward = True
+        module._bgkit_profile_module_name = name
+        module._bgkit_profile_module_family = child_name
+        module._bgkit_profile_module_stats = stats
+        module._bgkit_profile_module_pending_bwd_events = []
+        module._bgkit_profile_module_backward_handle = module.register_full_backward_hook(
+            _decoder_module_backward_hook,
+        )
+        module.forward = types.MethodType(_profiled_decoder_module_forward, module)
         count += 1
     return stats, count
 
@@ -516,6 +654,38 @@ def _frozen_deltanet_core_stats(trainer) -> dict[str, object] | None:
     if not report or int(report.get("patched_modules", 0) or 0) <= 0:
         return None
     return report
+
+
+def _reset_falcon_h1_internal_profiles() -> None:
+    try:
+        from bgkit.kernels.falcon_h1_mlp import reset_falcon_h1_mlp_profile
+
+        reset_falcon_h1_mlp_profile()
+    except Exception:
+        pass
+    try:
+        from bgkit.kernels.falcon_h1_mamba import reset_falcon_h1_mamba_profile
+
+        reset_falcon_h1_mamba_profile()
+    except Exception:
+        pass
+
+
+def _summarize_falcon_h1_internal_profiles() -> dict[str, object]:
+    out: dict[str, object] = {"mlp": [], "mamba": []}
+    try:
+        from bgkit.kernels.falcon_h1_mlp import summarize_falcon_h1_mlp_profile
+
+        out["mlp"] = summarize_falcon_h1_mlp_profile()
+    except Exception as exc:
+        out["mlp_error"] = repr(exc)
+    try:
+        from bgkit.kernels.falcon_h1_mamba import summarize_falcon_h1_mamba_profile
+
+        out["mamba"] = summarize_falcon_h1_mamba_profile()
+    except Exception as exc:
+        out["mamba_error"] = repr(exc)
+    return out
 
 
 def _elapsed_event_pairs(events: list[tuple[torch.cuda.Event, torch.cuda.Event]]) -> float:
@@ -729,6 +899,104 @@ def _summarize_gdr_internal_timers(
     return rows
 
 
+def _install_stage_timers(trainer) -> dict[str, dict[str, object]]:
+    """Install coarse stage timers around the trainer hot path."""
+
+    stats: dict[str, dict[str, object]] = {}
+
+    def _record(label: str, fn: Callable, *args, **kwargs):
+        item = stats.setdefault(label, {"cpu_ms": 0.0, "events": [], "calls": 0})
+        item["calls"] = int(item["calls"]) + 1
+        cpu_start = time.perf_counter()
+        use_cuda = torch.cuda.is_available() and (
+            _contains_cuda_tensor(args) or _contains_cuda_tensor(kwargs)
+        )
+        if use_cuda:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                end.record()
+                item["events"].append((start, end))
+                item["cpu_ms"] = float(item["cpu_ms"]) + (
+                    time.perf_counter() - cpu_start
+                ) * 1000.0
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            item["cpu_ms"] = float(item["cpu_ms"]) + (
+                time.perf_counter() - cpu_start
+            ) * 1000.0
+
+    for name, label in (
+        ("_compress_file_batch", "compress_file_batch"),
+        ("_compress_repo_l0_packed", "compress_repo_l0_packed"),
+        ("_decoder_forward_single_splice", "decoder_forward_single_splice"),
+        ("_forward_backward_repo_packed", "forward_backward_repo_packed"),
+    ):
+        original = getattr(trainer, name, None)
+        if original is None:
+            continue
+
+        def _wrap(fn, stage_label):
+            def _profiled(*args, **kwargs):
+                return _record(stage_label, fn, *args, **kwargs)
+
+            return _profiled
+
+        setattr(trainer, name, _wrap(original, label))
+
+    optimizer = getattr(trainer, "optimizer", None)
+    if optimizer is not None:
+        original_step = optimizer.step
+
+        def _optimizer_step_profiled(*args, **kwargs):
+            return _record("optimizer_step", original_step, *args, **kwargs)
+
+        optimizer.step = _optimizer_step_profiled
+
+    original_backward = torch.Tensor.backward
+    if not getattr(torch.Tensor.backward, "_bgkit_profile_stage_timer", False):
+
+        def _backward_profiled(self, *args, **kwargs):
+            return _record("tensor_backward", original_backward, self, *args, **kwargs)
+
+        _backward_profiled._bgkit_profile_stage_timer = True
+        torch.Tensor.backward = _backward_profiled
+
+    return stats
+
+
+def _clear_stage_timers(stats: dict[str, dict[str, object]]) -> None:
+    for item in stats.values():
+        item["cpu_ms"] = 0.0
+        item["calls"] = 0
+        events = item.get("events", [])
+        if isinstance(events, list):
+            events.clear()
+
+
+def _summarize_stage_timers(stats: dict[str, dict[str, object]]) -> list[dict[str, object]]:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    rows: list[dict[str, object]] = []
+    for name, item in stats.items():
+        events = item.get("events", [])
+        cuda_ms = _elapsed_event_pairs(events) if isinstance(events, list) else 0.0
+        rows.append(
+            {
+                "name": name,
+                "calls": int(item.get("calls", 0)),
+                "cpu_ms": float(item.get("cpu_ms", 0.0)),
+                "cuda_ms": cuda_ms,
+            }
+        )
+    rows.sort(key=lambda row: float(row["cuda_ms"]), reverse=True)
+    return rows
+
+
 def _accumulate_batch_stats(total: dict[str, float], stats: dict[str, float]) -> None:
     for key, value in stats.items():
         if key.endswith("_max_content_len") or key.endswith("_max_target_len"):
@@ -922,10 +1190,11 @@ def _move_step_batches_to_device(
     step_batches: list[list[dict]],
     device: torch.device,
 ) -> list[list[dict]]:
-    return [
+    moved_steps = [
         [_move_batch_to_device(batch, device) for batch in micro_batches]
         for micro_batches in step_batches
     ]
+    return moved_steps
 
 
 def _fixed_step_batches(
@@ -1087,12 +1356,77 @@ def _cuda_graph_forward_backward_probe(
         return {"enabled": True, "status": "skipped", "reason": "fixed_batches_required"}
 
     batch = _move_batch_to_device(fixed_batches[0][0], trainer.device)
+    batch["_bgkit_cuda_graph_probe_batch"] = True
     result: dict[str, object] = {
         "enabled": True,
         "status": "failed",
         "microbatches": 1,
         "bucket_hash": _batch_bucket_signature(batch)["hash"],
     }
+
+    def _capture_callable(name: str, fn) -> dict[str, object]:
+        probe: dict[str, object] = {"status": "failed"}
+        try:
+            trainer.optimizer.zero_grad()
+            torch.cuda.synchronize()
+            fn()
+            trainer.optimizer.zero_grad()
+            torch.cuda.synchronize()
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                fn()
+            graph.replay()
+            torch.cuda.synchronize()
+            trainer.optimizer.zero_grad()
+            probe["status"] = "captured"
+        except Exception as exc:  # pragma: no cover - CUDA/runtime dependent.
+            probe["error_type"] = type(exc).__name__
+            probe["error"] = str(exc)[:1000]
+            with contextlib.suppress(Exception):
+                trainer.optimizer.zero_grad()
+        probe["name"] = name
+        return probe
+
+    subprobes: list[dict[str, object]] = []
+    sample_type = batch.get("sample_type")
+    if sample_type == "file":
+        target_ratio = trainer._sample_target_ratio()
+
+        with torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=trainer.device.type == "cuda",
+        ), torch.no_grad():
+            enc_out = trainer._compress_file_batch(batch, target_ratio=target_ratio)
+        survivors = enc_out.survivor_embeddings
+        survivor_cu = enc_out.survivor_cu_seqlens
+
+        def decoder_forward_only() -> None:
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=trainer.device.type == "cuda",
+            ):
+                trainer._decoder_forward_single_splice(survivors, survivor_cu, batch)
+
+        def decoder_forward_backward() -> None:
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=trainer.device.type == "cuda",
+            ):
+                loss = trainer._decoder_forward_single_splice(survivors, survivor_cu, batch)
+            (loss / trainer._accum_steps).backward()
+
+        subprobes.append(_capture_callable("decoder_forward_only", decoder_forward_only))
+        subprobes.append(_capture_callable("decoder_forward_backward", decoder_forward_backward))
+        with contextlib.suppress(Exception):
+            enc_out.release()
+
+        def compression_only() -> None:
+            with torch.autocast(
+                "cuda", dtype=torch.bfloat16, enabled=trainer.device.type == "cuda",
+            ), torch.no_grad():
+                trainer._compress_file_batch(batch, target_ratio=target_ratio)
+
+        subprobes.append(_capture_callable("compression_only", compression_only))
+
+    result["subprobes"] = subprobes
     try:
         trainer.optimizer.zero_grad()
         torch.cuda.synchronize()
@@ -1102,19 +1436,134 @@ def _cuda_graph_forward_backward_probe(
         torch.cuda.synchronize()
 
         graph = torch.cuda.CUDAGraph()
+        trainer._suppress_forward_backward_metrics = True
         with torch.cuda.graph(graph):
             trainer._forward_backward(batch)
+        trainer._suppress_forward_backward_metrics = False
         graph.replay()
         torch.cuda.synchronize()
         trainer.optimizer.zero_grad()
 
         result["status"] = "captured"
     except Exception as exc:  # pragma: no cover - depends on CUDA/kernel runtime.
+        trainer._suppress_forward_backward_metrics = False
         result["error_type"] = type(exc).__name__
         result["error"] = str(exc)[:1000]
         with contextlib.suppress(Exception):
             trainer.optimizer.zero_grad()
     return result
+
+
+def _nonfinite_gradient_report(trainer, *, limit: int = 24) -> list[dict[str, object]]:
+    """Return a compact report of trainable parameters with NaN/Inf gradients."""
+
+    rows: list[dict[str, object]] = []
+    roots = (
+        ("decoder", getattr(trainer, "decoder", None)),
+        ("encoder", getattr(trainer, "encoder", None)),
+        ("model", getattr(trainer, "model", None)),
+    )
+    seen: set[int] = set()
+    for component, module in roots:
+        if module is None or not hasattr(module, "named_parameters"):
+            continue
+        for name, param in module.named_parameters():
+            pid = id(param)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            grad = param.grad
+            if grad is None:
+                continue
+            finite = torch.isfinite(grad)
+            if bool(finite.all().item()):
+                continue
+            grad_f = grad.detach().float()
+            rows.append(
+                {
+                    "component": component,
+                    "name": name,
+                    "shape": tuple(param.shape),
+                    "nan": int(torch.isnan(grad_f).sum().item()),
+                    "inf": int(torch.isinf(grad_f).sum().item()),
+                    "abs_max": float(torch.nan_to_num(grad_f, nan=0.0).abs().max().item()),
+                }
+            )
+            if len(rows) >= limit:
+                return rows
+    return rows
+
+
+def _largest_gradient_report(trainer, *, limit: int = 24) -> list[dict[str, object]]:
+    """Return trainable parameters with the largest finite gradient entries."""
+
+    rows: list[dict[str, object]] = []
+    roots = (
+        ("decoder", getattr(trainer, "decoder", None)),
+        ("encoder", getattr(trainer, "encoder", None)),
+        ("model", getattr(trainer, "model", None)),
+    )
+    seen: set[int] = set()
+    for component, module in roots:
+        if module is None or not hasattr(module, "named_parameters"):
+            continue
+        for name, param in module.named_parameters():
+            pid = id(param)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            grad = param.grad
+            if grad is None:
+                continue
+            grad_f = grad.detach().float()
+            finite = torch.isfinite(grad_f)
+            finite_count = int(finite.sum().item())
+            if finite_count == 0:
+                abs_max = float("nan")
+                rms = float("nan")
+            else:
+                finite_grad = grad_f[finite]
+                abs_max = float(finite_grad.abs().max().item())
+                rms = float(finite_grad.square().mean().sqrt().item())
+            rows.append(
+                {
+                    "component": component,
+                    "name": name,
+                    "shape": tuple(param.shape),
+                    "abs_max": abs_max,
+                    "rms": rms,
+                    "finite": finite_count,
+                    "total": int(grad.numel()),
+                }
+            )
+    rows.sort(key=lambda row: float(row["abs_max"]), reverse=True)
+    return rows[:limit]
+
+
+def _gradient_norm64(trainer) -> float:
+    """Compute total grad norm in float64 without mutating gradients."""
+
+    total = 0.0
+    seen: set[int] = set()
+    roots = (
+        getattr(trainer, "decoder", None),
+        getattr(trainer, "encoder", None),
+        getattr(trainer, "model", None),
+    )
+    for module in roots:
+        if module is None or not hasattr(module, "parameters"):
+            continue
+        for param in module.parameters():
+            pid = id(param)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            grad = param.grad
+            if grad is None:
+                continue
+            grad64 = grad.detach().double()
+            total += float(grad64.square().sum().item())
+    return math.sqrt(total)
 
 
 def _run_optimizer_step(
@@ -1167,10 +1616,18 @@ def _run_optimizer_step(
         with torch.profiler.record_function(f"microbatch_{micro_idx:02d}/forward_backward"):
             accum_metrics.append(trainer._forward_backward(batch))
 
+    largest_grads_before_clip = _largest_gradient_report(trainer)
+    grad_norm64_before_clip = _gradient_norm64(trainer)
     with torch.profiler.record_function("clip_grad_norm"):
         grad_norm = clip_grad_norm(trainer.trainable_parameters())
     if not math.isfinite(grad_norm):
-        raise RuntimeError(f"NaN/Inf grad_norm at profiled step {step}: {grad_norm}")
+        report = _nonfinite_gradient_report(trainer)
+        raise RuntimeError(
+            f"NaN/Inf grad_norm at profiled step {step}: {grad_norm}; "
+            f"grad_norm64_before_clip={grad_norm64_before_clip}; "
+            f"nonfinite_grads={report}; "
+            f"largest_grads_before_clip={largest_grads_before_clip}"
+        )
 
     with torch.profiler.record_function("optimizer_step"):
         trainer.optimizer.step()
@@ -1379,6 +1836,14 @@ def _profile_bucket_for_key(key: str) -> str:
     return "uncategorized"
 
 
+def _config_to_plain(value: Any) -> Any:
+    """Convert OmegaConf nodes and ordinary containers to JSON-ready values."""
+
+    if OmegaConf.is_config(value):
+        return OmegaConf.to_container(value, resolve=True)
+    return value
+
+
 def _profile_bucket_summary(prof, *, topk: int = 30) -> dict[str, object]:
     buckets: dict[str, dict[str, float]] = {}
     top_events: list[dict[str, object]] = []
@@ -1460,6 +1925,12 @@ def main(cfg: DictConfig) -> None:
     profile_gdr_internals = bool(profile_cfg.get("gdr_internals", False))
     profile_decoder_layers = bool(profile_cfg.get("decoder_layers", False))
     decoder_layers_topk = int(profile_cfg.get("decoder_layers_topk", 40))
+    profile_decoder_modules = bool(profile_cfg.get("decoder_modules", False))
+    decoder_modules_topk = int(profile_cfg.get("decoder_modules_topk", 80))
+    profile_stage_timers = bool(profile_cfg.get("stage_timers", False))
+    profile_falcon_internals = bool(profile_cfg.get("falcon_internals", False))
+    if profile_falcon_internals:
+        os.environ["BGKIT_FALCON_H1_PROFILE_INTERNALS"] = "1"
     trace_path_raw = profile_cfg.get("trace_path", None)
 
     trainer, dataloader_iter, checkpoint = _prepare_trainer(cfg)
@@ -1471,8 +1942,13 @@ def main(cfg: DictConfig) -> None:
     decoder_layer_count = 0
     if profile_decoder_layers:
         decoder_layer_stats, decoder_layer_count = _install_decoder_layer_profiler(trainer)
+    decoder_module_stats: dict[str, dict[str, object]] = {}
+    decoder_module_count = 0
+    if profile_decoder_modules:
+        decoder_module_stats, decoder_module_count = _install_decoder_module_profiler(trainer)
     gdr_internal_stats: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]]
     gdr_internal_stats = _install_gdr_internal_timers() if profile_gdr_internals else {}
+    stage_timer_stats = _install_stage_timers(trainer) if profile_stage_timers else {}
     trainable_contract = _trainable_contract_profile(trainer)
     max_steps, base_lr, warmup_steps = _schedule_values(trainer, cfg)
     accum_steps = trainer._validate_accum_steps(
@@ -1554,7 +2030,10 @@ def main(cfg: DictConfig) -> None:
                 "profile_decoder_linears_count": decoder_linear_count,
                 "profile_decoder_layers": profile_decoder_layers,
                 "profile_decoder_layers_count": decoder_layer_count,
+                "profile_decoder_modules": profile_decoder_modules,
+                "profile_decoder_modules_count": decoder_module_count,
                 "profile_gdr_internals": profile_gdr_internals,
+                "profile_stage_timers": profile_stage_timers,
                 "trainable_contract": trainable_contract,
                 "ce_impl": os.environ.get("BGKIT_DECODER_CE_IMPL", "<unset>"),
             },
@@ -1612,8 +2091,14 @@ def main(cfg: DictConfig) -> None:
             _clear_decoder_linear_profile_stats(decoder_linear_stats)
         if decoder_layer_stats:
             _clear_decoder_layer_profile_stats(decoder_layer_stats)
+        if decoder_module_stats:
+            _clear_decoder_layer_profile_stats(decoder_module_stats)
         if gdr_internal_stats:
             _clear_gdr_internal_timers(gdr_internal_stats)
+        if stage_timer_stats:
+            _clear_stage_timers(stage_timer_stats)
+        if profile_falcon_internals:
+            _reset_falcon_h1_internal_profiles()
         _reset_frozen_deltanet_core_stats(trainer)
         _reset_counts(kernel_counts)
         if capture_profiler:
@@ -1767,6 +2252,24 @@ def main(cfg: DictConfig) -> None:
             flush=True,
         )
 
+    decoder_module_profile: dict[str, object] | None = None
+    if decoder_module_stats:
+        decoder_module_profile = _summarize_decoder_layer_profile(
+            decoder_module_stats,
+            topk=decoder_modules_topk,
+        )
+        print(
+            json.dumps(
+                {
+                    "event": "profile_decoder_modules",
+                    "profiled_module_count": decoder_module_count,
+                    **decoder_module_profile,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
     gdr_internal_profile: list[dict[str, object]] | None = None
     if gdr_internal_stats:
         gdr_internal_profile = _summarize_gdr_internal_timers(gdr_internal_stats)
@@ -1775,6 +2278,34 @@ def main(cfg: DictConfig) -> None:
                 {
                     "event": "profile_gdr_internals",
                     "items": gdr_internal_profile,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    stage_timer_profile: list[dict[str, object]] | None = None
+    if stage_timer_stats:
+        stage_timer_profile = _summarize_stage_timers(stage_timer_stats)
+        print(
+            json.dumps(
+                {
+                    "event": "profile_stage_timers",
+                    "items": stage_timer_profile,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    falcon_internal_profile: dict[str, object] | None = None
+    if profile_falcon_internals:
+        falcon_internal_profile = _summarize_falcon_h1_internal_profiles()
+        print(
+            json.dumps(
+                {
+                    "event": "profile_falcon_h1_internals",
+                    **falcon_internal_profile,
                 },
                 sort_keys=True,
             ),
@@ -1845,6 +2376,7 @@ def main(cfg: DictConfig) -> None:
     #   decoder_linear_profile dict? — opt-in frozen decoder linear event totals
     #   decoder_layer_profile dict? — opt-in whole decoder-layer event totals
     #   gdr_internal_profile list? — opt-in FLA GDR internal event totals
+    #   stage_timer_profile list? — opt-in coarse trainer stage event totals
     #   frozen_deltanet_core_profile dict? — opt-in custom/fallback core counts
     #   trainable_contract dict — trainable/optimizer parameter counts used to
     #                             verify that decoder-training profiles really
@@ -1869,30 +2401,32 @@ def main(cfg: DictConfig) -> None:
         "profile_buckets": profiler_buckets,
         "decoder_linear_profile": decoder_linear_profile,
         "decoder_layer_profile": decoder_layer_profile,
+        "decoder_module_profile": decoder_module_profile,
         "gdr_internal_profile": gdr_internal_profile,
+        "stage_timer_profile": stage_timer_profile,
+        "falcon_internal_profile": falcon_internal_profile,
         "frozen_deltanet_core_profile": frozen_deltanet_core_profile,
         "trainable_contract": trainable_contract,
         "falcon_kernel_counts": measured_kernel_counts,
         "trace_path": str(trace_path) if trace_path is not None else None,
         "training_shape": {
-            "decoder_lora": OmegaConf.to_container(
-                cfg.training.get("decoder_lora", {}),
-                resolve=True,
+            "decoder_lora": _config_to_plain(cfg.training.get("decoder_lora", {})),
+            "decoder_layerwise_split": _config_to_plain(
+                cfg.training.get("decoder_layerwise_split", {})
             ),
-            "decoder_layerwise_split": OmegaConf.to_container(
-                cfg.training.get("decoder_layerwise_split", {}),
-                resolve=True,
-            ),
-            "frozen_decoder_kernels": OmegaConf.to_container(
-                cfg.training.get("frozen_decoder_kernels", {}),
-                resolve=True,
+            "frozen_decoder_kernels": _config_to_plain(
+                cfg.training.get("frozen_decoder_kernels", {})
             ),
             "capture_profiler": capture_profiler,
             "profile_decoder_linears": profile_decoder_linears,
             "profile_decoder_linears_count": decoder_linear_count,
             "profile_decoder_layers": profile_decoder_layers,
             "profile_decoder_layers_count": decoder_layer_count,
+            "profile_decoder_modules": profile_decoder_modules,
+            "profile_decoder_modules_count": decoder_module_count,
             "profile_gdr_internals": profile_gdr_internals,
+            "profile_stage_timers": profile_stage_timers,
+            "profile_falcon_internals": profile_falcon_internals,
             "fixed_batches": fixed_batches,
             "repeat_first_fixed_step": repeat_first_fixed_step,
             "static_device_batches": static_device_batches,
@@ -1976,8 +2510,37 @@ def main(cfg: DictConfig) -> None:
             "BGKIT_DECODER_MLP_SWIGLU_TRITON_FWD": os.environ.get(
                 "BGKIT_DECODER_MLP_SWIGLU_TRITON_FWD"
             ),
+            "BGKIT_FALCON_H1_MAMBA_SAVE_OUT": os.environ.get(
+                "BGKIT_FALCON_H1_MAMBA_SAVE_OUT"
+            ),
+            "BGKIT_FALCON_H1_MAMBA_SAVE_CONV": os.environ.get(
+                "BGKIT_FALCON_H1_MAMBA_SAVE_CONV"
+            ),
+            "BGKIT_FALCON_H1_MAMBA_INPROJ_AUTOGRAD": os.environ.get(
+                "BGKIT_FALCON_H1_MAMBA_INPROJ_AUTOGRAD"
+            ),
+            "BGKIT_FALCON_H1_SPECIALIZED_MAMBA": os.environ.get(
+                "BGKIT_FALCON_H1_SPECIALIZED_MAMBA"
+            ),
+            "BGKIT_FALCON_H1_DIRECT_FLASH_ATTN": os.environ.get(
+                "BGKIT_FALCON_H1_DIRECT_FLASH_ATTN"
+            ),
+            "BGKIT_FALCON_H1_DIRECT_FA4_ATTN": os.environ.get(
+                "BGKIT_FALCON_H1_DIRECT_FA4_ATTN"
+            ),
+            "BGKIT_FALCON_H1_DIRECT_HF_FLASH_ATTN": os.environ.get(
+                "BGKIT_FALCON_H1_DIRECT_HF_FLASH_ATTN"
+            ),
+            "BGKIT_FALCON_H1_DIRECT_SDPA": os.environ.get("BGKIT_FALCON_H1_DIRECT_SDPA"),
+            "BGKIT_FALCON_H1_TRAINABLE_MLP_AUTOGRAD": os.environ.get(
+                "BGKIT_FALCON_H1_TRAINABLE_MLP_AUTOGRAD"
+            ),
+            "BGKIT_FALCON_H1_PROFILE_INTERNALS": os.environ.get(
+                "BGKIT_FALCON_H1_PROFILE_INTERNALS"
+            ),
             "MAMBA_SM121_SAFE_AUTOTUNE": os.environ.get("MAMBA_SM121_SAFE_AUTOTUNE"),
             "MAMBA_SM121_STATIC_CONFIGS": os.environ.get("MAMBA_SM121_STATIC_CONFIGS"),
+            "MAMBA_FALCON_SM121_FASTPATH": os.environ.get("MAMBA_FALCON_SM121_FASTPATH"),
             "TRITON_CACHE_DIR": os.environ.get("TRITON_CACHE_DIR"),
         },
     }

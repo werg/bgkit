@@ -19,7 +19,7 @@ import numpy as np
 import structlog
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, random_split
 from transformers import AutoModelForCausalLM
 
 from bgkit.data.datasets.cached_survivor_dataset import (
@@ -27,7 +27,7 @@ from bgkit.data.datasets.cached_survivor_dataset import (
     collate_cached_dense_seed,
 )
 from bgkit.data.samplers import PackedTokenBudgetSampler
-from bgkit.models.decoder import ReconstructionDecoder, normalize_decoder_family
+from bgkit.models.decoder import normalize_decoder_family
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
@@ -106,9 +106,12 @@ class FalconProjectionCachedTrainer(BaseTrainer):
             raise ValueError(
                 "FalconProjectionCachedTrainer is Falcon-only "
                 f"(got decoder_family={decoder_family!r})"
-            )
+        )
         decoder_attention_impl = resolve_decoder_attention_implementation(
-            self.cfg.compute.get("attention_implementation", "auto"),
+            self.cfg.compute.get(
+                "decoder_attention_implementation",
+                self.cfg.compute.get("attention_implementation", "auto"),
+            ),
             decoder_family=decoder_family,
         )
         decoder_name = decoder_cfg.get(

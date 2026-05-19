@@ -51,11 +51,11 @@ bgkit_cache_dir: ${oc.env:DATA_DIR}/swe_embeddings
 decoder_lora:
   enabled: false
   implementation: peft
-  r: 16
-  alpha: 32
+  r: 32
+  alpha: 64
   dropout: 0.0
   peft_fused_backward: true
-  peft_fuse_gate_up: false
+  peft_fuse_gate_up: true
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 # Liger kernels: same pattern as Phase 1. LigerRMSNorm pinned OFF (Qwen3.5

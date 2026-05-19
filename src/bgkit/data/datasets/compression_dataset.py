@@ -257,7 +257,7 @@ class DataReconstructionSubset(Dataset):
         # Per-repo cap (heavy-tail rebalancing). Mirrors the cap that
         # forced_adapt's ``_ValidCompanionSubset`` introduced: the raw
         # corpus is power-law skewed (top 1% of repos = ~17% of chunks,
-        # top repo has 198× the median's chunk count). Capping each
+        # top repo has 198x the median's chunk count). Capping each
         # repo to ``max_chunks_per_repo`` brings the top-1% share down
         # to ~3% and gives every repo roughly comparable exposure
         # across an epoch. None disables (default).
@@ -281,6 +281,7 @@ class DataReconstructionSubset(Dataset):
             content_lengths = content_lengths[self._valid_indices]
             decoder_lengths = decoder_lengths[self._valid_indices]
         self._cached_content_lengths = content_lengths
+        self._cached_decoder_lengths = decoder_lengths + self._max_overhead
         self._cached_lengths = np.maximum(content_lengths, decoder_lengths) + (
             self._max_overhead
         )
@@ -345,6 +346,9 @@ class DataReconstructionSubset(Dataset):
 
     def content_token_length(self, idx: int) -> int:
         return int(self._cached_content_lengths[idx])
+
+    def decoder_token_length(self, idx: int) -> int:
+        return int(self._cached_decoder_lengths[idx])
 
     def __len__(self) -> int:
         if self._valid_indices is not None:
@@ -1247,6 +1251,21 @@ class CompressionDataset(Dataset):
             return int(subset.content_token_length(local_idx))
         overhead = getattr(subset, "_max_overhead", 0)
         return max(0, self.token_length(idx) - int(overhead))
+
+    def decoder_token_length(self, idx: int) -> int:
+        """Decoder-side target length estimate for padded decoder batching.
+
+        ``token_length`` intentionally uses the larger of encoder-content and
+        decoder-token lengths so packed encoder/decoder phases stay under a
+        single conservative budget. Falcon-H1 is different: its decoder
+        attention path pads each microbatch, so batching should be driven by
+        the decoder sequence length that controls ``B * max_len^2`` work.
+        """
+        obj_name, local_idx = self._map_index(idx)
+        subset = self._subsets[obj_name]
+        if hasattr(subset, "decoder_token_length"):
+            return int(subset.decoder_token_length(local_idx))
+        return self.token_length(idx)
 
     def objective_for_idx(self, idx: int) -> str:
         """Return which objective an index belongs to."""

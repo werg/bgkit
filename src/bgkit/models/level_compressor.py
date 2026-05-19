@@ -32,6 +32,7 @@ import torch.nn as nn
 from bgkit.models.components.selection import (
     DualThresholdController,
     adaptive_threshold_select,
+    exact_ratio_topk_select,
 )
 from bgkit.models.components.survivorship_head import SurvivorshipHead
 from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
@@ -248,10 +249,7 @@ class LevelCompressor(nn.Module):
         # 6 blocks -> hook at block 1 (~17% depth). Full Qwen3.5 has 24 layers
         # -> hook at layer 7 (~same relative depth). Tests can override.
         if head_layer_index is None:
-            if isinstance(backbone, PrunedBidirectionalQwen35):
-                head_layer_index = 1
-            else:
-                head_layer_index = 7
+            head_layer_index = 1 if isinstance(backbone, PrunedBidirectionalQwen35) else 7
         self._head_layer_index = int(head_layer_index)
 
         self.head = SurvivorshipHead(hidden_dim, survivorship_inner_dim)
@@ -305,6 +303,8 @@ class LevelCompressor(nn.Module):
         utility_grad_active: bool = False,
         utility_grad_capture: dict | None = None,
         forced_survivor_mask: torch.Tensor | None = None,
+        selection_mode: str = "threshold",
+        capture_decoder_only_prefix: bool = False,
     ) -> LevelOutput:
         """Run one compression level. ``forced_survivor_mask`` (bool, ``(N_content,)``)
         overrides head selection when provided; head still runs for diagnostics."""
@@ -375,6 +375,12 @@ class LevelCompressor(nn.Module):
             """
             content_hidden = hidden[content_pos_mask]  # (N_content, D)
             base_raw = self.head(content_hidden.unsqueeze(0)).squeeze(0)  # (N_content,)
+            if capture_decoder_only_prefix:
+                hook_state["decoder_only_prefix_hidden"] = hidden.detach()
+                hook_state["decoder_only_prefix_combined_cu"] = combined_cu.detach()
+                hook_state["decoder_only_prefix_combined_pos"] = combined_pos.detach()
+                hook_state["decoder_only_prefix_content_pos_mask"] = content_pos_mask.detach()
+                hook_state["decoder_only_prefix_base_raw"] = base_raw.detach()
 
             if utility_grad_active and hidden.requires_grad:
                 base_raw_for_util = self.head(
@@ -419,14 +425,29 @@ class LevelCompressor(nn.Module):
                 theta = self.threshold.theta_for_ratio(float(target_ratio)).to(
                     base_raw.device,
                 )
-                sel = adaptive_threshold_select(
-                    logits=logits_for_op,
-                    valid_mask=valid,
-                    theta=theta,
-                    cu_seqlens=content_cu_seqlens,
-                    pinned=pinned_positions,
-                    min_per_sample=min_per_sample,
-                )
+                if selection_mode == "exact_topk":
+                    sel = exact_ratio_topk_select(
+                        logits=logits_for_op,
+                        valid_mask=valid,
+                        target_ratio=float(target_ratio),
+                        cu_seqlens=content_cu_seqlens,
+                        pinned=pinned_positions,
+                        min_per_sample=min_per_sample,
+                    )
+                elif selection_mode == "threshold":
+                    sel = adaptive_threshold_select(
+                        logits=logits_for_op,
+                        valid_mask=valid,
+                        theta=theta,
+                        cu_seqlens=content_cu_seqlens,
+                        pinned=pinned_positions,
+                        min_per_sample=min_per_sample,
+                    )
+                else:
+                    raise ValueError(
+                        "selection_mode must be 'threshold' or 'exact_topk'; "
+                        f"got {selection_mode!r}"
+                    )
                 mask = sel.mask  # (N_content,)
                 survive_probs = torch.sigmoid(
                     logits_for_op.float() - theta.float(),
@@ -463,15 +484,22 @@ class LevelCompressor(nn.Module):
                     )
                 else:
                     valid_count = valid.sum()
-                    organic = (logits_for_op.float() > theta.float()) & valid
                     if pinned_positions is None:
                         pinned_mask = torch.zeros_like(valid)
                     else:
                         pinned_mask = pinned_positions & valid
-                    floor_mask = mask & ~organic & ~pinned_mask
-                    controllable = valid & ~pinned_mask & ~floor_mask
-                    organic_count = (organic & controllable).sum()
-                    controllable_count = controllable.sum()
+                    if selection_mode == "exact_topk":
+                        floor_mask = torch.zeros_like(valid)
+                        controllable = valid & ~pinned_mask
+                        organic = mask & controllable
+                        organic_count = sel._organic_numerator
+                        controllable_count = sel._organic_denominator
+                    else:
+                        organic = (logits_for_op.float() > theta.float()) & valid
+                        floor_mask = mask & ~organic & ~pinned_mask
+                        controllable = valid & ~pinned_mask & ~floor_mask
+                        organic_count = (organic & controllable).sum()
+                        controllable_count = controllable.sum()
 
                     undecided_mask = (
                         (survive_probs_metrics > 0.2)
@@ -499,10 +527,7 @@ class LevelCompressor(nn.Module):
             hook_state["theta_tensor"] = theta.detach()
             return hidden
 
-        if compression_off:
-            hooks = None
-        else:
-            hooks = {self._head_layer_index: _hook_after_head_layer}
+        hooks = None if compression_off else {self._head_layer_index: _hook_after_head_layer}
 
         # ---- Run backbone (post-norm by default; hook fires mid-backbone) ----
         backbone_out = self.backbone(
@@ -566,7 +591,193 @@ class LevelCompressor(nn.Module):
         )
         if utility_grad_active and utility_grad_capture is None:
             out._utility_grad_state = util_state
+        if capture_decoder_only_prefix:
+            out._decoder_only_prefix_cache = {
+                "hidden": hook_state.get("decoder_only_prefix_hidden"),
+                "combined_cu_seqlens": hook_state.get("decoder_only_prefix_combined_cu"),
+                "combined_position_ids": hook_state.get("decoder_only_prefix_combined_pos"),
+                "content_pos_mask": hook_state.get("decoder_only_prefix_content_pos_mask"),
+                "base_raw": hook_state.get("decoder_only_prefix_base_raw"),
+            }
         return out
+
+    def decoder_only_prefix(
+        self,
+        *,
+        content_embeddings: torch.Tensor,
+        content_cu_seqlens: torch.Tensor,
+        content_position_ids: torch.Tensor,
+        prompt_embeddings: torch.Tensor | None = None,
+        prompt_cu_seqlens: torch.Tensor | None = None,
+        prompt_position_ids: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | int]:
+        """Run the frozen, ratio-independent prefix through the head block."""
+        if not hasattr(self.backbone, "forward_from_block"):
+            raise TypeError(
+                "decoder_only_prefix requires a backbone with forward_from_block"
+            )
+        if self.with_prompt and prompt_embeddings is not None and prompt_embeddings.shape[0] > 0:
+            (
+                x,
+                combined_cu,
+                combined_pos,
+                content_pos_mask,
+                combined_max,
+            ) = _build_combined_pack(
+                content_embeddings,
+                content_cu_seqlens,
+                content_position_ids,
+                prompt_embeddings,
+                prompt_cu_seqlens,
+                prompt_position_ids,
+                self.prompt_separator_embedding,
+            )
+        else:
+            x = content_embeddings
+            combined_cu = content_cu_seqlens
+            combined_pos = content_position_ids
+            content_pos_mask = torch.ones(
+                x.shape[0], dtype=torch.bool, device=x.device,
+            )
+            lengths = lengths_from_cu(content_cu_seqlens).to(torch.int64)
+            combined_max = int(lengths.max().item()) if lengths.numel() else 0
+
+        hidden = self.backbone.forward_from_block(
+            hidden=x,
+            start_block=0,
+            cu_seqlens=combined_cu,
+            max_seqlen=combined_max,
+            position_ids=combined_pos,
+            end_block=self._head_layer_index + 1,
+            apply_final_norm=False,
+        ).last_hidden_state
+        content_hidden = hidden[content_pos_mask]
+        base_raw = self.head(content_hidden.unsqueeze(0)).squeeze(0)
+        return {
+            "hidden": hidden,
+            "combined_cu_seqlens": combined_cu,
+            "combined_position_ids": combined_pos,
+            "content_pos_mask": content_pos_mask,
+            "combined_max_seqlen": combined_max,
+            "base_raw": base_raw,
+        }
+
+    def decoder_only_from_prefix(
+        self,
+        *,
+        prefix_hidden: torch.Tensor,
+        combined_cu_seqlens: torch.Tensor,
+        combined_position_ids: torch.Tensor,
+        content_pos_mask: torch.Tensor,
+        content_cu_seqlens: torch.Tensor,
+        base_raw: torch.Tensor,
+        target_ratio: float,
+        min_per_sample: int = 0,
+        selection_mode: str = "exact_topk",
+    ) -> LevelOutput:
+        """Resume the frozen compressor from a cached head-block prefix."""
+        if not hasattr(self.backbone, "forward_from_block"):
+            raise TypeError(
+                "decoder_only_from_prefix requires a backbone with forward_from_block"
+            )
+        T = self.head_tanh_temperature.to(base_raw.dtype)  # noqa: N806
+        logits_for_op = torch.tanh(base_raw / T)
+        valid = torch.ones_like(base_raw, dtype=torch.bool)
+        theta = self.threshold.theta_for_ratio(float(target_ratio)).to(base_raw.device)
+
+        if selection_mode == "exact_topk":
+            sel = exact_ratio_topk_select(
+                logits=logits_for_op,
+                valid_mask=valid,
+                target_ratio=float(target_ratio),
+                cu_seqlens=content_cu_seqlens,
+                pinned=None,
+                min_per_sample=min_per_sample,
+            )
+            mask = sel.mask
+            survive_probs = torch.sigmoid(logits_for_op.float()).to(base_raw.dtype)
+            organic_count = sel._organic_numerator
+            controllable_count = sel._organic_denominator
+        elif selection_mode == "threshold":
+            sel = adaptive_threshold_select(
+                logits=logits_for_op,
+                valid_mask=valid,
+                theta=theta,
+                cu_seqlens=content_cu_seqlens,
+                pinned=None,
+                min_per_sample=min_per_sample,
+            )
+            mask = sel.mask
+            survive_probs = torch.sigmoid(
+                logits_for_op.float() - theta.float(),
+            ).to(base_raw.dtype)
+            organic = (logits_for_op.float() > theta.float()) & valid
+            floor_mask = mask & ~organic
+            controllable = valid & ~floor_mask
+            organic_count = (organic & controllable).sum()
+            controllable_count = controllable.sum()
+        else:
+            raise ValueError(
+                "selection_mode must be 'threshold' or 'exact_topk'; "
+                f"got {selection_mode!r}"
+            )
+
+        hidden = prefix_hidden.clone()
+        content_indices = torch.nonzero(content_pos_mask, as_tuple=False).squeeze(-1)
+        surviving_combined = content_indices[mask.detach()]
+        survive_vec = self.survive_embedding.to(hidden.dtype)
+        hidden[surviving_combined] = hidden[surviving_combined] + survive_vec
+
+        lengths = lengths_from_cu(combined_cu_seqlens).to(torch.int64)
+        combined_max = int(lengths.max().item()) if lengths.numel() else 0
+        hidden = self.backbone.forward_from_block(
+            hidden=hidden,
+            start_block=self._head_layer_index + 1,
+            cu_seqlens=combined_cu_seqlens,
+            max_seqlen=combined_max,
+            position_ids=combined_position_ids,
+            apply_final_norm=True,
+        ).last_hidden_state
+        content_hidden = hidden[content_pos_mask]
+        survivor_embeddings, survivor_cu_seqlens, survivor_counts = (
+            _gather_survivors_packed(
+                content_hidden,
+                mask,
+                content_cu_seqlens,
+            )
+        )
+
+        with torch.no_grad():
+            survive_probs_metrics = survive_probs.detach()
+            valid_count = valid.sum()
+            denom = valid_count.float().clamp(min=1.0)
+            undecided_mask = (
+                (survive_probs_metrics > 0.2)
+                & (survive_probs_metrics < 0.8)
+                & valid
+            )
+            undecided_fraction = undecided_mask.sum().float() / denom
+
+        return LevelOutput(
+            survivor_embeddings=survivor_embeddings,
+            survivor_cu_seqlens=survivor_cu_seqlens,
+            survivor_counts=survivor_counts,
+            survivor_mask=mask,
+            content_embeddings=content_hidden,
+            content_cu_seqlens=content_cu_seqlens,
+            base_raw=base_raw,
+            logits_for_op=logits_for_op,
+            survive_probs=survive_probs,
+            survive_probs_metrics=survive_probs_metrics,
+            theta=theta.detach(),
+            valid_count=valid_count,
+            organic_count=organic_count,
+            controllable_count=controllable_count,
+            floor_trigger_rate=sel.floor_trigger_rate,
+            num_pinned=sel.num_pinned,
+            organic_rate_std=sel.organic_rate_std,
+            undecided_fraction=undecided_fraction,
+        )
 
     def auto_reproduce(self, embeddings: torch.Tensor) -> torch.Tensor:
         """Map pre-norm embeddings back to input embedding space (L0 only).
@@ -607,12 +818,12 @@ def _gather_survivors_packed(
     device = content_embeddings.device
     survivor_embeddings = content_embeddings[survivor_mask]
 
-    B = int(content_cu_seqlens.shape[0]) - 1
+    batch_size = int(content_cu_seqlens.shape[0]) - 1
     n_total = int(survivor_mask.shape[0])
     seg_ids = segment_ids_from_cu(content_cu_seqlens, n_total)
-    counts = torch.zeros(B, dtype=torch.int64, device=device)
+    counts = torch.zeros(batch_size, dtype=torch.int64, device=device)
     counts.index_add_(0, seg_ids, survivor_mask.to(torch.int64))
-    cu = torch.zeros(B + 1, dtype=torch.int32, device=device)
+    cu = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
     cu[1:] = counts.to(torch.int32).cumsum(0)
     return survivor_embeddings, cu, counts
 

@@ -240,7 +240,10 @@ class FalconProjectionSeedTrainer(BaseTrainer):
         decoder_cfg = tcfg.get("model", {}).get("decoder", self.cfg.model.decoder)
         decoder_family = normalize_decoder_family(decoder_cfg.get("family", "falcon_h1"))
         decoder_attention_impl = resolve_decoder_attention_implementation(
-            self.cfg.compute.get("attention_implementation", "auto"),
+            self.cfg.compute.get(
+                "decoder_attention_implementation",
+                self.cfg.compute.get("attention_implementation", "auto"),
+            ),
             decoder_family=decoder_family,
         )
         decoder_name = decoder_cfg.get(

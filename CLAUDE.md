@@ -294,6 +294,38 @@ environment:
 | FlashQLA env smoke | `docker compose -f docker/docker-compose.yaml run --rm smoke-flashqla` |
 | FlashQLA parity test | `docker compose -f docker/docker-compose.yaml run --rm parity-flashqla` |
 | FlashQLA profile harness | `docker compose -f docker/docker-compose.yaml run --rm profile-flashqla` |
+| Luce megakernel env smoke | `docker compose -f docker/docker-compose.yaml run --rm smoke-luce-megakernel` |
+
+### Luce Qwen3.5 megakernel (experimental decoder kernel track)
+
+Local fork: `/home/werg/lucebox-hub` branch `bgkit-sm121-adapter`; Docker mount:
+`/home/werg/lucebox-hub/megakernel` → `/workspace/luce_megakernel:ro`.
+`docker/entrypoint.sh::bootstrap_luce_megakernel()` is **opt-in** via
+`BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL=1`, copies the read-only source into
+`$CHECKPOINT_DIR/.luce-megakernel-native/luce_megakernel`, runs
+`pip install -e . --no-build-isolation --user`, and prepends the cache root
+to `PYTHONPATH`.
+
+Scope now includes B-loop survivor-splice inference and a training-forward
+hidden-state surface. The local fork adds `prefill_embeds_bf16_nvfp4_lm` plus
+Python `Decoder.prefill_embeddings()`, so
+`bgkit.inference.luce_megakernel.LuceSingleSpliceGenerator` can prefill from
+`[prefix token embeddings | survivor embeddings]` and continue greedy decode in
+the Luce NVFP4 megakernel state. It also adds
+`prefill_embeds_bf16_nvfp4_hidden` / `Decoder.prefill_embeddings_hidden()` for
+`[prefix token embeddings | survivor embeddings | suffix token embeddings]`
+hidden-state parity against `ReconstructionDecoder.forward_with_single_splice`.
+It can pack an already-loaded BgKIT/HF Qwen3.5 state dict via
+`weights_from_hf_state_dict()`; this avoids silently falling back to pristine HF
+weights when evaluating our decoder.
+
+Remaining limitations are explicit engineering targets, not accepted final
+scope: greedy decode only until a logits-returning decode op exists; B-loop
+generation, not continuous batching; B=1 hidden prefill first; and no training
+backward yet. The backward track should be designed as a first-class
+custom-autograd path with a saved-intermediate contract, parity against
+HF/FA4+FLA, and separate forward/backward kernel milestones rather than bolting
+gradients onto the inference wrapper.
 
 ## Perf playbook for new training stages
 

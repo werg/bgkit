@@ -85,6 +85,27 @@ class TestPatchDeltanetLayer:
         assert call_kwargs["g"].min().item() >= -0.5
         assert call_kwargs["g"][1].item() == pytest.approx(-0.3)
 
+    def test_raw_gate_in_kernel_bypasses_precomputed_gate_clamp(self, monkeypatch):
+        """Raw-gate mode passes a-projection values to FLA with gate metadata."""
+        monkeypatch.setenv("BGKIT_DELTANET_RAW_GATE_IN_KERNEL", "1")
+        layer = self._make_layer()
+        layer.A_log = torch.nn.Parameter(torch.zeros(2))
+        layer.dt_bias = torch.nn.Parameter(torch.ones(2))
+        original_fn = layer.chunk_gated_delta_rule
+        patch_deltanet_layer(layer, g_clamp_min=-0.5)
+
+        precomputed_g = torch.tensor([-5.0, -0.25])
+        raw_a = torch.tensor([-7.0, 3.0])
+        layer._bgkit_last_raw_gate_a = raw_a
+        layer.chunk_gated_delta_rule(q="q", k="k", v="v", g=precomputed_g, beta="beta")
+
+        call_kwargs = original_fn.call_args.kwargs
+        assert torch.equal(call_kwargs["g"], raw_a)
+        assert call_kwargs["use_gate_in_kernel"] is True
+        assert call_kwargs["A_log"] is layer.A_log
+        assert call_kwargs["dt_bias"] is layer.dt_bias
+        assert call_kwargs["gate_clamp_min"] == pytest.approx(-0.5)
+
     def test_noop_without_chunk_method(self):
         """Layers without chunk_gated_delta_rule are silently skipped."""
         layer = MagicMock(spec=[])

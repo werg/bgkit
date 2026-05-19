@@ -15,10 +15,13 @@ where BgKIT was frozen). ICE model remains frozen.
 
 from __future__ import annotations
 
+import hashlib
 import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import ClassVar
 
+import numpy as np
 import structlog
 import torch
 from torch.utils.data import DataLoader, random_split
@@ -27,12 +30,18 @@ from bgkit.data.collators import collate_compression
 from bgkit.data.datasets.compression_dataset import CompressionDataset
 from bgkit.data.samplers import PackedTokenBudgetSampler
 from bgkit.models.decoder import ReconstructionDecoder, normalize_decoder_family
-from bgkit.models.encoder import BgKITEncoder
-from bgkit.models.projection_block import effective_projection_cu
+from bgkit.models.encoder import BgKITEncoder, EncoderOutput
+from bgkit.models.projection_block import effective_projection_counts, effective_projection_cu
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
-from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
+from bgkit.training.gradient_utils import (
+    configure_decoder_layerwise_split,
+    maybe_enable_decoder_gradient_checkpointing,
+    maybe_enable_frozen_decoder_kernels,
+    maybe_enable_gradient_checkpointing,
+    validate_decoder_lora_freeze_contract,
+)
 from bgkit.training.objectives.commit_reproduction import commit_reproduction_loss
 from bgkit.training.objectives.data_reconstruction import data_reconstruction_loss
 from bgkit.training.objectives.description_generation import description_generation_loss
@@ -56,6 +65,57 @@ _LOSS_FNS = {
     "structural_relational": structural_relational_loss,
     "commit_reproduction": commit_reproduction_loss,
 }
+
+
+class _DecoderOnlyL0PrefixCache:
+    """Bounded LRU for frozen L0 prefix activations."""
+
+    def __init__(self, max_bytes: int, *, device: str | torch.device = "cpu"):
+        self.max_bytes = max(0, int(max_bytes))
+        self.device = torch.device(device)
+        self.current_bytes = 0
+        self._entries: OrderedDict[str, tuple[dict, int]] = OrderedDict()
+
+    @staticmethod
+    def _entry_bytes(entry: dict) -> int:
+        total = 0
+        for key in ("hidden", "base_raw"):
+            tensor = entry[key]
+            total += int(tensor.numel() * tensor.element_size())
+        return total
+
+    def get(self, key: str) -> dict | None:
+        found = self._entries.pop(key, None)
+        if found is None:
+            return None
+        entry, size = found
+        self._entries[key] = (entry, size)
+        return entry
+
+    def put(self, key: str, entry: dict) -> None:
+        if self.max_bytes <= 0:
+            return
+        size = self._entry_bytes(entry)
+        if size > self.max_bytes:
+            return
+        old = self._entries.pop(key, None)
+        if old is not None:
+            self.current_bytes -= old[1]
+        self._entries[key] = (entry, size)
+        self.current_bytes += size
+        while self.current_bytes > self.max_bytes and self._entries:
+            _, (_, evicted_size) = self._entries.popitem(last=False)
+            self.current_bytes -= evicted_size
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
+class _DecoderOnlyL0PrefixCacheMissError(Exception):
+    def __init__(self, hits: int, misses: int):
+        super().__init__("decoder-only L0 prefix cache miss")
+        self.hits = int(hits)
+        self.misses = int(misses)
 
 
 class CompressionTrainer(BaseTrainer):
@@ -116,6 +176,11 @@ class CompressionTrainer(BaseTrainer):
         tcfg = self.cfg.training
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
+        freeze_cfg = tcfg.get("freeze", {})
+        self._bgkit_frozen = bool(freeze_cfg.get("bgkit", False))
+        self._decoder_only_fastpath = bool(
+            self._bgkit_frozen and tcfg.get("decoder_only_fastpath", True)
+        )
         attention_impl = resolve_attention_implementation(
             self.cfg.compute.get("attention_implementation", "auto")
         )
@@ -205,8 +270,17 @@ class CompressionTrainer(BaseTrainer):
         decoder_cfg = tcfg.get("model", {}).get("decoder", self.cfg.model.decoder)
         decoder_family = normalize_decoder_family(decoder_cfg.get("family", "qwen35"))
         self.encoder.set_active_decoder_family(decoder_family)
+        if self._decoder_only_fastpath and decoder_family == "falcon_h1":
+            # The Falcon decoder run keeps BgKIT frozen, so Qwen encoder full
+            # attention is a fixed feature extractor. On sm_121 the FA4 packed
+            # varlen kernel can hard-segfault before Python can fall back; use
+            # segmented SDPA unless the operator explicitly forces another mode.
+            os.environ.setdefault("BGKIT_QWEN35_PACKED_ATTENTION", "sdpa")
         decoder_attention_impl = resolve_decoder_attention_implementation(
-            self.cfg.compute.get("attention_implementation", "auto"),
+            self.cfg.compute.get(
+                "decoder_attention_implementation",
+                self.cfg.compute.get("attention_implementation", "auto"),
+            ),
             decoder_family=decoder_family,
         )
         decoder_name = decoder_cfg.backbone_name
@@ -233,7 +307,15 @@ class CompressionTrainer(BaseTrainer):
         self.decoder.set_lm_ce_impl(
             tcfg.get("decoder_ce_impl", self.cfg.compute.get("decoder_ce_impl", None))
         )
-        logger.info("decoder_ce_impl_selected", impl=self.decoder.lm_ce_impl)
+        self.decoder.set_lm_ce_strict(
+            tcfg.get("decoder_ce_strict", self.cfg.compute.get("decoder_ce_strict", None))
+        )
+        logger.info(
+            "decoder_ce_impl_selected",
+            impl=self.decoder.lm_ce_impl,
+            strict=self.decoder.lm_ce_strict,
+        )
+        configure_decoder_layerwise_split(self.decoder, self.cfg)
 
         # Load decoder from Step 1 checkpoint
         if step1_state_dicts is not None:
@@ -248,6 +330,7 @@ class CompressionTrainer(BaseTrainer):
         # LoRA wrapping (after checkpoint load, before gradient checkpointing)
         self._decoder_lora = False
         lora_cfg = tcfg.get("decoder_lora", {})
+        validate_decoder_lora_freeze_contract(self.cfg)
         if lora_cfg.get("enabled", False):
             self.decoder.apply_lora(lora_cfg)
             self._decoder_lora = True
@@ -260,7 +343,7 @@ class CompressionTrainer(BaseTrainer):
         # Bypassing the validation check isn't enough — the internal handle
         # mapping also breaks. Needs upstream TE fix.
 
-        maybe_enable_gradient_checkpointing(self.decoder.backbone, self.cfg)
+        maybe_enable_decoder_gradient_checkpointing(self.decoder.backbone, self.cfg)
 
         # torch.compile disabled: sm_121 shared memory (101 KB) is too small for
         # inductor-generated Triton kernels (need ~148 KB). "reduce-overhead" and
@@ -271,7 +354,7 @@ class CompressionTrainer(BaseTrainer):
         # Optional Liger Kernel fused kernels. The module patcher is
         # Qwen-specific; Falcon-H1 uses stateful Mamba blocks and should rely
         # on the HF Mamba/causal-conv fast path plus the generic LM CE kernel.
-        if tcfg.get("use_liger", True):
+        if tcfg.get("use_liger", True) and not self._decoder_only_fastpath:
             from bgkit.utils.liger_integration import (
                 apply_liger_to_decoder,
                 apply_liger_to_qwen35,
@@ -313,6 +396,11 @@ class CompressionTrainer(BaseTrainer):
                 patch_rope=patch_rope,
                 use_liger_ce=use_liger_ce,
                 decoder_ce_impl=self.decoder.lm_ce_impl,
+            )
+        elif self._decoder_only_fastpath:
+            logger.info(
+                "liger_kernel_skipped",
+                reason="decoder_only_fastpath_freezes_bgkit",
             )
 
         # BaseTrainer uses self.model for logging
@@ -520,14 +608,18 @@ class CompressionTrainer(BaseTrainer):
 
         import numpy as np
 
-        train_lengths = np.array([
-            self.compression_dataset.token_length(i)
-            for i in self.train_dataset.indices
-        ], dtype=np.int64)
-        eval_lengths = np.array([
-            self.compression_dataset.token_length(i)
-            for i in self.eval_dataset.indices
-        ], dtype=np.int64)
+        sampler_length_source = self._resolve_sampler_length_source(tcfg, decoder_family)
+        sampler_budget_mode = self._resolve_sampler_budget_mode(tcfg, decoder_family)
+        train_lengths = self._sampler_lengths(
+            self.compression_dataset,
+            self.train_dataset.indices,
+            source=sampler_length_source,
+        )
+        eval_lengths = self._sampler_lengths(
+            self.compression_dataset,
+            self.eval_dataset.indices,
+            source=sampler_length_source,
+        )
         # Content-only lengths drive min_sample_length (encoder input);
         # `lengths` includes chat-template overhead used by sampler budget.
         train_content_lengths = np.array([
@@ -546,6 +638,9 @@ class CompressionTrainer(BaseTrainer):
         self._max_batch_tokens_eval = max_batch_tokens_eval
         self._sampler_cost_multiplier = sampler_cost_multiplier
         self._sampler_eval_cost_multiplier = sampler_eval_cost_multiplier
+        self._sampler_budget_mode = sampler_budget_mode
+        self._sampler_eval_budget_mode = sampler_budget_mode
+        self._sampler_length_source = sampler_length_source
 
         self.train_sampler = PackedTokenBudgetSampler(
             self.train_dataset,
@@ -554,6 +649,7 @@ class CompressionTrainer(BaseTrainer):
             shuffle=True,
             seed=seed,
             cost_multiplier=sampler_cost_multiplier,
+            budget_mode=sampler_budget_mode,
         )
         self.train_dataloader = DataLoader(
             self.train_dataset,
@@ -569,6 +665,7 @@ class CompressionTrainer(BaseTrainer):
             max_batch_tokens=max_batch_tokens_eval,
             shuffle=False,
             cost_multiplier=sampler_eval_cost_multiplier,
+            budget_mode=sampler_budget_mode,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
@@ -577,6 +674,70 @@ class CompressionTrainer(BaseTrainer):
             num_workers=num_workers,
             pin_memory=pin_memory,
         )
+
+        if self._bgkit_frozen:
+            self.encoder.requires_grad_(False)
+            self.encoder.eval()
+            logger.info(
+                "bgkit_encoder_frozen_by_config",
+                decoder_only_fastpath=self._decoder_only_fastpath,
+            )
+        if bool(freeze_cfg.get("decoder", False)):
+            self.decoder.requires_grad_(False)
+            maybe_enable_frozen_decoder_kernels(self.decoder, self.cfg)
+            logger.info("decoder_frozen_by_config")
+        self._decoder_only_selection_mode = str(
+            tcfg.get("decoder_only_selection_mode", "exact_topk")
+        )
+        cache_gb = float(
+            os.environ.get(
+                "BGKIT_DECODER_ONLY_L0_PREFIX_CACHE_GB",
+                tcfg.get("decoder_only_l0_prefix_cache_max_gb", 8.0),
+            )
+        )
+        self._decoder_only_l0_prefix_cache_enabled = bool(
+            self._decoder_only_fastpath
+            and tcfg.get("decoder_only_l0_prefix_cache", True)
+            and cache_gb > 0.0
+        )
+        cache_device = str(
+            os.environ.get(
+                "BGKIT_DECODER_ONLY_L0_PREFIX_CACHE_DEVICE",
+                tcfg.get(
+                    "decoder_only_l0_prefix_cache_device",
+                    "cuda" if device.type == "cuda" else "cpu",
+                ),
+            )
+        ).lower()
+        if cache_device.startswith("cuda") and device.type != "cuda":
+            cache_device = "cpu"
+        if cache_device not in {"cpu", "cuda"} and not cache_device.startswith("cuda:"):
+            logger.warning(
+                "decoder_only_l0_prefix_cache_device_invalid",
+                requested=cache_device,
+                fallback="cpu",
+            )
+            cache_device = "cpu"
+        self._decoder_only_l0_prefix_cache = (
+            _DecoderOnlyL0PrefixCache(
+                int(cache_gb * (1024**3)),
+                device=cache_device,
+            )
+            if self._decoder_only_l0_prefix_cache_enabled
+            else None
+        )
+        self._decoder_only_l0_prefix_cache_last = {
+            "hits": 0,
+            "misses": 0,
+            "entries": 0,
+            "bytes": 0,
+        }
+        if self._decoder_only_l0_prefix_cache_enabled:
+            logger.info(
+                "decoder_only_l0_prefix_cache_enabled",
+                max_gb=cache_gb,
+                device=cache_device,
+            )
 
         # --- Optimizer ---
         self._setup_optimizer()
@@ -658,6 +819,9 @@ class CompressionTrainer(BaseTrainer):
     def _calibrate_head_tanh_temperatures(self, n_probe_batches: int = 4) -> None:
         """Probe L0 + L1 head output std at startup and set per-level
         ``head_tanh_temperature_l{0,1}`` buffers."""
+        if getattr(self, "_decoder_only_fastpath", False):
+            logger.info("head_tanh_temperature_calibration_skipped", reason="bgkit_frozen")
+            return
         from bgkit.training.survivorship_helpers import (
             calibrate_head_tanh_temperature,
         )
@@ -1074,6 +1238,42 @@ class CompressionTrainer(BaseTrainer):
         )
         return float(train_multiplier), float(eval_multiplier)
 
+    @staticmethod
+    def _resolve_sampler_budget_mode(tcfg, decoder_family: str) -> str:
+        sampler_cfg = tcfg.get("sampler", {}) or {}
+        explicit = sampler_cfg.get("budget_mode", tcfg.get("sampler_budget_mode", None))
+        mode = str(explicit) if explicit is not None else "packed_quadratic"
+        if mode not in ("packed_quadratic", "padded_quadratic"):
+            raise ValueError(
+                "training.sampler.budget_mode must be 'packed_quadratic' or "
+                f"'padded_quadratic', got {mode!r}"
+            )
+        return mode
+
+    @staticmethod
+    def _resolve_sampler_length_source(tcfg, decoder_family: str) -> str:
+        sampler_cfg = tcfg.get("sampler", {}) or {}
+        explicit = sampler_cfg.get("length_source", tcfg.get("sampler_length_source", None))
+        source = str(explicit) if explicit is not None else "token"
+        if source not in ("token", "decoder"):
+            raise ValueError(
+                "training.sampler.length_source must be 'token' or 'decoder', "
+                f"got {source!r}"
+            )
+        return source
+
+    @staticmethod
+    def _sampler_lengths(dataset, indices, *, source: str) -> np.ndarray:
+        if source == "decoder" and hasattr(dataset, "decoder_token_length"):
+            return np.array([
+                dataset.decoder_token_length(i)
+                for i in indices
+            ], dtype=np.int64)
+        return np.array([
+            dataset.token_length(i)
+            for i in indices
+        ], dtype=np.int64)
+
     def _perform_l1_rebuild(self) -> None:
         """Rebuild dataset and dataloader for L1 phase."""
         import numpy as np
@@ -1083,11 +1283,14 @@ class CompressionTrainer(BaseTrainer):
         # Enable L1 on the dataset
         self.compression_dataset.rebuild_for_l1()
 
+        sampler_length_source = getattr(self, "_sampler_length_source", "token")
+        sampler_budget_mode = getattr(self, "_sampler_budget_mode", "packed_quadratic")
         # Recompute subset-scoped lengths and rebuild sampler
-        train_lengths = np.array([
-            self.compression_dataset.token_length(i)
-            for i in self.train_dataset.indices
-        ], dtype=np.int64)
+        train_lengths = self._sampler_lengths(
+            self.compression_dataset,
+            self.train_dataset.indices,
+            source=sampler_length_source,
+        )
         # Refresh content lengths too so the min_sample_length filter
         # (lazily snapshotted in _rebuild_train_dataloader_with_budget)
         # picks up L1's new sample shapes on the next rebuild.
@@ -1112,6 +1315,8 @@ class CompressionTrainer(BaseTrainer):
         self._max_batch_tokens_eval = max_batch_tokens_eval
         self._sampler_cost_multiplier = sampler_cost_multiplier
         self._sampler_eval_cost_multiplier = sampler_eval_cost_multiplier
+        self._sampler_budget_mode = sampler_budget_mode
+        self._sampler_eval_budget_mode = sampler_budget_mode
         for cached in ("_train_dataset_full", "_train_lengths_full", "_train_content_lengths_full"):
             if hasattr(self, cached):
                 delattr(self, cached)
@@ -1122,6 +1327,7 @@ class CompressionTrainer(BaseTrainer):
             shuffle=True,
             seed=seed,
             cost_multiplier=sampler_cost_multiplier,
+            budget_mode=sampler_budget_mode,
         )
 
         # Rebuild dataloader
@@ -1137,10 +1343,11 @@ class CompressionTrainer(BaseTrainer):
         )
 
         # Rebuild eval sampler/dataloader with updated L1 lengths
-        eval_lengths = np.array([
-            self.compression_dataset.token_length(i)
-            for i in self.eval_dataset.indices
-        ], dtype=np.int64)
+        eval_lengths = self._sampler_lengths(
+            self.compression_dataset,
+            self.eval_dataset.indices,
+            source=sampler_length_source,
+        )
         self._eval_lengths = eval_lengths
         eval_sampler = PackedTokenBudgetSampler(
             self.eval_dataset,
@@ -1148,6 +1355,7 @@ class CompressionTrainer(BaseTrainer):
             max_batch_tokens=max_batch_tokens_eval,
             shuffle=False,
             cost_multiplier=sampler_eval_cost_multiplier,
+            budget_mode=sampler_budget_mode,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
@@ -1201,6 +1409,21 @@ class CompressionTrainer(BaseTrainer):
                 state = init_state()
                 self._surv_state_l1 = state
 
+        if getattr(self, "_decoder_only_fastpath", False):
+            accumulate(state, enc_out, target_ratio=target_ratio)
+            device = getattr(
+                getattr(enc_out, "survivor_embeddings", None),
+                "device",
+                self.device,
+            )
+            zero = torch.tensor(0.0, device=device)
+            return zero, survivorship_diagnostics(
+                enc_out, level=level, global_step=self.global_step,
+                every_n_steps=int(
+                    getattr(self, "_diagnostic_metrics_every_n_steps", 1) or 1
+                ),
+            )
+
         loss, metrics = compute_survivorship_losses(
             enc_out=enc_out,
             level=level,
@@ -1229,7 +1452,225 @@ class CompressionTrainer(BaseTrainer):
     # Compression pipeline
     # ------------------------------------------------------------------
 
-    def _compress_file_batch(
+    @staticmethod
+    def _packed_cu_from_lengths(lengths: list[int]) -> torch.Tensor:
+        cu = torch.zeros(len(lengths) + 1, dtype=torch.int32)
+        if lengths:
+            cu[1:] = torch.tensor(lengths, dtype=torch.int32).cumsum(0)
+        return cu
+
+    @staticmethod
+    def _l0_prefix_cache_key(
+        content_ids: torch.Tensor,
+        prompt_ids: torch.Tensor | None,
+    ) -> str:
+        h = hashlib.blake2b(digest_size=20)
+        content_cpu = content_ids.detach().to("cpu").contiguous()
+        h.update(b"content:")
+        h.update(str(tuple(content_cpu.shape)).encode("ascii"))
+        h.update(content_cpu.numpy().tobytes())
+        if prompt_ids is None:
+            h.update(b":prompt:none")
+        else:
+            prompt_cpu = prompt_ids.detach().to("cpu").contiguous()
+            h.update(b":prompt:")
+            h.update(str(tuple(prompt_cpu.shape)).encode("ascii"))
+            h.update(prompt_cpu.numpy().tobytes())
+        return h.hexdigest()
+
+    def _compress_file_batch_decoder_only_cached(
+        self,
+        batch: dict,
+        target_ratio: float,
+    ) -> EncoderOutput:
+        from bgkit.training.survivorship_helpers import LevelLossCfg
+        from bgkit.utils.packing import lengths_from_cu, position_ids_from_cu
+
+        cache = self._decoder_only_l0_prefix_cache
+        if cache is None:
+            raise RuntimeError("decoder-only L0 prefix cache is not enabled")
+
+        device = self.device
+        content_ids_cpu = batch["content_token_ids"]
+        content_cu_cpu = batch["content_cu_seqlens"]
+        prompt_ids_cpu = batch["compression_prompt_ids"]
+        prompt_cu_cpu = batch["prompt_cu_seqlens"]
+        content_starts = content_cu_cpu.to(torch.int64).tolist()
+        prompt_starts = prompt_cu_cpu.to(torch.int64).tolist()
+        batch_size = len(content_starts) - 1
+        has_prompt = int(prompt_ids_cpu.numel()) > 0
+
+        entries: list[dict | None] = [None] * batch_size
+        keys: list[str] = [""] * batch_size
+        miss_indices: list[int] = []
+        hits = 0
+        for i in range(batch_size):
+            c0, c1 = content_starts[i], content_starts[i + 1]
+            p0, p1 = prompt_starts[i], prompt_starts[i + 1]
+            prompt_slice = prompt_ids_cpu[p0:p1] if has_prompt else None
+            key = self._l0_prefix_cache_key(content_ids_cpu[c0:c1], prompt_slice)
+            keys[i] = key
+            entry = cache.get(key)
+            if entry is None:
+                miss_indices.append(i)
+            else:
+                hits += 1
+                entries[i] = entry
+
+        if miss_indices:
+            # The original decoder-only cache was batch-atomic: any miss forced
+            # the whole microbatch through the frozen encoder. Mixed hit/miss
+            # batches are common with shuffled training, so only encode the
+            # missing samples, insert their frozen prefix activations, then
+            # assemble the full batch from cache below.
+            if hits == 0:
+                raise _DecoderOnlyL0PrefixCacheMissError(
+                    hits=hits,
+                    misses=len(miss_indices),
+                )
+            miss_batch = self._slice_batch(batch, miss_indices)
+            miss_enc_out = self._compress_file_batch_uncached(
+                miss_batch,
+                target_ratio=target_ratio,
+            )
+            miss_enc_out.release()
+            still_missing = 0
+            for i in miss_indices:
+                entry = cache.get(keys[i])
+                if entry is None:
+                    still_missing += 1
+                else:
+                    entries[i] = entry
+            if still_missing:
+                raise _DecoderOnlyL0PrefixCacheMissError(
+                    hits=hits,
+                    misses=still_missing,
+                )
+
+        hidden_blocks: list[torch.Tensor] = []
+        base_raw_blocks: list[torch.Tensor] = []
+        combined_lengths: list[int] = []
+        content_mask_blocks: list[torch.Tensor] = []
+        pos_blocks: list[torch.Tensor] = []
+        for entry in entries:
+            if entry is None:
+                raise RuntimeError("internal L0 prefix cache assembly miss")
+            hidden = entry["hidden"].to(device=device, non_blocking=True)
+            base_raw = entry["base_raw"].to(device=device, non_blocking=True)
+            prompt_len = int(entry["prompt_len"])
+            content_len = int(entry["content_len"])
+            entry_has_prompt = bool(entry["has_prompt"])
+            total_len = int(hidden.shape[0])
+            content_start = prompt_len + 1 if entry_has_prompt else 0
+            mask = torch.zeros(total_len, dtype=torch.bool, device=device)
+            mask[content_start : content_start + content_len] = True
+            hidden_blocks.append(hidden)
+            base_raw_blocks.append(base_raw)
+            combined_lengths.append(total_len)
+            content_mask_blocks.append(mask)
+            pos_blocks.append(torch.arange(total_len, dtype=torch.int64, device=device))
+
+        prefix_hidden = torch.cat(hidden_blocks, dim=0)
+        base_raw = torch.cat(base_raw_blocks, dim=0)
+        combined_cu = self._packed_cu_from_lengths(combined_lengths).to(device)
+        combined_pos = torch.cat(pos_blocks, dim=0)
+        content_pos_mask = torch.cat(content_mask_blocks, dim=0)
+        content_cu = content_cu_cpu.to(device)
+
+        surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
+        l0_out = self.encoder.l0.decoder_only_from_prefix(
+            prefix_hidden=prefix_hidden,
+            combined_cu_seqlens=combined_cu,
+            combined_position_ids=combined_pos,
+            content_pos_mask=content_pos_mask,
+            content_cu_seqlens=content_cu,
+            base_raw=base_raw,
+            target_ratio=target_ratio,
+            min_per_sample=int(surv_l0.min_survivors_absolute_min),
+            selection_mode=self._decoder_only_selection_mode,
+        )
+
+        proj_input = l0_out.survivor_embeddings
+        proj_cu = l0_out.survivor_cu_seqlens
+        proj_lengths = lengths_from_cu(proj_cu).to(torch.int64)
+        proj_max = int(proj_lengths.max().item()) if proj_lengths.numel() else 0
+        proj_pos = position_ids_from_cu(proj_cu, int(proj_input.shape[0]))
+        proj_out = self.encoder.get_active_projection_block()(
+            proj_input,
+            cu_seqlens=proj_cu,
+            max_seqlen=proj_max,
+            position_ids=proj_pos,
+            survivor_mask=None,
+        )
+        out_cu = effective_projection_cu(proj_out, proj_cu)
+        counts = effective_projection_counts(proj_out, proj_cu)
+
+        misses = len(miss_indices)
+        self._decoder_only_l0_prefix_cache_last = {
+            "hits": hits,
+            "misses": misses,
+            "entries": len(cache),
+            "bytes": cache.current_bytes,
+        }
+        return EncoderOutput(
+            survivor_embeddings=proj_out.projected_embeddings,
+            survivor_cu_seqlens=out_cu,
+            survivor_counts=counts,
+            l0=l0_out,
+            l1=None,
+        )
+
+    def _store_decoder_only_l0_prefix_cache(
+        self,
+        batch: dict,
+        l0_out,
+    ) -> None:
+        cache = self._decoder_only_l0_prefix_cache
+        prefix = getattr(l0_out, "_decoder_only_prefix_cache", None)
+        if cache is None or not prefix:
+            return
+        hidden = prefix.get("hidden")
+        base_raw = prefix.get("base_raw")
+        combined_cu = prefix.get("combined_cu_seqlens")
+        if hidden is None or base_raw is None or combined_cu is None:
+            return
+
+        content_ids_cpu = batch["content_token_ids"]
+        content_cu_cpu = batch["content_cu_seqlens"]
+        prompt_ids_cpu = batch["compression_prompt_ids"]
+        prompt_cu_cpu = batch["prompt_cu_seqlens"]
+        content_starts = content_cu_cpu.to(torch.int64).tolist()
+        prompt_starts = prompt_cu_cpu.to(torch.int64).tolist()
+        combined_starts = combined_cu.to(torch.int64).tolist()
+        has_prompt = int(prompt_ids_cpu.numel()) > 0
+        hits = 0
+        misses = 0
+        for i in range(len(content_starts) - 1):
+            c0, c1 = content_starts[i], content_starts[i + 1]
+            p0, p1 = prompt_starts[i], prompt_starts[i + 1]
+            prompt_slice = prompt_ids_cpu[p0:p1] if has_prompt else None
+            key = self._l0_prefix_cache_key(content_ids_cpu[c0:c1], prompt_slice)
+            if cache.get(key) is not None:
+                hits += 1
+                continue
+            h0, h1 = combined_starts[i], combined_starts[i + 1]
+            entry = {
+                "hidden": hidden[h0:h1].detach().to(cache.device).contiguous(),
+                "base_raw": base_raw[c0:c1].detach().to(cache.device).contiguous(),
+                "prompt_len": p1 - p0 if has_prompt else 0,
+                "content_len": c1 - c0,
+                "has_prompt": has_prompt,
+            }
+            cache.put(key, entry)
+            misses += 1
+        self._decoder_only_l0_prefix_cache_last = {
+            "hits": hits,
+            "misses": misses,
+            "entries": len(cache),
+            "bytes": cache.current_bytes,
+        }
+
+    def _compress_file_batch_uncached(
         self, batch: dict, target_ratio: float,
     ):
         """Run L0 compression on a packed FileCompressionSample batch.
@@ -1265,7 +1706,10 @@ class CompressionTrainer(BaseTrainer):
 
         surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
         surv_l1 = getattr(self, "_surv_l1", LevelLossCfg())
-        util_active = surv_l0.utility_grad_loss_weight > 0.0
+        util_active = (
+            surv_l0.utility_grad_loss_weight > 0.0
+            and not getattr(self, "_decoder_only_fastpath", False)
+        )
 
         forced_mask_l0: torch.Tensor | None = None
         if bool(self.cfg.training.get("use_forced_survivor_mask_l0", False)):
@@ -1273,7 +1717,7 @@ class CompressionTrainer(BaseTrainer):
             if raw_forced is not None:
                 forced_mask_l0 = raw_forced.to(device=device, dtype=torch.bool)
 
-        return self.encoder(
+        enc_out = self.encoder(
             content_embeddings=content_emb,
             content_cu_seqlens=content_cu,
             content_position_ids=content_position_ids,
@@ -1285,7 +1729,41 @@ class CompressionTrainer(BaseTrainer):
             min_per_sample_l0=int(surv_l0.min_survivors_absolute_min),
             min_per_sample_l1=int(surv_l1.min_survivors_absolute_min),
             forced_survivor_mask_l0=forced_mask_l0,
+            selection_mode_l0=(
+                self._decoder_only_selection_mode
+                if getattr(self, "_decoder_only_fastpath", False)
+                else "threshold"
+            ),
+            capture_decoder_only_prefix_l0=(
+                getattr(self, "_decoder_only_l0_prefix_cache_enabled", False)
+                and getattr(self, "_decoder_only_fastpath", False)
+            ),
         )
+        if getattr(self, "_decoder_only_l0_prefix_cache_enabled", False):
+            self._store_decoder_only_l0_prefix_cache(batch, enc_out.l0)
+        return enc_out
+
+    def _compress_file_batch(
+        self, batch: dict, target_ratio: float,
+    ):
+        if (
+            getattr(self, "_decoder_only_l0_prefix_cache_enabled", False)
+            and not bool(self.cfg.training.get("use_forced_survivor_mask_l0", False))
+        ):
+            try:
+                return self._compress_file_batch_decoder_only_cached(
+                    batch,
+                    target_ratio=target_ratio,
+                )
+            except _DecoderOnlyL0PrefixCacheMissError as miss:
+                self._decoder_only_l0_prefix_cache_last = {
+                    "hits": miss.hits,
+                    "misses": miss.misses,
+                    "entries": len(self._decoder_only_l0_prefix_cache),
+                    "bytes": self._decoder_only_l0_prefix_cache.current_bytes,
+                }
+
+        return self._compress_file_batch_uncached(batch, target_ratio=target_ratio)
 
     def _compress_repo_l0_packed(self, batch: dict, target_ratio: float):
         """Single packed L0 forward across every file in every repo.
@@ -1311,7 +1789,10 @@ class CompressionTrainer(BaseTrainer):
         prompt_emb = bgkit_embed(prompt_ids)
 
         surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
-        util_active = surv_l0.utility_grad_loss_weight > 0.0
+        util_active = (
+            surv_l0.utility_grad_loss_weight > 0.0
+            and not getattr(self, "_decoder_only_fastpath", False)
+        )
         return self.encoder.l0(
             content_embeddings=content_emb,
             content_cu_seqlens=cu_file,
@@ -1322,6 +1803,11 @@ class CompressionTrainer(BaseTrainer):
             target_ratio=target_ratio,
             utility_grad_active=util_active,
             min_per_sample=int(surv_l0.min_survivors_absolute_min),
+            selection_mode=(
+                self._decoder_only_selection_mode
+                if getattr(self, "_decoder_only_fastpath", False)
+                else "threshold"
+            ),
         )
 
     @staticmethod
@@ -1382,6 +1868,25 @@ class CompressionTrainer(BaseTrainer):
         if loss_mask_flat is not None:
             loss_mask_flat = loss_mask_flat.to(device=device, dtype=torch.bool)
 
+        packed_splice_plan = None
+        if sample_indices is None and batch.get("_bgkit_cuda_graph_probe_batch", False):
+            plan_key = "_bgkit_decoder_packed_splice_plan"
+            packed_splice_plan = batch.get(plan_key)
+            if packed_splice_plan is None:
+                if getattr(self, "_suppress_forward_backward_metrics", False):
+                    raise RuntimeError(
+                        "static decoder splice plan was not warmed before CUDA graph capture"
+                    )
+                packed_splice_plan = self.decoder.build_packed_target_splice_plan(
+                    survivor_cu_seqlens=survivor_cu_seqlens,
+                    target_cu_seqlens=target_cu,
+                    splice_start=splice_start,
+                    splice_len=splice_len,
+                    loss_mask_flat=loss_mask_flat,
+                    sample_indices=None,
+                )
+                batch[plan_key] = packed_splice_plan
+
         return self.decoder.forward_with_packed_target_splice(
             survivor_embeddings=survivors,
             survivor_cu_seqlens=survivor_cu_seqlens,
@@ -1391,7 +1896,16 @@ class CompressionTrainer(BaseTrainer):
             splice_len=splice_len,
             loss_mask_flat=loss_mask_flat,
             sample_indices=sample_indices,
+            packed_splice_plan=packed_splice_plan,
         )
+
+    @staticmethod
+    def _materialize_decoder_input(tensor: torch.Tensor) -> torch.Tensor:
+        """Convert inference-mode tensors before feeding trainable decoder weights."""
+        is_inference = getattr(tensor, "is_inference", None)
+        if callable(is_inference) and is_inference():
+            return tensor.clone()
+        return tensor
 
     # ------------------------------------------------------------------
     # Train step
@@ -1407,7 +1921,10 @@ class CompressionTrainer(BaseTrainer):
         batches additionally run a single packed L1 forward across
         per-repo survivor groups.
         """
-        self.encoder.train()
+        if getattr(self, "_decoder_only_fastpath", False):
+            self.encoder.eval()
+        else:
+            self.encoder.train()
         self.decoder.train()
 
         # Check L1 introduction
@@ -1425,7 +1942,16 @@ class CompressionTrainer(BaseTrainer):
             with torch.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
             ):
-                enc_out = self._compress_file_batch(batch, target_ratio=target_ratio)
+                if getattr(self, "_decoder_only_fastpath", False):
+                    with torch.inference_mode():
+                        enc_out = self._compress_file_batch(
+                            batch, target_ratio=target_ratio,
+                        )
+                    enc_out.survivor_embeddings = self._materialize_decoder_input(
+                        enc_out.survivor_embeddings,
+                    )
+                else:
+                    enc_out = self._compress_file_batch(batch, target_ratio=target_ratio)
                 survivors = enc_out.survivor_embeddings
                 survivor_cu = enc_out.survivor_cu_seqlens
                 loss = self._decoder_forward_single_splice(survivors, survivor_cu, batch)
@@ -1460,6 +1986,7 @@ class CompressionTrainer(BaseTrainer):
             _surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
             if (
                 _surv_l0.utility_grad_loss_weight > 0.0
+                and not getattr(self, "_decoder_only_fastpath", False)
                 and enc_out.l0.post_head_content_values is not None
             ):
                 from bgkit.training.survivorship_helpers import utility_grad_bce_loss
@@ -1478,6 +2005,17 @@ class CompressionTrainer(BaseTrainer):
                     (util_loss * w / self._accum_steps).backward()
                 for k, v in util_metrics.items():
                     surv_metrics[f"l0_{k}"] = v
+
+            if getattr(self, "_suppress_forward_backward_metrics", False):
+                enc_out.release()
+                return {
+                    "loss": 0.0,
+                    "sample_type": sample_type,
+                    "min_target_ratio": float(target_ratio),
+                    "sampled_target_ratio": float(target_ratio),
+                    "actual_ratio": 0.0,
+                    "l1_enabled": float(self._l1_enabled),
+                }
 
             n_survivors = (
                 int(enc_out.l0.survivor_mask.sum().item())
@@ -1506,6 +2044,20 @@ class CompressionTrainer(BaseTrainer):
             "actual_ratio": actual_ratio,
             "l1_enabled": float(self._l1_enabled),
         }
+        if getattr(self, "_decoder_only_l0_prefix_cache_enabled", False):
+            cache_stats = getattr(self, "_decoder_only_l0_prefix_cache_last", {})
+            hits = int(cache_stats.get("hits", 0))
+            misses = int(cache_stats.get("misses", 0))
+            denom = max(hits + misses, 1)
+            metrics.update({
+                "decoder_only_l0_prefix_cache_hit_rate": hits / denom,
+                "decoder_only_l0_prefix_cache_entries": float(
+                    cache_stats.get("entries", 0)
+                ),
+                "decoder_only_l0_prefix_cache_gb": float(
+                    cache_stats.get("bytes", 0)
+                ) / float(1024**3),
+            })
         metrics.update(surv_metrics)
         return metrics
 
@@ -1556,74 +2108,87 @@ class CompressionTrainer(BaseTrainer):
         with torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
         ):
-            # --- Step 1: packed L0 across all files in all repos ---
-            l0_out = self._compress_repo_l0_packed(batch, target_ratio=target_ratio)
-            l0_survivors = l0_out.survivor_embeddings  # (N_surv_l0_total, D)
-            l0_survivor_cu = l0_out.survivor_cu_seqlens  # (total_files + 1,)
+            with torch.set_grad_enabled(
+                not getattr(self, "_decoder_only_fastpath", False)
+            ):
+                # --- Step 1: packed L0 across all files in all repos ---
+                l0_out = self._compress_repo_l0_packed(batch, target_ratio=target_ratio)
+                l0_survivors = l0_out.survivor_embeddings  # (N_surv_l0_total, D)
+                l0_survivor_cu = l0_out.survivor_cu_seqlens  # (total_files + 1,)
 
-            # Collect L0 survivorship aux loss (per-file content segmentation).
-            l0_surv_loss = None
-            if l0_out.logits_for_op is not None:
-                loss_v, l0_metrics = self._compute_survivorship_losses(
-                    l0_out, target_ratio,
-                    level="l0",
-                    content_token_ids=batch["content_token_ids"].to(device),
-                    content_cu_seqlens=batch["cu_file_seqlens"].to(device),
+                # Collect L0 survivorship aux loss (per-file content segmentation).
+                l0_surv_loss = None
+                if l0_out.logits_for_op is not None:
+                    loss_v, l0_metrics = self._compute_survivorship_losses(
+                        l0_out, target_ratio,
+                        level="l0",
+                        content_token_ids=batch["content_token_ids"].to(device),
+                        content_cu_seqlens=batch["cu_file_seqlens"].to(device),
+                    )
+                    l0_surv_loss = loss_v
+                    surv_metrics.update(l0_metrics)
+
+                # --- Step 2: regroup flat L0 survivors into per-repo groups ---
+                l1_input_flat, l1_input_cu = self._regroup_survivors_per_repo(
+                    l0_survivors, l0_survivor_cu, cu_repo,
                 )
-                l0_surv_loss = loss_v
-                surv_metrics.update(l0_metrics)
 
-            # --- Step 2: regroup flat L0 survivors into per-repo groups ---
-            l1_input_flat, l1_input_cu = self._regroup_survivors_per_repo(
-                l0_survivors, l0_survivor_cu, cu_repo,
-            )
+                # Bridge L0 final hidden states into L1's input-embedding space
+                # via L0's auto_repro_head. L1's backbone was deepcopied from
+                # L0 and expects input-embedding-distributed inputs.
+                l1_input_bridged = self.encoder.l0.auto_reproduce(l1_input_flat)
+                n_surv_total = int(l1_input_bridged.shape[0])
+                l1_input_positions = position_ids_from_cu(l1_input_cu, n_surv_total)
 
-            # Bridge L0 final hidden states into L1's input-embedding space
-            # via L0's auto_repro_head. L1's backbone was deepcopied from
-            # L0 and expects input-embedding-distributed inputs.
-            l1_input_bridged = self.encoder.l0.auto_reproduce(l1_input_flat)
-            n_surv_total = int(l1_input_bridged.shape[0])
-            l1_input_positions = position_ids_from_cu(l1_input_cu, n_surv_total)
+                surv_l1 = getattr(self, "_surv_l1", LevelLossCfg())
+                util_w_l1 = (
+                    0.0 if getattr(self, "_decoder_only_fastpath", False)
+                    else surv_l1.utility_grad_loss_weight
+                )
 
-            surv_l1 = getattr(self, "_surv_l1", LevelLossCfg())
-            util_w_l1 = surv_l1.utility_grad_loss_weight
-
-            # --- Step 3: packed L1 forward across all repos ---
-            l1_out = self.encoder.l1(
-                content_embeddings=l1_input_bridged,
-                content_cu_seqlens=l1_input_cu,
-                content_position_ids=l1_input_positions,
-                target_ratio=target_ratio,
-                utility_grad_active=util_w_l1 > 0.0,
-                min_per_sample=int(surv_l1.min_survivors_absolute_min),
-            )
-
-            l1_surv_loss = None
-            if l1_out.logits_for_op is not None:
-                loss_v, l1_metrics = self._compute_survivorship_losses(
-                    l1_out, target_ratio,
-                    level="l1",
-                    content_token_ids=None,
+                # --- Step 3: packed L1 forward across all repos ---
+                l1_out = self.encoder.l1(
+                    content_embeddings=l1_input_bridged,
                     content_cu_seqlens=l1_input_cu,
+                    content_position_ids=l1_input_positions,
+                    target_ratio=target_ratio,
+                    utility_grad_active=util_w_l1 > 0.0,
+                    min_per_sample=int(surv_l1.min_survivors_absolute_min),
+                    selection_mode=(
+                        self._decoder_only_selection_mode
+                        if getattr(self, "_decoder_only_fastpath", False)
+                        else "threshold"
+                    ),
                 )
-                l1_surv_loss = loss_v
-                surv_metrics.update(l1_metrics)
 
-            # --- Step 3.5: project L1 survivors through the shared
-            # projection_block before handing off to the decoder.
-            from bgkit.utils.packing import lengths_from_cu
-            proj_cu = l1_out.survivor_cu_seqlens
-            proj_lengths = lengths_from_cu(proj_cu).to(torch.int64)
-            proj_max = int(proj_lengths.max().item()) if proj_lengths.numel() else 0
-            proj_pos = position_ids_from_cu(proj_cu, int(l1_out.survivor_embeddings.shape[0]))
-            proj_out = self.encoder.projection_block(
-                l1_out.survivor_embeddings,
-                cu_seqlens=proj_cu,
-                max_seqlen=proj_max,
-                position_ids=proj_pos,
-                survivor_mask=None,
-            )
-            projected_cu = effective_projection_cu(proj_out, proj_cu)
+                l1_surv_loss = None
+                if l1_out.logits_for_op is not None:
+                    loss_v, l1_metrics = self._compute_survivorship_losses(
+                        l1_out, target_ratio,
+                        level="l1",
+                        content_token_ids=None,
+                        content_cu_seqlens=l1_input_cu,
+                    )
+                    l1_surv_loss = loss_v
+                    surv_metrics.update(l1_metrics)
+
+                # --- Step 3.5: project L1 survivors through the shared
+                # projection_block before handing off to the decoder.
+                from bgkit.utils.packing import lengths_from_cu
+                proj_cu = l1_out.survivor_cu_seqlens
+                proj_lengths = lengths_from_cu(proj_cu).to(torch.int64)
+                proj_max = int(proj_lengths.max().item()) if proj_lengths.numel() else 0
+                proj_pos = position_ids_from_cu(
+                    proj_cu, int(l1_out.survivor_embeddings.shape[0])
+                )
+                proj_out = self.encoder.projection_block(
+                    l1_out.survivor_embeddings,
+                    cu_seqlens=proj_cu,
+                    max_seqlen=proj_max,
+                    position_ids=proj_pos,
+                    survivor_mask=None,
+                )
+                projected_cu = effective_projection_cu(proj_out, proj_cu)
 
             # --- Step 4: packed decoder across all repos ---
             loss = self._decoder_forward_single_splice(
@@ -1648,6 +2213,7 @@ class CompressionTrainer(BaseTrainer):
         _surv_l0 = getattr(self, "_surv_l0", LevelLossCfg())
         if (
             _surv_l0.utility_grad_loss_weight > 0.0
+            and not getattr(self, "_decoder_only_fastpath", False)
             and l0_out.post_head_content_values is not None
         ):
             from bgkit.training.survivorship_helpers import utility_grad_bce_loss
@@ -1667,6 +2233,7 @@ class CompressionTrainer(BaseTrainer):
 
         if (
             util_w_l1 > 0.0
+            and not getattr(self, "_decoder_only_fastpath", False)
             and l1_out.post_head_content_values is not None
         ):
             from bgkit.training.survivorship_helpers import utility_grad_bce_loss
@@ -1708,9 +2275,12 @@ class CompressionTrainer(BaseTrainer):
         with torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=self.device.type == "cuda",
         ):
-            file_enc_out = self._compress_file_batch(
-                file_batch, target_ratio=target_ratio,
-            )
+            with torch.set_grad_enabled(
+                not getattr(self, "_decoder_only_fastpath", False)
+            ):
+                file_enc_out = self._compress_file_batch(
+                    file_batch, target_ratio=target_ratio,
+                )
             file_loss = self._decoder_forward_single_splice(
                 file_enc_out.survivor_embeddings,
                 file_enc_out.survivor_cu_seqlens,

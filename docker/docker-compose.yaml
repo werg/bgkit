@@ -57,9 +57,10 @@ x-gpu-common: &gpu-common
     # repeated autotune stalls on future training restarts.
     - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
     # Keep Blackwell's fused GDR backward path explicit in every training
-    # service. These are also FLA's sm_121 defaults, but exporting them here
-    # prevents accidental fallback when bisecting or launching ad-hoc shells.
-    - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-1}
+    # service. Real Step 5 fixed-batch profiling is faster and lower-peak-memory
+    # with saved GDR intermediates off, so default to recompute unless an A/B run
+    # explicitly overrides it.
+    - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-0}
     - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
     - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
     - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
@@ -85,6 +86,9 @@ x-gpu-common: &gpu-common
     # Prefer measured Falcon-H1 GB10 configs in the local mamba fork. Set to 0
     # to restore full Triton autotune for A/B runs.
     - MAMBA_SM121_STATIC_CONFIGS=${MAMBA_SM121_STATIC_CONFIGS:-1}
+    # BgKIT-owned Falcon-H1 training fast path in the local mamba fork. Skips
+    # generic stride guards and pins the teacher-forced Mamba2 contract.
+    - MAMBA_FALCON_SM121_FASTPATH=${MAMBA_FALCON_SM121_FASTPATH:-1}
     # PYTHONPATH override: prepend local kernel forks so ad-hoc Docker runs
     # exercise the same in-situ code we are tuning. The mamba fork is first
     # because Falcon-H1 imports pure-Python/Triton mamba_ssm ops from there;
@@ -146,6 +150,10 @@ x-gpu-common: &gpu-common
     # shell env to 0 to disable (e.g. when the extension's reshape logic
     # mishandles unusual head/kv-head configs in projection_block).
     - FLASH_ATTENTION_SM12X_USE_EXTENSION=${FLASH_ATTENTION_SM12X_USE_EXTENSION:-}
+    # Optional Luce Qwen3.5 megakernel bootstrap. Default off because the CUDA
+    # extension is experimental for BgKIT and expensive to build; enable for
+    # smoke/benchmark runs with BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL=1.
+    - BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL=${BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL:-0}
     # FA4 fork rebuild parallelism. entrypoint.sh sets MAX_JOBS=2 inline,
     # but ninja can ignore that under some pip versions and default to
     # nproc — `flash_bwd_hdim*_bf16_sm80.cu` jobs are ~3-5 GB RSS each, so
@@ -191,6 +199,10 @@ x-gpu-common: &gpu-common
     # default GDN backend. Mounted read-only for normal runs; kernels are
     # JIT-compiled by TileLang from the training image.
     - ../../FlashQLA:/workspace/flashqla:ro
+    # Local Luce megakernel checkout (Luce-Org/lucebox-hub/megakernel):
+    # experimental Qwen3.5-0.8B B=1 inference backend. entrypoint.sh copies
+    # this read-only mount into a writable checkpoint cache before building.
+    - ../../lucebox-hub/megakernel:/workspace/luce_megakernel:ro
     # Wandb authenticates via netrc (machine api.wandb.ai).
     - ~/.netrc:/workspace/.netrc:ro
     # Persist torch.compile (inductor) and Triton kernel caches across restarts
@@ -551,7 +563,7 @@ services:
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
       - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
-      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-1}
+      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-0}
       - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
       - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
       - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
@@ -585,7 +597,7 @@ services:
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
       - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
-      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-1}
+      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-0}
       - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
       - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
       - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
@@ -605,6 +617,76 @@ services:
       - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
     command: ["scripts/flashqla_env_smoke.py"]
 
+  # Build/import smoke test for the optional Luce Qwen3.5 megakernel backend.
+  # This enables only the Luce bootstrap and skips FlashAttention bootstrap so
+  # the service is focused on extension build/import health.
+  smoke-luce-megakernel:
+    <<: *gpu-common
+    mem_limit: 40g
+    memswap_limit: 40g
+    restart: "no"
+    environment:
+      - HOME=/workspace
+      - HYDRA_FULL_ERROR=1
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+      - TVM_CACHE_DIR=/workspace/.cache/tvm
+      - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+      - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+      - TORCH_COMPILE_DISABLE=1
+      - FLA_USE_TMA=1
+      - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
+      - BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL=1
+      - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+      - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+      - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
+      - MAX_JOBS=${MAX_JOBS:-2}
+      - NVCC_THREADS=${NVCC_THREADS:-1}
+    command: ["scripts/luce_megakernel_env_smoke.py"]
+
+  # Forward parity for the BgKIT-adapted Luce megakernel. Loads Qwen3.5 once,
+  # packs the same state dict into Luce, and compares token embedding prefill
+  # plus short survivor-splice generation against ReconstructionDecoder.
+  parity-luce-megakernel:
+    <<: *gpu-common
+    mem_limit: 70g
+    memswap_limit: 70g
+    restart: "no"
+    environment:
+      - HOME=/workspace
+      - HYDRA_FULL_ERROR=1
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+      - TVM_CACHE_DIR=/workspace/.cache/tvm
+      - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+      - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+      - TORCH_COMPILE_DISABLE=1
+      - FLA_USE_TMA=1
+      - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=1
+      - BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL=1
+      - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+      - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.45}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+      - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
+      - MAX_JOBS=${MAX_JOBS:-2}
+      - NVCC_THREADS=${NVCC_THREADS:-1}
+    command:
+      [
+        "scripts/test_luce_megakernel_parity.py",
+        "--mode",
+        "all",
+        "--quiet",
+        "--decode-steps",
+        "4",
+        "--max-new-tokens",
+        "2",
+      ]
+
   # FlashQLA parity smoke test. Runs scripts/test_flashqla_parity.py inside
   # the training image with the baked TileLang toolchain and FlashQLA/FLA bind
   # mounts. Hard memory cap (40g) so a runaway JIT compile cannot OOM the host.
@@ -619,7 +701,7 @@ services:
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
       - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
-      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-1}
+      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-0}
       - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
       - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
       - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
@@ -653,7 +735,7 @@ services:
       - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
       - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
       - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
-      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-1}
+      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-0}
       - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
       - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
       - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}

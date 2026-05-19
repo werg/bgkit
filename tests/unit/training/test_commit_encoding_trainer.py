@@ -623,6 +623,64 @@ class TestForwardBackwardSmoke:
         assert result["target_ratio_l0"] > 0.15
 
 
+class TestCheckpointRestore:
+    def test_restore_migrates_legacy_projection_block_keys(self, trainer):
+        encoder_state = trainer.encoder.state_dict()
+        legacy_encoder_state = {}
+        for key, value in encoder_state.items():
+            if key.startswith("projection_blocks.qwen35."):
+                legacy_key = key.replace("projection_blocks.qwen35.", "projection_block.", 1)
+                legacy_encoder_state[legacy_key] = value.detach().clone()
+            else:
+                legacy_encoder_state[key] = value.detach().clone()
+
+        decoder_state = {
+            key: value.detach().clone()
+            for key, value in trainer.decoder.state_dict().items()
+        }
+
+        trainer._restore_model_state(
+            {
+                "encoder": legacy_encoder_state,
+                "decoder": decoder_state,
+            }
+        )
+
+        restored = trainer.encoder.state_dict()
+        for key, expected in encoder_state.items():
+            torch.testing.assert_close(restored[key], expected)
+
+    def test_restore_prefers_merged_decoder_without_lora(self, trainer):
+        encoder_state = {
+            key: value.detach().clone()
+            for key, value in trainer.encoder.state_dict().items()
+        }
+        merged_decoder = {
+            key: value.detach().clone()
+            for key, value in trainer.decoder.state_dict().items()
+        }
+        offset_decoder = {
+            key: value.detach().clone()
+            for key, value in trainer.decoder.state_dict().items()
+        }
+        target_key = "backbone.lm_head.weight"
+        offset_decoder[target_key] = offset_decoder[target_key] + 1.0
+
+        trainer._decoder_lora = False
+        trainer._restore_model_state(
+            {
+                "encoder": encoder_state,
+                "decoder": offset_decoder,
+                "decoder_merged": merged_decoder,
+            }
+        )
+
+        torch.testing.assert_close(
+            trainer.decoder.state_dict()[target_key],
+            merged_decoder[target_key],
+        )
+
+
 # ---------------------------------------------------------------------------
 # Post-step bookkeeping.
 # ---------------------------------------------------------------------------

@@ -41,7 +41,11 @@ Two concerns are addressed here:
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
+import os
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import torch
@@ -63,6 +67,56 @@ logger = logging.getLogger(__name__)
 # Empirically verified: -1.5 fails at T=63 (max exp = 63*1.5 = 94.5 > 88).
 # -1.3 gives max exp = 63*1.3 = 81.9, safely within float32 range.
 DEFAULT_G_CLAMP_MIN = -1.3
+_PACKED_CONTEXT: contextvars.ContextVar[
+    tuple[torch.Tensor | None, torch.Tensor | None]
+] = contextvars.ContextVar("bgkit_deltanet_packed_context", default=(None, None))
+
+
+@contextlib.contextmanager
+def deltanet_packed_context(
+    cu_seqlens: torch.Tensor | None,
+    position_ids: torch.Tensor | None,
+) -> Iterator[None]:
+    """Expose packed sequence metadata to DeltaNet layers HF does not call with it."""
+
+    token = _PACKED_CONTEXT.set((cu_seqlens, position_ids))
+    try:
+        yield
+    finally:
+        _PACKED_CONTEXT.reset(token)
+
+
+def current_deltanet_packed_context() -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Return packed metadata for the current decoder forward, if any."""
+
+    return _PACKED_CONTEXT.get()
+
+
+def _raw_gate_in_kernel_enabled() -> bool:
+    return os.environ.get("BGKIT_DELTANET_RAW_GATE_IN_KERNEL", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _ensure_raw_gate_stash(layer: nn.Module) -> None:
+    """Stash raw a-projection outputs so packed GDR can compute gates in-kernel."""
+
+    in_proj_a = getattr(layer, "in_proj_a", None)
+    if in_proj_a is None or hasattr(layer, "_bgkit_original_in_proj_a_forward"):
+        return
+    original_a_forward = in_proj_a.forward
+
+    def _stashing_in_proj_a_forward(*args, **kwargs):
+        out = original_a_forward(*args, **kwargs)
+        if _raw_gate_in_kernel_enabled():
+            layer._bgkit_last_raw_gate_a = out
+        return out
+
+    layer._bgkit_original_in_proj_a_forward = original_a_forward
+    in_proj_a.forward = _stashing_in_proj_a_forward
 
 
 def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_MIN) -> None:
@@ -114,6 +168,22 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
     def _clamped(*args, **kwargs):
         # chunk_gated_delta_rule signature: (q, k, v, g, beta, ...)
         # HF calls with g= keyword; handle positional args too for robustness.
+        context_cu, _context_position_ids = current_deltanet_packed_context()
+        if context_cu is not None and "cu_seqlens" not in kwargs:
+            kwargs["cu_seqlens"] = context_cu
+        raw_a = getattr(layer, "_bgkit_last_raw_gate_a", None)
+        if _raw_gate_in_kernel_enabled() and isinstance(raw_a, torch.Tensor):
+            if len(args) >= 4:
+                args = list(args)
+                args[3] = raw_a
+                args = tuple(args)
+            else:
+                kwargs["g"] = raw_a
+            kwargs["use_gate_in_kernel"] = True
+            kwargs["A_log"] = layer.A_log
+            kwargs["dt_bias"] = layer.dt_bias
+            kwargs["gate_clamp_min"] = float(g_clamp_min)
+            return original_fn(*args, **kwargs)
         if len(args) >= 4:
             args = list(args)
             args[3] = args[3].clamp(min=g_clamp_min)
@@ -125,6 +195,7 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
 
     layer.chunk_gated_delta_rule = _clamped
     layer._unpatch_chunk_gdr = original_fn  # keep reference for idempotency
+    layer._bgkit_g_clamp_min = float(g_clamp_min)
 
     # ---- 2. Patch layer.forward to accept cu_seqlens / position_ids ----
     # Wave 1.1 will call:
@@ -166,32 +237,33 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
             _restore_4d = True
 
         if cu_seqlens is None:
-            # Non-packed call — legacy path used during transition or single-sample gen.
-            out = original_forward(hidden_states, cache_params, attention_mask)
-            if _restore_4d:
-                out = out.unsqueeze(0)
-            return out
+            for _alias in ("cu_seq_lens_q", "cu_seq_lens_k", "cu_seqlens"):
+                _value = _unused_kwargs.get(_alias)
+                if isinstance(_value, torch.Tensor):
+                    cu_seqlens = _value
+                    break
+        if cu_seqlens is None:
+            cu_seqlens, context_position_ids = current_deltanet_packed_context()
+            if position_ids is None:
+                position_ids = context_position_ids
 
-        # Packed path: temporarily monkey-patch chunk_gated_delta_rule on this instance
-        # to inject cu_seqlens, then call the original forward.
-        #
-        # We do this by wrapping _clamped (which is already layer.chunk_gated_delta_rule)
-        # rather than the original, so gate-clamping still applies.
-        clamped_fn = layer.chunk_gated_delta_rule  # = _clamped above
+        if _raw_gate_in_kernel_enabled():
+            _ensure_raw_gate_stash(layer)
 
-        def _with_cu_seqlens(*args, **kwargs):
-            # Inject cu_seqlens if not already present (don't override explicit passing).
-            if "cu_seqlens" not in kwargs:
-                kwargs["cu_seqlens"] = cu_seqlens
-            return clamped_fn(*args, **kwargs)
-
-        layer.chunk_gated_delta_rule = _with_cu_seqlens
         try:
-            # attention_mask is None in the packed regime — no padded mask.
-            out = original_forward(hidden_states, cache_params, None)
+            if cu_seqlens is None:
+                # Non-packed call — legacy path used during transition or
+                # single-sample generation.
+                out = original_forward(hidden_states, cache_params, attention_mask)
+            else:
+                # The persistent wrapper on ``chunk_gated_delta_rule`` reads
+                # this context and injects ``cu_seqlens``. This avoids creating
+                # and assigning a temporary per-call wrapper on every packed
+                # DeltaNet layer forward.
+                with deltanet_packed_context(cu_seqlens, position_ids):
+                    out = original_forward(hidden_states, cache_params, None)
         finally:
-            # Restore to _clamped so the layer is always in a consistent state.
-            layer.chunk_gated_delta_rule = clamped_fn
+            layer._bgkit_last_raw_gate_a = None
 
         if _restore_4d:
             out = out.unsqueeze(0)

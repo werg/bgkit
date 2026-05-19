@@ -33,6 +33,8 @@ Architecture notes (from model inspection):
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Callable
 
 import torch
@@ -43,8 +45,11 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
 
 from bgkit.utils.attention_backend import bgkit_flash_attention_4_forward
 
+logger = logging.getLogger(__name__)
+_FA4_FALLBACK_WARNED = False
 
-def _cpu_sdpa_packed(
+
+def _sdpa_packed(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -52,20 +57,14 @@ def _cpu_sdpa_packed(
     is_causal: bool,
     scale: float | None,
 ) -> torch.Tensor:
-    """CPU-only packed SDPA — used only by unit tests.
+    """Packed SDPA fallback.
 
-    Production (CUDA) runs strictly through FA4 via
-    ``bgkit_flash_attention_4_forward``. This helper exists solely so
-    host CPU unit tests (which construct mocks with CPU tensors) can
-    still run the encoder forward without a separate mask-based
-    attention path. The call sites in ``_packed_full_attention`` check
-    ``q.is_cuda`` and raise if CUDA tensors reach this helper.
+    CPU unit tests use this directly. CUDA production normally runs through
+    FA4, but on sm_121 the FA4 varlen op can occasionally throw a native
+    ``vector::reserve`` before the Falcon decoder step starts. When that
+    happens, this segmented SDPA fallback keeps frozen-encoder Falcon training
+    alive without changing packed sequence semantics.
     """
-    if query.is_cuda:
-        raise RuntimeError(
-            "_cpu_sdpa_packed should never be called with CUDA tensors; "
-            "FA4 is the only supported GPU path."
-        )
     cu = cu_seqlens.tolist()
     batch = len(cu) - 1
     n_heads = query.shape[1]
@@ -87,6 +86,25 @@ def _cpu_sdpa_packed(
         )
         outputs.append(out_b.squeeze(0).transpose(0, 1))
     return torch.cat(outputs, dim=0)
+
+
+_cpu_sdpa_packed = _sdpa_packed
+
+
+def _fa4_sdpa_fallback_enabled() -> bool:
+    return os.environ.get("BGKIT_QWEN35_FA4_FALLBACK_SDPA", "1") != "0"
+
+
+def _force_sdpa_packed_attention() -> bool:
+    value = os.environ.get("BGKIT_QWEN35_PACKED_ATTENTION", "").strip().lower()
+    return value in {"sdpa", "torch", "fallback"}
+
+
+def _should_fallback_from_fa4(exc: BaseException) -> bool:
+    if not _fa4_sdpa_fallback_enabled():
+        return False
+    text = str(exc)
+    return "vector::reserve" in text
 
 
 # ---------------------------------------------------------------------------
@@ -174,22 +192,50 @@ def _packed_full_attention(
     v = v.contiguous()  # (N, Hkv, Dh)
 
     # FA4 on CUDA (production). CPU branch exists only so host unit tests
-    # with CPU-tensor mocks can run; it raises immediately if CUDA tensors
-    # reach it, ensuring GPU paths always go through FA4.
+    # with CPU-tensor mocks can run. CUDA also uses it as a narrow fallback
+    # for the native FA4 ``vector::reserve`` failure seen on sm_121.
     if q.is_cuda:
-        attn_output, _ = bgkit_flash_attention_4_forward(
-            self_attn,
-            q,
-            k,
-            v,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            position_ids=position_ids,
-            is_causal=is_causal,
-            scale=self_attn.scaling,
-        )
+        if _force_sdpa_packed_attention():
+            attn_output = _sdpa_packed(
+                q, k, v, cu_seqlens=cu_seqlens, is_causal=is_causal, scale=self_attn.scaling,
+            )
+        else:
+            try:
+                attn_output, _ = bgkit_flash_attention_4_forward(
+                    self_attn,
+                    q,
+                    k,
+                    v,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                    position_ids=position_ids,
+                    is_causal=is_causal,
+                    scale=self_attn.scaling,
+                )
+            except (RuntimeError, ValueError) as exc:
+                if not _should_fallback_from_fa4(exc):
+                    raise
+                global _FA4_FALLBACK_WARNED
+                if not _FA4_FALLBACK_WARNED:
+                    logger.warning(
+                        "qwen35_fa4_vector_reserve_fallback_to_sdpa",
+                        extra={
+                            "max_seqlen": max_seqlen,
+                            "tokens": int(q.shape[0]),
+                            "segments": int(cu_seqlens.numel() - 1),
+                        },
+                    )
+                    _FA4_FALLBACK_WARNED = True
+                attn_output = _sdpa_packed(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens=cu_seqlens,
+                    is_causal=is_causal,
+                    scale=self_attn.scaling,
+                )
     else:
-        attn_output = _cpu_sdpa_packed(
+        attn_output = _sdpa_packed(
             q, k, v, cu_seqlens=cu_seqlens, is_causal=is_causal, scale=self_attn.scaling,
         )
     # (N, H, Dh) -> (N, H*Dh)

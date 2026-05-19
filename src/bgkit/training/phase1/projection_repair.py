@@ -163,7 +163,10 @@ class ProjectionRepairTrainer(BaseTrainer):
         decoder_family = normalize_decoder_family(decoder_cfg.get("family", "qwen35"))
         self.encoder.set_active_decoder_family(decoder_family)
         decoder_attention_impl = resolve_decoder_attention_implementation(
-            self.cfg.compute.get("attention_implementation", "auto"),
+            self.cfg.compute.get(
+                "decoder_attention_implementation",
+                self.cfg.compute.get("attention_implementation", "auto"),
+            ),
             decoder_family=decoder_family,
         )
         decoder_name = decoder_cfg.backbone_name
@@ -185,7 +188,14 @@ class ProjectionRepairTrainer(BaseTrainer):
         self.decoder.set_lm_ce_impl(
             tcfg.get("decoder_ce_impl", self.cfg.compute.get("decoder_ce_impl", None))
         )
-        logger.info("decoder_ce_impl_selected", impl=self.decoder.lm_ce_impl)
+        self.decoder.set_lm_ce_strict(
+            tcfg.get("decoder_ce_strict", self.cfg.compute.get("decoder_ce_strict", None))
+        )
+        logger.info(
+            "decoder_ce_impl_selected",
+            impl=self.decoder.lm_ce_impl,
+            strict=self.decoder.lm_ce_strict,
+        )
         if self._decoder_state_dict is not None:
             self.decoder.load_state_dict(self._decoder_state_dict)
             logger.info("loaded_decoder_from_checkpoint")

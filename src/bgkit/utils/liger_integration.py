@@ -657,7 +657,9 @@ def liger_chunked_ce_loss(
     Liger into hundreds of tiny matmuls on GB10, so the dispatcher falls back
     to :func:`bgkit.models.decoder._chunked_lm_ce` unless
     ``BGKIT_FORCE_LIGER_CE=1`` is set. ``BGKIT_LIGER_CE_MAX_INTERNAL_CHUNKS``
-    controls the auto-fallback threshold; default is 64.
+    controls the auto-fallback threshold; default is 64. Qwen3.5's wide vocab
+    can otherwise make the fused path spend hundreds of milliseconds in many
+    small internal chunks on GB10.
 
     Returns:
         Scalar mean loss over unmasked positions.

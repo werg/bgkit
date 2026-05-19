@@ -233,6 +233,7 @@ class PrunedBidirectionalQwen35(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         position_ids: torch.Tensor,
+        end_block: int | None = None,
         layer_hooks: dict[int, Callable[[torch.Tensor], torch.Tensor]] | None = None,
         apply_final_norm: bool = True,
         return_intermediates: bool = False,
@@ -242,8 +243,14 @@ class PrunedBidirectionalQwen35(nn.Module):
         Recomputes position embeddings for the packed sequence. Iterates
         ``blocks[start_block:]``. Applies the final norm if requested.
         """
+        if end_block is None:
+            end_block = len(self.blocks)
         if start_block < 0 or start_block > len(self.blocks):
             raise ValueError(f"start_block must be in [0, {len(self.blocks)}], got {start_block}")
+        if end_block < start_block or end_block > len(self.blocks):
+            raise ValueError(
+                f"end_block must be in [{start_block}, {len(self.blocks)}], got {end_block}"
+            )
         if hidden.ndim != 2:
             raise ValueError(
                 f"PrunedBidirectionalQwen35 expects packed (N, D) hidden; got "
@@ -257,7 +264,7 @@ class PrunedBidirectionalQwen35(nn.Module):
 
         intermediates = [] if return_intermediates else None
 
-        for offset, block in enumerate(self.blocks[start_block:]):
+        for offset, block in enumerate(self.blocks[start_block:end_block]):
             idx = start_block + offset
             hidden = block(
                 hidden,

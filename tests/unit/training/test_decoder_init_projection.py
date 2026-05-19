@@ -7,6 +7,8 @@ but SDPA produces functionally equivalent behavior for these mock shapes.
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -14,11 +16,9 @@ torch = pytest.importorskip("torch")
 from omegaconf import OmegaConf
 from torch import nn
 
-import copy
-
-from bgkit.models.level_compressor import LevelCompressor
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
+from bgkit.models.level_compressor import LevelCompressor
 from bgkit.models.projection_block import ProjectionBlock
 from bgkit.training.phase1.decoder_init import DecoderInitTrainer
 
@@ -257,6 +257,7 @@ def _make_trainer(
     projection_only_steps: int = 0,
     projection_lr: float | None = None,
     freeze_top_layer: bool = True,
+    freeze_decoder: bool = False,
     lr: float = 1e-3,
     lr_scale_bottom: float = 0.1,
     num_layers: int = 4,
@@ -273,6 +274,7 @@ def _make_trainer(
         "train_projection_block": train_projection_block,
         "projection_only_steps": projection_only_steps,
         "freeze_top_layer": freeze_top_layer,
+        "freeze": {"decoder": freeze_decoder},
         "lr_scale_bottom": lr_scale_bottom,
         "optimizer": "adamw",
     }
@@ -579,6 +581,17 @@ class TestProjectionCheckpoint:
         all_opt_params = {id(p) for g in t.optimizer.param_groups for p in g["params"]}
         dec_trainable = {id(p) for p in t.decoder.parameters() if p.requires_grad}
         assert dec_trainable.issubset(all_opt_params)
+
+    def test_freeze_decoder_config_survives_post_transition(self):
+        t = _make_trainer(
+            train_projection_block=True,
+            projection_only_steps=100,
+            freeze_decoder=True,
+        )
+        t.global_step = 150
+        t._configure_trainable_state()
+        assert t._decoder_frozen is True
+        assert not any(p.requires_grad for p in t.decoder.parameters())
 
     def test_resume_derives_state_from_step(self):
         """``_decoder_frozen`` is a pure function of ``global_step``."""

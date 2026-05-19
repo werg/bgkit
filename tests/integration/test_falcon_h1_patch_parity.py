@@ -32,6 +32,7 @@ import os
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 
 def _build_small_falcon(num_layers: int = 2):
@@ -156,6 +157,162 @@ def test_idempotent():
     assert r1.attention > 0 and r1.mlp > 0 and r1.mixer > 0 and r1.layer > 0, r1
 
 
+def test_packed_linear_patches_load_legacy_split_state_dict():
+    """Packed Falcon QKV/MLP projections strict-load old split checkpoint keys."""
+    os.environ.pop("BGKIT_FALCON_H1_PATCH", None)
+    from bgkit.utils.falcon_h1_patch import patch_falcon_h1_decoder
+
+    model_ref, cfg = _build_small_falcon(num_layers=2)
+    legacy_sd = _state_dict_clone(model_ref)
+
+    torch.manual_seed(5678)
+    model_patched, _ = _build_small_falcon(num_layers=2)
+    report = patch_falcon_h1_decoder(model_patched)
+    assert report.attention_packed_qkv == 2, report
+    assert report.mlp_packed_gate_up == 2, report
+
+    model_patched.load_state_dict(legacy_sd)
+    packed_sd = model_patched.state_dict()
+
+    assert "model.layers.0.self_attn.qkv_proj.weight" in packed_sd
+    assert "model.layers.0.self_attn.q_proj.weight" not in packed_sd
+    expected_qkv = torch.cat(
+        (
+            legacy_sd["model.layers.0.self_attn.q_proj.weight"],
+            legacy_sd["model.layers.0.self_attn.k_proj.weight"],
+            legacy_sd["model.layers.0.self_attn.v_proj.weight"],
+        ),
+        dim=0,
+    )
+    torch.testing.assert_close(
+        packed_sd["model.layers.0.self_attn.qkv_proj.weight"],
+        expected_qkv,
+    )
+
+    assert "model.layers.0.feed_forward.gate_up_proj.weight" in packed_sd
+    assert "model.layers.0.feed_forward.gate_proj.weight" not in packed_sd
+    expected_gate_up = torch.cat(
+        (
+            legacy_sd["model.layers.0.feed_forward.gate_proj.weight"],
+            legacy_sd["model.layers.0.feed_forward.up_proj.weight"],
+        ),
+        dim=0,
+    )
+    torch.testing.assert_close(
+        packed_sd["model.layers.0.feed_forward.gate_up_proj.weight"],
+        expected_gate_up,
+    )
+
+    torch.manual_seed(0)
+    ids = torch.randint(0, cfg.vocab_size, (1, 16))
+    model_ref.eval()
+    model_patched.eval()
+    with torch.no_grad():
+        out_ref = model_ref(input_ids=ids, use_cache=False).logits
+        out_p = model_patched(input_ids=ids, use_cache=False).logits
+    torch.testing.assert_close(out_p, out_ref, rtol=0.0, atol=1e-5)
+
+
+def test_packed_falcon_optimizer_state_merges_legacy_split_moments():
+    """Old split optimizer moments are concatenated for packed Falcon params."""
+    from bgkit.training.base_trainer import BaseTrainer
+
+    class _ConcreteTrainer(BaseTrainer):
+        def setup(self):
+            raise NotImplementedError
+
+        def _forward_backward(self, batch):
+            raise NotImplementedError
+
+        def evaluate(self):
+            raise NotImplementedError
+
+    param = torch.nn.Parameter(torch.empty(6, 2))
+    state_by_name = {
+        "decoder.block.self_attn.q_proj.weight": {
+            "momentum_buffer": torch.full((2, 2), 1.0),
+            "step": torch.tensor(3),
+        },
+        "decoder.block.self_attn.k_proj.weight": {
+            "momentum_buffer": torch.full((2, 2), 2.0),
+            "step": torch.tensor(4),
+        },
+        "decoder.block.self_attn.v_proj.weight": {
+            "momentum_buffer": torch.full((2, 2), 3.0),
+            "step": torch.tensor(5),
+        },
+    }
+
+    trainer = object.__new__(_ConcreteTrainer)
+    packed, sources = trainer._packed_falcon_optimizer_state(
+        "decoder.block.self_attn.qkv_proj.weight",
+        param,
+        state_by_name,
+    )
+
+    assert sources == (
+        "decoder.block.self_attn.q_proj.weight",
+        "decoder.block.self_attn.k_proj.weight",
+        "decoder.block.self_attn.v_proj.weight",
+    )
+    assert packed is not None
+    torch.testing.assert_close(
+        packed["momentum_buffer"],
+        torch.cat(
+            (
+                state_by_name["decoder.block.self_attn.q_proj.weight"]["momentum_buffer"],
+                state_by_name["decoder.block.self_attn.k_proj.weight"]["momentum_buffer"],
+                state_by_name["decoder.block.self_attn.v_proj.weight"]["momentum_buffer"],
+            ),
+            dim=0,
+        ),
+    )
+    torch.testing.assert_close(packed["step"], torch.tensor(5))
+
+
+def test_trainable_packed_mlp_autograd_parity_cpu():
+    """Packed trainable MLP autograd matches torch forward/backward on CPU."""
+    from bgkit.kernels.falcon_h1_mlp import falcon_h1_packed_mlp_trainable
+
+    torch.manual_seed(0)
+    batch, seq_len, hidden_size, intermediate_size = 2, 5, 8, 18
+
+    x = torch.randn(batch, seq_len, hidden_size, requires_grad=True)
+    gate_up_weight = torch.randn(2 * intermediate_size, hidden_size, requires_grad=True)
+    gate_up_bias = torch.randn(2 * intermediate_size, requires_grad=True)
+    down_weight = torch.randn(hidden_size, intermediate_size, requires_grad=True)
+    down_bias = torch.randn(hidden_size, requires_grad=True)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    gate_up_weight_ref = gate_up_weight.detach().clone().requires_grad_(True)
+    gate_up_bias_ref = gate_up_bias.detach().clone().requires_grad_(True)
+    down_weight_ref = down_weight.detach().clone().requires_grad_(True)
+    down_bias_ref = down_bias.detach().clone().requires_grad_(True)
+
+    out = falcon_h1_packed_mlp_trainable(
+        x,
+        gate_up_weight,
+        gate_up_bias,
+        down_weight,
+        down_bias,
+    )
+    gate_up_ref = F.linear(x_ref, gate_up_weight_ref, gate_up_bias_ref)
+    gate_ref, up_ref = gate_up_ref.split(intermediate_size, dim=-1)
+    out_ref = F.linear(F.silu(gate_ref) * up_ref, down_weight_ref, down_bias_ref)
+
+    torch.testing.assert_close(out, out_ref)
+
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    out_ref.backward(grad)
+
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    torch.testing.assert_close(gate_up_weight.grad, gate_up_weight_ref.grad)
+    torch.testing.assert_close(gate_up_bias.grad, gate_up_bias_ref.grad)
+    torch.testing.assert_close(down_weight.grad, down_weight_ref.grad)
+    torch.testing.assert_close(down_bias.grad, down_bias_ref.grad)
+
+
 def test_non_unit_multiplier_not_patched():
     """If config has a non-unit multiplier, the patched module count drops."""
     os.environ.pop("BGKIT_FALCON_H1_PATCH", None)
@@ -186,7 +343,7 @@ def test_mixer_cuda_fast_path_parity():
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     try:
-        import mamba_ssm  # noqa: F401
+        import mamba_ssm
     except Exception:
         pytest.skip("requires mamba-ssm")
 
@@ -221,3 +378,69 @@ def test_mixer_cuda_fast_path_parity():
     grad_diff = (g_p.float() - g_ref.float()).abs().max().item()
     print(f"bf16 embed grad max abs diff = {grad_diff:.3e}")
     assert grad_diff < 5e-2, f"grad diff too large: {grad_diff:.3e}"
+
+
+@pytest.mark.gpu
+def test_packed_mamba_seqidx_matches_padded_batch():
+    """Packed Falcon-H1 Mamba seq_idx matches the padded ragged-batch path."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    try:
+        import mamba_ssm
+    except Exception:
+        pytest.skip("requires mamba-ssm")
+
+    os.environ.pop("BGKIT_FALCON_H1_PATCH", None)
+    from bgkit.utils.falcon_h1_patch import patch_falcon_h1_decoder
+
+    model_ref, model_patched, cfg = _two_models_with_same_init(num_layers=2)
+    model_ref = model_ref.to(device="cuda", dtype=torch.bfloat16)
+    model_patched = model_patched.to(device="cuda", dtype=torch.bfloat16)
+    patch_falcon_h1_decoder(model_patched)
+    model_ref.train()
+    model_patched.train()
+
+    torch.manual_seed(0)
+    lengths = [31, 19, 11]
+    max_len = max(lengths)
+    ids = torch.zeros(len(lengths), max_len, dtype=torch.long, device="cuda")
+    mask = torch.zeros(len(lengths), max_len, dtype=torch.bool, device="cuda")
+    for row, length in enumerate(lengths):
+        ids[row, :length] = torch.randint(0, cfg.vocab_size, (length,), device="cuda")
+        mask[row, :length] = True
+
+    with torch.no_grad():
+        padded_logits = model_ref(input_ids=ids, attention_mask=mask, use_cache=False).logits
+
+        flat_ids = torch.cat([ids[row, :length] for row, length in enumerate(lengths)], dim=0)
+        flat_embeds = model_patched.model.embed_tokens(flat_ids).unsqueeze(0)
+        pos_ids = torch.cat(
+            [torch.arange(length, device="cuda", dtype=torch.long) for length in lengths],
+            dim=0,
+        ).unsqueeze(0)
+        cu = torch.tensor(
+            [0, *torch.tensor(lengths, device="cpu").cumsum(0).tolist()],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        seq_idx = torch.repeat_interleave(
+            torch.arange(len(lengths), device="cuda", dtype=torch.int32),
+            torch.tensor(lengths, device="cuda", dtype=torch.int32),
+        ).unsqueeze(0)
+        packed_logits = model_patched(
+            inputs_embeds=flat_embeds,
+            position_ids=pos_ids,
+            use_cache=False,
+            cu_seq_lens_q=cu,
+            cu_seq_lens_k=cu,
+            max_length_q=max_len,
+            max_length_k=max_len,
+            mamba_seq_idx=seq_idx,
+        ).logits
+
+    padded_real = torch.cat(
+        [padded_logits[row, :length] for row, length in enumerate(lengths)],
+        dim=0,
+    )
+    diff = (packed_logits.squeeze(0) - padded_real).abs().max().item()
+    assert diff < 5e-2, f"packed seq_idx logits diff too large: {diff:.3e}"

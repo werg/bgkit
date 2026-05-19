@@ -122,7 +122,10 @@ class DistillationTrainer(BaseTrainer):
         decoder_cfg = self.cfg.model.decoder
         decoder_family = normalize_decoder_family(decoder_cfg.get("family", "qwen35"))
         decoder_attention_impl = resolve_decoder_attention_implementation(
-            self.cfg.compute.get("attention_implementation", "auto"),
+            self.cfg.compute.get(
+                "decoder_attention_implementation",
+                self.cfg.compute.get("attention_implementation", "auto"),
+            ),
             decoder_family=decoder_family,
         )
         decoder_name = decoder_cfg.backbone_name
@@ -144,7 +147,17 @@ class DistillationTrainer(BaseTrainer):
                 self.cfg.compute.get("decoder_ce_impl", None),
             )
         )
-        logger.info("phase3_decoder_ce_impl_selected", impl=self.decoder.lm_ce_impl)
+        self.decoder.set_lm_ce_strict(
+            self.cfg.training.get(
+                "decoder_ce_strict",
+                self.cfg.compute.get("decoder_ce_strict", None),
+            )
+        )
+        logger.info(
+            "phase3_decoder_ce_impl_selected",
+            impl=self.decoder.lm_ce_impl,
+            strict=self.decoder.lm_ce_strict,
+        )
         self.decoder.train()
 
         self.tokenizer = AutoTokenizer.from_pretrained(decoder_name, trust_remote_code=True)

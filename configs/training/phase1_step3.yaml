@@ -204,11 +204,11 @@ moment_match_reference:
 decoder_lora:
   enabled: false
   implementation: peft
-  r: 16
-  alpha: 32
+  r: 32
+  alpha: 64
   dropout: 0.0
   peft_fused_backward: true
-  peft_fuse_gate_up: false
+  peft_fuse_gate_up: true
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 # Do NOT freeze top layer — LoRA handles parameter efficiency

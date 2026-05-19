@@ -171,6 +171,46 @@ class TestDeltanetPatchWiring:
             "cu_seqlens forwarded does not match the one passed to forward"
         )
 
+    def test_packed_path_keeps_chunk_gdr_wrapper_stable(self):
+        """Packed forward must not install a temporary chunk_gdr wrapper per call."""
+        from bgkit.utils.deltanet_patch import patch_deltanet_layer
+
+        captured = {}
+
+        layer = nn.Module()
+        layer.A_log = nn.Parameter(torch.zeros(1))
+
+        def _fake_chunk_gdr(*args, **kwargs):
+            captured["cu_seqlens"] = kwargs.get("cu_seqlens")
+            captured["wrapper_id_during_call"] = id(layer.chunk_gated_delta_rule)
+            return torch.zeros_like(args[0] if args else kwargs["q"]), None
+
+        def _fake_forward(hidden_states, cache_params=None, attention_mask=None):
+            captured["wrapper_id_at_forward_entry"] = id(layer.chunk_gated_delta_rule)
+            q = k = v = torch.randn(1, 5, 1, 4)
+            g = torch.full((1, 5, 1), -0.5)
+            beta = torch.ones(1, 5, 1)
+            layer.chunk_gated_delta_rule(q, k, v, g, beta)
+            captured["wrapper_id_after_call_inside_forward"] = id(
+                layer.chunk_gated_delta_rule
+            )
+            return hidden_states
+
+        layer.chunk_gated_delta_rule = _fake_chunk_gdr
+        layer.forward = _fake_forward
+        patch_deltanet_layer(layer)
+
+        wrapper_id = id(layer.chunk_gated_delta_rule)
+        cu = torch.tensor([0, 3, 5], dtype=torch.long)
+        hidden = torch.randn(1, 5, 32)
+        layer.forward(hidden, cu_seqlens=cu)
+
+        assert id(layer.chunk_gated_delta_rule) == wrapper_id
+        assert captured["wrapper_id_at_forward_entry"] == wrapper_id
+        assert captured["wrapper_id_during_call"] == wrapper_id
+        assert captured["wrapper_id_after_call_inside_forward"] == wrapper_id
+        assert torch.equal(captured["cu_seqlens"], cu)
+
     def test_non_packed_path_unaffected(self):
         """Without cu_seqlens, the patched forward must call original forward normally."""
         from bgkit.utils.deltanet_patch import patch_deltanet_layer
@@ -309,9 +349,15 @@ class TestDeltanetPackedParity:
     @pytest.fixture(autouse=True)
     def check_fla(self):
         try:
+            import fla.utils as _fla_utils
             from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _chk
         except ImportError:
             pytest.skip("fla (flash-linear-attention) not available")
+        if getattr(_fla_utils, "device_platform", None) != "cuda":
+            pytest.skip(
+                "fla-core is not running on CUDA (Triton unavailable on host venv); "
+                "packed DeltaNet parity requires the Docker training container."
+            )
 
     def _load_fixture(self) -> dict:
         return torch.load(DELTANET_FIXTURE, weights_only=False)

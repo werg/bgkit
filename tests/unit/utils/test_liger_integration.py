@@ -288,6 +288,54 @@ class TestLigerChunkedCELossFallback:
         assert hidden.grad is not None
         assert hidden.grad.abs().sum().item() > 0
 
+    def test_qwen_reconstruction_shapes_fall_back_by_default(self, monkeypatch):
+        monkeypatch.delenv("BGKIT_FORCE_LIGER_CE", raising=False)
+        monkeypatch.delenv("BGKIT_DISABLE_LIGER_CE", raising=False)
+        monkeypatch.delenv("BGKIT_LIGER_CE_MAX_INTERNAL_CHUNKS", raising=False)
+
+        assert (
+            liger_integration._estimated_liger_ce_chunks(
+                num_tokens=543,
+                hidden_dim=1024,
+                vocab_size=248_064,
+            )
+            == 136
+        )
+        assert not liger_integration._should_use_liger_ce(
+            num_tokens=543,
+            hidden_dim=1024,
+            vocab_size=248_064,
+        )
+
+    def test_liger_ce_chunk_guard_remains_overridable_upward(self, monkeypatch):
+        monkeypatch.delenv("BGKIT_FORCE_LIGER_CE", raising=False)
+        monkeypatch.delenv("BGKIT_DISABLE_LIGER_CE", raising=False)
+        monkeypatch.setenv("BGKIT_LIGER_CE_MAX_INTERNAL_CHUNKS", "256")
+
+        assert liger_integration._should_use_liger_ce(
+            num_tokens=543,
+            hidden_dim=1024,
+            vocab_size=248_064,
+        )
+
+    def test_liger_ce_force_and_disable_envs_win(self, monkeypatch):
+        monkeypatch.setenv("BGKIT_FORCE_LIGER_CE", "1")
+        monkeypatch.delenv("BGKIT_DISABLE_LIGER_CE", raising=False)
+        monkeypatch.delenv("BGKIT_LIGER_CE_MAX_INTERNAL_CHUNKS", raising=False)
+        assert liger_integration._should_use_liger_ce(
+            num_tokens=543,
+            hidden_dim=1024,
+            vocab_size=248_064,
+        )
+
+        monkeypatch.delenv("BGKIT_FORCE_LIGER_CE", raising=False)
+        monkeypatch.setenv("BGKIT_DISABLE_LIGER_CE", "1")
+        assert not liger_integration._should_use_liger_ce(
+            num_tokens=16,
+            hidden_dim=1024,
+            vocab_size=248_064,
+        )
+
     def test_decoder_hook_enables_liger_ce_flag(self):
         """`ReconstructionDecoder.enable_liger_ce` should toggle the internal
         flag that ``_compute_lm_ce`` consults. Without Liger installed the

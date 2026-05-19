@@ -27,8 +27,8 @@ Sample segmentation is carried in ``cu_seqlens`` (``(B+1,) int32``) — see
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -333,6 +333,113 @@ def adaptive_threshold_select(
         cu_seqlens=cu_seqlens,
         floor_trigger_rate=floor_trigger_rate,
         num_pinned=num_pinned,
+        organic_rate_std=organic_rate_std,
+        _organic_numerator=organic_numerator,
+        _organic_denominator=organic_denominator,
+    )
+
+
+def exact_ratio_topk_select(
+    logits: Tensor,
+    valid_mask: Tensor,
+    target_ratio: float,
+    cu_seqlens: Tensor,
+    pinned: Tensor | None = None,
+    min_per_sample: int = 0,
+) -> SelectionOut:
+    """Select per-sample top-k logits to directly realize ``target_ratio``.
+
+    This is intended for frozen-policy decoder training: the head is no
+    longer being optimized, so waiting for the threshold controller to drift
+    toward the target wastes steps. Pinned positions always survive and sit
+    outside the controllable count; each sample then fills the remaining
+    target quota from its highest-scoring non-pinned positions.
+    """
+    if logits.shape != valid_mask.shape:
+        raise ValueError(
+            f"logits and valid_mask must have the same shape, got "
+            f"{tuple(logits.shape)} vs {tuple(valid_mask.shape)}"
+        )
+    if logits.ndim != 1:
+        raise ValueError(
+            f"exact_ratio_topk_select expects flat (N,) logits; got shape {tuple(logits.shape)}"
+        )
+    if cu_seqlens.ndim != 1:
+        raise ValueError(f"cu_seqlens must be 1-D; got shape {tuple(cu_seqlens.shape)}")
+    ratio = float(target_ratio)
+    if not 0.0 < ratio <= 1.0:
+        raise ValueError(f"target_ratio must lie in (0, 1]; got {target_ratio}")
+
+    n = logits.shape[0]
+    device = logits.device
+    num_segs = cu_seqlens.shape[0] - 1
+    seg_ids = segment_ids_from_cu(cu_seqlens, n)
+    pinned_mask = torch.zeros_like(valid_mask) if pinned is None else pinned & valid_mask
+    controllable = valid_mask & ~pinned_mask
+
+    if num_segs == 0 or n == 0:
+        zero_f = torch.tensor(0.0, device=device)
+        zero_l = torch.zeros((), dtype=torch.int64, device=device)
+        return SelectionOut(
+            mask=torch.zeros_like(valid_mask),
+            cu_seqlens=cu_seqlens,
+            floor_trigger_rate=zero_f,
+            num_pinned=zero_l,
+            organic_rate_std=zero_f,
+            _organic_numerator=zero_l,
+            _organic_denominator=zero_l,
+        )
+
+    valid_counts = torch.zeros(num_segs, dtype=torch.int64, device=device)
+    valid_counts.index_add_(0, seg_ids, valid_mask.to(torch.int64))
+    pinned_counts = torch.zeros(num_segs, dtype=torch.int64, device=device)
+    pinned_counts.index_add_(0, seg_ids, pinned_mask.to(torch.int64))
+    target_counts = torch.ceil(valid_counts.to(torch.float32) * ratio).to(torch.int64)
+    if min_per_sample > 0:
+        min_counts = torch.full_like(valid_counts, int(min_per_sample))
+        min_counts = torch.minimum(min_counts, valid_counts)
+        target_counts = torch.maximum(target_counts, min_counts)
+    target_counts = torch.minimum(target_counts, valid_counts)
+    remaining_counts = (target_counts - pinned_counts).clamp(min=0)
+
+    neg_inf = float("-inf")
+    masked_logits = logits.float().masked_fill(~controllable, neg_inf)
+    order_by_logit = torch.argsort(-masked_logits, stable=True)
+    seg_ids_by_logit = seg_ids[order_by_logit]
+    order_by_seg = torch.argsort(seg_ids_by_logit, stable=True)
+    composed = order_by_logit[order_by_seg]
+    seg_ids_sorted = seg_ids[composed]
+    rank_in_seg = (
+        torch.arange(n, dtype=torch.int64, device=device)
+        - cu_seqlens.to(torch.int64)[seg_ids_sorted]
+    )
+    take_sorted = rank_in_seg < remaining_counts[seg_ids_sorted]
+    topk_mask = torch.zeros(n, dtype=torch.bool, device=device)
+    topk_mask[composed] = take_sorted
+    topk_mask &= controllable
+
+    final_mask = (topk_mask | pinned_mask) & valid_mask
+    selected_controllable = final_mask & controllable
+    organic_numerator = selected_controllable.sum()
+    organic_denominator = controllable.sum()
+
+    selected_per_sample = torch.zeros(num_segs, dtype=torch.float32, device=device)
+    selected_per_sample.index_add_(0, seg_ids, selected_controllable.to(torch.float32))
+    controllable_per_sample = torch.zeros(num_segs, dtype=torch.float32, device=device)
+    controllable_per_sample.index_add_(0, seg_ids, controllable.to(torch.float32))
+    per_sample_rate = selected_per_sample / controllable_per_sample.clamp(min=1.0)
+    per_sample_valid = controllable_per_sample > 0
+    n_valid_samples = per_sample_valid.sum().float().clamp(min=1.0)
+    masked_rate = per_sample_rate * per_sample_valid.float()
+    mean_rate = masked_rate.sum() / n_valid_samples
+    sq_dev = ((per_sample_rate - mean_rate) ** 2) * per_sample_valid.float()
+    organic_rate_std = (sq_dev.sum() / n_valid_samples).clamp(min=0).sqrt()
+
+    return SelectionOut(
+        mask=final_mask,
+        cu_seqlens=cu_seqlens,
+        floor_trigger_rate=torch.tensor(0.0, device=device),
+        num_pinned=pinned_mask.sum(),
         organic_rate_std=organic_rate_std,
         _organic_numerator=organic_numerator,
         _organic_denominator=organic_denominator,

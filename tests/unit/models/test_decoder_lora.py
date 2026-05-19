@@ -21,11 +21,15 @@ from torch.nn import functional as F
 
 from bgkit.models.decoder import DecoderLoRALinear, ReconstructionDecoder
 from bgkit.models.lora_triton import (
+    can_use_triton_deltanet_input_base_dx,
+    can_use_triton_down_swiglu_backward_cat,
     can_use_triton_gate_up_base_dx,
     can_use_triton_lora_dx_add,
     can_use_triton_lora_pair_dx_add,
     can_use_triton_swiglu_backward,
     can_use_triton_swiglu_forward,
+    triton_deltanet_input_base_dx,
+    triton_down_swiglu_backward_cat,
     triton_gate_up_base_dx,
     triton_lora_pair_dx_add_,
     triton_swiglu_backward,
@@ -60,6 +64,61 @@ class _MockMLP(nn.Module):
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _MockRMSNorm(nn.Module):
+    def __init__(self, hidden_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(hidden_dim))
+        self.eps = eps
+
+    def forward(self, x):
+        output = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
+
+
+class _MockLinearAttention(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+    def forward(self, hidden_states, cache_params=None, attention_mask=None):
+        del cache_params, attention_mask
+        return self.proj(hidden_states)
+
+
+class _MockQwenDecoderLayer(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.layer_type = "linear_attention"
+        self.input_layernorm = _MockRMSNorm(hidden_dim)
+        self.linear_attn = _MockLinearAttention(hidden_dim)
+        self.post_attention_layernorm = _MockRMSNorm(hidden_dim)
+        self.mlp = _MockMLP(hidden_dim)
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        **kwargs,
+    ):
+        del position_embeddings, position_ids, kwargs
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.linear_attn(
+            hidden_states=hidden_states,
+            cache_params=past_key_values,
+            attention_mask=attention_mask,
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states
 
 
 class _MockInnerModel(nn.Module):
@@ -109,6 +168,155 @@ class MockCausalLMBackbone(nn.Module):
         out = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
         logits = self.lm_head(out.last_hidden_state)
         return _CausalLMOutput(logits=logits)
+
+
+def apply_rotary_pos_emb(query_states, key_states, cos, sin):
+    return query_states, key_states
+
+
+def _mock_attention_forward(
+    module,
+    query_states,
+    key_states,
+    value_states,
+    attention_mask,
+    dropout=0.0,
+    scaling=None,
+    **kwargs,
+):
+    del module, attention_mask, dropout, scaling, kwargs
+    return (
+        query_states.transpose(1, 2)
+        + key_states.transpose(1, 2)
+        + value_states.transpose(1, 2),
+        None,
+    )
+
+
+class _MockAttentionFunctions:
+    def get_interface(self, impl, fallback):
+        del impl, fallback
+        return _mock_attention_forward
+
+
+ALL_ATTENTION_FUNCTIONS = _MockAttentionFunctions()
+eager_attention_forward = _mock_attention_forward
+
+
+class _MockQwen35Attention(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.head_dim = 4
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim * 2, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.o_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.q_norm = nn.Identity()
+        self.k_norm = nn.Identity()
+        self.layer_idx = 0
+        self.attention_dropout = 0.0
+        self.scaling = 1.0
+
+        class _Config:
+            _attn_implementation = "mock"
+
+        self.config = _Config()
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask,
+        past_key_values=None,
+        **kwargs,
+    ):
+        del kwargs
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+        query_states, gate = torch.chunk(
+            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
+            2,
+            dim=-1,
+        )
+        gate = gate.reshape(*input_shape, -1)
+        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                self.layer_idx,
+            )
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation,
+            eager_attention_forward,
+        )
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output * torch.sigmoid(gate)
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
+class MockQwen35AttentionBackbone(nn.Module):
+    def __init__(self, vocab_size: int = VOCAB_SIZE, hidden_dim: int = HIDDEN_DIM):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.attn = _MockQwen35Attention(hidden_dim)
+        self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        raise NotImplementedError
+
+
+class _MockDeltaNet(nn.Module):
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.in_proj_qkv = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.in_proj_z = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.in_proj_b = nn.Linear(hidden_dim, hidden_dim // 2, bias=False)
+        self.in_proj_a = nn.Linear(hidden_dim, hidden_dim // 2, bias=False)
+        self.out = nn.Linear(hidden_dim * 3, hidden_dim, bias=False)
+
+    def forward(self, x):
+        qkv = self.in_proj_qkv(x)
+        z = self.in_proj_z(x)
+        b = self.in_proj_b(x)
+        a = self.in_proj_a(x)
+        return self.out(torch.cat((qkv, z, b, a), dim=-1))
+
+
+class MockDeltaNetBackbone(nn.Module):
+    def __init__(self, vocab_size: int = VOCAB_SIZE, hidden_dim: int = HIDDEN_DIM):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.linear_attn = _MockDeltaNet(hidden_dim)
+        self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        raise NotImplementedError
+
+
+class MockQwenDecoderLayerBackbone(nn.Module):
+    def __init__(self, vocab_size: int = VOCAB_SIZE, hidden_dim: int = HIDDEN_DIM):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layer = _MockQwenDecoderLayer(hidden_dim)
+        self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        raise NotImplementedError
 
 
 LORA_CONFIG = {
@@ -238,12 +446,20 @@ class TestApplyLora:
         backbone = MockCausalLMBackbone()
         ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
         fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
-        ref.apply_lora({**LORA_CONFIG, "implementation": "peft"})
+        ref.apply_lora(
+            {
+                **LORA_CONFIG,
+                "implementation": "peft",
+                "peft_fused_backward": False,
+                "peft_fuse_gate_up": False,
+            }
+        )
         fused.apply_lora(
             {
                 **LORA_CONFIG,
                 "implementation": "peft",
                 "peft_fused_backward": True,
+                "peft_fuse_gate_up": False,
             }
         )
         fused.load_state_dict(ref.state_dict())
@@ -434,6 +650,27 @@ class TestApplyLora:
             up_weight,
         )
 
+    def test_triton_deltanet_input_base_dx_rejects_cpu_tensors(self):
+        grad_qkv = torch.zeros(4, 12)
+        grad_z = torch.zeros(4, 8)
+        grad_b = torch.zeros(4, 2)
+        grad_a = torch.zeros(4, 2)
+        qkv_weight = torch.zeros(12, 6)
+        z_weight = torch.zeros(8, 6)
+        b_weight = torch.zeros(2, 6)
+        a_weight = torch.zeros(2, 6)
+
+        assert not can_use_triton_deltanet_input_base_dx(
+            grad_qkv,
+            qkv_weight,
+            grad_z,
+            z_weight,
+            grad_b,
+            b_weight,
+            grad_a,
+            a_weight,
+        )
+
     @pytest.mark.skipif(
         not (torch.cuda.is_available() and os.environ.get("BGKIT_RUN_GPU_TESTS")),
         reason="CUDA Triton test; set BGKIT_RUN_GPU_TESTS=1 in the training container",
@@ -500,6 +737,67 @@ class TestApplyLora:
 
         torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.04)
 
+    @pytest.mark.skipif(
+        not (torch.cuda.is_available() and os.environ.get("BGKIT_RUN_GPU_TESTS")),
+        reason="CUDA Triton test; set BGKIT_RUN_GPU_TESTS=1 in the training container",
+    )
+    def test_triton_down_swiglu_backward_cat_matches_torch_cuda(self):
+        torch.manual_seed(0)
+        grad_out = torch.randn(9, 32, device="cuda", dtype=torch.bfloat16)
+        down_weight = torch.randn(32, 64, device="cuda", dtype=torch.bfloat16)
+        gate = torch.randn(9, 64, device="cuda", dtype=torch.bfloat16)
+        up = torch.randn(9, 64, device="cuda", dtype=torch.bfloat16)
+
+        assert can_use_triton_down_swiglu_backward_cat(
+            grad_out,
+            down_weight,
+            gate,
+            up,
+        )
+        actual = triton_down_swiglu_backward_cat(grad_out, down_weight, gate, up)
+        grad_hidden = grad_out @ down_weight
+        sigmoid_gate = torch.sigmoid(gate)
+        silu_gate = gate * sigmoid_gate
+        grad_up = grad_hidden * silu_gate
+        grad_gate = grad_hidden * up * sigmoid_gate * (1.0 + gate * (1.0 - sigmoid_gate))
+        expected = torch.cat((grad_gate, grad_up), dim=-1)
+
+        torch.testing.assert_close(actual, expected, atol=0.2, rtol=0.04)
+
+    @pytest.mark.skipif(
+        not (torch.cuda.is_available() and os.environ.get("BGKIT_RUN_GPU_TESTS")),
+        reason="CUDA Triton test; set BGKIT_RUN_GPU_TESTS=1 in the training container",
+    )
+    def test_triton_deltanet_input_base_dx_matches_torch_cuda(self):
+        torch.manual_seed(0)
+        grad_qkv = torch.randn(7, 96, device="cuda", dtype=torch.bfloat16)
+        grad_z = torch.randn(7, 32, device="cuda", dtype=torch.bfloat16)
+        grad_b = torch.randn(7, 4, device="cuda", dtype=torch.bfloat16)
+        grad_a = torch.randn(7, 4, device="cuda", dtype=torch.bfloat16)
+        qkv_weight = torch.randn(96, 32, device="cuda", dtype=torch.bfloat16)
+        z_weight = torch.randn(32, 32, device="cuda", dtype=torch.bfloat16)
+        b_weight = torch.randn(4, 32, device="cuda", dtype=torch.bfloat16)
+        a_weight = torch.randn(4, 32, device="cuda", dtype=torch.bfloat16)
+
+        actual = triton_deltanet_input_base_dx(
+            grad_qkv,
+            qkv_weight,
+            grad_z,
+            z_weight,
+            grad_b,
+            b_weight,
+            grad_a,
+            a_weight,
+        )
+        expected = (
+            grad_qkv @ qkv_weight
+            + grad_z @ z_weight
+            + grad_b @ b_weight
+            + grad_a @ a_weight
+        )
+
+        torch.testing.assert_close(actual, expected, atol=0.3, rtol=0.04)
+
 
 class TestLoraStateDictCompatibility:
     def test_native_loads_peft_lora_state_dict(self):
@@ -564,6 +862,408 @@ class TestLoraStateDictCompatibility:
             ],
             native_state["backbone.model.q_proj.lora_B"],
         )
+
+
+class TestFrozenMLPFusion:
+    def test_matches_reference_and_computes_only_input_grad(self):
+        torch.manual_seed(123)
+        backbone = MockCausalLMBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused.load_state_dict(ref.state_dict())
+
+        ref.backbone.requires_grad_(False)
+        fused.backbone.requires_grad_(False)
+        assert fused.enable_frozen_mlp_fusion() == 1
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        grad = torch.randn(2, 4, HIDDEN_DIM)
+
+        y_ref = ref.backbone.model.mlp(x_ref)
+        y_fused = fused.backbone.model.mlp(x)
+        torch.testing.assert_close(y_fused, y_ref)
+
+        y_ref.backward(grad)
+        y_fused.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        assert all(p.grad is None for p in fused.backbone.model.mlp.parameters())
+
+    def test_two_matmul_dx_mode_matches_reference(self, monkeypatch):
+        monkeypatch.setenv("BGKIT_DECODER_MLP_BASE_DX", "two")
+        torch.manual_seed(123)
+        backbone = MockCausalLMBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused.load_state_dict(ref.state_dict())
+
+        ref.backbone.requires_grad_(False)
+        fused.backbone.requires_grad_(False)
+        assert fused.enable_frozen_mlp_fusion() == 1
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        grad = torch.randn(2, 4, HIDDEN_DIM)
+
+        y_ref = ref.backbone.model.mlp(x_ref)
+        y_fused = fused.backbone.model.mlp(x)
+        torch.testing.assert_close(y_fused, y_ref)
+
+        y_ref.backward(grad)
+        y_fused.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        assert all(p.grad is None for p in fused.backbone.model.mlp.parameters())
+
+    def test_down_cat_dx_mode_falls_back_on_cpu(self, monkeypatch):
+        monkeypatch.setenv("BGKIT_DECODER_MLP_BASE_DX", "down_cat")
+        torch.manual_seed(123)
+        backbone = MockCausalLMBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused.load_state_dict(ref.state_dict())
+
+        ref.backbone.requires_grad_(False)
+        fused.backbone.requires_grad_(False)
+        assert fused.enable_frozen_mlp_fusion() == 1
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        grad = torch.randn(2, 4, HIDDEN_DIM)
+
+        y_ref = ref.backbone.model.mlp(x_ref)
+        y_fused = fused.backbone.model.mlp(x)
+        torch.testing.assert_close(y_fused, y_ref)
+
+        y_ref.backward(grad)
+        y_fused.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        assert all(p.grad is None for p in fused.backbone.model.mlp.parameters())
+
+    def test_falls_back_when_weights_are_trainable(self):
+        backbone = MockCausalLMBackbone()
+        decoder = ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
+        assert decoder.enable_frozen_mlp_fusion() == 1
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        out = decoder.backbone.model.mlp(x)
+        out.sum().backward()
+
+        assert decoder.backbone.model.mlp.gate_proj.weight.grad is not None
+        assert decoder.backbone.model.mlp.up_proj.weight.grad is not None
+        assert decoder.backbone.model.mlp.down_proj.weight.grad is not None
+
+
+class TestFrozenMLPSwiGLUFusion:
+    def test_matches_reference_and_computes_only_input_grad(self):
+        torch.manual_seed(456)
+        backbone = MockCausalLMBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused.load_state_dict(ref.state_dict())
+
+        ref.backbone.requires_grad_(False)
+        fused.backbone.requires_grad_(False)
+        assert fused.enable_frozen_mlp_swiglu_fusion() == 1
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        grad = torch.randn(2, 4, HIDDEN_DIM)
+
+        y_ref = ref.backbone.model.mlp(x_ref)
+        y_fused = fused.backbone.model.mlp(x)
+        torch.testing.assert_close(y_fused, y_ref)
+
+        y_ref.backward(grad)
+        y_fused.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        assert all(p.grad is None for p in fused.backbone.model.mlp.parameters())
+        assert "_bgkit_frozen_mlp_gate_up_weight" not in fused.state_dict()
+
+    def test_falls_back_when_weights_are_trainable(self):
+        backbone = MockCausalLMBackbone()
+        decoder = ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
+        assert decoder.enable_frozen_mlp_swiglu_fusion() == 0
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        out = decoder.backbone.model.mlp(x)
+        out.sum().backward()
+
+        assert decoder.backbone.model.mlp.gate_proj.weight.grad is not None
+        assert decoder.backbone.model.mlp.up_proj.weight.grad is not None
+        assert decoder.backbone.model.mlp.down_proj.weight.grad is not None
+
+
+class TestFrozenMLPResidualFusion:
+    def test_matches_reference_and_computes_only_input_grad(self):
+        torch.manual_seed(314)
+        backbone = MockQwenDecoderLayerBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused.load_state_dict(ref.state_dict())
+
+        ref.backbone.requires_grad_(False)
+        fused.backbone.requires_grad_(False)
+        assert fused.enable_frozen_mlp_residual_fusion() == 1
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        grad = torch.randn(2, 4, HIDDEN_DIM)
+        pos = (None, None)
+
+        y_ref = ref.backbone.model.layer(x_ref, position_embeddings=pos)
+        y_fused = fused.backbone.model.layer(x, position_embeddings=pos)
+        torch.testing.assert_close(y_fused, y_ref)
+
+        y_ref.backward(grad)
+        y_fused.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-6, rtol=1e-5)
+        assert "_bgkit_frozen_mlp_gate_up_weight" not in fused.state_dict()
+        assert all(p.grad is None for p in fused.backbone.parameters())
+
+    def test_two_matmul_dx_mode_matches_reference(self, monkeypatch):
+        monkeypatch.setenv("BGKIT_DECODER_MLP_BASE_DX", "two")
+        torch.manual_seed(314)
+        backbone = MockQwenDecoderLayerBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused.load_state_dict(ref.state_dict())
+
+        ref.backbone.requires_grad_(False)
+        fused.backbone.requires_grad_(False)
+        assert fused.enable_frozen_mlp_residual_fusion() == 1
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        grad = torch.randn(2, 4, HIDDEN_DIM)
+        pos = (None, None)
+
+        y_ref = ref.backbone.model.layer(x_ref, position_embeddings=pos)
+        y_fused = fused.backbone.model.layer(x, position_embeddings=pos)
+        torch.testing.assert_close(y_fused, y_ref)
+
+        y_ref.backward(grad)
+        y_fused.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad, atol=1e-6, rtol=1e-5)
+        assert all(p.grad is None for p in fused.backbone.parameters())
+
+    def test_skips_trainable_layers(self):
+        decoder = ReconstructionDecoder(MockQwenDecoderLayerBackbone(), hidden_dim=HIDDEN_DIM)
+
+        assert decoder.enable_frozen_mlp_residual_fusion() == 0
+
+
+class TestFrozenLinearDx:
+    def test_matches_reference_and_computes_only_input_grad(self):
+        torch.manual_seed(456)
+        backbone = MockCausalLMBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        wrapped = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        wrapped.load_state_dict(ref.state_dict())
+
+        ref.backbone.requires_grad_(False)
+        wrapped.backbone.requires_grad_(False)
+        assert wrapped.enable_frozen_linear_dx() == 5
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        grad = torch.randn(2, 4, HIDDEN_DIM)
+
+        y_ref = ref.backbone.model(inputs_embeds=x_ref).last_hidden_state
+        y_wrapped = wrapped.backbone.model(inputs_embeds=x).last_hidden_state
+        torch.testing.assert_close(y_wrapped, y_ref)
+
+        y_ref.backward(grad)
+        y_wrapped.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        assert all(p.grad is None for p in wrapped.backbone.parameters())
+
+    def test_falls_back_when_weights_are_trainable(self):
+        decoder = ReconstructionDecoder(MockCausalLMBackbone(), hidden_dim=HIDDEN_DIM)
+        assert decoder.enable_frozen_linear_dx() == 5
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        out = decoder.backbone.model(inputs_embeds=x).last_hidden_state
+        out.sum().backward()
+
+        assert decoder.backbone.model.q_proj.weight.grad is not None
+        assert decoder.backbone.model.v_proj.weight.grad is not None
+
+
+class TestFusedAttentionQKV:
+    def test_matches_reference_and_keeps_state_dict_clean(self):
+        torch.manual_seed(789)
+        backbone = MockQwen35AttentionBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused.load_state_dict(ref.state_dict())
+
+        ref.backbone.requires_grad_(False)
+        fused.backbone.requires_grad_(False)
+        assert fused.enable_fused_attention_qkv() == 1
+        assert fused.enable_fused_attention_qkv() == 1
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        grad = torch.randn(2, 4, HIDDEN_DIM)
+        pos = (None, None)
+
+        y_ref, _ = ref.backbone.model.attn(
+            hidden_states=x_ref,
+            position_embeddings=pos,
+            attention_mask=None,
+        )
+        y_fused, _ = fused.backbone.model.attn(
+            hidden_states=x,
+            position_embeddings=pos,
+            attention_mask=None,
+        )
+        torch.testing.assert_close(y_fused, y_ref)
+
+        y_ref.backward(grad)
+        y_fused.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        assert "_bgkit_qkv_weight" not in fused.state_dict()
+        assert all(p.grad is None for p in fused.backbone.parameters())
+
+    def test_skips_trainable_attention(self):
+        decoder = ReconstructionDecoder(MockQwen35AttentionBackbone(), hidden_dim=HIDDEN_DIM)
+        assert decoder.enable_fused_attention_qkv() == 0
+
+
+class TestFusedDeltaNetZBA:
+    def test_matches_reference_and_keeps_state_dict_keys(self):
+        torch.manual_seed(246)
+        backbone = MockDeltaNetBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused.load_state_dict(ref.state_dict())
+
+        ref.backbone.requires_grad_(False)
+        fused.backbone.requires_grad_(False)
+        assert fused.enable_fused_deltanet_zba() == 1
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        grad = torch.randn(2, 4, HIDDEN_DIM)
+
+        y_ref = ref.backbone.model.linear_attn(x_ref)
+        y_fused = fused.backbone.model.linear_attn(x)
+        torch.testing.assert_close(y_fused, y_ref)
+
+        y_ref.backward(grad)
+        y_fused.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        state_keys = set(fused.state_dict())
+        assert "backbone.model.linear_attn.in_proj_z.weight" in state_keys
+        assert "backbone.model.linear_attn.in_proj_b.weight" in state_keys
+        assert "backbone.model.linear_attn.in_proj_a.weight" in state_keys
+        assert all(p.grad is None for p in fused.backbone.parameters())
+
+    def test_skips_trainable_deltanet(self):
+        decoder = ReconstructionDecoder(MockDeltaNetBackbone(), hidden_dim=HIDDEN_DIM)
+        assert decoder.enable_fused_deltanet_zba() == 0
+
+
+class TestFusedDeltaNetInputBundle:
+    def test_matches_reference_and_keeps_state_dict_keys(self):
+        torch.manual_seed(135)
+        backbone = MockDeltaNetBackbone()
+        ref = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused = ReconstructionDecoder(copy.deepcopy(backbone), hidden_dim=HIDDEN_DIM)
+        fused.load_state_dict(ref.state_dict())
+
+        ref.backbone.requires_grad_(False)
+        fused.backbone.requires_grad_(False)
+        assert fused.enable_fused_deltanet_input_bundle() == 1
+
+        x = torch.randn(2, 4, HIDDEN_DIM, requires_grad=True)
+        x_ref = x.detach().clone().requires_grad_(True)
+        grad = torch.randn(2, 4, HIDDEN_DIM)
+
+        y_ref = ref.backbone.model.linear_attn(x_ref)
+        y_fused = fused.backbone.model.linear_attn(x)
+        torch.testing.assert_close(y_fused, y_ref)
+
+        y_ref.backward(grad)
+        y_fused.backward(grad)
+        torch.testing.assert_close(x.grad, x_ref.grad)
+        state_keys = set(fused.state_dict())
+        assert "backbone.model.linear_attn.in_proj_qkv.weight" in state_keys
+        assert "backbone.model.linear_attn.in_proj_z.weight" in state_keys
+        assert "backbone.model.linear_attn.in_proj_b.weight" in state_keys
+        assert "backbone.model.linear_attn.in_proj_a.weight" in state_keys
+        assert all(p.grad is None for p in fused.backbone.parameters())
+
+    def test_skips_trainable_deltanet(self):
+        decoder = ReconstructionDecoder(MockDeltaNetBackbone(), hidden_dim=HIDDEN_DIM)
+        assert decoder.enable_fused_deltanet_input_bundle() == 0
+
+
+class TestFrozenChunkedCE:
+    def test_matches_chunked_ce_hidden_grad_without_weight_grad(self):
+        torch.manual_seed(321)
+        backbone = MockCausalLMBackbone()
+        decoder = ReconstructionDecoder(backbone, hidden_dim=HIDDEN_DIM)
+        decoder.backbone.lm_head.requires_grad_(False)
+
+        hidden = torch.randn(2, 7, HIDDEN_DIM, requires_grad=True)
+        hidden_ref = hidden.detach().clone().requires_grad_(True)
+        labels = torch.randint(0, VOCAB_SIZE, (2, 7))
+        labels[0, 3] = -100
+        attention_mask = torch.ones(2, 7)
+        loss_mask = torch.ones(2, 7, dtype=torch.bool)
+        loss_mask[:, :2] = False
+        loss_mask[1, -1] = False
+
+        decoder.set_lm_ce_impl("chunked")
+        ref_loss = decoder._compute_lm_ce(
+            lm_head=decoder.backbone.lm_head,
+            hidden_states=hidden_ref,
+            token_ids_full=labels,
+            attention_mask=attention_mask,
+            loss_mask_full=loss_mask,
+            chunk_size=3,
+        )
+        decoder.set_lm_ce_impl("frozen_chunked")
+        loss = decoder._compute_lm_ce(
+            lm_head=decoder.backbone.lm_head,
+            hidden_states=hidden,
+            token_ids_full=labels,
+            attention_mask=attention_mask,
+            loss_mask_full=loss_mask,
+            chunk_size=3,
+        )
+
+        torch.testing.assert_close(loss, ref_loss)
+        ref_loss.backward()
+        loss.backward()
+        torch.testing.assert_close(hidden.grad, hidden_ref.grad, atol=1e-6, rtol=1e-5)
+        assert decoder.backbone.lm_head.weight.grad is None
+
+    def test_setter_accepts_frozen_chunked(self):
+        decoder = ReconstructionDecoder(MockCausalLMBackbone(), hidden_dim=HIDDEN_DIM)
+
+        decoder.set_lm_ce_impl("frozen_chunked")
+
+        assert decoder.lm_ce_impl == "frozen_chunked"
+
+    def test_rejects_trainable_lm_head(self):
+        decoder = ReconstructionDecoder(MockCausalLMBackbone(), hidden_dim=HIDDEN_DIM)
+        decoder.set_lm_ce_impl("frozen_chunked")
+        hidden = torch.randn(1, 4, HIDDEN_DIM, requires_grad=True)
+        labels = torch.randint(0, VOCAB_SIZE, (1, 4))
+        attention_mask = torch.ones(1, 4)
+        loss_mask = torch.ones(1, 4, dtype=torch.bool)
+
+        with pytest.raises(ValueError, match="requires a frozen LM head"):
+            decoder._compute_lm_ce(
+                lm_head=decoder.backbone.lm_head,
+                hidden_states=hidden,
+                token_ids_full=labels,
+                attention_mask=attention_mask,
+                loss_mask_full=loss_mask,
+                chunk_size=2,
+            )
 
 
 class TestMergeLora:

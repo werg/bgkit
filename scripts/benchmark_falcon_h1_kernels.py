@@ -25,6 +25,7 @@ from transformers import AutoConfig
 from transformers.models.falcon_h1 import FalconH1Config, FalconH1ForCausalLM
 
 from bgkit.utils.attention_backend import resolve_decoder_attention_implementation
+from bgkit.utils.falcon_h1_patch import patch_falcon_h1_decoder
 
 DEFAULT_MODEL_ID = "tiiuae/Falcon-H1-Tiny-90M-Instruct"
 
@@ -116,22 +117,35 @@ def case_from_config(
 
 
 def env_record() -> dict[str, Any]:
-    import causal_conv1d
-    import mamba_ssm
-    import mamba_ssm.ops.triton.selective_state_update as selective_state_update
-    import mamba_ssm.ops.triton.ssd_combined as ssd_combined
     import transformers
+
+    def package_version(name: str) -> str | None:
+        try:
+            return importlib_metadata.version(name)
+        except importlib_metadata.PackageNotFoundError:
+            return None
+
+    def module_file(name: str) -> str | None:
+        try:
+            spec = importlib_util.find_spec(name)
+        except ModuleNotFoundError:
+            return None
+        if spec is None or spec.origin is None:
+            return None
+        return str(Path(spec.origin).resolve())
 
     return {
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "transformers": transformers.__version__,
-        "mamba_ssm_version": importlib_metadata.version("mamba-ssm"),
-        "causal_conv1d_version": importlib_metadata.version("causal-conv1d"),
-        "mamba_ssm_file": str(Path(mamba_ssm.__file__).resolve()),
-        "ssd_combined_file": str(Path(ssd_combined.__file__).resolve()),
-        "selective_state_update_file": str(Path(selective_state_update.__file__).resolve()),
-        "causal_conv1d_file": str(Path(causal_conv1d.__file__).resolve()),
+        "mamba_ssm_version": package_version("mamba-ssm"),
+        "causal_conv1d_version": package_version("causal-conv1d"),
+        "mamba_ssm_file": module_file("mamba_ssm"),
+        "ssd_combined_file": module_file("mamba_ssm.ops.triton.ssd_combined"),
+        "selective_state_update_file": module_file(
+            "mamba_ssm.ops.triton.selective_state_update"
+        ),
+        "causal_conv1d_file": module_file("causal_conv1d"),
         "kernels_installed": bool(importlib_util.find_spec("kernels")),
         "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "cuda_capability": (
@@ -139,17 +153,25 @@ def env_record() -> dict[str, Any]:
         ),
         "mamba_sm121_safe_autotune": os.environ.get("MAMBA_SM121_SAFE_AUTOTUNE"),
         "mamba_sm121_static_configs": os.environ.get("MAMBA_SM121_STATIC_CONFIGS"),
+        "mamba_falcon_sm121_fastpath": os.environ.get("MAMBA_FALCON_SM121_FASTPATH"),
+        "bgkit_falcon_h1_mamba_skip_d_in_dx_kernel": os.environ.get(
+            "BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL",
+            "1",
+        ),
         "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR"),
     }
 
 
 def triton_best_configs() -> dict[str, Any]:
-    import mamba_ssm.ops.triton.layernorm_gated as layernorm_gated
-    import mamba_ssm.ops.triton.ssd_bmm as ssd_bmm
-    import mamba_ssm.ops.triton.ssd_chunk_scan as ssd_chunk_scan
-    import mamba_ssm.ops.triton.ssd_chunk_state as ssd_chunk_state
-    import mamba_ssm.ops.triton.ssd_combined as ssd_combined
-    import mamba_ssm.ops.triton.ssd_state_passing as ssd_state_passing
+    try:
+        import mamba_ssm.ops.triton.layernorm_gated as layernorm_gated
+        import mamba_ssm.ops.triton.ssd_bmm as ssd_bmm
+        import mamba_ssm.ops.triton.ssd_chunk_scan as ssd_chunk_scan
+        import mamba_ssm.ops.triton.ssd_chunk_state as ssd_chunk_state
+        import mamba_ssm.ops.triton.ssd_combined as ssd_combined
+        import mamba_ssm.ops.triton.ssd_state_passing as ssd_state_passing
+    except ModuleNotFoundError:
+        return {}
 
     modules = [
         ssd_combined,
@@ -254,14 +276,25 @@ def reset_counts(counts: dict[str, int]) -> None:
         counts[key] = 0
 
 
-def validate_counts(mode: str, counts: dict[str, int]) -> None:
+def validate_counts(
+    mode: str,
+    counts: dict[str, int],
+    *,
+    patch_report: dict[str, int],
+) -> None:
+    patched_attention = bool(patch_report.get("attention", 0))
+    patched_mixer = bool(patch_report.get("mixer", 0))
     if counts["mixer_torch_forward"] != 0:
         raise AssertionError(f"Mamba torch fallback was called: {counts}")
-    if counts["mixer_cuda_kernels_forward"] <= 0:
+    if not patched_mixer and counts["mixer_cuda_kernels_forward"] <= 0:
         raise AssertionError(f"Mamba CUDA fast path was not called: {counts}")
-    if counts["scaled_dot_product_attention"] <= 0:
+    if not patched_attention and counts["scaled_dot_product_attention"] <= 0:
         raise AssertionError(f"SDPA attention was not called: {counts}")
-    if mode == "train" and counts["mamba_split_conv1d_scan_combined"] <= 0:
+    if (
+        mode == "train"
+        and not patched_mixer
+        and counts["mamba_split_conv1d_scan_combined"] <= 0
+    ):
         raise AssertionError(f"training fused Mamba kernel was not called: {counts}")
     if (
         mode == "prefill"
@@ -296,7 +329,54 @@ def make_model(cfg: FalconH1Config, dtype: torch.dtype) -> FalconH1ForCausalLM:
         decoder_family="falcon_h1",
     )
     model = FalconH1ForCausalLM(cfg)
-    return model.to(device="cuda" if torch.cuda.is_available() else "cpu", dtype=dtype)
+    model = model.to(device="cuda" if torch.cuda.is_available() else "cpu", dtype=dtype)
+    if os.environ.get("BGKIT_FALCON_H1_PATCH", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        model._bgkit_falcon_h1_patch_report = patch_falcon_h1_decoder(model)  # type: ignore[attr-defined]
+    return model
+
+
+def patch_report_for(model: FalconH1ForCausalLM) -> dict[str, int]:
+    report = getattr(model, "_bgkit_falcon_h1_patch_report", None)
+    if report is None:
+        return {}
+    return dict(report.as_dict())
+
+
+def reset_internal_profiles() -> None:
+    try:
+        from bgkit.kernels.falcon_h1_mamba import reset_falcon_h1_mamba_profile
+
+        reset_falcon_h1_mamba_profile()
+    except Exception:
+        pass
+    try:
+        from bgkit.kernels.falcon_h1_mlp import reset_falcon_h1_mlp_profile
+
+        reset_falcon_h1_mlp_profile()
+    except Exception:
+        pass
+
+
+def summarize_internal_profiles() -> dict[str, Any]:
+    profiles: dict[str, Any] = {"mamba": [], "mlp": []}
+    try:
+        from bgkit.kernels.falcon_h1_mamba import summarize_falcon_h1_mamba_profile
+
+        profiles["mamba"] = summarize_falcon_h1_mamba_profile()
+    except Exception as exc:
+        profiles["mamba_error"] = repr(exc)
+    try:
+        from bgkit.kernels.falcon_h1_mlp import summarize_falcon_h1_mlp_profile
+
+        profiles["mlp"] = summarize_falcon_h1_mlp_profile()
+    except Exception as exc:
+        profiles["mlp_error"] = repr(exc)
+    return profiles
 
 
 def assert_fast_handles() -> dict[str, bool]:
@@ -588,6 +668,7 @@ def run_case(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     cfg = build_config(args.shape, args.model_id, args.num_hidden_layers)
     dtype = getattr(torch, args.dtype)
     model = make_model(cfg, dtype)
+    patch_report = patch_report_for(model)
     handles = assert_fast_handles()
     case = case_from_config(
         mode=mode,
@@ -633,6 +714,7 @@ def run_case(args: argparse.Namespace, mode: str) -> dict[str, Any]:
             raise ValueError(f"unknown mode {mode!r}")
 
         reset_counts(counts)
+        reset_internal_profiles()
         if mode == "train":
             elapsed_ms, value = run_train_case(
                 model,
@@ -660,7 +742,7 @@ def run_case(args: argparse.Namespace, mode: str) -> dict[str, Any]:
                 warmup=args.warmup,
                 iters=args.iters,
             )
-        validate_counts(mode, counts)
+        validate_counts(mode, counts, patch_report=patch_report)
         call_counts = dict(counts)
 
     peak_memory = (
@@ -672,7 +754,9 @@ def run_case(args: argparse.Namespace, mode: str) -> dict[str, Any]:
         "value": value,
         "peak_cuda_memory_bytes": peak_memory,
         "fast_handles": handles,
+        "patch_report": patch_report,
         "call_counts": call_counts,
+        "internal_profiles": summarize_internal_profiles(),
         "sdpa_flags": {
             "flash": torch.backends.cuda.flash_sdp_enabled(),
             "mem_efficient": torch.backends.cuda.mem_efficient_sdp_enabled(),

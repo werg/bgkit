@@ -38,6 +38,50 @@ gate with `FLA_GDR_SAVE_INTERMEDIATES=1` was worse
 `2,063 target/s`, `61.21 GiB`), so keep `FLA_GDR_SAVE_INTERMEDIATES=0` as the
 trainable-decoder default too.
 
+## LoRA Trade-Off Probe: Speed Is Not The Objective
+
+The LoRA question should be judged as loss/representation improvement per wall
+second and memory GB, not raw adapter step latency. `scripts/benchmark_qwen_decoder_gdr.py`
+now exposes benchmark-only knobs for `--lora-r`, `--lora-alpha`,
+`--lora-targets`, and `--peft-fuse-gate-up`, so synthetic packed-splice probes
+can vary the same surfaces as the training config.
+
+The best current Qwen LoRA implementation candidate is still PEFT with fused
+backward and gate/up fusion enabled. In synthetic packed-splice decoder probes
+at `seq_len=1024`, `survivor_len=512`, `train_survivors=true`, the candidate
+ordering was:
+
+- PEFT r16/all targets, fused backward off: `368.70 ms` median total.
+- PEFT r16/all targets, fused backward on, gate/up off: `352.41 ms`.
+- PEFT r16/all targets, fused backward on, gate/up on: `346.52 ms`.
+- Native fused r16/all targets: `351.67 ms`.
+- PEFT r32/all targets, fused backward on, gate/up on: `346.05 ms`.
+- PEFT r16/attention-only targets, fused backward on, gate/up on: `329.45 ms`.
+- PEFT r16/MLP-only targets, fused backward on, gate/up on: `340.83 ms`.
+
+The target-set timings are not enough to choose attention-only or MLP-only:
+they reduce trainable surface and may lose decoder adaptation capacity. For the
+full all-projection contract, rank was effectively free in the synthetic probe.
+
+Real Step 5 fixed-batch warmed profiles also make r32 plausible. Both used
+`+experiment=phase1_step5_lora_baseline`, `resume_checkpoint=none`,
+`profile.warmup_steps=1`, `profile.steps=1`, fixed repeated Stage-0 batches,
+`peft_fused_backward=true`, `peft_fuse_gate_up=true`, and the same `72,984`
+target-token batch. `profile_training_step_phase1_step5_20260519_153608.json`
+measured r16/alpha32 at `32,415 ms`, `2,252 target/s`, `26.93 GiB` peak, with
+`6.39M` trainable decoder LoRA params. `profile_training_step_phase1_step5_20260519_153347.json`
+measured r32/alpha64 at `32,912 ms`, `2,218 target/s`, `27.01 GiB` peak, with
+`12.78M` trainable decoder LoRA params. The r32 speed cost was therefore only
+about `1.5%` and `0.08 GiB` on this matched real batch.
+
+Conclusion: if LoRA is used as a serious decoder-adaptation path, the current
+best trade-off candidate is `r=32`, `alpha=64`, `dropout=0`, all Qwen
+projection targets, PEFT fused backward, and PEFT gate/up fusion. The remaining
+unknown is quality: run a short fixed-budget A/B training probe and compare
+loss improvement per wall-clock against r16/alpha32 and full-decoder no-LoRA.
+Do not promote attention-only or MLP-only targets until they win on validation
+or representation metrics, not just step speed.
+
 ## 1. Trainable Decoder Backward Fusion
 
 - Treat LoRA as out of scope for the first ambitious decoder kernel. The useful
@@ -2427,3 +2471,51 @@ trainable-decoder default too.
   only per-file token count.
 - Keep batch-shape changes tied to throughput and training semantics, not raw
   optimizer-step wall time.
+
+## 9. Falcon-H1 Trainable Decoder Backward
+
+- The Falcon kernel benchmark now applies the same `patch_falcon_h1_decoder`
+  path as `ReconstructionDecoder` by default and records `patch_report` plus
+  optional BgKIT Mamba/MLP internal profiles. This avoids benchmarking a stock
+  HF model while assuming the training patch is active.
+- On the patched 1-layer Falcon-H1 Tiny train probe (`batch=2`, `seq=1024`,
+  bf16), the dominant measured local bucket remains Mamba scan backward. The
+  best semantics-preserving switch was moving the `D * dout` contribution out
+  of the generic SSD `dx` kernel
+  (`BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL=1`). With internal profiling,
+  the Mamba scan backward bucket moved from roughly `2.93 ms/call` to
+  `2.76 ms/call`; a direct skip-on/skip-off parity probe matched loss, logits,
+  embed grad, and Mamba `D` grad exactly on the same one-layer model/input.
+- Keep Mamba `in_proj` inside the custom autograd boundary by default. Routing
+  it back through PyTorch autograd was slower in the same probe (`13.83 ms`
+  versus the patched default range). The experimental fused layer loop and
+  fused input projection also measured slower on the current tiny probe, so
+  they should stay opt-in until a real multi-layer training profile proves a
+  different result.
+- Real Phase D Falcon L0 fixed-batch profile
+  (`profile_training_step_phase1_falcon_l0_20260519_171907.json`) confirmed the
+  synthetic direction: measured step `13.37s`, `80,013` target tokens,
+  `5,984.8` target tok/s, peak `19.38 GiB`. Stage timers: tensor backward
+  `8.55s` CUDA, decoder forward single-splice `2.50s` CUDA, compression
+  `1.28s` CPU, optimizer `0.285s` CPU. Falcon internals across 192 calls:
+  `mamba_bwd_scan` `1109 ms`, Mamba `in_proj` backward `383 ms`,
+  `mamba_fwd_scan` `432 ms`, MLP trainable backward substeps are smaller
+  (`mlp_bwd_grad_x` `181 ms`, `mlp_bwd_gate_up_weight` `157 ms`,
+  `mlp_bwd_swiglu` `129 ms`).
+- Profiler-captured real step
+  (`profile_training_step_phase1_falcon_l0_20260519_172426.json`) showed the
+  broader target stack: `_FalconH1MambaSplitConv1dScanFnBackward` `2.35s`
+  CUDA total, FlashAttention varlen backward `1.39s`, Falcon packed MLP
+  backward `0.85s`, and generic `aten::mm`/`matmul` work still dominates the
+  total table. This means the next ambitious win is still a deeper Mamba
+  backward/linear-gradient rewrite, but attention backward is now the next
+  credible item after that.
+- Mamba tuning rejects so far: `BGKIT_FALCON_H1_MAMBA_CHUNK_SIZE=64/256` did
+  not beat the default `128` on the seq-1408 one-layer probe, and
+  `BGKIT_FALCON_H1_MAMBA_SAVE_CONV=0` was worse on the real fixed batch
+  (`16.23s` measured step, `18.54 GiB` peak), so saved conv should remain on.
+- Attention tuning rejects so far: direct HF flash attention was slower on the
+  seq-1408 one-layer train probe (`15.76 ms` vs `13.02 ms` baseline). Direct
+  SDPA was neutral synthetically (`13.05 ms`) but failed on the real fixed
+  batch with the native SM12x FlashAttention backward internal assert, so it
+  must remain opt-in/off.

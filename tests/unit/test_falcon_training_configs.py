@@ -49,6 +49,10 @@ def test_shared_decoder_training_contract_defaults_to_full_decoder_no_lora():
         cfg = compose(config_name="config")
 
     assert cfg.training.decoder_lora.enabled is False
+    assert cfg.training.decoder_lora.r == 32
+    assert cfg.training.decoder_lora.alpha == 64
+    assert cfg.training.decoder_lora.peft_fused_backward is True
+    assert cfg.training.decoder_lora.peft_fuse_gate_up is True
     assert cfg.training.freeze.decoder is False
     assert cfg.training.decoder_gradient_checkpointing is False
     assert cfg.training.decoder_layerwise_split.mode == "0"
@@ -66,6 +70,10 @@ def test_qwen_training_configs_disable_decoder_lora_by_default():
         cfg = OmegaConf.load(ROOT / "configs" / "training" / name)
 
         assert cfg.decoder_lora.enabled is False
+        assert cfg.decoder_lora.r == 32
+        assert cfg.decoder_lora.alpha == 64
+        assert cfg.decoder_lora.peft_fused_backward is True
+        assert cfg.decoder_lora.peft_fuse_gate_up is True
 
 
 def _assert_qwen_step5_full_decoder_no_lora_contract(cfg):
@@ -101,4 +109,8 @@ def test_qwen_step5_lora_baseline_stays_explicit():
 
     assert cfg.training.phase == "phase1_step5"
     assert cfg.training.decoder_lora.enabled is True
+    assert cfg.training.decoder_lora.r == 32
+    assert cfg.training.decoder_lora.alpha == 64
+    assert cfg.training.decoder_lora.peft_fused_backward is True
+    assert cfg.training.decoder_lora.peft_fuse_gate_up is True
     assert cfg.training.freeze.decoder is False

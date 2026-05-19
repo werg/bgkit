@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 try:
@@ -17,6 +19,30 @@ except ImportError:  # pragma: no cover - exercised on CPU-only installs
 def _require_triton() -> None:
     if triton is None or tl is None:
         raise RuntimeError("native NVFP4 Triton kernel requires triton")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {value}")
+    return value
+
+
+def _launch_param(name: str, default: int, *, kernel: str) -> int:
+    fallback = _env_int(f"BGKIT_NATIVE_NVFP4_{name}", default)
+    return _env_int(f"BGKIT_NATIVE_NVFP4_{kernel}_{name}", fallback)
+
+
+def _validate_block(name: str, value: int, *, multiple: int) -> int:
+    if value % multiple != 0:
+        raise ValueError(f"{name} must be divisible by {multiple}, got {value}")
+    return value
 
 
 @triton.jit
@@ -182,9 +208,23 @@ def _launch_forward(
     _require_triton()
     m = x_2d.shape[0]
     y = torch.empty((m, out_features), device=x_2d.device, dtype=x_2d.dtype)
-    block_m = 16
-    block_n = 64
-    block_k = 64
+    block_m = _validate_block(
+        "BGKIT_NATIVE_NVFP4_FWD_BLOCK_M",
+        _launch_param("BLOCK_M", 128, kernel="FWD"),
+        multiple=16,
+    )
+    block_n = _validate_block(
+        "BGKIT_NATIVE_NVFP4_FWD_BLOCK_N",
+        _launch_param("BLOCK_N", 128, kernel="FWD"),
+        multiple=16,
+    )
+    block_k = _validate_block(
+        "BGKIT_NATIVE_NVFP4_FWD_BLOCK_K",
+        _launch_param("BLOCK_K", 64, kernel="FWD"),
+        multiple=32,
+    )
+    num_warps = _launch_param("WARPS", 4, kernel="FWD")
+    num_stages = _launch_param("STAGES", 3, kernel="FWD")
     grid = (triton.cdiv(m, block_m), triton.cdiv(out_features, block_n))
     _nvfp4_linear_fwd_kernel[grid](
         x_2d,
@@ -200,8 +240,8 @@ def _launch_forward(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
-        num_warps=4,
-        num_stages=3,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return y
 
@@ -218,9 +258,23 @@ def _launch_backward_dx(
     _require_triton()
     m = dy_2d.shape[0]
     dx = torch.empty((m, in_features), device=dy_2d.device, dtype=dy_2d.dtype)
-    block_m = 16
-    block_n = 64
-    block_k = 64
+    block_m = _validate_block(
+        "BGKIT_NATIVE_NVFP4_BWD_BLOCK_M",
+        _launch_param("BLOCK_M", 64, kernel="BWD"),
+        multiple=16,
+    )
+    block_n = _validate_block(
+        "BGKIT_NATIVE_NVFP4_BWD_BLOCK_N",
+        _launch_param("BLOCK_N", 64, kernel="BWD"),
+        multiple=16,
+    )
+    block_k = _validate_block(
+        "BGKIT_NATIVE_NVFP4_BWD_BLOCK_K",
+        _launch_param("BLOCK_K", 64, kernel="BWD"),
+        multiple=32,
+    )
+    num_warps = _launch_param("WARPS", 4, kernel="BWD")
+    num_stages = _launch_param("STAGES", 3, kernel="BWD")
     grid = (triton.cdiv(m, block_m), triton.cdiv(in_features, block_k))
     _nvfp4_linear_bwd_dx_kernel[grid](
         dy_2d,
@@ -234,8 +288,8 @@ def _launch_backward_dx(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
-        num_warps=4,
-        num_stages=3,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return dx
 

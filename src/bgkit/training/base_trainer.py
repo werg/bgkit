@@ -615,6 +615,16 @@ class BaseTrainer(ABC):
         if optimizer_type == "muon":
             from bgkit.training.muon import Muon
 
+            muon_ns_steps = self.cfg.training.get("muon_ns_steps", None)
+            if muon_ns_steps is not None:
+                muon_ns_steps = int(muon_ns_steps)
+                if muon_ns_steps < 1:
+                    raise ValueError(
+                        f"training.muon_ns_steps must be >= 1, got {muon_ns_steps}"
+                    )
+                for group in param_groups:
+                    group.setdefault("ns_steps", muon_ns_steps)
+
             split_groups = self._split_for_muon(param_groups, self._muon_exclude_set)
             optimizer = Muon(split_groups)
             muon_count = sum(
@@ -633,6 +643,7 @@ class BaseTrainer(ABC):
                 muon_params=muon_count,
                 adam_params=adam_count,
                 groups=len(split_groups),
+                ns_steps=muon_ns_steps if muon_ns_steps is not None else 5,
             )
             return optimizer
 
@@ -925,6 +936,72 @@ class BaseTrainer(ABC):
 
         return tuple(names)
 
+    def _packed_optimizer_state_from_parts(
+        self,
+        param: torch.nn.Parameter,
+        state_by_name: dict,
+        source_names: tuple[str, ...],
+    ) -> tuple[dict | None, tuple[str, ...]]:
+        source_states = tuple(state_by_name.get(source_name) for source_name in source_names)
+        if not all(isinstance(source_state, dict) for source_state in source_states):
+            return None, ()
+
+        packed: dict = {}
+        common_keys = set(source_states[0])
+        for source_state in source_states[1:]:
+            common_keys &= set(source_state)
+        for key in common_keys:
+            values = tuple(source_state[key] for source_state in source_states)
+            if all(isinstance(value, torch.Tensor) for value in values):
+                tensors = tuple(value for value in values if isinstance(value, torch.Tensor))
+                first = tensors[0]
+                if (
+                    first.ndim >= 1
+                    and all(tensor.shape[1:] == first.shape[1:] for tensor in tensors)
+                    and sum(tensor.shape[0] for tensor in tensors) == param.shape[0]
+                    and first.shape[1:] == param.shape[1:]
+                ):
+                    packed[key] = torch.cat(tensors, dim=0)
+                elif first.ndim == 0 and all(tensor.shape == first.shape for tensor in tensors):
+                    stacked = torch.stack(tensors)
+                    packed[key] = stacked.max()
+                elif all(torch.equal(first, tensor) for tensor in tensors[1:]):
+                    packed[key] = first
+            elif all(value == values[0] for value in values[1:]):
+                packed[key] = values[0]
+
+        if not packed:
+            return None, ()
+        return packed, source_names
+
+    def _packed_falcon_optimizer_state(
+        self,
+        name: str,
+        param: torch.nn.Parameter,
+        state_by_name: dict,
+    ) -> tuple[dict | None, tuple[str, ...]]:
+        """Merge old Falcon split optimizer moments for packed params."""
+        if ".gate_up_proj." in name:
+            return self._packed_optimizer_state_from_parts(
+                param,
+                state_by_name,
+                (
+                    name.replace(".gate_up_proj.", ".gate_proj."),
+                    name.replace(".gate_up_proj.", ".up_proj."),
+                ),
+            )
+        if ".qkv_proj." in name:
+            return self._packed_optimizer_state_from_parts(
+                param,
+                state_by_name,
+                (
+                    name.replace(".qkv_proj.", ".q_proj."),
+                    name.replace(".qkv_proj.", ".k_proj."),
+                    name.replace(".qkv_proj.", ".v_proj."),
+                ),
+            )
+        return None, ()
+
     def _restore_optimizer_state_by_name(self, state_by_name: dict) -> None:
         """Install name-keyed optimizer state into the current optimizer.
 
@@ -988,7 +1065,22 @@ class BaseTrainer(ABC):
                 else:
                     matched_frozen += 1
             else:
-                if in_opt:
+                packed_state, packed_source_names = self._packed_falcon_optimizer_state(
+                    name, param, state_by_name
+                )
+                if packed_state is not None:
+                    matched_saved_names.update(packed_source_names)
+                    device = param.device
+                    moved = {
+                        k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                        for k, v in packed_state.items()
+                    }
+                    self.optimizer.state[param] = moved
+                    if in_opt:
+                        matched_in_opt += 1
+                    else:
+                        matched_frozen += 1
+                elif in_opt:
                     new_in_opt += 1
                 else:
                     new_frozen += 1
@@ -1403,6 +1495,7 @@ class BaseTrainer(ABC):
         cost_multiplier = float(
             getattr(self, "_sampler_cost_multiplier", 1.0) or 1.0
         )
+        budget_mode = str(getattr(self, "_sampler_budget_mode", "packed_quadratic"))
 
         # If the train_dataloader is currently wrapped (e.g. by
         # ``_InterleavingDataLoader`` in DecoderInitTrainer for QA mixing),
@@ -1428,6 +1521,7 @@ class BaseTrainer(ABC):
             shuffle=True,
             seed=seed,
             cost_multiplier=cost_multiplier,
+            budget_mode=budget_mode,
         )
         # Restore epoch so shuffle order is deterministic on resume.
         self.train_sampler.set_epoch(epoch)
@@ -1460,6 +1554,7 @@ class BaseTrainer(ABC):
             max_sample_length=max_len,
             n_samples=len(ds),
             cost_multiplier=cost_multiplier,
+            budget_mode=budget_mode,
         )
 
     def _rebuild_eval_dataloader_with_budget(self, new_budget: int) -> None:
@@ -1495,12 +1590,20 @@ class BaseTrainer(ABC):
             )
             or 1.0
         )
+        budget_mode = str(
+            getattr(
+                self,
+                "_sampler_eval_budget_mode",
+                getattr(self, "_sampler_budget_mode", "packed_quadratic"),
+            )
+        )
         eval_sampler = PackedTokenBudgetSampler(
             self.eval_dataset,
             lengths=self._eval_lengths,
             max_batch_tokens=new_budget,
             shuffle=False,
             cost_multiplier=cost_multiplier,
+            budget_mode=budget_mode,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
@@ -1514,6 +1617,7 @@ class BaseTrainer(ABC):
             old=old_budget,
             new=new_budget,
             cost_multiplier=cost_multiplier,
+            budget_mode=budget_mode,
         )
 
     @staticmethod
@@ -1580,9 +1684,9 @@ class BaseTrainer(ABC):
         """First-class ablation hook for eval (always-on when conditions match).
 
         Subclasses override to compute an alternative "supremum" / floor
-        loss alongside the normal eval loss — typically by substituting
+        loss alongside the normal eval loss - typically by substituting
         an idealized input at some pipeline stage (e.g. perfect projection,
-        gold encoder output, etc.). The gap ``eval/loss − eval/ablation_*_loss``
+        gold encoder output, etc.). The gap ``eval/loss - eval/ablation_*_loss``
         measures the cost of that pipeline stage.
 
         Called once per eval sub-batch from the trainer's eval loop with:
@@ -1602,7 +1706,7 @@ class BaseTrainer(ABC):
         - If conditions for ablation are not met on this sub-batch
           (e.g. companion data missing, config flag off), return
           ``(0.0, 0.0, "")`` and the caller skips accumulation.
-        - Otherwise return the loss × tokens sum, the token count, and
+        - Otherwise return the loss x tokens sum, the token count, and
           the metric-name suffix (e.g. ``"perfect_projection"``). The
           eval loop accumulates across sub-batches and the suffix is
           used to emit ``eval/ablation_<suffix>_loss`` and
@@ -1625,6 +1729,7 @@ class BaseTrainer(ABC):
         """
         import numpy as np
         from torch.utils.data import DataLoader, Subset
+
         from bgkit.data.samplers import PackedTokenBudgetSampler
 
         if not hasattr(self, "_eval_lengths"):
@@ -1680,6 +1785,13 @@ class BaseTrainer(ABC):
                 getattr(self, "_sampler_cost_multiplier", 1.0),
             ) or 1.0
         )
+        budget_mode = str(
+            getattr(
+                self,
+                "_sampler_eval_budget_mode",
+                getattr(self, "_sampler_budget_mode", "packed_quadratic"),
+            )
+        )
         if budget is None:
             return
         eval_sampler = PackedTokenBudgetSampler(
@@ -1688,6 +1800,7 @@ class BaseTrainer(ABC):
             max_batch_tokens=int(budget),
             shuffle=False,
             cost_multiplier=cost_multiplier,
+            budget_mode=budget_mode,
         )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
@@ -1700,7 +1813,7 @@ class BaseTrainer(ABC):
             "eval_sample_length_filter_applied",
             min_sample_length=min_len,
             max_sample_length=max_len,
-            kept=int(len(self._eval_lengths)),
+            kept=len(self._eval_lengths),
             dropped=int(
                 len(self._eval_lengths_full) - len(self._eval_lengths),
             ),

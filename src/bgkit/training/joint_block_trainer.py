@@ -90,7 +90,10 @@ class JointBlockTrainer(BaseTrainer):
             self.cfg.model.decoder.get("family", "qwen35")
         )
         decoder_attention_impl = resolve_decoder_attention_implementation(
-            self.cfg.compute.get("attention_implementation", "auto"),
+            self.cfg.compute.get(
+                "decoder_attention_implementation",
+                self.cfg.compute.get("attention_implementation", "auto"),
+            ),
             decoder_family=decoder_family,
         )
 

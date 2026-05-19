@@ -40,7 +40,7 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
 
     FA4 packed attention attends per segment, so memory/compute cost is
     ``sum(L_i^2)`` for a packed batch rather than ``B x max_len^2``.  The
-    budget is therefore::
+    default budget is therefore::
 
         sum((L_i * cost_multiplier)^2) <= max_batch_tokens * reference_seq_len
 
@@ -130,6 +130,7 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
         num_buckets: int = 8,
         bucket_shuffle: bool = True,
         cost_multiplier: float = 1.0,
+        budget_mode: str = "packed_quadratic",
     ) -> None:
         self._lengths: np.ndarray = np.asarray(lengths, dtype=np.int64)
         self._max_batch_tokens: int = int(max_batch_tokens)
@@ -154,9 +155,15 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
             raise ValueError(
                 f"bucket_mode must be 'none' or 'quantile', got {bucket_mode!r}"
             )
+        if budget_mode not in ("packed_quadratic", "padded_quadratic"):
+            raise ValueError(
+                "budget_mode must be 'packed_quadratic' or 'padded_quadratic', "
+                f"got {budget_mode!r}"
+            )
         self._bucket_mode: str = bucket_mode
         self._num_buckets: int = max(1, int(num_buckets))
         self._bucket_shuffle: bool = bool(bucket_shuffle)
+        self._budget_mode: str = str(budget_mode)
         # Clamp non-positive multipliers to 1.0 — a zero or negative
         # multiplier would collapse the budget math, which is never what
         # the caller meant.
@@ -314,6 +321,19 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
         scaled = round(seq_len * self._cost_multiplier)
         return scaled * scaled
 
+    def _effective_len(self, seq_len: int) -> int:
+        if self._cost_multiplier == 1.0:
+            return int(seq_len)
+        return round(seq_len * self._cost_multiplier)
+
+    def _single_cost(self, seq_len: int) -> int:
+        effective = self._effective_len(seq_len)
+        return effective * effective
+
+    @staticmethod
+    def _padded_cost(batch_size: int, max_effective_len: int) -> int:
+        return int(batch_size) * int(max_effective_len) * int(max_effective_len)
+
     def _build_batches(self) -> list[list[int]]:
         """Build all microbatches for the current epoch.
 
@@ -326,9 +346,18 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
           the property that kills the long-tail mixing (and gives the
           length-bucketed sampler its name).
 
-        Under either mode the budget inequality is::
+        With ``budget_mode="packed_quadratic"`` the budget inequality is::
 
             sum((L_i * cost_multiplier)^2) <= max_batch_tokens * reference_seq_len
+
+        With ``budget_mode="padded_quadratic"`` it is instead::
+
+            B * max_i((L_i * cost_multiplier))^2 <= max_batch_tokens * reference_seq_len
+
+        Use the padded mode for decoder families whose training path pads a
+        batch before attention (Falcon-H1); otherwise the sampler may legally
+        pack a batch that is cheap under a varlen/packed attention model but
+        very expensive under ``B x max_len^2`` padded attention.
 
         Oversized singletons (``(L * mult)^2 > budget``) are emitted
         alone and counted via :attr:`oversized_count`.
@@ -347,9 +376,11 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
         for seq in index_sequences:
             batch: list[int] = []
             running_sum: int = 0
+            running_max_len: int = 0
             for idx in seq:
                 seq_len = int(self._lengths[idx])
-                sq = self._effective_sq(seq_len)
+                effective_len = self._effective_len(seq_len)
+                sq = effective_len * effective_len
 
                 if not batch:
                     if sq > budget:
@@ -371,13 +402,27 @@ class PackedTokenBudgetSampler(Sampler[list[int]]):
                         oversized_count += 1
                     batch = [idx]
                     running_sum = sq
-                elif running_sum + sq <= budget:
-                    batch.append(idx)
-                    running_sum += sq
+                    running_max_len = effective_len
                 else:
+                    if self._budget_mode == "padded_quadratic":
+                        candidate_max = max(running_max_len, effective_len)
+                        candidate_cost = self._padded_cost(len(batch) + 1, candidate_max)
+                    else:
+                        candidate_max = running_max_len
+                        candidate_cost = running_sum + sq
+
+                    if candidate_cost <= budget:
+                        batch.append(idx)
+                        running_sum = candidate_cost if (
+                            self._budget_mode == "padded_quadratic"
+                        ) else running_sum + sq
+                        running_max_len = candidate_max
+                        continue
+
                     batches.append(batch)
                     batch = [idx]
                     running_sum = sq
+                    running_max_len = effective_len
                     if sq > budget:
                         if not self._warned_oversized:
                             logger.warning(

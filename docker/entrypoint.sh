@@ -99,7 +99,7 @@ PY
     build_env_fingerprint="$(
         printf 'FLASH_ATTN_CUDA_ARCHS=%s\n' "${FLASH_ATTN_CUDA_ARCHS:-120}"
         printf 'FLASH_ATTN_DTYPES=%s\n' "${FLASH_ATTN_DTYPES:-bf16}"
-        printf 'FLASH_ATTN_HEAD_DIMS=%s\n' "${FLASH_ATTN_HEAD_DIMS:-256}"
+        printf 'FLASH_ATTN_HEAD_DIMS=%s\n' "${FLASH_ATTN_HEAD_DIMS:-64,256}"
         printf 'FLASH_ATTN_INCLUDE_SPLIT=%s\n' "${FLASH_ATTN_INCLUDE_SPLIT:-1}"
     )"
     current_hash="$(
@@ -153,6 +153,7 @@ PY
             cd "$cache_repo"
             FLASH_ATTN_CUDA_ARCHS="${FLASH_ATTN_CUDA_ARCHS:-120}" \
             FLASH_ATTN_DTYPES="${FLASH_ATTN_DTYPES:-bf16}" \
+            FLASH_ATTN_HEAD_DIMS="${FLASH_ATTN_HEAD_DIMS:-64,256}" \
             FLASH_ATTN_INCLUDE_SPLIT="${FLASH_ATTN_INCLUDE_SPLIT:-1}" \
             MAX_JOBS="${MAX_JOBS:-2}" \
             NVCC_THREADS="${NVCC_THREADS:-1}" \
@@ -186,7 +187,7 @@ PY
             cd "${cache_repo}/flash_attn/cute"
             FLASH_ATTENTION_BUILD_SM12X_NATIVE=1 \
             TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}" \
-            FLASH_ATTN_HEAD_DIMS="${FLASH_ATTN_HEAD_DIMS:-256}" \
+            FLASH_ATTN_HEAD_DIMS="${FLASH_ATTN_HEAD_DIMS:-64,256}" \
             FLASH_ATTN_DTYPES="${FLASH_ATTN_DTYPES:-bf16}" \
             FLASH_ATTN_INCLUDE_SPLIT="${FLASH_ATTN_INCLUDE_SPLIT:-1}" \
             MAX_JOBS="${MAX_JOBS:-2}" \
@@ -221,7 +222,83 @@ if not native_sm12x_owned_backend_available():
 PY
 }
 
+bootstrap_luce_megakernel() {
+    # Build Luce's Qwen3.5 megakernel against the container's torch/CUDA ABI.
+    # The host checkout is bind-mounted read-only at /workspace/luce_megakernel;
+    # a writable cached copy receives the editable install and compiled .so.
+    if [ "${BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL:-0}" != "1" ]; then
+        return
+    fi
+    if [ ! -f /workspace/luce_megakernel/setup.py ]; then
+        echo "FATAL: BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL=1 but /workspace/luce_megakernel is not mounted." >&2
+        exit 9
+    fi
+
+    local cache_root cache_repo hash_file current_hash cached_hash capability extension_present
+    cache_root=/workspace/checkpoints/.luce-megakernel-native
+    cache_repo="${cache_root}/luce_megakernel"
+    hash_file="${cache_root}/source_hash"
+    mkdir -p "$cache_root"
+
+    capability="$(python - <<'PY'
+import torch
+if not torch.cuda.is_available():
+    print("none")
+else:
+    major, minor = torch.cuda.get_device_capability()
+    print(f"{major}.{minor}")
+PY
+)"
+
+    current_hash="$(
+        {
+            find /workspace/luce_megakernel \
+                \( -name '*.py' -o -name '*.cu' -o -name '*.cpp' -o -name '*.h' -o -name 'setup.py' \) \
+                -type f -print0 | sort -z | xargs -0 sha256sum
+            printf 'MEGAKERNEL_CUDA_ARCH=%s\n' "${MEGAKERNEL_CUDA_ARCH:-auto}"
+            printf 'MEGAKERNEL_NUM_BLOCKS=%s\n' "${MEGAKERNEL_NUM_BLOCKS:-82}"
+            printf 'MEGAKERNEL_BLOCK_SIZE=%s\n' "${MEGAKERNEL_BLOCK_SIZE:-512}"
+            printf 'capability=%s\n' "$capability"
+        } | sha256sum | cut -c1-16
+    )"
+    cached_hash=""
+    if [ -f "$hash_file" ]; then
+        cached_hash="$(cat "$hash_file")"
+    fi
+    extension_present=0
+    if compgen -G "${cache_repo}/qwen35_megakernel_bf16_C*.so" > /dev/null; then
+        extension_present=1
+    fi
+
+    if [ "$cached_hash" != "$current_hash" ] || [ "$extension_present" != "1" ]; then
+        echo "Bootstrapping Luce Qwen3.5 megakernel in container cache..."
+        rm -rf "$cache_repo"
+        cp -a /workspace/luce_megakernel "$cache_repo"
+        find "$cache_repo" -name '*.so' -type f -delete
+        (
+            cd "$cache_repo"
+            MAX_JOBS="${MAX_JOBS:-2}" \
+            NVCC_THREADS="${NVCC_THREADS:-1}" \
+            python -m pip install -e . --no-build-isolation --user
+        )
+        printf '%s' "$current_hash" > "$hash_file"
+    fi
+
+    export PYTHONPATH="${cache_repo}:${cache_root}:${PYTHONPATH:-}"
+    python - <<'PY'
+import importlib
+import torch
+
+mod = importlib.import_module("qwen35_megakernel_bf16_C")
+print(f"luce_megakernel_extension:{mod.__name__}")
+if torch.cuda.is_available():
+    major, minor = torch.cuda.get_device_capability()
+    print(f"luce_megakernel_cuda_capability:{major}.{minor}")
+PY
+}
+
 bootstrap_flash_attn_native
+bootstrap_luce_megakernel
 
 # Print source hash so logs always show which code is running
 hash=$(find /workspace/bgkit/src -name '*.py' -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12)
@@ -229,6 +306,10 @@ echo "bgkit source hash: $hash"
 if [ -d /workspace/flashqla/flash_qla ]; then
     flashqla_hash=$(find /workspace/flashqla/flash_qla -name '*.py' -print0 | sort -z | xargs -0 -r sha256sum | sha256sum | cut -c1-12 || true)
     echo "flashqla source hash: ${flashqla_hash:-unavailable}"
+fi
+if [ -d /workspace/luce_megakernel ]; then
+    luce_hash=$(find /workspace/luce_megakernel \( -name '*.py' -o -name '*.cu' -o -name '*.cpp' -o -name '*.h' \) -type f -print0 | sort -z | xargs -0 -r sha256sum | sha256sum | cut -c1-12 || true)
+    echo "luce_megakernel source hash: ${luce_hash:-unavailable}"
 fi
 python -c "import bgkit; print(f'bgkit {bgkit.__version__}')"
 

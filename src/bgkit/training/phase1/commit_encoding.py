@@ -58,7 +58,13 @@ from bgkit.models.projection_block import effective_projection_cu
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
-from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
+from bgkit.training.gradient_utils import (
+    configure_decoder_layerwise_split,
+    maybe_enable_decoder_gradient_checkpointing,
+    maybe_enable_frozen_decoder_kernels,
+    maybe_enable_gradient_checkpointing,
+    validate_decoder_lora_freeze_contract,
+)
 from bgkit.training.ratio_sampling import (
     build_ratio_sampler_config,
     resolve_anchor_grid,
@@ -190,7 +196,10 @@ class CommitEncodingTrainer(BaseTrainer):
         decoder_family = normalize_decoder_family(decoder_cfg.get("family", "qwen35"))
         self.encoder.set_active_decoder_family(decoder_family)
         decoder_attention_impl = resolve_decoder_attention_implementation(
-            self.cfg.compute.get("attention_implementation", "auto"),
+            self.cfg.compute.get(
+                "decoder_attention_implementation",
+                self.cfg.compute.get("attention_implementation", "auto"),
+            ),
             decoder_family=decoder_family,
         )
         decoder_name = decoder_cfg.backbone_name
@@ -216,7 +225,15 @@ class CommitEncodingTrainer(BaseTrainer):
         self.decoder.set_lm_ce_impl(
             tcfg.get("decoder_ce_impl", self.cfg.compute.get("decoder_ce_impl", None))
         )
-        logger.info("decoder_ce_impl_selected", impl=self.decoder.lm_ce_impl)
+        self.decoder.set_lm_ce_strict(
+            tcfg.get("decoder_ce_strict", self.cfg.compute.get("decoder_ce_strict", None))
+        )
+        logger.info(
+            "decoder_ce_impl_selected",
+            impl=self.decoder.lm_ce_impl,
+            strict=self.decoder.lm_ce_strict,
+        )
+        configure_decoder_layerwise_split(self.decoder, self.cfg)
 
         if step1_state_dicts is not None:
             decoder_sd = step1_state_dicts.get(
@@ -227,13 +244,14 @@ class CommitEncodingTrainer(BaseTrainer):
 
         self._decoder_lora = False
         lora_cfg = tcfg.get("decoder_lora", {})
+        validate_decoder_lora_freeze_contract(self.cfg)
         if lora_cfg.get("enabled", False):
             self.decoder.apply_lora(lora_cfg)
             self._decoder_lora = True
 
         maybe_enable_gradient_checkpointing(self.encoder.l0.backbone, self.cfg)
         maybe_enable_gradient_checkpointing(self.encoder.l1.backbone, self.cfg)
-        maybe_enable_gradient_checkpointing(self.decoder.backbone, self.cfg)
+        maybe_enable_decoder_gradient_checkpointing(self.decoder.backbone, self.cfg)
 
         if tcfg.get("use_liger", True):
             from bgkit.utils.liger_integration import (
@@ -757,6 +775,13 @@ class CommitEncodingTrainer(BaseTrainer):
         return "stage1_unfrozen" if (step % period) == 0 else "stage1_frozen"
 
     def _unfreeze_decoder_respecting_lora(self) -> None:
+        freeze_cfg = self.cfg.training.get("freeze", {})
+        if bool(freeze_cfg.get("decoder", False)):
+            self.decoder.requires_grad_(False)
+            maybe_enable_frozen_decoder_kernels(self.decoder, self.cfg)
+            logger.info("decoder_frozen_by_config")
+            return
+
         if getattr(self.decoder, "_has_lora", False):
             for name, p in self.decoder.named_parameters():
                 p.requires_grad_("lora_" in name)
@@ -1178,6 +1203,12 @@ class CommitEncodingTrainer(BaseTrainer):
         prefix_ids: list[torch.Tensor] = []
         suffix_ids: list[torch.Tensor] = []
         per_segment_loss_masks: list[torch.Tensor] = []
+        prefix_token_count = 0
+        suffix_token_count = 0
+        survivor_token_count = 0
+        max_prefix_len = 0
+        max_suffix_len = 0
+        max_survivor_len = 0
         for b in range(batch_size):
             sample_start = int(tok_cu_list[b])
             sample_end = int(tok_cu_list[b + 1])
@@ -1193,6 +1224,14 @@ class CommitEncodingTrainer(BaseTrainer):
             suffix_ids.append(suf)
 
             k_i = int(surv_cu_list[b + 1]) - int(surv_cu_list[b])
+            pre_len = int(pre.shape[0])
+            suf_len = int(suf.shape[0])
+            prefix_token_count += pre_len
+            suffix_token_count += suf_len
+            survivor_token_count += k_i
+            max_prefix_len = max(max_prefix_len, pre_len)
+            max_suffix_len = max(max_suffix_len, suf_len)
+            max_survivor_len = max(max_survivor_len, k_i)
             surv_mask = torch.zeros(k_i, dtype=torch.bool, device=device)
             if loss_mask_flat is not None:
                 sample_loss = loss_mask_flat[sample_start:sample_end]
@@ -1207,6 +1246,43 @@ class CommitEncodingTrainer(BaseTrainer):
             torch.cat(per_segment_loss_masks, dim=0)
             if per_segment_loss_masks else None
         )
+        cont_token_count = survivor_token_count + suffix_token_count
+        prefix_to_cont_ratio = float(prefix_token_count) / float(max(cont_token_count, 1))
+        split_cfg = self.cfg.training.get("decoder_layerwise_split", {}) or {}
+        try:
+            split_min_ratio = float(
+                os.environ.get(
+                    "BGKIT_QWEN35_LAYERWISE_SPLIT_MIN_RATIO",
+                    split_cfg.get("min_ratio", 3.0),
+                )
+            )
+        except (TypeError, ValueError):
+            split_min_ratio = 3.0
+        try:
+            split_min_prefix = int(
+                os.environ.get(
+                    "BGKIT_QWEN35_LAYERWISE_SPLIT_MIN_PREFIX",
+                    split_cfg.get("min_prefix", 1536),
+                )
+            )
+        except (TypeError, ValueError):
+            split_min_prefix = 1536
+        split_auto_eligible = (
+            prefix_to_cont_ratio >= split_min_ratio
+            and max_prefix_len >= split_min_prefix
+        )
+        self._last_decoder_splice_shape_metrics = {
+            "decoder_splice_samples": float(batch_size),
+            "decoder_splice_prefix_tokens": float(prefix_token_count),
+            "decoder_splice_survivor_tokens": float(survivor_token_count),
+            "decoder_splice_suffix_tokens": float(suffix_token_count),
+            "decoder_splice_cont_tokens": float(cont_token_count),
+            "decoder_splice_max_prefix_len": float(max_prefix_len),
+            "decoder_splice_max_survivor_len": float(max_survivor_len),
+            "decoder_splice_max_suffix_len": float(max_suffix_len),
+            "decoder_splice_prefix_to_cont_ratio": prefix_to_cont_ratio,
+            "decoder_splice_split_auto_eligible": float(split_auto_eligible),
+        }
         return self.decoder.forward_with_single_splice(
             survivor_embeddings=survivors,
             survivor_cu_seqlens=survivor_cu_seqlens,
@@ -1444,6 +1520,9 @@ class CommitEncodingTrainer(BaseTrainer):
             "actual_ratio": actual_ratio,
             "l0_trainable": float(l0_trainable),
         }
+        splice_shape_metrics = getattr(self, "_last_decoder_splice_shape_metrics", None)
+        if splice_shape_metrics:
+            result.update(splice_shape_metrics)
         result.update(aux_metrics)
 
         l0_out.release()
@@ -1657,9 +1736,31 @@ class CommitEncodingTrainer(BaseTrainer):
 
     def _restore_model_state(self, state_dicts: dict) -> None:
         if "encoder" in state_dicts:
-            self.encoder.load_state_dict(state_dicts["encoder"])
-        if "decoder" in state_dicts:
-            self.decoder.load_state_dict(state_dicts["decoder"])
+            from bgkit.models.encoder import _migrate_projection_state_keys
+
+            encoder_state, projection_migrated = _migrate_projection_state_keys(
+                state_dicts["encoder"],
+            )
+            result = self.encoder.load_state_dict(encoder_state, strict=False)
+            if projection_migrated:
+                logger.info("checkpoint_projection_keys_migrated")
+            missing = list(result.missing_keys)
+            unexpected = list(result.unexpected_keys)
+            if missing or unexpected:
+                logger.warning(
+                    "checkpoint_encoder_partial_load",
+                    missing=len(missing),
+                    unexpected=len(unexpected),
+                    missing_first=missing[:5],
+                    unexpected_first=unexpected[:5],
+                )
+        decoder_key = (
+            "decoder"
+            if getattr(self, "_decoder_lora", False) or "decoder_merged" not in state_dicts
+            else "decoder_merged"
+        )
+        if decoder_key in state_dicts:
+            self.decoder.load_state_dict(state_dicts[decoder_key])
 
     def _restore_training_state(self, training_state: dict) -> None:
         self._target_ratio_l0_override = training_state.get("target_ratio_l0_override")

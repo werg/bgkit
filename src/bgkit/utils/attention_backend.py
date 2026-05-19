@@ -28,6 +28,7 @@ BGKIT_FA4_ATTENTION_IMPL = "bgkit_fa4"
 _FA4_ALIASES = frozenset({"fa4", "flash_attention_4", BGKIT_FA4_ATTENTION_IMPL})
 _SDPA_ALIASES = frozenset({"sdpa", "torch_sdpa"})
 _FLASH_ATTN_2_ALIASES = frozenset({"flash_attention_2", "flash_attn_2", "fa2"})
+FALCON_HUB_FLASH_ATTN_2_IMPL = "kernels-community/flash-attn2"
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,62 @@ def _sm12x_native_true_gqa_ready() -> bool:
     except Exception:
         return False
     return native_sm12x_owned_backend_available()
+
+
+@lru_cache(maxsize=1)
+def _flash_attention_2_available() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        flash_attn = importlib.import_module("flash_attn")
+        for name in (
+            "flash_attn_func",
+            "flash_attn_varlen_func",
+            "flash_attn_with_kvcache",
+        ):
+            getattr(flash_attn, name)
+        bert_padding = importlib.import_module("flash_attn.bert_padding")
+        for name in ("pad_input", "unpad_input"):
+            getattr(bert_padding, name)
+    except Exception as exc:  # pragma: no cover - exact import failure is env-specific
+        logger.debug("flash_attention_2_unavailable", exc_info=exc)
+        return False
+    return True
+
+
+@lru_cache(maxsize=1)
+def _flash_attention_2_kernel_available() -> bool:
+    """Return whether Transformers can use the HF hub FA2 kernel fallback.
+
+    Newer Transformers can register ``kernels-community/flash-attn2`` through
+    the `kernels` package even when the classic ``flash_attn`` wheel is not
+    importable. Falcon-H1's normal padded attention path can use that fallback,
+    while BgKIT's packed FA4 path still requires its own backend.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        kernels = importlib.import_module("kernels")
+        kernel = kernels.get_kernel("kernels-community/flash-attn2")
+        _flash_func = kernel.flash_attn_func
+        _flash_varlen_func = kernel.flash_attn_varlen_func
+        del _flash_func, _flash_varlen_func
+    except Exception as exc:  # pragma: no cover - exact import/fetch failure is env-specific
+        logger.debug("flash_attention_2_kernel_unavailable", exc_info=exc)
+        return False
+    return True
+
+
+def _falcon_flash_attention_2_available() -> bool:
+    return _flash_attention_2_available() or _flash_attention_2_kernel_available()
+
+
+def _resolve_falcon_flash_attention_2_impl() -> str | None:
+    if _flash_attention_2_available():
+        return "flash_attention_2"
+    if _flash_attention_2_kernel_available():
+        return FALCON_HUB_FLASH_ATTN_2_IMPL
+    return None
 
 
 # Once the owned backend has been confirmed available in this process, subsequent
@@ -122,6 +179,7 @@ def bgkit_flash_attention_4_forward(
     sliding_window: int | None = None,
     softcap: float = 0.0,
     scale: float | None = None,
+    pack_gqa: bool | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, None]:
     """Packed varlen attention via FA4.
@@ -278,6 +336,7 @@ def bgkit_flash_attention_4_forward(
         causal=is_causal,
         window_size=window_size,
         softcap=softcap if softcap else 0.0,
+        pack_gqa=pack_gqa,
     )
     if isinstance(attn_output, tuple):
         attn_output = attn_output[0]
@@ -440,13 +499,26 @@ def resolve_decoder_attention_implementation(
 
     Qwen-family decoders use BgKIT's packed FA4 backend. Falcon-H1 does not:
     its HF attention module calls the attention interface with normal batched
-    Q/K/V tensors and no packed ``cu_seqlens`` metadata. Use SDPA there and
-    configure SDPA to flash-only on CUDA so fallbacks are fail-loud.
+    Q/K/V tensors and no packed ``cu_seqlens`` metadata. Prefer FA2 when it is
+    importable either as a classic ``flash_attn`` wheel or a Transformers
+    hub-kernel fallback, since Falcon's hdim64 attention benchmarked faster
+    than PyTorch SDPA on GB10; otherwise use flash-only SDPA as the portable
+    fallback.
     """
-    requested = requested or os.getenv("BGKIT_ATTENTION_IMPL", "auto")
+    requested = (
+        requested
+        or os.getenv("BGKIT_DECODER_ATTENTION_IMPL")
+        or os.getenv("BGKIT_ATTENTION_IMPL", "auto")
+    )
 
     if _is_falcon_h1_family(decoder_family):
-        if requested == "auto" or requested in _SDPA_ALIASES:
+        if requested == "auto":
+            fa2_impl = _resolve_falcon_flash_attention_2_impl()
+            if fa2_impl is not None:
+                return fa2_impl
+            configure_torch_sdp_flash_only()
+            return "sdpa"
+        if requested in _SDPA_ALIASES:
             configure_torch_sdp_flash_only()
             return "sdpa"
         if requested in _FA4_ALIASES:
@@ -456,7 +528,16 @@ def resolve_decoder_attention_implementation(
                 "decoder attention tensors. Use 'auto' or 'sdpa'."
             )
         if requested in _FLASH_ATTN_2_ALIASES:
-            return "flash_attention_2"
+            fa2_impl = _resolve_falcon_flash_attention_2_impl()
+            if fa2_impl is None:
+                raise RuntimeError(
+                    "Falcon-H1 decoder attention requested FlashAttention-2, "
+                    "but neither the classic flash_attn package nor the "
+                    "Transformers kernels-community/flash-attn2 fallback is "
+                    "usable. Rebuild/install flash_attn or the kernels package, "
+                    "or use 'auto'/'sdpa'."
+                )
+            return fa2_impl
         raise ValueError(
             f"Unsupported Falcon-H1 decoder attention implementation {requested!r}. "
             "Valid values: 'auto', 'sdpa', or 'flash_attention_2'."

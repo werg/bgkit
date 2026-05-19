@@ -10,6 +10,7 @@ from bgkit.models.components.selection import (
     DualThresholdController,
     SelectionOut,
     adaptive_threshold_select,
+    exact_ratio_topk_select,
     moment_match_loss,
 )
 
@@ -323,3 +324,50 @@ def test_segment_topk_floor_empty_segment_no_crash():
     assert mask[:3] == [True, False, True]
     # No positions for segment 1 (it has zero flat indices).
     assert mask[3:7] == [False, True, True, False]
+
+
+def test_exact_ratio_topk_selects_per_sample_quota():
+    cu = _cu([5, 4])
+    logits = torch.tensor([
+        0.1, 0.9, 0.2, 0.8, 0.3,
+        -1.0, 4.0, 0.0, 3.0,
+    ])
+    valid = torch.ones_like(logits, dtype=torch.bool)
+    out = exact_ratio_topk_select(logits, valid, 0.4, cu_seqlens=cu)
+    # ceil(5 * .4)=2 -> indices 1,3. ceil(4 * .4)=2 -> indices 6,8.
+    assert out.mask.tolist() == [
+        False, True, False, True, False,
+        False, True, False, True,
+    ]
+    assert out.organic_keep_rate == pytest.approx(4 / 9)
+
+
+def test_exact_ratio_topk_respects_pinned_and_minimum():
+    cu = _cu([5, 4])
+    logits = torch.tensor([
+        0.1, 0.9, 0.2, 0.8, 0.3,
+        -1.0, 4.0, 0.0, 3.0,
+    ])
+    valid = torch.ones_like(logits, dtype=torch.bool)
+    pinned = torch.tensor([
+        True, False, False, False, False,
+        False, False, True, False,
+    ])
+    out = exact_ratio_topk_select(
+        logits,
+        valid,
+        0.01,
+        cu_seqlens=cu,
+        pinned=pinned,
+        min_per_sample=2,
+    )
+    # Each sample target is min 2. Pinned consumes one slot per sample,
+    # then the best non-pinned logit fills the remaining slot.
+    assert out.mask.tolist() == [
+        True, True, False, False, False,
+        False, True, True, False,
+    ]
+    assert int(out.num_pinned.item()) == 2
+    # Controllable denominator excludes pinned positions; numerator is the
+    # two non-pinned top-k selections.
+    assert out.organic_keep_rate == pytest.approx(2 / 7)

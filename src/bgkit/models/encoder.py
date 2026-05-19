@@ -321,6 +321,9 @@ class BgKITEncoder(nn.Module):
         utility_grad_capture_l1: dict | None = None,
         forced_survivor_mask_l0: torch.Tensor | None = None,
         forced_survivor_mask_l1: torch.Tensor | None = None,
+        selection_mode_l0: str = "threshold",
+        selection_mode_l1: str = "threshold",
+        capture_decoder_only_prefix_l0: bool = False,
     ) -> EncoderOutput:
         if forced_survivor_mask_l1 is not None and target_ratio_l1 is None:
             raise ValueError(
@@ -342,6 +345,8 @@ class BgKITEncoder(nn.Module):
             utility_grad_active=utility_grad_active_l0,
             utility_grad_capture=utility_grad_capture_l0,
             forced_survivor_mask=forced_survivor_mask_l0,
+            selection_mode=selection_mode_l0,
+            capture_decoder_only_prefix=capture_decoder_only_prefix_l0,
         )
 
         if target_ratio_l1 is None:
@@ -363,6 +368,7 @@ class BgKITEncoder(nn.Module):
                 utility_grad_active=utility_grad_active_l1,
                 utility_grad_capture=utility_grad_capture_l1,
                 forced_survivor_mask=forced_survivor_mask_l1,
+                selection_mode=selection_mode_l1,
             )
             proj_input = l1_out.survivor_embeddings
             proj_cu = l1_out.survivor_cu_seqlens

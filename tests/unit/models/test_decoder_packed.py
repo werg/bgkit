@@ -20,6 +20,7 @@ Two tests:
 from __future__ import annotations
 
 import os
+from unittest.mock import patch
 
 import pytest
 
@@ -356,28 +357,84 @@ class TestPackedForwardParity:
             dtype=torch.bool,
         )
 
-        packed = decoder.forward_with_packed_target_splice(
-            survivor_embeddings=survivors,
-            survivor_cu_seqlens=survivor_cu,
-            target_ids_flat=target_ids_flat,
-            target_cu_seqlens=target_cu,
-            splice_start=splice_start,
-            splice_len=splice_len,
-            loss_mask_flat=loss_mask_flat,
+        with patch.object(
+            decoder,
+            "forward_with_single_splice",
+            wraps=decoder.forward_with_single_splice,
+        ) as single_splice:
+            packed = decoder.forward_with_packed_target_splice(
+                survivor_embeddings=survivors,
+                survivor_cu_seqlens=survivor_cu,
+                target_ids_flat=target_ids_flat,
+                target_cu_seqlens=target_cu,
+                splice_start=splice_start,
+                splice_len=splice_len,
+                loss_mask_flat=loss_mask_flat,
+            )
+        call_kwargs = single_splice.call_args.kwargs
+        assert call_kwargs["survivor_cu_seqlens_cpu"] == [0, 1, 3]
+        torch.testing.assert_close(
+            call_kwargs["packed_cu_seqlens"],
+            torch.tensor([0, 4, 9], dtype=torch.int32),
         )
+        assert [ids.tolist() for ids in call_kwargs["suffix_ids"]] == [[7], [9]]
         manual_loss_mask = torch.tensor(
-            [False, True, False, True, False, True, False, False, False, True],
+            [False, True, False, True, True, False, False, False, True],
             dtype=torch.bool,
         )
         listed = decoder.forward_with_single_splice(
             survivor_embeddings=survivors,
             survivor_cu_seqlens=survivor_cu,
             prefix_ids=[target_rows[0][:2], target_rows[1][:2]],
-            suffix_ids=[target_rows[0][3:], target_rows[1][3:]],
+            suffix_ids=[target_rows[0][3:4], target_rows[1][3:]],
             loss_mask=manual_loss_mask,
         )
 
         torch.testing.assert_close(packed, listed, atol=1e-5, rtol=1e-5)
+
+    def test_packed_target_splice_preserves_hidden_state_shape_when_requested(self, decoder):
+        """Trailing lossless tokens are kept for diagnostics that return hidden states."""
+
+        torch.manual_seed(24)
+        target_rows = [
+            torch.tensor([1, 2, 99, 7, 8], dtype=torch.long),
+            torch.tensor([3, 4, 88, 9, 10], dtype=torch.long),
+        ]
+        target_ids_flat = torch.cat(target_rows, dim=0)
+        target_cu = torch.tensor([0, 5, 10], dtype=torch.int32)
+        splice_start = torch.tensor([2, 2], dtype=torch.int64)
+        splice_len = torch.tensor([1, 1], dtype=torch.int64)
+        survivors = torch.randn(3, HIDDEN_DIM)
+        survivor_cu = torch.tensor([0, 1, 3], dtype=torch.int32)
+        loss_mask_flat = torch.tensor(
+            [False, False, False, True, False, False, False, False, True, False],
+            dtype=torch.bool,
+        )
+
+        with patch.object(
+            decoder,
+            "forward_with_single_splice",
+            wraps=decoder.forward_with_single_splice,
+        ) as single_splice:
+            out = decoder.forward_with_packed_target_splice(
+                survivor_embeddings=survivors,
+                survivor_cu_seqlens=survivor_cu,
+                target_ids_flat=target_ids_flat,
+                target_cu_seqlens=target_cu,
+                splice_start=splice_start,
+                splice_len=splice_len,
+                loss_mask_flat=loss_mask_flat,
+                return_hidden_states=True,
+            )
+
+        assert isinstance(out, InterleavedForwardOutput)
+        call_kwargs = single_splice.call_args.kwargs
+        torch.testing.assert_close(
+            call_kwargs["packed_cu_seqlens"],
+            torch.tensor([0, 5, 11], dtype=torch.int32),
+        )
+        assert [ids.tolist() for ids in call_kwargs["suffix_ids"]] == [[7, 8], [9, 10]]
+        assert out.hidden_states.shape == (1, 11, HIDDEN_DIM)
 
     def test_return_hidden_states(self, decoder):
         """return_hidden_states=True returns InterleavedForwardOutput."""

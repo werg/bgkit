@@ -112,14 +112,13 @@ moment_match_reference:
 decoder_lora:
   enabled: false
   implementation: peft
-  r: 16
-  alpha: 32
+  r: 32
+  alpha: 64
   dropout: 0.0
-  # Legacy LoRA baseline settings are retained for explicit A/B presets, but
+  # LoRA baseline settings are retained for explicit A/B presets, but
   # the default Step 5 training contract is full-decoder/no-LoRA.
   peft_fused_backward: true
-  # Experimental full-MLP fusion for LoRA A/B runs only.
-  peft_fuse_gate_up: false
+  peft_fuse_gate_up: true
   target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
 freeze:

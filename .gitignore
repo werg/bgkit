@@ -34,9 +34,15 @@ htmlcov/
 # Data and checkpoints (large files, root-level only)
 /data/
 /checkpoints/
+/.checkpoints-smoke/
 /outputs/
 /wandb/
 /logs/
+
+# Local build/dependency scratch directories
+/.local-debs/
+/.local-python-dev/
+/third_party/
 
 # OS
 .DS_Store

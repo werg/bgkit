@@ -28,7 +28,7 @@ from __future__ import annotations
 import os
 import types
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import structlog
@@ -44,7 +44,27 @@ try:
 except Exception:  # pragma: no cover - optional Triton dependency
     _LORA_TRITON = None
 
+try:
+    from quack.gemm_interface import (
+        gemm as _QUACK_GEMM,
+    )
+    from quack.gemm_interface import (
+        gemm_dgated as _QUACK_GEMM_DGATED,
+    )
+    from quack.gemm_interface import (
+        gemm_gated as _QUACK_GEMM_GATED,
+    )
+except Exception:  # pragma: no cover - optional CUTE/CUTLASS dependency
+    _QUACK_GEMM = None
+    _QUACK_GEMM_DGATED = None
+    _QUACK_GEMM_GATED = None
+
 logger = structlog.get_logger()
+
+_FROZEN_DELTANET_CORE_TIMER_EVENTS: dict[
+    str,
+    list[tuple[torch.cuda.Event, torch.cuda.Event]],
+] = {}
 
 DEFAULT_LM_CE_CHUNK_SIZE = int(os.environ.get("BGKIT_DECODER_CE_CHUNK_SIZE", "2048"))
 DEFAULT_LM_CE_IMPL = os.environ.get("BGKIT_DECODER_CE_IMPL", "cce").strip().lower()
@@ -52,8 +72,11 @@ LM_CE_IMPLS = frozenset(
     {
         "auto",
         "chunked",
+        "frozen_chunked",
         "liger",
         "cce",
+        "cce_static",
+        "cce_compact",
         "cce_exact",
         "cce_kahan_full",
         "cce_kahan_full_c",
@@ -70,15 +93,23 @@ def normalize_decoder_family(family: str | None) -> str:
         return "qwen35"
     if normalized in {"falcon_h1", "falcon-h1", "falcon"}:
         return "falcon_h1"
-    raise ValueError(
-        f"Unsupported decoder family {family!r}; expected 'qwen35' or 'falcon_h1'"
-    )
+    raise ValueError(f"Unsupported decoder family {family!r}; expected 'qwen35' or 'falcon_h1'")
 
 
 def _decoder_family_has_stateful_mixer(family: str | None) -> bool:
     """Whether sequence state can leak across flattened sample boundaries."""
 
-    return normalize_decoder_family(family) in {"falcon_h1"}
+    normalized = normalize_decoder_family(family)
+    return normalized == "falcon_h1"
+
+
+def _falcon_h1_packed_mamba_seqidx_enabled() -> bool:
+    return os.environ.get("BGKIT_FALCON_H1_PACKED_MAMBA_SEQIDX", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def _default_lora_targets(family: str) -> tuple[str, ...]:
@@ -131,8 +162,7 @@ def _resolve_lm_ce_impl(impl: str | None) -> str:
     resolved = DEFAULT_LM_CE_IMPL if impl is None else impl.strip().lower()
     if resolved not in LM_CE_IMPLS:
         raise ValueError(
-            f"Unsupported decoder CE implementation {impl!r}; "
-            f"expected one of {sorted(LM_CE_IMPLS)}"
+            f"Unsupported decoder CE implementation {impl!r}; expected one of {sorted(LM_CE_IMPLS)}"
         )
     return resolved
 
@@ -145,6 +175,366 @@ def _coerce_bool(value: object, *, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _coerce_int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _coerce_float_env(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _frozen_deltanet_core_timers_enabled() -> bool:
+    return _coerce_bool(
+        os.environ.get("BGKIT_FROZEN_DELTANET_CORE_TIMERS", "0"),
+        default=False,
+    )
+
+
+def _record_frozen_deltanet_core_timer(
+    name: str,
+    fn,
+):
+    if not _frozen_deltanet_core_timers_enabled() or not torch.cuda.is_available():
+        return fn()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    out = fn()
+    end.record()
+    _FROZEN_DELTANET_CORE_TIMER_EVENTS.setdefault(name, []).append((start, end))
+    return out
+
+
+def _reset_frozen_deltanet_core_timers() -> None:
+    _FROZEN_DELTANET_CORE_TIMER_EVENTS.clear()
+
+
+def _frozen_deltanet_core_timer_stats() -> list[dict[str, float | int | str]]:
+    if not _FROZEN_DELTANET_CORE_TIMER_EVENTS:
+        return []
+    torch.cuda.synchronize()
+    rows: list[dict[str, float | int | str]] = []
+    for name, events in _FROZEN_DELTANET_CORE_TIMER_EVENTS.items():
+        values = [start.elapsed_time(end) for start, end in events]
+        rows.append(
+            {
+                "name": name,
+                "calls": len(values),
+                "total_ms": float(sum(values)),
+                "mean_ms": float(sum(values) / len(values)) if values else 0.0,
+            }
+        )
+    rows.sort(key=lambda item: float(item["total_ms"]), reverse=True)
+    return rows
+
+
+def _qwen35_linear_attn_parts_single(
+    linear_attn: nn.Module,
+    hidden_states: torch.Tensor,
+    *,
+    recurrent_state: torch.Tensor | None = None,
+    conv_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Run one Qwen3.5 DeltaNet attention block with explicit prefix state.
+
+    This is intentionally a diagnostic schedule primitive: it mirrors the
+    Qwen3.5 linear-attention forward for a single dense sample so multi-token
+    continuation can consume a prefix recurrent state instead of HF's
+    single-token-only cache path.
+    """
+
+    batch_size, seq_len, _ = hidden_states.shape
+    mixed_qkv_pre = linear_attn.in_proj_qkv(hidden_states).transpose(1, 2)
+    mixed_qkv_for_conv = mixed_qkv_pre
+    if conv_state is not None:
+        mixed_qkv_for_conv = torch.cat([conv_state, mixed_qkv_for_conv], dim=-1)
+    if getattr(linear_attn, "causal_conv1d_fn", None) is not None:
+        mixed_qkv_conv = linear_attn.causal_conv1d_fn(
+            x=mixed_qkv_for_conv,
+            weight=linear_attn.conv1d.weight.squeeze(1),
+            bias=linear_attn.conv1d.bias,
+            activation=linear_attn.activation,
+            seq_idx=None,
+        )
+    else:
+        mixed_qkv_conv = F.silu(
+            linear_attn.conv1d(mixed_qkv_for_conv)[:, :, : mixed_qkv_for_conv.shape[-1]]
+        )
+    if conv_state is not None:
+        mixed_qkv_conv = mixed_qkv_conv[:, :, -seq_len:]
+    mixed_qkv = mixed_qkv_conv.transpose(1, 2)
+    query, key, value = torch.split(
+        mixed_qkv,
+        [linear_attn.key_dim, linear_attn.key_dim, linear_attn.value_dim],
+        dim=-1,
+    )
+    query = query.reshape(batch_size, seq_len, -1, linear_attn.head_k_dim)
+    key = key.reshape(batch_size, seq_len, -1, linear_attn.head_k_dim)
+    value = value.reshape(batch_size, seq_len, -1, linear_attn.head_v_dim)
+    beta = linear_attn.in_proj_b(hidden_states).sigmoid()
+    a = linear_attn.in_proj_a(hidden_states)
+    g = -linear_attn.A_log.float().exp() * F.softplus(a.float() + linear_attn.dt_bias)
+    if linear_attn.num_v_heads // linear_attn.num_k_heads > 1:
+        repeat = linear_attn.num_v_heads // linear_attn.num_k_heads
+        query = query.repeat_interleave(repeat, dim=2)
+        key = key.repeat_interleave(repeat, dim=2)
+    core, recurrent_final_state = linear_attn.chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        g=g,
+        beta=beta,
+        initial_state=recurrent_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=True,
+    )
+    z = linear_attn.in_proj_z(hidden_states).reshape(
+        batch_size,
+        seq_len,
+        -1,
+        linear_attn.head_v_dim,
+    )
+    normed = linear_attn.norm(
+        core.reshape(-1, linear_attn.head_v_dim),
+        z.reshape(-1, linear_attn.head_v_dim),
+    ).reshape(batch_size, seq_len, -1)
+    output = linear_attn.out_proj(normed)
+    conv_final_state = mixed_qkv_pre[:, :, -linear_attn.conv_kernel_size :]
+    return output, recurrent_final_state, conv_final_state
+
+
+def _qwen35_linear_attn_parts_packed(
+    linear_attn: nn.Module,
+    hidden_states: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor,
+    recurrent_state: torch.Tensor | None = None,
+    conv_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Run Qwen3.5 DeltaNet attention over packed varlen samples.
+
+    Unlike the stock packed Qwen path, this resets the qkv causal convolution
+    at sequence boundaries and can feed per-sequence prefix conv/recurrent
+    states into the continuation.
+    """
+
+    from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
+
+    batch_size, seq_len, _ = hidden_states.shape
+    mixed_qkv_pre = linear_attn.in_proj_qkv(hidden_states)
+    mixed_qkv, conv_final_state = fla_causal_conv1d(
+        mixed_qkv_pre,
+        linear_attn.conv1d.weight.squeeze(1),
+        linear_attn.conv1d.bias,
+        initial_state=conv_state,
+        output_final_state=output_final_state,
+        activation=linear_attn.activation,
+        backend=os.environ.get("BGKIT_QWEN35_LAYERWISE_SPLIT_CONV_BACKEND", "triton"),
+        cu_seqlens=cu_seqlens,
+    )
+    query, key, value = torch.split(
+        mixed_qkv,
+        [linear_attn.key_dim, linear_attn.key_dim, linear_attn.value_dim],
+        dim=-1,
+    )
+    query = query.reshape(batch_size, seq_len, -1, linear_attn.head_k_dim)
+    key = key.reshape(batch_size, seq_len, -1, linear_attn.head_k_dim)
+    value = value.reshape(batch_size, seq_len, -1, linear_attn.head_v_dim)
+    beta = linear_attn.in_proj_b(hidden_states).sigmoid()
+    a = linear_attn.in_proj_a(hidden_states)
+    g = -linear_attn.A_log.float().exp() * F.softplus(a.float() + linear_attn.dt_bias)
+    if linear_attn.num_v_heads // linear_attn.num_k_heads > 1:
+        repeat = linear_attn.num_v_heads // linear_attn.num_k_heads
+        query = query.repeat_interleave(repeat, dim=2)
+        key = key.repeat_interleave(repeat, dim=2)
+    core, recurrent_final_state = linear_attn.chunk_gated_delta_rule(
+        query,
+        key,
+        value,
+        g=g,
+        beta=beta,
+        initial_state=recurrent_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=True,
+        cu_seqlens=cu_seqlens,
+    )
+    z = linear_attn.in_proj_z(hidden_states).reshape(
+        batch_size,
+        seq_len,
+        -1,
+        linear_attn.head_v_dim,
+    )
+    normed = linear_attn.norm(
+        core.reshape(-1, linear_attn.head_v_dim),
+        z.reshape(-1, linear_attn.head_v_dim),
+    ).reshape(batch_size, seq_len, -1)
+    output = linear_attn.out_proj(normed)
+    return output, recurrent_final_state, conv_final_state
+
+
+def _qwen35_split_flat_parts(
+    flat: torch.Tensor,
+    lengths: Sequence[int],
+) -> list[torch.Tensor]:
+    parts: list[torch.Tensor] = []
+    offset = 0
+    for length in lengths:
+        next_offset = offset + int(length)
+        parts.append(flat[:, offset:next_offset, :])
+        offset = next_offset
+    return parts
+
+
+def _cu_from_lengths(lengths: Sequence[int], *, device: torch.device) -> torch.Tensor:
+    values = [0]
+    running = 0
+    for length in lengths:
+        running += int(length)
+        values.append(running)
+    return torch.tensor(values, dtype=torch.int32, device=device)
+
+
+def _qwen35_deltanet_layer_split_single(
+    layer: nn.Module,
+    prefix_hidden: torch.Tensor,
+    cont_hidden: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run one Qwen3.5 DeltaNet decoder layer as prefix prefill + continuation."""
+
+    recurrent_state = None
+    conv_state = None
+    if prefix_hidden.shape[1] > 0:
+        with torch.no_grad():
+            residual = prefix_hidden
+            norm_prefix = layer.input_layernorm(prefix_hidden)
+            prefix_attn, recurrent_state, conv_state = _qwen35_linear_attn_parts_single(
+                layer.linear_attn,
+                norm_prefix,
+                output_final_state=True,
+            )
+            prefix_out = residual + prefix_attn
+            residual = prefix_out
+            prefix_out = layer.post_attention_layernorm(prefix_out)
+            prefix_out = layer.mlp(prefix_out)
+            prefix_out = (residual + prefix_out).detach()
+    else:
+        prefix_out = prefix_hidden.detach()
+
+    if cont_hidden.shape[1] == 0:
+        return prefix_out, cont_hidden
+
+    residual = cont_hidden
+    norm_cont = layer.input_layernorm(cont_hidden)
+    cont_attn, _cont_state, _cont_conv = _qwen35_linear_attn_parts_single(
+        layer.linear_attn,
+        norm_cont,
+        recurrent_state=recurrent_state,
+        conv_state=conv_state,
+        output_final_state=False,
+    )
+    cont_out = residual + cont_attn
+    residual = cont_out
+    cont_out = layer.post_attention_layernorm(cont_out)
+    cont_out = layer.mlp(cont_out)
+    return prefix_out, residual + cont_out
+
+
+def _qwen35_deltanet_layer_split_packed(
+    layer: nn.Module,
+    prefix_hidden_parts: Sequence[torch.Tensor],
+    cont_hidden_parts: Sequence[torch.Tensor],
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    prefix_lengths = [int(part.shape[1]) for part in prefix_hidden_parts]
+    cont_lengths = [int(part.shape[1]) for part in cont_hidden_parts]
+    if any(length <= 0 for length in prefix_lengths) or any(
+        length <= 0 for length in cont_lengths
+    ):
+        next_prefix: list[torch.Tensor] = []
+        next_cont: list[torch.Tensor] = []
+        for prefix_hidden, cont_hidden in zip(
+            prefix_hidden_parts,
+            cont_hidden_parts,
+            strict=True,
+        ):
+            prefix_out, cont_out = _qwen35_deltanet_layer_split_single(
+                layer,
+                prefix_hidden,
+                cont_hidden,
+            )
+            next_prefix.append(prefix_out.detach())
+            next_cont.append(cont_out)
+        return next_prefix, next_cont
+
+    device = prefix_hidden_parts[0].device
+    with torch.no_grad():
+        prefix_hidden = torch.cat(
+            [part.squeeze(0) for part in prefix_hidden_parts],
+            dim=0,
+        ).unsqueeze(0)
+        prefix_cu = _cu_from_lengths(prefix_lengths, device=device)
+        norm_prefix = layer.input_layernorm(prefix_hidden)
+        prefix_attn, recurrent_state, conv_state = _qwen35_linear_attn_parts_packed(
+            layer.linear_attn,
+            norm_prefix,
+            cu_seqlens=prefix_cu,
+            output_final_state=True,
+        )
+        prefix_attn_parts = _qwen35_split_flat_parts(prefix_attn, prefix_lengths)
+        prefix_out_parts: list[torch.Tensor] = []
+        for prefix_input, prefix_attn_part in zip(
+            prefix_hidden_parts,
+            prefix_attn_parts,
+            strict=True,
+        ):
+            prefix_out = prefix_input + prefix_attn_part
+            residual_part = prefix_out
+            prefix_tail = layer.post_attention_layernorm(prefix_out)
+            prefix_tail = layer.mlp(prefix_tail)
+            prefix_out_parts.append((residual_part + prefix_tail).detach())
+
+    cont_hidden = torch.cat(
+        [part.squeeze(0) for part in cont_hidden_parts],
+        dim=0,
+    ).unsqueeze(0)
+    cont_cu = _cu_from_lengths(cont_lengths, device=device)
+    norm_cont = layer.input_layernorm(cont_hidden)
+    cont_attn, _cont_state, _cont_conv = _qwen35_linear_attn_parts_packed(
+        layer.linear_attn,
+        norm_cont,
+        cu_seqlens=cont_cu,
+        recurrent_state=recurrent_state,
+        conv_state=conv_state,
+        output_final_state=False,
+    )
+    cont_attn_parts = _qwen35_split_flat_parts(cont_attn, cont_lengths)
+    cont_out_parts: list[torch.Tensor] = []
+    for cont_input, cont_attn_part in zip(
+        cont_hidden_parts,
+        cont_attn_parts,
+        strict=True,
+    ):
+        cont_out = cont_input + cont_attn_part
+        residual_part = cont_out
+        cont_tail = layer.post_attention_layernorm(cont_out)
+        cont_tail = layer.mlp(cont_tail)
+        cont_out_parts.append(residual_part + cont_tail)
+    return prefix_out_parts, cont_out_parts
 
 
 @dataclass
@@ -283,6 +673,279 @@ def _chunked_lm_ce(
         weighted_sum = weighted_sum + (chunk_loss * shift_mask[:, start:end]).sum()
 
     return weighted_sum / shift_mask.sum().clamp(min=1)
+
+
+class _FrozenChunkedLMCEFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        lm_head_bias: torch.Tensor | None,
+        target_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor | None,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        shift_hidden = hidden_states[:, :-1, :]
+        shift_targets = target_ids[:, 1:].contiguous()
+        shift_mask = attention_mask[:, 1:].to(dtype=hidden_states.dtype).contiguous()
+        has_loss_mask = loss_mask is not None
+        if loss_mask is not None:
+            shift_mask = shift_mask * loss_mask[:, 1:].to(dtype=hidden_states.dtype)
+
+        denom = shift_mask.sum().clamp(min=1)
+        weighted_sum = hidden_states.new_zeros(())
+        with torch.no_grad():
+            _b, seq_len, _h = shift_hidden.shape
+            for start in range(0, seq_len, int(chunk_size)):
+                end = min(start + int(chunk_size), seq_len)
+                h_chunk = shift_hidden[:, start:end].contiguous()
+                t_chunk = shift_targets[:, start:end].contiguous()
+                chunk_loss = _chunk_ce_fn(lm_head_weight, h_chunk, t_chunk, lm_head_bias)
+                weighted_sum = weighted_sum + (chunk_loss * shift_mask[:, start:end]).sum()
+
+        ctx.chunk_size = int(chunk_size)
+        ctx.has_bias = lm_head_bias is not None
+        ctx.has_loss_mask = has_loss_mask
+        to_save = [
+            hidden_states,
+            lm_head_weight,
+            target_ids,
+            attention_mask,
+        ]
+        if lm_head_bias is not None:
+            to_save.append(lm_head_bias)
+        if loss_mask is not None:
+            to_save.append(loss_mask)
+        ctx.save_for_backward(*to_save)
+        return weighted_sum / denom
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        saved = list(ctx.saved_tensors)
+        hidden_states = saved.pop(0)
+        lm_head_weight = saved.pop(0)
+        target_ids = saved.pop(0)
+        attention_mask = saved.pop(0)
+        lm_head_bias = saved.pop(0) if ctx.has_bias else None
+        loss_mask = saved.pop(0) if ctx.has_loss_mask else None
+
+        shift_hidden = hidden_states[:, :-1, :]
+        shift_targets = target_ids[:, 1:].contiguous()
+        shift_mask = attention_mask[:, 1:].to(dtype=torch.float32).contiguous()
+        if loss_mask is not None:
+            shift_mask = shift_mask * loss_mask[:, 1:].to(dtype=torch.float32)
+        denom = shift_mask.sum().clamp(min=1)
+
+        grad_hidden = torch.zeros_like(hidden_states)
+        scale = (grad_output.to(dtype=torch.float32) / denom).reshape(())
+        _b, seq_len, _h = shift_hidden.shape
+        for start in range(0, seq_len, ctx.chunk_size):
+            end = min(start + ctx.chunk_size, seq_len)
+            h_chunk = shift_hidden[:, start:end].contiguous()
+            targets = shift_targets[:, start:end].contiguous()
+            mask = shift_mask[:, start:end]
+            logits = F.linear(h_chunk, lm_head_weight, lm_head_bias)
+            probs = torch.softmax(logits.to(dtype=torch.float32), dim=-1)
+            flat_probs = probs.view(-1, probs.shape[-1])
+            flat_targets = targets.reshape(-1)
+            flat_mask = mask.reshape(-1)
+            valid = (flat_mask != 0) & (flat_targets != -100)
+            if valid.any():
+                rows = torch.arange(
+                    flat_targets.numel(),
+                    device=flat_targets.device,
+                    dtype=torch.long,
+                )
+                safe_targets = flat_targets.clamp_min(0)
+                flat_probs[rows[valid], safe_targets[valid]] -= 1.0
+            effective_mask = flat_mask * valid.to(dtype=flat_mask.dtype)
+            flat_probs = flat_probs * effective_mask.reshape(-1, 1) * scale
+            grad_chunk = flat_probs.to(dtype=lm_head_weight.dtype).matmul(lm_head_weight)
+            grad_hidden[:, start:end, :] = grad_chunk.view_as(h_chunk).to(dtype=hidden_states.dtype)
+
+        return grad_hidden, None, None, None, None, None, None
+
+
+def _frozen_chunked_lm_ce(
+    lm_head: nn.Module,
+    hidden_states: torch.Tensor,
+    target_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    loss_mask: torch.Tensor | None,
+    chunk_size: int | None,
+) -> torch.Tensor:
+    """Chunked shifted CE for a frozen LM head, returning only hidden gradients.
+
+    This is a correctness-first autograd contract for the no-LoRA frozen-decoder
+    kernel track. It deliberately never returns LM-head weight/bias gradients.
+    """
+
+    lm_head_bias = getattr(lm_head, "bias", None)
+    if lm_head.weight.requires_grad or (lm_head_bias is not None and lm_head_bias.requires_grad):
+        raise ValueError(
+            "frozen_chunked decoder CE requires a frozen LM head because it "
+            "only computes hidden-state gradients."
+        )
+    return _FrozenChunkedLMCEFunction.apply(
+        hidden_states,
+        lm_head.weight,
+        lm_head_bias,
+        target_ids,
+        attention_mask,
+        loss_mask,
+        _resolve_ce_chunk_size(chunk_size),
+    )
+
+
+class _FrozenLinearDxFunction(torch.autograd.Function):
+    """Autograd for a frozen dense layer that returns only input gradients."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(weight)
+        ctx.x_shape = tuple(x.shape)
+        return F.linear(x, weight, bias)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (weight,) = ctx.saved_tensors
+        grad_out = grad_output.reshape(-1, grad_output.shape[-1])
+        grad_x = grad_out.matmul(weight)
+        return grad_x.reshape(ctx.x_shape), None, None
+
+
+class FrozenLinearInputGrad(nn.Module):
+    """Drop-in Linear wrapper for frozen-weight input-gradient experiments."""
+
+    def __init__(self, base: nn.Linear):
+        super().__init__()
+        self.in_features = base.in_features
+        self.out_features = base.out_features
+        self.weight = base.weight
+        self.bias = base.bias
+
+    @classmethod
+    def from_linear(cls, base: nn.Linear) -> FrozenLinearInputGrad:
+        return cls(base)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight.requires_grad or (self.bias is not None and self.bias.requires_grad):
+            return F.linear(x, self.weight, self.bias)
+        if not x.requires_grad:
+            return F.linear(x, self.weight, self.bias)
+        return _FrozenLinearDxFunction.apply(x, self.weight, self.bias)
+
+
+class _FusedSiblingLinearGroup:
+    """Shared one-call projection cache for a fixed sequence of frozen linears."""
+
+    def __init__(self, names: tuple[str, ...]):
+        self.names = names
+        self.members: list[FusedSiblingLinear] = []
+        self.weight: torch.Tensor | None = None
+        self.bias: torch.Tensor | None = None
+        self.output: torch.Tensor | None = None
+        self.input_id: int | None = None
+        self.returned: set[int] = set()
+
+    def register(self, member: FusedSiblingLinear) -> None:
+        self.members.append(member)
+
+    def reset_output(self) -> None:
+        self.output = None
+        self.input_id = None
+        self.returned.clear()
+
+    def _install_weight_cache(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        first = self.members[0]
+        expected_out = sum(int(member.weight.shape[0]) for member in self.members)
+        expected_shape = (expected_out, int(first.weight.shape[1]))
+        if (
+            self.weight is None
+            or self.weight.device != first.weight.device
+            or self.weight.dtype != first.weight.dtype
+            or tuple(self.weight.shape) != expected_shape
+        ):
+            self.weight = torch.cat(
+                tuple(member.weight.detach() for member in self.members),
+                dim=0,
+            ).contiguous()
+        if first.bias is None:
+            self.bias = None
+            return self.weight, None
+        expected_bias_shape = (expected_out,)
+        if (
+            self.bias is None
+            or self.bias.device != first.bias.device
+            or self.bias.dtype != first.bias.dtype
+            or tuple(self.bias.shape) != expected_bias_shape
+        ):
+            self.bias = torch.cat(
+                tuple(member.bias.detach() for member in self.members),
+                dim=0,
+            ).contiguous()
+        return self.weight, self.bias
+
+    def project(self, member: FusedSiblingLinear, x: torch.Tensor) -> torch.Tensor:
+        if self.output is None or self.input_id != id(x):
+            weight, bias = self._install_weight_cache()
+            self.output = F.linear(x, weight, bias)
+            self.input_id = id(x)
+            self.returned.clear()
+
+        start = 0
+        for item in self.members:
+            width = int(item.weight.shape[0])
+            if item is member:
+                out = self.output.narrow(-1, start, width)
+                self.returned.add(item.group_index)
+                if len(self.returned) == len(self.members):
+                    self.reset_output()
+                return out
+            start += width
+        raise RuntimeError("fused sibling linear member is not registered in its group")
+
+
+class FusedSiblingLinear(nn.Module):
+    """Linear wrapper that shares one frozen projection with sibling wrappers."""
+
+    def __init__(
+        self,
+        base: nn.Linear,
+        group: _FusedSiblingLinearGroup,
+        group_index: int,
+    ) -> None:
+        super().__init__()
+        self.weight = base.weight
+        self.bias = base.bias
+        self.in_features = base.in_features
+        self.out_features = base.out_features
+        self.group = group
+        self.group_index = int(group_index)
+        group.register(self)
+
+    @classmethod
+    def from_linear(
+        cls,
+        base: nn.Linear,
+        group: _FusedSiblingLinearGroup,
+        group_index: int,
+    ) -> FusedSiblingLinear:
+        return cls(base, group, group_index)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight.requires_grad or (self.bias is not None and self.bias.requires_grad):
+            return F.linear(x, self.weight, self.bias)
+        if x.dtype != self.weight.dtype:
+            return F.linear(x, self.weight, self.bias)
+        return self.group.project(self, x)
 
 
 @dataclass
@@ -557,16 +1220,14 @@ class _FrozenBaseMLPLoRAFunction(torch.autograd.Function):
                 sigmoid_gate = torch.sigmoid(gate_y)
                 silu_gate = gate_y * sigmoid_gate
                 grad_up = grad_hidden * silu_gate
-                grad_gate = grad_hidden * up_y * sigmoid_gate * (
-                    1.0 + gate_y * (1.0 - sigmoid_gate)
+                grad_gate = (
+                    grad_hidden * up_y * sigmoid_gate * (1.0 + gate_y * (1.0 - sigmoid_gate))
                 )
         else:
             sigmoid_gate = torch.sigmoid(gate_y)
             silu_gate = gate_y * sigmoid_gate
             grad_up = grad_hidden * silu_gate
-            grad_gate = grad_hidden * up_y * sigmoid_gate * (
-                1.0 + gate_y * (1.0 - sigmoid_gate)
-            )
+            grad_gate = grad_hidden * up_y * sigmoid_gate * (1.0 + gate_y * (1.0 - sigmoid_gate))
 
         gate_grad_h = grad_gate.matmul(gate_b).mul_(ctx.gate_scaling)
         up_grad_h = grad_up.matmul(up_b).mul_(ctx.up_scaling)
@@ -613,11 +1274,15 @@ class _FrozenBaseMLPLoRAFunction(torch.autograd.Function):
             except Exception:
                 grad_x.addmm_(gate_grad_h, gate_a)
                 grad_x.addmm_(up_grad_h, up_a)
-        elif _LORA_TRITON is not None and _LORA_TRITON.can_use_triton_lora_dx_add(
-            grad_x,
-            gate_grad_h,
-            gate_a,
-        ) and _LORA_TRITON.can_use_triton_lora_dx_add(grad_x, up_grad_h, up_a):
+        elif (
+            _LORA_TRITON is not None
+            and _LORA_TRITON.can_use_triton_lora_dx_add(
+                grad_x,
+                gate_grad_h,
+                gate_a,
+            )
+            and _LORA_TRITON.can_use_triton_lora_dx_add(grad_x, up_grad_h, up_a)
+        ):
             try:
                 grad_x = _LORA_TRITON.triton_lora_dx_add_(grad_x, gate_grad_h, gate_a)
                 grad_x = _LORA_TRITON.triton_lora_dx_add_(grad_x, up_grad_h, up_a)
@@ -650,6 +1315,2789 @@ class _FrozenBaseMLPLoRAFunction(torch.autograd.Function):
             None,
             None,
         )
+
+
+class _FrozenBaseMLPFunction(torch.autograd.Function):
+    """Autograd for a frozen Qwen-style SwiGLU MLP.
+
+    Computes only ``dX``. Base weight gradients are intentionally omitted,
+    so callers must use this only when the decoder MLP weights are frozen.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        gate_up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+        out_features: int,
+    ) -> torch.Tensor:
+        x_shape = tuple(x.shape)
+        x_2d = x.reshape(-1, x_shape[-1])
+
+        y_cat = F.linear(x_2d, gate_up_weight)
+        gate_y, up_y = y_cat.split(int(out_features), dim=-1)
+        if _LORA_TRITON is not None and _LORA_TRITON.can_use_triton_swiglu_forward(
+            gate_y,
+            up_y,
+        ):
+            try:
+                hidden = _LORA_TRITON.triton_swiglu_forward(gate_y, up_y)
+            except Exception:
+                hidden = F.silu(gate_y) * up_y
+        else:
+            hidden = F.silu(gate_y) * up_y
+
+        out = F.linear(hidden, down_weight)
+
+        ctx.save_for_backward(gate_up_weight, down_weight, gate_y, up_y)
+        ctx.x_shape = x_shape
+        ctx.out_features = int(out_features)
+        return out.reshape(*x_shape[:-1], down_weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        gate_up_weight, down_weight, gate_y, up_y = ctx.saved_tensors
+        grad_out = grad_output.reshape(-1, grad_output.shape[-1])
+
+        base_dx_mode = os.environ.get("BGKIT_DECODER_MLP_BASE_DX", "cat").strip().lower()
+        if (
+            base_dx_mode == "down_cat"
+            and _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_down_swiglu_backward_cat")
+        ):
+            try:
+                grad_cat = _LORA_TRITON.triton_down_swiglu_backward_cat(
+                    grad_out,
+                    down_weight,
+                    gate_y,
+                    up_y,
+                )
+                grad_x = grad_cat.matmul(gate_up_weight)
+                return grad_x.reshape(ctx.x_shape), None, None, None
+            except Exception:
+                if _coerce_bool(os.environ.get("BGKIT_DECODER_MLP_TRITON_BASE_DX_STRICT", "0")):
+                    raise
+
+        grad_hidden = grad_out.matmul(down_weight)
+        base_dx_max_rows = int(os.environ.get("BGKIT_DECODER_MLP_DIRECT_DX_MAX_ROWS", "256"))
+        rows = int(grad_hidden.reshape(-1, grad_hidden.shape[-1]).shape[0])
+        if (
+            base_dx_mode in {"direct", "adaptive"}
+            and (base_dx_mode == "direct" or rows <= base_dx_max_rows)
+            and _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_swiglu_gate_up_base_dx")
+        ):
+            try:
+                gate_weight, up_weight = gate_up_weight.split(ctx.out_features, dim=0)
+                grad_x = _LORA_TRITON.triton_swiglu_gate_up_base_dx(
+                    grad_hidden,
+                    gate_y,
+                    up_y,
+                    gate_weight,
+                    up_weight,
+                )
+                return grad_x.reshape(ctx.x_shape), None, None, None
+            except Exception:
+                if _coerce_bool(os.environ.get("BGKIT_DECODER_MLP_TRITON_BASE_DX_STRICT", "0")):
+                    raise
+        if (
+            base_dx_mode == "cat"
+            and _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_swiglu_backward_cat")
+            and _LORA_TRITON.can_use_triton_swiglu_backward(grad_hidden, gate_y, up_y)
+        ):
+            try:
+                grad_cat = _LORA_TRITON.triton_swiglu_backward_cat(
+                    grad_hidden,
+                    gate_y,
+                    up_y,
+                )
+                grad_x = grad_cat.matmul(gate_up_weight)
+                return grad_x.reshape(ctx.x_shape), None, None, None
+            except Exception:
+                pass
+
+        if _LORA_TRITON is not None and _LORA_TRITON.can_use_triton_swiglu_backward(
+            grad_hidden,
+            gate_y,
+            up_y,
+        ):
+            try:
+                grad_gate, grad_up = _LORA_TRITON.triton_swiglu_backward(
+                    grad_hidden,
+                    gate_y,
+                    up_y,
+                )
+            except Exception:
+                sigmoid_gate = torch.sigmoid(gate_y)
+                silu_gate = gate_y * sigmoid_gate
+                grad_up = grad_hidden * silu_gate
+                grad_gate = (
+                    grad_hidden * up_y * sigmoid_gate * (1.0 + gate_y * (1.0 - sigmoid_gate))
+                )
+        else:
+            sigmoid_gate = torch.sigmoid(gate_y)
+            silu_gate = gate_y * sigmoid_gate
+            grad_up = grad_hidden * silu_gate
+            grad_gate = grad_hidden * up_y * sigmoid_gate * (1.0 + gate_y * (1.0 - sigmoid_gate))
+
+        if base_dx_mode == "triton":
+            try:
+                if _LORA_TRITON is None:
+                    raise RuntimeError("lora_triton unavailable")
+                gate_weight, up_weight = gate_up_weight.split(ctx.out_features, dim=0)
+                grad_x = _LORA_TRITON.triton_gate_up_base_dx(
+                    grad_gate,
+                    gate_weight,
+                    grad_up,
+                    up_weight,
+                )
+            except Exception:
+                if _coerce_bool(os.environ.get("BGKIT_DECODER_MLP_TRITON_BASE_DX_STRICT", "0")):
+                    raise
+                grad_cat = torch.cat((grad_gate, grad_up), dim=-1)
+                grad_x = grad_cat.matmul(gate_up_weight)
+        elif base_dx_mode == "two":
+            gate_weight, up_weight = gate_up_weight.split(ctx.out_features, dim=0)
+            grad_x = grad_gate.matmul(gate_weight)
+            grad_x.addmm_(grad_up, up_weight)
+        else:
+            grad_cat = torch.cat((grad_gate, grad_up), dim=-1)
+            grad_x = grad_cat.matmul(gate_up_weight)
+
+        return grad_x.reshape(ctx.x_shape), None, None, None
+
+
+class _QuackFrozenBaseMLPFunction(torch.autograd.Function):
+    """Frozen Qwen MLP using Quack gated GEMM forward and d-gated backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        gate_up_weight_interleaved_t: torch.Tensor,
+        gate_up_weight_interleaved: torch.Tensor,
+        down_weight: torch.Tensor,
+        tuned: bool,
+        dynamic_scheduler: bool,
+    ) -> torch.Tensor:
+        if _QUACK_GEMM_GATED is None:
+            raise RuntimeError("quack.gemm_gated is unavailable")
+        preact, hidden = _QUACK_GEMM_GATED(
+            x.reshape(-1, x.shape[-1]),
+            gate_up_weight_interleaved_t,
+            activation="swiglu",
+            store_preact=True,
+            dynamic_scheduler=bool(dynamic_scheduler),
+            tuned=bool(tuned),
+        )
+        out = F.linear(hidden, down_weight)
+        ctx.save_for_backward(preact, gate_up_weight_interleaved, down_weight)
+        ctx.x_shape = tuple(x.shape)
+        ctx.tuned = bool(tuned)
+        ctx.dynamic_scheduler = bool(dynamic_scheduler)
+        return out.reshape(*ctx.x_shape[:-1], down_weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        preact, gate_up_weight_interleaved, down_weight = ctx.saved_tensors
+        if _QUACK_GEMM_DGATED is None:
+            raise RuntimeError("quack.gemm_dgated is unavailable")
+        grad_out = grad_output.reshape(-1, grad_output.shape[-1])
+        grad_preact, _hidden = _QUACK_GEMM_DGATED(
+            grad_out,
+            down_weight,
+            preact,
+            activation="swiglu",
+            dynamic_scheduler=ctx.dynamic_scheduler,
+            tuned=ctx.tuned,
+        )
+        grad_x = grad_preact.matmul(gate_up_weight_interleaved)
+        return grad_x.reshape(ctx.x_shape), None, None, None, None, None
+
+
+class _FrozenRMSNormMLPResidualFunction(torch.autograd.Function):
+    """Autograd for ``x + frozen_mlp(rmsnorm(x))``.
+
+    This is a block-level frozen-decoder contract: it returns only the input
+    gradient and intentionally omits RMSNorm/MLP weight gradients.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        gate_up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+        out_features: int,
+    ) -> torch.Tensor:
+        x_shape = tuple(x.shape)
+        x_2d = x.reshape(-1, x_shape[-1])
+        x_float = x_2d.float()
+        rstd = torch.rsqrt(x_float.pow(2).mean(dim=-1, keepdim=True) + float(eps))
+        norm_scale = 1.0 + norm_weight.float()
+        normed = (x_float * rstd * norm_scale).to(dtype=x.dtype)
+
+        y_cat = F.linear(normed, gate_up_weight)
+        gate_y, up_y = y_cat.split(int(out_features), dim=-1)
+        if _LORA_TRITON is not None and _LORA_TRITON.can_use_triton_swiglu_forward(
+            gate_y,
+            up_y,
+        ):
+            try:
+                hidden = _LORA_TRITON.triton_swiglu_forward(gate_y, up_y)
+            except Exception:
+                hidden = F.silu(gate_y) * up_y
+        else:
+            hidden = F.silu(gate_y) * up_y
+        mlp_out = F.linear(hidden, down_weight)
+
+        ctx.save_for_backward(
+            x_2d,
+            rstd,
+            norm_weight,
+            gate_up_weight,
+            down_weight,
+            gate_y,
+            up_y,
+        )
+        ctx.x_shape = x_shape
+        ctx.out_features = int(out_features)
+        return (x_2d + mlp_out).reshape(*x_shape[:-1], x_shape[-1])
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (
+            x_2d,
+            rstd,
+            norm_weight,
+            gate_up_weight,
+            down_weight,
+            gate_y,
+            up_y,
+        ) = ctx.saved_tensors
+        grad_out = grad_output.reshape(-1, grad_output.shape[-1])
+
+        base_dx_mode = os.environ.get("BGKIT_DECODER_MLP_BASE_DX", "cat").strip().lower()
+        grad_normed = None
+        if (
+            base_dx_mode == "down_cat"
+            and _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_down_swiglu_backward_cat")
+        ):
+            try:
+                grad_cat = _LORA_TRITON.triton_down_swiglu_backward_cat(
+                    grad_out,
+                    down_weight,
+                    gate_y,
+                    up_y,
+                )
+                grad_normed = grad_cat.matmul(gate_up_weight)
+            except Exception:
+                if _coerce_bool(os.environ.get("BGKIT_DECODER_MLP_TRITON_BASE_DX_STRICT", "0")):
+                    raise
+                grad_normed = None
+
+        grad_hidden = None
+        if grad_normed is None:
+            grad_hidden = grad_out.matmul(down_weight)
+        base_dx_max_rows = int(os.environ.get("BGKIT_DECODER_MLP_DIRECT_DX_MAX_ROWS", "256"))
+        rows = (
+            int(grad_hidden.reshape(-1, grad_hidden.shape[-1]).shape[0])
+            if grad_hidden is not None
+            else 0
+        )
+        if (
+            grad_hidden is not None
+            and base_dx_mode in {"direct", "adaptive"}
+            and (base_dx_mode == "direct" or rows <= base_dx_max_rows)
+            and _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_swiglu_gate_up_base_dx")
+        ):
+            try:
+                gate_weight, up_weight = gate_up_weight.split(ctx.out_features, dim=0)
+                grad_normed = _LORA_TRITON.triton_swiglu_gate_up_base_dx(
+                    grad_hidden,
+                    gate_y,
+                    up_y,
+                    gate_weight,
+                    up_weight,
+                )
+            except Exception:
+                if _coerce_bool(os.environ.get("BGKIT_DECODER_MLP_TRITON_BASE_DX_STRICT", "0")):
+                    raise
+                grad_normed = None
+        if (
+            grad_normed is None
+            and base_dx_mode == "cat"
+            and _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_swiglu_backward_cat")
+            and _LORA_TRITON.can_use_triton_swiglu_backward(grad_hidden, gate_y, up_y)
+        ):
+            try:
+                grad_cat = _LORA_TRITON.triton_swiglu_backward_cat(
+                    grad_hidden,
+                    gate_y,
+                    up_y,
+                )
+                grad_normed = grad_cat.matmul(gate_up_weight)
+            except Exception:
+                grad_normed = None
+
+        if grad_normed is None:
+            if _LORA_TRITON is not None and _LORA_TRITON.can_use_triton_swiglu_backward(
+                grad_hidden,
+                gate_y,
+                up_y,
+            ):
+                try:
+                    grad_gate, grad_up = _LORA_TRITON.triton_swiglu_backward(
+                        grad_hidden,
+                        gate_y,
+                        up_y,
+                    )
+                except Exception:
+                    sigmoid_gate = torch.sigmoid(gate_y)
+                    silu_gate = gate_y * sigmoid_gate
+                    grad_up = grad_hidden * silu_gate
+                    grad_gate = (
+                        grad_hidden * up_y * sigmoid_gate * (1.0 + gate_y * (1.0 - sigmoid_gate))
+                    )
+            else:
+                sigmoid_gate = torch.sigmoid(gate_y)
+                silu_gate = gate_y * sigmoid_gate
+                grad_up = grad_hidden * silu_gate
+                grad_gate = (
+                    grad_hidden * up_y * sigmoid_gate * (1.0 + gate_y * (1.0 - sigmoid_gate))
+                )
+
+            if base_dx_mode == "triton":
+                try:
+                    if _LORA_TRITON is None:
+                        raise RuntimeError("lora_triton unavailable")
+                    gate_weight, up_weight = gate_up_weight.split(ctx.out_features, dim=0)
+                    grad_normed = _LORA_TRITON.triton_gate_up_base_dx(
+                        grad_gate,
+                        gate_weight,
+                        grad_up,
+                        up_weight,
+                    )
+                except Exception:
+                    if _coerce_bool(os.environ.get("BGKIT_DECODER_MLP_TRITON_BASE_DX_STRICT", "0")):
+                        raise
+                    grad_cat = torch.cat((grad_gate, grad_up), dim=-1)
+                    grad_normed = grad_cat.matmul(gate_up_weight)
+            elif base_dx_mode == "two":
+                gate_weight, up_weight = gate_up_weight.split(ctx.out_features, dim=0)
+                grad_normed = grad_gate.matmul(gate_weight)
+                grad_normed.addmm_(grad_up, up_weight)
+            else:
+                grad_cat = torch.cat((grad_gate, grad_up), dim=-1)
+                grad_normed = grad_cat.matmul(gate_up_weight)
+
+        x_float = x_2d.float()
+        grad_scaled = grad_normed.float() * (1.0 + norm_weight.float())
+        mean_dot = (grad_scaled * x_float).mean(dim=-1, keepdim=True)
+        grad_norm_input = rstd * (grad_scaled - x_float * rstd.square() * mean_dot)
+        grad_x = grad_out + grad_norm_input.to(dtype=grad_out.dtype)
+        return grad_x.reshape(ctx.x_shape), None, None, None, None, None
+
+
+class _FrozenSwiGLUActivationFunction(torch.autograd.Function):
+    """SwiGLU activation with a fused elementwise backward for frozen MLP probes."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        gate: torch.Tensor,
+        up: torch.Tensor,
+        use_triton_forward: bool,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(gate, up)
+        if (
+            bool(use_triton_forward)
+            and _LORA_TRITON is not None
+            and _LORA_TRITON.can_use_triton_swiglu_forward(gate, up)
+        ):
+            try:
+                return _LORA_TRITON.triton_swiglu_forward(gate, up)
+            except Exception:
+                pass
+        return F.silu(gate) * up
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        gate, up = ctx.saved_tensors
+        if (
+            _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_swiglu_backward")
+            and _LORA_TRITON.can_use_triton_swiglu_backward(grad_output, gate, up)
+        ):
+            try:
+                grad_gate, grad_up = _LORA_TRITON.triton_swiglu_backward(
+                    grad_output,
+                    gate,
+                    up,
+                )
+                return grad_gate, grad_up, None
+            except Exception:
+                pass
+
+        sigmoid_gate = torch.sigmoid(gate)
+        silu_gate = gate * sigmoid_gate
+        grad_up = grad_output * silu_gate
+        grad_gate = grad_output * up * sigmoid_gate * (1.0 + gate * (1.0 - sigmoid_gate))
+        return grad_gate, grad_up, None
+
+
+def _install_frozen_mlp_gate_up_cache(
+    module: nn.Module,
+    gate_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+) -> torch.Tensor:
+    cached = getattr(module, "_bgkit_frozen_mlp_gate_up_weight", None)
+    expected_shape = (
+        gate_weight.shape[0] + up_weight.shape[0],
+        gate_weight.shape[1],
+    )
+    if (
+        cached is not None
+        and cached.device == gate_weight.device
+        and cached.dtype == gate_weight.dtype
+        and tuple(cached.shape) == expected_shape
+    ):
+        return cached
+
+    gate_up_weight = torch.cat((gate_weight.detach(), up_weight.detach()), dim=0).contiguous()
+    if cached is not None:
+        module._buffers["_bgkit_frozen_mlp_gate_up_weight"] = gate_up_weight
+        return gate_up_weight
+    module.register_buffer("_bgkit_frozen_mlp_gate_up_weight", gate_up_weight, persistent=False)
+    return gate_up_weight
+
+
+def _install_frozen_mlp_gate_up_interleaved_cache(
+    module: nn.Module,
+    gate_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cached = getattr(module, "_bgkit_frozen_mlp_gate_up_interleaved_weight", None)
+    cached_t = getattr(module, "_bgkit_frozen_mlp_gate_up_interleaved_weight_t", None)
+    expected_shape = (
+        gate_weight.shape[0] + up_weight.shape[0],
+        gate_weight.shape[1],
+    )
+    expected_t_shape = (gate_weight.shape[1], gate_weight.shape[0] + up_weight.shape[0])
+    if (
+        cached is not None
+        and cached_t is not None
+        and cached.device == gate_weight.device
+        and cached.dtype == gate_weight.dtype
+        and tuple(cached.shape) == expected_shape
+        and cached_t.device == gate_weight.device
+        and cached_t.dtype == gate_weight.dtype
+        and tuple(cached_t.shape) == expected_t_shape
+    ):
+        return cached, cached_t
+
+    gate_up_weight = (
+        torch.stack((gate_weight.detach(), up_weight.detach()), dim=1)
+        .reshape(gate_weight.shape[0] + up_weight.shape[0], gate_weight.shape[1])
+        .contiguous()
+    )
+    gate_up_weight_t = gate_up_weight.t().contiguous()
+    if cached is not None:
+        module._buffers["_bgkit_frozen_mlp_gate_up_interleaved_weight"] = gate_up_weight
+    else:
+        module.register_buffer(
+            "_bgkit_frozen_mlp_gate_up_interleaved_weight",
+            gate_up_weight,
+            persistent=False,
+        )
+    if cached_t is not None:
+        module._buffers["_bgkit_frozen_mlp_gate_up_interleaved_weight_t"] = gate_up_weight_t
+    else:
+        module.register_buffer(
+            "_bgkit_frozen_mlp_gate_up_interleaved_weight_t",
+            gate_up_weight_t,
+            persistent=False,
+        )
+    return gate_up_weight, gate_up_weight_t
+
+
+def _qwen35_attention_qkv_patchable(
+    module: nn.Module,
+    *,
+    for_install: bool = True,
+) -> bool:
+    q_proj = getattr(module, "q_proj", None)
+    k_proj = getattr(module, "k_proj", None)
+    v_proj = getattr(module, "v_proj", None)
+    if not (
+        isinstance(q_proj, nn.Linear)
+        and isinstance(k_proj, nn.Linear)
+        and isinstance(v_proj, nn.Linear)
+    ):
+        return False
+    if for_install and getattr(module, "_bgkit_fused_attention_qkv_forward", False):
+        return False
+    if q_proj.weight.requires_grad or k_proj.weight.requires_grad or v_proj.weight.requires_grad:
+        return False
+    if not (q_proj.weight.dtype == k_proj.weight.dtype == v_proj.weight.dtype):
+        return False
+    if not (q_proj.weight.device == k_proj.weight.device == v_proj.weight.device):
+        return False
+    if not (q_proj.in_features == k_proj.in_features == v_proj.in_features):
+        return False
+    if q_proj.bias is None:
+        if k_proj.bias is not None or v_proj.bias is not None:
+            return False
+    elif k_proj.bias is None or v_proj.bias is None:
+        return False
+    head_dim = int(getattr(module, "head_dim", 0) or 0)
+    if head_dim <= 0:
+        return False
+    # Qwen3.5 full attention projects query and gate together as
+    # (..., n_heads, 2 * head_dim). Plain Qwen3 attention has no gate and
+    # therefore must stay on the stock path.
+    return (
+        q_proj.out_features % (2 * head_dim) == 0
+        and k_proj.out_features % head_dim == 0
+        and v_proj.out_features % head_dim == 0
+    )
+
+
+def _fused_sibling_linears_patchable(
+    module: nn.Module,
+    names: tuple[str, ...],
+) -> bool:
+    children = [getattr(module, name, None) for name in names]
+    if not all(isinstance(child, nn.Linear) for child in children):
+        return False
+    first = children[0]
+    if any(child.weight.requires_grad for child in children):
+        return False
+    if any(child.bias is not None and child.bias.requires_grad for child in children):
+        return False
+    if any(child.weight.dtype != first.weight.dtype for child in children):
+        return False
+    if any(child.weight.device != first.weight.device for child in children):
+        return False
+    if any(child.in_features != first.in_features for child in children):
+        return False
+    first_has_bias = first.bias is not None
+    return all((child.bias is not None) == first_has_bias for child in children)
+
+
+def _frozen_qwen35_deltanet_core_patchable(module: nn.Module) -> bool:
+    names = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")
+    if not _fused_sibling_linears_patchable(
+        module,
+        ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"),
+    ):
+        return False
+    children = [getattr(module, name, None) for name in names]
+    if not all(isinstance(child, nn.Linear) for child in children):
+        return False
+    conv = getattr(module, "conv1d", None)
+    norm = getattr(module, "norm", None)
+    if not isinstance(conv, nn.Conv1d) or norm is None:
+        return False
+    tensors = [
+        module.in_proj_qkv.weight,
+        module.in_proj_z.weight,
+        module.in_proj_b.weight,
+        module.in_proj_a.weight,
+        module.out_proj.weight,
+        conv.weight,
+        getattr(module, "A_log", None),
+        getattr(module, "dt_bias", None),
+        getattr(norm, "weight", None),
+    ]
+    if conv.bias is not None:
+        tensors.append(conv.bias)
+    if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+        return False
+    if any(tensor.requires_grad for tensor in tensors):
+        return False
+    if any(child.bias is not None for child in children):
+        return False
+    head_k_dim = int(getattr(module, "head_k_dim", 0) or 0)
+    head_v_dim = int(getattr(module, "head_v_dim", 0) or 0)
+    num_v_heads = int(getattr(module, "num_v_heads", 0) or 0)
+    num_k_heads = int(getattr(module, "num_k_heads", 0) or 0)
+    if not (head_k_dim == head_v_dim == 128 and num_v_heads == num_k_heads):
+        return False
+    if int(module.in_proj_qkv.out_features) != 3 * num_v_heads * head_v_dim:
+        return False
+    if int(module.in_proj_z.out_features) != num_v_heads * head_v_dim:
+        return False
+    if int(module.in_proj_b.out_features) != num_v_heads:
+        return False
+    if int(module.in_proj_a.out_features) != num_v_heads:
+        return False
+    return int(module.out_proj.in_features) == num_v_heads * head_v_dim
+
+
+def _packed_effective_seq_len(
+    hidden_states: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    position_ids: torch.Tensor | None = None,
+) -> int:
+    if cu_seqlens is None or cu_seqlens.numel() <= 2:
+        if position_ids is None or position_ids.numel() == 0:
+            return int(hidden_states.shape[1])
+        return int(position_ids.max().item()) + 1
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    return int(lengths.max().item())
+
+
+def _position_ids_are_packed(
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor | None,
+) -> bool:
+    if position_ids is None or position_ids.numel() == 0:
+        return False
+    return int(position_ids.max().item()) + 1 < int(hidden_states.shape[1])
+
+
+def _cu_seqlens_from_position_ids(
+    position_ids: torch.Tensor | None,
+    total_len: int,
+) -> torch.Tensor | None:
+    if position_ids is None or position_ids.numel() == 0:
+        return None
+    pos = position_ids.reshape(-1)
+    starts = torch.nonzero(pos == 0, as_tuple=False).flatten().to(torch.int32)
+    if starts.numel() == 0:
+        return None
+    if int(starts[0].item()) != 0:
+        starts = torch.cat([starts.new_zeros(1), starts])
+    end = starts.new_tensor([int(total_len)])
+    return torch.cat([starts, end])
+
+
+def _resolve_packed_cu_seqlens(
+    explicit: torch.Tensor | None,
+    kwargs: Mapping[str, object],
+) -> torch.Tensor | None:
+    if explicit is not None:
+        return explicit
+    for name in ("cu_seqlens", "cu_seq_lens_q", "cu_seq_lens_k"):
+        value = kwargs.get(name)
+        if isinstance(value, torch.Tensor):
+            return value
+    return None
+
+
+def _resolve_deltanet_packed_metadata(
+    cu_seqlens: torch.Tensor | None,
+    position_ids: torch.Tensor | None,
+    kwargs: Mapping[str, object],
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    cu = _resolve_packed_cu_seqlens(cu_seqlens, kwargs)
+    pos = position_ids
+    if cu is None or pos is None:
+        try:
+            from bgkit.utils.deltanet_patch import current_deltanet_packed_context
+
+            context_cu, context_pos = current_deltanet_packed_context()
+        except Exception:
+            context_cu = context_pos = None
+        if cu is None:
+            cu = context_cu
+        if pos is None:
+            pos = context_pos
+    return cu, pos
+
+
+class _FrozenQwen35DeltaNetCoreFunction(torch.autograd.Function):
+    """Frozen Qwen3.5 DeltaNet core backward that returns only d hidden_states."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states: torch.Tensor,
+        in_proj_qkv_weight: torch.Tensor,
+        in_proj_z_weight: torch.Tensor,
+        in_proj_b_weight: torch.Tensor,
+        in_proj_a_weight: torch.Tensor,
+        in_proj_bundle_weight: torch.Tensor,
+        conv_weight: torch.Tensor,
+        conv_bias: torch.Tensor | None,
+        norm_weight: torch.Tensor,
+        out_proj_weight: torch.Tensor,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+        conv_kernel_size: int,
+        norm_eps: float,
+        norm_activation: str,
+        g_clamp_min: float,
+        cu_seqlens: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+        input_norm_weight: torch.Tensor,
+        input_norm_eps: float,
+        add_input_residual: bool,
+        gdr_initial_state: torch.Tensor | None,
+    ) -> torch.Tensor:
+        from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
+        from fla.modules.fused_norm_gate import layer_norm_gated_fwd
+        from fla.modules.l2norm import l2norm_fwd, l2norm_fwd_pair
+        from fla.ops.gated_delta_rule.chunk import (
+            _save_local_attention_for_backward,
+            chunk_gated_delta_rule_fwd,
+        )
+        from fla.ops.utils import prepare_chunk_indices
+
+        from causal_conv1d import causal_conv1d_fn
+
+        input_residual = hidden_states
+        has_input_norm = input_norm_weight.numel() > 0
+        if has_input_norm:
+            hidden_2d = hidden_states.reshape(-1, hidden_states.shape[-1])
+            hidden_float = hidden_2d.float()
+            input_norm_rstd = torch.rsqrt(
+                hidden_float.pow(2).mean(dim=-1, keepdim=True) + float(input_norm_eps)
+            )
+            input_norm_scale = 1.0 + input_norm_weight.float()
+            hidden_states = (
+                (hidden_float * input_norm_rstd * input_norm_scale)
+                .to(dtype=hidden_states.dtype)
+                .reshape_as(hidden_states)
+            )
+        else:
+            input_norm_rstd = hidden_states.new_empty(0)
+        batch_size, seq_len, _ = hidden_states.shape
+        effective_cu_seqlens = cu_seqlens
+        if effective_cu_seqlens is None and position_ids is not None:
+            effective_cu_seqlens = _cu_seqlens_from_position_ids(position_ids, seq_len)
+        chunk_indices = (
+            prepare_chunk_indices(effective_cu_seqlens, 64)
+            if effective_cu_seqlens is not None
+            else None
+        )
+        use_input_bundle = _coerce_bool(
+            os.environ.get("BGKIT_FROZEN_DELTANET_CHANNEL_LAST_BUNDLE_INPUT", "0"),
+            default=False,
+        )
+        if use_input_bundle:
+            input_bundle = _record_frozen_deltanet_core_timer(
+                "fwd_input_bundle_proj",
+                lambda: F.linear(hidden_states, in_proj_bundle_weight),
+            )
+            qkv_width = 3 * num_heads * head_dim
+            z_width = num_heads * head_dim
+            qkv_pre, z, b_raw, a_raw = input_bundle.split(
+                (qkv_width, z_width, num_heads, num_heads),
+                dim=-1,
+            )
+            qkv_pre = _record_frozen_deltanet_core_timer(
+                "fwd_input_bundle_qkv_contiguous",
+                qkv_pre.contiguous,
+            )
+        else:
+            qkv_pre = _record_frozen_deltanet_core_timer(
+                "fwd_qkv_in_proj",
+                lambda: F.linear(hidden_states, in_proj_qkv_weight),
+            )
+            z = b_raw = a_raw = None
+        use_channel_last_conv = _coerce_bool(
+            os.environ.get("BGKIT_FROZEN_DELTANET_CHANNEL_LAST_CONV", "0"),
+            default=False,
+        )
+        use_channel_last_conv_dx = use_channel_last_conv and _coerce_bool(
+            os.environ.get("BGKIT_FROZEN_DELTANET_CHANNEL_LAST_CONV_DX", "0"),
+            default=False,
+        )
+        reset_channel_last_conv = _coerce_bool(
+            os.environ.get("BGKIT_FROZEN_DELTANET_CHANNEL_LAST_RESET_CONV", "0"),
+            default=False,
+        )
+        use_position_conv = (
+            use_channel_last_conv
+            and reset_channel_last_conv
+            and position_ids is not None
+            and _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_causal_conv1d_channellast_position_fwd")
+        )
+        if use_channel_last_conv:
+            use_fused_qkv_conv_l2norm = (
+                not use_position_conv
+                and _coerce_bool(
+                    os.environ.get(
+                        "BGKIT_FROZEN_DELTANET_FUSED_QKV_CONV_L2NORM",
+                        "0",
+                    ),
+                    default=False,
+                )
+                and _LORA_TRITON is not None
+                and hasattr(_LORA_TRITON, "triton_qkv_conv_l2norm_channellast")
+                and _LORA_TRITON.can_use_triton_qkv_conv_l2norm_channellast(
+                    qkv_pre,
+                    conv_weight.squeeze(1),
+                    conv_bias,
+                    heads=num_heads,
+                    head_dim=head_dim,
+                )
+            )
+            qkv_pre_saved = (
+                qkv_pre if use_channel_last_conv_dx else qkv_pre.transpose(1, 2).contiguous()
+            )
+            if use_fused_qkv_conv_l2norm:
+                query, q_rstd, key, k_rstd, value = _record_frozen_deltanet_core_timer(
+                    "fwd_qkv_conv_l2norm_channel_last",
+                    lambda: _LORA_TRITON.triton_qkv_conv_l2norm_channellast(
+                        qkv_pre,
+                        conv_weight.squeeze(1),
+                        conv_bias,
+                        heads=num_heads,
+                        head_dim=head_dim,
+                    ),
+                )
+                query_raw = key_raw = None
+            else:
+                mixed_qkv = _record_frozen_deltanet_core_timer(
+                    "fwd_qkv_conv_channel_last_position"
+                    if use_position_conv
+                    else "fwd_qkv_conv_channel_last",
+                    lambda: (
+                        _LORA_TRITON.triton_causal_conv1d_channellast_position_fwd(
+                            qkv_pre,
+                            conv_weight.squeeze(1),
+                            conv_bias,
+                            position_ids,
+                        )
+                        if use_position_conv
+                        else fla_causal_conv1d(
+                            qkv_pre,
+                            conv_weight.squeeze(1),
+                            conv_bias,
+                            activation="swish",
+                            backend="cuda",
+                            cu_seqlens=effective_cu_seqlens if reset_channel_last_conv else None,
+                        )[0]
+                    ),
+                )
+                query_raw, key_raw, value = (
+                    item.reshape(batch_size, seq_len, num_heads, head_dim).contiguous()
+                    for item in mixed_qkv.split(
+                        (num_heads * head_dim, num_heads * head_dim, num_heads * head_dim),
+                        dim=-1,
+                    )
+                )
+                query = key = q_rstd = k_rstd = None
+        else:
+            qkv_pre_t = _record_frozen_deltanet_core_timer(
+                "fwd_qkv_transpose",
+                lambda: qkv_pre.transpose(1, 2).contiguous(),
+            )
+            mixed_qkv_t = _record_frozen_deltanet_core_timer(
+                "fwd_qkv_conv_channel_first",
+                lambda: causal_conv1d_fn(
+                    x=qkv_pre_t,
+                    weight=conv_weight.squeeze(1),
+                    bias=conv_bias,
+                    activation="silu",
+                ),
+            )
+            qkv_pre_saved = qkv_pre_t
+            if (
+                _coerce_bool(
+                    os.environ.get("BGKIT_FROZEN_DELTANET_TRITON_QKV_L2NORM_SPLIT", "0"),
+                    default=False,
+                )
+                and _LORA_TRITON is not None
+                and hasattr(_LORA_TRITON, "triton_split_qkv_l2norm_channelfirst")
+                and _LORA_TRITON.can_use_triton_split_qkv_channelfirst(
+                    mixed_qkv_t,
+                    heads=num_heads,
+                    head_dim=head_dim,
+                )
+            ):
+                try:
+                    query, q_rstd, key, k_rstd, value = (
+                        _LORA_TRITON.triton_split_qkv_l2norm_channelfirst(
+                            mixed_qkv_t,
+                            heads=num_heads,
+                            head_dim=head_dim,
+                        )
+                    )
+                    query_raw = query
+                    key_raw = key
+                except Exception:
+                    query = key = q_rstd = k_rstd = None
+                    mixed_qkv = mixed_qkv_t.transpose(1, 2)
+                    query_raw, key_raw, value = (
+                        item.reshape(batch_size, seq_len, num_heads, head_dim).contiguous()
+                        for item in mixed_qkv.split(
+                            (
+                                num_heads * head_dim,
+                                num_heads * head_dim,
+                                num_heads * head_dim,
+                            ),
+                            dim=-1,
+                        )
+                    )
+            elif (
+                _coerce_bool(
+                    os.environ.get("BGKIT_FROZEN_DELTANET_TRITON_QKV_SPLIT", "0"),
+                    default=False,
+                )
+                and _LORA_TRITON is not None
+                and hasattr(_LORA_TRITON, "triton_split_qkv_channelfirst")
+                and _LORA_TRITON.can_use_triton_split_qkv_channelfirst(
+                    mixed_qkv_t,
+                    heads=num_heads,
+                    head_dim=head_dim,
+                )
+            ):
+                try:
+                    query_raw, key_raw, value = _LORA_TRITON.triton_split_qkv_channelfirst(
+                        mixed_qkv_t,
+                        heads=num_heads,
+                        head_dim=head_dim,
+                    )
+                    query = key = q_rstd = k_rstd = None
+                except Exception:
+                    mixed_qkv = mixed_qkv_t.transpose(1, 2)
+                    query_raw, key_raw, value = (
+                        item.reshape(batch_size, seq_len, num_heads, head_dim).contiguous()
+                        for item in mixed_qkv.split(
+                            (
+                                num_heads * head_dim,
+                                num_heads * head_dim,
+                                num_heads * head_dim,
+                            ),
+                            dim=-1,
+                        )
+                    )
+                    query = key = q_rstd = k_rstd = None
+            else:
+                mixed_qkv = mixed_qkv_t.transpose(1, 2)
+                query_raw, key_raw, value = (
+                    item.reshape(batch_size, seq_len, num_heads, head_dim).contiguous()
+                    for item in mixed_qkv.split(
+                        (num_heads * head_dim, num_heads * head_dim, num_heads * head_dim),
+                        dim=-1,
+                    )
+                )
+                query = key = q_rstd = k_rstd = None
+        if query is None or key is None or q_rstd is None or k_rstd is None:
+            if _coerce_bool(
+                os.environ.get("FLA_GDR_PAIR_QK_L2NORM_FWD", "0"),
+                default=False,
+            ):
+                query, q_rstd, key, k_rstd = _record_frozen_deltanet_core_timer(
+                    "fwd_qk_l2norm_pair",
+                    lambda: l2norm_fwd_pair(query_raw, key_raw),
+                )
+            else:
+                query, q_rstd = _record_frozen_deltanet_core_timer(
+                    "fwd_q_l2norm",
+                    lambda: l2norm_fwd(query_raw),
+                )
+                key, k_rstd = _record_frozen_deltanet_core_timer(
+                    "fwd_k_l2norm",
+                    lambda: l2norm_fwd(key_raw),
+                )
+        if z is None or b_raw is None or a_raw is None:
+            z = _record_frozen_deltanet_core_timer(
+                "fwd_z_proj",
+                lambda: F.linear(hidden_states, in_proj_z_weight),
+            )
+            b_raw = _record_frozen_deltanet_core_timer(
+                "fwd_b_proj",
+                lambda: F.linear(hidden_states, in_proj_b_weight),
+            )
+            a_raw = _record_frozen_deltanet_core_timer(
+                "fwd_a_proj",
+                lambda: F.linear(hidden_states, in_proj_a_weight),
+            )
+        beta = b_raw.sigmoid()
+        g_for_fla = (-a_log.float().exp() * F.softplus(a_raw.float() + dt_bias)).clamp(
+            min=float(g_clamp_min)
+        )
+        scale = head_dim**-0.5
+        save_local_attention = _save_local_attention_for_backward()
+        gdr_initial_state_for_bwd = (
+            gdr_initial_state.clone() if gdr_initial_state is not None else None
+        )
+        (
+            g_cum,
+            core,
+            a_local,
+            _,
+            _initial_state_after_fwd,
+            g_input,
+            w_repr,
+            h_state,
+            v_new,
+            local_a,
+        ) = _record_frozen_deltanet_core_timer(
+            "fwd_gdr",
+            lambda: chunk_gated_delta_rule_fwd(
+                q=query,
+                k=key,
+                v=value,
+                g=g_for_fla,
+                beta=beta,
+                scale=scale,
+                initial_state=gdr_initial_state,
+                output_final_state=False,
+                use_gate_in_kernel=False,
+                A_log=None,
+                dt_bias=None,
+                return_intermediates=True,
+                return_local_attention=save_local_attention,
+                cu_seqlens=effective_cu_seqlens,
+                chunk_indices=chunk_indices,
+            ),
+        )
+        core_flat = core.reshape(batch_size * seq_len * num_heads, head_dim)
+        z_flat = z.reshape(batch_size * seq_len * num_heads, head_dim)
+        normed_flat, _tail_mean, tail_rstd, _tail_residual = _record_frozen_deltanet_core_timer(
+            "fwd_norm_gate",
+            lambda: layer_norm_gated_fwd(
+                core_flat,
+                z_flat,
+                norm_weight,
+                None,
+                activation=norm_activation,
+                eps=float(norm_eps),
+                is_rms_norm=True,
+            ),
+        )
+        normed = normed_flat.reshape(batch_size, seq_len, num_heads * head_dim)
+        output = _record_frozen_deltanet_core_timer(
+            "fwd_out_proj",
+            lambda: F.linear(normed, out_proj_weight),
+        )
+        ctx.save_for_backward(
+            qkv_pre_saved,
+            query,
+            q_rstd,
+            key,
+            k_rstd,
+            value,
+            z,
+            a_raw,
+            beta,
+            g_cum,
+            g_input if g_input is not None else hidden_states.new_empty(0),
+            a_local,
+            gdr_initial_state_for_bwd,
+            w_repr,
+            h_state,
+            v_new,
+            local_a if local_a is not None else hidden_states.new_empty(0),
+            core,
+            tail_rstd,
+            in_proj_qkv_weight,
+            in_proj_z_weight,
+            in_proj_b_weight,
+            in_proj_a_weight,
+            in_proj_bundle_weight,
+            conv_weight,
+            conv_bias if conv_bias is not None else hidden_states.new_empty(0),
+            norm_weight,
+            out_proj_weight,
+            a_log,
+            dt_bias,
+            effective_cu_seqlens
+            if effective_cu_seqlens is not None
+            else hidden_states.new_empty(0, dtype=torch.int32),
+            position_ids
+            if position_ids is not None
+            else hidden_states.new_empty(0, dtype=torch.int64),
+            chunk_indices
+            if chunk_indices is not None
+            else hidden_states.new_empty(0, 2, dtype=torch.int32),
+            input_residual if bool(add_input_residual) else hidden_states.new_empty(0),
+            input_norm_weight if has_input_norm else hidden_states.new_empty(0),
+            input_norm_rstd,
+        )
+        ctx.has_conv_bias = conv_bias is not None
+        ctx.has_g_input = g_input is not None
+        ctx.has_local_a = local_a is not None
+        ctx.used_channel_last_conv_dx = bool(use_channel_last_conv_dx)
+        ctx.used_position_conv = bool(use_position_conv)
+        ctx.has_position_ids = position_ids is not None
+        ctx.use_triton_ba_dx = _coerce_bool(
+            os.environ.get("BGKIT_FROZEN_DELTANET_TRITON_BA_DX", "0"),
+            default=False,
+        )
+        ctx.use_bundle_dx = _coerce_bool(
+            os.environ.get("BGKIT_FROZEN_DELTANET_BUNDLE_DX", "0"),
+            default=False,
+        )
+        ctx.use_triton_proj_dx = _coerce_bool(
+            os.environ.get("BGKIT_FROZEN_DELTANET_TRITON_PROJ_DX", "0"),
+            default=False,
+        )
+        ctx.use_triton_zba_dx = _coerce_bool(
+            os.environ.get("BGKIT_FROZEN_DELTANET_TRITON_ZBA_DX", "0"),
+            default=False,
+        )
+        ctx.use_wide_dproj_dx = _coerce_bool(
+            os.environ.get("BGKIT_FROZEN_DELTANET_WIDE_DPROJ_DX", "0"),
+            default=False,
+        )
+        ctx.use_wide_dproj_scratch_qkv = _coerce_bool(
+            os.environ.get("BGKIT_FROZEN_DELTANET_WIDE_DPROJ_SCRATCH_QKV", "0"),
+            default=False,
+        )
+        ctx.num_heads = int(num_heads)
+        ctx.head_dim = int(head_dim)
+        ctx.conv_kernel_size = int(conv_kernel_size)
+        ctx.norm_eps = float(norm_eps)
+        ctx.norm_activation = str(norm_activation)
+        ctx.g_clamp_min = float(g_clamp_min)
+        ctx.has_cu_seqlens = effective_cu_seqlens is not None
+        ctx.has_input_norm = has_input_norm
+        ctx.add_input_residual = bool(add_input_residual)
+        ctx.hidden_shape = tuple(hidden_states.shape)
+        ctx.hidden_dtype = hidden_states.dtype
+        return input_residual + output if bool(add_input_residual) else output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        from fla.modules.fused_norm_gate import layer_norm_gated_bwd
+        from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd_dproj
+
+        from causal_conv1d.causal_conv1d_interface import causal_conv1d_bwd_function
+
+        (
+            qkv_pre_saved,
+            query,
+            q_rstd,
+            key,
+            k_rstd,
+            value,
+            z,
+            a_raw,
+            beta,
+            g_cum,
+            g_input_saved,
+            a_local,
+            initial_state,
+            w_repr,
+            h_state,
+            v_new,
+            local_a_saved,
+            core,
+            tail_rstd,
+            in_proj_qkv_weight,
+            in_proj_z_weight,
+            in_proj_b_weight,
+            in_proj_a_weight,
+            in_proj_bundle_weight,
+            conv_weight,
+            conv_bias_saved,
+            norm_weight,
+            out_proj_weight,
+            a_log,
+            dt_bias,
+            cu_seqlens_saved,
+            position_ids_saved,
+            chunk_indices_saved,
+            input_residual_saved,
+            input_norm_weight_saved,
+            input_norm_rstd,
+        ) = ctx.saved_tensors
+        batch_size, seq_len, _ = ctx.hidden_shape
+        num_heads = ctx.num_heads
+        head_dim = ctx.head_dim
+        qkv_width = 3 * num_heads * head_dim
+        grad_flat = grad_output.reshape(batch_size * seq_len, -1)
+        rows = batch_size * seq_len
+        dz_width = num_heads * head_dim
+        d_normed = _record_frozen_deltanet_core_timer(
+            "bwd_out_proj_dx",
+            lambda: grad_flat @ out_proj_weight,
+        )
+        do_flat, dz_flat, _d_norm_weight, _d_norm_bias, _dresidual = (
+            _record_frozen_deltanet_core_timer(
+                "bwd_norm_gate",
+                lambda: layer_norm_gated_bwd(
+                    dy=d_normed.reshape(batch_size * seq_len * num_heads, head_dim),
+                    x=core.reshape(batch_size * seq_len * num_heads, head_dim),
+                    g=z.reshape(batch_size * seq_len * num_heads, head_dim),
+                    weight=norm_weight,
+                    bias=None,
+                    activation=ctx.norm_activation,
+                    eps=ctx.norm_eps,
+                    mean=None,
+                    rstd=tail_rstd,
+                    dresidual=None,
+                    has_residual=False,
+                    is_rms_norm=True,
+                    x_dtype=core.dtype,
+                    return_weight_bias_grads=False,
+                ),
+            )
+        )
+        do = do_flat.reshape(batch_size, seq_len, num_heads, head_dim)
+        dz_2d = dz_flat.reshape(rows, dz_width)
+        use_wide_dproj_dx = bool(
+            ctx.use_wide_dproj_dx
+            and not ctx.use_bundle_dx
+            and not ctx.use_triton_proj_dx
+            and not ctx.use_triton_zba_dx
+        )
+        use_wide_dproj_scratch_qkv = bool(
+            use_wide_dproj_dx
+            and ctx.use_wide_dproj_scratch_qkv
+            and ctx.used_channel_last_conv_dx
+            and _LORA_TRITON is not None
+        )
+        dproj_out = None
+        dproj_front_width = qkv_width + dz_width + 2 * num_heads
+        dproj_qkv_offset = 0
+        if use_wide_dproj_dx:
+            dproj_qkv_offset = dproj_front_width if use_wide_dproj_scratch_qkv else 0
+            dproj_out = dz_2d.new_empty(
+                rows,
+                dproj_front_width + (qkv_width if use_wide_dproj_scratch_qkv else 0),
+            )
+            _record_frozen_deltanet_core_timer(
+                "bwd_wide_dproj_z_copy",
+                lambda: dproj_out[:, qkv_width : qkv_width + dz_width].copy_(
+                    dz_2d.to(ctx.hidden_dtype),
+                ),
+            )
+        dproj, _dh0, _d_a_log, _d_dt_bias = _record_frozen_deltanet_core_timer(
+            "bwd_gdr_dproj",
+            lambda: chunk_gated_delta_rule_bwd_dproj(
+                q=query,
+                q_rstd=q_rstd,
+                k=key,
+                k_rstd=k_rstd,
+                v=value,
+                g=g_cum,
+                beta=beta,
+                A=a_local,
+                scale=head_dim**-0.5,
+                initial_state=initial_state,
+                do=do,
+                dht=None,
+                saved_w=w_repr,
+                saved_h=h_state,
+                saved_v_new=v_new,
+                saved_local_A=local_a_saved if ctx.has_local_a else None,
+                use_gate_in_kernel=False,
+                g_input=g_input_saved if ctx.has_g_input else None,
+                A_log=None,
+                dt_bias=None,
+                return_gate_param_grads=False,
+                raw_gate_input=a_raw,
+                raw_A_log=a_log,
+                raw_dt_bias=dt_bias,
+                store_raw_gate_grads=True,
+                apply_raw_gate_clamp=True,
+                raw_gate_clamp_min=ctx.g_clamp_min,
+                cu_seqlens=cu_seqlens_saved if ctx.has_cu_seqlens else None,
+                chunk_indices=chunk_indices_saved if ctx.has_cu_seqlens else None,
+                dproj_out=dproj_out,
+                dproj_z_width=dz_width if use_wide_dproj_dx else 0,
+                dproj_qkv_offset=dproj_qkv_offset,
+            ),
+        )
+        dproj_b_offset = qkv_width + (dz_width if use_wide_dproj_dx else 0)
+        db_raw = (
+            dproj[:, qkv_width : qkv_width + num_heads].reshape(batch_size, seq_len, num_heads)
+            if not use_wide_dproj_dx
+            else dproj[:, dproj_b_offset : dproj_b_offset + num_heads].reshape(
+                batch_size, seq_len, num_heads
+            )
+        )
+        da_raw = (
+            dproj[:, qkv_width + num_heads :].reshape(batch_size, seq_len, num_heads)
+            if not use_wide_dproj_dx
+            else dproj[
+                :,
+                dproj_b_offset + num_heads : dproj_b_offset + 2 * num_heads,
+            ].reshape(batch_size, seq_len, num_heads)
+        )
+        conv_bias = conv_bias_saved if ctx.has_conv_bias else None
+        dproj_qkv_grad_2d = dproj[
+            :,
+            dproj_qkv_offset : dproj_qkv_offset + qkv_width,
+        ]
+        dproj_qkv_grad = dproj_qkv_grad_2d.as_strided(
+            (batch_size, seq_len, qkv_width),
+            (seq_len * dproj.stride(0), dproj.stride(0), dproj.stride(1)),
+        )
+        dproj_qkv_dx_2d = dproj[:, :qkv_width]
+        dproj_qkv_dx = dproj_qkv_dx_2d.as_strided(
+            (batch_size, seq_len, qkv_width),
+            (seq_len * dproj.stride(0), dproj.stride(0), dproj.stride(1)),
+        )
+        d_qkv_written_to_dproj = False
+        if (
+            ctx.used_channel_last_conv_dx
+            and _LORA_TRITON is not None
+            and ctx.used_position_conv
+            and hasattr(_LORA_TRITON, "triton_causal_conv1d_channellast_position_dx")
+            and _LORA_TRITON.can_use_triton_causal_conv1d_channellast_position_dx(
+                qkv_pre_saved,
+                conv_weight.squeeze(1),
+                conv_bias,
+                dproj_qkv_grad,
+                position_ids_saved,
+            )
+        ):
+            d_qkv_pre = _record_frozen_deltanet_core_timer(
+                "bwd_qkv_conv_dx_triton_position",
+                lambda: _LORA_TRITON.triton_causal_conv1d_channellast_position_dx(
+                    qkv_pre_saved,
+                    conv_weight.squeeze(1),
+                    conv_bias,
+                    dproj_qkv_grad,
+                    position_ids_saved,
+                    out=dproj_qkv_dx if use_wide_dproj_scratch_qkv else None,
+                ),
+            )
+            d_qkv_written_to_dproj = use_wide_dproj_scratch_qkv
+        elif (
+            ctx.used_channel_last_conv_dx
+            and _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_causal_conv1d_channellast_dx")
+            and _LORA_TRITON.can_use_triton_causal_conv1d_channellast_dx(
+                qkv_pre_saved,
+                conv_weight.squeeze(1),
+                conv_bias,
+                dproj_qkv_grad,
+            )
+        ):
+            d_qkv_pre = _record_frozen_deltanet_core_timer(
+                "bwd_qkv_conv_dx_triton",
+                lambda: _LORA_TRITON.triton_causal_conv1d_channellast_dx(
+                    qkv_pre_saved,
+                    conv_weight.squeeze(1),
+                    conv_bias,
+                    dproj_qkv_grad,
+                    out=dproj_qkv_dx if use_wide_dproj_scratch_qkv else None,
+                ),
+            )
+            d_qkv_written_to_dproj = use_wide_dproj_scratch_qkv
+        else:
+            qkv_pre_t = (
+                qkv_pre_saved.transpose(1, 2).contiguous()
+                if ctx.used_channel_last_conv_dx
+                else qkv_pre_saved
+            )
+            d_qkv_t = dproj_qkv_grad.transpose(1, 2)
+            d_qkv_pre, _dweight, _dbias, _dinitial_states = _record_frozen_deltanet_core_timer(
+                "bwd_qkv_conv_dx",
+                lambda: causal_conv1d_bwd_function(
+                    qkv_pre_t,
+                    conv_weight.squeeze(1),
+                    conv_bias,
+                    d_qkv_t,
+                    None,
+                    None,
+                    None,
+                    None,
+                    False,
+                    True,
+                ),
+            )
+            d_qkv_pre = d_qkv_pre.transpose(1, 2)
+        d_qkv_flat = (
+            dproj_qkv_dx_2d if d_qkv_written_to_dproj else d_qkv_pre.reshape(rows, qkv_width)
+        )
+        if use_wide_dproj_dx and not d_qkv_written_to_dproj:
+            _record_frozen_deltanet_core_timer(
+                "bwd_wide_dproj_qkv_copy",
+                lambda: dproj[:, :qkv_width].copy_(d_qkv_flat.to(ctx.hidden_dtype)),
+            )
+        grad_hidden_has_ba = False
+        if (
+            ctx.use_triton_proj_dx
+            and _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_deltanet_input_base_dproj_dx")
+            and _LORA_TRITON.can_use_triton_deltanet_input_base_dproj_dx(
+                d_qkv_flat,
+                in_proj_qkv_weight,
+                dz_2d,
+                in_proj_z_weight,
+                dproj,
+                in_proj_b_weight,
+                in_proj_a_weight,
+            )
+        ):
+            grad_hidden = _record_frozen_deltanet_core_timer(
+                "bwd_input_proj_dx_triton_full",
+                lambda: _LORA_TRITON.triton_deltanet_input_base_dproj_dx(
+                    d_qkv_flat,
+                    in_proj_qkv_weight,
+                    dz_2d,
+                    in_proj_z_weight,
+                    dproj,
+                    in_proj_b_weight,
+                    in_proj_a_weight,
+                ),
+            )
+            grad_hidden_has_ba = True
+        elif ctx.use_bundle_dx:
+            bundle_grad = _record_frozen_deltanet_core_timer(
+                "bwd_input_proj_bundle_cat",
+                lambda: torch.cat(
+                    (
+                        d_qkv_flat.to(ctx.hidden_dtype),
+                        dz_2d.to(ctx.hidden_dtype),
+                        db_raw.reshape(rows, num_heads).to(ctx.hidden_dtype),
+                        da_raw.reshape(rows, num_heads).to(ctx.hidden_dtype),
+                    ),
+                    dim=1,
+                ),
+            )
+            grad_hidden = _record_frozen_deltanet_core_timer(
+                "bwd_input_proj_dx_bundle_mm",
+                lambda: bundle_grad @ in_proj_bundle_weight,
+            )
+            grad_hidden_has_ba = True
+        elif use_wide_dproj_dx:
+            dproj_mm = dproj[:, :dproj_front_width]
+            grad_hidden = _record_frozen_deltanet_core_timer(
+                "bwd_input_proj_dx_wide_dproj_mm",
+                lambda: dproj_mm @ in_proj_bundle_weight,
+            )
+            grad_hidden_has_ba = True
+        elif (
+            ctx.use_triton_zba_dx
+            and _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_deltanet_zba_dproj_dx_add_")
+        ):
+            grad_hidden = _record_frozen_deltanet_core_timer(
+                "bwd_qkv_proj_dx_mm",
+                lambda: d_qkv_flat @ in_proj_qkv_weight,
+            )
+            if _LORA_TRITON.can_use_triton_deltanet_zba_dproj_dx_add(
+                grad_hidden,
+                dz_2d,
+                dproj,
+                in_proj_z_weight,
+                in_proj_b_weight,
+                in_proj_a_weight,
+                qkv_out=qkv_width,
+            ):
+                grad_hidden = _record_frozen_deltanet_core_timer(
+                    "bwd_zba_proj_dx_triton_add",
+                    lambda: _LORA_TRITON.triton_deltanet_zba_dproj_dx_add_(
+                        grad_hidden,
+                        dz_2d,
+                        dproj,
+                        in_proj_z_weight,
+                        in_proj_b_weight,
+                        in_proj_a_weight,
+                        qkv_out=qkv_width,
+                    ),
+                )
+                grad_hidden_has_ba = True
+            else:
+                grad_hidden = _record_frozen_deltanet_core_timer(
+                    "bwd_zba_proj_dx_mm",
+                    lambda: (
+                        grad_hidden
+                        + dz_2d @ in_proj_z_weight
+                        + db_raw.reshape(rows, num_heads).to(ctx.hidden_dtype) @ in_proj_b_weight
+                        + da_raw.reshape(rows, num_heads).to(ctx.hidden_dtype) @ in_proj_a_weight
+                    ),
+                )
+                grad_hidden_has_ba = True
+        else:
+            use_addmm_z_dx = _coerce_bool(
+                os.environ.get("BGKIT_FROZEN_DELTANET_ADDMM_Z_DX", "0"),
+                default=False,
+            )
+            if use_addmm_z_dx:
+                grad_hidden = _record_frozen_deltanet_core_timer(
+                    "bwd_qkv_proj_dx_mm",
+                    lambda: d_qkv_flat @ in_proj_qkv_weight,
+                )
+                grad_hidden = _record_frozen_deltanet_core_timer(
+                    "bwd_z_proj_dx_addmm",
+                    lambda: torch.addmm(
+                        grad_hidden,
+                        dz_2d,
+                        in_proj_z_weight,
+                        beta=1.0,
+                        alpha=1.0,
+                        out=grad_hidden,
+                    ),
+                )
+            else:
+                grad_hidden = _record_frozen_deltanet_core_timer(
+                    "bwd_qkv_z_proj_dx_mm",
+                    lambda: d_qkv_flat @ in_proj_qkv_weight + dz_2d @ in_proj_z_weight,
+                )
+        if (
+            not grad_hidden_has_ba
+            and not ctx.use_bundle_dx
+            and not ctx.use_triton_zba_dx
+            and not ctx.use_triton_proj_dx
+            and ctx.use_triton_ba_dx
+            and _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_deltanet_ba_dproj_dx_add_")
+            and _LORA_TRITON.can_use_triton_deltanet_ba_dproj_dx_add(
+                grad_hidden,
+                dproj,
+                in_proj_b_weight,
+                in_proj_a_weight,
+                qkv_out=qkv_width,
+            )
+        ):
+            grad_hidden = _record_frozen_deltanet_core_timer(
+                "bwd_ba_proj_dx_triton_add",
+                lambda: _LORA_TRITON.triton_deltanet_ba_dproj_dx_add_(
+                    grad_hidden,
+                    dproj,
+                    in_proj_b_weight,
+                    in_proj_a_weight,
+                    qkv_out=qkv_width,
+                ),
+            )
+        elif not grad_hidden_has_ba:
+            grad_hidden = _record_frozen_deltanet_core_timer(
+                "bwd_ba_proj_dx_mm",
+                lambda: (
+                    grad_hidden
+                    + db_raw.reshape(batch_size * seq_len, num_heads).to(ctx.hidden_dtype)
+                    @ in_proj_b_weight
+                    + da_raw.reshape(batch_size * seq_len, num_heads).to(ctx.hidden_dtype)
+                    @ in_proj_a_weight
+                ),
+            )
+        residual_added = False
+        if ctx.has_input_norm:
+            x_2d = input_residual_saved.reshape(-1, input_residual_saved.shape[-1])
+            grad_normed = grad_hidden.reshape(-1, grad_hidden.shape[-1])
+            grad_residual_2d = (
+                grad_output.reshape(-1, grad_output.shape[-1]) if ctx.add_input_residual else None
+            )
+            use_triton_input_rmsnorm_dx = (
+                _coerce_bool(
+                    os.environ.get("BGKIT_FROZEN_DELTANET_INPUT_RMSNORM_DX", "0"),
+                    default=False,
+                )
+                and _LORA_TRITON is not None
+                and hasattr(_LORA_TRITON, "triton_rmsnorm_residual_dx")
+                and hasattr(_LORA_TRITON, "can_use_triton_rmsnorm_residual_dx")
+                and _LORA_TRITON.can_use_triton_rmsnorm_residual_dx(
+                    grad_normed,
+                    x_2d,
+                    input_norm_weight_saved,
+                    input_norm_rstd,
+                    grad_residual_2d,
+                )
+            )
+            if use_triton_input_rmsnorm_dx:
+                grad_hidden = _record_frozen_deltanet_core_timer(
+                    "bwd_input_rmsnorm_dx_triton",
+                    lambda: _LORA_TRITON.triton_rmsnorm_residual_dx(
+                        grad_normed,
+                        x_2d,
+                        input_norm_weight_saved,
+                        input_norm_rstd,
+                        grad_residual_2d,
+                    ),
+                ).reshape(ctx.hidden_shape)
+                residual_added = bool(ctx.add_input_residual)
+            else:
+                x_float = x_2d.float()
+                grad_scaled = grad_normed.float() * (1.0 + input_norm_weight_saved.float())
+                mean_dot = (grad_scaled * x_float).mean(dim=-1, keepdim=True)
+                grad_norm_input = input_norm_rstd * (
+                    grad_scaled - x_float * input_norm_rstd.square() * mean_dot
+                )
+                grad_hidden = grad_norm_input.to(dtype=grad_normed.dtype).reshape(ctx.hidden_shape)
+        if ctx.add_input_residual and not residual_added:
+            grad_hidden = grad_hidden + grad_output
+        return (
+            grad_hidden.reshape(ctx.hidden_shape),
+            None,  # in_proj_qkv_weight
+            None,  # in_proj_z_weight
+            None,  # in_proj_b_weight
+            None,  # in_proj_a_weight
+            None,  # in_proj_bundle_weight
+            None,  # conv_weight
+            None,  # conv_bias
+            None,  # norm_weight
+            None,  # out_proj_weight
+            None,  # a_log
+            None,  # dt_bias
+            None,  # num_heads
+            None,  # head_dim
+            None,  # conv_kernel_size
+            None,  # norm_eps
+            None,  # norm_activation
+            None,  # g_clamp_min
+            None,  # cu_seqlens
+            None,  # position_ids
+            None,  # input_norm_weight
+            None,  # input_norm_eps
+            None,  # add_input_residual
+            None,  # gdr_initial_state
+        )
+
+
+class _FrozenQwen35DeltaNetOriginalForwardRecomputeFunction(torch.autograd.Function):
+    """Use stock Qwen DeltaNet forward and recompute custom frozen backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states: torch.Tensor,
+        original_forward,
+        in_proj_qkv_weight: torch.Tensor,
+        in_proj_z_weight: torch.Tensor,
+        in_proj_b_weight: torch.Tensor,
+        in_proj_a_weight: torch.Tensor,
+        in_proj_bundle_weight: torch.Tensor,
+        conv_weight: torch.Tensor,
+        conv_bias: torch.Tensor | None,
+        norm_weight: torch.Tensor,
+        out_proj_weight: torch.Tensor,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+        conv_kernel_size: int,
+        norm_eps: float,
+        norm_activation: str,
+        g_clamp_min: float,
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(
+            hidden_states,
+            in_proj_qkv_weight,
+            in_proj_z_weight,
+            in_proj_b_weight,
+            in_proj_a_weight,
+            in_proj_bundle_weight,
+            conv_weight,
+            conv_bias if conv_bias is not None else hidden_states.new_empty(0),
+            norm_weight,
+            out_proj_weight,
+            a_log,
+            dt_bias,
+            cu_seqlens if cu_seqlens is not None else hidden_states.new_empty(0, dtype=torch.int32),
+        )
+        ctx.has_conv_bias = conv_bias is not None
+        ctx.has_cu_seqlens = cu_seqlens is not None
+        ctx.num_heads = int(num_heads)
+        ctx.head_dim = int(head_dim)
+        ctx.conv_kernel_size = int(conv_kernel_size)
+        ctx.norm_eps = float(norm_eps)
+        ctx.norm_activation = str(norm_activation)
+        ctx.g_clamp_min = float(g_clamp_min)
+        return _call_qwen35_deltanet_original_forward(
+            original_forward,
+            hidden_states,
+            cache_params=None,
+            attention_mask=None,
+            cu_seqlens=cu_seqlens,
+            position_ids=None,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (
+            hidden_states,
+            in_proj_qkv_weight,
+            in_proj_z_weight,
+            in_proj_b_weight,
+            in_proj_a_weight,
+            in_proj_bundle_weight,
+            conv_weight,
+            conv_bias_saved,
+            norm_weight,
+            out_proj_weight,
+            a_log,
+            dt_bias,
+            cu_seqlens_saved,
+        ) = ctx.saved_tensors
+        conv_bias = conv_bias_saved if ctx.has_conv_bias else None
+        cu_seqlens = cu_seqlens_saved if ctx.has_cu_seqlens else None
+        with torch.enable_grad():
+            hidden_recompute = hidden_states.detach().requires_grad_(True)
+            output = _FrozenQwen35DeltaNetCoreFunction.apply(
+                hidden_recompute,
+                in_proj_qkv_weight,
+                in_proj_z_weight,
+                in_proj_b_weight,
+                in_proj_a_weight,
+                in_proj_bundle_weight,
+                conv_weight,
+                conv_bias,
+                norm_weight,
+                out_proj_weight,
+                a_log,
+                dt_bias,
+                ctx.num_heads,
+                ctx.head_dim,
+                ctx.conv_kernel_size,
+                ctx.norm_eps,
+                ctx.norm_activation,
+                ctx.g_clamp_min,
+                cu_seqlens,
+                None,
+                hidden_states.new_empty(0),
+                0.0,
+                False,
+                None,
+            )
+            (grad_hidden,) = torch.autograd.grad(
+                output,
+                hidden_recompute,
+                grad_output,
+                retain_graph=False,
+                create_graph=False,
+            )
+        return (
+            grad_hidden,
+            None,  # original_forward
+            None,  # in_proj_qkv_weight
+            None,  # in_proj_z_weight
+            None,  # in_proj_b_weight
+            None,  # in_proj_a_weight
+            None,  # in_proj_bundle_weight
+            None,  # conv_weight
+            None,  # conv_bias
+            None,  # norm_weight
+            None,  # out_proj_weight
+            None,  # a_log
+            None,  # dt_bias
+            None,  # num_heads
+            None,  # head_dim
+            None,  # conv_kernel_size
+            None,  # norm_eps
+            None,  # norm_activation
+            None,  # g_clamp_min
+            None,  # cu_seqlens
+        )
+
+
+def _qwen35_deltanet_frozen_core_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    cache_params=None,
+    attention_mask: torch.Tensor | None = None,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
+    **unused_kwargs,
+) -> torch.Tensor:
+    cu_seqlens, position_ids = _resolve_deltanet_packed_metadata(
+        cu_seqlens,
+        position_ids,
+        unused_kwargs,
+    )
+    original_forward = getattr(module, "_bgkit_original_frozen_core_forward", None)
+    if (
+        original_forward is None
+        or cache_params is not None
+        or attention_mask is not None
+        or hidden_states.dim() != 3
+        or not hidden_states.is_cuda
+        or hidden_states.dtype != module.in_proj_qkv.weight.dtype
+        or not _frozen_qwen35_deltanet_core_patchable(module)
+    ):
+        if original_forward is None:
+            raise RuntimeError(
+                "frozen DeltaNet core patch was installed without an original forward"
+            )
+        module._bgkit_frozen_core_fallback_calls = (
+            getattr(module, "_bgkit_frozen_core_fallback_calls", 0) + 1
+        )
+        return _call_qwen35_deltanet_original_forward(
+            original_forward,
+            hidden_states,
+            cache_params,
+            attention_mask,
+            cu_seqlens=cu_seqlens,
+            position_ids=position_ids,
+            **unused_kwargs,
+        )
+    seq_len = _packed_effective_seq_len(hidden_states, cu_seqlens, position_ids)
+    min_seq_len = _coerce_int_env("BGKIT_FROZEN_DELTANET_CORE_BWD_MIN_SEQ_LEN", 0)
+    if min_seq_len > 0 and seq_len < min_seq_len:
+        module._bgkit_frozen_core_fallback_calls = (
+            getattr(module, "_bgkit_frozen_core_fallback_calls", 0) + 1
+        )
+        module._bgkit_frozen_core_fallback_short_seq_calls = (
+            getattr(module, "_bgkit_frozen_core_fallback_short_seq_calls", 0) + 1
+        )
+        return _call_qwen35_deltanet_original_forward(
+            original_forward,
+            hidden_states,
+            cache_params,
+            attention_mask,
+            cu_seqlens=cu_seqlens,
+            position_ids=position_ids,
+            **unused_kwargs,
+        )
+
+    max_seq_len = _coerce_int_env("BGKIT_FROZEN_DELTANET_CORE_BWD_MAX_SEQ_LEN", 544)
+    if max_seq_len > 0 and seq_len > max_seq_len:
+        module._bgkit_frozen_core_fallback_calls = (
+            getattr(module, "_bgkit_frozen_core_fallback_calls", 0) + 1
+        )
+        module._bgkit_frozen_core_fallback_long_seq_calls = (
+            getattr(module, "_bgkit_frozen_core_fallback_long_seq_calls", 0) + 1
+        )
+        return _call_qwen35_deltanet_original_forward(
+            original_forward,
+            hidden_states,
+            cache_params,
+            attention_mask,
+            cu_seqlens=cu_seqlens,
+            position_ids=position_ids,
+            **unused_kwargs,
+        )
+
+    try:
+        import bgkit.utils.deltanet_patch as deltanet_patch
+
+        default_g_clamp_min = deltanet_patch.DEFAULT_G_CLAMP_MIN
+    except Exception:
+        default_g_clamp_min = -1.3
+    module._bgkit_frozen_core_custom_calls = (
+        getattr(module, "_bgkit_frozen_core_custom_calls", 0) + 1
+    )
+    g_clamp_min = float(getattr(module, "_bgkit_g_clamp_min", default_g_clamp_min))
+    if _coerce_bool(
+        os.environ.get("BGKIT_FROZEN_DELTANET_ORIGINAL_FWD_RECOMPUTE_BWD", "0"),
+        default=False,
+    ):
+        return _FrozenQwen35DeltaNetOriginalForwardRecomputeFunction.apply(
+            hidden_states,
+            original_forward,
+            module.in_proj_qkv.weight,
+            module.in_proj_z.weight,
+            module.in_proj_b.weight,
+            module.in_proj_a.weight,
+            _install_deltanet_input_bundle_cache(module),
+            module.conv1d.weight,
+            module.conv1d.bias,
+            module.norm.weight,
+            module.out_proj.weight,
+            module.A_log,
+            module.dt_bias,
+            int(module.num_v_heads),
+            int(module.head_v_dim),
+            int(module.conv_kernel_size),
+            float(module.norm.eps),
+            str(module.norm.activation),
+            g_clamp_min,
+            cu_seqlens,
+        )
+    return _FrozenQwen35DeltaNetCoreFunction.apply(
+        hidden_states,
+        module.in_proj_qkv.weight,
+        module.in_proj_z.weight,
+        module.in_proj_b.weight,
+        module.in_proj_a.weight,
+        _install_deltanet_input_bundle_cache(module),
+        module.conv1d.weight,
+        module.conv1d.bias,
+        module.norm.weight,
+        module.out_proj.weight,
+        module.A_log,
+        module.dt_bias,
+        int(module.num_v_heads),
+        int(module.head_v_dim),
+        int(module.conv_kernel_size),
+        float(module.norm.eps),
+        str(module.norm.activation),
+        g_clamp_min,
+        cu_seqlens,
+        position_ids,
+        hidden_states.new_empty(0),
+        0.0,
+        False,
+        None,
+    )
+
+
+def _frozen_rmsnorm_deltanet_residual_patchable(
+    module: nn.Module,
+    x: torch.Tensor | None = None,
+) -> bool:
+    if getattr(module, "layer_type", None) != "linear_attention":
+        return False
+    norm = getattr(module, "input_layernorm", None)
+    linear_attn = getattr(module, "linear_attn", None)
+    norm_weight = getattr(norm, "weight", None)
+    if not isinstance(norm_weight, torch.Tensor) or norm_weight.requires_grad:
+        return False
+    if not hasattr(norm, "eps"):
+        return False
+    if not _frozen_qwen35_deltanet_core_patchable(linear_attn):
+        return False
+    if x is not None and (
+        not x.is_cuda
+        or x.dtype != linear_attn.in_proj_qkv.weight.dtype
+        or x.shape[-1] != linear_attn.in_proj_qkv.in_features
+    ):
+        return False
+    return (
+        norm_weight.dtype == linear_attn.in_proj_qkv.weight.dtype
+        and norm_weight.device == linear_attn.in_proj_qkv.weight.device
+    )
+
+
+def _qwen35_decoder_layer_frozen_deltanet_residual_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values=None,
+    **kwargs,
+) -> torch.Tensor:
+    original_forward = getattr(module, "_bgkit_original_deltanet_residual_forward", None)
+    if original_forward is None:
+        raise RuntimeError(
+            "frozen DeltaNet residual fusion was installed without an original forward"
+        )
+    if (
+        past_key_values is not None
+        or attention_mask is not None
+        or not _frozen_rmsnorm_deltanet_residual_patchable(module, hidden_states)
+    ):
+        return original_forward(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+
+    cu_seqlens, position_ids = _resolve_deltanet_packed_metadata(
+        kwargs.get("cu_seqlens"),
+        position_ids,
+        kwargs,
+    )
+    linear_attn = module.linear_attn
+    seq_len = _packed_effective_seq_len(hidden_states, cu_seqlens, position_ids)
+    min_seq_len = _coerce_int_env("BGKIT_FROZEN_DELTANET_CORE_BWD_MIN_SEQ_LEN", 0)
+    max_seq_len = _coerce_int_env("BGKIT_FROZEN_DELTANET_CORE_BWD_MAX_SEQ_LEN", 544)
+    if min_seq_len > 0 and seq_len < min_seq_len:
+        return original_forward(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+    if max_seq_len > 0 and seq_len > max_seq_len:
+        return original_forward(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+    try:
+        import bgkit.utils.deltanet_patch as deltanet_patch
+
+        default_g_clamp_min = deltanet_patch.DEFAULT_G_CLAMP_MIN
+    except Exception:
+        default_g_clamp_min = -1.3
+    g_clamp_min = float(getattr(linear_attn, "_bgkit_g_clamp_min", default_g_clamp_min))
+    hidden_states = _FrozenQwen35DeltaNetCoreFunction.apply(
+        hidden_states,
+        linear_attn.in_proj_qkv.weight,
+        linear_attn.in_proj_z.weight,
+        linear_attn.in_proj_b.weight,
+        linear_attn.in_proj_a.weight,
+        _install_deltanet_input_bundle_cache(linear_attn),
+        linear_attn.conv1d.weight,
+        linear_attn.conv1d.bias,
+        linear_attn.norm.weight,
+        linear_attn.out_proj.weight,
+        linear_attn.A_log,
+        linear_attn.dt_bias,
+        int(linear_attn.num_v_heads),
+        int(linear_attn.head_v_dim),
+        int(linear_attn.conv_kernel_size),
+        float(linear_attn.norm.eps),
+        str(linear_attn.norm.activation),
+        g_clamp_min,
+        cu_seqlens,
+        position_ids,
+        module.input_layernorm.weight,
+        float(module.input_layernorm.eps),
+        True,
+        None,
+    )
+    if _coerce_bool(
+        os.environ.get("BGKIT_FROZEN_DELTANET_RESIDUAL_MLP_BWD", "0"),
+        default=False,
+    ):
+        return _frozen_rmsnorm_mlp_residual(module, hidden_states)
+    residual = hidden_states
+    hidden_states = module.post_attention_layernorm(hidden_states)
+    hidden_states = module.mlp(hidden_states)
+    return residual + hidden_states
+
+
+def _call_qwen35_deltanet_original_forward(
+    original_forward,
+    hidden_states: torch.Tensor,
+    cache_params=None,
+    attention_mask: torch.Tensor | None = None,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
+    **unused_kwargs,
+) -> torch.Tensor:
+    try:
+        return original_forward(
+            hidden_states,
+            cache_params,
+            attention_mask,
+            cu_seqlens=cu_seqlens,
+            position_ids=position_ids,
+            **unused_kwargs,
+        )
+    except TypeError:
+        return original_forward(hidden_states, cache_params, attention_mask)
+
+
+class _FrozenChannelLastCausalConv1dFunction(torch.autograd.Function):
+    """Channel-last causal conv forward with frozen dX-only backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+        cu_seqlens: torch.Tensor | None,
+        backend: str,
+    ) -> torch.Tensor:
+        if position_ids is not None:
+            if _LORA_TRITON is None or not hasattr(
+                _LORA_TRITON,
+                "triton_causal_conv1d_channellast_position_fwd",
+            ):
+                raise RuntimeError("position-aware channel-last causal-conv forward is unavailable")
+            out = _LORA_TRITON.triton_causal_conv1d_channellast_position_fwd(
+                x,
+                weight,
+                bias,
+                position_ids,
+            )
+        else:
+            from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
+
+            out, _state = fla_causal_conv1d(
+                x,
+                weight,
+                bias,
+                activation="swish",
+                backend=backend,
+                cu_seqlens=cu_seqlens,
+            )
+        ctx.save_for_backward(
+            x,
+            weight,
+            bias if bias is not None else x.new_empty(0),
+            position_ids if position_ids is not None else x.new_empty(0, dtype=torch.int64),
+        )
+        ctx.has_bias = bias is not None
+        ctx.has_position_ids = position_ids is not None
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        from causal_conv1d.causal_conv1d_interface import causal_conv1d_bwd_function
+
+        x, weight, bias_saved, position_ids_saved = ctx.saved_tensors
+        bias = bias_saved if ctx.has_bias else None
+        if (
+            _LORA_TRITON is not None
+            and ctx.has_position_ids
+            and hasattr(_LORA_TRITON, "triton_causal_conv1d_channellast_position_dx")
+            and _LORA_TRITON.can_use_triton_causal_conv1d_channellast_position_dx(
+                x,
+                weight,
+                bias,
+                grad_output,
+                position_ids_saved,
+            )
+        ):
+            dx = _LORA_TRITON.triton_causal_conv1d_channellast_position_dx(
+                x,
+                weight,
+                bias,
+                grad_output,
+                position_ids_saved,
+            )
+        elif (
+            _LORA_TRITON is not None
+            and not ctx.has_position_ids
+            and hasattr(_LORA_TRITON, "triton_causal_conv1d_channellast_dx")
+            and _LORA_TRITON.can_use_triton_causal_conv1d_channellast_dx(
+                x,
+                weight,
+                bias,
+                grad_output,
+            )
+        ):
+            dx = _LORA_TRITON.triton_causal_conv1d_channellast_dx(
+                x,
+                weight,
+                bias,
+                grad_output,
+            )
+        elif ctx.has_position_ids:
+            raise RuntimeError("position-aware channel-last causal-conv dX kernel is unavailable")
+        else:
+            dx_t, _dweight, _dbias, _dinitial_states = causal_conv1d_bwd_function(
+                x.transpose(1, 2).contiguous(),
+                weight,
+                bias,
+                grad_output.transpose(1, 2).contiguous(),
+                None,
+                None,
+                None,
+                None,
+                False,
+                True,
+            )
+            dx = dx_t.transpose(1, 2)
+        return dx, None, None, None, None, None
+
+
+class _FrozenChannelLastQKVConvL2NormFunction(torch.autograd.Function):
+    """Fused channel-last qkv conv+L2Norm with frozen dX-only backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        num_heads: int,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _LORA_TRITON is None or not hasattr(
+            _LORA_TRITON,
+            "triton_qkv_conv_l2norm_channellast",
+        ):
+            raise RuntimeError("fused channel-last qkv conv+l2norm is unavailable")
+        q, q_rstd, k, k_rstd, v = _LORA_TRITON.triton_qkv_conv_l2norm_channellast(
+            x,
+            weight,
+            bias,
+            heads=int(num_heads),
+            head_dim=int(head_dim),
+        )
+        ctx.mark_non_differentiable(q_rstd, k_rstd)
+        ctx.save_for_backward(
+            x,
+            weight,
+            bias if bias is not None else x.new_empty(0),
+            q,
+            q_rstd,
+            k,
+            k_rstd,
+        )
+        ctx.has_bias = bias is not None
+        ctx.num_heads = int(num_heads)
+        ctx.head_dim = int(head_dim)
+        return q, q_rstd, k, k_rstd, v
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_q: torch.Tensor,
+        _grad_q_rstd: torch.Tensor | None,
+        grad_k: torch.Tensor,
+        _grad_k_rstd: torch.Tensor | None,
+        grad_v: torch.Tensor,
+    ):
+        from fla.modules.l2norm import l2norm_bwd_pair
+
+        from causal_conv1d.causal_conv1d_interface import causal_conv1d_bwd_function
+
+        x, weight, bias_saved, q, q_rstd, k, k_rstd = ctx.saved_tensors
+        bias = bias_saved if ctx.has_bias else None
+        gdr_applied_l2norm_bwd = _coerce_bool(
+            os.environ.get("FLA_GDR_FUSE_QK_L2NORM_BWD", "0"),
+            default=False,
+        )
+        if gdr_applied_l2norm_bwd:
+            batch_size, seq_len, _heads, _head_dim = q.shape
+            split_dx_enabled = _coerce_bool(
+                os.environ.get(
+                    "BGKIT_FROZEN_DELTANET_STOCK_FUSED_QKV_CONV_SPLIT_DX",
+                    "0",
+                ),
+                default=False,
+            )
+            if split_dx_enabled and _LORA_TRITON is not None:
+                grad_q_conv = grad_q.contiguous()
+                grad_k_conv = grad_k.contiguous()
+                grad_v_conv = grad_v.contiguous()
+                if (
+                    hasattr(_LORA_TRITON, "triton_qkv_conv_channellast_split_dx")
+                    and hasattr(
+                        _LORA_TRITON,
+                        "can_use_triton_qkv_conv_channellast_split_dx",
+                    )
+                    and _LORA_TRITON.can_use_triton_qkv_conv_channellast_split_dx(
+                        x,
+                        weight,
+                        bias,
+                        grad_q_conv,
+                        grad_k_conv,
+                        grad_v_conv,
+                        heads=ctx.num_heads,
+                        head_dim=ctx.head_dim,
+                    )
+                ):
+                    dx = _LORA_TRITON.triton_qkv_conv_channellast_split_dx(
+                        x,
+                        weight,
+                        bias,
+                        grad_q_conv,
+                        grad_k_conv,
+                        grad_v_conv,
+                        heads=ctx.num_heads,
+                        head_dim=ctx.head_dim,
+                    )
+                    return dx, None, None, None, None
+            d_mixed = torch.cat(
+                (
+                    grad_q.reshape(batch_size, seq_len, -1),
+                    grad_k.reshape(batch_size, seq_len, -1),
+                    grad_v.reshape(batch_size, seq_len, -1),
+                ),
+                dim=-1,
+            )
+            if (
+                _LORA_TRITON is not None
+                and hasattr(_LORA_TRITON, "triton_causal_conv1d_channellast_dx")
+                and _LORA_TRITON.can_use_triton_causal_conv1d_channellast_dx(
+                    x,
+                    weight,
+                    bias,
+                    d_mixed,
+                )
+            ):
+                dx = _LORA_TRITON.triton_causal_conv1d_channellast_dx(
+                    x,
+                    weight,
+                    bias,
+                    d_mixed,
+                )
+                return dx, None, None, None, None
+            dx_t, _dweight, _dbias, _dinitial_states = causal_conv1d_bwd_function(
+                x.transpose(1, 2).contiguous(),
+                weight,
+                bias,
+                d_mixed.transpose(1, 2).contiguous(),
+                None,
+                None,
+                None,
+                None,
+                False,
+                True,
+            )
+            return dx_t.transpose(1, 2), None, None, None, None
+        if (
+            _coerce_bool(
+                os.environ.get(
+                    "BGKIT_FROZEN_DELTANET_STOCK_FUSED_QKV_CONV_L2NORM_DX",
+                    "0",
+                ),
+                default=False,
+            )
+            and _LORA_TRITON is not None
+            and hasattr(_LORA_TRITON, "triton_qkv_conv_l2norm_channellast_dx")
+            and _LORA_TRITON.can_use_triton_qkv_conv_l2norm_channellast_dx(
+                x,
+                weight,
+                bias,
+                q,
+                q_rstd,
+                grad_q.contiguous(),
+                k,
+                k_rstd,
+                grad_k.contiguous(),
+                grad_v.contiguous(),
+                heads=ctx.num_heads,
+                head_dim=ctx.head_dim,
+            )
+        ):
+            dx = _LORA_TRITON.triton_qkv_conv_l2norm_channellast_dx(
+                x,
+                weight,
+                bias,
+                q,
+                q_rstd,
+                grad_q,
+                k,
+                k_rstd,
+                grad_k,
+                grad_v,
+                heads=ctx.num_heads,
+                head_dim=ctx.head_dim,
+            )
+            return dx, None, None, None, None
+        dq_raw, dk_raw = l2norm_bwd_pair(q, q_rstd, grad_q, k, k_rstd, grad_k)
+        batch_size, seq_len, _heads, _head_dim = q.shape
+        d_mixed = torch.cat(
+            (
+                dq_raw.reshape(batch_size, seq_len, -1),
+                dk_raw.reshape(batch_size, seq_len, -1),
+                grad_v.reshape(batch_size, seq_len, -1),
+            ),
+            dim=-1,
+        )
+        dx_t, _dweight, _dbias, _dinitial_states = causal_conv1d_bwd_function(
+            x.transpose(1, 2).contiguous(),
+            weight,
+            bias,
+            d_mixed.transpose(1, 2).contiguous(),
+            None,
+            None,
+            None,
+            None,
+            False,
+            True,
+        )
+        return dx_t.transpose(1, 2), None, None, None, None
+
+
+def _install_deltanet_input_bundle_cache(module: nn.Module) -> torch.Tensor:
+    children = (
+        module.in_proj_qkv,
+        module.in_proj_z,
+        module.in_proj_b,
+        module.in_proj_a,
+    )
+    expected_shape = (
+        sum(int(child.weight.shape[0]) for child in children),
+        int(children[0].weight.shape[1]),
+    )
+    cached = getattr(module, "_bgkit_deltanet_input_bundle_weight", None)
+    if (
+        cached is None
+        or cached.device != children[0].weight.device
+        or cached.dtype != children[0].weight.dtype
+        or tuple(cached.shape) != expected_shape
+    ):
+        cached = torch.cat(
+            tuple(child.weight.detach() for child in children),
+            dim=0,
+        ).contiguous()
+        if "_bgkit_deltanet_input_bundle_weight" in module._buffers:
+            module._buffers["_bgkit_deltanet_input_bundle_weight"] = cached
+        else:
+            module.register_buffer(
+                "_bgkit_deltanet_input_bundle_weight",
+                cached,
+                persistent=False,
+            )
+    return cached
+
+
+def _qwen35_deltanet_channel_last_conv_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    cache_params=None,
+    attention_mask: torch.Tensor | None = None,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    position_ids: torch.Tensor | None = None,
+    **unused_kwargs,
+) -> torch.Tensor:
+    """Frozen Qwen3.5 DeltaNet forward with channel-last qkv causal conv."""
+
+    cu_seqlens, position_ids = _resolve_deltanet_packed_metadata(
+        cu_seqlens,
+        position_ids,
+        unused_kwargs,
+    )
+    original_forward = getattr(module, "_bgkit_original_channel_last_conv_forward", None)
+    if (
+        original_forward is None
+        or cache_params is not None
+        or attention_mask is not None
+        or hidden_states.dim() != 3
+        or not hidden_states.is_cuda
+        or hidden_states.dtype != module.in_proj_qkv.weight.dtype
+        or not _frozen_qwen35_deltanet_core_patchable(module)
+    ):
+        if original_forward is None:
+            raise RuntimeError(
+                "channel-last DeltaNet conv patch was installed without an original forward"
+            )
+        return _call_qwen35_deltanet_original_forward(
+            original_forward,
+            hidden_states,
+            cache_params,
+            attention_mask,
+            cu_seqlens=cu_seqlens,
+            position_ids=position_ids,
+            **unused_kwargs,
+        )
+
+    from fla.modules.convolution import causal_conv1d as fla_causal_conv1d
+    from fla.modules.l2norm import l2norm_fwd
+
+    batch_size, seq_len, _ = hidden_states.shape
+    use_input_bundle = _coerce_bool(
+        os.environ.get("BGKIT_FROZEN_DELTANET_CHANNEL_LAST_BUNDLE_INPUT", "0"),
+        default=False,
+    )
+    if use_input_bundle:
+        input_bundle = F.linear(
+            hidden_states,
+            _install_deltanet_input_bundle_cache(module),
+            None,
+        )
+        qkv_pre, z_raw, b_raw, a = input_bundle.split(
+            (
+                int(module.conv_dim),
+                int(module.value_dim),
+                int(module.num_v_heads),
+                int(module.num_v_heads),
+            ),
+            dim=-1,
+        )
+        qkv_pre = qkv_pre.contiguous()
+    else:
+        qkv_pre = module.in_proj_qkv(hidden_states)
+        z_raw = module.in_proj_z(hidden_states)
+        b_raw = module.in_proj_b(hidden_states)
+        a = module.in_proj_a(hidden_states)
+    conv_backend = (
+        os.environ.get("BGKIT_FROZEN_DELTANET_CHANNEL_LAST_CONV_BACKEND", "cuda").strip() or "cuda"
+    )
+    conv_weight = module.conv1d.weight.squeeze(1)
+    conv_bias = module.conv1d.bias
+    reset_conv_at_segments = _coerce_bool(
+        os.environ.get("BGKIT_FROZEN_DELTANET_CHANNEL_LAST_RESET_CONV", "0"),
+        default=False,
+    )
+    use_conv_dx = _coerce_bool(
+        os.environ.get("BGKIT_FROZEN_DELTANET_CHANNEL_LAST_CONV_DX", "0"),
+        default=False,
+    )
+    use_fused_conv_l2norm = bool(
+        not reset_conv_at_segments
+        and _coerce_bool(
+            os.environ.get(
+                "BGKIT_FROZEN_DELTANET_STOCK_FUSED_QKV_CONV_L2NORM",
+                "0",
+            ),
+            default=False,
+        )
+        and _LORA_TRITON is not None
+        and hasattr(_LORA_TRITON, "triton_qkv_conv_l2norm_channellast")
+        and hasattr(_LORA_TRITON, "can_use_triton_qkv_conv_l2norm_channellast")
+        and _LORA_TRITON.can_use_triton_qkv_conv_l2norm_channellast(
+            qkv_pre,
+            conv_weight,
+            conv_bias,
+            heads=int(module.num_v_heads),
+            head_dim=int(module.head_v_dim),
+        )
+    )
+    qk_l2norm_done = False
+    q_rstd = k_rstd = None
+    use_custom_conv = bool(
+        use_conv_dx
+        and not use_fused_conv_l2norm
+        and _LORA_TRITON is not None
+        and hasattr(_LORA_TRITON, "triton_causal_conv1d_channellast_dx")
+    )
+    if use_fused_conv_l2norm:
+        query, q_rstd, key, k_rstd, value = _FrozenChannelLastQKVConvL2NormFunction.apply(
+            qkv_pre,
+            conv_weight,
+            conv_bias,
+            int(module.num_v_heads),
+            int(module.head_v_dim),
+        )
+        qk_l2norm_done = True
+    elif use_custom_conv:
+        mixed_qkv = _FrozenChannelLastCausalConv1dFunction.apply(
+            qkv_pre,
+            conv_weight,
+            conv_bias,
+            position_ids if reset_conv_at_segments else None,
+            cu_seqlens if reset_conv_at_segments else None,
+            conv_backend,
+        )
+    else:
+        mixed_qkv, _conv_state = fla_causal_conv1d(
+            qkv_pre,
+            conv_weight,
+            conv_bias,
+            activation="swish",
+            backend=conv_backend,
+            cu_seqlens=cu_seqlens if reset_conv_at_segments else None,
+        )
+    if not use_fused_conv_l2norm:
+        query, key, value = torch.split(
+            mixed_qkv,
+            [
+                int(module.key_dim),
+                int(module.key_dim),
+                int(module.value_dim),
+            ],
+            dim=-1,
+        )
+        query = query.reshape(batch_size, seq_len, -1, int(module.head_k_dim))
+        key = key.reshape(batch_size, seq_len, -1, int(module.head_k_dim))
+        value = value.reshape(batch_size, seq_len, -1, int(module.head_v_dim))
+    pre_l2norm = _coerce_bool(
+        os.environ.get("BGKIT_FROZEN_DELTANET_CHANNEL_LAST_PRE_L2NORM", "0"),
+        default=False,
+    )
+    if pre_l2norm and not qk_l2norm_done:
+        query, _q_rstd = l2norm_fwd(query.contiguous())
+        key, _k_rstd = l2norm_fwd(key.contiguous())
+        qk_l2norm_done = True
+
+    z = z_raw.reshape(
+        batch_size,
+        seq_len,
+        -1,
+        int(module.head_v_dim),
+    )
+    beta = b_raw.sigmoid()
+    g_clamp_min = getattr(module, "_bgkit_g_clamp_min", None)
+    use_raw_gate_in_kernel = _coerce_bool(
+        os.environ.get("BGKIT_DELTANET_RAW_GATE_IN_KERNEL", "0"),
+        default=False,
+    )
+    if use_raw_gate_in_kernel:
+        g = a
+    else:
+        g = -module.A_log.float().exp() * F.softplus(a.float() + module.dt_bias)
+        if g_clamp_min is not None:
+            g = g.clamp(min=float(g_clamp_min))
+
+    repeat = int(module.num_v_heads) // int(module.num_k_heads)
+    if repeat > 1:
+        query = query.repeat_interleave(repeat, dim=2)
+        key = key.repeat_interleave(repeat, dim=2)
+
+    gdr_kwargs = {
+        "g": g,
+        "beta": beta,
+        "initial_state": None,
+        "output_final_state": False,
+        "use_qk_l2norm_in_kernel": not qk_l2norm_done,
+    }
+    if (
+        qk_l2norm_done
+        and q_rstd is not None
+        and k_rstd is not None
+        and _coerce_bool(os.environ.get("FLA_GDR_FUSE_QK_L2NORM_BWD", "0"), default=False)
+    ):
+        gdr_kwargs["q_rstd"] = q_rstd
+        gdr_kwargs["k_rstd"] = k_rstd
+    gdr_fn = module.chunk_gated_delta_rule
+    if use_raw_gate_in_kernel:
+        gdr_kwargs["use_gate_in_kernel"] = True
+        gdr_kwargs["A_log"] = module.A_log
+        gdr_kwargs["dt_bias"] = module.dt_bias
+        if g_clamp_min is not None:
+            gdr_kwargs["gate_clamp_min"] = float(g_clamp_min)
+        # Bypass BgKIT's precomputed-g clamp wrapper here: in this mode ``g``
+        # is the raw a-projection, and FLA applies A_log/dt_bias/clamp.
+        gdr_fn = getattr(module, "_unpatch_chunk_gdr", module.chunk_gated_delta_rule)
+    if cu_seqlens is not None:
+        gdr_kwargs["cu_seqlens"] = cu_seqlens
+    core_attn_out, _last_recurrent_state = gdr_fn(
+        query,
+        key,
+        value,
+        **gdr_kwargs,
+    )
+    core_attn_out = core_attn_out.reshape(-1, int(module.head_v_dim))
+    z = z.reshape(-1, int(module.head_v_dim))
+    core_attn_out = module.norm(core_attn_out, z)
+    core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+    return module.out_proj(core_attn_out)
+
+
+def _install_attention_qkv_cache(module: nn.Module) -> tuple[torch.Tensor, torch.Tensor | None]:
+    q_proj = module.q_proj
+    k_proj = module.k_proj
+    v_proj = module.v_proj
+    expected_shape = (
+        q_proj.out_features + k_proj.out_features + v_proj.out_features,
+        q_proj.in_features,
+    )
+    cached = getattr(module, "_bgkit_qkv_weight", None)
+    if (
+        cached is None
+        or cached.device != q_proj.weight.device
+        or cached.dtype != q_proj.weight.dtype
+        or tuple(cached.shape) != expected_shape
+    ):
+        cached = torch.cat(
+            (
+                q_proj.weight.detach(),
+                k_proj.weight.detach(),
+                v_proj.weight.detach(),
+            ),
+            dim=0,
+        ).contiguous()
+        if "_bgkit_qkv_weight" in module._buffers:
+            module._buffers["_bgkit_qkv_weight"] = cached
+        else:
+            module.register_buffer("_bgkit_qkv_weight", cached, persistent=False)
+
+    q_bias = q_proj.bias
+    if q_bias is None:
+        return cached, None
+
+    expected_bias_shape = (q_proj.out_features + k_proj.out_features + v_proj.out_features,)
+    cached_bias = getattr(module, "_bgkit_qkv_bias", None)
+    if (
+        cached_bias is None
+        or cached_bias.device != q_bias.device
+        or cached_bias.dtype != q_bias.dtype
+        or tuple(cached_bias.shape) != expected_bias_shape
+    ):
+        cached_bias = torch.cat(
+            (
+                q_bias.detach(),
+                k_proj.bias.detach(),
+                v_proj.bias.detach(),
+            ),
+            dim=0,
+        ).contiguous()
+        if "_bgkit_qkv_bias" in module._buffers:
+            module._buffers["_bgkit_qkv_bias"] = cached_bias
+        else:
+            module.register_buffer("_bgkit_qkv_bias", cached_bias, persistent=False)
+    return cached, cached_bias
+
+
+def _original_forward_globals(module: nn.Module) -> dict:
+    original_forward = getattr(module, "_bgkit_original_qkv_forward", None)
+    func = getattr(original_forward, "__func__", original_forward)
+    return getattr(func, "__globals__", {})
+
+
+def _qwen35_attention_fused_qkv_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    past_key_values=None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    original_forward = getattr(module, "_bgkit_original_qkv_forward", None)
+    if original_forward is None or not _qwen35_attention_qkv_patchable(
+        module,
+        for_install=False,
+    ):
+        if original_forward is None:
+            raise RuntimeError("fused QKV attention was installed without an original forward")
+        return original_forward(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+
+    globals_ = _original_forward_globals(module)
+    apply_rotary_pos_emb = globals_.get("apply_rotary_pos_emb")
+    all_attention_functions = globals_.get("ALL_ATTENTION_FUNCTIONS")
+    eager_attention_forward = globals_.get("eager_attention_forward")
+    if apply_rotary_pos_emb is None or all_attention_functions is None:
+        return original_forward(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+
+    q_proj = module.q_proj
+    k_proj = module.k_proj
+    v_proj = module.v_proj
+    qkv_weight, qkv_bias = _install_attention_qkv_cache(module)
+    if hidden_states.dtype != qkv_weight.dtype:
+        return original_forward(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, module.head_dim)
+    qkv = F.linear(hidden_states, qkv_weight, qkv_bias)
+    q_flat, k_flat, v_flat = qkv.split(
+        (q_proj.out_features, k_proj.out_features, v_proj.out_features),
+        dim=-1,
+    )
+
+    query_states, gate = torch.chunk(
+        q_flat.reshape(*input_shape, -1, module.head_dim * 2),
+        2,
+        dim=-1,
+    )
+    gate = gate.reshape(*input_shape, -1)
+    query_states = module.q_norm(query_states.reshape(hidden_shape)).transpose(1, 2)
+    key_states = module.k_norm(k_flat.reshape(hidden_shape)).transpose(1, 2)
+    value_states = v_flat.reshape(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(
+            key_states,
+            value_states,
+            module.layer_idx,
+        )
+
+    attention_interface = all_attention_functions.get_interface(
+        module.config._attn_implementation,
+        eager_attention_forward,
+    )
+    attn_output, attn_weights = attention_interface(
+        module,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not module.training else module.attention_dropout,
+        scaling=module.scaling,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = attn_output * torch.sigmoid(gate)
+    attn_output = module.o_proj(attn_output)
+    return attn_output, attn_weights
 
 
 def _install_gate_up_lora_cache(module: nn.Module) -> torch.Tensor:
@@ -716,6 +4164,245 @@ def _fused_gate_up_mlp_forward(module: nn.Module, x: torch.Tensor) -> torch.Tens
         gate.base_layer.out_features,
     )
     return module.down_proj(module.act_fn(gate_out) * up_out)
+
+
+def _frozen_base_mlp_forward(
+    module: nn.Module,
+    x: torch.Tensor,
+    *args,
+    **kwargs,
+) -> torch.Tensor:
+    original_forward = getattr(module, "_bgkit_original_forward", None)
+    if original_forward is None:
+        raise RuntimeError("Frozen MLP fusion was installed without an original forward")
+    if args or kwargs:
+        return original_forward(x, *args, **kwargs)
+
+    gate = getattr(module, "gate_proj", None)
+    up = getattr(module, "up_proj", None)
+    down = getattr(module, "down_proj", None)
+    act_fn = getattr(module, "act_fn", None)
+    if (
+        not isinstance(gate, nn.Linear)
+        or not isinstance(up, nn.Linear)
+        or not isinstance(down, nn.Linear)
+        or act_fn is None
+    ):
+        return original_forward(x)
+
+    act_name = getattr(act_fn, "__name__", act_fn.__class__.__name__).lower()
+    if "silu" not in act_name and "swish" not in act_name:
+        return original_forward(x)
+    if (
+        gate.bias is not None
+        or up.bias is not None
+        or down.bias is not None
+        or gate.weight.requires_grad
+        or up.weight.requires_grad
+        or down.weight.requires_grad
+        or gate.in_features != up.in_features
+        or gate.out_features != up.out_features
+        or down.in_features != gate.out_features
+        or x.dtype != gate.weight.dtype
+        or x.dtype != up.weight.dtype
+        or x.dtype != down.weight.dtype
+    ):
+        return original_forward(x)
+
+    if _coerce_bool(os.environ.get("BGKIT_DECODER_MLP_QUACK", "0")):
+        rows = int(x.reshape(-1, x.shape[-1]).shape[0])
+        min_rows = _coerce_int_env("BGKIT_DECODER_MLP_QUACK_MIN_ROWS", 1024)
+        if rows < min_rows:
+            return original_forward(x)
+        if (
+            _QUACK_GEMM_GATED is not None
+            and _QUACK_GEMM_DGATED is not None
+            and x.is_cuda
+            and x.dtype in {torch.bfloat16, torch.float16}
+        ):
+            gate_up_weight, gate_up_weight_t = _install_frozen_mlp_gate_up_interleaved_cache(
+                module,
+                gate.weight,
+                up.weight,
+            )
+            return _QuackFrozenBaseMLPFunction.apply(
+                x,
+                gate_up_weight_t,
+                gate_up_weight,
+                down.weight,
+                _coerce_bool(os.environ.get("BGKIT_DECODER_MLP_QUACK_TUNED", "1")),
+                _coerce_bool(os.environ.get("BGKIT_DECODER_MLP_QUACK_DYNAMIC_SCHEDULER", "0")),
+            )
+        if _coerce_bool(os.environ.get("BGKIT_DECODER_MLP_QUACK_STRICT", "0")):
+            raise RuntimeError("BGKIT_DECODER_MLP_QUACK=1 but Quack MLP path is unavailable")
+
+    gate_up_weight = _install_frozen_mlp_gate_up_cache(module, gate.weight, up.weight)
+    return _FrozenBaseMLPFunction.apply(
+        x,
+        gate_up_weight,
+        down.weight,
+        gate.out_features,
+    )
+
+
+def _frozen_mlp_swiglu_forward(
+    module: nn.Module,
+    x: torch.Tensor,
+    *args,
+    **kwargs,
+) -> torch.Tensor:
+    original_forward = getattr(module, "_bgkit_original_swiglu_forward", None)
+    if original_forward is None:
+        raise RuntimeError("Frozen MLP SwiGLU fusion was installed without an original forward")
+    if args or kwargs:
+        return original_forward(x, *args, **kwargs)
+    if not _frozen_mlp_components_patchable(module, x):
+        return original_forward(x)
+
+    gate_y = module.gate_proj(x)
+    up_y = module.up_proj(x)
+    use_triton_forward = bool(getattr(module, "_bgkit_frozen_mlp_swiglu_triton_forward", False))
+    return module.down_proj(_FrozenSwiGLUActivationFunction.apply(gate_y, up_y, use_triton_forward))
+
+
+def _frozen_mlp_components_patchable(
+    module: nn.Module,
+    x: torch.Tensor | None = None,
+) -> bool:
+    gate = getattr(module, "gate_proj", None)
+    up = getattr(module, "up_proj", None)
+    down = getattr(module, "down_proj", None)
+    act_fn = getattr(module, "act_fn", None)
+    if (
+        not isinstance(gate, nn.Linear)
+        or not isinstance(up, nn.Linear)
+        or not isinstance(down, nn.Linear)
+        or act_fn is None
+    ):
+        return False
+    act_name = getattr(act_fn, "__name__", act_fn.__class__.__name__).lower()
+    if "silu" not in act_name and "swish" not in act_name:
+        return False
+    if (
+        gate.bias is not None
+        or up.bias is not None
+        or down.bias is not None
+        or gate.weight.requires_grad
+        or up.weight.requires_grad
+        or down.weight.requires_grad
+        or gate.in_features != up.in_features
+        or gate.out_features != up.out_features
+        or down.in_features != gate.out_features
+        or gate.weight.dtype != up.weight.dtype
+        or gate.weight.dtype != down.weight.dtype
+        or gate.weight.device != up.weight.device
+        or gate.weight.device != down.weight.device
+    ):
+        return False
+    return x is None or (
+        x.dtype == gate.weight.dtype
+        and x.device == gate.weight.device
+        and x.shape[-1] == gate.in_features
+    )
+
+
+def _frozen_rmsnorm_mlp_residual_patchable(
+    module: nn.Module,
+    x: torch.Tensor | None = None,
+) -> bool:
+    norm = getattr(module, "post_attention_layernorm", None)
+    mlp = getattr(module, "mlp", None)
+    if norm is None or mlp is None:
+        return False
+    norm_weight = getattr(norm, "weight", None)
+    if not isinstance(norm_weight, torch.Tensor) or norm_weight.requires_grad:
+        return False
+    if not hasattr(norm, "eps"):
+        return False
+    if not _frozen_mlp_components_patchable(mlp, x):
+        return False
+    gate = mlp.gate_proj
+    return norm_weight.dtype == gate.weight.dtype and norm_weight.device == gate.weight.device
+
+
+def _frozen_rmsnorm_mlp_residual(
+    module: nn.Module,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    if not _frozen_rmsnorm_mlp_residual_patchable(module, x):
+        residual = x
+        x = module.post_attention_layernorm(x)
+        x = module.mlp(x)
+        return residual + x
+
+    mlp = module.mlp
+    gate = mlp.gate_proj
+    up = mlp.up_proj
+    down = mlp.down_proj
+    gate_up_weight = _install_frozen_mlp_gate_up_cache(mlp, gate.weight, up.weight)
+    return _FrozenRMSNormMLPResidualFunction.apply(
+        x,
+        module.post_attention_layernorm.weight,
+        float(module.post_attention_layernorm.eps),
+        gate_up_weight,
+        down.weight,
+        gate.out_features,
+    )
+
+
+def _qwen35_decoder_layer_frozen_mlp_residual_forward(
+    module: nn.Module,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None = None,
+    position_ids: torch.LongTensor | None = None,
+    past_key_values=None,
+    **kwargs,
+) -> torch.Tensor:
+    original_forward = getattr(module, "_bgkit_original_mlp_residual_forward", None)
+    if original_forward is None:
+        raise RuntimeError("frozen MLP residual fusion was installed without an original forward")
+    if not _frozen_rmsnorm_mlp_residual_patchable(module):
+        return original_forward(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+
+    input_hidden_states = hidden_states
+    residual = hidden_states
+    hidden_states = module.input_layernorm(hidden_states)
+
+    if getattr(module, "layer_type", None) == "linear_attention":
+        hidden_states = module.linear_attn(
+            hidden_states=hidden_states,
+            cache_params=past_key_values,
+            attention_mask=attention_mask,
+        )
+    elif getattr(module, "layer_type", None) == "full_attention":
+        hidden_states, _ = module.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+    else:
+        return original_forward(
+            hidden_states=input_hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+
+    hidden_states = residual + hidden_states
+    return _frozen_rmsnorm_mlp_residual(module, hidden_states)
 
 
 def _peft_fast_lora_tensors(module: nn.Module, x: torch.Tensor | torch.dtype):
@@ -997,12 +4684,43 @@ class ReconstructionDecoder(nn.Module):
         self._lora_peft_fused_count = 0
         self._lora_peft_gate_up_fused_count = 0
         self._lora_native_gate_up_fused_count = 0
+        self._fused_attention_qkv_count = 0
+        self._fused_deltanet_zba_count = 0
+        self._fused_deltanet_input_bundle_count = 0
+        self._frozen_deltanet_core_bwd_count = 0
+        self._frozen_deltanet_residual_bwd_count = 0
+        self._frozen_deltanet_channel_last_conv_count = 0
+        self._frozen_mlp_fused_count = 0
+        self._frozen_mlp_swiglu_fused_count = 0
+        self._frozen_mlp_residual_fused_count = 0
+        self._frozen_linear_dx_count = 0
         # Opt-in flag for Liger-fused linear+CE. Trainers toggle this via
         # ``enable_liger_ce(True)`` when the Liger Kernel package is available;
         # the default is off so CPU host tests and un-installed environments
         # keep hitting the existing chunked-CE path.
         self._use_liger_ce = False
         self._lm_ce_impl = DEFAULT_LM_CE_IMPL
+        self._lm_ce_strict = os.environ.get("BGKIT_DECODER_CE_STRICT", "0") == "1"
+        self._qwen35_layerwise_split_mode = os.environ.get(
+            "BGKIT_QWEN35_LAYERWISE_SPLIT",
+            "0",
+        ).strip().lower()
+        self._qwen35_layerwise_split_min_ratio = _coerce_float_env(
+            "BGKIT_QWEN35_LAYERWISE_SPLIT_MIN_RATIO",
+            3.0,
+        )
+        self._qwen35_layerwise_split_min_prefix = _coerce_int_env(
+            "BGKIT_QWEN35_LAYERWISE_SPLIT_MIN_PREFIX",
+            1536,
+        )
+        self._qwen35_layerwise_split_packed_deltanet = _coerce_bool(
+            os.environ.get("BGKIT_QWEN35_LAYERWISE_SPLIT_PACKED_DELTANET", "0"),
+            default=False,
+        )
+        self._stateful_decoder_pad_multiple = max(
+            1,
+            _coerce_int_env("BGKIT_STATEFUL_DECODER_PAD_MULTIPLE", 1),
+        )
 
         if nvfp4:
             self.enable_nvfp4()
@@ -1015,10 +4733,9 @@ class ReconstructionDecoder(nn.Module):
         # plus saved-tensor copies). Set ``BGKIT_FALCON_H1_PATCH=0`` to
         # disable. Generation / KV-cache decode paths run on the unpatched
         # path (the patched mixer raises if called with cache_params).
-        if (
-            self.decoder_family == "falcon_h1"
-            and os.environ.get("BGKIT_FALCON_H1_PATCH", "1") not in ("0", "false", "False")
-        ):
+        if self.decoder_family == "falcon_h1" and os.environ.get(
+            "BGKIT_FALCON_H1_PATCH", "1"
+        ) not in ("0", "false", "False"):
             try:
                 from bgkit.utils.falcon_h1_patch import patch_falcon_h1_decoder
 
@@ -1037,7 +4754,51 @@ class ReconstructionDecoder(nn.Module):
     def uses_stateful_sequence_mixer(self) -> bool:
         """True when flattened packed samples would leak sequence state."""
 
-        return _decoder_family_has_stateful_mixer(self.decoder_family)
+        return self._requires_padded_stateful_sequence_mixer()
+
+    def _falcon_h1_can_use_packed_mamba_seqidx(self, device: torch.device | str | None) -> bool:
+        """Whether this concrete Falcon-H1 backbone can isolate packed Mamba rows."""
+
+        if normalize_decoder_family(self.decoder_family) != "falcon_h1":
+            return False
+        if not _falcon_h1_packed_mamba_seqidx_enabled():
+            return False
+
+        report = getattr(self, "_falcon_h1_patch_report", None)
+        if report is not None and int(getattr(report, "packed_seqidx_loop", 0)) > 0:
+            return True
+
+        has_packed_loop = False
+        has_fused_cuda_loop = False
+        for module in self.backbone.modules():
+            has_packed_loop = has_packed_loop or bool(
+                getattr(module, "_bgkit_falcon_h1_packed_seqidx_loop", False)
+            )
+            has_fused_cuda_loop = has_fused_cuda_loop or bool(
+                getattr(module, "_bgkit_falcon_h1_fused_training_loop", False)
+            )
+            if has_packed_loop and has_fused_cuda_loop:
+                break
+
+        if has_packed_loop:
+            return True
+        if not has_fused_cuda_loop:
+            return False
+
+        if device is None:
+            return False
+        resolved_device = torch.device(device)
+        return resolved_device.type == "cuda" and self.training
+
+    def _requires_padded_stateful_sequence_mixer(
+        self,
+        device: torch.device | str | None = None,
+    ) -> bool:
+        """True when the current backbone must keep stateful samples as rows."""
+
+        if not _decoder_family_has_stateful_mixer(self.decoder_family):
+            return False
+        return not self._falcon_h1_can_use_packed_mamba_seqidx(device)
 
     def enable_liger_ce(self, enabled: bool = True) -> None:
         """Toggle the fused linear+CE path used inside ``forward_interleaved_with_loss``.
@@ -1062,11 +4823,422 @@ class ReconstructionDecoder(nn.Module):
 
         self._lm_ce_impl = _resolve_lm_ce_impl(impl)
 
+    def set_lm_ce_strict(self, strict: bool | None) -> None:
+        """Select whether optional CCE failures are fatal.
+
+        ``None`` preserves the process-level env default for compatibility.
+        Configured training presets should set this explicitly when a CCE path
+        is part of the measured performance contract.
+        """
+
+        if strict is None:
+            self._lm_ce_strict = os.environ.get("BGKIT_DECODER_CE_STRICT", "0") == "1"
+            return
+        self._lm_ce_strict = bool(strict)
+
+    def set_qwen35_layerwise_split(
+        self,
+        *,
+        mode: str | bool | None = None,
+        min_ratio: float | None = None,
+        min_prefix: int | None = None,
+        packed_deltanet: bool | None = None,
+    ) -> None:
+        """Configure the Qwen3.5 prefix/continuation split schedule.
+
+        ``mode`` accepts false/off, true/on, or auto/threshold. The packed
+        DeltaNet branch is deliberately separate because it is still a
+        diagnostic path, not a training-safe promotion.
+        """
+
+        if mode is not None:
+            if isinstance(mode, bool):
+                self._qwen35_layerwise_split_mode = "1" if mode else "0"
+            else:
+                normalized = str(mode).strip().lower()
+                allowed = {
+                    "0",
+                    "1",
+                    "auto",
+                    "false",
+                    "no",
+                    "off",
+                    "on",
+                    "threshold",
+                    "true",
+                    "yes",
+                }
+                if normalized not in allowed:
+                    raise ValueError(
+                        "decoder_layerwise_split.mode must be one of "
+                        f"{sorted(allowed)}; got {mode!r}"
+                    )
+                self._qwen35_layerwise_split_mode = normalized
+        if min_ratio is not None:
+            self._qwen35_layerwise_split_min_ratio = float(min_ratio)
+        if min_prefix is not None:
+            min_prefix_int = int(min_prefix)
+            if min_prefix_int < 0:
+                raise ValueError("decoder_layerwise_split.min_prefix must be non-negative")
+            self._qwen35_layerwise_split_min_prefix = min_prefix_int
+        if packed_deltanet is not None:
+            self._qwen35_layerwise_split_packed_deltanet = bool(packed_deltanet)
+
+    def enable_frozen_mlp_fusion(self) -> int:
+        """Patch frozen Qwen-style MLP modules to compute activation grads only.
+
+        The installed forward falls back to the original module unless gate,
+        up, and down projections are bias-free frozen ``nn.Linear`` modules
+        with matching dtypes. This keeps the optimization correct for the
+        no-LoRA frozen-decoder training contract.
+        """
+
+        count = 0
+        for module in self.backbone.modules():
+            if (
+                isinstance(getattr(module, "gate_proj", None), nn.Linear)
+                and isinstance(getattr(module, "up_proj", None), nn.Linear)
+                and isinstance(getattr(module, "down_proj", None), nn.Linear)
+                and hasattr(module, "act_fn")
+                and not hasattr(module, "_bgkit_original_forward")
+            ):
+                module._bgkit_original_forward = module.forward
+                module.forward = types.MethodType(_frozen_base_mlp_forward, module)
+                module._bgkit_frozen_mlp_forward = True
+                count += 1
+        self._frozen_mlp_fused_count = count
+        logger.info("decoder_frozen_mlp_fusion_enabled", modules=count)
+        return count
+
+    def enable_frozen_mlp_swiglu_fusion(
+        self,
+        *,
+        use_triton_forward: bool | None = None,
+    ) -> int:
+        """Patch only frozen Qwen-style MLP SwiGLU activation backward.
+
+        This leaves the stock frozen gate/up/down linears in place and only
+        replaces ``silu(gate) * up`` with a small custom autograd boundary.
+        """
+
+        if use_triton_forward is None:
+            use_triton_forward = _coerce_bool(
+                os.environ.get("BGKIT_DECODER_MLP_SWIGLU_TRITON_FWD", "0")
+            )
+        count = 0
+        for module in self.backbone.modules():
+            if getattr(module, "_bgkit_frozen_mlp_swiglu_forward", False):
+                module._bgkit_frozen_mlp_swiglu_triton_forward = bool(use_triton_forward)
+                count += 1
+                continue
+            if not (
+                isinstance(getattr(module, "gate_proj", None), nn.Linear)
+                and isinstance(getattr(module, "up_proj", None), nn.Linear)
+                and isinstance(getattr(module, "down_proj", None), nn.Linear)
+                and hasattr(module, "act_fn")
+            ):
+                continue
+            if not _frozen_mlp_components_patchable(module):
+                continue
+            module._bgkit_original_swiglu_forward = module.forward
+            module.forward = types.MethodType(_frozen_mlp_swiglu_forward, module)
+            module._bgkit_frozen_mlp_swiglu_forward = True
+            module._bgkit_frozen_mlp_swiglu_triton_forward = bool(use_triton_forward)
+            count += 1
+        self._frozen_mlp_swiglu_fused_count = count
+        logger.info(
+            "decoder_frozen_mlp_swiglu_fusion_enabled",
+            modules=count,
+            triton_forward=bool(use_triton_forward),
+        )
+        return count
+
+    def enable_frozen_mlp_residual_fusion(self) -> int:
+        """Patch frozen Qwen3.5 decoder layers' RMSNorm+MLP residual tail.
+
+        This binds a stock-compatible layer forward that leaves the token mixer
+        path unchanged, then replaces ``x + mlp(post_attention_layernorm(x))``
+        with a custom frozen-weight autograd function that computes only ``dX``.
+        """
+
+        count = 0
+        for module in self.backbone.modules():
+            if getattr(module, "_bgkit_frozen_mlp_residual_forward", False):
+                continue
+            if not (
+                hasattr(module, "input_layernorm")
+                and hasattr(module, "post_attention_layernorm")
+                and hasattr(module, "mlp")
+                and hasattr(module, "layer_type")
+            ):
+                continue
+            if not _frozen_rmsnorm_mlp_residual_patchable(module):
+                continue
+            module._bgkit_original_mlp_residual_forward = module.forward
+            module.forward = types.MethodType(
+                _qwen35_decoder_layer_frozen_mlp_residual_forward,
+                module,
+            )
+            module._bgkit_frozen_mlp_residual_forward = True
+            count += 1
+        self._frozen_mlp_residual_fused_count = count
+        logger.info("decoder_frozen_mlp_residual_fusion_enabled", modules=count)
+        return count
+
+    def enable_fused_attention_qkv(self) -> int:
+        """Patch frozen Qwen3.5 full-attention blocks to project Q/K/V together.
+
+        DeltaNet layers already use a fused qkv projection. The Qwen3.5
+        full-attention layers still launch three frozen input projections
+        before attention. This opt-in patch keeps the original module and
+        state-dict keys intact, caches a non-persistent concatenated qkv
+        weight, and binds a forward that computes one wide projection before
+        following the stock attention path.
+        """
+
+        count = 0
+        for module in self.backbone.modules():
+            if getattr(module, "_bgkit_fused_attention_qkv_forward", False):
+                count += 1
+                continue
+            if not _qwen35_attention_qkv_patchable(module):
+                continue
+            module._bgkit_original_qkv_forward = module.forward
+            module.forward = types.MethodType(_qwen35_attention_fused_qkv_forward, module)
+            module._bgkit_fused_attention_qkv_forward = True
+            count += 1
+        self._fused_attention_qkv_count = count
+        logger.info("decoder_fused_attention_qkv_enabled", modules=count)
+        return count
+
+    def enable_fused_deltanet_zba(self) -> int:
+        """Patch frozen Qwen3.5 DeltaNet z/b/a projections into one projection.
+
+        Qwen3.5 DeltaNet already fuses q/k/v through ``in_proj_qkv`` but keeps
+        ``in_proj_z``, ``in_proj_b``, and ``in_proj_a`` as independent frozen
+        linears. This wrapper preserves the three child module names while
+        sharing one concatenated ``F.linear`` call and one input-gradient matmul
+        across the sequential z, b, and a calls in the stock forward.
+        """
+
+        names = ("in_proj_z", "in_proj_b", "in_proj_a")
+        count = 0
+        for module in self.backbone.modules():
+            if not _fused_sibling_linears_patchable(module, names):
+                continue
+            group = _FusedSiblingLinearGroup(names)
+            for idx, child_name in enumerate(names):
+                child = getattr(module, child_name)
+                setattr(
+                    module,
+                    child_name,
+                    FusedSiblingLinear.from_linear(child, group, idx),
+                )
+            count += 1
+        self._fused_deltanet_zba_count = count
+        logger.info("decoder_fused_deltanet_zba_enabled", modules=count)
+        return count
+
+    def enable_fused_deltanet_input_bundle(self) -> int:
+        """Patch frozen Qwen3.5 DeltaNet qkv/z/b/a projections into one projection.
+
+        This is the wider DeltaNet input-projection contract for the frozen
+        decoder kernel track. The stock forward already calls these four
+        projections on the same ``hidden_states`` tensor in a fixed sequence;
+        wrapping the sibling modules lets that forward reuse one concatenated
+        projection without changing child names or state-dict keys.
+        """
+
+        names = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+        count = 0
+        for module in self.backbone.modules():
+            if not _fused_sibling_linears_patchable(module, names):
+                continue
+            group = _FusedSiblingLinearGroup(names)
+            for idx, child_name in enumerate(names):
+                child = getattr(module, child_name)
+                setattr(
+                    module,
+                    child_name,
+                    FusedSiblingLinear.from_linear(child, group, idx),
+                )
+            count += 1
+        self._fused_deltanet_input_bundle_count = count
+        logger.info("decoder_fused_deltanet_input_bundle_enabled", modules=count)
+        return count
+
+    def enable_frozen_deltanet_core_bwd(self) -> int:
+        """Patch frozen Qwen3.5 DeltaNet modules with a core dX-only backward.
+
+        The patch is deliberately narrow and opt-in. It targets the no-LoRA
+        frozen decoder contract, preserves module names and state-dict keys, and
+        falls back to the original forward for cache or masked calls.
+        """
+
+        count = 0
+        for module in self.backbone.modules():
+            if getattr(module, "_bgkit_frozen_deltanet_core_forward", False):
+                continue
+            if not _frozen_qwen35_deltanet_core_patchable(module):
+                continue
+            module._bgkit_original_frozen_core_forward = module.forward
+            module.forward = types.MethodType(_qwen35_deltanet_frozen_core_forward, module)
+            module._bgkit_frozen_deltanet_core_forward = True
+            count += 1
+        self._frozen_deltanet_core_bwd_count = count
+        logger.info("decoder_frozen_deltanet_core_bwd_enabled", modules=count)
+        return count
+
+    def enable_frozen_deltanet_residual_bwd(self) -> int:
+        """Patch frozen Qwen3.5 DeltaNet layer residuals with a wider dX path.
+
+        This owns ``x -> input RMSNorm -> DeltaNet -> x + out`` for linear
+        attention layers and returns only the input gradient. It reuses the
+        direct frozen DeltaNet core backward while removing the stock RMSNorm
+        and residual autograd boundary around it.
+        """
+
+        count = 0
+        for module in self.backbone.modules():
+            if getattr(module, "_bgkit_frozen_deltanet_residual_forward", False):
+                continue
+            if not _frozen_rmsnorm_deltanet_residual_patchable(module):
+                continue
+            module._bgkit_original_deltanet_residual_forward = module.forward
+            module.forward = types.MethodType(
+                _qwen35_decoder_layer_frozen_deltanet_residual_forward,
+                module,
+            )
+            module._bgkit_frozen_deltanet_residual_forward = True
+            count += 1
+        self._frozen_deltanet_residual_bwd_count = count
+        logger.info("decoder_frozen_deltanet_residual_bwd_enabled", modules=count)
+        return count
+
+    def reset_frozen_deltanet_core_bwd_stats(self) -> None:
+        """Reset diagnostic call counters for the opt-in frozen core wrapper."""
+
+        _reset_frozen_deltanet_core_timers()
+        for module in self.backbone.modules():
+            if not getattr(module, "_bgkit_frozen_deltanet_core_forward", False):
+                continue
+            module._bgkit_frozen_core_custom_calls = 0
+            module._bgkit_frozen_core_fallback_calls = 0
+            module._bgkit_frozen_core_fallback_packed_calls = 0
+            module._bgkit_frozen_core_fallback_short_seq_calls = 0
+            module._bgkit_frozen_core_fallback_long_seq_calls = 0
+
+    def frozen_deltanet_core_bwd_stats(self) -> dict[str, object]:
+        """Return diagnostic call counters for the opt-in frozen core wrapper."""
+
+        patched_modules = 0
+        custom_calls = 0
+        fallback_calls = 0
+        fallback_packed_calls = 0
+        fallback_short_seq_calls = 0
+        fallback_long_seq_calls = 0
+        for module in self.backbone.modules():
+            if not getattr(module, "_bgkit_frozen_deltanet_core_forward", False):
+                continue
+            patched_modules += 1
+            custom_calls += int(getattr(module, "_bgkit_frozen_core_custom_calls", 0))
+            fallback_calls += int(getattr(module, "_bgkit_frozen_core_fallback_calls", 0))
+            fallback_packed_calls += int(
+                getattr(module, "_bgkit_frozen_core_fallback_packed_calls", 0)
+            )
+            fallback_short_seq_calls += int(
+                getattr(module, "_bgkit_frozen_core_fallback_short_seq_calls", 0)
+            )
+            fallback_long_seq_calls += int(
+                getattr(module, "_bgkit_frozen_core_fallback_long_seq_calls", 0)
+            )
+        return {
+            "patched_modules": patched_modules,
+            "custom_calls": custom_calls,
+            "fallback_calls": fallback_calls,
+            "fallback_packed_calls": fallback_packed_calls,
+            "fallback_short_seq_calls": fallback_short_seq_calls,
+            "fallback_long_seq_calls": fallback_long_seq_calls,
+            "timers": _frozen_deltanet_core_timer_stats(),
+        }
+
+    def enable_frozen_deltanet_channel_last_conv(self) -> int:
+        """Patch frozen Qwen3.5 DeltaNet modules to keep qkv conv channel-last.
+
+        This keeps the stock GatedDeltaNet graph after qkv conv, including FLA's
+        default GDR backward, and only removes the qkv projection's
+        channel-first causal-conv detour. It is an opt-in benchmark candidate
+        for the no-LoRA frozen decoder contract.
+        """
+
+        count = 0
+        for module in self.backbone.modules():
+            if getattr(module, "_bgkit_frozen_deltanet_channel_last_conv_forward", False):
+                count += 1
+                continue
+            if not _frozen_qwen35_deltanet_core_patchable(module):
+                continue
+            module._bgkit_original_channel_last_conv_forward = module.forward
+            module.forward = types.MethodType(
+                _qwen35_deltanet_channel_last_conv_forward,
+                module,
+            )
+            module._bgkit_frozen_deltanet_channel_last_conv_forward = True
+            count += 1
+        self._frozen_deltanet_channel_last_conv_count = count
+        logger.info("decoder_frozen_deltanet_channel_last_conv_enabled", modules=count)
+        return count
+
+    def enable_frozen_linear_dx(
+        self,
+        *,
+        target_modules: tuple[str, ...] | None = None,
+    ) -> int:
+        """Wrap frozen decoder Linear modules with an input-gradient-only autograd path.
+
+        This is an opt-in measurement hook for the no-LoRA frozen decoder
+        contract. It keeps state-dict names stable because the wrapped module
+        still exposes ``weight`` and ``bias`` at the same child path.
+        """
+
+        targets = set(
+            target_modules
+            or (
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            )
+        )
+        count = 0
+        for parent in list(self.backbone.modules()):
+            for child_name, child in list(parent.named_children()):
+                if child_name not in targets:
+                    continue
+                if isinstance(child, FrozenLinearInputGrad):
+                    continue
+                if not isinstance(child, nn.Linear):
+                    continue
+                setattr(parent, child_name, FrozenLinearInputGrad.from_linear(child))
+                count += 1
+        self._frozen_linear_dx_count = count
+        logger.info("decoder_frozen_linear_dx_enabled", modules=count)
+        return count
+
     @property
     def lm_ce_impl(self) -> str:
         """Return the effective decoder LM CE implementation."""
 
         return self._lm_ce_impl
+
+    @property
+    def lm_ce_strict(self) -> bool:
+        """Return whether optional CCE failures are fatal."""
+
+        return self._lm_ce_strict
 
     def enable_nvfp4(self) -> None:
         """Convert decoder Linear modules to TE Linear with NVFP4 support.
@@ -1125,14 +5297,18 @@ class ReconstructionDecoder(nn.Module):
 
         if self._use_native_nvfp4:
             return
-        targets = target_modules or self._lora_target_modules or (
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
+        targets = (
+            target_modules
+            or self._lora_target_modules
+            or (
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            )
         )
         if self._has_lora:
             count = self._convert_lora_base_layers_to_native_nvfp4(tuple(targets))
@@ -1160,6 +5336,7 @@ class ReconstructionDecoder(nn.Module):
         wrapper_types: tuple[type[nn.Module], ...] = (DecoderLoRALinear,)
         try:
             from peft.tuners.lora import Linear as LoraLinear
+
             wrapper_types = (DecoderLoRALinear, LoraLinear)
         except ImportError:
             pass
@@ -1255,6 +5432,7 @@ class ReconstructionDecoder(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         position_ids: torch.Tensor,
+        mamba_seq_idx: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int]:
         """Run ``inner_model`` in packed (varlen) mode.
 
@@ -1293,12 +5471,16 @@ class ReconstructionDecoder(nn.Module):
             "max_length_q": max_seqlen,
             "max_length_k": max_seqlen,
         }
+        if mamba_seq_idx is not None:
+            packed_attn_kwargs["mamba_seq_idx"] = mamba_seq_idx
 
         seq_pad = 0
         padded_embeds = inputs_embeds
 
         if self._use_te:
             import transformer_engine.pytorch as te
+
+            from bgkit.utils.deltanet_patch import deltanet_packed_context
 
             _b, s, _h = inputs_embeds.shape
             align = 16  # NVFP4_BLOCK_SIZE
@@ -1311,7 +5493,10 @@ class ReconstructionDecoder(nn.Module):
                 # Extend position_ids with zeros for the padding positions.
                 pad_pos = position_ids.new_zeros(seq_pad)
                 pos_ids_2d = torch.cat([position_ids, pad_pos], dim=0).unsqueeze(0)
-            with te.fp8_autocast(enabled=True, fp8_recipe=self._te_recipe):
+            with (
+                deltanet_packed_context(cu_seqlens, position_ids),
+                te.fp8_autocast(enabled=True, fp8_recipe=self._te_recipe),
+            ):
                 hidden = inner_model(
                     inputs_embeds=padded_embeds,
                     position_ids=pos_ids_2d,
@@ -1319,12 +5504,15 @@ class ReconstructionDecoder(nn.Module):
                     **packed_attn_kwargs,
                 ).last_hidden_state
         else:
-            hidden = inner_model(
-                inputs_embeds=padded_embeds,
-                position_ids=pos_ids_2d,
-                use_cache=False,
-                **packed_attn_kwargs,
-            ).last_hidden_state
+            from bgkit.utils.deltanet_patch import deltanet_packed_context
+
+            with deltanet_packed_context(cu_seqlens, position_ids):
+                hidden = inner_model(
+                    inputs_embeds=padded_embeds,
+                    position_ids=pos_ids_2d,
+                    use_cache=False,
+                    **packed_attn_kwargs,
+                ).last_hidden_state
 
         return hidden, seq_pad
 
@@ -1395,6 +5583,210 @@ class ReconstructionDecoder(nn.Module):
             return_hidden_states=return_hidden_states,
         )
 
+    def _forward_qwen35_layerwise_split_packed_splice(
+        self,
+        *,
+        prefix_embeds_all: torch.Tensor,
+        suffix_embeds_all: torch.Tensor,
+        survivor_embeddings: torch.Tensor,
+        prefix_token_ids: Sequence[torch.Tensor],
+        suffix_token_ids: Sequence[torch.Tensor],
+        prefix_lens: Sequence[int],
+        survivor_lens: Sequence[int],
+        suffix_lens: Sequence[int],
+        survivor_cu: Sequence[int],
+        loss_mask: torch.Tensor | None,
+        lm_head: nn.Module,
+        chunk_size: int | None,
+    ) -> torch.Tensor:
+        """Diagnostic Qwen3.5 schedule: no-grad prefix, differentiable continuation.
+
+        This is a production-shaped lift of the synthetic
+        ``--manual-layerwise-split`` diagnostic. It is opt-in only and targets
+        frozen-decoder training, where the useful gradient is into survivor
+        embeddings, not prefix token embeddings or decoder weights.
+        """
+
+        inner_model, _lm_head = self._get_inner_model_and_head()
+        batch_size = len(prefix_lens)
+        if batch_size == 0:
+            raise ValueError("layerwise split requires a non-empty batch")
+        device = survivor_embeddings.device
+        target_dtype = prefix_embeds_all.dtype
+
+        prefix_hidden_parts: list[torch.Tensor] = []
+        cont_hidden_parts: list[torch.Tensor] = []
+        cont_token_ids: list[torch.Tensor] = []
+        cont_loss_masks: list[torch.Tensor] = []
+        prefix_offset = 0
+        suffix_offset = 0
+        flat_offset = 0
+        for idx in range(batch_size):
+            l_pre = int(prefix_lens[idx])
+            l_surv = int(survivor_lens[idx])
+            l_suf = int(suffix_lens[idx])
+            seg_len = l_pre + l_surv + l_suf
+            surv_start = int(survivor_cu[idx])
+            surv_end = int(survivor_cu[idx + 1])
+            prefix_hidden_parts.append(
+                prefix_embeds_all[prefix_offset : prefix_offset + l_pre]
+                .to(dtype=target_dtype)
+                .unsqueeze(0)
+            )
+            survivor_part = survivor_embeddings[surv_start:surv_end].to(dtype=target_dtype)
+            suffix_part = suffix_embeds_all[suffix_offset : suffix_offset + l_suf].to(
+                dtype=target_dtype
+            )
+            cont_hidden_parts.append(torch.cat([survivor_part, suffix_part], dim=0).unsqueeze(0))
+            cont_token_ids.append(
+                torch.cat(
+                    [
+                        suffix_token_ids[idx].new_zeros(l_surv),
+                        suffix_token_ids[idx],
+                    ],
+                    dim=0,
+                )
+            )
+            if loss_mask is not None:
+                sample_mask = loss_mask[flat_offset + l_pre : flat_offset + seg_len].to(
+                    device=device,
+                    dtype=torch.bool,
+                )
+            else:
+                sample_mask = torch.cat(
+                    [
+                        torch.zeros(l_surv, device=device, dtype=torch.bool),
+                        torch.ones(l_suf, device=device, dtype=torch.bool),
+                    ],
+                    dim=0,
+                )
+            cont_loss_masks.append(sample_mask)
+            prefix_offset += l_pre
+            suffix_offset += l_suf
+            flat_offset += seg_len
+
+        layer_types = list(getattr(inner_model.config, "layer_types", []))
+
+        for layer_idx, layer in enumerate(
+            inner_model.layers[: inner_model.config.num_hidden_layers]
+        ):
+            layer_type = layer_types[layer_idx] if layer_idx < len(layer_types) else None
+            if layer_type == "linear_attention":
+                packed_deltanet = _coerce_bool(
+                    os.environ.get(
+                        "BGKIT_QWEN35_LAYERWISE_SPLIT_PACKED_DELTANET",
+                        "1" if self._qwen35_layerwise_split_packed_deltanet else "0",
+                    ),
+                    default=False,
+                )
+                if packed_deltanet:
+                    prefix_hidden_parts, cont_hidden_parts = _qwen35_deltanet_layer_split_packed(
+                        layer,
+                        prefix_hidden_parts,
+                        cont_hidden_parts,
+                    )
+                else:
+                    next_prefix: list[torch.Tensor] = []
+                    next_cont: list[torch.Tensor] = []
+                    for prefix_hidden, cont_hidden in zip(
+                        prefix_hidden_parts,
+                        cont_hidden_parts,
+                        strict=True,
+                    ):
+                        prefix_out, cont_out = _qwen35_deltanet_layer_split_single(
+                            layer,
+                            prefix_hidden,
+                            cont_hidden,
+                        )
+                        next_prefix.append(prefix_out.detach())
+                        next_cont.append(cont_out)
+                    prefix_hidden_parts = next_prefix
+                    cont_hidden_parts = next_cont
+                continue
+            if layer_type != "full_attention":
+                raise RuntimeError(f"unsupported Qwen3.5 decoder layer type: {layer_type!r}")
+
+            try:
+                from transformers.masking_utils import create_causal_mask
+            except Exception as exc:  # pragma: no cover - optional HF internals
+                raise RuntimeError(
+                    "BGKIT_QWEN35_LAYERWISE_SPLIT requires transformers.masking_utils"
+                ) from exc
+            combined_parts = [
+                torch.cat([prefix_hidden.detach(), cont_hidden], dim=1).squeeze(0)
+                for prefix_hidden, cont_hidden in zip(
+                    prefix_hidden_parts,
+                    cont_hidden_parts,
+                    strict=True,
+                )
+            ]
+            next_prefix = []
+            next_cont = []
+            for prefix_hidden, cont_hidden, combined_part in zip(
+                prefix_hidden_parts,
+                cont_hidden_parts,
+                combined_parts,
+                strict=True,
+            ):
+                l_pre = int(prefix_hidden.shape[1])
+                l_cont = int(cont_hidden.shape[1])
+                seq_len = int(combined_part.shape[0])
+                combined = combined_part.unsqueeze(0)
+                position_ids_2d = torch.arange(
+                    seq_len,
+                    dtype=torch.long,
+                    device=device,
+                ).unsqueeze(0)
+                attention_mask = torch.ones(1, seq_len, dtype=torch.bool, device=device)
+                causal_mask = create_causal_mask(
+                    config=inner_model.config,
+                    inputs_embeds=combined,
+                    attention_mask=attention_mask,
+                    past_key_values=None,
+                    position_ids=position_ids_2d,
+                )
+                position_embeddings = inner_model.rotary_emb(combined, position_ids_2d)
+                sample_out = layer(
+                    combined,
+                    position_embeddings=position_embeddings,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids_2d,
+                    past_key_values=None,
+                    use_cache=False,
+                )
+                if isinstance(sample_out, (tuple, list)):
+                    sample_out = sample_out[0]
+                next_prefix.append(sample_out[:, :l_pre, :].detach())
+                next_cont.append(sample_out[:, l_pre : l_pre + l_cont, :])
+            prefix_hidden_parts = next_prefix
+            cont_hidden_parts = next_cont
+
+        cont_hidden_flat = torch.cat([part.squeeze(0) for part in cont_hidden_parts], dim=0)
+        cont_hidden = inner_model.norm(cont_hidden_flat.unsqueeze(0))
+        token_ids = torch.cat([ids.to(device=device, dtype=torch.long) for ids in cont_token_ids])
+        final_loss_mask = torch.cat(cont_loss_masks, dim=0).to(device=device, dtype=torch.bool)
+        cont_lengths = [
+            int(survivor_lens[idx]) + int(suffix_lens[idx]) for idx in range(batch_size)
+        ]
+        if batch_size > 1:
+            boundary_values = []
+            running = 0
+            for length in cont_lengths[:-1]:
+                running += int(length)
+                boundary_values.append(running)
+            if boundary_values:
+                boundaries = torch.tensor(boundary_values, dtype=torch.long, device=device)
+                final_loss_mask = final_loss_mask.index_fill(0, boundaries, False)
+        attention_mask = torch.ones(1, int(token_ids.shape[0]), dtype=torch.bool, device=device)
+        return self._compute_lm_ce(
+            lm_head=lm_head,
+            hidden_states=cont_hidden,
+            token_ids_full=token_ids.unsqueeze(0),
+            attention_mask=attention_mask,
+            loss_mask_full=final_loss_mask.unsqueeze(0),
+            chunk_size=chunk_size,
+        )
+
     def _forward_single_splice_padded_tensors(
         self,
         *,
@@ -1432,40 +5824,28 @@ class ReconstructionDecoder(nn.Module):
             )
         return loss
 
-    def forward_with_packed_target_splice(
+    def build_packed_target_splice_plan(
         self,
         *,
-        survivor_embeddings: torch.Tensor,
         survivor_cu_seqlens: torch.Tensor,
-        target_ids_flat: torch.Tensor,
         target_cu_seqlens: torch.Tensor,
         splice_start: torch.Tensor,
         splice_len: torch.Tensor,
         loss_mask_flat: torch.Tensor | None = None,
         sample_indices: list[int] | None = None,
-        chunk_size: int | None = None,
         return_hidden_states: bool = False,
-    ) -> torch.Tensor | InterleavedForwardOutput:
-        """Forward + loss from packed target tensors and explicit splice metadata.
-
-        This is the trainer-facing single-splice API. It consumes the collator's
-        flat target representation directly instead of forcing callers to build
-        Python lists of per-sample prefix/suffix tensors. Attention-only decoder
-        families delegate to ``forward_with_single_splice`` after deriving those
-        views. Stateful mixer families build the padded batch directly, which
-        avoids an otherwise wasted pack-then-pad round trip and keeps recurrent
-        state isolated per sample.
-        """
-
-        device = survivor_embeddings.device
-        target_ids_flat = target_ids_flat.to(device=device, dtype=torch.long)
-        if loss_mask_flat is not None:
-            loss_mask_flat = loss_mask_flat.to(device=device, dtype=torch.bool)
+    ) -> dict[str, object]:
+        """Precompute host-side packed-splice metadata for a fixed bucket."""
 
         _tc = target_cu_seqlens.detach().to(device="cpu", dtype=torch.int64).flatten()
         _ss = splice_start.detach().to(device="cpu", dtype=torch.int64).flatten()
         _sl = splice_len.detach().to(device="cpu", dtype=torch.int64).flatten()
         _sc = survivor_cu_seqlens.detach().to(device="cpu", dtype=torch.int64).flatten()
+        loss_mask_cpu = (
+            loss_mask_flat.detach().to(device="cpu", dtype=torch.bool).flatten()
+            if loss_mask_flat is not None and not return_hidden_states
+            else None
+        )
         target_cu_list = _tc.tolist()
         splice_start_list = _ss.tolist()
         splice_len_list = _sl.tolist()
@@ -1495,8 +5875,7 @@ class ReconstructionDecoder(nn.Module):
         for out_idx, sample_idx in enumerate(selected_samples):
             if sample_idx < 0 or sample_idx >= target_batch_size:
                 raise IndexError(
-                    f"sample index {sample_idx} is outside target batch size "
-                    f"{target_batch_size}"
+                    f"sample index {sample_idx} is outside target batch size {target_batch_size}"
                 )
             sample_start = int(target_cu_list[sample_idx])
             sample_end = int(target_cu_list[sample_idx + 1])
@@ -1511,18 +5890,137 @@ class ReconstructionDecoder(nn.Module):
                     f"splice range ({splice_b_start}, {splice_b_len}) exceeds "
                     f"sample {sample_idx} target length {sample_len}"
                 )
+            suffix_len = sample_len - splice_b_start - splice_b_len
+            if loss_mask_cpu is not None and suffix_len > 0:
+                suffix_mask = loss_mask_cpu[
+                    sample_start + splice_b_start + splice_b_len : sample_end
+                ]
+                true_positions = torch.nonzero(suffix_mask, as_tuple=False)
+                suffix_len = int(true_positions[-1].item()) + 1 if true_positions.numel() > 0 else 0
 
             sample_starts.append(sample_start)
             sample_ends.append(sample_end)
             splice_starts.append(splice_b_start)
             splice_lens.append(splice_b_len)
             prefix_lens.append(splice_b_start)
-            suffix_lens.append(sample_len - splice_b_start - splice_b_len)
+            suffix_lens.append(suffix_len)
             survivor_lens.append(
                 int(survivor_cu_list[out_idx + 1]) - int(survivor_cu_list[out_idx])
             )
 
-        if not self.uses_stateful_sequence_mixer:
+        segment_lengths = [
+            prefix_lens[idx] + survivor_lens[idx] + suffix_lens[idx]
+            for idx in range(batch_size)
+        ]
+        packed_cu_list = [0]
+        packed_total = 0
+        for seg_len in segment_lengths:
+            packed_total += seg_len
+            packed_cu_list.append(packed_total)
+
+        return {
+            "target_batch_size": target_batch_size,
+            "selected_samples": selected_samples,
+            "batch_size": batch_size,
+            "target_cu_list": target_cu_list,
+            "survivor_cu_list": survivor_cu_list,
+            "prefix_lens": prefix_lens,
+            "suffix_lens": suffix_lens,
+            "survivor_lens": survivor_lens,
+            "sample_starts": sample_starts,
+            "sample_ends": sample_ends,
+            "splice_starts": splice_starts,
+            "splice_lens": splice_lens,
+            "segment_lengths": segment_lengths,
+            "packed_cu_list": packed_cu_list,
+            "packed_cu_seqlens": torch.tensor(
+                packed_cu_list,
+                dtype=torch.int32,
+                device=survivor_cu_seqlens.device,
+            ),
+        }
+
+    def forward_with_packed_target_splice(
+        self,
+        *,
+        survivor_embeddings: torch.Tensor,
+        survivor_cu_seqlens: torch.Tensor,
+        target_ids_flat: torch.Tensor,
+        target_cu_seqlens: torch.Tensor,
+        splice_start: torch.Tensor,
+        splice_len: torch.Tensor,
+        loss_mask_flat: torch.Tensor | None = None,
+        sample_indices: list[int] | None = None,
+        packed_splice_plan: dict[str, object] | None = None,
+        chunk_size: int | None = None,
+        return_hidden_states: bool = False,
+    ) -> torch.Tensor | InterleavedForwardOutput:
+        """Forward + loss from packed target tensors and explicit splice metadata.
+
+        This is the trainer-facing single-splice API. It consumes the collator's
+        flat target representation directly instead of forcing callers to build
+        Python lists of per-sample prefix/suffix tensors. Attention-only decoder
+        families delegate to ``forward_with_single_splice`` after deriving those
+        views. Stateful mixer families build the padded batch directly, which
+        avoids an otherwise wasted pack-then-pad round trip and keeps recurrent
+        state isolated per sample.
+        """
+
+        device = survivor_embeddings.device
+        target_ids_flat = target_ids_flat.to(device=device, dtype=torch.long)
+        if loss_mask_flat is not None:
+            loss_mask_flat = loss_mask_flat.to(device=device, dtype=torch.bool)
+
+        if packed_splice_plan is None:
+            packed_splice_plan = self.build_packed_target_splice_plan(
+                survivor_cu_seqlens=survivor_cu_seqlens,
+                target_cu_seqlens=target_cu_seqlens,
+                splice_start=splice_start,
+                splice_len=splice_len,
+                loss_mask_flat=loss_mask_flat,
+                sample_indices=sample_indices,
+                return_hidden_states=return_hidden_states,
+            )
+
+        target_batch_size = int(packed_splice_plan["target_batch_size"])
+        selected_samples = list(packed_splice_plan["selected_samples"])
+        batch_size = int(packed_splice_plan["batch_size"])
+        survivor_cu_list = list(packed_splice_plan["survivor_cu_list"])
+        prefix_lens = list(packed_splice_plan["prefix_lens"])
+        suffix_lens = list(packed_splice_plan["suffix_lens"])
+        survivor_lens = list(packed_splice_plan["survivor_lens"])
+        sample_starts = list(packed_splice_plan["sample_starts"])
+        sample_ends = list(packed_splice_plan["sample_ends"])
+        splice_starts = list(packed_splice_plan["splice_starts"])
+        splice_lens = list(packed_splice_plan["splice_lens"])
+        segment_lengths = list(packed_splice_plan["segment_lengths"])
+
+        if batch_size == 0:
+            raise ValueError("packed target splice batch must contain at least one sample")
+        if (
+            len(survivor_cu_list) != batch_size + 1
+            or survivor_cu_seqlens.shape[0] != batch_size + 1
+        ):
+            raise ValueError(
+                f"survivor_cu_seqlens must have shape (selected_B+1,) = "
+                f"({batch_size + 1},); got {tuple(survivor_cu_seqlens.shape)}"
+            )
+        if sample_indices is not None and selected_samples != [int(i) for i in sample_indices]:
+            raise ValueError(
+                "packed_splice_plan sample_indices do not match the requested sample_indices"
+            )
+        if target_batch_size != int(target_cu_seqlens.shape[0]) - 1:
+            raise ValueError(
+                "packed_splice_plan target batch size does not match target_cu_seqlens"
+            )
+        if len(prefix_lens) != batch_size or len(suffix_lens) != batch_size:
+            raise ValueError(
+                "packed_splice_plan prefix/suffix lengths do not match batch size"
+            )
+
+        requires_padded_stateful_path = self._requires_padded_stateful_sequence_mixer(device)
+
+        if not requires_padded_stateful_path:
             prefix_ids: list[torch.Tensor] = []
             suffix_ids: list[torch.Tensor] = []
             segment_loss_masks: list[torch.Tensor] = []
@@ -1531,31 +6029,38 @@ class ReconstructionDecoder(nn.Module):
                 sample_end = sample_ends[out_idx]
                 splice_b_start = splice_starts[out_idx]
                 splice_b_len = splice_lens[out_idx]
-                prefix_ids.append(
-                    target_ids_flat[sample_start : sample_start + splice_b_start]
-                )
-                suffix_ids.append(
-                    target_ids_flat[sample_start + splice_b_start + splice_b_len : sample_end]
-                )
+                prefix_ids.append(target_ids_flat[sample_start : sample_start + splice_b_start])
+                suffix_start = sample_start + splice_b_start + splice_b_len
+                suffix_end = suffix_start + suffix_lens[out_idx]
+                suffix_ids.append(target_ids_flat[suffix_start:suffix_end])
                 if loss_mask_flat is not None:
                     sample_loss = loss_mask_flat[sample_start:sample_end]
                     pre_mask = sample_loss[:splice_b_start]
-                    suf_mask = sample_loss[splice_b_start + splice_b_len :]
+                    suf_mask = sample_loss[
+                        splice_b_start + splice_b_len : splice_b_start
+                        + splice_b_len
+                        + suffix_lens[out_idx]
+                    ]
                     surv_mask = pre_mask.new_zeros(survivor_lens[out_idx])
-                    segment_loss_masks.append(
-                        torch.cat([pre_mask, surv_mask, suf_mask], dim=0)
-                    )
+                    segment_loss_masks.append(torch.cat([pre_mask, surv_mask, suf_mask], dim=0))
 
+            packed_cu_obj = packed_splice_plan.get("packed_cu_seqlens")
+            if isinstance(packed_cu_obj, torch.Tensor):
+                packed_cu = packed_cu_obj.to(device=device, dtype=torch.int32)
+            else:
+                packed_cu = torch.tensor(
+                    packed_splice_plan["packed_cu_list"],
+                    dtype=torch.int32,
+                    device=device,
+                )
             return self.forward_with_single_splice(
                 survivor_embeddings=survivor_embeddings,
                 survivor_cu_seqlens=survivor_cu_seqlens,
+                survivor_cu_seqlens_cpu=survivor_cu_list,
+                packed_cu_seqlens=packed_cu,
                 prefix_ids=prefix_ids,
                 suffix_ids=suffix_ids,
-                loss_mask=(
-                    torch.cat(segment_loss_masks, dim=0)
-                    if segment_loss_masks
-                    else None
-                ),
+                loss_mask=(torch.cat(segment_loss_masks, dim=0) if segment_loss_masks else None),
                 chunk_size=chunk_size,
                 return_hidden_states=return_hidden_states,
             )
@@ -1576,7 +6081,10 @@ class ReconstructionDecoder(nn.Module):
         ]
         suffix_views = [
             target_ids_flat[
-                sample_starts[idx] + splice_starts[idx] + splice_lens[idx] : sample_ends[idx]
+                sample_starts[idx] + splice_starts[idx] + splice_lens[idx] : sample_starts[idx]
+                + splice_starts[idx]
+                + splice_lens[idx]
+                + suffix_lens[idx]
             ]
             for idx in range(batch_size)
             if suffix_lens[idx] > 0
@@ -1595,10 +6103,12 @@ class ReconstructionDecoder(nn.Module):
             )
 
         segment_lengths = [
-            prefix_lens[idx] + survivor_lens[idx] + suffix_lens[idx]
-            for idx in range(batch_size)
+            prefix_lens[idx] + survivor_lens[idx] + suffix_lens[idx] for idx in range(batch_size)
         ]
         max_len = max(segment_lengths) if segment_lengths else 0
+        pad_multiple = int(getattr(self, "_stateful_decoder_pad_multiple", 1) or 1)
+        if pad_multiple > 1 and max_len > 0:
+            max_len = ((max_len + pad_multiple - 1) // pad_multiple) * pad_multiple
         inputs_embeds = torch.zeros(
             batch_size,
             max_len,
@@ -1644,9 +6154,7 @@ class ReconstructionDecoder(nn.Module):
                 inputs_embeds[out_idx, :l_pre] = prefix_embeds[
                     prefix_offset : prefix_offset + l_pre
                 ]
-                token_ids[out_idx, :l_pre] = target_ids_flat[
-                    sample_start : sample_start + l_pre
-                ]
+                token_ids[out_idx, :l_pre] = target_ids_flat[sample_start : sample_start + l_pre]
             if k_i:
                 inputs_embeds[out_idx, l_pre:survivor_end] = survivor_embeddings[
                     surv_start:surv_end
@@ -1656,7 +6164,10 @@ class ReconstructionDecoder(nn.Module):
                     suffix_offset : suffix_offset + l_suf
                 ]
                 token_ids[out_idx, survivor_end:seg_len] = target_ids_flat[
-                    sample_start + splice_b_start + splice_b_len : sample_end
+                    sample_start + splice_b_start + splice_b_len : sample_start
+                    + splice_b_start
+                    + splice_b_len
+                    + l_suf
                 ]
 
             attention_mask[out_idx, :seg_len] = True
@@ -1666,7 +6177,7 @@ class ReconstructionDecoder(nn.Module):
                     loss_mask_2d[out_idx, :l_pre] = sample_loss[:l_pre]
                 if l_suf:
                     loss_mask_2d[out_idx, survivor_end:seg_len] = sample_loss[
-                        splice_b_start + splice_b_len :
+                        splice_b_start + splice_b_len : splice_b_start + splice_b_len + l_suf
                     ]
             elif l_suf:
                 loss_mask_2d[out_idx, survivor_end:seg_len] = True
@@ -1689,6 +6200,9 @@ class ReconstructionDecoder(nn.Module):
         *,
         survivor_embeddings: torch.Tensor,
         survivor_cu_seqlens: torch.Tensor,
+        survivor_cu_seqlens_cpu: Sequence[int] | None = None,
+        packed_cu_seqlens: torch.Tensor | None = None,
+        packed_position_ids: torch.Tensor | None = None,
         prefix_ids: list[torch.Tensor],
         suffix_ids: list[torch.Tensor],
         loss_mask: torch.Tensor | None = None,
@@ -1711,6 +6225,17 @@ class ReconstructionDecoder(nn.Module):
             sample ``i``.
         survivor_cu_seqlens:
             Shape ``(B+1,)`` int32. Cumulative survivor counts per sample.
+        survivor_cu_seqlens_cpu:
+            Optional Python-side copy of ``survivor_cu_seqlens``. Supplying
+            this avoids a device-to-host sync in static packed-splice paths.
+        packed_cu_seqlens:
+            Optional prebuilt ``(B+1,)`` int32 cumulative sequence lengths for
+            the final packed decoder sequence. Supplying this avoids a
+            CPU-to-device tensor construction in static packed-splice paths.
+        packed_position_ids:
+            Optional prebuilt ``(N_total,)`` int64 per-sample position IDs for
+            the final packed decoder sequence. Supplying this avoids graph-
+            capture-incompatible dynamic position-ID construction.
         prefix_ids:
             Length-``B`` list of 1-D ``(L_pre_i,)`` int64 token ID tensors.
             Each tensor is the portion of the token sequence that appears
@@ -1764,7 +6289,15 @@ class ReconstructionDecoder(nn.Module):
         # 2*B small kernel launches that drove a ~17 s/step regression
         # via host-side launch overhead on unified memory).
         # ----------------------------------------------------------------
-        surv_cu_list = survivor_cu_seqlens.tolist()  # one sync, used downstream
+        if survivor_cu_seqlens_cpu is None:
+            surv_cu_list = survivor_cu_seqlens.tolist()  # one sync, used downstream
+        else:
+            surv_cu_list = [int(x) for x in survivor_cu_seqlens_cpu]
+            if len(surv_cu_list) != batch_size + 1:
+                raise ValueError(
+                    f"survivor_cu_seqlens_cpu must have length B+1 = {batch_size + 1}; "
+                    f"got {len(surv_cu_list)}"
+                )
         # Move prefix/suffix tensors to device once (host-side; no kernels).
         prefix_on_device = [p.to(device=device, dtype=torch.long) for p in prefix_ids]
         suffix_on_device = [s.to(device=device, dtype=torch.long) for s in suffix_ids]
@@ -1801,8 +6334,59 @@ class ReconstructionDecoder(nn.Module):
             raise ValueError(
                 f"loss_mask shape {tuple(loss_mask.shape)} does not match N_total={n_total}"
             )
+        split_mode = os.environ.get(
+            "BGKIT_QWEN35_LAYERWISE_SPLIT",
+            self._qwen35_layerwise_split_mode,
+        ).strip().lower()
+        use_qwen35_layerwise_split = _coerce_bool(split_mode, default=False)
+        if split_mode in {"auto", "threshold"}:
+            prefix_total = int(sum(prefix_lens))
+            cont_total = int(sum(surv_lens) + sum(suffix_lens))
+            max_prefix_len = max(prefix_lens) if prefix_lens else 0
+            prefix_to_cont_ratio = float(prefix_total) / float(max(cont_total, 1))
+            min_ratio = (
+                _coerce_float_env(
+                    "BGKIT_QWEN35_LAYERWISE_SPLIT_MIN_RATIO",
+                    self._qwen35_layerwise_split_min_ratio,
+                )
+                if "BGKIT_QWEN35_LAYERWISE_SPLIT_MIN_RATIO" in os.environ
+                else float(self._qwen35_layerwise_split_min_ratio)
+            )
+            min_prefix = (
+                _coerce_int_env(
+                    "BGKIT_QWEN35_LAYERWISE_SPLIT_MIN_PREFIX",
+                    self._qwen35_layerwise_split_min_prefix,
+                )
+                if "BGKIT_QWEN35_LAYERWISE_SPLIT_MIN_PREFIX" in os.environ
+                else int(self._qwen35_layerwise_split_min_prefix)
+            )
+            use_qwen35_layerwise_split = (
+                prefix_to_cont_ratio >= float(min_ratio)
+                and int(max_prefix_len) >= int(min_prefix)
+            )
+        if (
+            normalize_decoder_family(self.decoder_family) == "qwen35"
+            and not self._requires_padded_stateful_sequence_mixer(device)
+            and not return_hidden_states
+            and not self._use_te
+            and use_qwen35_layerwise_split
+        ):
+            return self._forward_qwen35_layerwise_split_packed_splice(
+                prefix_embeds_all=emb_prefix_all,
+                suffix_embeds_all=emb_suffix_all,
+                survivor_embeddings=survivor_embeddings,
+                prefix_token_ids=prefix_on_device,
+                suffix_token_ids=suffix_on_device,
+                prefix_lens=prefix_lens,
+                survivor_lens=surv_lens,
+                suffix_lens=suffix_lens,
+                survivor_cu=surv_cu_list,
+                loss_mask=loss_mask,
+                lm_head=lm_head,
+                chunk_size=chunk_size,
+            )
 
-        if self.uses_stateful_sequence_mixer:
+        if self._requires_padded_stateful_sequence_mixer(device):
             max_len = max(seg_lengths) if seg_lengths else 0
             hidden_dim = int(survivor_embeddings.shape[-1])
             inputs_embeds = torch.zeros(
@@ -1831,9 +6415,7 @@ class ReconstructionDecoder(nn.Module):
                 device=device,
             )
             caller_loss_mask = (
-                loss_mask.to(device=device, dtype=torch.bool)
-                if loss_mask is not None
-                else None
+                loss_mask.to(device=device, dtype=torch.bool) if loss_mask is not None else None
             )
 
             p_off = 0
@@ -1857,16 +6439,12 @@ class ReconstructionDecoder(nn.Module):
                         surv_start:surv_end
                     ]
                 if l_suf:
-                    inputs_embeds[b, suffix_start:seg_len] = emb_suffix_all[
-                        s_off : s_off + l_suf
-                    ]
+                    inputs_embeds[b, suffix_start:seg_len] = emb_suffix_all[s_off : s_off + l_suf]
                     token_ids[b, suffix_start:seg_len] = suffix_on_device[b]
 
                 attention_mask[b, :seg_len] = True
                 if caller_loss_mask is not None:
-                    loss_mask_2d[b, :seg_len] = caller_loss_mask[
-                        flat_off : flat_off + seg_len
-                    ]
+                    loss_mask_2d[b, :seg_len] = caller_loss_mask[flat_off : flat_off + seg_len]
                 else:
                     loss_mask_2d[b, suffix_start:seg_len] = True
 
@@ -1930,9 +6508,25 @@ class ReconstructionDecoder(nn.Module):
         for sl in seg_lengths:
             running += sl
             cu_list.append(running)
-        cu = torch.tensor(cu_list, dtype=torch.int32, device=device)
+        if packed_cu_seqlens is None:
+            cu = torch.tensor(cu_list, dtype=torch.int32, device=device)
+        else:
+            if packed_cu_seqlens.shape != (batch_size + 1,):
+                raise ValueError(
+                    f"packed_cu_seqlens must have shape (B+1,) = ({batch_size + 1},); "
+                    f"got {tuple(packed_cu_seqlens.shape)}"
+                )
+            cu = packed_cu_seqlens.to(device=device, dtype=torch.int32)
         max_seqlen = max(seg_lengths) if seg_lengths else 0
-        pos_ids = position_ids_from_cu(cu, n_total)  # (N_total,)
+        if packed_position_ids is None:
+            pos_ids = position_ids_from_cu(cu, n_total)  # (N_total,)
+        else:
+            if packed_position_ids.shape != (n_total,):
+                raise ValueError(
+                    f"packed_position_ids must have shape (N_total,) = ({n_total},); "
+                    f"got {tuple(packed_position_ids.shape)}"
+                )
+            pos_ids = packed_position_ids.to(device=device, dtype=torch.long)
 
         # Apply caller-supplied loss_mask if provided; otherwise use default.
         if loss_mask is not None:
@@ -1952,11 +6546,17 @@ class ReconstructionDecoder(nn.Module):
         # ----------------------------------------------------------------
         # Packed backbone forward.
         # ----------------------------------------------------------------
+        mamba_seq_idx = None
+        if normalize_decoder_family(self.decoder_family) == "falcon_h1":
+            lengths = cu[1:] - cu[:-1]
+            sample_ids = torch.arange(batch_size, device=device, dtype=torch.int32)
+            mamba_seq_idx = torch.repeat_interleave(sample_ids, lengths).unsqueeze(0)
         hidden, seq_pad = self._packed_forward(
             inputs_embeds=inputs_embeds,
             cu_seqlens=cu,
             max_seqlen=max_seqlen,
             position_ids=pos_ids,
+            mamba_seq_idx=mamba_seq_idx,
         )
         if seq_pad > 0:
             hidden = hidden[:, :-seq_pad, :]
@@ -2114,6 +6714,16 @@ class ReconstructionDecoder(nn.Module):
         chunk_size = _resolve_ce_chunk_size(chunk_size)
         ce_impl = _resolve_lm_ce_impl(getattr(self, "_lm_ce_impl", None))
 
+        if ce_impl == "frozen_chunked":
+            return _frozen_chunked_lm_ce(
+                lm_head,
+                hidden_states,
+                token_ids_full,
+                attention_mask,
+                loss_mask_full,
+                chunk_size,
+            )
+
         if ce_impl not in {"auto", "chunked", "liger"}:
             from bgkit.utils.cce_integration import cut_cross_entropy_lm_ce
 
@@ -2126,7 +6736,7 @@ class ReconstructionDecoder(nn.Module):
                 loss_mask=loss_mask_full,
                 impl=ce_impl,
                 chunk_size=chunk_size,
-                strict=os.environ.get("BGKIT_DECODER_CE_STRICT", "0") == "1",
+                strict=bool(getattr(self, "_lm_ce_strict", False)),
             )
 
         use_liger = getattr(self, "_use_liger_ce", False)
@@ -2310,25 +6920,27 @@ class ReconstructionDecoder(nn.Module):
                 model dtype. ``implementation`` defaults to ``"peft"``;
                 ``"native"`` is retained as a compatibility/debug path.
         """
-        rank = int(lora_config.get("r", 16))
-        alpha = float(lora_config.get("alpha", 32))
+        rank = int(lora_config.get("r", 32))
+        alpha = float(lora_config.get("alpha", 64))
         dropout = float(lora_config.get("dropout", 0.0))
         decoder_family = normalize_decoder_family(self.decoder_family)
         family = normalize_decoder_family(lora_config.get("family", decoder_family))
         _ensure_decoder_lora_supported(decoder_family)
         _ensure_decoder_lora_supported(family)
-        target_modules = tuple(
-            lora_config.get("target_modules", _default_lora_targets(family))
-        )
+        target_modules = tuple(lora_config.get("target_modules", _default_lora_targets(family)))
         adapter_dtype = self._resolve_lora_adapter_dtype(
             lora_config.get("adapter_dtype", lora_config.get("dtype"))
         )
-        implementation = str(
-            lora_config.get(
-                "implementation",
-                os.environ.get("BGKIT_DECODER_LORA_IMPL", "peft"),
+        implementation = (
+            str(
+                lora_config.get(
+                    "implementation",
+                    os.environ.get("BGKIT_DECODER_LORA_IMPL", "peft"),
+                )
             )
-        ).strip().lower()
+            .strip()
+            .lower()
+        )
         native_fused = _coerce_bool(
             lora_config.get("fused", os.environ.get("BGKIT_DECODER_LORA_FUSED", "1")),
             default=True,
@@ -2343,16 +6955,16 @@ class ReconstructionDecoder(nn.Module):
         peft_fused_backward = _coerce_bool(
             lora_config.get(
                 "peft_fused_backward",
-                os.environ.get("BGKIT_DECODER_PEFT_FUSED_BACKWARD", "0"),
+                os.environ.get("BGKIT_DECODER_PEFT_FUSED_BACKWARD", "1"),
             ),
-            default=False,
+            default=True,
         )
         peft_fuse_gate_up = _coerce_bool(
             lora_config.get(
                 "peft_fuse_gate_up",
-                os.environ.get("BGKIT_DECODER_PEFT_FUSE_GATE_UP", "0"),
+                os.environ.get("BGKIT_DECODER_PEFT_FUSE_GATE_UP", "1"),
             ),
-            default=False,
+            default=True,
         )
         if implementation in {"native", "bgkit", "lightweight"}:
             wrapped = self._apply_native_lora(
@@ -2382,8 +6994,7 @@ class ReconstructionDecoder(nn.Module):
             self._lora_impl = "peft"
         else:
             raise ValueError(
-                "decoder LoRA implementation must be native or peft; "
-                f"got {implementation!r}"
+                f"decoder LoRA implementation must be native or peft; got {implementation!r}"
             )
         self._has_lora = True
         self._lora_target_modules = target_modules
@@ -2581,8 +7192,7 @@ class ReconstructionDecoder(nn.Module):
         if key in {"fp32", "float32", "full"}:
             return torch.float32
         raise ValueError(
-            "decoder LoRA dtype must be one of base, bf16, fp16, fp32, "
-            f"or peft; got {value!r}"
+            f"decoder LoRA dtype must be one of base, bf16, fp16, fp32, or peft; got {value!r}"
         )
 
     def _cast_lora_adapters(self, dtype: torch.dtype | None) -> int:
@@ -2631,8 +7241,7 @@ class ReconstructionDecoder(nn.Module):
             for key in keys
         )
         has_native_layout = any(
-            (key.endswith(".lora_A") or key.endswith(".lora_B"))
-            and ".default.weight" not in key
+            (key.endswith(".lora_A") or key.endswith(".lora_B")) and ".default.weight" not in key
             for key in keys
         )
         if self._lora_impl == "native" and has_peft_layout:
