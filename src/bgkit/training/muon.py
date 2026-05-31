@@ -9,6 +9,17 @@ Each param group must have a ``use_muon: bool`` key:
 
 Vendored to avoid an external dependency. Only the single-device variant is
 included (DGX Spark trains on one GPU).
+
+FP32 master weights (2026-05-27): for any param whose dtype is not fp32,
+the optimizer maintains an fp32 master copy in
+``state["master_param"]``. The optimizer step runs entirely in fp32 (grad
+upcast, update in fp32, master updated) and then writes the result back
+into the low-precision live param. Without this, a per-step update of
+magnitude ``lr * adam_update`` smaller than the bf16 increment at the
+param's value (~param/128) gets rounded to zero before being added to the
+live param. The bug surfaced on the survivorship head (head.head.2.bias
+stuck at 0.0625 across 50k+ training steps under asymmetric BCE) but
+applies to every bf16 param the optimizer touches.
 """
 
 from __future__ import annotations
@@ -75,6 +86,29 @@ def _adam_update(
     return bc1 / (bc2.sqrt() + eps)
 
 
+def _ensure_master_param(state: dict, p: torch.Tensor) -> torch.Tensor:
+    """Return the fp32 master copy of ``p``, lazily creating it.
+
+    If ``p`` is already fp32 we return ``p`` itself — no master needed.
+    Otherwise we materialize an fp32 copy of ``p.data`` on the same
+    device. Saved-state checkpoints that predate the master-weight
+    refactor have no ``master_param`` key, so a resume initializes the
+    master from the bf16 live param's current value — that's the same
+    state the optimizer would have continued from anyway.
+
+    The master is stored under ``state["master_param"]`` so the
+    name-keyed save/restore path in BaseTrainer serializes it
+    automatically.
+    """
+    if p.dtype == torch.float32:
+        return p
+    master = state.get("master_param")
+    if master is None or master.shape != p.shape or master.device != p.device:
+        master = p.detach().to(dtype=torch.float32).clone()
+        state["master_param"] = master
+    return master
+
+
 class Muon(torch.optim.Optimizer):
     """Muon+AdamW hybrid optimizer (single-device).
 
@@ -128,35 +162,57 @@ class Muon(torch.optim.Optimizer):
                     if p.grad is None:
                         continue
                     state = self.state[p]
-                    if len(state) == 0:
-                        state["momentum_buffer"] = torch.zeros_like(p)
+                    master = _ensure_master_param(state, p)
+                    grad32 = p.grad.to(dtype=torch.float32)
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(master)
+                    elif state["momentum_buffer"].dtype != torch.float32:
+                        # Migrate legacy bf16 momentum buffers to fp32.
+                        state["momentum_buffer"] = state["momentum_buffer"].to(
+                            dtype=torch.float32
+                        )
                     update = _muon_update(
-                        p.grad,
+                        grad32,
                         state["momentum_buffer"],
                         beta=group["momentum"],
                         ns_steps=group["ns_steps"],
                     )
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                    master.mul_(1 - group["lr"] * group["weight_decay"])
+                    master.add_(update.reshape(master.shape), alpha=-group["lr"])
+                    if master is not p:
+                        p.data.copy_(master)
             else:
                 for p in group["params"]:
                     if p.grad is None:
                         continue
                     state = self.state[p]
-                    if len(state) == 0:
-                        state["exp_avg"] = torch.zeros_like(p)
-                        state["exp_avg_sq"] = torch.zeros_like(p)
+                    master = _ensure_master_param(state, p)
+                    grad32 = p.grad.to(dtype=torch.float32)
+                    if "exp_avg" not in state:
+                        state["exp_avg"] = torch.zeros_like(master)
+                        state["exp_avg_sq"] = torch.zeros_like(master)
                         state["step"] = 0
+                    else:
+                        if state["exp_avg"].dtype != torch.float32:
+                            state["exp_avg"] = state["exp_avg"].to(
+                                dtype=torch.float32
+                            )
+                        if state["exp_avg_sq"].dtype != torch.float32:
+                            state["exp_avg_sq"] = state["exp_avg_sq"].to(
+                                dtype=torch.float32
+                            )
                     state["step"] += 1
                     update = _adam_update(
-                        p.grad,
+                        grad32,
                         state["exp_avg"],
                         state["exp_avg_sq"],
                         state["step"],
                         group["betas"],
                         group["eps"],
                     )
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
+                    master.mul_(1 - group["lr"] * group["weight_decay"])
+                    master.add_(update, alpha=-group["lr"])
+                    if master is not p:
+                        p.data.copy_(master)
 
         return loss
