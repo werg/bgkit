@@ -195,7 +195,11 @@ class DecoderInitTrainer(BaseTrainer):
         # Config init_theta wins if set explicitly (e.g., to tune the warmup
         # bias); otherwise it's computed.
         model_cfg = self.cfg.model
-        ctrl_src = model_cfg.get("threshold_controller", {})
+        # Per-training-config override takes precedence over global default;
+        # matches the decoder_cfg lookup pattern in compression.py.
+        ctrl_src = tcfg.get("model", {}).get(
+            "threshold_controller", model_cfg.get("threshold_controller", {}),
+        )
         target_ratio_start = float(tcfg.get("target_ratio_start", 0.10))
         threshold_controller_cfg = {
             "init_theta": float(

@@ -223,6 +223,15 @@ class FalconProjectionSeedTrainer(BaseTrainer):
             raise ValueError(f"checkpoint {src_ckpt} missing 'encoder' key")
 
         projection_num_layers = int(bgkit_cfg.get("projection_num_layers", 1))
+        # Per-training-config threshold_controller override so Falcon configs
+        # can cap anchors at 6 (0.60) without colliding with the encoder
+        # default of 7 anchors. Mirrors the same fix made in compression.py
+        # / decoder_init.py / kr_kb_trainer.py / build_dense_seed_cache.py.
+        step_model_cfg = tcfg.get("model", {}) or {}
+        threshold_cfg = step_model_cfg.get(
+            "threshold_controller",
+            self.cfg.model.get("threshold_controller", {}),
+        )
         self.encoder = BgKITEncoder.from_pretrained_with_state_dict(
             bgkit_cfg.backbone_name,
             state_dicts["encoder"],
@@ -234,6 +243,7 @@ class FalconProjectionSeedTrainer(BaseTrainer):
             bidi_warmup_steps=0,
             active_decoder_family="falcon_h1",
             projection_num_layers=projection_num_layers,
+            threshold_controller_cfg=dict(threshold_cfg) if threshold_cfg else None,
         ).to(self.device)
         self.encoder.set_active_decoder_family("falcon_h1")
 
@@ -590,12 +600,38 @@ class FalconProjectionSeedTrainer(BaseTrainer):
             "diag/forced_survivors": batch["forced_counts"].float().mean(),
             "diag/alignment_score": batch["alignment_scores"].float().mean(),
         }
-        if self._survivor_bce_weight > 0.0 and enc_out.l0.logits_for_op is not None:
-            forced = batch["forced_survivor_mask_l0"].to(self.device).float()
-            bce = F.binary_cross_entropy_with_logits(enc_out.l0.logits_for_op.float(), forced)
-            total = total + self._survivor_bce_weight * bce
+        # Asymmetric "doom-the-bogus" head BCE (ported 2026-05-23 from
+        # bgkit.training.survivorship_helpers): supervise the head to
+        # predict 0 at non-forced positions (where projection_block's
+        # 2x expansion produces unreliable embeddings). Forced positions
+        # are unsupervised so utility-grad / aggregate-ratio pressure in
+        # l0_align / l0 can rank them. Uses base_raw (pre-tanh) so
+        # gradient stays alive — the prior logits_for_op path
+        # (= tanh(base_raw/T)) saturated and killed the head's gradient.
+        if self._survivor_bce_weight > 0.0 and enc_out.l0.base_raw is not None:
+            base_raw = enc_out.l0.base_raw
+            forced = batch["forced_survivor_mask_l0"].to(
+                device=base_raw.device, dtype=torch.bool,
+            )
+            if forced.shape[0] != base_raw.shape[0]:
+                raise ValueError(
+                    "forced_survivor_mask_l0 shape "
+                    f"{tuple(forced.shape)} does not match base_raw shape "
+                    f"{tuple(base_raw.shape)}"
+                )
+            neg = (~forced).to(dtype=torch.float32)
+            target = torch.zeros_like(base_raw, dtype=torch.float32)
+            bce_per_pos = F.binary_cross_entropy_with_logits(
+                base_raw.float(), target, reduction="none",
+            )
+            denom = neg.sum().clamp(min=1.0)
+            forced_bce = (bce_per_pos * neg).sum() / denom
+            total = total + self._survivor_bce_weight * forced_bce
             metrics["loss"] = total
-            metrics["loss/survivor_bce"] = bce.detach()
+            metrics["loss/forced_survivor_bce"] = forced_bce.detach()
+            metrics["loss/forced_survivor_pos_fraction"] = (
+                forced.float().mean().detach()
+            )
 
         (total / self._accum_steps).backward()
         enc_out.release()

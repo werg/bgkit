@@ -86,13 +86,13 @@ def main() -> None:
     parser.add_argument(
         "--tokens-dir",
         type=Path,
-        default=Path(os.environ["DATA_DIR"]) / "processed" / "tokens",
+        default=Path(os.environ["DATA_DIR"]) / "processed_v2" / "tokens",
         help="Qwen base mmap directory (with tokens.npy + offsets.npy + manifest.json).",
     )
     parser.add_argument(
         "--companion-dir",
         type=Path,
-        default=Path(os.environ["DATA_DIR"]) / "processed" / "tokens_falcon_h1",
+        default=Path(os.environ["DATA_DIR"]) / "processed_v2" / "tokens_falcon_h1",
         help="Falcon companion mmap directory (with falcon_tokens.npy etc.).",
     )
     parser.add_argument(
@@ -165,6 +165,12 @@ def main() -> None:
         raise ValueError(f"Source checkpoint {src_path} has no 'encoder' state dict")
 
     attn_impl = resolve_attention_implementation("auto")
+    # Falcon Phase 1 checkpoints cap anchors at 0.60 (6 anchors); the encoder
+    # default schedule is 7. Pass the Falcon-shaped threshold config so the
+    # state_dict load doesn't fail with size mismatch on l{0,1}.threshold.*.
+    falcon_threshold_cfg = {
+        "anchor_ratios": [0.02, 0.04, 0.08, 0.16, 0.32, 0.60],
+    }
     encoder = BgKITEncoder.from_pretrained_with_state_dict(
         args.backbone_name,
         state_dicts["encoder"],
@@ -174,6 +180,7 @@ def main() -> None:
         attn_implementation=attn_impl,
         bidi_warmup_steps=0,
         active_decoder_family="falcon_h1",
+        threshold_controller_cfg=falcon_threshold_cfg,
     ).to(device)
     encoder.requires_grad_(False)
     encoder.eval()

@@ -87,6 +87,71 @@ class SelectionOut:
         return float(num.item()) / den_v
 
 
+def remap_threshold_controller_state(
+    state_dict: dict,
+    prefix: str,
+    new_ratios: list[float],
+    ratio_space: str = "log",
+) -> bool:
+    """In-place migrate a saved ThresholdCurveController curve onto a new
+    anchor grid.
+
+    When the anchor schema changes (e.g. Falcon caps anchors at 0.6 so a
+    7-anchor checkpoint must move to a 6-anchor curve), naïve
+    ``load_state_dict`` either fails on the shape mismatch or — with
+    ``strict=False`` — silently leaves the controller initialized from
+    config and drops the trained curve. This helper re-interpolates the
+    saved ``anchor_thetas`` onto ``new_ratios`` using the controller's
+    ``ratio_space`` (matching ``theta_for_ratio``'s semantics).
+
+    The velocity buffer is zeroed (momentum doesn't transfer across grids)
+    and ``_last_target_rate`` is preserved (it's a scalar). Returns True
+    if a migration was applied, False if shapes already matched.
+    """
+    ratios_key = f"{prefix}.anchor_ratios"
+    thetas_key = f"{prefix}.anchor_thetas"
+    if ratios_key not in state_dict or thetas_key not in state_dict:
+        return False
+    saved_ratios = [float(x) for x in state_dict[ratios_key].float().cpu().tolist()]
+    new_ratios_list = [float(x) for x in new_ratios]
+    if saved_ratios == new_ratios_list:
+        return False
+    saved_thetas = [float(x) for x in state_dict[thetas_key].float().cpu().tolist()]
+
+    eps = 1e-6
+    def _xform(r: float) -> float:
+        r = min(max(r, eps), 1.0 - eps)
+        if ratio_space == "linear":
+            return r
+        if ratio_space == "log":
+            return math.log(r)
+        return math.log(r / (1.0 - r))
+
+    saved_x = [_xform(r) for r in saved_ratios]
+    new_thetas: list[float] = []
+    for r in new_ratios_list:
+        q = _xform(r)
+        if q <= saved_x[0]:
+            new_thetas.append(saved_thetas[0])
+            continue
+        if q >= saved_x[-1]:
+            new_thetas.append(saved_thetas[-1])
+            continue
+        for i in range(len(saved_x) - 1):
+            if saved_x[i] <= q <= saved_x[i + 1]:
+                span = max(saved_x[i + 1] - saved_x[i], 1e-12)
+                t = (q - saved_x[i]) / span
+                new_thetas.append(saved_thetas[i] * (1 - t) + saved_thetas[i + 1] * t)
+                break
+
+    state_dict[ratios_key] = torch.tensor(new_ratios_list, dtype=torch.float32)
+    state_dict[thetas_key] = torch.tensor(new_thetas, dtype=torch.float32)
+    velocity_key = f"{prefix}._anchor_velocity"
+    if velocity_key in state_dict:
+        state_dict[velocity_key] = torch.zeros(len(new_ratios_list), dtype=torch.float32)
+    return True
+
+
 def _validate_anchor_ratios(anchor_ratios: list[float]) -> list[float]:
     if len(anchor_ratios) < 2:
         raise ValueError("anchor_ratios must contain at least 2 ratios")
