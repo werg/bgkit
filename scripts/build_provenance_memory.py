@@ -138,16 +138,14 @@ def build_provenance(
                 n_skipped += 1
                 continue
 
-            # Row-unique gold article id within this episode. Form:
-            # ``<episode_id>#r<local_row_idx>``. Memory browse trees built
-            # from the same metadata will key leaves the same way (a
-            # corresponding builder hook in build_browse_tree.py adds the
-            # index suffix per episode). If your browse tree is indexed by
-            # the bare episode_id, drop the suffix — but then multiple
-            # provenance rows collide onto the same leaf.
+            # Browse-tree leaves are keyed by bare episode_id (the mmap
+            # ``document_id`` column). Multiple provenance rows for the
+            # same episode (different (question, gold_answer) framings)
+            # collide onto the same leaf — that's correct: one article,
+            # many queries against it.
             local = episode_row_counters.get(str(episode_id), 0)
             episode_row_counters[str(episode_id)] = local + 1
-            gold_article_id = f"{episode_id}#r{local:05d}"
+            gold_article_id = str(episode_id)
 
             question_str = tokenizer.decode(question_ids, skip_special_tokens=True)
             answer_str = tokenizer.decode(answer_ids, skip_special_tokens=True)

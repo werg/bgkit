@@ -41,7 +41,8 @@ _SPECS = {
     #   Tag extraction for meshes handled specially in convert_dataset().
     "pubmedqa": DatasetSpec(
         dataset_id="qiaojin/PubMedQA",
-        split="pqa_labeled",
+        config="pqa_labeled",
+        split="train",
         document_fields=("context", "long_answer"),
         question_fields=("question",),
         answer_fields=("final_decision", "long_answer"),
@@ -49,7 +50,8 @@ _SPECS = {
     ),
     "pubmedqa_artificial": DatasetSpec(
         dataset_id="qiaojin/PubMedQA",
-        split="pqa_artificial",
+        config="pqa_artificial",
+        split="train",
         document_fields=("context", "long_answer"),
         question_fields=("question",),
         answer_fields=("final_decision", "long_answer"),

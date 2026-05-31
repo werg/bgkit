@@ -1,0 +1,10 @@
+{
+  "kilt_wikipedia": 0.05,
+  "pubmedqa": 0.20,
+  "narrativeqa": 0.20,
+  "newsqa": 0.10,
+  "git_history": 0.20,
+  "memory": 0.40,
+  "msmarco_passage": 0.10,
+  "searchqa": 0.10
+}

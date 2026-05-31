@@ -40,7 +40,18 @@ from bgkit.data.l0_cache import (
     update_dataset_index,
     write_cache_manifest,
 )
+from bgkit.utils.deltanet_patch import (
+    patch_fused_rms_norm_gated_for_sm121,
+    patch_gated_delta_rule_numerics,
+)
 from bgkit.utils.packing import position_ids_from_cu
+from bgkit.utils.triton_alloc_patch import patch_triton_allocator
+from bgkit.utils.triton_patch import patch_triton_autotuner
+
+patch_triton_allocator()
+patch_triton_autotuner()
+patch_gated_delta_rule_numerics()
+patch_fused_rms_norm_gated_for_sm121()
 
 
 def _load_encoder(
@@ -210,9 +221,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.mmap_dir is None:
-        from bgkit.env import DATA_DIR
+        from bgkit.env import get_data_dir
 
-        args.mmap_dir = Path(DATA_DIR) / "mmap" / "phase2"
+        args.mmap_dir = get_data_dir() / "mmap" / "phase2"
 
     retention = {k: float(v) for k, v in json.loads(args.retention_json.read_text()).items()}
     by_dataset: dict[str, list[str]] = defaultdict(list)
