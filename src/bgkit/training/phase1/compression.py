@@ -155,6 +155,8 @@ class CompressionTrainer(BaseTrainer):
         "forced_survivor_bce_weight_l1": "_handle_surv_l1_forced_bce_weight",
         "forced_survivor_bce_anchor_ratio_l0": "_handle_surv_l0_forced_bce_anchor",
         "forced_survivor_bce_anchor_ratio_l1": "_handle_surv_l1_forced_bce_anchor",
+        "forced_survivor_bce_symmetric_l0": "_handle_surv_l0_forced_bce_symmetric",
+        "forced_survivor_bce_symmetric_l1": "_handle_surv_l1_forced_bce_symmetric",
         "utility_grad_loss_weight_l0": "_handle_surv_l0_utility_grad_weight",
         "utility_grad_loss_weight_l1": "_handle_surv_l1_utility_grad_weight",
         "decisiveness_loss_weight_l0": "_handle_surv_l0_decisiveness_weight",
@@ -193,7 +195,12 @@ class CompressionTrainer(BaseTrainer):
         projection_num_layers = int(bgkit_cfg.get("projection_num_layers", 1))
         bidi_warmup = self.cfg.training.get("bidi_warmup_steps", 1000)
         model_cfg = self.cfg.model
-        ctrl_src = model_cfg.get("threshold_controller", {})
+        # Allow per-training-config override (training.model.threshold_controller)
+        # to take precedence over the global default, matching the decoder_cfg
+        # lookup pattern. Falcon phases use this to cap anchors at 0.6.
+        ctrl_src = tcfg.get("model", {}).get(
+            "threshold_controller", model_cfg.get("threshold_controller", {}),
+        )
         target_ratio_start = float(tcfg.get("target_ratio_start", 0.30))
         threshold_controller_cfg = {
             "init_theta": float(
@@ -223,6 +230,28 @@ class CompressionTrainer(BaseTrainer):
         # Auto-detect pruned architecture from state dict keys
         if step1_state_dicts:
             from bgkit.models.encoder import is_pruned_encoder_state_dict
+            # Migrate ThresholdCurveController curves if the warm-start
+            # checkpoint has a different anchor grid than the current
+            # config (e.g. Falcon C → D with capped anchors).
+            target_anchor_ratios = threshold_controller_cfg.get("anchor_ratios")
+            if target_anchor_ratios:
+                from bgkit.models.components.selection import (
+                    remap_threshold_controller_state,
+                )
+                ratio_space = threshold_controller_cfg.get("ratio_space", "log")
+                for level in ("l0", "l1"):
+                    if remap_threshold_controller_state(
+                        step1_state_dicts["encoder"],
+                        f"{level}.threshold",
+                        list(target_anchor_ratios),
+                        ratio_space=ratio_space,
+                    ):
+                        logger.info(
+                            "threshold_anchors_migrated",
+                            source="step1_checkpoint",
+                            level=level,
+                            new_ratios=list(target_anchor_ratios),
+                        )
             pruned = is_pruned_encoder_state_dict(step1_state_dicts["encoder"])
             logger.info(
                 "loading_bgkit_encoder",
@@ -912,15 +941,34 @@ class CompressionTrainer(BaseTrainer):
                 candidate_phases = ("phase1_step5",)
 
             errors: list[str] = []
-            # For Falcon family, use eval/cos_sim (higher-is-better) to avoid
-            # the sign-flip trap: forced_adapt's eval/loss switched magnitude
-            # under the cos-weight reweighting (0.25 pre, 0.84 post), so
-            # ranking by eval/loss picks the worse pre-reweighting checkpoint.
-            # eval/cos_sim has the same direction-of-better in both regimes.
-            falcon_metric = decoder_family == "falcon_h1"
-            metric_key = "eval/cos_sim" if falcon_metric else "eval/loss"
-            lower_better = not falcon_metric
+            # Per-phase metric selection: each Falcon source phase trains a
+            # different objective and so logs a different "best" metric.
+            #   * forced_adapt: projection-alignment (anchor+cos) → eval/cos_sim
+            #     (higher-is-better). eval/loss switched magnitude under the
+            #     cos-weight reweighting (0.25→0.84), so ranking by eval/loss
+            #     picks the worse pre-reweighting checkpoint.
+            #   * dense_seed: same projection-seed objective → eval/cos_sim
+            #     when present, else eval/loss.
+            #   * l0_align + l0: data-reconstruction objective → eval/loss
+            #     (lower-is-better). These trainers do NOT log eval/cos_sim,
+            #     so a single-metric resolver wrongly fell through to
+            #     forced_adapt and lost the l0_align warm-start.
+            if decoder_family == "falcon_h1":
+                falcon_metric_for_phase = {
+                    "phase1_falcon_dense_seed": ("eval/cos_sim", False),
+                    "phase1_falcon_forced_adapt": ("eval/cos_sim", False),
+                    "phase1_falcon_l0_align": ("eval/loss", True),
+                    "phase1_falcon_l0": ("eval/loss", True),
+                }
+            else:
+                falcon_metric_for_phase = {}
             for phase in candidate_phases:
+                if decoder_family == "falcon_h1":
+                    metric_key, lower_better = falcon_metric_for_phase.get(
+                        phase, ("eval/loss", True),
+                    )
+                else:
+                    metric_key, lower_better = ("eval/loss", True)
                 try:
                     resolved = resolve_checkpoint(
                         checkpoint_dir,
@@ -930,6 +978,13 @@ class CompressionTrainer(BaseTrainer):
                         label="step1_checkpoint",
                     )
                     step1_checkpoint = str(resolved)
+                    logger.info(
+                        "step1_checkpoint_resolved",
+                        phase=phase,
+                        metric=metric_key,
+                        lower_better=lower_better,
+                        path=step1_checkpoint,
+                    )
                     break
                 except ValueError as exc:
                     errors.append(str(exc))
@@ -1001,6 +1056,31 @@ class CompressionTrainer(BaseTrainer):
 
     def _handle_surv_l1_forced_bce_anchor(self, val) -> None:
         self._update_surv_field("l1", "forced_survivor_bce_anchor_ratio", val)
+
+    def _handle_surv_l0_forced_bce_symmetric(self, val) -> None:
+        self._set_surv_symmetric_flag("l0", val)
+
+    def _handle_surv_l1_forced_bce_symmetric(self, val) -> None:
+        self._set_surv_symmetric_flag("l1", val)
+
+    def _set_surv_symmetric_flag(self, level: str, val) -> None:
+        from bgkit.training.survivorship_helpers import LevelLossCfg
+
+        attr_name = f"_surv_{level}"
+        cfg_obj = getattr(self, attr_name, None)
+        if cfg_obj is None:
+            cfg_obj = LevelLossCfg()
+            setattr(self, attr_name, cfg_obj)
+        new_val = bool(val)
+        old = bool(cfg_obj.forced_survivor_bce_symmetric)
+        cfg_obj.forced_survivor_bce_symmetric = new_val
+        logger.info(
+            "live_surv_field_update",
+            level=level,
+            field="forced_survivor_bce_symmetric",
+            old=old,
+            new=new_val,
+        )
 
     def _handle_surv_l0_utility_grad_weight(self, val) -> None:
         self._update_surv_field("l0", "utility_grad_loss_weight", val)
@@ -3160,6 +3240,31 @@ class CompressionTrainer(BaseTrainer):
     def _restore_model_state(self, state_dicts: dict) -> None:
         if "encoder" in state_dicts:
             enc_state = state_dicts["encoder"]
+            # Migrate ThresholdCurveController curves if the saved anchor
+            # grid differs from the current config (e.g. Falcon capped at
+            # 0.6 vs the legacy 7-anchor schema with 0.64 + 0.95). Without
+            # this the load would either fail on shape mismatch or
+            # silently drop the trained curve.
+            from bgkit.models.components.selection import (
+                remap_threshold_controller_state,
+            )
+            for level in ("l0", "l1"):
+                ctrl = getattr(self.encoder, level, None)
+                if ctrl is None or not hasattr(ctrl, "threshold"):
+                    continue
+                new_ratios = ctrl.threshold.anchor_ratios.float().cpu().tolist()
+                ratio_space = ctrl.threshold.ratio_space
+                if remap_threshold_controller_state(
+                    enc_state,
+                    f"{level}.threshold",
+                    new_ratios,
+                    ratio_space=ratio_space,
+                ):
+                    logger.info(
+                        "threshold_anchors_migrated",
+                        level=level,
+                        new_ratios=new_ratios,
+                    )
             result = self.encoder.load_state_dict(enc_state, strict=False)
             if result.missing_keys:
                 logger.info(

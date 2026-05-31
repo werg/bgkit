@@ -705,16 +705,22 @@ class TestResolveStep1Checkpoint:
             result = trainer._resolve_step1_checkpoint()
 
         assert result == str(dense_path)
-        assert [call.kwargs["phase"] for call in mock_resolve.call_args_list] == [
+        # Per-phase metric: l0_align uses eval/loss (data-reconstruction
+        # objective, no cos_sim logged); forced_adapt + dense_seed use
+        # eval/cos_sim (projection-alignment objective, cos_sim is the
+        # regime-stable metric).
+        calls = mock_resolve.call_args_list
+        assert [c.kwargs["phase"] for c in calls] == [
             "phase1_falcon_l0_align",
             "phase1_falcon_forced_adapt",
             "phase1_falcon_dense_seed",
         ]
-        assert all(
-            call.kwargs["metric"] == "eval/cos_sim"
-            and call.kwargs["lower_is_better"] is False
-            for call in mock_resolve.call_args_list
-        )
+        assert [c.kwargs["metric"] for c in calls] == [
+            "eval/loss",
+            "eval/cos_sim",
+            "eval/cos_sim",
+        ]
+        assert [c.kwargs["lower_is_better"] for c in calls] == [True, False, False]
         assert trainer._input_sources["step1"] == dense_path.name
 
     def test_falcon_l1_auto_resolves_l0_stage(self, trainer):
@@ -731,11 +737,12 @@ class TestResolveStep1Checkpoint:
         ) as mock_resolve:
             result = trainer._resolve_step1_checkpoint()
 
+        # L1 warm-starts from L0; L0 logs eval/loss (lower-is-better).
         mock_resolve.assert_called_once_with(
             Path("/tmp/ckpts"),
             phase="phase1_falcon_l0",
-            metric="eval/cos_sim",
-            lower_is_better=False,
+            metric="eval/loss",
+            lower_is_better=True,
             label="step1_checkpoint",
         )
         assert result == str(l0_path)

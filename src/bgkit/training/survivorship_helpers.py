@@ -294,6 +294,16 @@ class LevelLossCfg:
     # valid. Live-tuning handler still accepts updates so old
     # control.json files don't error, but the value has no effect.
     forced_survivor_bce_anchor_ratio: float = 0.0
+    # When True, switch the forced-survivor BCE to SYMMETRIC: target=1
+    # on forced positions, target=0 on non-forced, supervised across
+    # ALL valid positions. This actively teaches the head to predict
+    # forced positions positive, instead of only suppressing non-forced
+    # (the asymmetric mode left the positive class to utility-grad /
+    # ratio pressure, which is too weak to escape a max-entropy head
+    # state). Use this in any setup that needs the head to organically
+    # reproduce the forced selection after the forced-mask override
+    # is removed.
+    forced_survivor_bce_symmetric: bool = False
 
 
 def _metric_scalar(value: Tensor, *, sync: bool):
@@ -699,13 +709,25 @@ def compute_survivorship_losses(
                 f"{tuple(base_raw.shape)}. Mask and base_raw must be flat "
                 "(N_content,) tensors over the same packed axis."
             )
-        neg = (~fm).to(dtype=torch.float32)
-        target = torch.zeros_like(base_raw, dtype=torch.float32)
-        bce_per_pos = F.binary_cross_entropy_with_logits(
-            base_raw.float(), target, reduction="none",
-        )
-        denom = neg.sum().clamp(min=1.0)
-        forced_bce = (bce_per_pos * neg).sum() / denom
+        if weights.forced_survivor_bce_symmetric:
+            target = fm.to(dtype=torch.float32)
+            bce_per_pos = F.binary_cross_entropy_with_logits(
+                base_raw.float(), target, reduction="none",
+            )
+            denom = torch.tensor(
+                float(base_raw.shape[0]),
+                device=base_raw.device,
+                dtype=torch.float32,
+            ).clamp(min=1.0)
+            forced_bce = bce_per_pos.sum() / denom
+        else:
+            neg = (~fm).to(dtype=torch.float32)
+            target = torch.zeros_like(base_raw, dtype=torch.float32)
+            bce_per_pos = F.binary_cross_entropy_with_logits(
+                base_raw.float(), target, reduction="none",
+            )
+            denom = neg.sum().clamp(min=1.0)
+            forced_bce = (bce_per_pos * neg).sum() / denom
         effective_weight = float(weights.forced_survivor_bce_weight)
         metrics["forced_survivor_bce"] = _metric_scalar(forced_bce, sync=sync_metrics)
         metrics["forced_survivor_pos_fraction"] = _metric_scalar(
@@ -945,6 +967,9 @@ def resolve_level_loss_cfg(cfg_block: dict | None) -> LevelLossCfg:
         forced_survivor_bce_weight=float(cfg.get("forced_survivor_bce_weight", 0.0)),
         forced_survivor_bce_anchor_ratio=float(
             cfg.get("forced_survivor_bce_anchor_ratio", 0.6),
+        ),
+        forced_survivor_bce_symmetric=bool(
+            cfg.get("forced_survivor_bce_symmetric", False),
         ),
     )
 
