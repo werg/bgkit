@@ -97,7 +97,8 @@ freeze:
   decoder: false
 
 data:
-  file_tokens_path: ${oc.env:DATA_DIR}/processed/tokens
+  # file_tokens_path comes from training.data default in configs/config.yaml
+  # (processed_v2/tokens). The other paths below have no central default yet.
   commit_tokens_path: ${oc.env:DATA_DIR}/processed/commit_reproduction
   description_tokens_path: ${oc.env:DATA_DIR}/mmap/descriptions
   structural_tokens_path: ${oc.env:DATA_DIR}/mmap/structural

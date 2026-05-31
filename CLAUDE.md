@@ -19,6 +19,8 @@ cp .env.example .env   # then edit DATA_DIR / CHECKPOINT_DIR
 
 The `.env` file is read by: Python (`bgkit.env` via python-dotenv), Makefile (`-include .env`), shell scripts (source `.env`), and Docker Compose (native `.env` support). There are no fallback defaults anywhere — `.env` is it.
 
+**Canonical training-data corpus**: `${DATA_DIR}/processed_v2/tokens` (and `processed_v2/tokens_falcon_h1` for the Falcon companion). The 2026-05-01 rebuild added Markdown/YAML/JSON/HTML/CSS to the language allowlist (+45% chunks vs the original `processed/`). Defaults are wired in `configs/data/tokens.yaml` (`tokens.input_dir`) and `configs/config.yaml` (`training.data.file_tokens_path`, `training.data.falcon_companion_dir`). Phases override only for documented exceptions (`phase1_falcon_forced_adapt` uses `tokens_falcon_h1_containment` for stricter alignment).
+
 ## GPU Work Must Use the Docker Container
 
 Any work involving PyTorch, CUDA, or GPU computation **must** be run inside the NGC-based Docker container — not directly in the host venv. The container (`docker/Dockerfile`) is based on `nvcr.io/nvidia/pytorch:26.03-py3` and provides the correct ARM64 + CUDA 13.2 + sm_121 PyTorch build.

@@ -30,6 +30,16 @@ resume_checkpoint: null  # null = auto-resume latest; "none" = fresh start; or e
 control_file: null  # optional path to live HP control JSON
 
 training:
+  # Default data paths for the compression / Falcon trainers. Individual
+  # training configs may override. fineweb_edu_v1/ is the 5B-token
+  # FineWeb-Edu ingest (2026-05-21) — switched off processed_v2 (code
+  # repos) because Phase 2 Stage A ablation showed BgKIT context was
+  # contributing ~nothing to answer quality on data the decoder had
+  # memorized. FineWeb-Edu is broader, ~2× the token count, and forces
+  # the encoder to actually carry information into the decoder.
+  data:
+    file_tokens_path: ${oc.env:DATA_DIR}/fineweb_edu_v1/tokens
+    falcon_companion_dir: ${oc.env:DATA_DIR}/fineweb_edu_v1/tokens_falcon_h1
   # Shared decoder-training contract. Phases may override this only for named
   # diagnostics or legacy baselines.
   decoder_lora:

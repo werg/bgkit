@@ -28,11 +28,4 @@ data:
   # position for those samples (weak sparsity prior; the decoder CE on
   # answers is the primary supervision and isn't affected).
   qa_data_dir: ${oc.env:DATA_DIR}/mmap/qa_conditioned
-  # Override the default ``processed/tokens`` path. ``processed_v2/tokens``
-  # was rebuilt 2026-05-01 with a broadened language_allowlist (added
-  # Markdown, YAML, TOML, JSON, XML, HTML, CSS, Gradle) so that the QA-
-  # generator's looser file scope is matched by the file-token corpus.
-  # QA-join recovers 86,817 samples (75.8%) vs 60,705 (53.0%) on the
-  # original ``processed/tokens`` — +43% training data.
-  tokens:
-    input_dir: ${oc.env:DATA_DIR}/processed_v2/tokens
+  # tokens.input_dir defaults to processed_v2/tokens via configs/data/tokens.yaml.

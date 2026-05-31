@@ -1,5 +1,11 @@
 tokens:
-  input_dir: ${oc.env:DATA_DIR}/processed/tokens
+  # fineweb_edu_v1/ is the canonical default since the 2026-05-21 pivot
+  # off code-repo data (Phase 2 Stage A ablation showed BgKIT context
+  # was barely contributing because the decoder had memorized the small
+  # QA datasets). 5B Qwen tokens of FineWeb-Edu, ~2× the processed_v2
+  # corpus, broader genre coverage. Phases that need the original code
+  # corpus must override explicitly.
+  input_dir: ${oc.env:DATA_DIR}/fineweb_edu_v1/tokens
   # Content length hard cap. Lowered 8192→4096 on 2026-04-19 after
   # the combination of long-content samples + target_ratio=0.92 +
   # grad_accum=8 produced decoder sequences of ~15K tokens (prefix

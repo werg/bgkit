@@ -199,6 +199,22 @@ x-gpu-common: &gpu-common
   shm_size: "8gb"
   volumes:
     - ${DATA_DIR}:/workspace/data
+    # NVMe overlay for FineWeb-Edu hot data (tokens + Falcon companion).
+    # The HDD copy in ${DATA_DIR}/fineweb_edu_v1 is the canonical version;
+    # this bind mount overlays the tokens/ + tokens_falcon_h1/ subpaths
+    # with NVMe-resident copies so dataloader workers don't bottleneck on
+    # the spinning disk (~30 MB/s, 165ms IO wait → 0% GPU utilization).
+    # Migrated 2026-05-23 when forced_adapt was running at 26.5 s/step on
+    # HDD; expected ~3-5 s/step on NVMe.
+    - /home/werg/bgkit-data-nvme/fineweb_edu_v1/tokens:/workspace/data/fineweb_edu_v1/tokens
+    - /home/werg/bgkit-data-nvme/fineweb_edu_v1/tokens_falcon_h1:/workspace/data/fineweb_edu_v1/tokens_falcon_h1
+    # Commit-encoding datasets for Qwen3.5 Steps 4.7 / 5 / 6 (small,
+    # ~5.3 GB total). FineWeb-Edu has no commit analog so these stay on
+    # the code corpus; NVMe overlay just avoids HDD bottleneck when
+    # those stages run.
+    - /home/werg/bgkit-data-nvme/processed/commit_encoding:/workspace/data/processed/commit_encoding
+    - /home/werg/bgkit-data-nvme/processed/commit_reproduction:/workspace/data/processed/commit_reproduction
+    - /home/werg/bgkit-data-nvme/mmap/descriptions:/workspace/data/mmap/descriptions
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
     - ${CHECKPOINT_DIR}:/workspace/checkpoints
     # Source code — the ONLY way bgkit code enters the container.
@@ -394,6 +410,12 @@ services:
 
   train-falcon-forced-adapt:
     <<: *gpu-common
+    # NOTE: do NOT add `environment:` block here — it would shadow
+    # gpu-common's entire env (wandb creds, triton cache paths, etc).
+    # Override BGKIT_CUDA_MEM_FRACTION via shell env when launching
+    # (gpu-common already reads it: `${BGKIT_CUDA_MEM_FRACTION:-0.65}`).
+    # FineWeb-Edu forced_adapt benefits from 0.80 + max_batch_tokens=2048
+    # + max_sample_length=768.
     command: ["scripts/train.py", "+experiment=phase1_falcon_forced_adapt"]
 
   # Phase C: end-to-end alignment at no compression. Encoder.l0 + projection
