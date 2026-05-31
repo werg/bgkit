@@ -1,5 +1,11 @@
 phase: phase1_falcon_forced_adapt
 optimizer: adamw
+# Warm-start: re-feed the latest l0_align checkpoint so we continue from the
+# encoder+projection state l0_align had reached (which is downstream of the
+# first forced_adapt's plateau). Without this override the auto-resolver
+# falls back to dense_seed and we'd throw away the joint encoder/projection
+# refinement l0_align added.
+bgkit_checkpoint: /workspace/checkpoints/phase1_falcon_l0_align_step6956_20260523_090348
 # Re-run: 20k steps with reweighted loss to push cos_sim past the
 # 0.52 plateau the 2.5k-step run hit. The previous setup had
 # anchor MSE at 2× cos_loss in weight even though cos is what
@@ -15,13 +21,15 @@ lr: 1.0e-4
 projection_lr: 1.0e-4
 encoder_lr: 8.0e-5
 warmup_steps: 500
-# Matches phase1_step5's quadratic budget. The original 16384 was 16x
-# Step 5's effective work per batch with no measured justification.
-max_batch_tokens: 4096
-# Eval batches were 2x train (8192); under the 3-layer projection memory
-# pressure they push past the CUDA cap right before the next train step
-# OOMs. Match eval to train so eval doesn't move the memory ceiling.
-max_batch_tokens_eval: 4096
+# Lowered 2026-05-23 from 4096 → 2048. Combined with max_sample_length=768,
+# this halves worst-case batch memory and unsticks the allocator from the
+# 100s/step thrash state observed on FineWeb-Edu adapter restart.
+max_batch_tokens: 2048
+# Tightened 2026-05-23 from 4096 → 2048 after the post-eval memory blow-up
+# at step 7000 on FineWeb-Edu (cuda_max_reserved hit the 79 GB cap; train
+# slowed to 67s/step). FineWeb-Edu has longer per-doc tail samples than
+# code, so eval batches need a smaller budget than train.
+max_batch_tokens_eval: 2048
 gradient_accumulation_steps: 2
 max_eval_samples: 1000
 # Eval-leak diagnosis 2026-05-13: eval loop's per-iteration tensors stayed
@@ -42,16 +50,26 @@ adapt_encoder: true
 # 2048 doubles the dataset slice (~402k → ~928k samples) at the
 # memory cost of larger activations. Combined with
 # BGKIT_CUDA_MEM_FRACTION=0.80 the cap is ~97 GB.
-max_sample_length: 2048
+max_sample_length: 768
 min_sample_length: 32
-# Per-repo cap: the raw corpus is power-law skewed — top repo has 6,151
-# chunks vs median 31 (198× upweight under uniform sampling). After 20+
-# epochs eval cos_sim plateau'd at ~0.58 while train cos kept climbing
-# (~0.08 gap, classic overfitting on the heavy tail). Capping each repo
-# to 200 chunks reduces dataset to ~586k chunks (47% of original) but
-# brings the top-1% repo share from ~17% down to ~3% — much more
-# balanced effective exposure across repos.
-max_chunks_per_repo: 200
+# Lowered 2026-05-23 from 2048 → 1024 → 768. FineWeb-Edu is heavy-tailed:
+# 27% of docs are >1024 tokens but they hold 65% of total token volume.
+# Cap=768 keeps 60% of docs / 24% of tokens, drops worst-case batch
+# sum(L²) from 4M (4×1024²) to ~3M (5×768²) — ~25% less attention memory
+# vs cap=1024. The filtered tail is sustained-OOM-causing on the 79 GB
+# unified-memory cap; bumping the cap alone trades reliability for
+# slowdowns during pathological batches. Filtering is the durable fix.
+# Per-repo cap (CODE corpus only): the code corpus is power-law skewed —
+# top repo has 6,151 chunks vs median 31 (198× upweight under uniform
+# sampling). Capping each repo to 200 chunks balances exposure.
+#
+# CRITICAL: For fineweb_edu_v1, every doc has repo_path =
+# "HuggingFaceFW/fineweb-edu/sample-10BT" (one synthetic repo for all
+# 4.9M docs). A 200-chunk cap would restrict training to 200 chunks
+# total → catastrophic overfit (train cos_sim 0.94, eval 0.34 observed
+# on 2026-05-22 before this fix). Set null to disable the cap when on
+# FineWeb-Edu data.
+max_chunks_per_repo: null
 # exclude_files_metadata_path was used with the fast companion to test
 # the overfitting hypothesis. Now we're on the containment companion
 # with completely different per-position targets — the model has not
@@ -62,17 +80,13 @@ max_chunks_per_repo: 200
 # exclude_files_metadata_path: ${oc.env:DATA_DIR}/processed/tokens/metadata.parquet
 
 data:
-  # Containment-alignment companion: each forced_survivor is a Qwen
-  # position whose char range contains EXACTLY 2 Falcon tokens — clean
-  # byte-level targets, no heuristic best-guess. ~7% of chunks survive
-  # (Qwen and Falcon BPE are similar granularity so most Qwens contain
-  # just 1 Falcon, not 2). Surviving chunks have dense forced positions
-  # (~154/chunk avg). 18.8M total forced positions, all with unambiguous
-  # targets — vs fast-mode's 1.38B positions where half had ZERO char
-  # overlap with their assigned pair.
-  falcon_companion_dir: ${oc.env:DATA_DIR}/processed_v2/tokens_falcon_h1_containment
+  # 2026-05-21: switched to the standard FineWeb-Edu Falcon companion.
+  # The previous _containment variant (built from processed_v2 code) does
+  # not exist for fineweb_edu_v1 and the natural-language token boundaries
+  # in web text are less pathological than code, so the standard fast-mode
+  # alignment should already be clean enough. Revisit if forced-BCE metrics
+  # show alignment noise.
   tokens:
-    input_dir: ${oc.env:DATA_DIR}/processed_v2/tokens
     max_seq_len: 8192
 
 # Loss reweighting: cos_loss is what matters for decoder readability.
@@ -84,12 +98,16 @@ data:
 anchor_weight: 0.1
 cos_weight: 2.0
 norm_weight: 0.1
-# Disabled: the head BCE was applied to tanh-saturated logits, gradient
-# died instantly. Worse, with adapt_encoder=true that broken signal
-# back-propagates through the encoder backbone — noise injection at
-# 0.2 weight. Set to 0 so the encoder receives clean signal only from
-# the anchor losses.
-survivor_bce_weight: 0.0
+# Re-enabled 2026-05-23 after porting the asymmetric "doom-the-bogus"
+# BCE from survivorship_helpers.py into projection_seed_falcon.py. The
+# old failure mode (tanh-saturated logits, dead gradient) is gone — the
+# port uses base_raw (pre-tanh) so BCE-with-logits gradient is alive.
+# Asymmetric supervision: target=0 at NON-forced positions only; forced
+# positions are unsupervised so utility-grad / ratio pressure in
+# l0_align / l0 can still rank them. Weight kept moderate to avoid
+# dominating the anchor (cos/MSE/norm) losses that drive projection
+# alignment.
+survivor_bce_weight: 0.2
 
 checkpoint_pruning:
   enabled: true
@@ -109,3 +127,6 @@ model:
     family: falcon_h1
     backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
     hidden_dim: 512
+  # Falcon-specific anchor cap (see phase1_falcon_l0.yaml for rationale).
+  threshold_controller:
+    anchor_ratios: [0.02, 0.04, 0.08, 0.16, 0.32, 0.60]

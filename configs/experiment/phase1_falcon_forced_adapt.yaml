@@ -5,13 +5,20 @@ defaults:
   - _self_
 
 run_name: phase1_falcon_forced_adapt
-bgkit_checkpoint: auto
+# Warm-start from the l0_align checkpoint that ran on top of the
+# memory-truncated forced_adapt — that's the latest encoder+projection
+# state we have. Override `auto` which would resolve to dense_seed only
+# (the auto-resolver doesn't walk back from l0_align → forced_adapt).
+bgkit_checkpoint: /workspace/checkpoints/phase1_falcon_l0_align_step6956_20260523_090348
 
 # forced_adapt unfreezes encoder.l0 so it runs the live encoder every step.
 # With async dataloader workers the encoder backbone gets to run at near
 # full GPU utilization, dropping the I/O-bound 100s/step we saw at workers=0.
 compute:
-  num_workers: 2
+  # Bumped from 2 → 6 on 2026-05-23 to keep up with FineWeb-Edu I/O.
+  # Dataloader workers were stuck in D-state (disk sleep) with workers=2,
+  # GPU sat at 0% utilization between batches → ~50s/step.
+  num_workers: 6
   pin_memory: false
 
 model:

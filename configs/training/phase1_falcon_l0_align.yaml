@@ -121,12 +121,10 @@ dynamic_ckpt:
   flush_when_free_below_gb: 6.0
 
 data:
-  # Switch to v2: 1.73M chunks vs 1.24M in old processed/tokens. Use the
-  # fast-mode companion (not containment — Phase C wants the full corpus
-  # for decoder LM CE diversity; containment's 7% chunk acceptance is too
-  # sparse for end-to-end training).
-  file_tokens_path: ${oc.env:DATA_DIR}/processed_v2/tokens
-  falcon_companion_dir: ${oc.env:DATA_DIR}/processed_v2/tokens_falcon_h1
+  # file_tokens_path + falcon_companion_dir come from training.data defaults
+  # in configs/config.yaml (processed_v2 fast-mode companion). The
+  # containment variant is intentionally NOT used here — Phase C wants the
+  # full corpus for decoder LM CE diversity.
   prompt_variants_dir: configs/prompt_variants
   tokens:
     max_seq_len: 8192
@@ -135,4 +133,8 @@ model:
   decoder:
     family: falcon_h1
     backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+  # Falcon-specific anchor cap (see phase1_falcon_l0.yaml for rationale).
+  threshold_controller:
+    anchor_ratios: [0.02, 0.04, 0.08, 0.16, 0.32, 0.60]
+
     hidden_dim: 512

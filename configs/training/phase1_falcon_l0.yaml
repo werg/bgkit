@@ -25,11 +25,32 @@ max_eval_samples: 1000
 eval_every: 1000
 save_every: 2000
 
-# Head takes over here: encoder's natural selection is used (no
-# forced-mask override). Head was BCE-trained to predict forced in
-# Phase C, so its initial selection starts near the forced positions;
-# the threshold controller then tightens compression below that baseline.
-use_forced_survivor_mask_l0: false
+# Symmetric BCE on `base_raw` produces large auxiliary gradients
+# (forced_survivor_bce sits around 7 at initialization because head
+# logits at forced positions are deeply negative from l0_align). The
+# resulting grad_norm runs ~100, which the default clip=1.0 squashes
+# to ~1% per step — head can't move. Raise clip to 10 so the BCE
+# direction survives while still catching genuine spikes.
+max_grad_norm: 10.0
+
+# Transition mode (2026-05-26 fix): the previous l0 design assumed the
+# asymmetric "doom-the-bogus" BCE in forced_adapt/l0_align had implicitly
+# taught the head to predict forced positions positive. It did not — the
+# asymmetric BCE only suppressed non-forced (target=0); forced positions
+# were unsupervised and the head's `use_forced_survivor_mask=true` path
+# bypassed the head's output entirely, so the head never actually learned
+# the positive class. Starting l0 with the mask off resulted in a
+# degenerate state (actual_ratio 0.6% vs target 60%, theta pinned at floor,
+# undecided_fraction 1.0).
+#
+# Fix: keep the forced mask ON at the start of l0, but switch the BCE to
+# SYMMETRIC (target=1 on forced AND target=0 on non-forced). The head now
+# learns to organically reproduce the forced selection while the encoder
+# safely runs with the correct mask. Once forced_survivor_bce drops near
+# zero AND the head's organic ratio approaches the forced fraction
+# (~0.55), flip `use_forced_survivor_mask_l0` to false via control.json
+# to enter true compression mode.
+use_forced_survivor_mask_l0: true
 
 sampler:
   cost_multiplier: 1.0
@@ -62,6 +83,10 @@ survivorship:
     min_survivors_absolute_min: 1
     min_survivors_tau: 0.3
     forced_survivor_bce_weight: 1.0
+    # Symmetric BCE: target=1 at forced positions AND target=0 at
+    # non-forced. Replaces the asymmetric "doom-the-bogus" supervision
+    # — see use_forced_survivor_mask_l0 above for the rationale.
+    forced_survivor_bce_symmetric: true
   l1:
     ratio_loss_weight: 0.0
     decisiveness_loss_weight: 0.0
@@ -96,8 +121,8 @@ freeze:
   decoder: false
 
 data:
-  file_tokens_path: ${oc.env:DATA_DIR}/processed/tokens
-  falcon_companion_dir: ${oc.env:DATA_DIR}/processed/tokens_falcon_h1
+  # file_tokens_path + falcon_companion_dir come from training.data defaults
+  # in configs/config.yaml (processed_v2/tokens + processed_v2/tokens_falcon_h1).
   prompt_variants_dir: configs/prompt_variants
   tokens:
     max_seq_len: 8192
@@ -107,3 +132,13 @@ model:
     family: falcon_h1
     backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
     hidden_dim: 512
+  # Falcon-specific anchor grid: cap at 0.60. Survivor fractions above
+  # ~60% are net-harmful for the Falcon-H1 Tiny decoder (more spurious
+  # context inflates footprint and dilutes signal). The legacy
+  # anchors at 0.64 / 0.95 were unreachable under the 0.6→0.1
+  # curriculum and left untrained θ values that produced post-resume
+  # keep-rate spikes whenever the curriculum interpolation reached
+  # them. Migration of legacy 7-anchor checkpoints is automatic via
+  # ``remap_threshold_controller_state`` in ``_restore_model_state``.
+  threshold_controller:
+    anchor_ratios: [0.02, 0.04, 0.08, 0.16, 0.32, 0.60]

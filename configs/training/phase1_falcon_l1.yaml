@@ -77,12 +77,16 @@ freeze:
   decoder: false
 
 data:
-  file_tokens_path: ${oc.env:DATA_DIR}/processed/tokens
-  falcon_companion_dir: ${oc.env:DATA_DIR}/processed/tokens_falcon_h1
+  # file_tokens_path + falcon_companion_dir come from training.data defaults
+  # in configs/config.yaml.
   prompt_variants_dir: configs/prompt_variants
 
 model:
   decoder:
     family: falcon_h1
     backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+  # Falcon-specific anchor cap (see phase1_falcon_l0.yaml for rationale).
+  threshold_controller:
+    anchor_ratios: [0.02, 0.04, 0.08, 0.16, 0.32, 0.60]
+
     hidden_dim: 512

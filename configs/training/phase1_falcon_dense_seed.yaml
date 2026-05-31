@@ -23,8 +23,10 @@ save_every: 500
 adapt_encoder: false
 
 data:
-  # Output of scripts/build_dense_seed_cache.py.
-  cache_dir: ${oc.env:DATA_DIR}/processed/falcon_dense_seed_cache
+  # Output of scripts/build_dense_seed_cache.py — switched 2026-05-22 from
+  # processed/ (code) to fineweb_edu_v1 (5B-token FineWeb-Edu subset) as
+  # part of the Phase 2 ablation-driven pivot off code-corpus pretraining.
+  cache_dir: ${oc.env:DATA_DIR}/fineweb_edu_v1/falcon_dense_seed_cache
 
 anchor_weight: 1.0
 cos_weight: 0.5
