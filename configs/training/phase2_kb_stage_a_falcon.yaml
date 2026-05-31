@@ -8,14 +8,32 @@ l0_lr: 2.0e-4
 l1_lr: 2.0e-4
 eval_every: 500
 save_every: 2000
+
+# Run an extra eval pass at each cadence with survivors zeroed (no
+# BgKIT knowledge reaches the decoder). The gap between
+# ``eval/loss`` and ``eval/ablation/zeroed/loss`` (and EM, F1, etc.)
+# is the BgKIT contribution. ``noise`` would tell us whether the
+# decoder uses the actual signal vs just "context exists"; skipped
+# here to keep eval wall-clock bounded.
+eval_ablation_modes:
+  - zeroed
 max_steps: null
 batch_size: 4
+
+# OOM mitigation on the 79 GB cuda-mem-guard cap. Full Qwen-0.8B encoder +
+# Falcon-H1-90M decoder + projection_block activations at batch_size=4 do
+# not fit without gradient checkpointing on both stacks.
+activation_checkpointing:
+  encoder: true
+  decoder: true
 
 datasets:
   - pubmedqa
   - narrativeqa
-  - git_history
   - memory
+# git_history requires the vLLM-based generate_git_qa.py pipeline (10-20 GPU
+# hours on 10k repos) — deferred to Stage B since the bootstrap mix already
+# spans 247k (dataset, article) pairs across pubmedqa + narrativeqa + memory.
 
 max_samples_per_dataset_default: 1500
 live_l0: true
@@ -93,10 +111,19 @@ moment_match_reference:
   l1:
     path: null
 
-phase1_checkpoint: auto
+# Explicit pin: registry "best by eval/loss" for phase1_falcon_l0 still
+# resolves to the pre-rebuild step2000 (older training run with stale eval
+# numbers), but the L0 cache was precomputed against step10000 — autoresolve
+# would mismatch the cache_manifest and crash.
+phase1_checkpoint: /workspace/checkpoints/phase1_falcon_l0_step10000_20260521_071410
 
 model:
   decoder:
     family: falcon_h1
     backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
     hidden_dim: 512
+  # Falcon-specific anchor cap (matches Phase 1 Falcon configs). Without
+  # this, the encoder is built with the 7-anchor Qwen schedule and
+  # state_dict load fails with size mismatch on l{0,1}.threshold.anchor_*.
+  threshold_controller:
+    anchor_ratios: [0.02, 0.04, 0.08, 0.16, 0.32, 0.60]

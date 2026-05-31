@@ -237,9 +237,9 @@ class KRKBTrainer(BaseTrainer):
         value = self.step_cfg.get(key, None)
         if value:
             return Path(str(value))
-        from bgkit.env import DATA_DIR
+        from bgkit.env import get_data_dir
 
-        return Path(DATA_DIR) / default
+        return get_data_dir() / default
 
     # ------------------------------------------------------------------
     # setup()
@@ -332,6 +332,19 @@ class KRKBTrainer(BaseTrainer):
         self.tokenizer = AutoTokenizer.from_pretrained(
             decoder_name, trust_remote_code=True,
         )
+
+        # Falcon-H1's chat template has an off-by-one bug at the tool
+        # branch (closing <|im_end|> after </tool_response> skipped when
+        # followed by assistant). Without the patch, our trajectory
+        # builder's prefix-extension assertion in
+        # bgkit.data.bgkit_tool_template fires on the first browse turn.
+        from bgkit.data.chat_template import patch_falcon_h1_chat_template
+
+        if patch_falcon_h1_chat_template(self.tokenizer):
+            logger.info(
+                "falcon_chat_template_patched",
+                decoder_tokenizer=decoder_name,
+            )
 
         # --- Encoder ---
         self._load_encoder()
@@ -757,11 +770,19 @@ class KRKBTrainer(BaseTrainer):
             )
 
         encoder_cfg = self.cfg.model.get("encoder", {})
+        # Per-training-config override takes precedence so Falcon-family
+        # phases can cap anchors at 0.60 without forking model defaults.
+        step_model_cfg = self.step_cfg.get("model", {}) or {}
+        threshold_cfg = step_model_cfg.get(
+            "threshold_controller",
+            self.cfg.model.get("threshold_controller", {}),
+        )
         self.encoder = BgKITEncoder.from_pretrained_with_state_dict(
             encoder_cfg.get("backbone_name", "Qwen/Qwen3.5-0.8B-Base"),
             encoder_state,
             hidden_dim=int(encoder_cfg.get("hidden_dim", 1024)),
             active_decoder_family=getattr(self, "_decoder_family", "qwen35"),
+            threshold_controller_cfg=dict(threshold_cfg) if threshold_cfg else None,
         ).to(self.device)
 
     def _assert_vocab_alignment(self) -> None:
@@ -1216,7 +1237,11 @@ class KRKBTrainer(BaseTrainer):
         self.train_dataset, self.eval_dataset = random_split(
             full, [train_size, eval_size], generator=generator,
         )
-        batch_size = int(self.cfg.get("batch_size", 1))
+        # Per-phase batch_size override takes precedence over the global
+        # default in configs/config.yaml (which is sized for Phase 1).
+        batch_size = int(
+            self.step_cfg.get("batch_size", self.cfg.get("batch_size", 1))
+        )
         self.train_dataloader = DataLoader(
             self.train_dataset,
             batch_size=batch_size,
@@ -1293,9 +1318,11 @@ class KRKBTrainer(BaseTrainer):
                 return None
             # Truncate to a sensible probe length to bound backbone cost.
             ids = ids[:512]
-            token_ids = torch.tensor([ids], dtype=torch.long)
-            mask = torch.ones_like(token_ids, dtype=torch.bool)
-            return token_ids, mask
+            # Packed varlen format: flat (N,) tokens + cu_seqlens (B+1,) int32.
+            # Single-sample probe → cu_seqlens = [0, L].
+            token_ids = torch.tensor(ids, dtype=torch.long)
+            cu_seqlens = torch.tensor([0, len(ids)], dtype=torch.int32)
+            return token_ids, cu_seqlens
 
         for level in ("l0", "l1"):
             calibrated_t = calibrate_head_tanh_temperature(
@@ -1382,8 +1409,13 @@ class KRKBTrainer(BaseTrainer):
     # Activation-checkpointed encoder forward
     # ------------------------------------------------------------------
 
-    # Canonical positional argument order for a single LevelCompressor
-    # forward (encoder.l0 or encoder.l1).
+    # Canonical positional argument order + defaults for a single
+    # LevelCompressor forward (encoder.l0 or encoder.l1). When activation
+    # checkpointing is on we convert kwargs → positional and a bare
+    # ``kwargs.get(name)`` returns None for unset args, which overrides
+    # the function's intrinsic default (e.g. ``min_per_sample: int = 0``
+    # becomes None and crashes inside the head hook). Keep this in sync
+    # with LevelCompressor.forward().
     _LEVEL_ARG_ORDER = (
         "content_embeddings",
         "content_cu_seqlens",
@@ -1397,6 +1429,16 @@ class KRKBTrainer(BaseTrainer):
         "utility_grad_active",
         "utility_grad_capture",
     )
+    _LEVEL_ARG_DEFAULTS = {
+        "prompt_embeddings": None,
+        "prompt_cu_seqlens": None,
+        "prompt_position_ids": None,
+        "pinned_positions": None,
+        "target_ratio": None,
+        "min_per_sample": 0,
+        "utility_grad_active": False,
+        "utility_grad_capture": None,
+    }
 
     def _checkpointed_level(self, level: str, **kwargs):
         """Call ``self.encoder.{level}(**kwargs)`` with optional activation checkpointing.
@@ -1419,7 +1461,10 @@ class KRKBTrainer(BaseTrainer):
 
         from torch.utils.checkpoint import checkpoint
 
-        positional = tuple(kwargs.get(name) for name in self._LEVEL_ARG_ORDER)
+        positional = tuple(
+            kwargs.get(name, self._LEVEL_ARG_DEFAULTS.get(name))
+            for name in self._LEVEL_ARG_ORDER
+        )
         arg_names = self._LEVEL_ARG_ORDER
 
         def _forward(*args):
@@ -3331,10 +3376,38 @@ class KRKBTrainer(BaseTrainer):
         answer token F1 (macro over samples). The existing ``eval/loss``,
         ``eval/n_samples``, and ``eval/tokens_per_sample`` keys are
         preserved for backward compatibility.
+
+        When ``training.eval_ablation_modes`` is non-empty (e.g.
+        ``[zeroed, noise]``), runs additional eval passes with each
+        ablation mode applied and re-emits every metric under
+        ``eval/ablation/{mode}/...``. Headline ``eval/...`` keys always
+        reflect the no-ablation (``present``) pass. Each extra mode
+        roughly doubles eval wall-clock; sized by ``max_eval_samples``.
         """
-
         self.model.eval()
+        try:
+            metrics = self._eval_pass()
+            extra_modes = list(self.step_cfg.get("eval_ablation_modes", []) or [])
+            for mode in extra_modes:
+                mode_str = str(mode)
+                self.set_ablation_mode(mode_str)
+                try:
+                    sub = self._eval_pass()
+                finally:
+                    self.set_ablation_mode(None)
+                for k, v in sub.items():
+                    if k.startswith("eval/"):
+                        metrics[f"eval/ablation/{mode_str}/{k[len('eval/'):]}"] = v
+        finally:
+            self.model.train()
+        return metrics
 
+    def _eval_pass(self) -> dict[str, float]:
+        """Single pass over the eval dataloader. Assumes the model is
+        already in eval mode and any ablation_mode is set. Returns the
+        standard ``eval/...`` metrics dict for whatever ablation_mode is
+        currently active.
+        """
         total_loss_weighted = 0.0
         total_tokens = 0
         n_samples = 0
@@ -3394,7 +3467,6 @@ class KRKBTrainer(BaseTrainer):
                     kb_f1_sum += float(result["f1"])
                     kb_f1_n += 1
 
-        self.model.train()
         if total_tokens == 0:
             return {
                 "eval/loss": 0.0,
