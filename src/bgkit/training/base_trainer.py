@@ -194,6 +194,7 @@ class BaseTrainer(ABC):
         "max_batch_tokens_eval": "_handle_max_batch_tokens_eval",
         "min_sample_length": "_handle_min_sample_length",
         "max_sample_length": "_handle_max_sample_length",
+        "max_grad_norm": "_handle_max_grad_norm",
     }
 
     #: Steps between structured log messages. Override in subclass.
@@ -353,6 +354,52 @@ class BaseTrainer(ABC):
         """
         return []
 
+    def _detect_unified_memory(self) -> bool:
+        """True iff the CUDA device's reported total ~= system MemTotal.
+
+        On a unified-memory device (GB10 / DGX Spark) the GPU and host share
+        one physical pool. ``torch.cuda.mem_get_info()[0]`` then returns
+        Linux ``MemFree``, which is depressed by the kernel's page cache.
+        Reclaimable page-cache pages are NOT counted as "free" even though
+        the kernel will gladly evict them when CUDA asks. The correct
+        signal on unified memory is ``MemAvailable`` (free + reclaimable).
+        """
+        import torch as _t
+        if not _t.cuda.is_available():
+            return False
+        try:
+            cuda_total = _t.cuda.get_device_properties(0).total_memory
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        sys_total = int(line.split()[1]) * 1024
+                        break
+                else:
+                    return False
+            return cuda_total >= 0.8 * sys_total
+        except (OSError, ValueError, IndexError, AttributeError):
+            return False
+
+    def _get_free_gb_signal(self) -> float:
+        """Free-memory signal for the dynamic_ckpt scheduler.
+
+        Discrete GPU: ``torch.cuda.mem_get_info()[0]`` (VRAM free).
+        Unified memory: ``MemAvailable`` (system free + reclaimable cache),
+        because the kernel evicts page cache on demand for CUDA allocations,
+        so mmap pages do not actually contend for our budget.
+        """
+        import torch as _t
+        free_bytes, _ = _t.cuda.mem_get_info()
+        if getattr(self, "_unified_memory", False):
+            try:
+                with open("/proc/meminfo") as f:
+                    for line in f:
+                        if line.startswith("MemAvailable:"):
+                            return int(line.split()[1]) * 1024 / 1e9
+            except (OSError, ValueError, IndexError):
+                pass
+        return free_bytes / 1e9
+
     def _init_dynamic_ckpt_scheduler(self) -> None:
         """Resolve config + initialize per-step state for the memory-driven
         ckpt scheduler.
@@ -369,6 +416,7 @@ class BaseTrainer(ABC):
         compute_mem = self.cfg.compute.get("memory", {}) or {}
         compute_dyn = compute_mem.get("dynamic_ckpt", {}) or {}
         train_dyn = tcfg.get("dynamic_ckpt", {}) or {}
+        self._unified_memory = self._detect_unified_memory()
 
         def _get(key, default):
             v = train_dyn.get(key, None) if hasattr(train_dyn, "get") else None
@@ -433,7 +481,8 @@ class BaseTrainer(ABC):
                 "dynamic_ckpt_scheduler_armed",
                 mode=self._ckpt_mode,
                 managed=[label for label, _ in self._dyn_ckpt_models],
-                signal="cuda_free_gb",
+                signal="mem_available_gb" if self._unified_memory else "cuda_free_gb",
+                unified_memory=self._unified_memory,
                 flush_when_free_below_gb=self._dyn_flush_when_free_below,
                 flush_min_slack_gb=self._dyn_flush_min_slack,
                 megatron_upshift_when_free_below_gb=self._dyn_megatron_upshift_when_free_below,
@@ -469,14 +518,15 @@ class BaseTrainer(ABC):
         import torch as _t
         if not _t.cuda.is_available():
             return
-        free_bytes, _total_bytes = _t.cuda.mem_get_info()
         # CRITICAL: ``free_pre`` is the actual memory pressure before any
         # rescue. Use this for ALL mode-flip decisions. Using post-flush
-        # free would hide the pressure (flush rescues to ~113 GB free, mode
-        # flip then sees no problem, scheduler stays in off-mode forever
-        # while flush keeps rescuing every step). Pre-flush free reveals
-        # the true working-set demand.
-        free_pre_gb = free_bytes / 1e9
+        # free would hide the pressure (flush rescues, mode flip then sees
+        # no problem, scheduler stays in off-mode forever while flush keeps
+        # rescuing every step). Pre-flush free reveals the true working-set
+        # demand. ``_get_free_gb_signal`` returns MemAvailable on unified
+        # memory so reclaimable page cache (mmap data files) doesn't fake
+        # pressure that isn't there.
+        free_pre_gb = self._get_free_gb_signal()
 
         # Tier 1: adaptive cache flush. Slack-driven, cooldown-free.
         if free_pre_gb < self._dyn_flush_when_free_below:
@@ -486,7 +536,7 @@ class BaseTrainer(ABC):
             if slack_gb >= self._dyn_flush_min_slack:
                 _t.cuda.empty_cache()
                 self._last_cache_clear_step = step
-                new_free_gb = _t.cuda.mem_get_info()[0] / 1e9
+                new_free_gb = self._get_free_gb_signal()
                 logger.info(
                     "cuda_cache_cleared_adaptive",
                     step=step,
@@ -778,7 +828,10 @@ class BaseTrainer(ABC):
             k: v.item() if hasattr(v, "item") else v
             for k, v in self._forward_backward(batch).items()
         }
-        grad_norm = clip_grad_norm(self.trainable_parameters())
+        grad_norm = clip_grad_norm(
+            self.trainable_parameters(),
+            max_norm=getattr(self, "_max_grad_norm", 1.0),
+        )
         if not math.isfinite(grad_norm):
             raise RuntimeError(
                 f"NaN/Inf grad_norm in train_step (grad_norm={grad_norm}). "
@@ -1640,6 +1693,39 @@ class BaseTrainer(ABC):
             return int(explicit)
         return 2 * int(max_batch_tokens)
 
+    def _handle_max_grad_norm(self, val) -> None:
+        """Live-config handler for ``max_grad_norm``.
+
+        Validates the value and updates ``_max_grad_norm``. Takes effect
+        immediately on the next optimizer step via ``clip_grad_norm`` (no
+        rebuild needed).
+        """
+        try:
+            new_val = float(val)
+        except (TypeError, ValueError):
+            logger.warning(
+                "live_max_grad_norm_invalid",
+                value=val,
+                expected="positive float",
+            )
+            return
+        if not (new_val > 0) or new_val != new_val:  # rejects 0, negatives, NaN
+            logger.warning(
+                "live_max_grad_norm_invalid",
+                value=val,
+                expected="positive float",
+            )
+            return
+        old = getattr(self, "_max_grad_norm", 1.0)
+        if old == new_val:
+            return
+        self._max_grad_norm = new_val
+        logger.info(
+            "live_max_grad_norm_update",
+            old=float(old),
+            new=new_val,
+        )
+
     def _handle_max_batch_tokens(self, val) -> None:
         """Live-config handler for ``max_batch_tokens``.
 
@@ -2310,6 +2396,12 @@ class BaseTrainer(ABC):
             tcfg.get("gradient_accumulation_steps", 1)
         )
         self._accum_steps = accum_steps
+        # Per-phase override for gradient clipping. Default 1.0 preserves
+        # historical behavior. Phases that rely on large-magnitude
+        # auxiliary losses (e.g. symmetric forced-survivor BCE in
+        # phase1_falcon_l0) need a higher cap so the auxiliary gradient
+        # direction survives clipping.
+        self._max_grad_norm = float(tcfg.get("max_grad_norm", 1.0))
 
         # Resume warmup: optional linear ramp from near-zero to scheduled LR
         # over N steps after a resume. DEFAULT 0 (disabled) — the by-name
@@ -2436,7 +2528,10 @@ class BaseTrainer(ABC):
                         micro_metrics = self._forward_backward(batch)
                         accum_metrics.append(micro_metrics)
 
-                    grad_norm = clip_grad_norm(self.trainable_parameters())
+                    grad_norm = clip_grad_norm(
+                        self.trainable_parameters(),
+                        max_norm=self._max_grad_norm,
+                    )
 
                     if not math.isfinite(grad_norm):
                         raise RuntimeError(
