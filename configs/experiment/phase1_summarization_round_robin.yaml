@@ -1,0 +1,16 @@
+# @package _global_
+defaults:
+  - /config
+  - /training/phase1_summarization_round_robin
+  - _self_
+
+run_name: phase1_summarization_round_robin
+
+# Merged warmstart: encoder + both projection_blocks + both decoders.
+# Build it with:
+#   .venv/bin/python3 scripts/build_dual_decoder_warmstart.py \
+#     --encoder-source        <latest qwen realign ckpt> \
+#     --decoder-qwen-source   <same qwen realign ckpt> \
+#     --decoder-falcon-source <latest falcon-l0 ckpt> \
+#     --output phase1_summarization_warmstart_<date>
+step1_checkpoint: /workspace/checkpoints/phase1_summarization_warmstart_20260605

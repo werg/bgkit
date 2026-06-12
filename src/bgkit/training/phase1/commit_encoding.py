@@ -58,6 +58,7 @@ from bgkit.models.projection_block import effective_projection_cu
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
+from bgkit.training.compression_curriculum import CompressionCurriculumMixin
 from bgkit.training.gradient_utils import (
     configure_decoder_layerwise_split,
     maybe_enable_decoder_gradient_checkpointing,
@@ -78,7 +79,7 @@ from bgkit.utils.packing import position_ids_from_cu
 logger = structlog.get_logger()
 
 
-class CommitEncodingTrainer(BaseTrainer):
+class CommitEncodingTrainer(CompressionCurriculumMixin, BaseTrainer):
     """Step 5: commit encoding with split-L0/L1 + L0-freeze curriculum."""
 
     LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {
@@ -1531,28 +1532,8 @@ class CommitEncodingTrainer(BaseTrainer):
 
     def _post_step(self, step: int) -> None:
         self.encoder.step_bidi_warmup()
-
-        from bgkit.training.survivorship_helpers import (
-            apply_post_step_updates,
-            init_state,
-            maybe_unload_ice,
-        )
-
-        merged: dict[str, float] = {}
-        for level, state_attr in (("l0", "_surv_state_l0"), ("l1", "_surv_state_l1")):
-            state = getattr(self, state_attr, None)
-            if state is None:
-                continue
-            update_metrics = apply_post_step_updates(
-                self.encoder,
-                state,
-                target_ratio=None,
-                level=level,
-            )
-            merged.update(update_metrics)
-            setattr(self, state_attr, init_state())
-
-        self._last_post_step_metrics = merged
+        self._run_dual_ascent(step)  # CompressionCurriculumMixin (L0 + L1)
+        from bgkit.training.survivorship_helpers import maybe_unload_ice
         unloaded = maybe_unload_ice(
             getattr(self, "_ice_teacher", None),
             step,
@@ -1564,10 +1545,7 @@ class CommitEncodingTrainer(BaseTrainer):
     def _add_step_metrics(self, metrics: dict[str, float]) -> None:
         if self._last_sampled_target_ratio is not None:
             metrics.setdefault("sampled_target_ratio", self._last_sampled_target_ratio)
-        post = getattr(self, "_last_post_step_metrics", None)
-        if post:
-            for k, v in post.items():
-                metrics.setdefault(k, v)
+        self._inject_survivorship_metrics(metrics)  # CompressionCurriculumMixin
         # Always log curriculum state for observability.
         ratio_l0, ratio_l1, _, _, _ = self._curriculum_state(int(self.global_step))
         metrics.setdefault("curriculum_target_ratio_l0", ratio_l0)

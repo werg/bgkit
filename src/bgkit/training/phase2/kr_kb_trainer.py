@@ -60,6 +60,7 @@ from bgkit.models.lora_encoder import (
 from bgkit.models.projection_block import effective_projection_cu
 from bgkit.models.topic_embeddings import TopicEmbeddingModule
 from bgkit.training.base_trainer import BaseTrainer
+from bgkit.training.compression_curriculum import CompressionCurriculumMixin
 from bgkit.training.ratio_sampling import (
     build_ratio_sampler_config,
     resolve_anchor_grid,
@@ -144,7 +145,7 @@ class _KBDecodeTrace:
     bgkit_call_spans: list[tuple[int, int]]
 
 
-class KRKBTrainer(BaseTrainer):
+class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     """Knowledge-retrieval KB-scale trainer.
 
     Config schema under ``training``::
@@ -3268,13 +3269,9 @@ class KRKBTrainer(BaseTrainer):
         Stage A: live L0 → update both L0 and L1.
         Stage B: cached L0 with L0 LoRA frozen → skip L0 updates.
         """
-        # Accumulate pending L0/L1 outputs into per-level state, then apply.
-        from bgkit.training.survivorship_helpers import (
-            accumulate,
-            apply_post_step_updates,
-            init_state,
-            maybe_unload_ice,
-        )
+        # Accumulate pending L0/L1 outputs into per-level state, then apply
+        # via the shared dual-ascent dispatch (CompressionCurriculumMixin).
+        from bgkit.training.survivorship_helpers import accumulate, maybe_unload_ice
 
         # L0 target: per-microbatch ratios differ by dataset. Weight each
         # microbatch by its controllable_count so θ targets the true
@@ -3319,29 +3316,12 @@ class KRKBTrainer(BaseTrainer):
         else:
             target_l1 = float(self._l1_retention)
 
-        merged: dict[str, float] = {}
-        # L0 update: skip if Stage B (cached L0, L0 frozen).
-        l0_metrics = apply_post_step_updates(
-            self.encoder,
-            self._surv_state_l0,
-            target_ratio=target_l0,
-            level="l0",
-            skip_threshold_step=not self._live_l0,
+        # L0 update skipped at Stage B (cached L0, L0 frozen); L1 always updates.
+        self._run_dual_ascent(
+            step,
+            target_ratios={"l0": target_l0, "l1": target_l1},
+            skip_levels=() if self._live_l0 else ("l0",),
         )
-        merged.update(l0_metrics)
-        self._surv_state_l0 = init_state()
-
-        # L1 always updates.
-        l1_metrics = apply_post_step_updates(
-            self.encoder,
-            self._surv_state_l1,
-            target_ratio=target_l1,
-            level="l1",
-        )
-        merged.update(l1_metrics)
-        self._surv_state_l1 = init_state()
-
-        self._last_post_step_metrics = merged
 
         unloaded = maybe_unload_ice(
             getattr(self, "_ice_teacher", None),
@@ -3353,6 +3333,7 @@ class KRKBTrainer(BaseTrainer):
 
     def _add_step_metrics(self, metrics: dict[str, float]) -> None:
         """Attach post-step θ/μ updates (without clobbering base keys)."""
+        self._inject_survivorship_metrics(metrics)  # CompressionCurriculumMixin
         post = getattr(self, "_last_post_step_metrics", None)
         if post:
             for k, v in post.items():

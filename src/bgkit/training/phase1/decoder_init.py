@@ -35,6 +35,7 @@ from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
+from bgkit.training.compression_curriculum import CompressionCurriculumMixin
 from bgkit.training.gradient_utils import (
     configure_decoder_layerwise_split,
     maybe_enable_decoder_gradient_checkpointing,
@@ -130,7 +131,7 @@ class _InterleavingIterator:
         return batch
 
 
-class DecoderInitTrainer(BaseTrainer):
+class DecoderInitTrainer(CompressionCurriculumMixin, BaseTrainer):
     """Step 1: Decoder init with encoder unfreeze + compression curriculum."""
 
     LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {
@@ -1865,23 +1866,10 @@ class DecoderInitTrainer(BaseTrainer):
             self.encoder.step_bidi_warmup()
 
         if self._compression_active and not self._encoder_frozen:
-            from bgkit.training.survivorship_helpers import (
-                apply_post_step_updates,
-                init_state,
-                maybe_unload_ice,
-            )
+            from bgkit.training.survivorship_helpers import maybe_unload_ice
 
-            state_l0 = getattr(self, "_surv_state_l0", None)
-            if state_l0 is not None:
-                update_metrics = apply_post_step_updates(
-                    self.encoder,
-                    state_l0,
-                    target_ratio=None,
-                    level="l0",
-                )
-                self._last_post_step_metrics = update_metrics
-                # Reset the L0 state for the next optimizer step.
-                self._surv_state_l0 = init_state()
+            # Dual-ascent θ (L0-only at this step) via CompressionCurriculumMixin.
+            self._run_dual_ascent(step, levels=("l0",))
 
             # Unload ICE once warmup ends across all levels (idempotent).
             unloaded = maybe_unload_ice(
@@ -1902,11 +1890,7 @@ class DecoderInitTrainer(BaseTrainer):
             metrics["target_ratio"] = self._current_target_ratio()
         if self._last_sampled_target_ratio is not None:
             metrics["sampled_target_ratio"] = self._last_sampled_target_ratio
-        post = getattr(self, "_last_post_step_metrics", None)
-        if post is not None:
-            # Merge without clobbering base metrics (grad_norm, loss, etc).
-            for k, v in post.items():
-                metrics.setdefault(k, v)
+        self._inject_survivorship_metrics(metrics)  # CompressionCurriculumMixin
 
     def _get_bidi_alpha(self) -> float:
         """Get the current bidirectional warmup alpha from the encoder."""

@@ -1032,9 +1032,20 @@ class CompressionDataset(Dataset):
 
         variant_banks: dict[str, list] = {}
         variant_dir = getattr(cfg, "prompt_variants_dir", None)
+        # Per-objective override map: data.variant_bank_overrides:
+        #   file_read_repro: document_verbatim_repro
+        # tells the file_read_repro objective to load
+        # ``document_verbatim_repro.json`` instead of ``file_read_repro.json``.
+        # Use this when the corpus is prose (FineWeb-Edu) and the default
+        # code-framed file_read prompts ("You are an AI coding assistant
+        # with access to bgkit_read_file") would feed wildly off-distribution
+        # framing to the decoder. The override file must live in the same
+        # ``prompt_variants_dir`` and follow the same per-variant schema
+        # (system_prompt, user_prompt, compression_prompt, response_prefix).
+        variant_bank_overrides = dict(getattr(cfg, "variant_bank_overrides", {}) or {})
         if variant_dir and Path(variant_dir).is_dir():
             p = Path(variant_dir)
-            bank_candidates = {
+            default_files = {
                 "file_read_repro": ["file_read_repro.json"],
                 "description_gen": ["description_gen.json"],
                 "structural_repro": ["structural_repro.json"],
@@ -1042,6 +1053,15 @@ class CompressionDataset(Dataset):
                 # that file as an alias when the step-5-specific name is absent.
                 "commit_repro": ["commit_repro.json", "commit_encoding.json"],
             }
+            bank_candidates: dict[str, list[str]] = {}
+            for obj_key, defaults in default_files.items():
+                override = variant_bank_overrides.get(obj_key)
+                if override:
+                    # Prepend the override file (with .json appended if absent).
+                    fn = override if str(override).endswith(".json") else f"{override}.json"
+                    bank_candidates[obj_key] = [fn, *defaults]
+                else:
+                    bank_candidates[obj_key] = defaults
             for obj_key, candidates in bank_candidates.items():
                 bank = None
                 for candidate in candidates:

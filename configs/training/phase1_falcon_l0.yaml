@@ -140,5 +140,20 @@ model:
   # keep-rate spikes whenever the curriculum interpolation reached
   # them. Migration of legacy 7-anchor checkpoints is automatic via
   # ``remap_threshold_controller_state`` in ``_restore_model_state``.
+  #
+  # Other fields mirror configs/model/survivorship_head.yaml because a
+  # per-training-config ``threshold_controller`` block REPLACES the
+  # global (not merges). Diagnosed 2026-06-01 after eval breakdowns at
+  # step 47000 and 65000: anchors not visited by the window-above
+  # sampler (0.02/0.04/0.08) stayed frozen at l0_align warm-start
+  # thetas. ``kernel_bandwidth: 0.5`` spreads each in-band dual-ascent
+  # update across all anchors weighted by distance, so anchors below
+  # the active operating point continue to train as the curriculum
+  # descends.
   threshold_controller:
     anchor_ratios: [0.02, 0.04, 0.08, 0.16, 0.32, 0.60]
+    ratio_space: log
+    lr: 0.05
+    momentum: 0.0
+    clamp: 1.5
+    kernel_bandwidth: 0.5

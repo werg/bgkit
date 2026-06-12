@@ -1,0 +1,53 @@
+# @package _global_
+# Decisive comparison: realign trainer + Step 6's PAIRED encoder+decoder
+# (no warmstart merge) + Step 6's native processed_v2 data.
+#
+# Tests the hypothesis that the realign plateau at 4.40 — even on
+# processed_v2 — is caused by the warmstart's broken encoder/decoder
+# pairing, NOT by the trainer, the data, or the decoder alone.
+#
+# Expected if hypothesis correct: loss drops fast toward Step 6's
+# multi-objective baseline 0.85 (or further on this single-objective
+# data_reconstruction task — Step 3 reached 0.20).
+# If this also plateaus at 4.4: encoder pairing isn't the issue and we
+# need to look elsewhere.
+defaults:
+  - /config
+  - /training/phase1_qwen_realign
+  - _self_
+
+run_name: phase1_qwen_realign_paired_baseline
+
+# Step 6's most-trained ckpt — encoder + decoder + projection +
+# threshold + optimizer state, all co-trained. Encoder uses legacy
+# single projection_block.* which BgKITEncoder auto-migrates to
+# projection_blocks.qwen35.*; decoder.pt is LoRA-wrapped Qwen,
+# decoder_merged.pt is the canonical 321-key non-LoRA snapshot
+# (compression.py pops decoder_merged first).
+step1_checkpoint: /workspace/checkpoints/phase1_step6_step1643_20260510_080636
+
+training:
+  # Unique phase so auto-resume can't pick up unrelated ckpts and
+  # silently try to load LoRA decoder.pt into the non-LoRA realign
+  # decoder (compression.py:3318 bug — task #28).
+  phase: phase1_qwen_realign_paired_baseline
+  # Match Step 6's data
+  data:
+    file_tokens_path: ${oc.env:DATA_DIR}/processed_v2/tokens
+    falcon_companion_dir: ${oc.env:DATA_DIR}/processed_v2/tokens_falcon_h1
+  # Keep realign curriculum so we can compare like-for-like vs the
+  # main realign run (0.55→0.10 ramp). Step 6 itself ran at fixed 0.10;
+  # if THIS run plateaus too, the curriculum at high ratios is a
+  # contributor independent of pairing.
+
+model:
+  decoder:
+    family: qwen35
+    backbone_name: Qwen/Qwen3.5-0.8B
+
+# Code data → use original code-framed variant bank (no prose override).
+data:
+  prompt_variants_dir: configs/prompt_variants
+  variant_bank_overrides: {}
+  tokens:
+    max_seq_len: 8192

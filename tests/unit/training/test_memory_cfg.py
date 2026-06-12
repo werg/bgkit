@@ -173,3 +173,43 @@ def test_memory_cfg_legacy_memory_budget_maps_to_scope_budgets():
     assert t._scope_cap("evaluate") == 40.0
     assert t._scope_cap("gen_eval") == 55.0
     assert t._scope_cap("save_checkpoint") is None
+
+
+def test_prefetcher_restages_after_external_release_no_false_stop():
+    """Regression: dropping the staged batch (memory-budget scope) must NOT
+    look like end-of-epoch. ``_DevicePrefetcher`` re-prefetches lazily on the
+    next ``__next__`` and only raises StopIteration on genuine exhaustion.
+
+    The 2026-06-10 post-save loss spike: ``_release_training_transients`` set
+    ``_next_batch = None`` before each save/eval scope; the prefetcher then
+    raised StopIteration, the train loop rolled the epoch over, and the
+    ``sort_samples_ascending`` dataloader jumped back to its smallest samples
+    (survivor collapse + loss 0.7 -> 3.7) on EVERY save/eval.
+    """
+    from bgkit.training.base_trainer import _DevicePrefetcher
+
+    class _Dev:
+        type = "cpu"
+
+    data = [{"x": i} for i in range(4)]
+    pf = _DevicePrefetcher(iter(data), _Dev())
+
+    # Consume one batch normally. The prefetcher has now staged {"x": 1}.
+    assert next(pf) == {"x": 0}
+
+    # Simulate _release_training_transients dropping the staged batch.
+    # This discards the already-staged {"x": 1} (its device memory is what we
+    # free for the scope) — the documented "one extra transfer" cost.
+    pf._next_batch = None
+    assert pf._exhausted is False
+
+    # Next() must re-stage and continue the epoch, NOT raise StopIteration.
+    # One microbatch ({"x": 1}) is skipped — negligible vs. a full-epoch reset.
+    assert next(pf) == {"x": 2}
+    assert next(pf) == {"x": 3}
+
+    # Genuine exhaustion still raises.
+    import pytest
+
+    with pytest.raises(StopIteration):
+        next(pf)

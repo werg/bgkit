@@ -101,6 +101,37 @@ def _raw_gate_in_kernel_enabled() -> bool:
     }
 
 
+# Diagnostic: dump the exact chunk_gated_delta_rule inputs for large multi-segment
+# batches so the sm_121 deadlock can be replayed in isolation. Enabled by setting
+# BGKIT_DUMP_DELTANET=<dir>; only dumps calls with > BGKIT_DUMP_DELTANET_MIN_NSEG
+# segments (default 8). One file per call: dn_dump_<NNN>.pt.
+_DN_DUMP_COUNTER = [0]
+
+
+def _maybe_dump_deltanet_call(args: tuple, kwargs: dict) -> None:
+    dump_dir = os.environ.get("BGKIT_DUMP_DELTANET")
+    if not dump_dir:
+        return
+    cu = kwargs.get("cu_seqlens")
+    if not isinstance(cu, torch.Tensor):
+        return
+    min_nseg = int(os.environ.get("BGKIT_DUMP_DELTANET_MIN_NSEG", "8"))
+    if (cu.numel() - 1) <= min_nseg:
+        return
+    import os.path as _osp
+
+    def _cpu(x):
+        return x.detach().cpu() if isinstance(x, torch.Tensor) else x
+
+    payload = {
+        "args": [_cpu(a) for a in args],
+        "kwargs": {k: _cpu(v) for k, v in kwargs.items()},
+    }
+    n = _DN_DUMP_COUNTER[0]
+    _DN_DUMP_COUNTER[0] += 1
+    torch.save(payload, _osp.join(dump_dir, f"dn_dump_{n:03d}.pt"))
+
+
 def _ensure_raw_gate_stash(layer: nn.Module) -> None:
     """Stash raw a-projection outputs so packed GDR can compute gates in-kernel."""
 
@@ -191,6 +222,7 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
         elif "g" in kwargs:
             kwargs["g"] = kwargs["g"].clamp(min=g_clamp_min)
         # cu_seqlens injected by _packed_forward below; pass straight through.
+        _maybe_dump_deltanet_call(args, kwargs)
         return original_fn(*args, **kwargs)
 
     layer.chunk_gated_delta_rule = _clamped
@@ -246,6 +278,21 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
             cu_seqlens, context_position_ids = current_deltanet_packed_context()
             if position_ids is None:
                 position_ids = context_position_ids
+
+        if os.environ.get("BGKIT_DEBUG_DELTANET"):
+            if isinstance(cu_seqlens, torch.Tensor):
+                _segs = (cu_seqlens[1:] - cu_seqlens[:-1])
+                _cl = (
+                    f"nseg={cu_seqlens.numel() - 1} last={int(cu_seqlens[-1])} "
+                    f"min_seg={int(_segs.min())} max_seg={int(_segs.max())} "
+                    f"dtype={cu_seqlens.dtype}"
+                )
+            else:
+                _cl = "None"
+            print(
+                f"[dndbg] hs={tuple(hidden_states.shape)} cu_seqlens[{_cl}]",
+                flush=True,
+            )
 
         if _raw_gate_in_kernel_enabled():
             _ensure_raw_gate_stash(layer)

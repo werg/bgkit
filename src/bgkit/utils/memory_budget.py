@@ -70,6 +70,20 @@ import structlog
 
 logger = structlog.get_logger()
 
+# Only flush the CUDA caching allocator (``empty_cache()``) at scope
+# boundaries when free device memory has dropped below this many GB.
+# Rationale: ``empty_cache()`` returns reserved-but-unused blocks to the
+# driver via ``cudaFree``, which on sm_121 can deadlock the *next* FLA
+# Gated-DeltaNet kernel launch (TMA / global_scratch interaction) — the
+# root cause of the phase1_summarization_round_robin checkpoint-boundary
+# crash-loop diagnosed 2026-06-07. When there is ample headroom the flush
+# buys nothing (the next phase reuses the reserved cache) and only risks
+# the deadlock, so we skip it. Under genuine pressure the flush still
+# fires, matching ``memory.dynamic_ckpt.flush_when_free_below_gb`` (20 GB).
+# ``gc.collect()`` is unconditional — it is cheap and never triggers the
+# allocator hazard. Override via ``BGKIT_RECLAIM_FLUSH_FREE_GB``.
+_RECLAIM_FLUSH_FREE_GB = float(os.environ.get("BGKIT_RECLAIM_FLUSH_FREE_GB", "20"))
+
 
 def collect_memory_diagnostics() -> dict[str, float]:
     """Collect memory-usage metrics for leak/fragmentation diagnosis.
@@ -158,11 +172,24 @@ def _reclaim() -> None:
     returns reserved-but-unused CUDA blocks to the pool.  On unified
     memory those reserved blocks are physical pages that the next
     phase cannot otherwise see.
+
+    ``empty_cache()`` is gated on real memory pressure
+    (``_RECLAIM_FLUSH_FREE_GB``): flushing the allocator when there is
+    ample free memory provides no benefit and can deadlock the next FLA
+    DeltaNet kernel launch on sm_121. ``gc.collect()`` always runs.
     """
     import torch
 
     gc.collect()
-    if torch.cuda.is_available():
+    if not torch.cuda.is_available():
+        return
+    try:
+        free_gb = torch.cuda.mem_get_info()[0] / 1e9
+    except Exception:
+        # mem_get_info can fail without an initialized context; fall back
+        # to the original unconditional flush rather than skip silently.
+        free_gb = 0.0
+    if free_gb < _RECLAIM_FLUSH_FREE_GB:
         torch.cuda.empty_cache()
 
 

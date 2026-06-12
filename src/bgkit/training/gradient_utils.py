@@ -104,6 +104,62 @@ def _megatron_checkpoint_func(forward, *args, **kwargs):
     )
 
 
+def _no_determinism_checkpoint_func(forward, *args, **kwargs):
+    """Like HF's default ``partial(checkpoint, use_reentrant=False)`` but skips
+    the saved-tensor-COUNT determinism assertion.
+
+    The Qwen3.5 packed decoder fails the default check with e.g.
+    ``CheckpointError: 58 vs 56 saved tensors``: its FLA Gated-DeltaNet custom
+    autograd Function conditionally ``save_for_backward``s cu_seqlens /
+    chunk_indices bookkeeping tensors on the packed path, so the recompute saves
+    a different *count* than the original forward. That count delta is a FALSE
+    POSITIVE — the DeltaNet output is a pure function of (inputs, cu_seqlens),
+    both of which are identical on recompute (``deltanet_packed_context`` is
+    still active), so the recomputed activations and gradients are numerically
+    identical. ``use_reentrant=True`` is not an option here because the HF layer
+    is invoked with kwargs, which reentrant checkpointing cannot carry. Skipping
+    ONLY the count check (not the recompute) unblocks decoder gradient
+    checkpointing while keeping gradients correct. Decoder-only — the encoder
+    path keeps the default check.
+    """
+    return checkpoint(
+        forward, *args, use_reentrant=False, determinism_check="none", **kwargs,
+    )
+
+
+def _reentrant_checkpoint_func(forward, *args, **kwargs):
+    """REENTRANT checkpoint — re-runs ``forward`` in backward instead of
+    comparing saved-tensor COUNTS between original and recompute.
+
+    This is the fix for the decoder ``CheckpointError: A different number of
+    tensors was saved during the original forward and recomputation``. Both
+    decoder backbones recompute a custom autograd Function that
+    ``save_for_backward``s a *conditional* number of tensors — the Qwen3.5
+    packed FLA Gated-DeltaNet (cu_seqlens / chunk_indices) and the Falcon-H1
+    Mamba scan — so the non-reentrant checkpoint's hard count assertion trips
+    (``determinism_check="none"`` does NOT skip it; megatron selective-save
+    recomputes those ops too and trips it as well). Reentrant checkpointing
+    never compares counts, so it sidesteps the false positive while keeping
+    gradients correct.
+
+    Why kwargs are fine here (the old "reentrant can't carry kwargs" blocker):
+    HF v5's ``GradientCheckpointingLayer.__call__`` invokes this as
+    ``_gradient_checkpointing_func(partial(super().__call__, **layer_kwargs),
+    *args)`` — the layer's keyword inputs are already baked into ``forward``,
+    and only the positional tensor(s) (hidden_states) arrive in ``*args``, which
+    is exactly what reentrant supports. Any residual ``**kwargs`` are baked into
+    a closure; they carry no grad-requiring tensors (position_embeddings,
+    cu_seqlens, masks), so reentrant's "grad inputs must be positional" rule
+    holds.
+    """
+    if kwargs:
+        def _fn(*a):
+            return forward(*a, **kwargs)
+
+        return checkpoint(_fn, *args, use_reentrant=True)
+    return checkpoint(forward, *args, use_reentrant=True)
+
+
 def enable_gradient_checkpointing(model: nn.Module) -> None:
     """Enable gradient checkpointing on a model if supported.
 
@@ -671,13 +727,21 @@ def _enable_gradient_checkpointing_mode(
         return False
     enable_gradient_checkpointing(model)
     megatron_layers = 0
+    nodeterm_layers = 0
+    reentrant_layers = 0
     if requested == "megatron":
         megatron_layers = _install_megatron_checkpoint_func(model)
+    elif requested == "no_determinism":
+        nodeterm_layers = _install_no_determinism_checkpoint_func(model)
+    elif requested == "reentrant":
+        reentrant_layers = _install_reentrant_checkpoint_func(model)
     logger.info(
         "gradient_checkpointing_enabled",
         model=model.__class__.__name__,
         mode=requested,
         megatron_layers=megatron_layers,
+        nodeterm_layers=nodeterm_layers,
+        reentrant_layers=reentrant_layers,
     )
     return True
 
@@ -786,6 +850,10 @@ def _coerce_gradient_checkpointing_value(val: Any) -> bool | str:
         normalized = val.strip().lower()
         if normalized in {"megatron", "selective", "selective_ops", "selective_v2"}:
             return "megatron"
+        if normalized in {"no_determinism", "no_determinism_check", "nodeterm"}:
+            return "no_determinism"
+        if normalized in {"reentrant", "use_reentrant", "reentrant_checkpoint"}:
+            return "reentrant"
         if normalized in {"true", "1", "on", "yes"}:
             return True
         if normalized in {"false", "0", "off", "no"}:
@@ -875,6 +943,39 @@ def _install_megatron_checkpoint_func(model: nn.Module) -> int:
         if not getattr(module, "gradient_checkpointing", False):
             continue
         module._gradient_checkpointing_func = _megatron_checkpoint_func
+        swapped += 1
+    return swapped
+
+
+def _install_no_determinism_checkpoint_func(model: nn.Module) -> int:
+    """Replace each checkpointed layer's ``_gradient_checkpointing_func`` with
+    :func:`_no_determinism_checkpoint_func` (non-reentrant checkpoint that skips
+    the saved-tensor-count assertion). Unblocks decoder gradient checkpointing on
+    the Qwen3.5 packed path (see that function's docstring). Returns the count of
+    layers swapped."""
+    swapped = 0
+    for module in model.modules():
+        if not hasattr(module, "_gradient_checkpointing_func"):
+            continue
+        if not getattr(module, "gradient_checkpointing", False):
+            continue
+        module._gradient_checkpointing_func = _no_determinism_checkpoint_func
+        swapped += 1
+    return swapped
+
+
+def _install_reentrant_checkpoint_func(model: nn.Module) -> int:
+    """Replace each checkpointed layer's ``_gradient_checkpointing_func`` with
+    :func:`_reentrant_checkpoint_func` (reentrant checkpoint — no saved-tensor
+    count comparison). The fix for the decoder DeltaNet/Mamba CheckpointError.
+    Returns the count of layers swapped."""
+    swapped = 0
+    for module in model.modules():
+        if not hasattr(module, "_gradient_checkpointing_func"):
+            continue
+        if not getattr(module, "gradient_checkpointing", False):
+            continue
+        module._gradient_checkpointing_func = _reentrant_checkpoint_func
         swapped += 1
     return swapped
 

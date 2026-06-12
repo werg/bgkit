@@ -45,6 +45,27 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.projection_repair import ProjectionRepairTrainer
 
         return ProjectionRepairTrainer(cfg)
+    elif phase == "phase1_summarization_round_robin":
+        # Round-robin Qwen+Falcon decoder training on multi-doc
+        # summarization corpora. Loads both decoders simultaneously and
+        # alternates per microbatch, co-evolving encoder + both
+        # projection_blocks + both decoders. Carries the joint state
+        # forward to upcoming KR / distillation tasks.
+        from bgkit.training.phase1.summarization_round_robin import (
+            SummarizationRoundRobinTrainer,
+        )
+
+        return SummarizationRoundRobinTrainer(cfg)
+    elif phase == "phase1_qwen_projection_warmup":
+        # Distill a pre-Falcon Qwen-aligned encoder's projection into
+        # the current encoder's `projection_blocks.qwen35`, freezing
+        # everything else. Bridges Falcon-era backbone drift before a
+        # full Qwen realignment run.
+        from bgkit.training.phase1.qwen_projection_warmup import (
+            QwenProjectionWarmupTrainer,
+        )
+
+        return QwenProjectionWarmupTrainer(cfg)
     elif phase == "phase1_falcon_dense_seed":
         # Cache-based: the encoder is frozen and the forced-survivor mask is
         # fixed, so pre-projection survivor embeddings are deterministic and
@@ -100,9 +121,14 @@ def _create_trainer(cfg: DictConfig):
         return CommitEncodingTrainer(cfg)
     elif phase in (
         "phase1_step6",
+        "phase1_step6_diagnostic_fineweb",
+        "phase1_step6_diagnostic_olddata",
         "phase1_falcon_l0_align",
         "phase1_falcon_l0",
         "phase1_falcon_l1",
+        "phase1_qwen_realign",
+        "phase1_qwen_realign_olddata",
+        "phase1_qwen_realign_paired_baseline",
     ):
         # phase1_falcon_l0_align runs the CompressionTrainer at target_ratio=1.0
         # for end-to-end no-compression alignment; phase1_falcon_l0 is then the

@@ -20,7 +20,13 @@ x-gpu-common: &gpu-common
   # emergency checkpoint is lost. Raised to 180 s on 2026-04-21 after a
   # phase1_step3 stop at step ~4250 lost ~250 steps because the save
   # didn't finish before SIGKILL.
-  stop_grace_period: 180s
+  # 600s (was 180s): a graceful stop triggers an emergency checkpoint save, and
+  # checkpointing.save_checkpoint now fsyncs before returning. A large ckpt
+  # (summarization: ~15 GB / ~9 GB bf16) fsynced to the slow USB HDD
+  # (/mnt/external, ~27 MB/s) can exceed 180s, so docker SIGKILLs mid-fsync and
+  # the emergency save is lost (safe — atomic rename → falls back to the last
+  # periodic checkpoint — but wasteful). 600s lets it complete.
+  stop_grace_period: 600s
   # Auto-recover on crash: if training exits with a non-zero status (OOM,
   # CUDA error, kernel panic), Docker restarts the container. The trainer
   # always resumes from the latest registered checkpoint via
@@ -52,6 +58,11 @@ x-gpu-common: &gpu-common
     # static, ship-with-fork variant; this is the live, grow-during-training
     # variant. They coexist.)
     - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+    # NVMe fast checkpoint dir: trainers write checkpoints here (fast fsync, no
+    # spinning-disk dirty-page spike), then async-copy to the HDD archive
+    # (${CHECKPOINT_DIR}). Backed by a host bind-mount on NVMe (see volumes), so
+    # it survives container restarts and resume can prefer the NVMe copy.
+    - BGKIT_FAST_CHECKPOINT_DIR=/workspace/checkpoints_fast
     # Use shipped GB10 FLA configs before falling back to Triton autotune.
     # This keeps the conservative GDR h/dhu BV=16 defaults from adding
     # repeated autotune stalls on future training restarts.
@@ -149,14 +160,23 @@ x-gpu-common: &gpu-common
     # captures from being active when fla compiles new kernel variants.
     - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
     - TORCH_COMPILE_DISABLE=1
-    # TMA on sm_121: the original "broken on sm_121" defensive disable is
-    # stale per the 2026-04-21 fla fork review — fla 0.4.2 in Triton 3.6
-    # runs TMA fwd+bwd correctly on GB10. Re-enabled 2026-04-21 to
-    # reclaim the Blackwell bulk-async memory-transfer speedup on DeltaNet
-    # kernels (3 of 4 layers in Qwen3.5). If numerical / correctness drift
-    # appears in training, revert to FLA_USE_TMA=0 and document what
-    # triggered it. See docs/fla_fork_review_2026_04_21.md.
-    - FLA_USE_TMA=1
+    # TMA on sm_121: re-disabled 2026-06-07. It was re-enabled 2026-04-21
+    # for the Blackwell bulk-async speedup on DeltaNet (3 of 4 Qwen3.5
+    # layers), but it is the documented trigger the comment warned about:
+    # phase1_summarization_round_robin crash-looped because the FLA
+    # Gated-DeltaNet forward kernel (chunk_gated_delta_rule_fwd_kernel_h_
+    # blockdim64) DEADLOCKS on its first launch after the CUDA caching
+    # allocator is flushed (empty_cache at a checkpoint/eval boundary) —
+    # 6 of 7 watchdog hard-exits, ~every 6 h. The step watchdog catches it
+    # at 300 s and restarts, so it limped forward but lost ~8 min/cycle and
+    # left wandb looking dead. TMA-off removes the deadlock surface; the
+    # global_scratch allocator (the NullAllocator-deadlock fix, see the
+    # fla mount comment below) stays registered with TMA off, so we keep
+    # that protection. Perf cost: loses the bulk-async DeltaNet transfer
+    # speedup. Re-enable to A/B once the FLA fork handles empty_cache +
+    # TMA descriptors safely on sm_121. See docs/fla_fork_review_2026_04_21.md
+    # and the 2026-06-07 checkpoint-boundary hang diagnosis.
+    - FLA_USE_TMA=0
     # Build FlashAttention's native CUDA backend inside the container when the
     # mounted host checkout doesn't provide a container-compatible binary.
     - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=1
@@ -215,8 +235,21 @@ x-gpu-common: &gpu-common
     - /home/werg/bgkit-data-nvme/processed/commit_encoding:/workspace/data/processed/commit_encoding
     - /home/werg/bgkit-data-nvme/processed/commit_reproduction:/workspace/data/processed/commit_reproduction
     - /home/werg/bgkit-data-nvme/mmap/descriptions:/workspace/data/mmap/descriptions
+    # Summarization corpora (multi_news + arxiv) NVMe overlay (2026-06-08).
+    # phase1_summarization_round_robin streams these every step with
+    # num_workers; on the HDD they bottlenecked the ~37 s/step shared base and
+    # contended with the 15 GB checkpoint writes. Canonical copy stays on the
+    # HDD ${DATA_DIR}; these overlay only the training subpaths.
+    - /home/werg/bgkit-data-nvme/multi_news_v1/processed_qwen_target:/workspace/data/multi_news_v1/processed_qwen_target
+    - /home/werg/bgkit-data-nvme/multi_news_v1/processed:/workspace/data/multi_news_v1/processed
+    - /home/werg/bgkit-data-nvme/arxiv_v1/processed_qwen_target:/workspace/data/arxiv_v1/processed_qwen_target
+    - /home/werg/bgkit-data-nvme/arxiv_v1/processed:/workspace/data/arxiv_v1/processed
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
     - ${CHECKPOINT_DIR}:/workspace/checkpoints
+    # NVMe fast-checkpoint staging (host NVMe). Recent checkpoints land here
+    # first for fast saves; a background daemon archives them to the HDD
+    # (${CHECKPOINT_DIR}) and keeps only the last few here.
+    - /home/werg/bgkit-ckpt-fast:/workspace/checkpoints_fast
     # Source code — the ONLY way bgkit code enters the container.
     # Image has deps only; no bgkit in dist-packages.
     - ../src:/workspace/bgkit/src:ro
@@ -433,6 +466,73 @@ services:
   train-falcon-l1:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase1_falcon_l1"]
+
+  # Qwen3.5-0.8B realignment stage: catches the Qwen decoder up to the
+  # encoder state after a long Falcon-only training stretch. Resumes
+  # encoder + projection from the latest phase1_falcon_l0 checkpoint;
+  # Qwen decoder loads pristine from HF.
+  train-qwen-realign:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_qwen_realign"]
+
+  # Diagnostic: same realign trainer + warmstart, OLD data (processed/tokens).
+  # If this lands at low loss → realign's plateau is data-shift driven; if
+  # also high → trainer itself is broken. See configs/experiment/phase1_qwen_realign_olddata.yaml
+  train-qwen-realign-olddata:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_qwen_realign_olddata"]
+
+  # Diagnostic: ORIGINAL Step 6 trainer/config + Step 6 ckpt + NEW FineWeb
+  # data. Reveals data-shift cost vs encoder-pairing cost.
+  train-step6-diagnostic-fineweb:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step6_diagnostic_fineweb"]
+
+  # Final diagnostic: Step 6 trainer + Step 6 ckpt + OLD processed/tokens.
+  # Should reproduce ~0.85 baseline, proving ckpt+trainer aren't broken
+  # and the realign plateau on FineWeb is purely data-shift cost.
+  train-step6-diagnostic-olddata:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step6_diagnostic_olddata"]
+
+  # Decisive: realign trainer + Step 6's PAIRED encoder+decoder (no
+  # warmstart merge) + processed_v2 data. Tests whether the realign
+  # plateau at 4.40 is caused by the warmstart's broken encoder/decoder
+  # pairing — should descend fast toward Step 6's baseline if so.
+  train-qwen-realign-paired-baseline:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_qwen_realign_paired_baseline"]
+
+  train-qwen-projection-warmup:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_qwen_projection_warmup"]
+
+  # Round-robin Qwen+Falcon decoder summarization training.
+  # Both decoders loaded simultaneously; encoder + both projection_blocks
+  # + both decoders co-evolve under per-microbatch decoder routing.
+  # Override gpu-common's 80g mem_limit to 115g — two decoders + two-level
+  # encoder + Muon optimizer state pushes past 80g even at small batches.
+  # ALSO set BGKIT_CUDA_MEM_FRACTION=0.85 in your shell env (or .env)
+  # before launching this service — the gpu-common template defaults to
+  # 0.65 (== ~79 GB cap on 121 GB Spark) which is too low here.
+  train-summarization-round-robin:
+    <<: *gpu-common
+    # 111g (was 115g): reserve ~10g of the 121g unified pool for the host so a
+    # container memory spike triggers cgroup-local reclaim of its own ~26g of
+    # reclaimable mmap page cache instead of a GLOBAL oom that kills user-session
+    # processes incl. the Claude harness (2026-06-09). The genuine training
+    # working set is only ~45g (16g CPU anon + 29g GPU); the trimmed 4g is
+    # reclaimable dataset page cache, so this costs ~0 training perf. NOTE: GPU
+    # allocations are only partially cgroup-charged, so this is partial
+    # protection — do NOT run a second GPU job in this container concurrently.
+    mem_limit: 111g
+    memswap_limit: 111g
+    # pin_memory=false: page-locked dataloader buffers can't be served from the
+    # ~49g reclaimable page cache, so they need truly-free RAM (~9g) and trigger
+    # global OOMs that killed the shell/Claude session (memory.events oom_kill,
+    # 2026-06-08). Plain pageable buffers let the kernel manage them against the
+    # cache. num_workers stays 6 (NVMe throughput); the pin was the culprit.
+    command: ["scripts/train.py", "+experiment=phase1_summarization_round_robin", "++compute.num_workers=6", "++compute.pin_memory=false"]
 
   # Docker-native Falcon-H1 kernel harness. This is the reusable check for
   # mamba-ssm fork overlays and attention fallback guards; override args by

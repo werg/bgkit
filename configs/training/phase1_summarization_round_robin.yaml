@@ -1,0 +1,167 @@
+phase: phase1_summarization_round_robin
+optimizer: muon
+muon_ns_steps: 1
+
+# Easy-start curriculum, lesson from the Qwen realign run: starting at
+# ratio 0.9 (~no compression) lets the decoders learn the new task
+# (summarization) under near-full context first. Ramp slowly toward
+# 0.10 over the run so compression tightens only after the decoders
+# have stable summarization behavior.
+max_steps: 30000
+lr: 3.0e-5
+warmup_steps: 500
+bidi_warmup_steps: 0
+max_batch_tokens: 500
+gradient_accumulation_steps: 32
+# 2026-06-10: raised 1024 -> 4096. arxiv papers average ~10.5k source tokens
+# across ~6.5 sections; at 1024 the encoder saw only ~10% of each paper (often a
+# truncated fragment of section 1) while the target is the whole-paper abstract —
+# a structural source/target mismatch that floored eval loss. 4096 covers ~40%
+# (intro -> start of methods). Not higher: the encoder's 6 full-attention layers
+# are O(L^2), so 8192 would be ~12x step time + decoder-OOM risk at high ratio.
+# Memory-safe via reentrant decoder GC + frac 0.85 clean-OOM ceiling.
+# 2026-06-11: raised 4096 -> 8192 (the original/default cap). At 4096 the Falcon
+# decoder re-adapted from ~680 to ~2700 survivors (loss 0.6), confirming it can
+# generalize across sizes. 8192 widens coverage to ~80% of the paper. Combined
+# with sort_samples_ascending=false (size mixing) to prevent re-overfitting to a
+# single survivor-count. cuda_max ~25GB at 4096; 8192 worst-case ~40GB << ceiling.
+max_total_source_tokens: 8192
+max_target_tokens: 256
+max_eval_samples: 500
+eval_every: 1000
+save_every: 2000
+# reset_wandb: start a fresh wandb run on resume instead of reattaching to the
+# prior run id stored in the checkpoint. Used once on 2026-06-10 (the prior run
+# meoxg5pn's predecessor oywxvoqm had a step pointer poisoned to ~11001 by a
+# pre-crash session, rejecting all post-resume logs as non-monotonic). Now false
+# so restarts resume the current run normally; flip to true for a one-shot reset.
+# (2026-06-10: was true for one restart to escape poisoned run 9grxqkzv after the
+# prefetcher-fix rollback; reverted once the clean run uq1luc2y / step-11600 save
+# landed, so auto-restarts now reattach to uq1luc2y instead of spawning new runs.)
+reset_wandb: false  # (2026-06-11: was one-shot true for the cross-section L1 fresh run een4tbbr; reverted after the step-13600 save recorded the new run id)
+max_grad_norm: 5.0
+gradient_checkpointing: true
+# Decoder gradient checkpointing: "megatron" (selective-save). REQUIRED for
+# memory: with it OFF, the decoder stores ALL activations, and at the relaxed
+# ratio (~0.67 -> ~760 survivors/group -> long decoder sequences) the Falcon-H1
+# decoder forward balloons to ~60 GB and OOMs (falcon_h1_patch.py:1129) — the
+# 2026-06-10 machine freezes. Plain `true` (HF default non-reentrant checkpoint)
+# fails on the Qwen3.5 packed FLA Gated-DeltaNet path with `CheckpointError:
+# 58 vs 56 saved tensors` (the custom autograd Function conditionally
+# save_for_backwards cu_seqlens/chunk_indices, so recompute saves a different
+# COUNT — a false positive). `determinism_check="none"` does NOT suppress that
+# count check. The encoder runs GC fine ONLY because it's the PRUNED backbone
+# (DeltaNet removed in Step 2) — no count-mismatching op. The decoders are full
+# Qwen3.5 (DeltaNet) + Falcon-H1 (Mamba), and BOTH custom autograd Functions trip
+# the count assertion under ANY non-reentrant checkpoint (`true`, "megatron",
+# "no_determinism" all fail). Fix = REENTRANT checkpointing: re-runs forward in
+# backward instead of comparing saved-tensor counts. HF v5 bakes layer kwargs
+# into the forward partial, so only hidden_states is positional — reentrant works
+# (the old "kwargs" blocker doesn't apply). See _reentrant_checkpoint_func.
+#
+# 2026-06-10: VERIFIED CORRECT by scripts/diag_decoder_gc.py — reentrant GC
+# gradients bit-match no-GC (max|grad_diff|=9.8e-4, identical to baseline
+# run-to-run kernel non-determinism; GC adds ZERO error) and the loss matches to
+# 5 decimals. So reentrant decoder GC is numerically correct AND bounds the
+# decoder activation memory that OOM'd the Falcon-H1 path (the machine freezes).
+# (The transient loss 0.8->3.7 seen in one run was NOT caused by GC — separate,
+# under observation: likely ascending sample-size ordering / accumulated resume
+# state.) Non-reentrant modes (true/megatron/no_determinism) still fail the
+# DeltaNet/Mamba saved-tensor COUNT check; reentrant sidesteps it.
+decoder_gradient_checkpointing: "reentrant"
+# Preserve the warmstart's threshold calibration; the realign run already
+# tuned it for these encoder activations.
+skip_head_temperature_calibration: true
+
+# Curriculum (live-tunable via ${CHECKPOINT_DIR}/control.json).
+# L0 + L1 compress in series; end-to-end ratio = ratio_l0 × ratio_l1.
+# Balanced split throughout: ratio_l0 = ratio_l1 = √(end_to_end_ratio).
+# Sweep:
+#   start: 0.949 × 0.949 ≈ 0.9 end-to-end (~10% compression — easy start)
+#   end:   0.316 × 0.316 ≈ 0.1 end-to-end (~10× compression)
+# Matches the Step 4.7 bridge-distill "frac_extras=0.31 / r=√teacher_ratio"
+# split principle: both levels carry equal share of the compression load.
+target_ratio_start: 0.949
+target_ratio_end: 0.316
+target_ratio_ramp_steps: 25000
+target_ratio_l1_start: 0.949
+target_ratio_l1_end: 0.316
+target_ratio_l1_ramp_steps: 25000
+# L1 active from step 0 so it co-trains all the way through.
+l1_introduction_step: 0
+
+# 2026-06-11: randomized (was true/smaller-first). Ascending order fed the
+# model one size at a time, which let the Falcon-H1 decoder OVERFIT to a single
+# survivor-count (~680 at the old 1024 cap); raising the cap then shocked it
+# (loss 18, grad_norm 3700) until it re-adapted. Randomized order interleaves
+# small (multi_news, ~hundreds of survivors) and large (arxiv, ~thousands) every
+# batch, forcing size-generalization. Memory is no longer a reason for small-
+# first (cuda_max ~25GB at 4096; worst-case 8192 sample ~40GB << 83GB ceiling).
+sort_samples_ascending: false
+
+# Round-robin routing. ``qwen_decoder_prob`` is P(decoder == qwen35) per
+# microbatch under random sampling. Set to 0.5 for strict alternation;
+# any other value triggers random sampling.
+# Default 0.3 biases toward Falcon (70% Falcon / 30% Qwen) — Falcon is
+# the lighter / more-trained decoder so it benefits from more steps and
+# the encoder evolves primarily in its direction, with Qwen kept fresh
+# via the 30%.
+qwen_decoder_prob: 0.3
+
+# Two decoders loaded simultaneously. Source weights come from the
+# merged warmstart ckpt (step1_checkpoint) by default; a per-family
+# `checkpoint:` override is allowed.
+decoder_qwen:
+  family: qwen35
+  backbone_name: Qwen/Qwen3.5-0.8B
+decoder_falcon:
+  family: falcon_h1
+  backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+
+# Closed-loop survivorship (CompressionCurriculumMixin). Dual-ascent θ (the
+# threshold_controller below) holds the aggregate keep-rate at the curriculum
+# target every optimizer step — this is the fix for the open-loop
+# over-compression regression. The min-survivors aux loss guards the per-sample
+# tail (zero/low-survivor samples). ratio_loss stays 0 (redundant with θ).
+survivorship:
+  l0:
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+  l1:
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+# Survivorship diagnostics force a GPU sync per emit; sample every 25 steps.
+diagnostic_metrics_every_n_steps: 25
+
+data:
+  prompt_variants_dir: configs/prompt_variants
+  # Parallel processed dirs, one per decoder family. Each family must
+  # cover the same dataset names with matching row counts (parallel
+  # tokenizations of the same source corpus).
+  # NOTE: pmc_oa_md (pubmed) currently has 0 group_id intersection
+  # between qwen-target and falcon-target tokenizations — likely a
+  # group-id-generation mismatch in process_summarization_corpus.py.
+  # Excluded for now; multi_news + arxiv give 953K parallel rows.
+  summarization_dirs:
+    qwen35:
+      multi_news: ${oc.env:DATA_DIR}/multi_news_v1/processed_qwen_target
+      arxiv_s2orc: ${oc.env:DATA_DIR}/arxiv_v1/processed_qwen_target
+    falcon_h1:
+      multi_news: ${oc.env:DATA_DIR}/multi_news_v1/processed
+      arxiv_s2orc: ${oc.env:DATA_DIR}/arxiv_v1/processed
+
+model:
+  # Threshold controller inherits from the warmstart's saved anchor grid
+  # at load time (see SummarizationRoundRobinTrainer.setup). The block
+  # below sets the lr / clamp / kernel_bandwidth for further dual-ascent
+  # updates during this run.
+  threshold_controller:
+    ratio_space: log
+    lr: 0.05
+    momentum: 0.0
+    clamp: 1.5
+    kernel_bandwidth: 0.5

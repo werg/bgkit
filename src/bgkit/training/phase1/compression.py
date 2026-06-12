@@ -35,6 +35,7 @@ from bgkit.models.projection_block import effective_projection_counts, effective
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
+from bgkit.training.compression_curriculum import CompressionCurriculumMixin
 from bgkit.training.gradient_utils import (
     configure_decoder_layerwise_split,
     maybe_enable_decoder_gradient_checkpointing,
@@ -118,7 +119,7 @@ class _DecoderOnlyL0PrefixCacheMissError(Exception):
         self.misses = int(misses)
 
 
-class CompressionTrainer(BaseTrainer):
+class CompressionTrainer(CompressionCurriculumMixin, BaseTrainer):
     """Step 2: Compression training with multi-objective curriculum.
 
     Packed-attention pipeline (FA4 varlen). File batches run a single
@@ -213,6 +214,19 @@ class CompressionTrainer(BaseTrainer):
             "ratio_space": str(ctrl_src.get("ratio_space", "log")),
             "init_target_ratio": target_ratio_start,
             "default_query_ratio": target_ratio_start,
+            # Gaussian-kernel anchor updates spread each dual-ascent step
+            # across all anchors weighted by distance from the sampled
+            # ratio. Without this, anchors outside the current sampler
+            # window-above remain frozen at warm-start values. Diagnosed
+            # 2026-06-01: phase1_falcon_l0 ran 48k steps with the 0.02/
+            # 0.04/0.08 anchors byte-identical to the l0_align values,
+            # producing eval-only theta jumps whenever curriculum
+            # descended past the 0.16 anchor.
+            "kernel_bandwidth": (
+                float(ctrl_src["kernel_bandwidth"])
+                if ctrl_src.get("kernel_bandwidth") is not None
+                else None
+            ),
         }
 
         step1_checkpoint = self._resolve_step1_checkpoint()
@@ -346,13 +360,26 @@ class CompressionTrainer(BaseTrainer):
         )
         configure_decoder_layerwise_split(self.decoder, self.cfg)
 
-        # Load decoder from Step 1 checkpoint
+        # Load decoder from Step 1 checkpoint. Set
+        # ``load_decoder_from_bgkit_checkpoint: false`` to skip — useful
+        # when resuming an encoder from a checkpoint that trained a
+        # different decoder family (e.g. Qwen realignment resuming from
+        # a Falcon-trained encoder), in which case the saved decoder
+        # state has incompatible architecture keys.
+        load_decoder_from_ckpt = bool(
+            tcfg.get("load_decoder_from_bgkit_checkpoint", True),
+        )
         if step1_state_dicts is not None:
             decoder_sd = step1_state_dicts.pop(
                 "decoder_merged", step1_state_dicts.pop("decoder", None)
             )
-            if decoder_sd is not None:
+            if decoder_sd is not None and load_decoder_from_ckpt:
                 self.decoder.load_state_dict(decoder_sd)
+            elif decoder_sd is not None:
+                logger.info(
+                    "decoder_state_dict_skipped",
+                    reason="training.load_decoder_from_bgkit_checkpoint=false",
+                )
         del step1_state_dicts
         gc.collect()
 
@@ -534,21 +561,14 @@ class CompressionTrainer(BaseTrainer):
                 error=str(probe_exc),
             )
 
-        # --- Survivorship head config (per-level) ---
-        from bgkit.training.survivorship_helpers import (
-            init_state,
-            load_reference_moments,
-            resolve_level_ice_cfg,
-            resolve_level_loss_cfg,
-        )
+        # --- Survivorship + dual-ascent state (CompressionCurriculumMixin) ---
+        from bgkit.training.survivorship_helpers import load_reference_moments
 
         surv_cfg = tcfg.get("survivorship", {})
-        self._surv_l0 = resolve_level_loss_cfg(surv_cfg.get("l0", {}))
-        self._surv_l1 = resolve_level_loss_cfg(surv_cfg.get("l1", {}))
-
         ice_cfg = tcfg.get("ice_distillation", {})
-        self._ice_l0 = resolve_level_ice_cfg(ice_cfg.get("l0", {}))
-        self._ice_l1 = resolve_level_ice_cfg(ice_cfg.get("l1", {}))
+        # Sets _surv_l{0,1}, _ice_l{0,1}, _ref_moments_l{0,1}=None,
+        # _surv_state_l{0,1}, _last_post_step_metrics.
+        self._init_survivorship_state(surv_cfg=surv_cfg, ice_cfg=ice_cfg)
         self._max_warmup_step = max(
             self._ice_l0.bce_warmup_steps if self._ice_l0.enabled else 0,
             self._ice_l1.bce_warmup_steps if self._ice_l1.enabled else 0,
@@ -589,10 +609,6 @@ class CompressionTrainer(BaseTrainer):
         )
         if self._surv_l1.moment_match_weight > 0 and l1_path:
             self._ref_moments_l1 = load_reference_moments(l1_path)
-
-        self._surv_state_l0 = init_state()
-        self._surv_state_l1 = init_state()
-        self._last_post_step_metrics: dict[str, float] = {}
 
         # --- Dataset ---
         # Training YAML's `data:` section lives under cfg.training.data
@@ -834,7 +850,24 @@ class CompressionTrainer(BaseTrainer):
         # CommitEncodingTrainer._calibrate_head_tanh_temperatures for the
         # rationale; the probe is cheap and confirms/corrects the loaded
         # checkpoint's T values against the current head outputs.
-        self._calibrate_head_tanh_temperatures()
+        # Phase override: a projection-warmup-then-resume run wants the
+        # checkpoint's T values preserved exactly, because the warmup
+        # projection was trained against the projection-target distribution
+        # under those T values. Recalibrating here shifts which positions
+        # the head selects → projection sees a shifted input distribution
+        # → warmup alignment is washed (diagnosed 2026-06-03 on
+        # phase1_qwen_realign, eval/loss plateau at 4.4).
+        if bool(tcfg.get("skip_head_temperature_calibration", False)):
+            l0_t = float(self.encoder.l0.head_tanh_temperature.item())
+            l1_t = float(self.encoder.l1.head_tanh_temperature.item())
+            logger.info(
+                "head_tanh_temperature_calibration_skipped",
+                reason="training.skip_head_temperature_calibration=true",
+                preserved_l0=l0_t,
+                preserved_l1=l1_t,
+            )
+        else:
+            self._calibrate_head_tanh_temperatures()
 
         logger.info(
             "compression_trainer_setup",
@@ -2427,28 +2460,10 @@ class CompressionTrainer(BaseTrainer):
         self._maybe_apply_head_warmup_freeze()
 
     def _post_optimizer_step(self, step: int) -> None:
-        """Advance bidi warmup; run dual-ascent θ + EMA μ updates per level."""
+        """Advance bidi warmup; run dual-ascent θ (shared mixin) per level."""
         self.encoder.step_bidi_warmup()
-
-        from bgkit.training.survivorship_helpers import (
-            apply_post_step_updates,
-            init_state,
-            maybe_unload_ice,
-        )
-
-        merged: dict[str, float] = {}
-        for level, state_attr in (("l0", "_surv_state_l0"), ("l1", "_surv_state_l1")):
-            state = getattr(self, state_attr, None)
-            if state is None:
-                continue
-            update_metrics = apply_post_step_updates(
-            self.encoder, state,
-                target_ratio=None, level=level,
-            )
-            merged.update(update_metrics)
-            setattr(self, state_attr, init_state())
-        self._last_post_step_metrics = merged
-
+        self._run_dual_ascent(step)  # CompressionCurriculumMixin
+        from bgkit.training.survivorship_helpers import maybe_unload_ice
         unloaded = maybe_unload_ice(
             getattr(self, "_ice_teacher", None),
             step,
@@ -2462,10 +2477,7 @@ class CompressionTrainer(BaseTrainer):
         metrics["bidi_alpha"] = self._get_bidi_alpha()
         if self._last_sampled_target_ratio is not None:
             metrics.setdefault("sampled_target_ratio", self._last_sampled_target_ratio)
-        post = getattr(self, "_last_post_step_metrics", None)
-        if post:
-            for k, v in post.items():
-                metrics.setdefault(k, v)
+        self._inject_survivorship_metrics(metrics)  # CompressionCurriculumMixin
 
     def _build_training_state(
         self,

@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import math
+import os
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from pathlib import Path
@@ -57,6 +58,16 @@ class _DevicePrefetcher:
         self.device = device
         self.stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
         self._next_batch = None
+        # ``_exhausted`` distinguishes "underlying iterator returned
+        # StopIteration" (genuine end-of-epoch) from "staged batch was dropped
+        # externally" (``_release_training_transients`` nulls ``_next_batch``
+        # before an eval/save scope to free its device memory). Without this
+        # flag a dropped staged batch looks identical to exhaustion, so the
+        # next ``__next__`` raised StopIteration and the train loop spuriously
+        # rolled the epoch over — resetting an ``sort_samples_ascending``
+        # dataloader back to its smallest samples on EVERY save/eval (the
+        # 2026-06-10 post-save loss spike + survivor collapse).
+        self._exhausted = False
         self._prefetch()
 
     def _to_device(self, batch):
@@ -72,6 +83,7 @@ class _DevicePrefetcher:
             batch = next(self.iterator)
         except StopIteration:
             self._next_batch = None
+            self._exhausted = True
             return
         if self.stream is None:
             self._next_batch = batch
@@ -82,6 +94,12 @@ class _DevicePrefetcher:
             self._next_batch = self._to_device(batch)
 
     def __next__(self):
+        # The staged batch may have been dropped externally (a memory-budget
+        # scope called _release_training_transients). Re-stage it rather than
+        # treating it as end-of-epoch — only a real StopIteration from the
+        # underlying iterator (``_exhausted``) ends the epoch.
+        if self._next_batch is None and not self._exhausted:
+            self._prefetch()
         if self.stream is not None:
             import torch
 
@@ -211,6 +229,19 @@ class BaseTrainer(ABC):
         self._schedule_params: dict[str, float] | None = None
         self._training_state: dict | None = None
         self._input_sources: dict[str, str] | None = None
+        # Map of component name → source path (or None for cold start).
+        # Populated by trainers via ``register_checkpoint_source`` during
+        # ``setup()``; emitted as a hard-to-miss banner by
+        # ``_log_startup_banner`` immediately after ``setup()`` returns.
+        # The banner forces the operator to confirm checkpoint provenance
+        # at every launch, which catches "I set the wrong config key and
+        # the trainer silently ran on random weights" class of bugs.
+        # Components that intentionally cold-start should register
+        # ``None`` so the banner explicitly flags it instead of staying
+        # silent.
+        self._startup_sources: dict[str, str | None] = {}
+        self._startup_extras: dict[str, str | int | float | None] = {}
+        self._startup_notes: list[str] = []
         self._accum_steps = 1
         self._dataloader_invalidated = False  # set True in _pre_step_hook to force re-iter
         # Microbatches already consumed from the current epoch's dataloader.
@@ -248,6 +279,82 @@ class BaseTrainer(ABC):
     def trainable_parameters(self) -> list:
         """Parameters for gradient clipping. Override in subclasses."""
         return [p for p in self.model.parameters() if p.requires_grad]
+
+    # ------------------------------------------------------------------
+    # Startup banner registration (called from trainer.setup())
+    # ------------------------------------------------------------------
+
+    def register_checkpoint_source(
+        self, component: str, source: str | None,
+    ) -> None:
+        """Record where a component's weights came from for the startup banner.
+
+        Pass ``source=None`` to flag a cold start (pristine HF weights /
+        random init) — the banner marks it loudly so the operator can
+        confirm the cold start is intentional. Components: typically
+        ``encoder``, ``decoder``, ``optimizer_state``, and any
+        phase-specific extras like ``teacher_encoder``.
+        """
+        self._startup_sources[component] = source
+
+    def register_startup_extra(
+        self, key: str, value: str | int | float | None,
+    ) -> None:
+        """Record a phase-specific value (target_ratio, anchor count, etc.).
+
+        Surfaces in the startup banner under "Phase-specific".
+        """
+        self._startup_extras[key] = value
+
+    def register_startup_note(self, note: str) -> None:
+        """Add a free-form note for the startup banner.
+
+        Use for things like 'decoder cold-start (intentional, no Qwen
+        ckpt exists for current encoder)'. Keep each note short — they
+        list verbatim under "Notes:".
+        """
+        self._startup_notes.append(note)
+
+    def _log_startup_banner(self) -> None:
+        """Emit the loud "PLEASE CHECK" banner. Called by ``train()`` after
+        ``setup()`` completes, so every trainer (current and future) gets
+        the banner for free.
+
+        Backward-compat: if a trainer hasn't been ported to call
+        ``register_checkpoint_source`` yet, fall back to populating from
+        ``_input_sources`` (the existing lineage convention) so the
+        banner is still informative on older trainers.
+        """
+        from bgkit.training.startup_banner import log_startup_banner
+
+        sources = dict(self._startup_sources)
+        notes = list(self._startup_notes)
+        # Back-compat fallback: trainers that haven't been updated still
+        # populate _input_sources from their _resolve_*_checkpoint
+        # methods. Carry those over so the banner is informative.
+        if not sources and self._input_sources:
+            sources = {k: v for k, v in self._input_sources.items()}
+            notes.append(
+                "trainer has not yet registered explicit checkpoint "
+                "sources — banner populated from legacy _input_sources",
+            )
+
+        encoder_src = (
+            sources.pop("encoder", None)
+            or sources.pop("step1", None)
+            or sources.pop("bgkit", None)
+        )
+        decoder_src = sources.pop("decoder", None)
+        opt_src = sources.pop("optimizer_state", None)
+        log_startup_banner(
+            phase=str(self.cfg.training.get("phase", "<unknown>")),
+            run_name=str(self.cfg.get("run_name", "<unnamed>")),
+            encoder_source=encoder_src,
+            decoder_source=decoder_src,
+            optimizer_state_source=opt_src,
+            extras={**sources, **self._startup_extras},
+            notes=notes,
+        )
 
     def _post_step(self, step: int) -> None:
         """Hook called after each optimizer step. Override for per-step bookkeeping.
@@ -896,7 +1003,28 @@ class BaseTrainer(ABC):
                 # aliased to the live optimizer buffer (torch.save will
                 # serialize whatever we hand it, but an aliased dict is
                 # fragile if the optimizer mutates mid-serialization).
-                state_by_name[name] = dict(self.optimizer.state[param])
+                #
+                # Downcast the large float buffers (momentum / moments — the
+                # dominant ~12 GB of this run's Muon state for 1.586 B params)
+                # to bf16 on disk to ~halve the checkpoint write volume. The
+                # slow USB-HDD flush of that volume is what left the dirty-page
+                # backlog that stalled the post-save CUDA allocation; halving it
+                # halves the fsync time. Scalars like the integer ``step``
+                # (numel == 1) and non-float tensors are left intact so they
+                # round-trip EXACTLY. bf16 momentum/moments is standard practice
+                # (running averages tolerate it; the value is upcast back to
+                # fp32 on load) and convergence-neutral. ``.to(bf16)`` also
+                # returns a fresh tensor, so the live buffer isn't aliased.
+                state_by_name[name] = {
+                    k: (
+                        v.to(torch.bfloat16)
+                        if isinstance(v, torch.Tensor)
+                        and v.is_floating_point()
+                        and v.numel() > 1
+                        else v
+                    )
+                    for k, v in self.optimizer.state[param].items()
+                }
         unreachable = len(opt_param_ids) - len(seen_opt_ids)
         if unreachable:
             raise RuntimeError(
@@ -1055,6 +1183,22 @@ class BaseTrainer(ABC):
             )
         return None, ()
 
+    @staticmethod
+    def _restore_opt_tensor(v, device):
+        """Move a saved optimizer-state value to ``device`` and upcast bf16/fp16
+        float buffers back to fp32 — the inverse of the bf16 downcast applied in
+        :meth:`_build_optimizer_state_by_name`. The optimizer's math expects
+        fp32 state and fresh (unresumed) runs use fp32, so this keeps a resumed
+        run numerically aligned going forward. Non-tensors and already-fp32
+        buffers (older checkpoints saved before the downcast) pass through
+        unchanged, so loading stays backward-compatible."""
+        if not isinstance(v, torch.Tensor):
+            return v
+        v = v.to(device)
+        if v.is_floating_point() and v.dtype in (torch.bfloat16, torch.float16):
+            v = v.to(torch.float32)
+        return v
+
     def _restore_optimizer_state_by_name(self, state_by_name: dict) -> None:
         """Install name-keyed optimizer state into the current optimizer.
 
@@ -1082,7 +1226,6 @@ class BaseTrainer(ABC):
         is reachable by ``_named_parameters_for_optimizer`` — if any
         aren't, save/restore would silently lose state for them.
         """
-        import torch
 
         opt_param_ids = {
             id(p) for pg in self.optimizer.param_groups for p in pg["params"]
@@ -1109,7 +1252,7 @@ class BaseTrainer(ABC):
                 saved = state_by_name[saved_name]
                 device = param.device
                 moved = {
-                    k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                    k: self._restore_opt_tensor(v, device)
                     for k, v in saved.items()
                 }
                 self.optimizer.state[param] = moved
@@ -1125,7 +1268,7 @@ class BaseTrainer(ABC):
                     matched_saved_names.update(packed_source_names)
                     device = param.device
                     moved = {
-                        k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                        k: self._restore_opt_tensor(v, device)
                         for k, v in packed_state.items()
                     }
                     self.optimizer.state[param] = moved
@@ -1183,13 +1326,33 @@ class BaseTrainer(ABC):
             training_state=self._training_state,
             optimizer_type=self._optimizer_type,
         )
-        ckpt_path = save_checkpoint(
+        return self._write_checkpoint(
             checkpoint_dir,
             metadata,
             model=self.model.state_dict(),
             optimizer_state_by_name=self._build_optimizer_state_by_name(),
         )
+
+    def _write_checkpoint(
+        self, checkpoint_dir: Path, metadata: CheckpointMetadata, **state_dicts
+    ) -> Path:
+        """Write a checkpoint, routing through the NVMe fast-dir if configured.
+
+        SINGLE source of truth for NVMe routing + async archive. Both the
+        default ``save_checkpoint`` and any trainer override (which may save a
+        different set of state dicts, e.g. encoder + two decoders) MUST go
+        through here — otherwise an override silently writes to the slow HDD and
+        skips archival (the 2026-06-10 routing bug). When ``_fast_checkpoint_dir``
+        is set, the checkpoint is written there (fast fsync, no spinning-disk
+        dirty-page spike) and queued for async copy to the HDD archive.
+        """
+        fast_dir = getattr(self, "_fast_checkpoint_dir", None)
+        write_dir = fast_dir if fast_dir is not None else checkpoint_dir
+        ckpt_path = save_checkpoint(write_dir, metadata, **state_dicts)
         self._last_checkpoint_path = str(ckpt_path)
+        archiver = getattr(self, "_archiver", None)
+        if fast_dir is not None and archiver is not None:
+            archiver.enqueue(ckpt_path, fast_dir)
         return ckpt_path
 
     def _check_optimizer_type_compat(self, metadata: CheckpointMetadata) -> None:
@@ -2143,6 +2306,11 @@ class BaseTrainer(ABC):
           in evaluate() results; lower is better)
         """
         self.setup()
+        # Loud, hard-to-miss checkpoint provenance summary so the
+        # operator can confirm what actually loaded before training
+        # starts. Catches "wrong config key, silent pristine encoder"
+        # class of bugs.
+        self._log_startup_banner()
 
         tcfg = self.cfg.training
         if (
@@ -2163,6 +2331,42 @@ class BaseTrainer(ABC):
             self.cfg.compute.get("cuda_empty_cache_every_step", False),
         )
         checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
+
+        # Optional NVMe fast-write + async HDD archive. When configured, save
+        # writes the checkpoint to the fast (NVMe) dir — ~15 s fsync, no
+        # spinning-disk dirty-page backlog / post-save spike — then a background
+        # daemon copies it to the HDD archive (throttled fsync) so the full
+        # checkpoint history is preserved. Resume prefers the NVMe copy; it is a
+        # host bind-mount so it survives container restarts. keep_last_n caps the
+        # NVMe footprint; the HDD keeps everything.
+        fast_ckpt = self.cfg.get("fast_checkpoint_dir", None) or os.environ.get(
+            "BGKIT_FAST_CHECKPOINT_DIR"
+        )
+        self._fast_checkpoint_dir = None
+        self._archiver = None
+        phase_for_ckpt = getattr(tcfg, "phase", None) or self.cfg.training.phase
+        if fast_ckpt:
+            from bgkit.training.checkpoint_archiver import (
+                CheckpointArchiver,
+                archive_pending_into,
+            )
+
+            self._fast_checkpoint_dir = Path(fast_ckpt)
+            self._fast_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            # Recover any NVMe-only checkpoints from a prior crash onto the HDD.
+            archive_pending_into(
+                checkpoint_dir, self._fast_checkpoint_dir, phase_for_ckpt
+            )
+            self._archiver = CheckpointArchiver(
+                archive_dir=checkpoint_dir,
+                phase=phase_for_ckpt,
+                keep_last_n=int(self.cfg.get("fast_checkpoint_keep_last_n", 3)),
+            )
+            logger.info(
+                "checkpoint_fast_dir_enabled",
+                fast_dir=str(self._fast_checkpoint_dir),
+                archive_dir=str(checkpoint_dir),
+            )
 
         # Checkpoint registry
         registry = CheckpointRegistry(checkpoint_dir)
@@ -2187,7 +2391,9 @@ class BaseTrainer(ABC):
         elif resume_path is None:
             phase = getattr(tcfg, "phase", None)
             if phase:
-                auto_resolved = resolve_latest_checkpoint(checkpoint_dir, phase)
+                auto_resolved = resolve_latest_checkpoint(
+                    checkpoint_dir, phase, fast_dir=self._fast_checkpoint_dir
+                )
                 if auto_resolved is not None:
                     resume_path = str(auto_resolved)
                     logger.info("auto_resume_resolved", checkpoint=resume_path, phase=phase)
@@ -2773,6 +2979,24 @@ class BaseTrainer(ABC):
                                 ckpt_path = self.save_checkpoint(
                                     checkpoint_dir, metrics=step_metrics
                                 )
+                                # Unified-memory: the save's transient blocks
+                                # (e.g. bf16 optimizer copies) and the prior
+                                # step's freed activations sit in the CUDA
+                                # allocator's RESERVED pool. The scope's own
+                                # reclaim skips empty_cache() when free>20GB, so
+                                # on this run (free ~64GB) they're never returned
+                                # to the single shared pool — and the first
+                                # post-save step then re-demands pages ON TOP of
+                                # them, spiking toward OOM. Flush explicitly here
+                                # so those bytes go back to the pool before the
+                                # next step. Safe: watchdog paused, and this is a
+                                # full step away from the next FLA kernel launch
+                                # (the sm_121 cudaFree-near-launch concern that
+                                # gated the scope flush does not apply here).
+                                import gc as _gc
+                                _gc.collect()
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
                             finally:
                                 _wd_resume()
                         registry.register(self._build_registry_entry(
@@ -2795,12 +3019,30 @@ class BaseTrainer(ABC):
                             )
                             parent = self._registry_parent()
                             self._release_training_transients()
+                            from bgkit.utils.step_watchdog import pause as _wd_pause
+                            from bgkit.utils.step_watchdog import resume as _wd_resume
+
                             # Graceful shutdown: do NOT enforce the cap — we
                             # want the rescue-save to succeed even under
                             # memory pressure that may be causing the
                             # shutdown.  Still scope it for logging/reclaim.
-                            with memory_budget_scope("save_checkpoint_shutdown"):
-                                ckpt_path = self.save_checkpoint(checkpoint_dir)
+                            #
+                            # PAUSE THE WATCHDOG around the save. On a slow
+                            # (spinning-disk) CHECKPOINT_DIR a ~9 GB rescue save
+                            # blocks the main thread for ~5 min — longer than the
+                            # step-watchdog timeout — so without this pause the
+                            # watchdog mistakes the save for a hang and calls
+                            # os._exit(1) mid-fsync, destroying the emergency
+                            # checkpoint (it never gets its atomic rename, left as
+                            # a ._tmp_ dir). The normal save path already pauses;
+                            # the shutdown path historically did not — silently
+                            # eating emergency checkpoints (2026-06-10).
+                            _wd_pause()
+                            try:
+                                with memory_budget_scope("save_checkpoint_shutdown"):
+                                    ckpt_path = self.save_checkpoint(checkpoint_dir)
+                            finally:
+                                _wd_resume()
                             registry.register(self._build_registry_entry(
                                 ckpt_path, None, wandb_run,
                                 status="interrupted",
@@ -2819,6 +3061,11 @@ class BaseTrainer(ABC):
                             if interruptor.received_signal
                             else None,
                         )
+                        if self._archiver is not None:
+                            # Best-effort: land in-flight archives on the HDD.
+                            # Resume prefers the NVMe copy (a persistent host
+                            # bind-mount), so an incomplete archive loses nothing.
+                            self._archiver.wait_idle(timeout=120.0)
                         return
 
                     step += 1
@@ -2861,6 +3108,10 @@ class BaseTrainer(ABC):
                     ckpt_manager.prune()
                 (checkpoint_dir / ".last_checkpoint").write_text(str(ckpt_path))
         finally:
+            if getattr(self, "_archiver", None) is not None:
+                # Training done — drain all pending archives to the HDD so the
+                # full checkpoint history is durable before the process exits.
+                self._archiver.wait_idle()
             if wandb_run is not None:
                 wandb_run.finish()
 

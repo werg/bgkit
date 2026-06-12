@@ -169,6 +169,48 @@ TOOL_CONFIGS: dict[str, ChatTemplateConfig] = {
         },
         content_in_code_fence=False,
     ),
+    "multi_news_summarization": ChatTemplateConfig(
+        tool_name="bgkit_summarize_news",
+        tool_description=(
+            "Summarize a set of news articles provided as BgKIT compressed context."
+        ),
+        tool_parameters={
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Group identifier (e.g. multi_news/train/N).",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Instructions for the summary.",
+                },
+            },
+            "required": ["target", "prompt"],
+        },
+        content_in_code_fence=False,
+    ),
+    "scientific_abstract": ChatTemplateConfig(
+        tool_name="bgkit_write_abstract",
+        tool_description=(
+            "Draft a scientific abstract from a paper's body provided as BgKIT context."
+        ),
+        tool_parameters={
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "string",
+                    "description": "Paper identifier.",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Instructions for the abstract.",
+                },
+            },
+            "required": ["target", "prompt"],
+        },
+        content_in_code_fence=False,
+    ),
     "file_read_query": ChatTemplateConfig(
         tool_name="bgkit_read_file",
         tool_description="Read and analyze file contents from BgKIT compressed context.",

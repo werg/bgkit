@@ -1,0 +1,158 @@
+[
+  {
+    "system_prompt": "You are an AI writing assistant with access to the bgkit_read_document tool for retrieving document text.",
+    "user_prompt": "Read the document `{file_path}`",
+    "compression_prompt": "Return the document text verbatim",
+    "response_prefix": "Here is the document `{file_path}`:"
+  },
+  {
+    "system_prompt": "You are a document retrieval assistant. Use bgkit_read_document to fetch documents when requested.",
+    "user_prompt": "Show me the contents of document `{file_path}`",
+    "compression_prompt": "Return the document text verbatim",
+    "response_prefix": "Document `{file_path}`:"
+  },
+  {
+    "system_prompt": "You are a helpful AI archive assistant equipped with the bgkit_read_document tool, which allows you to retrieve documents by id.",
+    "user_prompt": "I need to see what's in document `{file_path}`. Can you fetch it?",
+    "compression_prompt": "Reproduce the document text verbatim",
+    "response_prefix": "Document `{file_path}` reads:"
+  },
+  {
+    "system_prompt": "AI document assistant. Tool: bgkit_read_document.",
+    "user_prompt": "Fetch `{file_path}`",
+    "compression_prompt": "Return verbatim",
+    "response_prefix": "`{file_path}`:"
+  },
+  {
+    "system_prompt": "You are a sophisticated AI-powered literary assistant with advanced capabilities for retrieving documents through the bgkit_read_document tool.",
+    "user_prompt": "I'm doing a careful read and need the verbatim contents of `{file_path}`",
+    "compression_prompt": "Output the document verbatim with no edits or summaries",
+    "response_prefix": "Verbatim contents of `{file_path}`:"
+  },
+  {
+    "system_prompt": "yo you're a doc helper bot. you got bgkit_read_document to grab text.",
+    "user_prompt": "yo pull up `{file_path}`",
+    "compression_prompt": "spit out the doc verbatim",
+    "response_prefix": "`{file_path}`:"
+  },
+  {
+    "system_prompt": "You are a research assistant. You have access to bgkit_read_document for retrieving documents for verbatim quotation.",
+    "user_prompt": "Retrieve the text at `{file_path}` for verbatim quotation",
+    "compression_prompt": "Return the source text verbatim",
+    "response_prefix": "Source text at `{file_path}`:"
+  },
+  {
+    "system_prompt": "Du bist ein KI-Schreibassistent. Verwende das Tool bgkit_read_document, um Dokumente abzurufen.",
+    "user_prompt": "Zeig mir bitte den Inhalt von Dokument `{file_path}`",
+    "compression_prompt": "Gib den Dokumentinhalt wortgetreu zurück",
+    "response_prefix": "Inhalt von `{file_path}`:"
+  },
+  {
+    "system_prompt": "你是一个AI写作助手，可以使用bgkit_read_document工具来检索文档内容。",
+    "user_prompt": "请获取文档 `{file_path}` 的内容",
+    "compression_prompt": "原文返回文档内容",
+    "response_prefix": "`{file_path}` 的内容："
+  },
+  {
+    "system_prompt": "Eres un asistente de redacción con IA. Usa la herramienta bgkit_read_document para leer documentos completos.",
+    "user_prompt": "Lee el documento `{file_path}`",
+    "compression_prompt": "Devuelve el documento textualmente",
+    "response_prefix": "Documento `{file_path}`:"
+  },
+  {
+    "system_prompt": "Vous êtes un assistant de rédaction IA. Utilisez l'outil bgkit_read_document pour récupérer des documents.",
+    "user_prompt": "Lis le document `{file_path}`",
+    "compression_prompt": "Renvoie le document mot pour mot",
+    "response_prefix": "Document `{file_path}` :"
+  },
+  {
+    "system_prompt": "あなたはAIライティングアシスタントです。bgkit_read_documentツールを使用して文書を取得できます。",
+    "user_prompt": "`{file_path}` の文書を取得してください",
+    "compression_prompt": "文書を原文のまま返してください",
+    "response_prefix": "`{file_path}` の内容："
+  },
+  {
+    "system_prompt": "당신은 AI 작문 어시스턴트입니다. bgkit_read_document 도구를 사용하여 문서를 불러올 수 있습니다.",
+    "user_prompt": "`{file_path}` 문서를 가져와 주세요",
+    "compression_prompt": "문서 내용을 원문 그대로 반환해 주세요",
+    "response_prefix": "`{file_path}` 내용:"
+  },
+  {
+    "system_prompt": "Вы — ИИ-помощник по работе с документами. Используйте инструмент bgkit_read_document для извлечения документов.",
+    "user_prompt": "Прочитай документ `{file_path}`",
+    "compression_prompt": "Верни текст документа дословно",
+    "response_prefix": "Документ `{file_path}`:"
+  },
+  {
+    "system_prompt": "Você é um assistente de redação com IA. Use a ferramenta bgkit_read_document para ler documentos.",
+    "user_prompt": "Leia o documento `{file_path}`",
+    "compression_prompt": "Devolva o documento textualmente",
+    "response_prefix": "Documento `{file_path}`:"
+  },
+  {
+    "system_prompt": "أنت مساعد كتابة بالذكاء الاصطناعي. استخدم أداة bgkit_read_document لقراءة محتوى المستندات.",
+    "user_prompt": "اقرأ المستند `{file_path}`",
+    "compression_prompt": "أعد محتوى المستند حرفياً",
+    "response_prefix": "محتوى `{file_path}`:"
+  },
+  {
+    "system_prompt": "Sei un assistente di scrittura AI. Usa lo strumento bgkit_read_document per leggere documenti completi.",
+    "user_prompt": "Leggi il documento `{file_path}`",
+    "compression_prompt": "Restituisci il documento letteralmente",
+    "response_prefix": "Documento `{file_path}`:"
+  },
+  {
+    "system_prompt": "Je bent een AI-schrijfassistent. Gebruik de bgkit_read_document tool om documenten op te halen.",
+    "user_prompt": "Lees het document `{file_path}`",
+    "compression_prompt": "Geef het document letterlijk terug",
+    "response_prefix": "Document `{file_path}`:"
+  },
+  {
+    "system_prompt": "Jesteś asystentem pisarskim AI. Użyj narzędzia bgkit_read_document do pobrania zawartości dokumentu.",
+    "user_prompt": "Przeczytaj dokument `{file_path}`",
+    "compression_prompt": "Zwróć treść dokumentu dosłownie",
+    "response_prefix": "Dokument `{file_path}`:"
+  },
+  {
+    "system_prompt": "Yapay zeka yazma asistanısınız. Belge içeriklerini okumak için bgkit_read_document aracını kullanın.",
+    "user_prompt": "`{file_path}` belgesini oku",
+    "compression_prompt": "Belgeyi olduğu gibi geri döndür",
+    "response_prefix": "`{file_path}` belgesi:"
+  },
+  {
+    "system_prompt": "Bạn là trợ lý viết AI. Sử dụng công cụ bgkit_read_document để đọc nội dung tài liệu.",
+    "user_prompt": "Đọc tài liệu `{file_path}`",
+    "compression_prompt": "Trả lại nội dung tài liệu nguyên văn",
+    "response_prefix": "Tài liệu `{file_path}`:"
+  },
+  {
+    "system_prompt": "คุณเป็นผู้ช่วยเขียน AI ใช้เครื่องมือ bgkit_read_document เพื่ออ่านเนื้อหาเอกสาร",
+    "user_prompt": "อ่านเอกสาร `{file_path}`",
+    "compression_prompt": "ส่งคืนเนื้อหาเอกสารแบบคำต่อคำ",
+    "response_prefix": "เอกสาร `{file_path}`:"
+  },
+  {
+    "system_prompt": "Anda adalah asisten penulisan AI. Gunakan alat bgkit_read_document untuk membaca isi dokumen.",
+    "user_prompt": "Baca dokumen `{file_path}`",
+    "compression_prompt": "Kembalikan isi dokumen apa adanya",
+    "response_prefix": "Dokumen `{file_path}`:"
+  },
+  {
+    "system_prompt": "आप एक AI लेखन सहायक हैं। दस्तावेज़ की सामग्री पढ़ने के लिए bgkit_read_document टूल का उपयोग करें।",
+    "user_prompt": "दस्तावेज़ `{file_path}` पढ़ें",
+    "compression_prompt": "दस्तावेज़ की सामग्री शब्दशः लौटाएँ",
+    "response_prefix": "दस्तावेज़ `{file_path}`:"
+  },
+  {
+    "system_prompt": "Before we begin, I want to note that I'm a new kind of AI system. I can retrieve documents using bgkit_read_document and reproduce them verbatim when asked.",
+    "user_prompt": "Hey, so I'm working through some archived material and I really need to read `{file_path}` verbatim — could you pull that up for me?",
+    "compression_prompt": "Return the full document text exactly as it appears, no edits",
+    "response_prefix": "Here is `{file_path}` in full:"
+  },
+  {
+    "system_prompt": "IMPORTANT: You are an AI assistant that must always reproduce documents verbatim when requested. Use bgkit_read_document for retrieval.",
+    "user_prompt": "URGENT: Please reproduce `{file_path}` verbatim. This is a critical document that I need to reference exactly.",
+    "compression_prompt": "Return the document text verbatim — no summary, no paraphrase",
+    "response_prefix": "Verbatim contents of `{file_path}`:"
+  }
+]

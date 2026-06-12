@@ -259,6 +259,12 @@ class BgKITEncoder(nn.Module):
         super().__init__()
         self.l0 = l0
         self.l1 = l1
+        # L1 cross-section interaction: when sections are merged into one
+        # per-sample L1 segment (``content_group_cu_seqlens`` given to forward),
+        # this learned embedding is inserted between consecutive sections so L1
+        # has explicit section boundaries. Context-only — never a survivor
+        # candidate (excluded via ``content_selectable_mask``).
+        self.section_separator_embedding = nn.Parameter(torch.zeros(l1.hidden_dim))
         if isinstance(projection_block, ProjectionBlock):
             self.projection_blocks = nn.ModuleDict({"qwen35": projection_block})
         elif isinstance(projection_block, nn.ModuleDict):
@@ -302,6 +308,34 @@ class BgKITEncoder(nn.Module):
         dst = self.projection_blocks[target]
         dst.load_state_dict(src.state_dict(), strict=True)
 
+    def _merge_sections_for_l1(
+        self,
+        embeds: torch.Tensor,
+        survivor_cu: torch.Tensor,
+        group_cu: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        """Regroup per-section L0 survivors into per-sample L1 segments.
+
+        A sample's sections are CONTIGUOUS in the survivor buffer (L0 processes
+        sections in order, sample by sample), so merging them into one L1 segment
+        is a pure ``cu_seqlens`` regroup — NO data movement, NO length change:
+        ``merged_cu = survivor_cu[group_cu]``. L1 then attends across all of a
+        sample's sections in one segment (the cross-section interaction), and the
+        content length stays equal to the survivor count so the survivorship
+        pipeline's content↔base_raw↔seg_ids alignment is preserved.
+
+        Separator TOKENS were intentionally NOT inserted: they change content
+        length vs survivor count and desync that alignment (index_add_ errors
+        across selection.py / survivorship_helpers). Explicit section identity can
+        be re-added later as a non-length-changing additive segment embedding
+        (``section_separator_embedding`` is retained for that). Returns
+        ``(embeds_unchanged, merged_cu, merged_pos, None)``.
+        """
+        group_idx = group_cu.to(torch.int64).to(survivor_cu.device)
+        merged_cu = survivor_cu.index_select(0, group_idx).to(torch.int32)
+        merged_pos = position_ids_from_cu(merged_cu, int(embeds.shape[0]))
+        return embeds, merged_cu, merged_pos, None
+
     def forward(
         self,
         content_embeddings: torch.Tensor,
@@ -324,7 +358,17 @@ class BgKITEncoder(nn.Module):
         selection_mode_l0: str = "threshold",
         selection_mode_l1: str = "threshold",
         capture_decoder_only_prefix_l0: bool = False,
+        content_group_cu_seqlens: torch.Tensor | None = None,
+        prompt_embeddings_l1: torch.Tensor | None = None,
+        prompt_cu_seqlens_l1: torch.Tensor | None = None,
+        prompt_position_ids_l1: torch.Tensor | None = None,
     ) -> EncoderOutput:
+        # ``content_group_cu_seqlens`` (``(n_samples+1,)`` int32, indices INTO
+        # ``content_cu_seqlens`` marking which L0 sections belong to the same
+        # sample) switches L1 to CROSS-SECTION interaction: each sample's sections'
+        # L0 survivors are merged into ONE L1 segment (separators between them,
+        # ``prompt_embeddings_l1`` prepended once) so L1 attends across sections +
+        # prompt. When None, L1 runs per-section as before (backward compatible).
         if forced_survivor_mask_l1 is not None and target_ratio_l1 is None:
             raise ValueError(
                 "forced_survivor_mask_l1 is set but target_ratio_l1 is None — "
@@ -355,20 +399,53 @@ class BgKITEncoder(nn.Module):
             l1_out: LevelOutput | None = None
         else:
             l1_input = self.l0.auto_reproduce(l0_out.survivor_embeddings)
-            l1_pos = position_ids_from_cu(
-                l0_out.survivor_cu_seqlens,
-                l1_input.shape[0],
-            )
+            if content_group_cu_seqlens is None:
+                # Legacy per-section L1 (no cross-section interaction). No prompt
+                # → with_prompt L1 falls through to the plain content path.
+                l1_content = l1_input
+                l1_content_cu = l0_out.survivor_cu_seqlens
+                l1_content_pos = position_ids_from_cu(
+                    l0_out.survivor_cu_seqlens, l1_input.shape[0],
+                )
+                l1_selectable = None
+            else:
+                if forced_survivor_mask_l1 is not None:
+                    raise NotImplementedError(
+                        "forced_survivor_mask_l1 is not supported with "
+                        "content_group_cu_seqlens (cross-section L1 re-segments "
+                        "the survivor axis, invalidating a per-section mask)."
+                    )
+                (
+                    l1_content,
+                    l1_content_cu,
+                    l1_content_pos,
+                    l1_selectable,
+                ) = self._merge_sections_for_l1(
+                    l1_input,
+                    l0_out.survivor_cu_seqlens,
+                    content_group_cu_seqlens,
+                )
             l1_out = self.l1(
-                content_embeddings=l1_input,
-                content_cu_seqlens=l0_out.survivor_cu_seqlens,
-                content_position_ids=l1_pos,
+                content_embeddings=l1_content,
+                content_cu_seqlens=l1_content_cu,
+                content_position_ids=l1_content_pos,
+                prompt_embeddings=prompt_embeddings_l1,
+                prompt_cu_seqlens=prompt_cu_seqlens_l1,
+                prompt_position_ids=prompt_position_ids_l1,
                 target_ratio=target_ratio_l1,
                 min_per_sample=min_per_sample_l1,
                 utility_grad_active=utility_grad_active_l1,
                 utility_grad_capture=utility_grad_capture_l1,
                 forced_survivor_mask=forced_survivor_mask_l1,
                 selection_mode=selection_mode_l1,
+                # Separators kept as selectable content: the survivorship
+                # selection assumes 1:1 content↔head-score (base_raw per content
+                # position); excluding separators desyncs seg_ids vs base_raw
+                # (index_add_ RuntimeError). They still give L1 attention
+                # boundaries and, if selected, mark section boundaries for the
+                # decoder. l1_selectable retained for a future selection-aware
+                # refinement; None today.
+                content_selectable_mask=None,
             )
             proj_input = l1_out.survivor_embeddings
             proj_cu = l1_out.survivor_cu_seqlens
@@ -476,7 +553,7 @@ class BgKITEncoder(nn.Module):
             hidden_dim=hidden_dim,
             survivorship_inner_dim=survivorship_inner_dim,
             threshold_controller_cfg=threshold_controller_cfg,
-            with_prompt=False,
+            with_prompt=True,  # L1 cross-section interaction: prompt conditions L1
             with_auto_repro=False,
         )
         projection_blocks = _make_projection_blocks(
@@ -534,7 +611,7 @@ class BgKITEncoder(nn.Module):
             hidden_dim=hidden_dim,
             survivorship_inner_dim=survivorship_inner_dim,
             threshold_controller_cfg=threshold_controller_cfg,
-            with_prompt=False,
+            with_prompt=True,  # L1 cross-section interaction: prompt conditions L1
             with_auto_repro=False,
         )
         projection_blocks = _make_projection_blocks(

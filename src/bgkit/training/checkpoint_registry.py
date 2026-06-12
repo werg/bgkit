@@ -44,17 +44,29 @@ def resolve_checkpoint(
 def resolve_latest_checkpoint(
     checkpoint_dir: Path,
     phase: str,
+    fast_dir: Path | None = None,
 ) -> Path | None:
     """Find the latest on-disk checkpoint for a phase, or None if no match.
 
     Used for auto-resume: silently returns None when no checkpoint exists
     (first run), unlike resolve_checkpoint which raises.
+
+    When ``fast_dir`` (the NVMe live dir) is given, both it and
+    ``checkpoint_dir`` (the HDD archive) are scanned, and the physical path
+    prefers the NVMe copy when present (faster resume; also the only intact copy
+    if the process died mid-archive). Recent checkpoints live on NVMe; older
+    ones only on the HDD — both resolve correctly.
     """
     registry = CheckpointRegistry(checkpoint_dir)
-    registry.backfill(checkpoint_dir)
+    extra = [Path(fast_dir)] if fast_dir is not None else None
+    registry.backfill(checkpoint_dir, extra_dirs=extra)
     latest = registry.latest(phase=phase)
     if latest is None:
         return None
+    if fast_dir is not None:
+        fast_path = Path(fast_dir) / latest.name
+        if fast_path.exists():
+            return fast_path
     return checkpoint_dir / latest.name
 
 
@@ -263,7 +275,11 @@ class CheckpointRegistry:
         self._save()
         return True
 
-    def backfill(self, checkpoint_dir: Path | None = None) -> int:
+    def backfill(
+        self,
+        checkpoint_dir: Path | None = None,
+        extra_dirs: list[Path] | None = None,
+    ) -> int:
         """Scan on-disk checkpoints and reconcile with registry.
 
         - Registers on-disk checkpoints not yet in the registry.
@@ -272,18 +288,27 @@ class CheckpointRegistry:
 
         Args:
             checkpoint_dir: Directory to scan. Defaults to the registry's checkpoint_dir.
+            extra_dirs: Additional directories to scan (e.g. the NVMe live dir).
+                A checkpoint present in ANY scanned dir counts as on-disk, so a
+                checkpoint that exists only on NVMe (HDD archive still in flight)
+                is never falsely marked pruned.
 
         Returns:
             Number of newly registered entries.
         """
-        scan_dir = Path(checkpoint_dir) if checkpoint_dir is not None else self._checkpoint_dir
-        if not scan_dir.exists():
+        primary = Path(checkpoint_dir) if checkpoint_dir is not None else self._checkpoint_dir
+        scan_dirs = [primary] + [Path(d) for d in (extra_dirs or [])]
+        scan_dirs = [d for d in scan_dirs if d.exists()]
+        if not scan_dirs:
             return 0
 
-        # Reconcile: mark entries whose dirs are gone as pruned
+        def _present(name: str) -> bool:
+            return any((d / name).exists() for d in scan_dirs)
+
+        # Reconcile: mark entries whose dirs are gone (from EVERY scanned dir) as pruned
         dirty = False
         for entry in self._entries.values():
-            if entry.on_disk and not (scan_dir / entry.name).exists():
+            if entry.on_disk and not _present(entry.name):
                 entry.on_disk = False
                 entry.status = "pruned"
                 dirty = True
@@ -293,7 +318,7 @@ class CheckpointRegistry:
         # "pruned". We can't distinguish that case, so we recover to "completed" as the
         # pragmatic default.
         for entry in self._entries.values():
-            if not entry.on_disk and (scan_dir / entry.name).exists():
+            if not entry.on_disk and _present(entry.name):
                 entry.on_disk = True
                 if entry.status == "pruned":
                     entry.status = "completed"
@@ -304,14 +329,17 @@ class CheckpointRegistry:
             self._save()
 
         count = 0
-        for meta_file in scan_dir.glob("*/metadata.json"):
+        seen_this_scan: set[str] = set()
+        meta_files = [mf for d in scan_dirs for mf in d.glob("*/metadata.json")]
+        for meta_file in meta_files:
             ckpt_dir = meta_file.parent
             name = ckpt_dir.name
-            # Skip incomplete checkpoints (written by atomic save but not yet renamed)
-            if name.startswith("._tmp_"):
+            # Skip incomplete checkpoints (atomic save / archive not yet renamed)
+            if name.startswith("._"):
                 continue
-            if name in self._entries:
+            if name in self._entries or name in seen_this_scan:
                 continue
+            seen_this_scan.add(name)
 
             try:
                 meta = json.loads(meta_file.read_text())

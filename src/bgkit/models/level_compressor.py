@@ -47,18 +47,29 @@ def _build_combined_pack(
     prompt_cu_seqlens: torch.Tensor | None,
     prompt_position_ids: torch.Tensor | None,
     separator_embedding: torch.Tensor,
+    content_selectable_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Concatenate per-sample ``[prompt_i | sep | content_i]`` into one pack."""
+    """Concatenate per-sample ``[prompt_i | sep | content_i]`` into one pack.
+
+    ``content_selectable_mask`` (``(N_content,)`` bool, optional): per-content-position
+    flag marking which content positions are SELECTION CANDIDATES. Defaults to all-True.
+    Used to mark in-content section-separator positions as context-only (attended but not
+    selectable as survivors) — the same role the prompt prefix already plays.
+    """
     device = content_embeddings.device
     D = content_embeddings.shape[-1]  # noqa: N806
     content_lengths = lengths_from_cu(content_cu_seqlens).to(torch.int64).tolist()
     B = len(content_lengths)  # noqa: N806
 
     if prompt_embeddings is None:
-        mask = torch.ones(
-            content_embeddings.shape[0],
-            dtype=torch.bool,
-            device=device,
+        mask = (
+            content_selectable_mask
+            if content_selectable_mask is not None
+            else torch.ones(
+                content_embeddings.shape[0],
+                dtype=torch.bool,
+                device=device,
+            )
         )
         max_seq = int(max(content_lengths)) if content_lengths else 0
         return (
@@ -98,7 +109,12 @@ def _build_combined_pack(
             torch.arange(total_len, dtype=torch.int64, device=device),
         )
         mask_block = torch.zeros(total_len, dtype=torch.bool, device=device)
-        mask_block[p_len + 1 :] = True
+        if content_selectable_mask is not None:
+            mask_block[p_len + 1 :] = content_selectable_mask[
+                content_starts[i] : content_starts[i] + c_len
+            ]
+        else:
+            mask_block[p_len + 1 :] = True
         mask_blocks.append(mask_block)
 
     combined_embeddings = torch.cat(blocks, dim=0)
@@ -305,9 +321,22 @@ class LevelCompressor(nn.Module):
         forced_survivor_mask: torch.Tensor | None = None,
         selection_mode: str = "threshold",
         capture_decoder_only_prefix: bool = False,
+        content_selectable_mask: torch.Tensor | None = None,
     ) -> LevelOutput:
         """Run one compression level. ``forced_survivor_mask`` (bool, ``(N_content,)``)
-        overrides head selection when provided; head still runs for diagnostics."""
+        overrides head selection when provided; head still runs for diagnostics.
+
+        ``content_selectable_mask`` (bool, ``(N_content,)``, optional) marks which content
+        positions are survivor candidates; non-selectable positions (e.g. inserted
+        section-separator embeddings) attend but are never selected."""
+        if content_selectable_mask is not None:
+            if content_selectable_mask.shape != (content_embeddings.shape[0],):
+                raise ValueError(
+                    f"content_selectable_mask must have shape "
+                    f"({content_embeddings.shape[0]},); got "
+                    f"{tuple(content_selectable_mask.shape)}"
+                )
+            content_selectable_mask = content_selectable_mask.to(torch.bool)
         if content_embeddings.ndim != 2:
             raise ValueError(
                 f"content_embeddings must be packed (N, D); got "
@@ -348,13 +377,18 @@ class LevelCompressor(nn.Module):
                 prompt_cu_seqlens,
                 prompt_position_ids,
                 self.prompt_separator_embedding,
+                content_selectable_mask=content_selectable_mask,
             )
         else:
             x = content_embeddings
             combined_cu = content_cu_seqlens
             combined_pos = content_position_ids
-            content_pos_mask = torch.ones(
-                x.shape[0], dtype=torch.bool, device=x.device,
+            content_pos_mask = (
+                content_selectable_mask
+                if content_selectable_mask is not None
+                else torch.ones(
+                    x.shape[0], dtype=torch.bool, device=x.device,
+                )
             )
             lengths = lengths_from_cu(content_cu_seqlens).to(torch.int64)
             combined_max = int(lengths.max().item()) if lengths.numel() else 0

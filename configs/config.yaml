@@ -25,7 +25,7 @@ project_name: bgkit
 run_name: null  # auto-generated if null
 batch_size: 32
 checkpoint_dir: ${oc.env:CHECKPOINT_DIR}
-resume_checkpoint: null  # null = auto-resume latest; "none" = fresh start; or explicit path
+resume_checkpoint: null  # auto-resume latest
 
 control_file: null  # optional path to live HP control JSON
 
