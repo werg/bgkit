@@ -11,6 +11,7 @@ import contextlib
 import dataclasses
 import math
 import os
+import time
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, sa
 from bgkit.training.gradient_utils import clip_grad_norm
 from bgkit.training.interruption import GracefulInterruptor
 from bgkit.training.live_config import LiveConfig
+from bgkit.natstack_bridge import NatstackBridge
 from bgkit.training.scheduling import cosine_with_warmup
 from bgkit.utils.memory_budget import (
     collect_memory_diagnostics as _collect_memory_diagnostics,
@@ -1513,6 +1515,34 @@ class BaseTrainer(ABC):
             setattr(self, attr, type(old)(val) if old is not None else float(val))
             logger.info("live_config_update", key=key, attr=attr, old=old, new=val)
 
+    def _bridge_knob_schema(self) -> list[dict]:
+        """Enumerate live-tunable knobs for a natstack-bridge ``knobs`` frame.
+
+        Mirrors the MRO merge in :meth:`apply_live_config`: every key declared
+        in ``LIVE_CONFIG_FIELDS`` across ``type(self).__mro__`` is a knob.
+        Handler-only keys (in ``LIVE_CONFIG_HANDLERS`` but not
+        ``LIVE_CONFIG_FIELDS``) are NOT enumerated — they have no backing attr to
+        read a current value / infer a type from. The wire ``type`` is inferred
+        from the current attr value (bool before int, since bool subclasses int).
+        """
+        fields: dict[str, str] = {}
+        for cls in reversed(type(self).__mro__):
+            fields.update(getattr(cls, "LIVE_CONFIG_FIELDS", {}))
+
+        schema: list[dict] = []
+        for key, attr in fields.items():
+            cur = getattr(self, attr, None)
+            if isinstance(cur, bool):
+                wire_type, wire_cur = "bool", cur
+            elif isinstance(cur, int):
+                wire_type, wire_cur = "int", cur
+            elif isinstance(cur, float):
+                wire_type, wire_cur = "float", cur
+            else:
+                wire_type, wire_cur = "str", ("" if cur is None else str(cur))
+            schema.append({"name": key, "type": wire_type, "current": wire_cur})
+        return schema
+
     def _handle_target_ratio(self, val: float | int | None) -> None:
         """Live-config handler for ``target_ratio`` override.
 
@@ -2668,6 +2698,22 @@ class BaseTrainer(ABC):
         phase = getattr(tcfg, "phase", None)
         live_config = LiveConfig(control_path, namespace=phase)
 
+        # natstack supervisor bridge (additive, env-gated by BGKIT_BRIDGE_SOCK).
+        # Returns None when the env var is unset → every hook below is guarded by
+        # ``if bridge is not None:`` so the unset path is byte-for-byte unchanged.
+        bridge = NatstackBridge.maybe_create()
+        if bridge is not None:
+            try:
+                static_cfg = OmegaConf.to_container(self.cfg, resolve=False)
+            except Exception:
+                static_cfg = {}
+            bridge.emit_hello(
+                phase=str(phase) if phase is not None else "train",
+                config=static_cfg if isinstance(static_cfg, dict) else {},
+                max_steps=int(max_steps),
+            )
+            bridge.emit_knobs(self._bridge_knob_schema())
+
         # Checkpoint pruning
         prune_cfg = tcfg.get("checkpoint_pruning", {})
         prune_enabled = prune_cfg.get("enabled", False) if prune_cfg else False
@@ -2831,9 +2877,26 @@ class BaseTrainer(ABC):
                         logger.info("train_step", step=step, **metrics)
                     if wandb_run is not None:
                         wandb_run.log(metrics, step=step)
+                    if bridge is not None:
+                        bridge.emit_metric(step, "train", metrics)
+                        bridge.emit_status(
+                            step,
+                            hps={
+                                d["name"]: d["current"]
+                                for d in self._bridge_knob_schema()
+                            },
+                            phase=str(phase) if phase is not None else None,
+                            max_steps=max_steps,
+                        )
 
                     # Eval
-                    if eval_every > 0 and step > 0 and step % eval_every == 0:
+                    _bridge_eval = bridge is not None and bridge.eval_requested
+                    if _bridge_eval:
+                        bridge.eval_requested = False
+                    if (
+                        (eval_every > 0 and step > 0 and step % eval_every == 0)
+                        or _bridge_eval
+                    ):
                         self._release_training_transients()
                         from bgkit.utils.step_watchdog import pause as _wd_pause
                         from bgkit.utils.step_watchdog import resume as _wd_resume
@@ -2850,6 +2913,15 @@ class BaseTrainer(ABC):
                         logger.info("eval", step=step, **eval_metrics)
                         if wandb_run is not None:
                             wandb_run.log(eval_metrics, step=step)
+                        if bridge is not None:
+                            bridge.emit_metric(step, "eval", eval_metrics)
+                            bridge.emit_event(
+                                step,
+                                "eval_done",
+                                {"loss": eval_metrics.get("eval/loss")}
+                                if "eval/loss" in eval_metrics
+                                else None,
+                            )
 
                         last_eval_metrics = eval_metrics
                         last_eval_step = step
@@ -2886,6 +2958,24 @@ class BaseTrainer(ABC):
 
                     # Live config polling
                     changes = live_config.poll()
+
+                    # natstack bridge control — drained and applied HERE, at the
+                    # same step boundary as the file-based live config, so every
+                    # existing LIVE_CONFIG_* knob works for free. ``set_hp``
+                    # patches are merged into ``changes`` (so they also flow
+                    # through the inline local-variable updates below: lr,
+                    # eval_every, save_every, max_steps, warmup_steps);
+                    # request_eval / save_checkpoint / pause / resume / list_knobs
+                    # are handled after the apply block.
+                    _bridge_cmds: list[dict] = []
+                    if bridge is not None:
+                        _bridge_cmds = bridge.drain_control()
+                        for _frame in _bridge_cmds:
+                            if _frame.get("t") == "set_hp":
+                                _patch = _frame.get("patch")
+                                if isinstance(_patch, dict):
+                                    changes = {**changes, **_patch}
+
                     if changes:
                         # Apply LR changes
                         if "lr" in changes:
@@ -2956,9 +3046,69 @@ class BaseTrainer(ABC):
                         # Apply trainer-specific changes (loss weights, etc.)
                         self.apply_live_config(changes)
 
+                    # natstack bridge control commands (non-set_hp). Applied at
+                    # the same boundary; applied_seq stamped per frame. set_hp
+                    # was already merged into ``changes`` above.
+                    if bridge is not None and _bridge_cmds:
+                        for _frame in _bridge_cmds:
+                            _t = _frame.get("t")
+                            _seq = int(_frame.get("seq", 0) or 0)
+                            if _t == "set_hp":
+                                bridge.note_applied_seq(_seq)
+                                bridge.ack(_seq, ok=True)
+                            elif _t == "list_knobs":
+                                bridge.emit_knobs(
+                                    self._bridge_knob_schema(), reply_to=_seq
+                                )
+                            elif _t == "request_eval":
+                                bridge.eval_requested = True
+                                bridge.note_applied_seq(_seq)
+                                bridge.ack(_seq, ok=True)
+                            elif _t == "save_checkpoint":
+                                bridge.checkpoint_requested = True
+                                bridge.note_applied_seq(_seq)
+                                bridge.ack(_seq, ok=True)
+                            elif _t == "pause":
+                                bridge.paused = True
+                                bridge.note_applied_seq(_seq)
+                                bridge.ack(_seq, ok=True)
+                            elif _t == "resume":
+                                bridge.paused = False
+                                bridge.note_applied_seq(_seq)
+                                bridge.ack(_seq, ok=True)
+
+                    # Bridge pause: block here (still consulting control) until
+                    # resumed or interrupted, so no training step advances while
+                    # paused. Cheap poll; only entered when a pause command landed.
+                    if bridge is not None and bridge.paused:
+                        while bridge.paused and not interruptor.should_stop:
+                            for _frame in bridge.drain_control():
+                                _t = _frame.get("t")
+                                _seq = int(_frame.get("seq", 0) or 0)
+                                if _t == "resume":
+                                    bridge.paused = False
+                                    bridge.note_applied_seq(_seq)
+                                    bridge.ack(_seq, ok=True)
+                                elif _t == "list_knobs":
+                                    bridge.emit_knobs(
+                                        self._bridge_knob_schema(), reply_to=_seq
+                                    )
+                                elif _t == "set_hp":
+                                    # Defer HP application to the next live step;
+                                    # just ack receipt while paused.
+                                    bridge.note_applied_seq(_seq)
+                                    bridge.ack(_seq, ok=True)
+                            time.sleep(0.1)
+
                     # Checkpoint
                     saved_this_step = False
-                    if save_every > 0 and step > 0 and step % save_every == 0:
+                    _bridge_ckpt = bridge is not None and bridge.checkpoint_requested
+                    if _bridge_ckpt:
+                        bridge.checkpoint_requested = False
+                    if (
+                        (save_every > 0 and step > 0 and step % save_every == 0)
+                        or _bridge_ckpt
+                    ):
                         self._training_state = self._build_training_state(
                             es_best, es_evals_without_improvement, wandb_run,
                         )
@@ -3010,6 +3160,12 @@ class BaseTrainer(ABC):
                             str(ckpt_path)
                         )
                         saved_this_step = True
+                        if bridge is not None:
+                            bridge.emit_event(
+                                step,
+                                "checkpoint_saved",
+                                {"path": str(ckpt_path)},
+                            )
 
                     # Graceful shutdown check
                     if interruptor.should_stop:
@@ -3066,6 +3222,8 @@ class BaseTrainer(ABC):
                             # Resume prefers the NVMe copy (a persistent host
                             # bind-mount), so an incomplete archive loses nothing.
                             self._archiver.wait_idle(timeout=120.0)
+                        if bridge is not None:
+                            bridge.emit_event(step, "finished", {"reason": "interrupted"})
                         return
 
                     step += 1
@@ -3107,6 +3265,20 @@ class BaseTrainer(ABC):
                     )
                     ckpt_manager.prune()
                 (checkpoint_dir / ".last_checkpoint").write_text(str(ckpt_path))
+                if bridge is not None:
+                    bridge.emit_event(self.global_step, "finished")
+        except BaseException as _exc:  # noqa: BLE001 — emit then re-raise
+            if bridge is not None:
+                _is_oom = isinstance(_exc, RuntimeError) and (
+                    "out of memory" in str(_exc).lower()
+                    or "CUDA out of memory" in str(_exc)
+                )
+                bridge.emit_event(
+                    self.global_step,
+                    "oom" if _is_oom else "error",
+                    {"error": str(_exc)[:500], "type": type(_exc).__name__},
+                )
+            raise
         finally:
             if getattr(self, "_archiver", None) is not None:
                 # Training done — drain all pending archives to the HDD so the
