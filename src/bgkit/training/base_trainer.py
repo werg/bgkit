@@ -1184,20 +1184,42 @@ class BaseTrainer(ABC):
         return None, ()
 
     @staticmethod
-    def _restore_opt_tensor(v, device):
-        """Move a saved optimizer-state value to ``device`` and upcast bf16/fp16
-        float buffers back to fp32 — the inverse of the bf16 downcast applied in
-        :meth:`_build_optimizer_state_by_name`. The optimizer's math expects
-        fp32 state and fresh (unresumed) runs use fp32, so this keeps a resumed
-        run numerically aligned going forward. Non-tensors and already-fp32
-        buffers (older checkpoints saved before the downcast) pass through
-        unchanged, so loading stays backward-compatible."""
+    def _restore_opt_tensor(v, device, target_float_dtype=torch.float32):
+        """Move a saved optimizer-state value to ``device`` and cast bf16/fp16
+        float buffers to ``target_float_dtype`` — the inverse of the bf16
+        downcast applied in :meth:`_build_optimizer_state_by_name`.
+
+        ``target_float_dtype`` must be the dtype a FRESH (unresumed) optimizer
+        would use for this buffer (see :meth:`_fresh_opt_state_float_dtype`):
+
+        - **Muon / fp32-master optimizers** keep fp32 state (the fp32
+          ``master_param`` MUST stay fp32; momentum/exp_avg are re-upcast to
+          fp32 inside ``Muon.step``). Default fp32 preserves this exactly.
+        - **Plain torch AdamW on a bf16 model** creates its moments as
+          ``zeros_like(param)`` → bf16, and does NOT self-heal. Upcasting them
+          to fp32 on resume makes ``exp_avg.lerp_(grad, …)`` mix fp32 state with
+          a bf16 grad → ``RuntimeError: expected dtype float for 'end'``. Passing
+          ``param.dtype`` (bf16) keeps the resumed state matching a fresh run.
+
+        Non-tensors and already-target-dtype buffers pass through unchanged, so
+        loading stays backward-compatible (older fp32 checkpoints round-trip)."""
         if not isinstance(v, torch.Tensor):
             return v
         v = v.to(device)
         if v.is_floating_point() and v.dtype in (torch.bfloat16, torch.float16):
-            v = v.to(torch.float32)
+            v = v.to(target_float_dtype)
         return v
+
+    def _fresh_opt_state_float_dtype(self, param: torch.nn.Parameter) -> torch.dtype:
+        """The float dtype a FRESH optimizer state would use for ``param`` — the
+        target for :meth:`_restore_opt_tensor`. Plain ``torch.optim.AdamW``
+        builds moments as ``zeros_like(param)`` (== ``param.dtype``); Muon keeps
+        an fp32 master + self-heals its moments to fp32, so fp32 is both correct
+        and required there. Default fp32 for any other / unknown optimizer keeps
+        the historical behavior and is safe (matches pre-fix loads)."""
+        if getattr(self, "_optimizer_type", "muon") == "adamw":
+            return param.dtype
+        return torch.float32
 
     def _restore_optimizer_state_by_name(self, state_by_name: dict) -> None:
         """Install name-keyed optimizer state into the current optimizer.
@@ -1251,8 +1273,9 @@ class BaseTrainer(ABC):
                 matched_saved_names.add(saved_name)
                 saved = state_by_name[saved_name]
                 device = param.device
+                tgt_dtype = self._fresh_opt_state_float_dtype(param)
                 moved = {
-                    k: self._restore_opt_tensor(v, device)
+                    k: self._restore_opt_tensor(v, device, tgt_dtype)
                     for k, v in saved.items()
                 }
                 self.optimizer.state[param] = moved
@@ -1267,8 +1290,9 @@ class BaseTrainer(ABC):
                 if packed_state is not None:
                     matched_saved_names.update(packed_source_names)
                     device = param.device
+                    tgt_dtype = self._fresh_opt_state_float_dtype(param)
                     moved = {
-                        k: self._restore_opt_tensor(v, device)
+                        k: self._restore_opt_tensor(v, device, tgt_dtype)
                         for k, v in packed_state.items()
                     }
                     self.optimizer.state[param] = moved

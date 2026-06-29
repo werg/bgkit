@@ -278,6 +278,27 @@ class BgKITEncoder(nn.Module):
                 f"families: {sorted(self.projection_blocks.keys())}"
             )
 
+        # ---- L1->L1 recursive bridge (encoder-internal, DECODER-AGNOSTIC) ----
+        # Maps L1's (pre-norm) hidden output back into L1's input-embedding
+        # space, exactly analogous to ``l0.auto_repro_head`` (the L0->L1
+        # bridge). It is a plain ``nn.Linear(hidden, hidden)`` with NO
+        # qwen/falcon distinction — it never touches the decoder. This is the
+        # recursive analog used by the L1L1RecursiveDistillTrainer
+        # (phase2_kb_l1l1) to teach L1 to compress in L1-input space.
+        #
+        # DISTINCT from ``projection_blocks`` (decoder-family-keyed, maps into
+        # the decoder's embedding space) — do NOT conflate the two.
+        #
+        # Initialized by cloning ``l0.auto_repro_head`` ("start from the
+        # L0->L1 projection"). At construction l0's bridge is at fresh init;
+        # ``from_pretrained_with_state_dict`` re-clones from the LOADED l0
+        # bridge when the checkpoint lacks ``l1l1_bridge.*`` keys (see
+        # ``_clone_l1l1_bridge_if_absent``).
+        self.l1l1_bridge = nn.Linear(l1.hidden_dim, l1.hidden_dim)
+        _src_bridge = getattr(self.l0, "auto_repro_head", None)
+        if isinstance(_src_bridge, nn.Linear):
+            self.l1l1_bridge.load_state_dict(_src_bridge.state_dict())
+
     @property
     def projection_block(self) -> ProjectionBlock:
         """Backward-compatible alias for the active projection block."""
@@ -294,6 +315,39 @@ class BgKITEncoder(nn.Module):
 
     def get_active_projection_block(self) -> ProjectionBlock:
         return self.projection_blocks[self.active_family]
+
+    def l1_auto_reproduce(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """L1->L1 recursive bridge: map L1 (pre-norm) hidden output back into
+        L1's input-embedding space.
+
+        Mirrors :meth:`LevelCompressor.auto_reproduce` (the L0->L1 bridge) but
+        for the recursive L1 stage: applies ``self.l1.norm`` first (L1 survivor
+        embeddings are pre-norm) then the encoder-internal ``self.l1l1_bridge``
+        linear. Decoder-agnostic — never touches ``projection_blocks``.
+        """
+        return self.l1l1_bridge(self.l1.norm(embeddings))
+
+    @staticmethod
+    def _clone_l1l1_bridge_if_absent(encoder: BgKITEncoder, state_dict: dict) -> None:
+        """Clone the L1->L1 bridge from the (loaded) L0->L1 bridge when the
+        checkpoint did not carry ``l1l1_bridge.*`` keys.
+
+        Stage-A / older checkpoints predate the recursive bridge, so they lack
+        these keys; in that case the bridge must start from the L0->L1
+        projection. When the keys ARE present they have already loaded normally
+        (this is a no-op).
+        """
+        import logging
+
+        if any(k.startswith("l1l1_bridge.") for k in state_dict):
+            return
+        src = getattr(encoder.l0, "auto_repro_head", None)
+        if isinstance(src, nn.Linear):
+            encoder.l1l1_bridge.load_state_dict(src.state_dict())
+            logging.getLogger(__name__).info(
+                "l1l1_bridge_clone_init: l1l1_bridge.* absent from checkpoint; "
+                "cloned weights from l0.auto_repro_head (L0->L1 projection).",
+            )
 
     @property
     def active_projection_output_dim(self) -> int:
@@ -335,6 +389,194 @@ class BgKITEncoder(nn.Module):
         merged_cu = survivor_cu.index_select(0, group_idx).to(torch.int32)
         merged_pos = position_ids_from_cu(merged_cu, int(embeds.shape[0]))
         return embeds, merged_cu, merged_pos, None
+
+    def run_l1_and_project(
+        self,
+        l1_input_embeddings: torch.Tensor,
+        l1_input_cu_seqlens: torch.Tensor,
+        target_ratio_l1: float,
+        content_group_cu_seqlens: torch.Tensor | None = None,
+        prompt_embeddings_l1: torch.Tensor | None = None,
+        prompt_cu_seqlens_l1: torch.Tensor | None = None,
+        prompt_position_ids_l1: torch.Tensor | None = None,
+        pinned_positions_l1: torch.Tensor | None = None,
+        min_per_sample_l1: int = 0,
+        utility_grad_active_l1: bool = False,
+        utility_grad_capture_l1: dict | None = None,
+        forced_survivor_mask_l1: torch.Tensor | None = None,
+        selection_mode_l1: str = "threshold",
+    ):
+        """Shared L1 stage: (cross-section merge →) L1 forward → projection.
+
+        ``l1_input_embeddings`` must ALREADY be in L1's input-embedding space:
+        the L0 survivors bridged through :meth:`l0.auto_reproduce`
+        (hidden→input), with any non-survivor input-space tokens — e.g. the
+        Phase-2 pinned article-ID embeddings — interleaved by the caller. The
+        caller MUST bridge only the survivors, never tokens that are already in
+        input space (``auto_reproduce`` would mangle them).
+
+        Single source of truth for the L1 cross-section + prompt + projection,
+        used by both :meth:`forward` and ``KRKBTrainer`` (which runs L0 and L1
+        separately for the cached-L0 stage split). Returns
+        ``(l1_out, proj_out, proj_cu)``.
+        """
+        if content_group_cu_seqlens is None:
+            l1_content = l1_input_embeddings
+            l1_content_cu = l1_input_cu_seqlens
+            l1_content_pos = position_ids_from_cu(
+                l1_input_cu_seqlens, l1_input_embeddings.shape[0],
+            )
+        else:
+            if forced_survivor_mask_l1 is not None:
+                raise NotImplementedError(
+                    "forced_survivor_mask_l1 is not supported with "
+                    "content_group_cu_seqlens (cross-section L1 re-segments "
+                    "the survivor axis, invalidating a per-section mask)."
+                )
+            (
+                l1_content,
+                l1_content_cu,
+                l1_content_pos,
+                _l1_selectable,
+            ) = self._merge_sections_for_l1(
+                l1_input_embeddings,
+                l1_input_cu_seqlens,
+                content_group_cu_seqlens,
+            )
+        l1_out = self.l1(
+            content_embeddings=l1_content,
+            content_cu_seqlens=l1_content_cu,
+            content_position_ids=l1_content_pos,
+            prompt_embeddings=prompt_embeddings_l1,
+            prompt_cu_seqlens=prompt_cu_seqlens_l1,
+            prompt_position_ids=prompt_position_ids_l1,
+            pinned_positions=pinned_positions_l1,
+            target_ratio=target_ratio_l1,
+            min_per_sample=min_per_sample_l1,
+            utility_grad_active=utility_grad_active_l1,
+            utility_grad_capture=utility_grad_capture_l1,
+            forced_survivor_mask=forced_survivor_mask_l1,
+            selection_mode=selection_mode_l1,
+            content_selectable_mask=None,
+        )
+        proj_cu = l1_out.survivor_cu_seqlens
+        proj_max = _max_from_cu(proj_cu)
+        proj_pos = position_ids_from_cu(proj_cu, l1_out.survivor_embeddings.shape[0])
+        proj_out = self.get_active_projection_block()(
+            l1_out.survivor_embeddings,
+            cu_seqlens=proj_cu,
+            max_seqlen=proj_max,
+            position_ids=proj_pos,
+            survivor_mask=None,
+        )
+        return l1_out, proj_out, proj_cu
+
+    def encode_node(
+        self,
+        children_reps_l1in: torch.Tensor,
+        children_cu_seqlens: torch.Tensor,
+        target_ratio: float,
+        pinned_id_embeddings: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Recursive-L1 entry point for offline bottom-up tree encoding.
+
+        Runs ONE recursive L1 compression pass and returns the node's
+        subtree-summary survivors. This is the cached-L1-tree analog of the
+        L1 stage inside :meth:`run_l1_and_project`, with three deliberate
+        differences:
+
+        - **Input space.** ``children_reps_l1in`` is ALREADY in L1's
+          input-embedding space — the caller has bridged its inputs into it:
+
+          * leaf node → the leaf's articles' L0 survivors bridged through
+            :meth:`l0.auto_reproduce` (L0-output → L1-input);
+          * interior node → the children's cached node reps bridged through
+            :meth:`l1_auto_reproduce` (L1-output → L1-input).
+
+          encode_node NEVER bridges its input itself, and the input dim must
+          equal L1's hidden/input dim (asserted below).
+
+        - **Query-agnostic.** Cached node reps are computed offline with no
+          query conditioning, so encode_node takes no query. Per-node
+          conditioning is limited to the optional ``pinned_id_embeddings``
+          (the node's own id embedding, already in L1-input space), prepended
+          once per node as a single-token L1 prompt so the summary can carry
+          its identity. Query-conditioning is re-applied later on the live
+          search path, not here.
+
+        - **No projection.** encode_node returns the node's survivors in
+          L1-OUTPUT space (pre-norm last block), NOT the projected decoder
+          embeddings — it never touches ``projection_blocks``. A parent node
+          bridges these via :meth:`l1_auto_reproduce` back into L1-input space
+          and calls encode_node again, walking the tree bottom-up.
+
+        Args:
+            children_reps_l1in: ``(N, D)`` packed children reps in L1-input
+                space. ``D`` must equal ``self.l1.hidden_dim``.
+            children_cu_seqlens: ``(n_nodes + 1,)`` int32 segment boundaries —
+                one segment per node being encoded in this batch.
+            target_ratio: L1 compression ratio for this node/depth.
+            pinned_id_embeddings: optional ``(n_nodes, D)`` per-node id
+                embeddings (L1-input space), prepended as a 1-token prompt.
+
+        Returns:
+            ``(node_survivors, node_cu_seqlens)`` — survivors in L1-OUTPUT
+            (pre-norm) space and the matching ``(n_nodes + 1,)`` int32 cu.
+        """
+        if children_reps_l1in.ndim != 2:
+            raise ValueError(
+                "encode_node: children_reps_l1in must be packed (N, D); got "
+                f"{tuple(children_reps_l1in.shape)}"
+            )
+        if int(children_reps_l1in.shape[-1]) != int(self.l1.hidden_dim):
+            raise ValueError(
+                "encode_node: input dim "
+                f"{int(children_reps_l1in.shape[-1])} != L1 input dim "
+                f"{int(self.l1.hidden_dim)} — caller must bridge children reps "
+                "into L1-input space (l0.auto_reproduce for leaves, "
+                "l1_auto_reproduce for interior nodes)."
+            )
+
+        n_nodes = int(children_cu_seqlens.numel()) - 1
+        content_pos = position_ids_from_cu(
+            children_cu_seqlens, int(children_reps_l1in.shape[0]),
+        )
+
+        prompt_emb = None
+        prompt_cu = None
+        prompt_pos = None
+        if pinned_id_embeddings is not None:
+            if pinned_id_embeddings.ndim != 2 or int(
+                pinned_id_embeddings.shape[0]
+            ) != n_nodes:
+                raise ValueError(
+                    "encode_node: pinned_id_embeddings must be "
+                    f"(n_nodes={n_nodes}, D); got "
+                    f"{tuple(pinned_id_embeddings.shape)}"
+                )
+            if int(pinned_id_embeddings.shape[-1]) != int(self.l1.hidden_dim):
+                raise ValueError(
+                    "encode_node: pinned_id_embeddings dim "
+                    f"{int(pinned_id_embeddings.shape[-1])} != L1 input dim "
+                    f"{int(self.l1.hidden_dim)}"
+                )
+            prompt_emb = pinned_id_embeddings.to(children_reps_l1in.dtype)
+            prompt_cu = torch.arange(
+                0, n_nodes + 1, dtype=torch.int32,
+                device=children_reps_l1in.device,
+            )
+            prompt_pos = position_ids_from_cu(prompt_cu, n_nodes)
+
+        l1_out = self.l1(
+            content_embeddings=children_reps_l1in,
+            content_cu_seqlens=children_cu_seqlens,
+            content_position_ids=content_pos,
+            prompt_embeddings=prompt_emb,
+            prompt_cu_seqlens=prompt_cu,
+            prompt_position_ids=prompt_pos,
+            target_ratio=target_ratio,
+        )
+        return l1_out.survivor_embeddings, l1_out.survivor_cu_seqlens
 
     def forward(
         self,
@@ -394,71 +636,39 @@ class BgKITEncoder(nn.Module):
         )
 
         if target_ratio_l1 is None:
-            proj_input = l0_out.survivor_embeddings
-            proj_cu = l0_out.survivor_cu_seqlens
+            # L1 skipped: project the L0 survivors directly.
             l1_out: LevelOutput | None = None
-        else:
-            l1_input = self.l0.auto_reproduce(l0_out.survivor_embeddings)
-            if content_group_cu_seqlens is None:
-                # Legacy per-section L1 (no cross-section interaction). No prompt
-                # → with_prompt L1 falls through to the plain content path.
-                l1_content = l1_input
-                l1_content_cu = l0_out.survivor_cu_seqlens
-                l1_content_pos = position_ids_from_cu(
-                    l0_out.survivor_cu_seqlens, l1_input.shape[0],
-                )
-                l1_selectable = None
-            else:
-                if forced_survivor_mask_l1 is not None:
-                    raise NotImplementedError(
-                        "forced_survivor_mask_l1 is not supported with "
-                        "content_group_cu_seqlens (cross-section L1 re-segments "
-                        "the survivor axis, invalidating a per-section mask)."
-                    )
-                (
-                    l1_content,
-                    l1_content_cu,
-                    l1_content_pos,
-                    l1_selectable,
-                ) = self._merge_sections_for_l1(
-                    l1_input,
-                    l0_out.survivor_cu_seqlens,
-                    content_group_cu_seqlens,
-                )
-            l1_out = self.l1(
-                content_embeddings=l1_content,
-                content_cu_seqlens=l1_content_cu,
-                content_position_ids=l1_content_pos,
-                prompt_embeddings=prompt_embeddings_l1,
-                prompt_cu_seqlens=prompt_cu_seqlens_l1,
-                prompt_position_ids=prompt_position_ids_l1,
-                target_ratio=target_ratio_l1,
-                min_per_sample=min_per_sample_l1,
-                utility_grad_active=utility_grad_active_l1,
-                utility_grad_capture=utility_grad_capture_l1,
-                forced_survivor_mask=forced_survivor_mask_l1,
-                selection_mode=selection_mode_l1,
-                # Separators kept as selectable content: the survivorship
-                # selection assumes 1:1 content↔head-score (base_raw per content
-                # position); excluding separators desyncs seg_ids vs base_raw
-                # (index_add_ RuntimeError). They still give L1 attention
-                # boundaries and, if selected, mark section boundaries for the
-                # decoder. l1_selectable retained for a future selection-aware
-                # refinement; None today.
-                content_selectable_mask=None,
+            proj_cu = l0_out.survivor_cu_seqlens
+            proj_max = _max_from_cu(proj_cu)
+            proj_pos = position_ids_from_cu(
+                proj_cu, l0_out.survivor_embeddings.shape[0],
             )
-            proj_input = l1_out.survivor_embeddings
-            proj_cu = l1_out.survivor_cu_seqlens
-
-        proj_max = _max_from_cu(proj_cu)
-        proj_pos = position_ids_from_cu(proj_cu, proj_input.shape[0])
-        proj_out = self.get_active_projection_block()(
-            proj_input,
-            cu_seqlens=proj_cu,
-            max_seqlen=proj_max,
-            position_ids=proj_pos,
-            survivor_mask=None,
-        )
+            proj_out = self.get_active_projection_block()(
+                l0_out.survivor_embeddings,
+                cu_seqlens=proj_cu,
+                max_seqlen=proj_max,
+                position_ids=proj_pos,
+                survivor_mask=None,
+            )
+        else:
+            # Bridge L0 survivors (hidden→input space), then run the shared L1
+            # stage (cross-section merge → L1 → projection). KRKBTrainer calls
+            # the SAME run_l1_and_project, so the two paths cannot diverge.
+            l1_input = self.l0.auto_reproduce(l0_out.survivor_embeddings)
+            l1_out, proj_out, proj_cu = self.run_l1_and_project(
+                l1_input_embeddings=l1_input,
+                l1_input_cu_seqlens=l0_out.survivor_cu_seqlens,
+                target_ratio_l1=target_ratio_l1,
+                content_group_cu_seqlens=content_group_cu_seqlens,
+                prompt_embeddings_l1=prompt_embeddings_l1,
+                prompt_cu_seqlens_l1=prompt_cu_seqlens_l1,
+                prompt_position_ids_l1=prompt_position_ids_l1,
+                min_per_sample_l1=min_per_sample_l1,
+                utility_grad_active_l1=utility_grad_active_l1,
+                utility_grad_capture_l1=utility_grad_capture_l1,
+                forced_survivor_mask_l1=forced_survivor_mask_l1,
+                selection_mode_l1=selection_mode_l1,
+            )
 
         out_cu = effective_projection_cu(proj_out, proj_cu)
         counts = effective_projection_counts(proj_out, proj_cu)
@@ -711,6 +921,9 @@ class BgKITEncoder(nn.Module):
             )
         }
         result = encoder.load_state_dict(migrated, strict=False)
+        # L1->L1 recursive bridge: clone from the (now loaded) L0->L1 bridge
+        # when the checkpoint predates it (e.g. phase2_kb_step1194).
+        cls._clone_l1l1_bridge_if_absent(encoder, migrated)
         # If the active family is missing from the checkpoint AND another
         # family IS present, fall back to cloning *and* warn loudly: the
         # active family's projection block has never been trained against
@@ -931,6 +1144,7 @@ class BgKITEncoder(nn.Module):
             )
         }
         result = encoder.load_state_dict(migrated, strict=False)
+        cls._clone_l1l1_bridge_if_absent(encoder, migrated)
         import logging
 
         logger = logging.getLogger(__name__)

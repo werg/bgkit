@@ -69,21 +69,40 @@ def _load_encoder(
     from bgkit.training.checkpointing import load_checkpoint
 
     _meta, state = load_checkpoint(phase1_checkpoint)
-    model_state = state.get("model", {})
-    encoder_state = {
-        k.replace("encoder.", "", 1): v
-        for k, v in model_state.items()
-        if k.startswith("encoder.")
-    }
+    # New-layout checkpoints (Phase 1 summarization dual-decoder, Phase 2 KB)
+    # write the encoder as its own ``encoder.pt`` whose state-dict keys are
+    # already un-prefixed (``l0.*`` / ``l1.*`` / ``projection_blocks.*``).
+    # Older single-file checkpoints nest everything under ``model`` with an
+    # ``encoder.`` prefix. Accept both.
+    encoder_state = state.get("encoder")
+    if encoder_state is None:
+        model_state = state.get("model", {})
+        encoder_state = {
+            k.replace("encoder.", "", 1): v
+            for k, v in model_state.items()
+            if k.startswith("encoder.")
+        }
 
     if stage_a_checkpoint is not None:
         _meta_a, state_a = load_checkpoint(stage_a_checkpoint)
-        model_state_a = state_a.get("model", {})
-        l0_state_a = {
-            k.replace("encoder.", "", 1): v
-            for k, v in model_state_a.items()
-            if k.startswith("encoder.l0.")
-        }
+        enc_a = state_a.get("encoder")
+        if enc_a is not None:
+            # NOTE: ``l0_task_prompts.`` is a SIBLING of ``l0.`` (not ``l0.…``),
+            # so it must be matched explicitly or the per-task prompts are
+            # silently dropped from the Stage-B cache.
+            l0_state_a = {
+                k: v
+                for k, v in enc_a.items()
+                if k.startswith("l0.") or k.startswith("l0_task_prompts.")
+            }
+        else:
+            model_state_a = state_a.get("model", {})
+            l0_state_a = {
+                k.replace("encoder.", "", 1): v
+                for k, v in model_state_a.items()
+                if k.startswith("encoder.l0.")
+                or k.startswith("encoder.l0_task_prompts.")
+            }
         if not l0_state_a:
             raise RuntimeError(
                 f"Stage A checkpoint {stage_a_checkpoint} has no "
@@ -94,6 +113,21 @@ def _load_encoder(
     encoder = BgKITEncoder.load_l0_only(
         "Qwen/Qwen3.5-0.8B-Base", encoder_state, hidden_dim=1024,
     )
+    # Per-task L0 prompts (present iff the encoder was trained with
+    # l0_prompt_tokens > 0). load_l0_only doesn't know about them, so extract
+    # them from the state dict and stash on the encoder. The Stage-B cache MUST
+    # be encoded with the SAME prompts L0 was trained with, or cached survivors
+    # won't match the live-L0 behaviour they're standing in for.
+    task_prompts: dict[str, torch.Tensor] = {}
+    for _k, _v in encoder_state.items():
+        if _k.startswith("l0_task_prompts."):
+            task_prompts[_k.split(".", 1)[1]] = _v
+    encoder._l0_task_prompts = task_prompts  # type: ignore[attr-defined]
+    if task_prompts:
+        print(
+            f"[precompute] loaded {len(task_prompts)} per-task L0 prompts: "
+            f"{sorted(task_prompts)}",
+        )
     return encoder
 
 
@@ -154,10 +188,33 @@ def _encode_and_write_batch(
         input_embeds, cu_seqlens, position_ids = _pack_batch(
             tokens_list, embed_tokens, device,
         )
+        # Per-task L0 prompt (when the encoder carries one for this dataset):
+        # replicate it once per article so cached survivors reflect the same
+        # task-conditioned L0 the trainer used.
+        l0_prompt_emb = None
+        l0_prompt_cu = None
+        l0_prompt_pos = None
+        _tp = getattr(encoder, "_l0_task_prompts", {}) or {}
+        if dataset in _tp:
+            _p = _tp[dataset].to(device=device, dtype=input_embeds.dtype)
+            _P = int(_p.shape[0])
+            _n = len(present)
+            l0_prompt_emb = (
+                _p.unsqueeze(0).expand(_n, -1, -1).reshape(_n * _P, -1)
+            )
+            l0_prompt_cu = torch.arange(
+                0, (_n + 1) * _P, _P, dtype=torch.int32, device=device,
+            )
+            l0_prompt_pos = position_ids_from_cu(
+                l0_prompt_cu, int(l0_prompt_emb.shape[0]),
+            )
         out = encoder.l0(
             content_embeddings=input_embeds,
             content_cu_seqlens=cu_seqlens,
             content_position_ids=position_ids,
+            prompt_embeddings=l0_prompt_emb,
+            prompt_cu_seqlens=l0_prompt_cu,
+            prompt_position_ids=l0_prompt_pos,
             target_ratio=retention_ratio,
         )
         survivors_flat = out.survivor_embeddings.cpu().float().numpy()

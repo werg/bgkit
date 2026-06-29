@@ -1,0 +1,13 @@
+# @package _global_
+# Experiment preset: Phase 2 PATH-SELECTIVE recursive-L1 navigation over the big
+# knowledge trees (KILT / PubMedQA / NarrativeQA). phase: phase2_kb ->
+# KRKBTrainer with recursive_l1_tree.enabled: true and full_backprop falsy
+# (cached L1-tree, off-path nodes read DETACHED from the SurvivorBlockCache).
+# Requires the L1-tree cache (scripts/precompute_l1_tree.py) for every dataset.
+defaults:
+  - /config
+  - /training/phase2_kb_stage_b_recursive_l1
+  - _self_
+
+run_name: phase2_kb_stage_b_recursive_l1
+resume_checkpoint: null

@@ -631,6 +631,21 @@ services:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase2_kb_stage_b"]
 
+  # 8-step wall-time / memory SMOKE of the per-repo full-backprop trainer (the
+  # review's M1/M2 check) on the worst-case-inclusive git_commit_repro_smoke
+  # subset. restart: "no" so the probe runs once and exits (not a real run).
+  train-phase2-kb-git-repro-smoke:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_git_repro_smoke"]
+
+  # Recursive-L1 (L1->L1) bridge distillation. Clone of train-phase2-kb-stage-a
+  # (gpu-common) with the command overridden. Trains ONLY encoder.l1l1_bridge;
+  # decoder-agnostic (no decoder loaded).
+  train-phase2-kb-l1l1-distill:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase2_kb_l1l1_distill"]
+
   train-phase2-kb-stage-a-falcon:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase2_kb_stage_a_falcon"]

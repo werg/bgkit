@@ -26,6 +26,7 @@ import contextlib
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 
 import structlog
 import torch
@@ -35,6 +36,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset, random_split
 
 from bgkit.data.article_token_store import ArticleTokenStore
 from bgkit.data.bgkit_tool_template import (
+    BGKIT_BROWSE_SENTINEL,
     BGKIT_SENTINEL,
     BGKIT_TOPIC_SENTINEL,
     make_system_prompt,
@@ -77,6 +79,11 @@ from bgkit.utils.packing import (
 
 logger = structlog.get_logger()
 
+# Default general (query-agnostic) compression prompt fed to the shared repo
+# tree (L0 + L1) in per-repo full-backprop mode.  Overridable via
+# ``training.recursive_l1_tree.general_prompt``.
+DEFAULT_RECURSIVE_GENERAL_PROMPT = "compress this repository's commit history"
+
 
 # ---------------------------------------------------------------------------
 # Model container
@@ -90,13 +97,25 @@ class _KBModel(nn.Module):
     def __init__(
         self,
         encoder: nn.Module,
-        decoder: nn.Module,
-        lora_router: LoRARouter | None,
+        decoder: nn.Module | None = None,
+        lora_router: LoRARouter | None = None,
         topic_embeddings: TopicEmbeddingModule | None = None,
+        decoders: dict[str, nn.Module] | None = None,
     ) -> None:
         super().__init__()
         self.encoder = encoder
-        self.decoder = decoder
+        # Round-robin training holds one decoder per family in a ModuleDict so a
+        # single ``state_dict()`` round-trips both decoders (keys
+        # ``decoders.qwen35.*`` / ``decoders.falcon_h1.*``); single-decoder
+        # stages keep the plain ``decoder`` attribute. Either way the trainer's
+        # ``self.decoder`` pointer is aimed at the active family's module before
+        # every forward. No code reads ``model.decoder`` directly (the trainer
+        # uses ``self.decoder``), so ``decoder=None`` in dict mode is safe.
+        if decoders is not None:
+            self.decoders = nn.ModuleDict(decoders)
+            self.decoder = None
+        else:
+            self.decoder = decoder
         self.lora_router = lora_router
         self.topic_embeddings = topic_embeddings
 
@@ -172,6 +191,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     _log_every = 5
     _use_device_prefetcher = False  # samples carry variable-shaped state
 
+    # Live-config handlers (merged across the MRO with BaseTrainer's, so the
+    # inherited lr / max_batch_tokens / ... handlers are preserved). The
+    # per-repo file-sample cap is nullable (null = unlimited), so it needs a
+    # handler rather than the declarative numeric LIVE_CONFIG_FIELDS path.
+    LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
+        "max_file_samples_per_repo": "_handle_max_file_samples_per_repo",
+    }
+
     # Ablation modes — set via set_ablation_mode() during eval.
     ABLATION_NONE = None
     ABLATION_ZEROED = "zeroed"       # survivors → zeros (no context info)
@@ -216,6 +243,45 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._ablation_mode: str | None = None
         self._encoder_lora_enabled = True
         self._direct_l1_trainable = False
+        # Recursive-L1 (Phase 3) path-selective browse encode. Default OFF —
+        # the non-recursive browse-text path is fully preserved. Set in
+        # setup() from ``training.recursive_l1_tree.enabled``.
+        self._recursive_l1: bool = False
+        self._l1_tree_cache = None
+        self._recursive_l1_retention: float = 0.15
+        # Full-backprop recursive-L1 (git-repro full-tree curriculum). When
+        # True, the WHOLE window subtree is re-encoded live every step and
+        # gradient flows to ALL nodes (on-path AND off-path) — no cached/
+        # detached off-path reads. SMALL trees only (git-repro windows).
+        self._recursive_l1_full_backprop: bool = False
+        # PER-REPO full-backprop (git_commit_repro file-state reconstruction).
+        # When True the whole window-0 subtree is encoded ONCE per repo
+        # (shared, gradient-accumulated across the repo's file-samples) with a
+        # GENERAL query-agnostic prompt; each file-sample's browse turns splice
+        # the shared node reps while only its drill-down bgkit turn re-encodes
+        # the drilled file-diff with the SPECIFIC commit/filename query. Set in
+        # setup() from ``training.recursive_l1_tree.full_backprop_per_repo``.
+        self._per_repo_full_backprop: bool = False
+        # Per-repo cost knob (None = unlimited; int K subsamples K file-samples
+        # per repo-batch, re-seeded per epoch). Set in setup() from
+        # ``recursive_l1_tree.max_file_samples_per_repo``.
+        self._max_file_samples_per_repo: int | None = None
+        # Recursive retention ramps (float OR {start,end,ramp_steps}); resolved
+        # by global_step in _recursive_l{0,1}_retention_now().  ``None`` keeps
+        # the legacy scalar fallback (``_recursive_l1_retention``).
+        self._recursive_l0_retention_cfg: float | dict | None = None
+        self._recursive_l1_retention_cfg: float | dict | None = None
+        # Transient L0 retention override active only while the shared repo
+        # tree is being encoded (so the tree's L0 leaves use the recursive L0
+        # ramp, not the per-dataset ``l0_retention``).  None = inactive.
+        self._recursive_l0_override: float | None = None
+        # Shared per-repo tree node reps (node_id -> (proj, l1out)) + a flag
+        # telling _recursive_browse_node_reps to LOOK UP rather than re-encode.
+        self._shared_tree_memo: dict | None = None
+        self._per_repo_shared_tree_active: bool = False
+        # General (query-agnostic) compression prompt fed to BOTH L0 and L1 of
+        # the shared repo tree.  Per-repo mode only; set in setup().
+        self._recursive_general_prompt: str = DEFAULT_RECURSIVE_GENERAL_PROMPT
         # Training-time random ablation (capability regression prevention).
         # Rolled once per sample in _build_decoder_segments_core; disabled
         # during eval. Probabilities are cfg-driven and sum independently.
@@ -241,6 +307,67 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         from bgkit.env import get_data_dir
 
         return get_data_dir() / default
+
+    def _build_decoder_for_family(self, decoder_cfg):
+        """Build one ``ReconstructionDecoder`` + tokenizer from a decoder config
+        block, with identical CE-impl / gradient-checkpointing / tokenizer /
+        Falcon-template wiring. Factored out of :meth:`setup` so round-robin can
+        build both families (qwen35 + falcon_h1). Returns ``(decoder, tokenizer)``.
+        """
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        from bgkit.data.chat_template import patch_falcon_h1_chat_template
+
+        decoder_name = decoder_cfg["backbone_name"]
+        family = normalize_decoder_family(decoder_cfg.get("family", "qwen35"))
+        attn_impl = resolve_decoder_attention_implementation(
+            self.cfg.compute.get(
+                "decoder_attention_implementation",
+                self.cfg.compute.get("attention_implementation", "auto"),
+            ),
+            decoder_family=family,
+        )
+        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        backbone = AutoModelForCausalLM.from_pretrained(
+            decoder_name,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+            attn_implementation=attn_impl,
+        ).to(self.device)
+        hidden = backbone.get_input_embeddings().weight.shape[1]
+        decoder = ReconstructionDecoder(
+            backbone, hidden_dim=hidden, decoder_family=family,
+        )
+        decoder.set_lm_ce_impl(
+            self.step_cfg.get(
+                "decoder_ce_impl", self.cfg.compute.get("decoder_ce_impl", None),
+            ),
+        )
+        decoder.set_lm_ce_strict(
+            self.step_cfg.get(
+                "decoder_ce_strict", self.cfg.compute.get("decoder_ce_strict", None),
+            ),
+        )
+        decoder.train()
+        # Decoder GC via the reentrant mechanism the summarization trainer uses
+        # (works with FLA DeltaNet/Mamba in both families; see the primary decoder
+        # build above).
+        from bgkit.training.gradient_utils import (
+            maybe_enable_decoder_gradient_checkpointing,
+        )
+
+        maybe_enable_decoder_gradient_checkpointing(backbone, self.cfg)
+        tokenizer = AutoTokenizer.from_pretrained(
+            decoder_name, trust_remote_code=True,
+        )
+        if patch_falcon_h1_chat_template(tokenizer):
+            logger.info("falcon_chat_template_patched", decoder_tokenizer=decoder_name)
+        logger.info(
+            "phase2_kb_decoder_built",
+            family=family, model=decoder_name,
+            ce_impl=decoder.lm_ce_impl, ce_strict=decoder.lm_ce_strict,
+        )
+        return decoder, tokenizer
 
     # ------------------------------------------------------------------
     # setup()
@@ -301,20 +428,16 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # ``training.activation_checkpointing.decoder: true`` when a phase
         # needs the extra activation headroom.
         ac_cfg = self.step_cfg.get("activation_checkpointing", {}) or {}
-        if ac_cfg.get("decoder", False) and hasattr(
-            decoder_backbone, "gradient_checkpointing_enable",
-        ):
-            try:
-                decoder_backbone.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={"use_reentrant": False},
-                )
-                logger.info("phase2_kb_decoder_gc_enabled")
-            except TypeError:
-                # Older HF versions don't accept kwargs.
-                decoder_backbone.gradient_checkpointing_enable()
-                logger.info("phase2_kb_decoder_gc_enabled_legacy")
-        else:
-            logger.info("phase2_kb_decoder_gc_disabled")
+        # Decoder GC via the SAME mechanism the summarization round-robin trainer
+        # uses (training.decoder_gradient_checkpointing: "reentrant"). Reentrant
+        # mode skips the use_reentrant=False tensor-match check, so it works with
+        # the FLA DeltaNet/Mamba kernels in Qwen3.5 + Falcon-H1 (use_reentrant=False
+        # raised CheckpointError: 666 vs 382 saved tensors).
+        from bgkit.training.gradient_utils import (
+            maybe_enable_decoder_gradient_checkpointing,
+        )
+
+        maybe_enable_decoder_gradient_checkpointing(decoder_backbone, self.cfg)
         self._checkpoint_encoder = bool(ac_cfg.get("encoder", False))
         logger.info(
             "phase2_kb_encoder_activation_checkpointing_resolved",
@@ -347,9 +470,67 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 decoder_tokenizer=decoder_name,
             )
 
+        # --- Round-robin second decoder (dual-family training) ---
+        # By default Phase 2 trains the single decoder built above. When
+        # ``round_robin: true`` (Stage A handoff from the summarization run) we
+        # ALSO build the other family's decoder + tokenizer; the encoder's
+        # survivors then train against both, with one family picked per batch
+        # (``_pick_decoder_family`` / ``_set_active_decoder``). The primary
+        # decoder above is the qwen35 family (model.decoder default == the
+        # decoder_qwen block); the secondary is Falcon.
+        self._round_robin = bool(self.step_cfg.get("round_robin", False))
+        self._qwen_decoder_prob = float(self.step_cfg.get("qwen_decoder_prob", 0.3))
+        self._microbatch_counter = 0
+        self._decoders_by_family = {self._decoder_family: self.decoder}
+        self._tokenizer_by_family = {self._decoder_family: self.tokenizer}
+        if self._round_robin:
+            other_family = "falcon_h1" if self._decoder_family == "qwen35" else "qwen35"
+            other_key = "decoder_falcon" if other_family == "falcon_h1" else "decoder_qwen"
+            other_cfg = self.step_cfg.get(other_key)
+            if not other_cfg:
+                raise ValueError(
+                    f"round_robin=true requires a training.{other_key} block "
+                    f"(building the {other_family} decoder)"
+                )
+            other_dec, other_tok = self._build_decoder_for_family(other_cfg)
+            self._decoders_by_family[other_family] = other_dec
+            self._tokenizer_by_family[other_family] = other_tok
+            logger.info(
+                "phase2_kb_round_robin_decoders",
+                families=sorted(self._decoders_by_family),
+                primary=self._decoder_family,
+                qwen_decoder_prob=self._qwen_decoder_prob,
+            )
+
         # --- Encoder ---
         self._load_encoder()
         self.encoder.set_active_decoder_family(self._decoder_family)
+
+        # Per-task learnable L0 prompts (gated; default OFF). When
+        # l0_prompt_tokens > 0, attach a learnable (P, D) prompt per dataset to
+        # the encoder so it is saved/loaded with the encoder state dict and L0's
+        # within-document compression becomes task-conditioned. With
+        # l0_freeze_backbone the L0 backbone is frozen (prompt-tuning). Off =>
+        # unchanged live trainable-L0 path.
+        self._l0_prompt_tokens = int(self.step_cfg.get("l0_prompt_tokens", 0) or 0)
+        self._l0_freeze_backbone = bool(
+            self.step_cfg.get("l0_freeze_backbone", False)
+        )
+        if self._l0_prompt_tokens > 0:
+            import torch.nn as _nn
+            _P = self._l0_prompt_tokens
+            _D = int(self.encoder.l0.survive_embedding.shape[-1])
+            _ref = next(self.encoder.l0.parameters())
+            self.encoder.l0_task_prompts = _nn.ParameterDict({
+                str(_ds): _nn.Parameter(torch.zeros(_P, _D))
+                for _ds in list(self.step_cfg.get("datasets", []))
+            }).to(device=self.device, dtype=_ref.dtype)
+            logger.info(
+                "phase2_kb_l0_task_prompts_built",
+                n_datasets=len(self.encoder.l0_task_prompts),
+                prompt_tokens=_P, hidden_dim=_D,
+                freeze_backbone=self._l0_freeze_backbone,
+            )
 
         # Encoder-side tokenizer (usually the same vocab as the decoder for
         # Qwen3.5, but we load it from the encoder's backbone name so we're
@@ -389,6 +570,102 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         if self._live_l0:
             mmap_root = self._resolve_dir("mmap_dir", "mmap/phase2")
             self._token_store = ArticleTokenStore(mmap_root)
+
+        # --- Recursive-L1 tree (Phase 3, optional) ---
+        # Two modes, both flag-gated (default OFF — the non-recursive trainer
+        # never touches either):
+        #
+        #  * CACHED PATH-SELECTIVE (default recursive mode): off-path
+        #    browse-tree nodes read their query-agnostic subtree summaries
+        #    (built offline by scripts/precompute_l1_tree.py) from the L1-tree
+        #    cache, DETACHED; only the live search path carries gradient. For
+        #    BIG trees (pubmedqa/KILT) where the whole subtree cannot fit live.
+        #
+        #  * FULL-BACKPROP (``full_backprop: true``): the WHOLE window subtree
+        #    is re-encoded LIVE every step and gradient flows to ALL nodes
+        #    (on-path + off-path). No L1-tree cache is needed (only the L0
+        #    cache of the file-diff leaves). SMALL trees ONLY — git-repro
+        #    windows (~16-64 commits). Must NOT be enabled on big trees.
+        rec_cfg = self.step_cfg.get("recursive_l1_tree", {}) or {}
+        self._recursive_l1 = bool(rec_cfg.get("enabled", False))
+        self._recursive_l1_full_backprop = bool(rec_cfg.get("full_backprop", False))
+        # Per-repo batching is a refinement of full-backprop: the whole
+        # window-0 subtree is encoded ONCE per repo (shared, grad-accumulated)
+        # instead of per file-sample.  Implies full_backprop.
+        self._per_repo_full_backprop = bool(
+            rec_cfg.get("full_backprop_per_repo", False),
+        )
+        if self._per_repo_full_backprop:
+            self._recursive_l1_full_backprop = True
+        if self._recursive_l1:
+            # Retention may be a scalar (legacy) OR a step-interpolated ramp
+            # ``{start, end, ramp_steps}`` (per-repo curriculum). Store the raw
+            # cfg for ramp resolution and keep a resolved scalar for the legacy
+            # path-selective code + back-compat.
+            self._recursive_l1_retention_cfg = rec_cfg.get(
+                "l1_retention", self.step_cfg.get("l1_retention", 0.15),
+            )
+            self._recursive_l0_retention_cfg = rec_cfg.get("l0_retention", None)
+            self._recursive_l1_retention = self._interp_recursive_ratio(
+                self._recursive_l1_retention_cfg, default=0.15,
+            )
+            self._recursive_general_prompt = str(
+                rec_cfg.get("general_prompt", DEFAULT_RECURSIVE_GENERAL_PROMPT),
+            )
+            # Per-repo cost knob: each file-sample's backward recomputes the
+            # GC'd shared-tree forward once (Nx per repo), and the staged drill
+            # graphs scale with the repo's file-sample count. ``null``
+            # (default) = use every file-sample; an int K subsamples up to K
+            # file-samples per repo-batch (re-seeded per epoch so coverage
+            # varies across epochs). Lets the GPU profile bound per-step
+            # cost + memory without changing the data.
+            _mfs = rec_cfg.get("max_file_samples_per_repo", None)
+            self._max_file_samples_per_repo = (
+                int(_mfs) if _mfs is not None else None
+            )
+            if self._per_repo_full_backprop:
+                self._l1_tree_cache = None
+                logger.warning(
+                    "phase2_kb_recursive_l1_per_repo_full_backprop_enabled",
+                    l0_retention=self._recursive_l0_retention_cfg,
+                    l1_retention=self._recursive_l1_retention_cfg,
+                    general_prompt=self._recursive_general_prompt,
+                    note=(
+                        "window-0 subtree encoded ONCE per repo (shared, "
+                        "grad-accumulated via retain_graph across the repo's "
+                        "file-samples); browse turns splice shared node reps, "
+                        "drill-down bgkit re-encodes the file-diff with the "
+                        "specific commit/filename query; SMALL trees ONLY"
+                    ),
+                )
+            elif self._recursive_l1_full_backprop:
+                # No L1-tree cache precompute — the tree is encoded live each
+                # step from the L0 leaf cache.
+                self._l1_tree_cache = None
+                logger.warning(
+                    "phase2_kb_recursive_l1_full_backprop_enabled",
+                    l1_retention=self._recursive_l1_retention,
+                    note=(
+                        "whole window subtree re-encoded LIVE each step; "
+                        "gradient flows to ALL nodes; SMALL trees ONLY "
+                        "(git-repro windows) — do NOT enable on big trees "
+                        "(pubmedqa/KILT)"
+                    ),
+                )
+            else:
+                from bgkit.data.l0_cache import SurvivorBlockCache
+
+                tree_cache_dir = self._resolve_dir(
+                    "recursive_l1_tree_cache_dir", "l1_tree_cache_kb",
+                )
+                if rec_cfg.get("cache_dir"):
+                    tree_cache_dir = Path(str(rec_cfg.get("cache_dir")))
+                self._l1_tree_cache = SurvivorBlockCache(str(tree_cache_dir))
+                logger.info(
+                    "phase2_kb_recursive_l1_enabled",
+                    cache_dir=str(tree_cache_dir),
+                    l1_retention=self._recursive_l1_retention,
+                )
 
         # --- Browse trees ---
         self._load_browse_trees()
@@ -446,6 +723,19 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         )
 
         surv_cfg = self.step_cfg.get("survivorship", {}) or {}
+        # Master switch for ALL survivorship aux losses (BCE / moment-match /
+        # min-survivors / decisiveness / relevance / utility-grad BCE) AND the
+        # _pending_l0/l1_outputs collection that feeds them. Default OFF: per the
+        # 2026-06-29 decision the survivorship aux is dropped for ALL phase2_kb
+        # runs (KRKBTrainer serves Phase 2 only; selection is the least-important
+        # stage and the reps are distributed, so the head is frozen at its
+        # pre-trained selection). Set survivorship_aux: true to re-enable head
+        # training. (Phase 1 / Joint Block / l1l1-distill use other trainers and
+        # never read this flag.) When OFF (the default): the head gets no gradient
+        # and the forward retains nothing — the dual-ascent θ control is decoupled
+        # and still runs (accumulated per-microbatch at encode time; see
+        # _accumulate_theta_state / _post_optimizer_step).
+        self._survivorship_aux = bool(surv_cfg.get("survivorship_aux", False))
         self._ratio_loss_weight = float(surv_cfg.get("ratio_loss_weight", 0.1))
         self._decisiveness_loss_weight = float(
             surv_cfg.get("decisiveness_loss_weight", 0.05),
@@ -524,7 +814,6 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             surv_cfg.get("relevance_distractor_damp", 0.5),
         )
         self._n_distractors = int(surv_cfg.get("n_distractors", 3))
-
         # --- Datasets ---
         self._build_dataloaders()
 
@@ -573,10 +862,16 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # --- Model container + optimizer ---
         self.model = _KBModel(
             encoder=self.encoder,
-            decoder=self.decoder,
+            decoder=None if self._round_robin else self.decoder,
+            decoders=self._decoders_by_family if self._round_robin else None,
             lora_router=self.lora_router,
             topic_embeddings=self.topic_embeddings,
         ).to(self.device)
+        if self._round_robin:
+            # self.decoder is a live pointer into the container's ModuleDict;
+            # keep it aimed at the primary family until the first per-batch swap.
+            self._decoders_by_family = dict(self.model.decoders)
+            self.decoder = self._decoders_by_family[self._decoder_family]
         self.optimizer = self._create_optimizer(
             self._build_optimizer_groups(),
             default_lr=float(self.step_cfg.get("lr", 1e-4)),
@@ -774,17 +1069,72 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # Per-training-config override takes precedence so Falcon-family
         # phases can cap anchors at 0.60 without forking model defaults.
         step_model_cfg = self.step_cfg.get("model", {}) or {}
-        threshold_cfg = step_model_cfg.get(
+        threshold_cfg = dict(step_model_cfg.get(
             "threshold_controller",
             self.cfg.model.get("threshold_controller", {}),
-        )
+        ) or {})
+        # The encoder's per-level DualThresholdController buffers
+        # (anchor_ratios / anchor_thetas / _anchor_velocity) are sized by the
+        # anchor grid used at Phase-1 train time. The summarization encoder was
+        # trained with the Falcon 6-anchor grid, not the Qwen 7-anchor model
+        # default, so derive the grid from the SAVED state to size the
+        # reconstructed buffers identically — otherwise load_state_dict raises a
+        # size mismatch on l{0,1}.threshold.anchor_* (6 vs 7). Other threshold
+        # params (lr / init_theta / kernel_bandwidth / clamp) still come from
+        # config so Phase 2 controls its own dual-ascent dynamics.
+        saved_anchors = encoder_state.get("l0.threshold.anchor_ratios")
+        if saved_anchors is not None:
+            threshold_cfg["anchor_ratios"] = saved_anchors.tolist()
         self.encoder = BgKITEncoder.from_pretrained_with_state_dict(
             encoder_cfg.get("backbone_name", "Qwen/Qwen3.5-0.8B-Base"),
             encoder_state,
             hidden_dim=int(encoder_cfg.get("hidden_dim", 1024)),
             active_decoder_family=getattr(self, "_decoder_family", "qwen35"),
-            threshold_controller_cfg=dict(threshold_cfg) if threshold_cfg else None,
+            threshold_controller_cfg=threshold_cfg or None,
         ).to(self.device)
+
+        # Load the co-trained decoder(s) from the SAME Phase-1 checkpoint (the
+        # summarization handoff saved decoder_qwen / decoder_falcon). Without
+        # this the decoders stay at fresh-HF init and the summarization decoder
+        # training is discarded. Applies to single-decoder stages too.
+        _ckpt_decoder_key = {"qwen35": "decoder_qwen", "falcon_h1": "decoder_falcon"}
+        for family, dec in getattr(self, "_decoders_by_family", {}).items():
+            key = _ckpt_decoder_key.get(family)
+            if key and key in state_dicts:
+                missing, unexpected = dec.load_state_dict(
+                    state_dicts[key], strict=False,
+                )
+                logger.info(
+                    "phase2_kb_decoder_loaded_from_phase1",
+                    family=family, ckpt_key=key,
+                    missing=len(missing), unexpected=len(unexpected),
+                )
+            else:
+                logger.info(
+                    "phase2_kb_decoder_fresh_hf_init",
+                    family=family, reason=f"{key!r} not in checkpoint",
+                )
+
+        # Encoder activation checkpointing via the SAME per-backbone-layer
+        # mechanism the summarization trainer uses (gated by
+        # training.gradient_checkpointing). Each backbone transformer layer is a
+        # pure attn+MLP sub-forward, so it is checkpoint-safe — unlike the coarse
+        # _checkpointed_level path (disabled via activation_checkpointing.encoder:
+        # false), which wraps the whole non-pure LevelCompressor forward (incl.
+        # the side-effecting survivorship logic) and fails the use_reentrant=False
+        # tensor-match check (666 vs 382 saved tensors).
+        from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
+
+        # Checkpoint BOTH L0 and L1 backbones (per-layer GC — the summarization
+        # trainer's proven mechanism). With LoRA dropped (lora.enabled: false /
+        # train_l1_direct), L1's backbone is plain weights again, so its recompute
+        # is deterministic — the L1 LoRA was the ONLY thing that broke checkpoint
+        # recompute (LoRARouter thread-local adapter state). L0 is the live
+        # per-bgkit-call memory hog; L1 the bucketed cross-doc fusion — both now
+        # capped, which is what fits round-robin Stage A in budget.
+        maybe_enable_gradient_checkpointing(self.encoder.l0.backbone, self.cfg)
+        if getattr(self.encoder, "l1", None) is not None:
+            maybe_enable_gradient_checkpointing(self.encoder.l1.backbone, self.cfg)
 
     def _assert_vocab_alignment(self) -> None:
         """Verify encoder-tokenizer and decoder-tokenizer IDs index into
@@ -853,6 +1203,29 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     # LoRA
     # ------------------------------------------------------------------
 
+    def _set_l0_trainability(self) -> None:
+        """Live-L0 trainability. Default: train L0 fully (direct). With
+        ``l0_freeze_backbone`` (prompt-tuning) freeze the L0 backbone and train
+        only the L0 head + threshold. The per-task L0 prompts (if present) are
+        always trainable."""
+        if getattr(self, "_l0_freeze_backbone", False):
+            self.encoder.l0.requires_grad_(False)
+            self.encoder.l0.head.requires_grad_(True)
+            self.encoder.l0.threshold.requires_grad_(True)
+            # Keep the L0->L1 bridge trainable even with a frozen backbone: the
+            # task prompt shifts L0's survivor distribution, so the bridge should
+            # adapt to it (mirrors "the bridge stays trainable as L0 evolves").
+            # It's a single ~1M-param head, so still parameter-efficient. Freeze
+            # it too if you want strict prompt-only tuning.
+            if getattr(self.encoder.l0, "auto_repro_head", None) is not None:
+                self.encoder.l0.auto_repro_head.requires_grad_(True)
+            logger.info("phase2_kb_l0_backbone_frozen")
+        else:
+            self.encoder.l0.requires_grad_(True)
+        _tp = getattr(self.encoder, "l0_task_prompts", None)
+        if _tp is not None:
+            _tp.requires_grad_(True)
+
     def _install_lora(self) -> None:
         """Configure encoder trainability for Phase 2.
 
@@ -870,11 +1243,22 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             self.lora_router = None
             LoRARouter.bind(None)
             self.encoder.requires_grad_(False)
+            if getattr(self, "_round_robin", False):
+                self.encoder.projection_blocks.requires_grad_(True)
             if self._live_l0:
-                self.encoder.l0.requires_grad_(True)
+                self._set_l0_trainability()
             self._direct_l1_trainable = bool(lora_cfg.get("train_l1_direct", True))
             if self._direct_l1_trainable:
                 self.encoder.l1.requires_grad_(True)
+                # The L1↔L1 bridge (encoder.l1l1_bridge) is a top-level sibling
+                # of encoder.l1 — NOT inside it — so encoder.l1.requires_grad_
+                # above does NOT unfreeze it. It MUST train: it adapts L0's
+                # evolving output into L1's input space and is exercised on
+                # every interior tree node via l1_auto_reproduce. Left frozen it
+                # would stay pinned at the distilled init and misalign as L0/L1
+                # drift. (Trains with L1; tracked in _build_optimizer_groups.)
+                if getattr(self.encoder, "l1l1_bridge", None) is not None:
+                    self.encoder.l1l1_bridge.requires_grad_(True)
             logger.info(
                 "phase2_kb_encoder_lora_disabled",
                 live_l0=self._live_l0,
@@ -897,11 +1281,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
         # Freeze encoder base; unfreeze L1 LoRA always.
         self.encoder.requires_grad_(False)
+        if getattr(self, "_round_robin", False):
+            # Co-train both families' projection blocks (they track the decoders).
+            self.encoder.projection_blocks.requires_grad_(True)
         self.lora_router.set_level_trainable("l1", True)
         # Stage A: train L0 weights directly (head + auto_repro_head + backbone).
         # Stage B: keep L0 frozen.
         if self._live_l0:
-            self.encoder.l0.requires_grad_(True)
+            self._set_l0_trainability()
         logger.info(
             "phase2_kb_encoder_lora_enabled",
             levels=sorted(self.lora_router.levels),
@@ -1160,6 +1547,29 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 kept_indices.append(i)
         return Subset(dataset, kept_indices)
 
+    @staticmethod
+    def _resolve_one_epoch_max_steps(
+        n_batches: int, accum_steps: int, epochs: int | None,
+    ) -> int:
+        """Resolve ``max_steps`` for the ``max_steps: null`` config path.
+
+        The train loop (``base_trainer.train``) runs ``while step < max_steps``,
+        consuming ``accum_steps`` microbatches per optimizer step. So ONE real
+        pass over the data is ``ceil(n_batches / accum_steps)`` optimizer steps.
+
+        - ``epochs`` set -> ``epochs * ceil(n_batches / accum_steps)`` — TRUE
+          epoch count.
+        - ``epochs`` is None -> legacy ``n_batches`` (preserved EXACTLY so no
+          existing/live config changes silently). NB: with ``accum_steps > 1``
+          that legacy value actually runs ``accum_steps`` real epochs, not one —
+          set ``training.epochs`` to fix. (With packing, ``n_batches`` is the
+          microbatch count, much smaller than the sample count, so if it drops
+          below ``warmup_steps`` the cosine LR never leaves warmup.)
+        """
+        if epochs is not None:
+            return int(epochs) * math.ceil(n_batches / max(accum_steps, 1))
+        return n_batches
+
     def _build_dataloaders(self) -> None:
         """Load per-dataset trajectory parquets, optionally subset them
         according to the stage curriculum, and wrap in DataLoaders.
@@ -1238,19 +1648,99 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self.train_dataset, self.eval_dataset = random_split(
             full, [train_size, eval_size], generator=generator,
         )
+        # Trim outlier samples by live-L0 token budget BEFORE building the
+        # dataloader + computing max_steps below, so both reflect the filtered
+        # set. Drops the genuine narrativeqa/pubmedqa token-outlier tails
+        # (profiled 2026-06-28); memory's large-but-typical samples pass.
+        self._filter_train_by_token_budget()
         # Per-phase batch_size override takes precedence over the global
         # default in configs/config.yaml (which is sized for Phase 1).
         batch_size = int(
             self.step_cfg.get("batch_size", self.cfg.get("batch_size", 1))
         )
-        self.train_dataloader = DataLoader(
-            self.train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            collate_fn=_collate_kb,
-            num_workers=int(self.cfg.compute.get("num_workers", 0)),
-            pin_memory=False,
-        )
+        num_workers = int(self.cfg.compute.get("num_workers", 0))
+        # Token-budget microbatch packing (opt-in via max_microbatch_l0_tokens).
+        # Packs small trajectories together / isolates large ones, bounding the
+        # per-microbatch live-L0 peak while raising GPU utilization vs a fixed
+        # batch_size. Off (0) -> the legacy fixed-batch_size path is unchanged.
+        mb_budget = int(self.step_cfg.get("max_microbatch_l0_tokens", 0) or 0)
+        self._train_batch_sampler = None
+        if getattr(self, "_per_repo_full_backprop", False):
+            # PER-REPO: one batch = all of a repo's window-0 file-samples
+            # (grouped by the shared-subtree root node id). The shared tree is
+            # then encoded once per batch; internal micro-batching over the
+            # repo's file-samples bounds the per-step decoder peak.
+            from bgkit.data.samplers import RepoGroupedBatchSampler
+
+            group_keys = [
+                self._repo_group_key(self.train_dataset[i])
+                for i in range(len(self.train_dataset))
+            ]
+            self._train_batch_sampler = RepoGroupedBatchSampler(
+                group_keys, shuffle=True, seed=int(self.cfg.get("seed", 42)),
+            )
+            self.train_dataloader = DataLoader(
+                self.train_dataset,
+                batch_sampler=self._train_batch_sampler,
+                collate_fn=_collate_kb,
+                num_workers=num_workers,
+                pin_memory=False,
+            )
+            n_train_batches = len(self._train_batch_sampler)
+            logger.info(
+                "phase2_kb_per_repo_grouping",
+                n_samples=len(self.train_dataset),
+                n_repos=n_train_batches,
+                avg_file_samples_per_repo=round(
+                    len(self.train_dataset) / max(n_train_batches, 1), 2,
+                ),
+            )
+        elif mb_budget > 0 and self._live_l0:
+            loads = getattr(self, "_train_token_loads", None)
+            if loads is None or len(loads) != len(self.train_dataset):
+                loads = [
+                    self._sample_l0_token_load(self.train_dataset[i])
+                    for i in range(len(self.train_dataset))
+                ]
+            from bgkit.data.samplers import KBTokenBudgetBatchSampler
+            # Cap samples/microbatch to bound the decoder backward — a microbatch
+            # of many tiny samples runs that many sequential decoder backwards,
+            # spiking the peak (2026-06-28: 90GB packed vs 73GB single). 0 = token
+            # budget only.
+            mb_max_samples = int(self.step_cfg.get("max_microbatch_samples", 0) or 0)
+            self._train_batch_sampler = KBTokenBudgetBatchSampler(
+                loads, mb_budget, max_samples=(mb_max_samples or None), shuffle=True,
+                seed=int(self.cfg.get("seed", 42)),
+            )
+            self.train_dataloader = DataLoader(
+                self.train_dataset,
+                batch_sampler=self._train_batch_sampler,
+                collate_fn=_collate_kb,
+                num_workers=num_workers,
+                pin_memory=False,
+            )
+            n_train_batches = len(self._train_batch_sampler)
+            logger.info(
+                "phase2_kb_token_budget_packing",
+                budget=mb_budget,
+                n_samples=len(self.train_dataset),
+                n_microbatches=n_train_batches,
+                avg_samples_per_microbatch=round(
+                    len(self.train_dataset) / max(n_train_batches, 1), 2,
+                ),
+            )
+        else:
+            self.train_dataloader = DataLoader(
+                self.train_dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=_collate_kb,
+                num_workers=num_workers,
+                pin_memory=False,
+            )
+            n_train_batches = math.ceil(
+                len(self.train_dataset) / max(batch_size, 1)
+            )
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
             batch_size=1,
@@ -1267,14 +1757,27 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # rest of the trainer doesn't need to know about ``null``.
         configured_max_steps = self.step_cfg.get("max_steps", None)
         if configured_max_steps is None:
-            one_epoch = math.ceil(len(self.train_dataset) / max(batch_size, 1))
+            accum_steps = int(
+                self.step_cfg.get("gradient_accumulation_steps", 1) or 1
+            )
+            epochs = self.step_cfg.get("epochs", None)
+            one_epoch = self._resolve_one_epoch_max_steps(
+                n_train_batches, accum_steps, epochs,
+            )
             with open_dict(self.step_cfg):
                 self.step_cfg.max_steps = one_epoch
             logger.info(
                 "phase2_kb_max_steps_one_epoch",
                 stage=self._stage(),
                 train_size=len(self.train_dataset),
-                batch_size=batch_size,
+                batch_size=(None if self._train_batch_sampler else batch_size),
+                packing=bool(self._train_batch_sampler),
+                n_batches=n_train_batches,
+                accum_steps=accum_steps,
+                epochs_cfg=(None if epochs is None else int(epochs)),
+                real_epochs=round(
+                    one_epoch * accum_steps / max(n_train_batches, 1), 2,
+                ),
                 max_steps=one_epoch,
             )
 
@@ -1354,7 +1857,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
     def _build_optimizer_groups(self) -> list[dict]:
         groups: list[dict] = []
-        dec_params = [p for p in self.decoder.parameters() if p.requires_grad]
+        # Round-robin optimizes BOTH decoders + BOTH families' projection
+        # blocks; single-decoder stages optimize just self.decoder.
+        dec_params = [
+            p
+            for dec in self._all_decoders()
+            for p in dec.parameters()
+            if p.requires_grad
+        ]
         if dec_params:
             groups.append({
                 "params": dec_params,
@@ -1362,6 +1872,19 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     "decoder_lr", self.step_cfg.get("lr", 1e-4)
                 )),
             })
+        if getattr(self, "_round_robin", False):
+            proj_params = [
+                p
+                for p in self.encoder.projection_blocks.parameters()
+                if p.requires_grad
+            ]
+            if proj_params:
+                groups.append({
+                    "params": proj_params,
+                    "lr": float(self.step_cfg.get(
+                        "projection_lr", self.step_cfg.get("lr", 1e-4)
+                    )),
+                })
         # Stage A: L0 weights train directly (no LoRA wrapper).
         if self._live_l0:
             l0_params = [p for p in self.encoder.l0.parameters() if p.requires_grad]
@@ -1372,6 +1895,19 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                         self.step_cfg.get("l0_lr", self.step_cfg.get("lr", 1e-4))
                     ),
                 })
+            # Per-task learnable L0 prompts (gated). They live on
+            # encoder.l0_task_prompts (a sibling of encoder.l0), so they are NOT
+            # in l0.parameters() above — add them explicitly at the L0 LR.
+            _tp = getattr(self.encoder, "l0_task_prompts", None)
+            if _tp is not None:
+                _tp_params = [p for p in _tp.parameters() if p.requires_grad]
+                if _tp_params:
+                    groups.append({
+                        "params": _tp_params,
+                        "lr": float(
+                            self.step_cfg.get("l0_lr", self.step_cfg.get("lr", 1e-4))
+                        ),
+                    })
         if self.lora_router is not None:
             for level in sorted(self.lora_router.levels):
                 lvl_params = [
@@ -1396,6 +1932,21 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     "params": l1_params,
                     "lr": float(
                         self.step_cfg.get(lr_key, self.step_cfg.get("lr", 1e-4))
+                    ),
+                })
+        # L1↔L1 bridge (encoder.l1l1_bridge): a top-level sibling of encoder.l1,
+        # so it is NOT in encoder.l1.parameters() and NOT covered by the L1 LoRA
+        # adapter set above. When trainable (direct-L1 / recursive runs) it must
+        # be optimized — same LR as the L1 backbone group. Guarded by
+        # requires_grad so configs that keep it frozen add no empty group.
+        bridge = getattr(self.encoder, "l1l1_bridge", None)
+        if bridge is not None:
+            bridge_params = [p for p in bridge.parameters() if p.requires_grad]
+            if bridge_params:
+                groups.append({
+                    "params": bridge_params,
+                    "lr": float(
+                        self.step_cfg.get("l1_lr", self.step_cfg.get("lr", 1e-4))
                     ),
                 })
         if self.topic_embeddings is not None:
@@ -1501,6 +2052,11 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         Curriculum interpolates by ``self.global_step``. After
         ``ramp_steps`` the ratio stays at ``end``.
         """
+        # While the shared per-repo tree is being encoded, the tree's L0
+        # leaves use the recursive L0 ramp, not the per-dataset rate.
+        override = getattr(self, "_recursive_l0_override", None)
+        if override is not None:
+            return float(override)
         entry = self._l0_retention.get(dataset)
         if entry is None:
             return float(self.step_cfg.get("default_l0_retention", 0.10))
@@ -1525,6 +2081,46 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             self._step_sampled_l0_ratios.append(float(ratio))
         return float(ratio)
 
+    @staticmethod
+    def _interp_ratio_ramp(cfg, step: int, default: float = 0.15) -> float:
+        """Interpolate a retention ratio from a scalar OR ``{start, end,
+        ramp_steps}`` ramp, by ``step``.  Mirrors :meth:`_l0_retention_for`'s
+        curriculum math but is stateless so it can drive the recursive L0/L1
+        ramps. After ``ramp_steps`` the ratio stays at ``end``.
+        """
+        if cfg is None:
+            return float(default)
+        if isinstance(cfg, (int, float)):
+            return float(cfg)
+        start = float(cfg.get("start", default))
+        end = float(cfg.get("end", start))
+        ramp = max(1, int(cfg.get("ramp_steps", 1)))
+        t = min(1.0, max(0, int(step)) / ramp)
+        return start + (end - start) * t
+
+    def _interp_recursive_ratio(self, cfg, default: float = 0.15) -> float:
+        return self._interp_ratio_ramp(cfg, int(getattr(self, "global_step", 0)), default)
+
+    def _recursive_l0_retention_now(self) -> float:
+        """Current recursive-L0 retention (shared-tree leaves). Falls back to
+        the per-dataset default when no recursive L0 ramp is configured."""
+        cfg = getattr(self, "_recursive_l0_retention_cfg", None)
+        if cfg is None:
+            return float(self.step_cfg.get("default_l0_retention", 0.10))
+        return self._interp_recursive_ratio(cfg, default=0.10)
+
+    def _recursive_l1_retention_now(self) -> float:
+        """Current recursive-L1 retention, ramp-aware.  Prefers the configured
+        ramp; falls back to the legacy scalar attribute (set directly by unit
+        tests) and finally to the sampled L1 ratio."""
+        cfg = getattr(self, "_recursive_l1_retention_cfg", None)
+        if cfg is not None:
+            return self._interp_recursive_ratio(cfg, default=0.15)
+        scalar = getattr(self, "_recursive_l1_retention", None)
+        if scalar is not None:
+            return float(scalar)
+        return self._sample_l1_retention()
+
     def _sample_l1_retention(self) -> float:
         """Sample an L1 retention ratio around the configured base rate."""
         ratio = sample_ratio(
@@ -1542,6 +2138,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self,
         dataset: str,
         article_ids: list[str],
+        query_emb: torch.Tensor | None = None,
     ):
         """Run the encoder live on each article's tokens to produce L0 survivors.
 
@@ -1594,11 +2191,52 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         ).utility_grad_loss_weight > 0.0
         grad_capture: dict | None = {} if util_active else None
 
+        # L0 compression prompt — replicated once per article (mirrors the
+        # summarization trainer's per-section prompt). Two mutually-exclusive
+        # regimes:
+        #   - Per-task learnable prompt (l0_prompt_tokens > 0): the FROZEN-L0
+        #     conditioning, for when L0 is cached and a per-query prompt can't be
+        #     baked into the cache (Stage B / frozen backbone).
+        #   - Actual per-sample query (default for LIVE L0): the real question is
+        #     fed to L0 so its within-document compression is query-aware. Always
+        #     applied in the live path so it is never silently dropped.
+        l0_prompt_emb = None
+        l0_prompt_cu = None
+        l0_prompt_pos = None
+        _tp = getattr(self.encoder, "l0_task_prompts", None)
+        if (
+            getattr(self, "_l0_prompt_tokens", 0) > 0
+            and _tp is not None
+            and dataset in _tp
+        ):
+            _prompt_src = _tp[dataset]  # (P, D) learnable per-task prompt
+        elif query_emb is not None and int(query_emb.shape[0]) > 0:
+            _prompt_src = query_emb  # (L_query, D) the actual question
+        else:
+            _prompt_src = None
+        if _prompt_src is not None:
+            _L = int(_prompt_src.shape[0])
+            _n_art = len(lengths)
+            l0_prompt_emb = (
+                _prompt_src.unsqueeze(0).expand(_n_art, -1, -1)
+                .reshape(_n_art * _L, -1).to(input_embeddings.dtype)
+            )
+            l0_prompt_cu = torch.arange(
+                0, (_n_art + 1) * _L, _L,
+                dtype=torch.int32, device=self.device,
+            )
+            l0_prompt_pos = position_ids_from_cu(
+                l0_prompt_cu, int(l0_prompt_emb.shape[0]),
+            )
+
         out = self._checkpointed_level(
             "l0",
             content_embeddings=input_embeddings,
             content_cu_seqlens=cu_seqlens,
             content_position_ids=position_ids,
+            prompt_embeddings=l0_prompt_emb,
+            prompt_cu_seqlens=l0_prompt_cu,
+            prompt_position_ids=l0_prompt_pos,
             target_ratio=ratio,
             utility_grad_active=util_active,
             utility_grad_capture=grad_capture,
@@ -1609,6 +2247,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
     def _l0_for_articles(
         self, dataset: str, article_ids: list[str],
+        query_emb: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return packed L0 survivors for each article.
 
@@ -1631,18 +2270,26 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         utility-grad BCE) after the main forward.
         """
         if self._live_l0:
-            out, content_cu, ratio = self._live_l0_encode(dataset, article_ids)
+            out, content_cu, ratio = self._live_l0_encode(
+                dataset, article_ids, query_emb=query_emb,
+            )
             survivors = out.survivor_embeddings  # (N_survivors, D)
             cu_seqlens = out.survivor_cu_seqlens  # (B+1,)
-            if self.encoder.training and hasattr(self, "_pending_l0_outputs"):
-                self._pending_l0_outputs.append({
-                    "dataset": dataset,
-                    "enc_out": out,
-                    "ratio": ratio,
-                    # Packed pre-compression content cu_seqlens so aux
-                    # losses can do segment-aware reductions.
-                    "cu_seqlens": content_cu,
-                })
+            if self.encoder.training:
+                if getattr(self, "_survivorship_aux", True):
+                    if hasattr(self, "_pending_l0_outputs"):
+                        self._pending_l0_outputs.append({
+                            "dataset": dataset,
+                            "enc_out": out,
+                            "ratio": ratio,
+                            # Packed pre-compression content cu_seqlens so aux
+                            # losses can do segment-aware reductions.
+                            "cu_seqlens": content_cu,
+                        })
+                else:
+                    # Aux OFF: accumulate ONLY the θ control scalars (no graph
+                    # retention) so the head freezes but θ still tracks the ramp.
+                    self._accumulate_theta_state("l0", out, ratio)
             return survivors, cu_seqlens
         if self._l0_cache is None:
             raise RuntimeError("L0 cache is None but live_l0 is False")
@@ -1746,6 +2393,61 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 "trainer is using."
             )
         return article_ids
+
+    def _sample_l0_token_load(self, sample) -> int:
+        """Total live-L0 token load for one sample = sum over its bgkit turns
+        of the resolved articles' token lengths. Used by the token-budget
+        outlier filter. Cheap: offsets-CSR length lookups, no token loads."""
+        total = 0
+        for turn in sample.trajectory:
+            if turn.kind != "bgkit":
+                continue
+            ids = list(turn.args.get("ids", []))
+            if not ids:
+                continue
+            try:
+                doc_ids = self._resolve_article_ids(sample.dataset_name, ids)
+            except Exception:
+                continue
+            for d in doc_ids:
+                try:
+                    total += self._token_store.length(sample.dataset_name, d)
+                except KeyError:
+                    continue
+        return total
+
+    def _filter_train_by_token_budget(self) -> None:
+        """Drop training samples whose live-L0 token load exceeds
+        ``max_sample_l0_tokens`` — the genuine outliers (narrativeqa / pubmedqa
+        tails) that would OOM the live-L0 forward. Memory's large-but-typical
+        samples (median ~42K tokens) pass. No-op when the budget is 0/unset or
+        L0 is cached (Stage B). Profiled 2026-06-28."""
+        budget = int(self.step_cfg.get("max_sample_l0_tokens", 0) or 0)
+        if budget <= 0 or not self._live_l0 or self._token_store is None:
+            return
+        from torch.utils.data import Subset
+        valid: list[int] = []
+        valid_loads: list[int] = []
+        dropped: dict[str, int] = {}
+        for idx in range(len(self.train_dataset)):
+            sample = self.train_dataset[idx]
+            load = self._sample_l0_token_load(sample)
+            if load <= budget:
+                valid.append(idx)
+                valid_loads.append(load)
+            else:
+                key = getattr(sample, "dataset_name", "?")
+                dropped[key] = dropped.get(key, 0) + 1
+        n_before = len(self.train_dataset)
+        self.train_dataset = Subset(self.train_dataset, valid)
+        # Cache per-sample loads (aligned with the post-filter Subset) so the
+        # token-budget microbatch sampler can reuse them without a second walk.
+        self._train_token_loads = valid_loads
+        logger.info(
+            "phase2_kb_token_budget_filter", budget=budget,
+            kept=len(valid), dropped=n_before - len(valid),
+            dropped_by_dataset=dropped,
+        )
 
     def _validate_trajectory_article_coverage(self) -> None:
         """Walk every training + eval trajectory at setup time and assert
@@ -1968,8 +2670,17 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             [True] * len(article_ids) + [False] * len(distractor_ids)
         )
 
-        # Packed L0 survivors for all articles in this turn.
-        l0_flat, l0_cu = self._l0_for_articles(dataset, all_ids)
+        # L0 input embeddings + the per-sample query, built up front so the live
+        # L0 forward can attend to the query (query-conditioned within-document
+        # compression). The same q_emb feeds L1's compression prompt below.
+        embed_tokens = self.encoder.l0.backbone.get_input_embeddings()
+        q_ids = self.encoder_tokenizer.encode(query, add_special_tokens=False) or [0]
+        q_tensor = torch.tensor(q_ids, dtype=torch.long, device=self.device)
+        q_emb = embed_tokens(q_tensor)  # (L_query, D), L0 input space
+
+        # Packed L0 survivors for all articles in this turn — QUERY-CONDITIONED
+        # in the live path (the question is fed to L0 as its compression prompt).
+        l0_flat, l0_cu = self._l0_for_articles(dataset, all_ids, query_emb=q_emb)
         l0_lengths = lengths_from_cu(l0_cu).tolist()
 
         rev_maps = getattr(self, "_doc_id_to_title", None) or {}
@@ -1985,11 +2696,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 ids = [0]
             id_token_lists.append(ids)
 
-        embed_tokens = self.encoder.l0.backbone.get_input_embeddings()
-
         pieces: list[torch.Tensor] = []
         pinned_list: list[bool] = []
         relevance_list: list[bool] = []
+        # True at L0-survivor positions, False at pinned-ID-token positions — so
+        # _run_l1_batch bridges ONLY the survivors (the IDs are already
+        # input-space and must not pass through auto_reproduce).
+        survivor_list: list[bool] = []
         for i, aid_tokens in enumerate(id_token_lists):
             is_relevant = is_relevant_per_article[i]
             # Pin ID tokens for GOLD articles only. Distractor ID tokens are
@@ -2000,6 +2713,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             pieces.append(id_emb)
             pinned_list.extend([pin_these] * len(aid_tokens))
             relevance_list.extend([is_relevant] * len(aid_tokens))
+            survivor_list.extend([False] * len(aid_tokens))
 
             k_i = int(l0_lengths[i]) if i < len(l0_lengths) else 0
             if k_i > 0:
@@ -2007,25 +2721,23 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 pieces.append(l0_flat[start : start + k_i].to(l0_flat.dtype))
                 pinned_list.extend([False] * k_i)
                 relevance_list.extend([is_relevant] * k_i)
+                survivor_list.extend([True] * k_i)
 
         content = torch.cat(pieces, dim=0)  # (L_content, D)
         pinned = torch.tensor(pinned_list, dtype=torch.bool, device=self.device)
         relevance_mask = torch.tensor(
             relevance_list, dtype=torch.bool, device=self.device,
         )
-
-        # Query prompt
-        q_ids = self.encoder_tokenizer.encode(query, add_special_tokens=False)
-        if not q_ids:
-            q_ids = [0]
-        q_tensor = torch.tensor(q_ids, dtype=torch.long, device=self.device)
-        q_emb = embed_tokens(q_tensor).to(content.dtype)  # (L_query, D)
+        survivor_mask = torch.tensor(
+            survivor_list, dtype=torch.bool, device=self.device,
+        )
 
         return {
             "content": content,
             "pinned": pinned,
             "relevance_mask": relevance_mask,
-            "query_emb": q_emb,
+            "survivor_mask": survivor_mask,
+            "query_emb": q_emb.to(content.dtype),
         }
 
     def _run_l1_batch(
@@ -2095,25 +2807,40 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         if target_ratio is None:
             target_ratio = self._sample_l1_retention()
 
-        # Bridge L0 survivors + pinned ID embeddings through L0's
-        # auto_repro_head so L1's independent backbone (a deepcopy of L0
-        # at construction) sees its expected input-embedding distribution.
-        bridged_content = self.encoder.l0.auto_reproduce(content_flat)
-        # Activate L1 LoRA when installed; Falcon-family configs use direct
-        # L1 training and therefore run this block without an adapter context.
+        # Bridge ONLY the L0-survivor positions (hidden→input space) through
+        # auto_repro_head. The interleaved pinned article-ID embeddings are
+        # ALREADY input-space (embed_tokens) and must NOT be bridged —
+        # auto_reproduce norms+projects, which mangles them. This matches
+        # encoder.forward (bridges L0 survivors only). ``survivor_mask`` comes
+        # from _prepare_l1_turn: True at L0-survivor positions, False at ID
+        # tokens.
+        survivor_flat = torch.cat(
+            [t["survivor_mask"] for t in non_null], dim=0,
+        ).to(self.device)
+        bridged_content = content_flat.clone()
+        if bool(survivor_flat.any()):
+            bridged_content[survivor_flat] = self.encoder.l0.auto_reproduce(
+                content_flat[survivor_flat],
+            ).to(content_flat.dtype)
+
+        # Run the SHARED L1 stage (cross-section merge → L1 → projection) — the
+        # very encoder.run_l1_and_project that encoder.forward uses, so the
+        # Phase-2 and summarization L0→L1 paths cannot diverge. content_cu is
+        # already per-turn (sections joined in _prepare_l1_turn), so no
+        # content_group_cu_seqlens re-segmentation is needed here. Activate the
+        # L1 LoRA when installed (a no-op under direct training).
         with self._l1_adapter_context():
-            out = self._checkpointed_level(
-                "l1",
-                content_embeddings=bridged_content,
-                content_cu_seqlens=content_cu,
-                content_position_ids=content_pos_ids,
-                prompt_embeddings=query_flat,
-                prompt_cu_seqlens=query_cu,
-                prompt_position_ids=query_pos_ids,
-                pinned_positions=pinned_flat,
-                target_ratio=target_ratio,
-                utility_grad_active=util_active_l1,
-                utility_grad_capture=l1_grad_capture,
+            out, proj_out, proj_cu = self.encoder.run_l1_and_project(
+                l1_input_embeddings=bridged_content,
+                l1_input_cu_seqlens=content_cu,
+                target_ratio_l1=target_ratio,
+                content_group_cu_seqlens=None,
+                prompt_embeddings_l1=query_flat,
+                prompt_cu_seqlens_l1=query_cu,
+                prompt_position_ids_l1=query_pos_ids,
+                pinned_positions_l1=pinned_flat,
+                utility_grad_active_l1=util_active_l1,
+                utility_grad_capture_l1=l1_grad_capture,
             )
         if l1_grad_capture is not None:
             out._l1_grad_capture = l1_grad_capture  # type: ignore[attr-defined]
@@ -2121,39 +2848,22 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # Stash encoder output for aux loss computation (when training).
         # Everything is flat: relevance_mask and pinned are flat (N_content,)
         # bool, cu_seqlens is the per-turn segmentation of the flat buffer.
-        if self.encoder.training and hasattr(self, "_pending_l1_outputs"):
-            self._pending_l1_outputs.append({
-                "enc_out": out,
-                "cu_seqlens": content_cu,
-                "pinned": pinned_flat,
-                "relevance_mask": relevance_flat,
-                "ratio": target_ratio,
-            })
+        if self.encoder.training:
+            if getattr(self, "_survivorship_aux", True):
+                if hasattr(self, "_pending_l1_outputs"):
+                    self._pending_l1_outputs.append({
+                        "enc_out": out,
+                        "cu_seqlens": content_cu,
+                        "pinned": pinned_flat,
+                        "relevance_mask": relevance_flat,
+                        "ratio": target_ratio,
+                    })
+            else:
+                # Aux OFF: θ-only accumulation, no graph retention.
+                self._accumulate_theta_state("l1", out, target_ratio)
 
-        # Project L1 survivors into decoder space via the shared
-        # projection block. L1's raw survivor_embeddings are post-norm
-        # backbone hidden states; the decoder expects projected vectors.
-        surv_emb = out.survivor_embeddings  # (N_surv_total, D)
-        surv_cu_t = out.survivor_cu_seqlens
-        if int(surv_cu_t[-1].item()) > 0:
-            from bgkit.utils.packing import lengths_from_cu as _lfc
-            from bgkit.utils.packing import position_ids_from_cu as _pfc
-
-            surv_lengths = _lfc(surv_cu_t).to(torch.int64)
-            surv_max = int(surv_lengths.max().item()) if surv_lengths.numel() else 0
-            surv_pos = _pfc(surv_cu_t, int(surv_emb.shape[0]))
-            proj_out = self.encoder.projection_block(
-                surv_emb,
-                cu_seqlens=surv_cu_t,
-                max_seqlen=surv_max,
-                position_ids=surv_pos,
-                survivor_mask=None,
-            )
-            projected = proj_out.projected_embeddings
-            projected_cu_t = effective_projection_cu(proj_out, surv_cu_t)
-        else:
-            projected = surv_emb
-            projected_cu_t = surv_cu_t
+        projected = proj_out.projected_embeddings
+        projected_cu_t = effective_projection_cu(proj_out, proj_cu)
 
         # Extract per-turn projected survivors via per-turn boundaries.
         surv_cu = projected_cu_t.to(torch.int64).tolist()
@@ -2175,6 +2885,503 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             else:
                 results.append(next(it))
         return results
+
+    # ------------------------------------------------------------------
+    # Recursive-L1 path-selective browse encode (Phase 3)
+    # ------------------------------------------------------------------
+
+    def _recursive_query_emb(self, sample: KBSample, rendered) -> torch.Tensor:
+        """Query embeddings (embed_tokens / L1-input space) for live-path
+        conditioning.
+
+        Uses the first bgkit turn's query when present (the actual retrieval
+        intent), else the sample question. Mirrors :meth:`_prepare_l1_turn`'s
+        ``q_emb`` so the live path and the final bgkit leaf are conditioned on
+        the same signal. The cached off-path node reps are query-AGNOSTIC by
+        design — conditioning is re-applied only here, on the live path.
+        """
+        query = ""
+        for turn in rendered.bgkit_turns:
+            q = str(turn.args.get("query", ""))
+            if q:
+                query = q
+                break
+        if not query:
+            query = sample.question
+        embed_tokens = self.encoder.l0.backbone.get_input_embeddings()
+        q_ids = self.encoder_tokenizer.encode(query, add_special_tokens=False) or [0]
+        q_tensor = torch.tensor(q_ids, dtype=torch.long, device=self.device)
+        return embed_tokens(q_tensor)
+
+    def _recursive_browse_node_reps(
+        self, sample: KBSample, rendered,
+    ) -> list[torch.Tensor | None]:
+        """Compute one projected (decoder-space) dense node-rep per browse turn.
+
+        Two modes (see :meth:`setup`):
+
+        - **Cached path-selective** (default): walks the browse path leaf→root.
+          At each path node the single on-path child is the LIVE re-encode of
+          the deeper path node (gradient flows), while every off-path sibling
+          is read from the offline L1-tree cache and ``.detach()``-ed (no
+          gradient — the memory win). The live path is query-conditioned; the
+          cache is query-agnostic.
+
+        - **Full-backprop** (``recursive_l1_tree.full_backprop``): re-encodes
+          the WHOLE window subtree LIVE so gradient flows to ALL nodes
+          (on-path + off-path). Delegates to
+          :meth:`_recursive_browse_node_reps_full_backprop`.
+
+        Returns a list aligned by index with ``rendered.browse_turns`` /
+        ``rendered.browse_sentinel_positions``. ``None`` entries (no resolvable
+        rep) are spliced as a zero fallback so the sentinel token is still
+        consumed.
+        """
+        dataset = sample.dataset_name
+        tree = self._trees.get(dataset)
+        browse_turns = rendered.browse_turns
+        if tree is None or not browse_turns:
+            return [None] * len(browse_turns)
+
+        path_nodes = [str(t.args.get("id", "")) for t in browse_turns]
+
+        # PER-REPO: the shared window-0 tree was already encoded ONCE for this
+        # repo (with the GENERAL prompt). Browse turns just LOOK UP the shared
+        # node rep — no per-sample re-encode. The drill-down bgkit turns are
+        # handled separately (with the SPECIFIC query) by the bgkit-turn path.
+        if getattr(self, "_per_repo_shared_tree_active", False):
+            memo = getattr(self, "_shared_tree_memo", None) or {}
+            return [
+                (memo[n][0] if (n in memo and memo[n][0] is not None) else None)
+                for n in path_nodes
+            ]
+
+        q_emb = self._recursive_query_emb(sample, rendered)
+
+        if getattr(self, "_recursive_l1_full_backprop", False):
+            return self._recursive_browse_node_reps_full_backprop(
+                dataset, tree, path_nodes, q_emb,
+            )
+
+        reps: list[torch.Tensor | None] = [None] * len(path_nodes)
+        # Live on-path child carried UP the path (L1-output, pre-norm).
+        child_l1out: torch.Tensor | None = None
+        child_id: str | None = None
+        for i in range(len(path_nodes) - 1, -1, -1):
+            node_id = path_nodes[i]
+            if node_id not in tree:
+                # Break the live chain — a missing node has no rep and no
+                # live child to feed its parent.
+                child_l1out, child_id = None, None
+                continue
+            proj, l1out = self._encode_path_node(
+                dataset, tree, node_id,
+                on_path_child_id=child_id,
+                on_path_child_l1out=child_l1out,
+                q_emb=q_emb,
+            )
+            reps[i] = proj
+            child_l1out, child_id = l1out, node_id
+        return reps
+
+    def _recursive_browse_node_reps_full_backprop(
+        self, dataset: str, tree, path_nodes: list[str], q_emb: torch.Tensor,
+    ) -> list[torch.Tensor | None]:
+        """Full-backprop browse node-reps: encode each browse-path node's
+        ENTIRE subtree LIVE (all children recursively, no detach), so gradient
+        flows to every node in the window — on-path and off-path alike.
+
+        Per-node encodes are memoized so the shared subtree is encoded once
+        (the browse path is a root→leaf chain, so encoding the shallowest
+        browse node already covers all deeper path nodes and every off-path
+        branch under them). Returns the projected (decoder-space) rep per
+        browse turn. Logs the encoded subtree node-count.
+
+        L0 (leaf file-diff survivors) stays cached/frozen — the L0 cache is
+        the precomputed input; only the L1 backbone/adapter + ``l1l1_bridge``
+        + the live tree reps receive gradient.
+        """
+        memo: dict[str, tuple[torch.Tensor | None, torch.Tensor | None]] = {}
+        stats = {"nodes": 0}
+        reps: list[torch.Tensor | None] = []
+        for node_id in path_nodes:
+            if node_id not in tree:
+                reps.append(None)
+                continue
+            proj, _l1out = self._encode_subtree(
+                dataset, tree, node_id, q_emb, memo, stats,
+            )
+            reps.append(proj)
+        logger.info(
+            "phase2_kb_recursive_l1_full_backprop_subtree",
+            dataset=dataset,
+            n_nodes_encoded=stats["nodes"],
+            n_browse_turns=len(path_nodes),
+        )
+        return reps
+
+    def _encode_subtree(
+        self,
+        dataset: str,
+        tree,
+        node_id: str,
+        q_emb: torch.Tensor,
+        memo: dict[str, tuple[torch.Tensor | None, torch.Tensor | None]],
+        stats: dict[str, int],
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Recursively encode a node's full subtree LIVE (full-backprop mode).
+
+        - leaf node → its articles' L0 survivors (LIVE-encoded when
+          ``live_l0: true`` — e.g. the per-repo run; cached/frozen otherwise) →
+          ``l0.auto_reproduce`` (L0-output → L1-input) → :meth:`_run_recursive_l1`;
+        - interior node → :meth:`_run_recursive_l1` over
+          ``[l1_auto_reproduce(encode_subtree(child).l1out) for ALL children]``
+          — every child is encoded live + recursively, NO detach anywhere, so
+          gradient reaches every node in the subtree.
+
+        Returns ``(projected_decoder_embeddings, l1_output_survivors)``;
+        ``(None, None)`` when the node resolves to nothing. Memoized by
+        ``node_id`` so each node is encoded exactly once per sample.
+        """
+        cached = memo.get(node_id)
+        if cached is not None:
+            return cached
+        node = tree.get(node_id)
+        if not node.children:
+            result = self._encode_leaf_subtree(dataset, node, q_emb)
+        else:
+            pieces: list[torch.Tensor] = []
+            for cid in node.children:
+                if cid not in tree:
+                    continue
+                _cproj, c_l1out = self._encode_subtree(
+                    dataset, tree, cid, q_emb, memo, stats,
+                )
+                if c_l1out is None or c_l1out.numel() == 0:
+                    continue
+                pieces.append(self.encoder.l1_auto_reproduce(c_l1out))
+            if not pieces:
+                result = (None, None)
+            else:
+                children_reps_l1in = torch.cat(
+                    [p.to(pieces[0].dtype) for p in pieces], dim=0,
+                )
+                result = self._run_recursive_l1(children_reps_l1in, q_emb)
+        memo[node_id] = result
+        if result[0] is not None:
+            stats["nodes"] += 1
+        return result
+
+    def _encode_path_node(
+        self,
+        dataset: str,
+        tree,
+        node_id: str,
+        *,
+        on_path_child_id: str | None,
+        on_path_child_l1out: torch.Tensor | None,
+        q_emb: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Live re-encode of one browse-path node into (projected, L1-output).
+
+        Children reps are assembled in L1-INPUT space. INTERIOR path nodes:
+          - on-path child: the deeper path node's live L1-output bridged via
+            ``encoder.l1_auto_reproduce`` (LIVE — gradient flows up the path);
+          - off-path siblings: their cached node reps (L1-output) bridged via
+            ``encoder.l1_auto_reproduce``, DETACHED so no gradient reaches the
+            off-path subtree.
+
+        DEEPEST path node (no live child yet) is the base case: its entire
+        subtree is on the live path, so it is re-encoded LIVE from its
+        articles' L0 survivors via :meth:`_encode_path_leaf_l1out` and has no
+        off-path children (avoids double-counting the node's own articles).
+
+        Returns ``(projected_decoder_embeddings, l1_output_survivors)`` —
+        ``proj`` is spliced at the browse sentinel; ``l1out`` is fed up to the
+        parent path node. ``(None, None)`` when no children resolve.
+        """
+        node = tree.get(node_id)
+        pieces: list[torch.Tensor] = []
+
+        if on_path_child_l1out is not None and on_path_child_l1out.numel() > 0:
+            # INTERIOR path node: one live on-path child + off-path siblings
+            # read from the query-agnostic L1-tree cache (DETACHED — no
+            # gradient reaches the off-path subtree; this is the memory win).
+            pieces.append(self.encoder.l1_auto_reproduce(on_path_child_l1out))
+            cache = getattr(self, "_l1_tree_cache", None)
+            if cache is not None:
+                for cid in node.children:
+                    if cid == on_path_child_id:
+                        continue
+                    if not cache.has(dataset, cid):
+                        continue
+                    cached = cache.get(dataset, cid)
+                    if cached.numel() == 0:
+                        continue
+                    cached = cached.to(
+                        device=self.device, dtype=pieces[0].dtype,
+                    ).detach()
+                    pieces.append(self.encoder.l1_auto_reproduce(cached))
+        else:
+            # DEEPEST path node (base case): the whole node subtree is on the
+            # live search path — re-encode its articles' L0 survivors live.
+            # No off-path children here (the node IS the live leaf).
+            leaf_l1out = self._encode_path_leaf_l1out(dataset, node, q_emb)
+            if leaf_l1out is not None and leaf_l1out.numel() > 0:
+                pieces.append(self.encoder.l1_auto_reproduce(leaf_l1out))
+
+        if not pieces:
+            return None, None
+
+        target_dtype = pieces[0].dtype
+        children_reps_l1in = torch.cat(
+            [p.to(target_dtype) for p in pieces], dim=0,
+        )
+        return self._run_recursive_l1(children_reps_l1in, q_emb)
+
+    def _encode_leaf_subtree(
+        self, dataset: str, node, q_emb: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Live L0→L1 encode of a leaf node's articles.
+
+        Pulls the node's articles' L0 survivors (live in Stage A, cached
+        otherwise — the L0 cache is the frozen precomputed input), bridges
+        L0-output → L1-input via ``encoder.l0.auto_reproduce``, and runs the
+        recursive L1 stage. Returns ``(projected_decoder_embeddings,
+        l1_output_survivors)``, or ``(None, None)`` if the node resolves to no
+        cached articles. Shared by the path-selective base case and the
+        full-backprop leaf case.
+        """
+        article_ids = self._resolve_article_ids(dataset, [node.id])
+        if not article_ids:
+            return None, None
+        l0_flat, _l0_cu = self._l0_for_articles(
+            dataset, article_ids, query_emb=q_emb,
+        )
+        if l0_flat.numel() == 0:
+            return None, None
+        l1in = self.encoder.l0.auto_reproduce(l0_flat)
+        return self._run_recursive_l1(l1in, q_emb)
+
+    def _encode_path_leaf_l1out(
+        self, dataset: str, node, q_emb: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """L1-output of a path node's articles (path-selective deepest-node
+        base case). Thin wrapper over :meth:`_encode_leaf_subtree` that returns
+        only the L1-output survivors (the live base of the search path)."""
+        _proj, l1out = self._encode_leaf_subtree(dataset, node, q_emb)
+        return l1out
+
+    def _run_recursive_l1(
+        self, children_reps_l1in: torch.Tensor, q_emb: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one query-conditioned recursive L1 pass over a single node's
+        children reps. Returns ``(projected_decoder_embeddings,
+        l1_output_survivors)``.
+        """
+        n = int(children_reps_l1in.shape[0])
+        cu = torch.tensor([0, n], dtype=torch.int32, device=self.device)
+        ratio = self._recursive_l1_retention_now()
+        q = q_emb.to(children_reps_l1in.dtype)
+        q_cu = torch.tensor(
+            [0, int(q.shape[0])], dtype=torch.int32, device=self.device,
+        )
+        q_pos = position_ids_from_cu(q_cu, int(q.shape[0]))
+        with self._l1_adapter_context():
+            l1_out, proj_out, _proj_cu = self.encoder.run_l1_and_project(
+                l1_input_embeddings=children_reps_l1in,
+                l1_input_cu_seqlens=cu,
+                target_ratio_l1=float(ratio),
+                content_group_cu_seqlens=None,
+                prompt_embeddings_l1=q,
+                prompt_cu_seqlens_l1=q_cu,
+                prompt_position_ids_l1=q_pos,
+            )
+        # When survivorship aux is OFF the recursive tree's L1 nodes are the
+        # dominant L1 compression path (the curriculum), yet they bypass the
+        # _run_l1_batch / _pending route that normally feeds θ. Feed their
+        # per-node keep-rate to the L1 dual-ascent state at the RECURSIVE L1
+        # ramp ratio so θ actually tracks the recursive ramp (0.30→0.05). No
+        # graph retained (scalar counts only). Aux-ON recursive runs keep their
+        # existing drill-driven θ behaviour (state is pinned post-step).
+        if (
+            self.encoder.training
+            and not getattr(self, "_survivorship_aux", True)
+        ):
+            self._accumulate_theta_state("l1", l1_out, ratio)
+        return proj_out.projected_embeddings, l1_out.survivor_embeddings
+
+    # ------------------------------------------------------------------
+    # Per-repo shared tree (git_commit_repro full-backprop)
+    # ------------------------------------------------------------------
+
+    def _repo_group_key(self, sample: KBSample) -> str:
+        """Return the shared-subtree root node id for a git_commit_repro
+        file-sample — the FIRST browse-turn id, which for the
+        ``root → repo → repo/wK → c16 → c4 → commit`` layout is always the
+        window node ``repo/wK``.  Every file-sample of one ``(repo, window)``
+        shares this key, so grouping by it batches a repo's file-samples
+        together and identifies the root of the window-0 subtree to encode
+        once.  Returns ``""`` when the sample has no browse turn (no shared
+        tree — falls back to per-sample handling)."""
+        for turn in sample.trajectory:
+            if turn.kind == "browse":
+                return str(turn.args.get("id", ""))
+        return ""
+
+    def _subsample_repo_batch(self, batch: list, root_node_id: str) -> list:
+        """Optionally cap a repo-batch to ``max_file_samples_per_repo`` (M1/M2
+        cost knob). ``None`` → unchanged. Re-seeded per epoch (and per repo) so
+        the K-subset rotates across epochs rather than always training the same
+        K files. Returns the (possibly smaller) sample list."""
+        k = getattr(self, "_max_file_samples_per_repo", None)
+        if k is None or len(batch) <= k:
+            return batch
+        import random as _random
+
+        seed = (
+            int(self.cfg.get("seed", 42))
+            + int(getattr(self, "epoch", 0))
+            + (hash(root_node_id) & 0xFFFFFFFF)
+        )
+        return _random.Random(seed).sample(list(batch), k)
+
+    def _handle_max_file_samples_per_repo(self, val) -> None:
+        """Live-config handler for the per-repo file-sample cap (M1/M2 cost
+        knob). ``null``/``None``/``<=0`` → unlimited (None); a positive int →
+        clamp to K. :meth:`_subsample_repo_batch` reads
+        ``self._max_file_samples_per_repo`` fresh per repo-batch, so a write to
+        ``control.json`` takes effect on the next repo-batch with no restart —
+        both opening up (raise / null) and clamping down."""
+        old = getattr(self, "_max_file_samples_per_repo", None)
+        if val is None:
+            self._max_file_samples_per_repo = None
+            logger.info(
+                "live_max_file_samples_per_repo", old=old, new=None,
+                meaning="unlimited",
+            )
+            return
+        if isinstance(val, (int, float)):
+            k = int(val)
+            self._max_file_samples_per_repo = k if k > 0 else None
+            logger.info(
+                "live_max_file_samples_per_repo",
+                old=old, new=self._max_file_samples_per_repo,
+            )
+            return
+        logger.warning(
+            "live_max_file_samples_per_repo_invalid",
+            value=val, expected="None or int",
+        )
+
+    def _dynamic_ckpt_managed_models(self) -> list[tuple[str, torch.nn.Module]]:
+        """Register the per-repo run's backbones with the memory-driven dynamic
+        ckpt scheduler so it can flip their gradient-checkpointing MODE (not
+        just the adaptive cache-flush) as system memory varies.
+
+        Without this override the base default returns ``[]`` → only the
+        adaptive CUDA cache-flush fires and the GC mode-flip never engages.
+        Registers L0 + L1 encoder backbones + EVERY decoder backbone (both
+        families under round-robin, so whichever family is active per
+        microbatch is always in the managed set). Mirrors
+        ``CommitEncodingTrainer._dynamic_ckpt_managed_models``.
+        """
+        models: list[tuple[str, torch.nn.Module]] = []
+        enc = getattr(self, "encoder", None)
+        if enc is not None:
+            l0 = getattr(enc, "l0", None)
+            if l0 is not None and getattr(l0, "backbone", None) is not None:
+                models.append(("encoder.l0", l0.backbone))
+            l1 = getattr(enc, "l1", None)
+            if l1 is not None and getattr(l1, "backbone", None) is not None:
+                models.append(("encoder.l1", l1.backbone))
+        decs = getattr(self, "_decoders_by_family", None)
+        if decs:
+            for family, dec in decs.items():
+                bb = getattr(dec, "backbone", None)
+                if bb is not None:
+                    models.append((f"decoder_{family}", bb))
+        elif getattr(self, "decoder", None) is not None:
+            bb = getattr(self.decoder, "backbone", None)
+            if bb is not None:
+                models.append(("decoder", bb))
+        return models
+
+    def _recursive_general_prompt_emb(self) -> torch.Tensor:
+        """L0-input-space embedding of the GENERAL (query-agnostic)
+        compression prompt fed to both L0 and L1 of the shared repo tree."""
+        embed_tokens = self.encoder.l0.backbone.get_input_embeddings()
+        text = getattr(
+            self, "_recursive_general_prompt", DEFAULT_RECURSIVE_GENERAL_PROMPT,
+        )
+        ids = self.encoder_tokenizer.encode(text, add_special_tokens=False) or [0]
+        return embed_tokens(
+            torch.tensor(ids, dtype=torch.long, device=self.device),
+        )
+
+    def _compute_shared_repo_tree(
+        self, dataset: str, root_node_id: str,
+    ) -> tuple[dict, dict]:
+        """Encode the WHOLE window-0 subtree ONCE for a repo with the GENERAL
+        prompt, returning ``(memo, stats)``.
+
+        ``memo`` maps every encoded node id → ``(projected_rep, l1_output)``
+        (live, gradient-carrying); the browse turns of every file-sample in
+        the repo then SPLICE ``memo[node][0]`` instead of re-encoding. The L0
+        leaves are encoded LIVE under the recursive L0 ramp (``_recursive_l0_
+        override``), bridged L0→L1, and consolidated up the tree under the
+        recursive L1 ramp — all backed by the per-layer gradient-checkpointed
+        L0/L1 backbones.  The autograd graph is kept alive by the returned
+        ``memo`` so the file-samples' backward passes can flow gradient into
+        the shared tree (see :meth:`_forward_backward_per_repo`).
+        """
+        memo: dict[str, tuple] = {}
+        stats: dict[str, int] = {"nodes": 0}
+        tree = self._trees.get(dataset)
+        if tree is None or root_node_id not in tree:
+            return memo, stats
+        q_emb = self._recursive_general_prompt_emb()
+        self._recursive_l0_override = self._recursive_l0_retention_now()
+        try:
+            self._encode_subtree(dataset, tree, root_node_id, q_emb, memo, stats)
+        finally:
+            self._recursive_l0_override = None
+        logger.info(
+            "phase2_kb_per_repo_shared_tree_encoded",
+            dataset=dataset,
+            root=root_node_id,
+            n_nodes=stats["nodes"],
+            l0_retention=self._recursive_l0_retention_now(),
+            l1_retention=self._recursive_l1_retention_now(),
+        )
+        return memo, stats
+
+    def _encode_sample_turns(self, prep: dict) -> list[torch.Tensor]:
+        """Encode a single file-sample's drill-down bgkit turns (SPECIFIC
+        per-turn query) into projected survivors, one tensor per turn.
+
+        Unlike :meth:`_forward_backward`'s cross-sample bucketing, the per-repo
+        path encodes one file-sample at a time (so its decoder + drill graph
+        free between micro-batches while the shared tree is retained). A
+        file-sample has only ~1-2 drill turns, so a single packed L1 forward
+        per sample is cheap. ``None`` turns get a zero fallback."""
+        turns = prep["prepared_turns"]
+        hidden_dim = self.encoder.active_projection_output_dim
+        zero = torch.zeros((1, hidden_dim), device=self.device, dtype=torch.bfloat16)
+        result: list[torch.Tensor] = [zero] * len(turns)
+        non_null = [(i, t) for i, t in enumerate(turns) if t is not None]
+        if non_null:
+            # Drill-down retrieval shares the L1 controller (θ) with the shared
+            # tree, so the whole L1 compression is ONE curriculum: request the
+            # SAME recursive L1 ramp ratio as the tree (not the static top-level
+            # l1_retention) so config matches behaviour and θ is driven uniformly.
+            outs = self._run_l1_batch(
+                [t for _, t in non_null],
+                target_ratio=self._recursive_l1_retention_now(),
+            )
+            for (i, _t), surv in zip(non_null, outs, strict=True):
+                result[i] = surv
+        return result
 
     # ------------------------------------------------------------------
     # Decoder segment construction
@@ -2208,7 +3415,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         embedding segments).
 
         All bgkit turns of a single sample run through one batched L1
-        encoder call (padded to the max content/query length across turns).
+        encoder call (packed varlen across turns — no padding tokens).
         This amortizes the per-call encoder launch overhead across the
         trajectory's ~3-4 bgkit calls.
 
@@ -2339,12 +3546,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         else:
             topic_tags = []
 
+        recursive_l1 = getattr(self, "_recursive_l1", False)
         rendered = tokenize_trajectory(
             self.tokenizer,
             system_prompt,
             sample.question,
             sample.trajectory,
             topic_knowledge_tags=topic_tags or None,
+            browse_node_sentinel=recursive_l1,
         )
         token_ids = rendered.token_ids.to(self.device)
         loss_mask = rendered.loss_mask.to(self.device)
@@ -2365,6 +3574,19 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             for turn in rendered.bgkit_turns
         ]
 
+        # Recursive-L1: path-selective dense node-rep per browse turn. Runs the
+        # encoder eagerly (unlike bgkit turns, which are deferred + bucketed)
+        # because the recursion is inherently per-sample. Empty list when the
+        # flag is off — no browse sentinels were emitted, so nothing to splice.
+        browse_node_reps: list[torch.Tensor | None] = []
+        browse_sentinel_len = 0
+        if recursive_l1 and rendered.browse_sentinel_positions:
+            browse_sentinel_ids = self.tokenizer.encode(
+                BGKIT_BROWSE_SENTINEL, add_special_tokens=False,
+            )
+            browse_sentinel_len = len(browse_sentinel_ids)
+            browse_node_reps = self._recursive_browse_node_reps(sample, rendered)
+
         return {
             "sample": sample,
             "rendered": rendered,
@@ -2374,6 +3596,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             "topic_sentinel_len": topic_sentinel_len,
             "prepared_turns": prepared_turns,
             "topic_block": topic_block,
+            "browse_node_reps": browse_node_reps,
+            "browse_sentinel_len": browse_sentinel_len,
         }
 
     def _assemble_sample_segments(
@@ -2403,6 +3627,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         sentinel_len = prep["sentinel_len"]
         topic_sentinel_len = prep["topic_sentinel_len"]
         topic_block = prep["topic_block"]
+        browse_node_reps = prep.get("browse_node_reps", []) or []
+        browse_sentinel_len = int(prep.get("browse_sentinel_len", 0) or 0)
 
         decoder_hidden = self.decoder.hidden_dim
 
@@ -2437,6 +3663,27 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 )
             survivors = self._apply_context_ablation(survivors, skip=skip_survivors)
             splice_events.append((start, "bgkit", survivors))
+        # Recursive-L1: dense path-selective node-rep at each browse sentinel.
+        # None reps (no resolvable subtree) splice a single zero vector so the
+        # sentinel token is still consumed. The bgkit ablation switch also
+        # gates these (they are query-conditioned compressed context).
+        if browse_node_reps and rendered.browse_sentinel_positions:
+            zero_browse = torch.zeros(
+                (1, decoder_hidden), device=self.device, dtype=torch.bfloat16,
+            )
+            for rep, start in zip(
+                browse_node_reps, rendered.browse_sentinel_positions, strict=True,
+            ):
+                payload = rep if rep is not None else zero_browse
+                if payload.size(-1) != decoder_hidden:
+                    raise RuntimeError(
+                        f"browse node-rep hidden dim {payload.size(-1)} != "
+                        f"decoder hidden dim {decoder_hidden}."
+                    )
+                payload = self._apply_context_ablation(
+                    payload, skip=skip_survivors,
+                )
+                splice_events.append((start, "browse", payload))
         splice_events.sort(key=lambda e: e[0])
 
         # Cumulative deltas at each splice point, used for span remapping.
@@ -2446,10 +3693,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
         segments: list[Segment] = []
         cursor = 0
+        sentinel_len_by_kind = {
+            "topic": topic_sentinel_len,
+            "bgkit": sentinel_len,
+            "browse": browse_sentinel_len,
+        }
         for start, kind, payload in splice_events:
-            sentinel_tok_len = (
-                topic_sentinel_len if kind == "topic" else sentinel_len
-            )
+            sentinel_tok_len = sentinel_len_by_kind[kind]
             end = start + sentinel_tok_len
 
             if start > cursor:
@@ -2689,6 +3939,11 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
         Returns (total_weighted_loss, metrics_dict).
         """
+        # Aux OFF: no survivorship gradient at all (head stays frozen at its
+        # pre-trained selection). _pending is empty in this mode anyway.
+        if not getattr(self, "_survivorship_aux", True):
+            return torch.zeros((), device=self.device, dtype=torch.float32), {}
+
         metrics: dict[str, float] = {}
         total = torch.zeros((), device=self.device, dtype=torch.float32)
 
@@ -2962,6 +4217,11 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         need to re-enter the router here. Clears large per-entry
         stashes before return to bound peak memory.
         """
+        # Aux OFF: no utility-grad BCE distillation (head frozen); nothing was
+        # retained in _pending.
+        if not getattr(self, "_survivorship_aux", True):
+            return {}
+
         from bgkit.training.survivorship_helpers import (
             LevelLossCfg,
             utility_grad_bce_loss,
@@ -3040,12 +4300,172 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
         return metrics
 
+    def _all_decoders(self) -> list:
+        """Decoders to optimize/save: both families in round-robin, else one."""
+        if getattr(self, "_decoders_by_family", None):
+            return list(self._decoders_by_family.values())
+        return [self.decoder]
+
+    def _pick_decoder_family(self) -> str:
+        """Pick the decoder family for the next batch (round-robin routing)."""
+        import random
+
+        if abs(self._qwen_decoder_prob - 0.5) > 1e-6:
+            return "qwen35" if random.random() < self._qwen_decoder_prob else "falcon_h1"
+        family = "qwen35" if (self._microbatch_counter % 2 == 0) else "falcon_h1"
+        self._microbatch_counter += 1
+        return family
+
+    def _set_active_decoder(self, family: str) -> None:
+        """Aim self.decoder / self.tokenizer / encoder projection at ``family``.
+
+        Called before each batch (train) / sample (eval) so the encoder's active
+        projection block, the decoder, and the tokenizer that renders the
+        trajectory are all the same family.
+        """
+        self.decoder = self._decoders_by_family[family]
+        self.tokenizer = self._tokenizer_by_family[family]
+        self._decoder_family = family
+        self.encoder.set_active_decoder_family(family)
+
+    def _forward_backward_per_repo(self, batch) -> dict[str, float]:
+        """Per-repo forward + backward (git_commit_repro full-backprop).
+
+        ``batch`` is one repo's window-0 file-samples (grouped by
+        :class:`~bgkit.data.samplers.RepoGroupedBatchSampler`). The whole
+        window-0 subtree is encoded ONCE with the GENERAL prompt; then each
+        file-sample is decoded and its loss is backpropped with
+        ``retain_graph=True`` so the SHARED tree graph survives across the
+        repo's file-samples and accumulates their gradients.
+
+        Two phases bound memory while normalising correctly:
+          1. **Stage** every CONTRIBUTING file-sample (prep + drill encode +
+             segment assembly); samples with no segments / zero loss-tokens are
+             dropped here so they don't dilute the average.
+          2. **Decode + backward** each staged sample, normalising by the
+             actual contributing count (not ``len(batch)``). The decoder graph
+             is the heavy one and is created/freed per sample; the staged drill
+             graphs (small) + the memo-referenced shared tree persist for the
+             backwards. ``max_file_samples_per_repo`` bounds the staged count.
+
+        Gradient updates flow to L0 (live) + L1 + ``l1l1_bridge`` + the tree
+        reps + the active decoder. The retained shared-tree graph is freed by
+        refcount when ``memo`` drops at function exit (when survivorship aux is
+        ON its final backward releases it; with aux OFF there is no final aux
+        backward — refcounting frees it).
+        """
+        if not batch:
+            return {"loss": torch.zeros((), device=self.device), "tokens": 0.0}
+
+        if self._round_robin:
+            self._set_active_decoder(self._pick_decoder_family())
+
+        dataset = batch[0].dataset_name
+        root_node_id = self._repo_group_key(batch[0])
+        # m3: every reconstruction trajectory must start with a window browse
+        # turn (the shared-subtree root). An empty key collapses cross-dataset
+        # in the sampler AND leaves _compute_shared_repo_tree with no root — a
+        # silent no-op. Fail loudly so a future data regression is caught.
+        assert root_node_id, (
+            "per-repo batch sample has no browse turn (empty shared-tree root "
+            f"key); dataset={dataset!r}. git_commit_repro trajectories must "
+            "begin with a window browse turn."
+        )
+
+        # M1/M2 knob: optionally subsample the repo's file-samples to bound the
+        # per-step cost (N tree-recomputes) + staged-graph memory. Re-seeded per
+        # epoch so coverage rotates across epochs.
+        batch = self._subsample_repo_batch(batch, root_node_id)
+
+        self._pending_l0_outputs = []
+        self._pending_l1_outputs = []
+        self._step_sampled_l0_ratios = []
+        self._step_sampled_l1_ratios = []
+        if self.topic_embeddings is not None:
+            self.topic_embeddings.record_batch_usage(
+                [self._sample_tags_for(s) for s in batch],
+            )
+
+        # --- 1. Encode the shared window-0 tree ONCE (general prompt) ---
+        memo, _stats = self._compute_shared_repo_tree(dataset, root_node_id)
+        self._shared_tree_memo = memo
+        self._per_repo_shared_tree_active = True
+
+        total_loss_val = 0.0
+        total_tokens = 0
+        n_samples = 0
+        n_turns_total = 0
+        try:
+            # --- 2a. Stage every CONTRIBUTING file-sample (prep + drill encode
+            #         + assemble). Dropping non-contributors here means the
+            #         normaliser below is the true contributing count.
+            staged: list[tuple[list, int, int]] = []  # (segments, tokens, n_turns)
+            for sample in batch:
+                prep = self._prepare_sample_for_decode(sample)
+                per_turn = self._encode_sample_turns(prep)
+                segments, _trace = self._assemble_sample_segments(prep, per_turn)
+                if not segments:
+                    continue
+                sample_tokens = 0
+                for seg in segments:
+                    if isinstance(seg, TokenSegment) and seg.loss_mask is not None:
+                        sample_tokens += int(seg.loss_mask.sum().item())
+                if sample_tokens == 0:
+                    continue
+                staged.append((segments, sample_tokens, len(prep["prepared_turns"])))
+
+            n_contrib = len(staged)
+            if n_contrib == 0:
+                return {"loss": torch.zeros((), device=self.device), "tokens": 0.0}
+
+            # --- 2b. Decode + backward each staged sample, normalised by the
+            #         CONTRIBUTING count (m1) and accum. retain_graph keeps the
+            #         memo-referenced shared tree alive across file-samples; the
+            #         decoder graph frees once its refs drop each iteration.
+            for segments, sample_tokens, n_turns in staged:
+                sample_loss = self.decoder.forward_interleaved_with_loss(segments)
+                scaled = sample_loss / (n_contrib * self._accum_steps)
+                scaled.backward(retain_graph=True)
+                total_loss_val += float(sample_loss.detach())
+                total_tokens += sample_tokens
+                n_samples += 1
+                n_turns_total += n_turns
+
+            # --- 3. Survivorship aux losses over the accumulated L0 (shared
+            #        tree leaves + per-sample drills) + L1 outputs. No-op when
+            #        survivorship aux is OFF (returns zeros). When ON, this final
+            #        backward (retain_graph=False) releases the shared tree.
+            aux_loss, aux_metrics = self._compute_survivorship_aux_losses()
+            if aux_loss.requires_grad:
+                (aux_loss / self._accum_steps).backward()
+        finally:
+            self._per_repo_shared_tree_active = False
+            self._shared_tree_memo = None
+
+        self._apply_utility_grad_bce_phase2()
+        if self.topic_embeddings is not None:
+            self.topic_embeddings.apply_gradient_averaging()
+
+        metrics_out = {
+            "loss": torch.tensor(total_loss_val / n_samples, device=self.device),
+            "tokens": float(total_tokens / n_samples),
+            "live_l0": 1.0 if self._live_l0 else 0.0,
+            "per_repo_file_samples": float(len(batch)),
+            "per_repo_contributing_samples": float(n_samples),
+            "per_repo_shared_tree_nodes": float(_stats.get("nodes", 0)),
+            "l1_turns_per_sample": float(n_turns_total / n_samples),
+            "recursive_l0_retention": self._recursive_l0_retention_now(),
+            "recursive_l1_retention": self._recursive_l1_retention_now(),
+        }
+        metrics_out.update(aux_metrics)
+        return metrics_out
+
     def _forward_backward(self, batch) -> dict[str, float]:
         """Cross-sample batched forward + backward.
 
         Every sample in the training batch has ~3-4 bgkit turns. We pool
         ALL turns from ALL samples, bucket them by content length (power
-        of 2), and run each bucket as a single padded encoder forward.
+        of 2), and run each bucket as a single packed (varlen) encoder forward.
         Then each sample is assembled into segments using the pre-computed
         L1 outputs and the decoder forward runs per-sample. This collapses
         (batch_size * turns_per_sample) encoder launches into at most a
@@ -3053,6 +4473,20 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         """
         if not batch:
             return {"loss": torch.zeros((), device=self.device), "tokens": 0.0}
+
+        # PER-REPO full-backprop: a batch is one repo's file-samples. Encode
+        # the shared window-0 tree ONCE and grad-accumulate the file-samples'
+        # decoder losses through it (retain_graph). Distinct enough from the
+        # cross-sample bucketed path to warrant its own method.
+        if getattr(self, "_per_repo_full_backprop", False):
+            return self._forward_backward_per_repo(batch)
+
+        # Round-robin: one decoder family for the whole batch. The L1 encode is
+        # batched across all samples under the active projection family and then
+        # decoded per-sample, so the family must be fixed for the step (matches
+        # the summarization trainer's per-microbatch routing).
+        if self._round_robin:
+            self._set_active_decoder(self._pick_decoder_family())
 
         # Reset per-step accumulators for survivorship aux losses
         self._pending_l0_outputs: list[dict] = []
@@ -3263,15 +4697,58 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     # Post-optimizer-step hooks
     # ------------------------------------------------------------------
 
+    def _accumulate_theta_state(self, level: str, enc_out, ratio: float) -> None:
+        """Accumulate ONLY the dual-ascent θ control statistics (per-microbatch
+        scalar keep-rate sum/count + target-ratio mass) for ``level`` directly
+        into the per-level :class:`MicrobatchAggState`, WITHOUT retaining
+        ``enc_out`` in ``_pending_l{0,1}_outputs``.
+
+        Used when survivorship aux is disabled (``survivorship_aux: false``):
+        θ keeps adapting to the retention ramp with zero activation retention.
+        ``accumulate`` reads only zero-dim count scalars off ``enc_out`` (no
+        autograd graph), so this is memory-free. The accumulated
+        ``target_ratio`` mass lets :meth:`_run_dual_ascent` use the true
+        batch-weighted target under a ramp without a pinned ``target_ratios``.
+        """
+        from bgkit.training.survivorship_helpers import accumulate
+
+        state = getattr(
+            self, "_surv_state_l0" if level == "l0" else "_surv_state_l1", None,
+        )
+        if state is None:
+            return
+        accumulate(state, enc_out, target_ratio=float(ratio))
+
     def _post_optimizer_step(self, step: int) -> None:
         """Run dual-ascent θ + EMA μ updates per level using true-mean aggregation.
 
         Stage A: live L0 → update both L0 and L1.
         Stage B: cached L0 with L0 LoRA frozen → skip L0 updates.
         """
+        from bgkit.training.survivorship_helpers import accumulate, maybe_unload_ice
+
+        # Decoupled θ path: when survivorship aux is OFF the per-level state was
+        # already accumulated per-microbatch at encode time (no _pending), so
+        # just run dual-ascent (drains + resets the state). target_ratios=None
+        # → the accumulated per-microbatch target-ratio mass drives the target
+        # (correct under the L0/L1 retention ramps).
+        if not getattr(self, "_survivorship_aux", True):
+            self._run_dual_ascent(
+                step,
+                target_ratios=None,
+                skip_levels=() if self._live_l0 else ("l0",),
+            )
+            unloaded = maybe_unload_ice(
+                getattr(self, "_ice_teacher", None),
+                step,
+                getattr(self, "_max_warmup_step", 0),
+            )
+            if unloaded:
+                logger.info("ice_teacher_unloaded", step=step)
+            return
+
         # Accumulate pending L0/L1 outputs into per-level state, then apply
         # via the shared dual-ascent dispatch (CompressionCurriculumMixin).
-        from bgkit.training.survivorship_helpers import accumulate, maybe_unload_ice
 
         # L0 target: per-microbatch ratios differ by dataset. Weight each
         # microbatch by its controllable_count so θ targets the true
@@ -3411,9 +4888,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         kb_bgkit_n = 0
         kb_f1_sum = 0.0
         kb_f1_n = 0
+        self._eval_family_counter = 0
 
         for batch in self.eval_dataloader:
             for sample in batch:
+                if self._round_robin:
+                    # Deterministic alternation so eval/loss reflects both
+                    # decoders ~50/50 and is reproducible across runs.
+                    self._set_active_decoder(
+                        "qwen35" if self._eval_family_counter % 2 == 0
+                        else "falcon_h1"
+                    )
+                    self._eval_family_counter += 1
                 result = self._eval_one_sample(sample)
                 if result is None:
                     continue

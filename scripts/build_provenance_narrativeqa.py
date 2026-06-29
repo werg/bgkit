@@ -100,6 +100,8 @@ def build_provenance(
         )
 
     columns = ["id", "document_id"]
+    if "book_id" in schema.names:
+        columns.append("book_id")
     for candidate in _TITLE_COLUMNS:
         if candidate in schema.names:
             columns.append(candidate)
@@ -147,14 +149,20 @@ def build_provenance(
                 n_skipped += 1
                 continue
 
-            # Prefer a human-readable title if present; else the parent
-            # book id (reshard pipeline); else the row's own document_id.
+            # Prefer a human-readable title if present; else the per-book
+            # grouping key (book_id, written by convert_hf_to_mmap.py); else
+            # the parent book id (reshard pipeline); else the row's own
+            # document_id.
             scope_description: str | None = None
             for key in _TITLE_COLUMNS:
                 val = row.get(key)
                 if val:
                     scope_description = str(val)
                     break
+            if scope_description is None:
+                book = row.get("book_id")
+                if book:
+                    scope_description = str(book)
             if scope_description is None:
                 parent = row.get("parent_book")
                 if parent:

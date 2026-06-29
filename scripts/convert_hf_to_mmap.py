@@ -283,6 +283,22 @@ def _extract_narrativeqa_document(record: dict) -> str:
     return ""
 
 
+def _extract_narrativeqa_book_id(record: dict) -> str:
+    """Extract the per-book id from NarrativeQA's nested document dict.
+
+    ``document["id"]`` is the stable book key shared by every question
+    about the same book. The top-level record carries no id, so without
+    this the converter falls back to per-row enumeration and the
+    book grouping (needed for a per-book browse tree) is lost.
+    """
+    document = record.get("document")
+    if isinstance(document, dict):
+        book_id = document.get("id")
+        if book_id:
+            return str(book_id)
+    return ""
+
+
 def _extract_narrativeqa_question(record: dict) -> str:
     """Extract question text from NarrativeQA format.
 
@@ -397,6 +413,7 @@ def convert_dataset(
 
     for idx, record in enumerate(dataset):
         # Dataset-specific extraction
+        book_id = ""
         if is_msmarco:
             document_text = _extract_msmarco_document(record)
             question_text = _extract_first(record, spec.question_fields)
@@ -405,6 +422,7 @@ def convert_dataset(
             document_text = _extract_narrativeqa_document(record)
             question_text = _extract_narrativeqa_question(record)
             answer_text = _extract_narrativeqa_answer(record)
+            book_id = _extract_narrativeqa_book_id(record)
         elif is_kilt_task:
             document_text = ""  # KILT tasks reference Wikipedia by provenance
             question_text = _extract_first(record, spec.question_fields)
@@ -527,6 +545,12 @@ def convert_dataset(
             if record.get("meta", {}).get("task"):
                 row_meta["task_name"] = str(record["meta"]["task"])
 
+        # NarrativeQA: retain the per-book grouping key. document_id stays
+        # per-row (one row per question), so the browse tree groups rows
+        # under their shared book_id leaf-tag.
+        if book_id:
+            row_meta["book_id"] = book_id
+
         metadata_rows.append(row_meta)
 
     if not document_chunks:
@@ -556,6 +580,11 @@ def convert_dataset(
     if any("task_name" in row for row in metadata_rows):
         columns["task_name"] = pa.array(
             [row.get("task_name", "") for row in metadata_rows],
+            type=pa.string(),
+        )
+    if any("book_id" in row for row in metadata_rows):
+        columns["book_id"] = pa.array(
+            [row.get("book_id", "") for row in metadata_rows],
             type=pa.string(),
         )
     metadata_table = pa.table(columns)

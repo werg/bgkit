@@ -80,6 +80,19 @@ class LoRALinearWrapper(nn.Module):
         self.base_layer = base
         self.adapters = nn.ModuleDict()
 
+    def __getattr__(self, name: str):
+        # Delegate Linear-like attribute access (out_features, in_features,
+        # weight, bias, ...) to the wrapped base Linear so callers that
+        # introspect the original nn.Linear keep working through the wrapper
+        # (e.g. bidirectional_qwen35 reads q_proj.out_features). nn.Module's
+        # __getattr__ resolves registered params/buffers/submodules first
+        # (including ``base_layer`` and ``adapters``), so this passthrough only
+        # fires for genuine Linear attributes and cannot recurse on base_layer.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(super().__getattr__("base_layer"), name)
+
     def add_adapter(
         self,
         name: str,

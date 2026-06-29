@@ -195,7 +195,14 @@ PY
         )
     fi
 
-    if [ -z "${FLASH_ATTENTION_SM12X_USE_EXTENSION+x}" ]; then
+    # Auto-detect only when the user hasn't explicitly chosen a value. NOTE:
+    # docker-compose.yaml injects `FLASH_ATTENTION_SM12X_USE_EXTENSION=${...:-}`,
+    # i.e. an EMPTY STRING when the host var is unset. The old guard used
+    # `${VAR+x}` (true only when *undefined*), so the empty-string default made
+    # it skip the auto-enable forever (extension stayed deselected even when
+    # built). Test for empty instead: empty/unset → auto-detect; an explicit
+    # "0" (disable) or "1" (enable) is respected and not overridden.
+    if [ -z "${FLASH_ATTENTION_SM12X_USE_EXTENSION}" ]; then
         if python - <<'PY'
 import torch
 

@@ -847,6 +847,27 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
         def calls(self):
             return self.l0.calls + self.l1.calls
 
+        def run_l1_and_project(
+            self,
+            l1_input_embeddings,
+            l1_input_cu_seqlens,
+            target_ratio_l1=None,
+            content_group_cu_seqlens=None,
+            prompt_embeddings_l1=None,
+            prompt_cu_seqlens_l1=None,
+            **kwargs,
+        ):
+            # Mirrors BgKITEncoder.run_l1_and_project: (no cross-section merge
+            # for content_group=None) → L1 forward → projection.
+            l1_out = self.l1(
+                content_embeddings=l1_input_embeddings,
+                content_cu_seqlens=l1_input_cu_seqlens,
+                prompt_embeddings=prompt_embeddings_l1,
+                prompt_cu_seqlens=prompt_cu_seqlens_l1,
+            )
+            proj_out = self.projection_block(l1_out.survivor_embeddings)
+            return l1_out, proj_out, l1_out.survivor_cu_seqlens
+
     trainer = KRKBTrainer.__new__(KRKBTrainer)
     trainer.device = torch.device("cpu")
     trainer.encoder = _StubEncoder()
@@ -912,7 +933,7 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
 
     # Mock _l0_for_articles directly to skip the encoder-based L0 path.
     # Packed form: return (flat_rows, cu_seqlens) with K=2 per article.
-    def fake_l0(self, dataset, article_ids):
+    def fake_l0(self, dataset, article_ids, query_emb=None):
         n = len(article_ids)
         k = 2
         flat = torch.arange(n * k * hidden_dim, dtype=torch.float32).reshape(
@@ -1099,3 +1120,154 @@ def test_l0_retention_curriculum_ramp():
     # Past ramp_steps: stays at end
     trainer.global_step = 5000
     assert trainer._l0_retention_for("pubmedqa") == pytest.approx(0.01)
+
+
+def test_live_l0_encode_feeds_per_task_prompt_when_enabled():
+    """Per-task L0 prompts: when l0_prompt_tokens > 0, _live_l0_encode feeds L0 a
+    non-None prompt_embeddings (replicated per article) that DIFFERS by dataset;
+    when off (0), no prompt is passed (unchanged path)."""
+    import types
+
+    import torch.nn as nn
+
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+    from bgkit.training.survivorship_helpers import LevelLossCfg
+
+    hidden_dim = 4
+
+    class _StubBackbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._embed = torch.nn.Embedding(50, hidden_dim)
+
+        def get_input_embeddings(self):
+            return self._embed
+
+    class _StubL0(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = _StubBackbone()
+            self.calls: list = []
+
+        def __call__(self, **kwargs):
+            self.calls.append(kwargs)
+            cu = kwargs["content_cu_seqlens"]
+            return types.SimpleNamespace(
+                survivor_embeddings=kwargs["content_embeddings"],
+                survivor_cu_seqlens=cu,
+                survivor_counts=(cu[1:] - cu[:-1]).to(torch.int64),
+            )
+
+    class _StubEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l0 = _StubL0()
+
+    class _TokenStore:
+        def get(self, dataset, aid):
+            return torch.tensor([1, 2, 3], dtype=torch.long)
+
+    trainer = KRKBTrainer.__new__(KRKBTrainer)
+    trainer.device = torch.device("cpu")
+    trainer.encoder = _StubEncoder()
+    trainer._checkpoint_encoder = False
+    trainer._token_store = _TokenStore()
+    trainer._surv_l0 = LevelLossCfg()
+    trainer._sample_l0_retention_for = lambda _ds: 0.5
+    trainer._l0_prompt_tokens = 3
+    trainer.encoder.l0_task_prompts = nn.ParameterDict({
+        "ds_a": nn.Parameter(torch.ones(3, hidden_dim)),
+        "ds_b": nn.Parameter(torch.full((3, hidden_dim), 2.0)),
+    })
+
+    trainer._live_l0_encode("ds_a", ["x", "y"])  # 2 articles
+    pa = trainer.encoder.l0.calls[-1]["prompt_embeddings"]
+    trainer._live_l0_encode("ds_b", ["x", "y"])
+    pb = trainer.encoder.l0.calls[-1]["prompt_embeddings"]
+
+    assert pa is not None and pb is not None
+    assert pa.shape == (2 * 3, hidden_dim)  # n_articles * prompt_tokens
+    assert not torch.allclose(pa, pb)  # task-conditioned: differs by dataset
+
+    # Disabled (default) → no prompt is fed.
+    trainer._l0_prompt_tokens = 0
+    trainer._live_l0_encode("ds_a", ["x"])
+    assert trainer.encoder.l0.calls[-1]["prompt_embeddings"] is None
+
+
+def test_live_l0_encode_feeds_actual_query_when_no_task_prompt():
+    """Live-L0 query conditioning (the DEFAULT, not a flag): with per-task
+    prompts OFF, _live_l0_encode feeds L0 the ACTUAL query (replicated once per
+    article) as its compression prompt, so L0's within-doc compression is
+    query-aware. Per-task prompts supersede the query when on (frozen path)."""
+    import types
+
+    import torch.nn as nn
+
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+    from bgkit.training.survivorship_helpers import LevelLossCfg
+
+    hidden_dim = 4
+
+    class _StubBackbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._embed = torch.nn.Embedding(50, hidden_dim)
+
+        def get_input_embeddings(self):
+            return self._embed
+
+    class _StubL0(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = _StubBackbone()
+            self.calls: list = []
+
+        def __call__(self, **kwargs):
+            self.calls.append(kwargs)
+            cu = kwargs["content_cu_seqlens"]
+            return types.SimpleNamespace(
+                survivor_embeddings=kwargs["content_embeddings"],
+                survivor_cu_seqlens=cu,
+                survivor_counts=(cu[1:] - cu[:-1]).to(torch.int64),
+            )
+
+    class _StubEncoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l0 = _StubL0()
+
+    class _TokenStore:
+        def get(self, dataset, aid):
+            return torch.tensor([1, 2, 3], dtype=torch.long)
+
+    trainer = KRKBTrainer.__new__(KRKBTrainer)
+    trainer.device = torch.device("cpu")
+    trainer.encoder = _StubEncoder()
+    trainer._checkpoint_encoder = False
+    trainer._token_store = _TokenStore()
+    trainer._surv_l0 = LevelLossCfg()
+    trainer._sample_l0_retention_for = lambda _ds: 0.5
+    trainer._l0_prompt_tokens = 0  # per-task prompts OFF → query is used
+
+    q_len = 5
+    q_emb = torch.randn(q_len, hidden_dim)
+    trainer._live_l0_encode("ds_a", ["x", "y", "z"], query_emb=q_emb)  # 3 articles
+    p = trainer.encoder.l0.calls[-1]["prompt_embeddings"]
+    assert p is not None
+    assert p.shape == (3 * q_len, hidden_dim)  # query replicated per article
+    for i in range(3):  # each article's slice is exactly the query
+        assert torch.allclose(p[i * q_len : (i + 1) * q_len], q_emb.to(p.dtype))
+
+    # No query + no task prompt → no prompt (unchanged legacy path).
+    trainer._live_l0_encode("ds_a", ["x"])
+    assert trainer.encoder.l0.calls[-1]["prompt_embeddings"] is None
+
+    # Per-task prompt supersedes the query when both are present (frozen path).
+    trainer._l0_prompt_tokens = 3
+    trainer.encoder.l0_task_prompts = nn.ParameterDict({
+        "ds_a": nn.Parameter(torch.ones(3, hidden_dim)),
+    })
+    trainer._live_l0_encode("ds_a", ["x", "y"], query_emb=q_emb)
+    p2 = trainer.encoder.l0.calls[-1]["prompt_embeddings"]
+    assert p2.shape == (2 * 3, hidden_dim)  # per-task tokens (3), not query (5)

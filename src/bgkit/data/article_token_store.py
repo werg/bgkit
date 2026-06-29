@@ -82,6 +82,11 @@ class _DatasetView:
         end = int(self._offsets[row + 1])
         return torch.from_numpy(self._tokens[start:end].astype(np.int64))
 
+    def length(self, document_id: str) -> int:
+        """Token count for one article via the offsets CSR — no token load."""
+        row = self._id_to_row[document_id]
+        return int(self._offsets[row + 1]) - int(self._offsets[row])
+
     def document_ids(self) -> list[str]:
         return list(self._id_to_row.keys())
 
@@ -125,6 +130,10 @@ class ArticleTokenStore:
     def get(self, dataset: str, document_id: str) -> torch.Tensor:
         """Return a (L,) int64 tensor of token IDs for the given article."""
         return self._view(dataset).get(document_id)
+
+    def length(self, dataset: str, document_id: str) -> int:
+        """Token count for one article without materializing its tokens."""
+        return self._view(dataset).length(document_id)
 
     def get_batch(
         self,

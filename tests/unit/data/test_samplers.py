@@ -730,3 +730,43 @@ class TestQueryAwareBatchSampler:
         count_at_10 = sum(len(b) for b in sampler)
 
         assert count_at_10 > count_at_0, "More samples with distractors at step 10"
+
+
+# ---------------------------------------------------------------------------
+# KBTokenBudgetBatchSampler (Phase-2 linear token-budget packing)
+# ---------------------------------------------------------------------------
+
+from bgkit.data.samplers import KBTokenBudgetBatchSampler
+
+
+def test_kb_token_budget_packs_small_isolates_large():
+    costs = [10, 20, 30, 150, 40]  # idx 3 is oversized vs budget 100
+    s = KBTokenBudgetBatchSampler(costs, budget=100, shuffle=False)
+    batches = list(s)
+    assert sorted(i for b in batches for i in b) == list(range(len(costs)))
+    big = [b for b in batches if 3 in b]
+    assert len(big) == 1 and big[0] == [3]  # oversized alone
+    for b in batches:
+        assert sum(costs[i] for i in b) <= 100 or b == [3]
+    assert len(s) == len(batches)
+
+
+def test_kb_token_budget_covers_all_and_respects_budget_shuffled():
+    rng = random.Random(0)
+    costs = [rng.randint(1, 60) for _ in range(200)]
+    s = KBTokenBudgetBatchSampler(costs, budget=128, shuffle=True, seed=7)
+    batches = list(s)
+    assert sorted(i for b in batches for i in b) == list(range(200))
+    for b in batches:
+        assert sum(costs[i] for i in b) <= 128 or len(b) == 1
+    assert len(s) == len(batches)
+
+
+def test_kb_token_budget_set_epoch_reshuffles():
+    costs = [5] * 50
+    s = KBTokenBudgetBatchSampler(costs, budget=20, shuffle=True, seed=1)
+    s.set_epoch(0); b0 = list(s)
+    s.set_epoch(1); b1 = list(s)
+    assert sorted(i for b in b0 for i in b) == list(range(50))
+    assert sorted(i for b in b1 for i in b) == list(range(50))
+    assert b0 != b1  # reshuffled across epochs

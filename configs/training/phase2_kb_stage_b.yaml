@@ -6,11 +6,15 @@
 # scripts/precompute_l0_subset.py with --stage-a-checkpoint pointing at
 # the trained Stage A checkpoint.
 #
-# Memory safety: container runs with mem_limit: 80g + memswap_limit: 80g
-# (docker/docker-compose.yaml gpu-common anchor), and the peer-CUDA
-# safety check in BaseTrainer refuses to start if total CUDA usage
-# would exceed 90% of BGKIT_CUDA_MEM_FRACTION (default 0.65 = 83 GB).
-# Together these prevent host OOM on the 128 GB unified-memory DGX Spark.
+# Memory safety (2026-06-28): the global guard is .env BGKIT_CUDA_MEM_FRACTION=0.80
+# (~97GB process cap → ~24GB host margin on the 121GB unified-memory host, so a
+# host FREEZE is impossible — see the Stage A GC-off freeze post-mortem in memory).
+# ⚠ Stage B uses CACHED L0 (live_l0: false) — NO live-L0 forward — so its peak
+# profile is FUNDAMENTALLY DIFFERENT from Stage A's: the per-step cost is the L1
+# encoder + decoder forward over the (small) cached survivors, NOT a raw-token L0
+# forward. DO NOT copy Stage A's trim (max_sample_l0_tokens) / memory-retention
+# tuning — those are live-L0 knobs. Profile Stage B FRESH (profile-phase2-kb-stage-b
+# compose service) before raising batch_size.
 phase: phase2_kb
 stage: B
 optimizer: adamw
@@ -22,16 +26,17 @@ l1_lr: 2.0e-4
 eval_every: 1000
 save_every: 5000
 
-# Phase 2 trajectory batches are far heavier per sample than Phase 1
-# packed-token batches: each KBSample triggers 3-4 encoder bucket
-# forwards + a per-sample decoder forward. The root config.yaml default
-# of 32 is designed for Phase 1 token-budget samplers and will OOM here.
-# Stage B has a larger corpus and cached L0 (no live encoder forward for
-# L0) — slightly cheaper per step than Stage A — but the L1 encoder
-# forward + decoder forward profile is similar.
-# batch_size=4 is a conservative baseline pending a profiler run with
-# the profile-phase2-kb-stage-b compose service (mem_limit: 80g).
-# Raise to 8 once Stage A profiler confirms headroom.
+# batch_size=4 is a conservative baseline pending a fresh profiler run
+# (profile-phase2-kb-stage-b). Cached L0 is cheaper per step than Stage A's live
+# L0, so there is likely headroom — but PROFILE first (cached-L0 caveat above).
+#
+# SPEEDUP FOLLOW-UP — token-budget packing: Stage A's ~2.9x packing win
+# (max_microbatch_l0_tokens) is currently GATED ON live_l0 in
+# kr_kb_trainer._build_dataloaders, so it does NOT apply to Stage B's cached path —
+# and its cost fn (_sample_l0_token_load = raw token load) is the wrong unit for
+# cached survivors anyway. HIGH-VALUE TRAINER FOLLOW-UP: extend packing to the
+# cached path with a survivor-count cost so Stage B's 60k steps get the same
+# throughput win. Until then Stage B uses fixed batch_size.
 batch_size: 4
 
 datasets:
@@ -48,7 +53,31 @@ datasets:
 # to run a smaller subset for debugging, add a whitelist here.
 
 live_l0: false
+# The L0 cache MUST be precomputed with the PROMPT-FIT checkpoint so the cached
+# survivors reflect the per-task L0 prompts (see phase2_kb_prompt_fit + the
+# precompute command in the stage_a_checkpoint note below). A cache built without
+# the prompts gives a task-UNCONDITIONED cached L0.
 l0_cache_dir: ${oc.env:DATA_DIR}/l0_cache_kb
+
+# ── Recursive-L1 path-selective browse encode (Phase 3) ──────────────────
+# OFF by default — the trainer's browse turns stay text-only. When enabled,
+# each browse turn additionally splices a DENSE node-rep: the live search
+# path is re-encoded with gradient (query-conditioned), while off-path
+# browse-tree siblings are read DETACHED from the query-agnostic L1-tree
+# cache built by scripts/precompute_l1_tree.py (the memory win). Requires
+# that cache to exist for every active dataset.
+recursive_l1_tree:
+  enabled: false
+  # cache_dir: ${oc.env:DATA_DIR}/l1_tree_cache_kb   # default when omitted
+  # l1_retention: 0.15                               # defaults to l1_retention
+  # full_backprop: false
+  #   FULL-TREE curriculum (git-repro windows ONLY). When true, the WHOLE
+  #   window subtree is re-encoded LIVE every step and gradient flows to ALL
+  #   nodes (on-path + off-path) — off-path siblings are re-encoded live from
+  #   the L0 leaf cache, NOT read detached from an L1-tree cache (so no
+  #   precompute_l1_tree.py run is needed). L0 stays frozen/cached. SMALL
+  #   trees ONLY (~16-64 commits) — MUST NOT be enabled on big trees
+  #   (pubmedqa/KILT) or it will OOM / be intractably slow.
 
 l0_retention:
   kilt_wikipedia: 0.05
@@ -90,6 +119,12 @@ lora:
 # frozen, so L0 survivorship losses are zeroed and the trainer skips L0
 # θ/μ updates in post-step. L1 continues from Stage A's cold-start.
 survivorship:
+  # Phase 2 (KRKBTrainer): selection is the least-important signal (reps are
+  # distributed; the pre-trained head already selects decent candidates), so
+  # ALL survivorship aux is OFF — head frozen, no _pending retention, only the
+  # main reconstruction loss + the (still-on) dual-ascent θ control. The
+  # per-level weights below are inert under this flag (kept for re-enable).
+  survivorship_aux: false
   relevance_loss_weight: 0.05
   relevance_gold_boost: 1.5
   relevance_distractor_damp: 0.5
@@ -130,6 +165,17 @@ moment_match_reference:
     path: null
 
 phase1_checkpoint: auto
-# stage_a_checkpoint: auto  # uncomment once Stage A has produced a
-# best-checkpoint registry entry; the precompute script needs this to
-# bake Stage A's L0 LoRA into the cache.
+# stage_a_checkpoint — consumed by precompute_l0_subset.py (NOT by Stage B
+# directly; Stage B reads l0_cache_dir). Point it at the PROMPT-FIT best checkpoint
+# (phase2_kb_prompt_fit) so precompute bakes BOTH the shaped L0 weights AND the
+# learned per-task prompts (l0_task_prompts.*) into the cache:
+#   python scripts/precompute_l0_subset.py \
+#     --articles $DATA_DIR/trajectory_sets/stage_b.jsonl \
+#     --mmap-dir $DATA_DIR/mmap/phase2 \
+#     --phase1-checkpoint $CHECKPOINT_DIR/phase1_summarization_round_robin_step51945_... \
+#     --stage-a-checkpoint $CHECKPOINT_DIR/phase2_kb_prompt_fit_best \
+#     --output-dir $DATA_DIR/l0_cache_kb \
+#     --retention-json configs/phase2_kb/l0_retention.json --lora-rank 32
+# precompute auto-detects l0_task_prompts.* in the ckpt (scripts/
+# precompute_l0_subset.py:~90-116). If prompt-fit hasn't run, pass
+# phase2_kb_stage_a_best instead — the cache will be task-UNconditioned.

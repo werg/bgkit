@@ -486,9 +486,29 @@ class SummarizationRoundRobinTrainer(CompressionCurriculumMixin, BaseTrainer):
         # When sort_ascending is on, disable sampler shuffle so the
         # ascending order is preserved.
         sort_asc = bool(tcfg.get("sort_samples_ascending", True))
+        # Sampler bucketing. ``quantile`` (the sampler default) groups samples
+        # into length-quantile buckets and feeds them ONE BUCKET AT A TIME —
+        # consecutive optimizer steps come from the same narrow length band.
+        # This corpus is sharply BIMODAL (≈95% arxiv at the 8192 cap, ≈5%
+        # multi_news at ~2k tokens), so quantile buckets cleanly separate
+        # "long arxiv" from "short multi_news" and the run traverses them in
+        # huge blocks: thousands of all-long steps, then thousands of all-short
+        # steps (diagnosed 2026-06-18 — the "survivor cliff" at step ~19730 was
+        # the sampler crossing from the arxiv bucket into the multi_news bucket,
+        # NOT a compression failure). That makes the per-step length
+        # distribution non-stationary and couples the step-indexed compression
+        # curriculum to whichever length band the sampler happens to be in.
+        # ``none`` = a single global shuffled pool, so every optimizer step sees
+        # a random long/short mix (stationary survivor counts, curriculum
+        # decoupled from length). Safe here: under FA4 packed/varlen the budget
+        # is sum(L_i^2), and at max_batch_tokens=500 almost every sample is an
+        # oversized singleton anyway, so bucketing buys little and costs the
+        # block-wise non-stationarity above.
+        bucket_mode = str(tcfg.get("sampler_bucket_mode", "none"))
         self.train_sampler = PackedTokenBudgetSampler(
             self.train_dataset, lengths=train_lengths,
             max_batch_tokens=max_batch_tokens, shuffle=not sort_asc,
+            bucket_mode=bucket_mode,
             bucket_shuffle=not sort_asc,
             seed=int(self.cfg.get("seed", 42)),
         )

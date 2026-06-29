@@ -1,0 +1,12 @@
+# @package _global_
+# Experiment preset: Phase 2 git_commit_repro FULL-BACKPROP recursive-L1
+# curriculum bootstrap. phase: phase2_kb -> KRKBTrainer with
+# recursive_l1_tree.full_backprop: true (whole window subtree encoded LIVE;
+# L0 cached/frozen; L1 + l1l1_bridge + tree trainable).
+defaults:
+  - /config
+  - /training/phase2_kb_git_repro_fullbackprop
+  - _self_
+
+run_name: phase2_kb_git_repro_fullbackprop
+resume_checkpoint: null

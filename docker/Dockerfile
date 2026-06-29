@@ -32,6 +32,13 @@ RUN mkdir -p src/bgkit && \
     # a single pip call with both packages reorders arbitrarily.
     pip install --no-cache-dir --force-reinstall "nvidia-cutlass-dsl-libs-cu13==4.4.2" && \
     pip install --no-cache-dir --force-reinstall "nvidia-cutlass-dsl-libs-base==4.4.2" && \
+    # Pin the cutlass-dsl meta package to 4.5.0 to match the known-good matrix the
+    # flash-attention fork's flash_attn.cute backend was validated against (the
+    # working summarization container runs exactly cutlass-dsl 4.5.0 + libs 4.4.2).
+    # The libs stay 4.4.2 above — they carry cutlass.pipeline.PipelineClcFetchAsync,
+    # which 4.5.2 drops and the fork's tile_scheduler needs. --no-deps so the meta
+    # bump does not pull libs back to 4.5.x.
+    pip install --no-cache-dir --force-reinstall --no-deps "nvidia-cutlass-dsl==4.5.0" && \
     pip uninstall -y bgkit && \
     rm -rf src/
 
@@ -41,6 +48,20 @@ RUN mkdir -p src/bgkit && \
 RUN pip install --no-cache-dir \
     "tilelang==${TILELANG_VERSION}" \
     "apache-tvm-ffi==${APACHE_TVM_FFI_VERSION}"
+
+# quack-kernels: the CuTe-DSL kernel library that the flash-attention fork's
+# flash_attn.cute backend imports (quack.compile_utils, quack.cute_dsl_utils,
+# quack.copy_utils, quack.layout_utils, quack.sm, quack.activation, ...). Without
+# it a fresh container aborts at trainer setup() with "flash_attn.cute could not
+# be imported" (strict FA-only execution). The dep was never in this Dockerfile —
+# working containers had it pip-installed into their writable layer at runtime, so
+# fresh containers (and any recreated training container) broke. Pinned to 0.4.1 to
+# match the validated cutlass-dsl 4.5.0 / libs 4.4.2 / apache-tvm-ffi 0.1.9 matrix:
+# quack 0.5.x requires a newer tvm_ffi, and letting pip resolve quack's deps bumps
+# cutlass-dsl libs to 4.5.2 (which drops PipelineClcFetchAsync). --no-deps keeps the
+# pinned matrix intact; tvm_ffi is provided by apache-tvm-ffi above.
+ARG QUACK_KERNELS_VERSION=0.4.1
+RUN pip install --no-cache-dir --no-deps "quack-kernels==${QUACK_KERNELS_VERSION}"
 
 # fla (flash-linear-attention): stock PyPI fla 0.4.2 is installed via [gpu] extra.
 #

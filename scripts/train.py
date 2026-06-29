@@ -139,6 +139,14 @@ def _create_trainer(cfg: DictConfig):
         from bgkit.training.phase1.compression import CompressionTrainer
 
         return CompressionTrainer(cfg)
+    elif phase == "phase2_kb_l1l1":
+        # Recursive-L1 bridge distillation: trains ONLY encoder.l1l1_bridge
+        # (the L1->L1 bridge, analog of l0.auto_repro_head) via two jointly
+        # summed objectives (identity + compression-matching). Decoder-agnostic;
+        # no decoder is loaded. See l1l1_distill.py for the full design.
+        from bgkit.training.phase2.l1l1_distill import L1L1RecursiveDistillTrainer
+
+        return L1L1RecursiveDistillTrainer(cfg)
     elif phase in ("phase2", "phase2_kb"):
         # Phase 2 is unified: a single trainer handles every dataset via
         # the trajectory framework. Flat datasets (NewsQA, MS MARCO,
@@ -225,6 +233,21 @@ def main(cfg: DictConfig) -> None:
 
         _free_bytes, _total_bytes = _torch.cuda.mem_get_info()
         _total_gb = _total_bytes / 1e9
+        # mem_get_info() returns the host-wide unified POOL (used below for the
+        # peer estimate + the 90% safety ceiling). But PyTorch's
+        # set_per_process_memory_fraction() multiplies the fraction by the
+        # DEVICE capacity (get_device_properties().total_memory), which is
+        # smaller on this unified system (~121.6 vs ~130.6 GB). Computing the
+        # fraction against the pool therefore UNDER-allocates the process by
+        # ~7 GB. Use the device capacity for any quantity that derives from /
+        # feeds the per-process fraction, so the budget matches what PyTorch
+        # actually enforces. (The host-wide ceiling stays on the pool.)
+        try:
+            _device_gb = _torch.cuda.get_device_properties(0).total_memory / 1e9
+            if not (0 < _device_gb <= _total_gb * 1.05):
+                _device_gb = _total_gb
+        except Exception:
+            _device_gb = _total_gb
         _raw_used_bytes = _total_bytes - _free_bytes
         _reclaimable_bytes_val = _reclaimable_bytes()
         _used_by_peers_bytes = max(0, _raw_used_bytes - _reclaimable_bytes_val)
@@ -237,12 +260,19 @@ def main(cfg: DictConfig) -> None:
             f"=> peer CUDA = {_used_by_peers_gb:.1f} GB / {_total_gb:.1f} GB pool",
             flush=True,
         )
-        _our_ask_gb = _frac * _total_gb
+        # Our ask = the fraction applied to the DEVICE capacity (what PyTorch
+        # enforces). The ceiling stays host-wide (keep us + peers under 90% of
+        # the unified pool so the OS/driver retain ~10%).
+        _our_ask_gb = _frac * _device_gb
         _safe_ceiling_gb = 0.90 * _total_gb
         _allow_peer = _os.environ.get("BGKIT_ALLOW_PEER_CUDA", "0") == "1"
 
         if _used_by_peers_gb + _our_ask_gb > _safe_ceiling_gb:
-            _max_safe_frac = max(0.05, (_safe_ceiling_gb - _used_by_peers_gb) / _total_gb)
+            # Largest DEVICE fraction that keeps us + peers under the host
+            # ceiling: (ceiling - peer) GB / device capacity.
+            _max_safe_frac = max(
+                0.05, (_safe_ceiling_gb - _used_by_peers_gb) / _device_gb,
+            )
             _msg = (
                 f"[cuda-mem-guard] peer CUDA usage = {_used_by_peers_gb:.1f} GB / "
                 f"{_total_gb:.1f} GB pool. Our requested fraction {_frac:.2f} "
@@ -252,7 +282,7 @@ def main(cfg: DictConfig) -> None:
             if _allow_peer:
                 print(
                     f"{_msg}BGKIT_ALLOW_PEER_CUDA=1 set — auto-shrinking to "
-                    f"fraction {_max_safe_frac:.3f} ({_max_safe_frac * _total_gb:.1f} GB).",
+                    f"fraction {_max_safe_frac:.3f} ({_max_safe_frac * _device_gb:.1f} GB).",
                     flush=True,
                 )
                 _frac = _max_safe_frac

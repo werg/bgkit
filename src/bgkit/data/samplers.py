@@ -588,3 +588,135 @@ class QueryAwareBatchSampler(Sampler[list[int]]):
         if n_dist > 0:
             total += len(self._query_to_indices) * n_dist
         return (total + self._batch_size - 1) // self._batch_size
+
+
+class RepoGroupedBatchSampler(Sampler[list[int]]):
+    """Group dataset indices by a per-index key and yield one batch per group.
+
+    Phase-2 ``git_commit_repro`` per-repo full-backprop use: every file-sample
+    of one ``(repo, window-0)`` shares a group key (the window node id), so a
+    batch is the whole repo's file-samples. The trainer then encodes that
+    repo's shared window-0 tree ONCE and grad-accumulates the file-samples'
+    losses through it. Unlike :class:`PackedTokenBudgetSampler` /
+    :class:`KBTokenBudgetBatchSampler`, a group is NEVER split across batches —
+    splitting would force re-encoding the shared tree per sub-batch, defeating
+    the share. Per-step memory is instead bounded by the trainer's internal
+    micro-batching over the group's file-samples.
+
+    Per epoch (when ``shuffle``): the group visit order and each group's
+    internal order are reshuffled from ``seed + epoch``. Call :meth:`set_epoch`
+    each epoch. Empty-string keys (samples with no browse turn / no shared
+    tree) are kept as their own degenerate group.
+    """
+
+    def __init__(
+        self,
+        group_keys: Sequence[str],
+        *,
+        shuffle: bool = True,
+        seed: int = 42,
+    ):
+        self._groups: dict[str, list[int]] = {}
+        for idx, key in enumerate(group_keys):
+            self._groups.setdefault(str(key), []).append(idx)
+        self._shuffle = shuffle
+        self._seed = seed
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self._seed + self._epoch)
+        keys = list(self._groups)
+        if self._shuffle:
+            rng.shuffle(keys)
+        for key in keys:
+            indices = list(self._groups[key])
+            if self._shuffle:
+                rng.shuffle(indices)
+            yield indices
+
+    def __len__(self) -> int:
+        return len(self._groups)
+
+
+class KBTokenBudgetBatchSampler(Sampler[list[int]]):
+    """Pack dataset indices into microbatches by a per-index LINEAR cost (the
+    live-L0 token load) so ``sum(cost) <= budget`` per microbatch.
+
+    Phase-2 KRKBTrainer use: the many small QA trajectories (~4-5K L0 tokens)
+    pack together for GPU utilization, while large memory trajectories (~52K)
+    fall into their own microbatch — bounding the per-microbatch live-L0
+    activation peak. An index whose cost alone exceeds ``budget`` gets its own
+    batch (a single trajectory can't be split).
+
+    Linear cost (sum of token loads), NOT the quadratic ``sum(L_i^2)`` of
+    :class:`PackedTokenBudgetSampler`: the Phase-2 bound is the live-L0 forward
+    *memory* (activations ~ total tokens), not FA4 attention compute.
+
+    Greedy first-fit over a per-epoch shuffle: simple, randomized, bounds each
+    batch. Not bin-packing-optimal but adequate. Call :meth:`set_epoch` each
+    epoch to reshuffle. (Note: the legacy ``TokenBudgetBatchSampler`` deleted in
+    the FA4 migration was quadratic + length-based; this is a distinct class.)
+    """
+
+    def __init__(
+        self,
+        costs: Sequence[int],
+        budget: int,
+        *,
+        max_samples: int | None = None,
+        shuffle: bool = True,
+        seed: int = 42,
+    ):
+        self._costs = [int(c) for c in costs]
+        self._budget = max(int(budget), 1)
+        # Cap on indices per microbatch (on top of the token budget). Bounds the
+        # per-microbatch DECODER backward: a microbatch of N small samples runs N
+        # sequential decoder forwards whose backward graphs accumulate, so a
+        # token-only budget lets a many-tiny-sample batch spike the activation
+        # peak (observed 2026-06-28: packed peak 90GB vs 73GB single-sample).
+        # None / <=0 = token budget only.
+        self._max_samples = int(max_samples) if max_samples and max_samples > 0 else None
+        self._shuffle = shuffle
+        self._seed = seed
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = epoch
+
+    def _iter_batches(self) -> Iterator[list[int]]:
+        order = list(range(len(self._costs)))
+        if self._shuffle:
+            random.Random(self._seed + self._epoch).shuffle(order)
+        batch: list[int] = []
+        cur = 0
+        for idx in order:
+            c = self._costs[idx]
+            # Close the current batch before it would overflow the token budget
+            # OR hit the sample cap, then start a fresh one with this index.
+            if batch and (
+                cur + c > self._budget
+                or (self._max_samples and len(batch) >= self._max_samples)
+            ):
+                yield batch
+                batch, cur = [], 0
+            batch.append(idx)
+            cur += c
+            # A full batch (by tokens, by sample cap, or a single oversized
+            # index) closes immediately.
+            if cur >= self._budget or (
+                self._max_samples and len(batch) >= self._max_samples
+            ):
+                yield batch
+                batch, cur = [], 0
+        if batch:
+            yield batch
+
+    def __iter__(self) -> Iterator[list[int]]:
+        return self._iter_batches()
+
+    def __len__(self) -> int:
+        # Recomputed (cheap, O(N)); consistent with __iter__ for a given epoch.
+        return sum(1 for _ in self._iter_batches())

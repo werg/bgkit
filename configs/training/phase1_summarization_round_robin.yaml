@@ -11,8 +11,18 @@ max_steps: 30000
 lr: 3.0e-5
 warmup_steps: 500
 bidi_warmup_steps: 0
-max_batch_tokens: 500
-gradient_accumulation_steps: 32
+# 2026-06-19: raised 500 -> 4096 (perf). At 500 the quadratic budget
+# (500*2048=1.02M sum(L^2), singleton threshold ~1012 tok) forced EVERY sample
+# into its own microbatch — no FA4 packing, paying per-microbatch overhead 32x
+# with zero batching benefit. 4096 (budget 8.39M, threshold ~2896 tok) packs the
+# short multi_news / sub-3k docs; arxiv@8192 stay singletons (67M>>budget) so
+# peak memory is unchanged (bounded by the arxiv singleton, cuda_max ~29/83GB).
+# Keep <=16384 (DeltaNet decoder cost is sum(L_i^2); playbook sweet spot 16384/4).
+max_batch_tokens: 4096
+# 2026-06-19: lowered 32 -> 16 (perf, user-approved). Halves microbatches per
+# optimizer step => ~2x faster steps. Effective batch ~halves (more gradient
+# noise) — accepted tradeoff. NOT a live-tunable key, so applied via restart.
+gradient_accumulation_steps: 16
 # 2026-06-10: raised 1024 -> 4096. arxiv papers average ~10.5k source tokens
 # across ~6.5 sections; at 1024 the encoder saw only ~10% of each paper (often a
 # truncated fragment of section 1) while the target is the whole-paper abstract —
@@ -26,10 +36,27 @@ gradient_accumulation_steps: 32
 # with sort_samples_ascending=false (size mixing) to prevent re-overfitting to a
 # single survivor-count. cuda_max ~25GB at 4096; 8192 worst-case ~40GB << ceiling.
 max_total_source_tokens: 8192
+# Sampler bucketing (2026-06-18). "none" = single global shuffled pool so every
+# step sees a random long/short mix. "quantile" (sampler default) feeds one
+# length-bucket at a time, which on this BIMODAL corpus (~95% arxiv@8192 cap,
+# ~5% multi_news@~2k) traverses long-then-short in huge blocks — the cause of
+# the step-19730 "survivor cliff" (sampler crossed arxiv->multi_news bucket, not
+# a compression failure). "none" keeps the per-step length distribution
+# stationary and decouples the step-indexed curriculum from document length.
+sampler_bucket_mode: none
 max_target_tokens: 256
 max_eval_samples: 500
 eval_every: 1000
 save_every: 2000
+# Checkpoint retention. 2026-06-22: this block was MISSING (unlike every other
+# phase config), so pruning was disabled and 97 checkpoints (~1.4 TB) accumulated
+# and filled /mnt/external → crash loop on checkpoint write. keep_latest protects
+# resume; keep_best (by eval/loss) keeps a few low-eval reference checkpoints.
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 3
+  metric: eval/loss
 # reset_wandb: start a fresh wandb run on resume instead of reattaching to the
 # prior run id stored in the checkpoint. Used once on 2026-06-10 (the prior run
 # meoxg5pn's predecessor oywxvoqm had a step pointer poisoned to ~11001 by a

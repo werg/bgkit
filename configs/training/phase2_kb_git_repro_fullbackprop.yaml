@@ -1,0 +1,224 @@
+# Phase 2 KB — git_commit_repro PER-REPO full-backprop recursive-L1 curriculum.
+#
+# WHAT THIS RUNS
+#   Dataset: git_commit_repro ONLY (file-state reconstruction). Per
+#   (file, target_commit) the model browse-navigates a window of commits and
+#   reconstructs the WHOLE FILE content (gold = the file blob in gold_answer).
+#   Compression is MEANINGFUL here: the gold is produced by APPLYING the
+#   retrieved diffs, not by copying a single passage, so we can push real
+#   L0 + L1 compression.
+#
+# PER-REPO FULL-BACKPROP (recursive_l1_tree.full_backprop_per_repo: true)
+#   A training batch is ONE repo's window-0 file-samples (grouped by
+#   RepoGroupedBatchSampler on the shared-subtree root = the window node id).
+#   For each repo the WHOLE window-0 subtree is encoded ONCE — L0 LIVE on every
+#   diff leaf -> L1 up the tree -> node reps — with a GENERAL query-agnostic
+#   prompt (general_prompt below). Every file-sample's browse turns SPLICE
+#   those shared node reps; only its drill-down bgkit turn re-encodes the
+#   drilled file-diff (+ the commit's other files as distractors) with the
+#   SPECIFIC commit/filename query. The file-samples' decoder losses are
+#   backpropped through the SHARED tree (retain_graph across the repo's
+#   file-samples; released by the final aux backward), so one optimizer step
+#   updates L0 (live) + L1 + encoder.l1l1_bridge + the tree reps + the decoder.
+#
+#   This replaces the earlier PER-SAMPLE full-backprop (which re-encoded each
+#   file's whole walk per sample, query-conditioned). Encoding the shared tree
+#   once per repo amortizes the dominant cost across all of a repo's files.
+#
+# DISPATCH: phase: phase2_kb -> KRKBTrainer (scripts/train.py). Per-repo
+#   full-backprop is a flag inside KRKBTrainer, not a new trainer.
+#
+# MEMORY: peak per step = the gradient-checkpointed shared tree (retained) +
+#   ONE file-sample's drill encode + decoder forward at a time. Each
+#   file-sample's decoder/drill graph is dropped (and collected) after its
+#   backward; only the memo-referenced shared tree persists. With both
+#   round-robin decoders resident (only one active per step), per-layer encoder
+#   GC, and reentrant decoder GC this fits a batch-1-repo step. The .env
+#   BGKIT_CUDA_MEM_FRACTION=0.80 guard (~97 GB cap on the 121 GB unified host)
+#   makes a host FREEZE impossible (worst case = recoverable CUDA OOM).
+phase: phase2_kb
+stage: A                       # live-L0 semantics (live_l0 below)
+optimizer: adamw
+
+# Training horizon — bootstrap sizing; TUNABLE once git_commit_repro size known.
+max_steps: 5000
+warmup_steps: 300
+lr: 1.0e-4
+decoder_lr: 5.0e-5
+l1_lr: 2.0e-4
+eval_every: 500
+save_every: 500
+
+# batch_size is IGNORED in per-repo mode: RepoGroupedBatchSampler emits one
+# batch = one repo's window-0 file-samples, micro-batched internally. Keep
+# gradient_accumulation_steps to average over several repos per optimizer step.
+batch_size: 1
+gradient_accumulation_steps: 4
+
+# Gradient checkpointing — REQUIRED. The shared window-0 subtree holds many
+# live L1 node forwards in the retained graph; per-layer encoder GC + reentrant
+# decoder GC keep that tractable. Turning GC off on this host has frozen the
+# machine (see Stage A notes). Keep ON.
+activation_checkpointing:
+  encoder: false
+  decoder: false
+gradient_checkpointing: true
+decoder_gradient_checkpointing: "reentrant"
+
+datasets:
+  - git_commit_repro
+
+# LIVE L0 — gradient trains the L0 backbone/head/auto_repro_head on the diff
+# leaves of the shared tree. No L0 precompute / l0_cache needed (the earlier
+# per-sample config froze L0 + read a cache; the per-repo redesign drops that).
+live_l0: true
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2
+
+# ── Recursive-L1 PER-REPO full-backprop ─────────────────────────────────────
+recursive_l1_tree:
+  enabled: true
+  full_backprop_per_repo: true   # implies full_backprop
+  # GENERAL (query-agnostic) compression prompt fed to BOTH L0 and L1 of the
+  # shared repo tree. The drill-down bgkit turn uses the SPECIFIC per-turn
+  # query (commit message + filename) instead.
+  general_prompt: "compress this repository's commit history"
+  # Step-interpolated retention ramps (start -> end over ramp_steps, by
+  # global_step). Recursive L0 (shared-tree diff leaves) 0.15 -> 0.05;
+  # recursive L1 (up the tree) 0.30 -> 0.05.
+  l0_retention:
+    start: 0.15
+    end: 0.05
+    ramp_steps: 4000
+  l1_retention:
+    start: 0.30
+    end: 0.05
+    ramp_steps: 4000
+  # Per-step cost knob (M1/M2). Each file-sample's backward recomputes the GC'd
+  # shared-tree forward once (Nx per repo) and stages a drill graph, so per-step
+  # cost + memory scale with a repo's window size. null = use every file-sample
+  # (WIDE-OPEN / aggressive — this run relies on the trainer's memory safeguards:
+  # the dynamic-ckpt adaptive cache-flush AND the GC mode-flip, both wired for
+  # KRKBTrainer); an int K subsamples up to K file-samples per repo-batch
+  # (re-seeded per epoch so coverage rotates).
+  # LIVE-TUNABLE: write {"phase2_kb": {"max_file_samples_per_repo": <K-or-null>}}
+  # to ${CHECKPOINT_DIR}/control.json to clamp down OR open back up mid-run
+  # (takes effect on the next repo-batch, no restart).
+  max_file_samples_per_repo: null
+
+# L0 retention for the DRILL-DOWN bgkit encode (the file-diff at the target
+# commit, with the specific query). Matched to the recursive L0 ramp for a
+# coherent within-document compression curriculum.
+l0_retention:
+  git_commit_repro:
+    start: 0.15
+    end: 0.05
+    ramp_steps: 4000
+
+# Top-level L1 retention. NOTE: this does NOT pin the drill-down retrieval —
+# the drill shares the L1 controller (θ) with the shared tree and requests the
+# SAME recursive L1 ramp (recursive_l1_tree.l1_retention, 0.30→0.05) at runtime
+# (KRKBTrainer._encode_sample_turns), so the whole L1 compression is ONE
+# curriculum. This scalar only sizes the dual-ascent anchor grid + serves as a
+# fallback; set to the ramp END so the anchor grid covers the ramp's tight end.
+l1_retention: 0.05
+
+# Jitter off — the recursive ramps drive retention deterministically.
+l0_retention_jitter:
+  enabled: false
+l1_retention_jitter:
+  enabled: false
+
+# Direct training (no LoRA): L1's LoRA was the only thing that broke GC
+# recompute (LoRARouter thread-local state). L0 trains directly (live).
+# l1l1_bridge + L1 backbone train directly. Round-robin projection blocks
+# train too (they track the decoders).
+lora:
+  enabled: false
+  train_l1_direct: true
+  l0_rank: 32
+  l1_rank: 32
+  alpha: 64
+  dropout: 0.0
+
+# Survivorship aux losses DISABLED for the recursive-L1 reconstruction run.
+# The pre-trained head already selects decent candidates and selection is the
+# least-important signal here (reps are distributed), so we freeze the head
+# (no aux gradient: BCE / moment-match / min-survivors / decisiveness /
+# relevance / utility-grad all skipped) and train only L0/L1 backbones +
+# l1l1_bridge + projection via the reconstruction loss. This ALSO removes the
+# _pending_l0/l1_outputs retention (they existed only to feed the aux +
+# utility-grad), so the per-repo forward retains NOTHING beyond the shared tree
+# — bounding memory regardless of file-sample count. The dual-ascent θ control
+# stays ON (accumulated per-microbatch at encode time) so L0/L1 retention still
+# track their ramps. The per-level weights below are therefore inert (kept for
+# documentation / easy re-enable via survivorship_aux: true).
+survivorship:
+  survivorship_aux: false
+  relevance_loss_weight: 0.05
+  relevance_gold_boost: 1.5
+  relevance_distractor_damp: 0.5
+  n_distractors: 3
+  ratio_loss_weight: 0.1
+  decisiveness_loss_weight: 0.05
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+
+# L1 already distilled-bridge-warm; L0 inherits the summarization-trained head.
+# No ICE warmup.
+ice_distillation:
+  l0:
+    enabled: false
+  l1:
+    enabled: false
+
+moment_match_reference:
+  l0:
+    path: null
+  l1:
+    path: null
+
+# ── Encoder source: the distilled L1->L1 bridge checkpoint ──────────────────
+# Loads L0 + L1 + the distilled l1l1_bridge (encoder.pt carries l1l1_bridge.*).
+# STAGE BOTH DECODERS FIRST: copy decoder_qwen.pt + decoder_falcon.pt from the
+# summarization round-robin ckpt into this dir so the co-trained decoders load
+# (load_checkpoint globs *.pt by stem -> decoder_qwen / decoder_falcon). Do NOT
+# overwrite encoder.pt. See the implementation report for the copy command.
+phase1_checkpoint: /workspace/checkpoints/phase2_kb_l1l1_step200_20260629_054912
+
+# ── Decoder: ROUND-ROBIN both families (Qwen-0.8B + Falcon-H1-90M) ──────────
+# Both decoders resident; one family picked per repo-batch. The summarization
+# run co-trained both, so staging decoder_qwen.pt + decoder_falcon.pt into the
+# encoder ckpt dir (above) loads them warm rather than fresh-HF. qwen_decoder_prob
+# biases the split (Qwen-0.8B is ~9x Falcon-90M; fewer Qwen batches = faster).
+round_robin: true
+qwen_decoder_prob: 0.3
+decoder_qwen:
+  family: qwen35
+  backbone_name: Qwen/Qwen3.5-0.8B
+decoder_falcon:
+  family: falcon_h1
+  backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+
+# Checkpoint pruning — keep a few best + latest.
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+  lower_is_better: true

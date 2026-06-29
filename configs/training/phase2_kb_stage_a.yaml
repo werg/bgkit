@@ -24,7 +24,10 @@ decoder_lr: 5.0e-5
 l0_lr: 2.0e-4
 l1_lr: 2.0e-4
 eval_every: 500
-save_every: 2000
+# 2026-06-28: 2000 -> 500 for OOM resilience. Big NarrativeQA samples push the
+# live-L0 peak to ~104GB; if one exceeds budget mid-run, resume loses <=500 steps
+# instead of everything. (First save now coincides with first eval at 500.)
+save_every: 500
 # max_steps is computed dynamically as ceil(len(train_dataset) / batch_size).
 # The trainer interprets ``max_steps: null`` as "one epoch over the train
 # split". Set explicitly to override.
@@ -38,13 +41,61 @@ max_steps: null
 # the profile-phase2-kb-stage-a compose service (mem_limit: 80g).
 # Raise to 8 once Phase 2 data prerequisites are ready and profiler
 # confirms headroom (target: CUDA peak < 60 GB at batch_size=4).
-batch_size: 4
+# 2026-06-27: dropped 4 -> 2 for ROUND-ROBIN. Holding both decoders (Qwen 0.8B
+# + Falcon 90M) + live L0, a heavier Qwen-decoder microbatch spiked peak to
+# ~100GB at batch 4 and OOM'd (the auto-shrunk fraction allows ~100GB alongside
+# the 8GB peer openclaw-spark container). Batch 2 halves the per-microbatch
+# activation peak (step-0 was 65GB at batch 4); grad-accum 2 keeps the effective
+# batch at 4. Raise back toward 4 when the GPU isn't shared / once profiled.
+# 2026-06-28: batch_size 1 (reverted from 2). Batch 2's worst-case microbatch —
+# two large memory samples paired — OOM'd in the L1 backbone SwiGLU MLP
+# (pruned_qwen35.py self.mlp_frozen) at peak 101.4GB against the 112.8GB budget:
+# the forward MLP intermediate over the huge merged L1 sequence is a transient
+# that gradient checkpointing can't shrink. It restarted once and recovered, but
+# that churn isn't worth it on a multi-hour run. Batch 1 halves the per-microbatch
+# L1 forward (no worst-case pair; batch-1 peak was 46GB); grad_accum 4 keeps the
+# effective batch at 4. ~2x slower (~26h) but stable. To return to batch 2, first
+# add a per-microbatch token-budget sampler so a 2-large-sample pair can't form.
+batch_size: 1
+gradient_accumulation_steps: 4
+
+# Activation checkpointing — REQUIRED for round-robin on the shared GPU. The
+# per-sample activation peak (live-L0 + L1 encoder forward over long browse/bgkit
+# content, plus the Qwen decoder forward over long trajectories) OOM'd at ~103GB
+# even at batch 2 (batch size barely moved the peak: 61GB@b2 vs 65GB@b4 at step
+# 0). Encoder AC is safe (Qwen-based). Decoder GC is gated to the Qwen family in
+# _build_decoder_for_family (Falcon-H1 GC hits an FLA DeltaNet checkpoint
+# mismatch; the 90M Falcon decoder is small enough not to need it).
+# Gradient checkpointing — ported from the summarization round-robin trainer
+# (the proven, checkpoint-safe forms). KRKBTrainer's home-grown coarse path
+# (activation_checkpointing.* -> _checkpointed_level wrapping the whole non-pure
+# LevelCompressor forward, + use_reentrant=False decoder GC) is DISABLED: it
+# fails the strict tensor-match check on the FLA kernels + side-effecting
+# survivorship logic (666-vs-382 CheckpointError). Instead:
+#   - encoder: per-backbone-layer GC via maybe_enable_gradient_checkpointing
+#     (each layer = pure attn+MLP) -- keyed off `gradient_checkpointing` below.
+#   - decoder: reentrant GC via maybe_enable_decoder_gradient_checkpointing
+#     (reentrant skips the tensor-match check -> FLA DeltaNet/Mamba is fine).
+activation_checkpointing:
+  encoder: false
+  decoder: false
+# 2026-06-28: GC was briefly turned OFF for speed and it FROZE THE MACHINE — host
+# NVRM out-of-memory (NV_ERR_NO_MEMORY, kernel log). GC-off keeps backbone
+# activations, pushing the GPU process toward the guard cap; on this 121GB
+# unified-memory host, process-at-cap + driver/OS overhead exhausted RAM. GC-ON
+# keeps the peak at ~73GB (safe). DO NOT turn GC off on this host unless the guard
+# cap is first dropped far below host RAM AND the peak is measured under it.
+gradient_checkpointing: true
+decoder_gradient_checkpointing: "reentrant"
 
 datasets:
   - pubmedqa
   - narrativeqa
-  - git_history
   - memory
+  # narrativeqa RESTORED 2026-06-28: its OOM risk was the ~3% outlier tail
+  # (>64K-token samples), not the median (4.2K tokens, trivially cheap). The
+  # max_sample_l0_tokens trim drops exactly that tail. git_history still pending
+  # (its QA data isn't built yet).
 
 # Stage A is the live-L0 bootstrap — keep the working set small so live
 # L0 is affordable. ~1500 samples per dataset × 4 datasets ≈ 6K samples
@@ -52,6 +103,55 @@ datasets:
 max_samples_per_dataset_default: 1500
 
 live_l0: true
+
+# Per-task learnable L0 prompts (parameter-efficient L0 conditioning). When
+# l0_prompt_tokens > 0, each dataset gets a learnable (l0_prompt_tokens, D)
+# prompt fed into L0's compression-prompt slot, so L0's WITHIN-document
+# compression becomes task-aware (vs the current query-agnostic L0). With
+# l0_freeze_backbone: true the L0 backbone is frozen and only the prompts
+# (+ L0 head/threshold) train — prompt-tuning a frozen L0. Both default off, so
+# the live trainable-L0 path is unchanged. NOTE: when trained with prompts,
+# Stage B's precompute_l0_subset.py auto-loads them from the encoder checkpoint
+# (the l0_task_prompts.* keys) and feeds them per-article, so the cached
+# survivors reflect the same task-conditioned L0.
+l0_prompt_tokens: 0
+l0_freeze_backbone: false
+
+# Outlier trim (memory bound): drop training samples whose total live-L0 token
+# load (summed over bgkit turns) exceeds this. Per the 2026-06-28 token profile
+# (per-sample tokens: narrativeqa median 4.2K / pubmedqa 4.8K / memory 42K).
+# 2026-06-28: 64K -> 52K. At 64K the largest passing memory samples (~56-64K)
+# pushed the live-L0 forward peak to ~93GB against the 112.8GB process cap, so
+# the adaptive CUDA flush fired EVERY step (free dropped to 3-9GB) and step time
+# ballooned 29s -> 180-360s (~10x). 52K caps the live-L0 peak to ~65-76GB
+# (free >35GB, no per-step flush). Drops memory's upper ~25% tail from the LIVE
+# bootstrap; those samples still join via Stage B's cached L0. 0 disables.
+max_sample_l0_tokens: 52000
+
+# Token-budget microbatch packing (2026-06-28). When > 0, the train loader packs
+# trajectories into microbatches by live-L0 token load up to this budget: the
+# many small QA samples (~4-5K tokens) pack together (better GPU utilization)
+# while large memory samples (~52K) run alone (bounded peak). 0 = OFF (legacy
+# fixed batch_size path). Must be >= max_sample_l0_tokens (52K) so a largest
+# sample fits alone.
+# 2026-06-28: RE-ENABLED at 52K (= the max_sample_l0_tokens trim) after the
+# GC-off+packing combo froze the host. SAFE NOW because: (a) GC is back ON (low
+# per-step peak); (b) guard lowered to .env 0.80 (~97GB cap → a host freeze is
+# impossible, worst case is a recoverable CUDA OOM); (c) budget = the trim, so a
+# microbatch is capped at 52K tokens = the current largest single sample, keeping
+# the peak ~73GB (PEAK-NEUTRAL) while the many small QA samples (~4-5K) pack
+# ~10/microbatch → ~1.5-2x throughput on the bulk of the data. Monitored live; can
+# raise the budget only with measured peak headroom (NOTE: resume is bf16-bugged,
+# so a crash currently loses progress — stay conservative). NOTE: packing makes
+# max_steps the MICROBATCH count (~1.3-1.5K, still > warmup_steps 500).
+max_microbatch_l0_tokens: 52000
+# 2026-06-28: the 52K budget is NOT peak-neutral after all — a microbatch of many
+# tiny samples runs that many sequential decoder backwards (graphs accumulate),
+# observed peak ~90GB vs ~73GB single-sample. max_microbatch_samples caps
+# samples/microbatch to bound the decoder backward; 6 keeps the peak ~75-80GB
+# (safe under the .80 guard / ~97GB cap) while still packing 6x the small QA
+# samples. 0 = token budget only. (Applies on next (re)start.)
+max_microbatch_samples: 6
 # l0_cache_dir unused at Stage A since live_l0 = true
 # browse_tree_dir defaults to {DATA_DIR}/browse_trees
 # trajectory_dir defaults to {DATA_DIR}/trajectories
@@ -63,7 +163,10 @@ l0_retention:
   narrativeqa: 0.20
   newsqa: 0.10
   git_history: 0.20
-  memory: 0.40
+  memory: 0.10   # 2026-06-28: 0.40 -> 0.15 -> 0.10 (weakest compressor; harder L0
+                 # continues the compression study AND shrinks the L1+decoder
+                 # activations to relieve the live-L0 memory thrash, alongside the
+                 # 52K token trim above)
 
 # L1 retention drives how much *additional* compression L1 applies on
 # top of the per-article L0 survivors. The pinned article-ID tokens
@@ -87,6 +190,15 @@ l1_retention_jitter:
   anchor_sampling_prob: 0.30
 
 lora:
+  # 2026-06-27: DISABLED — train the L0 + L1 backbones DIRECTLY (no adapters),
+  # matching the proven phase2_kb_stage_a_falcon variant + the summarization
+  # round-robin trainer. LoRA-on-frozen-base was for the OLD code-only Phase-1
+  # encoder (adapt it to NL); the summarization encoder we hand off already
+  # trained on NL, so that rationale is moot. Critically, L1's LoRA was the ONLY
+  # thing blocking checkpointing L1 (LoRARouter thread-local adapter state
+  # doesn't reproduce on GC recompute) — the OOM. Direct L1 + L1 GC fixes it.
+  enabled: false
+  train_l1_direct: true
   l0_rank: 32
   l1_rank: 32
   alpha: 64
@@ -96,6 +208,12 @@ lora:
 # moment match + utility-gradient BCE distillation (new) on top of Phase
 # 2's legacy ratio + decisiveness + relevance (unchanged).
 survivorship:
+  # Phase 2 (KRKBTrainer): selection is the least-important signal (reps are
+  # distributed; the pre-trained head already selects decent candidates), so
+  # ALL survivorship aux is OFF — head frozen, no _pending retention, only the
+  # main reconstruction loss + the (still-on) dual-ascent θ control. The
+  # per-level weights below are inert under this flag (kept for re-enable).
+  survivorship_aux: false
   relevance_loss_weight: 0.05
   relevance_gold_boost: 1.5        # gold positions target ~1.5 * target_ratio
   relevance_distractor_damp: 0.5   # distractor positions target ~0.5 * target_ratio
@@ -144,4 +262,35 @@ moment_match_reference:
   l1:
     path: null
 
-phase1_checkpoint: auto
+# --- Phase 1 handoff: the dual-decoder summarization encoder + decoders ---
+# Pinned (NOT ``auto``): registry auto-resolve picks best-eval/loss, which for
+# the mid-curriculum summarization run is the early, barely-compressed
+# step-7000 — not what we want. step-51945 is the latest, staged into
+# CHECKPOINT_DIR (encoder + decoder_qwen + decoder_falcon; CHECKPOINT_DIR
+# mounts to /workspace/checkpoints in the container).
+phase1_checkpoint: /workspace/checkpoints/phase1_summarization_round_robin_step51945_20260624_060459
+
+# Round-robin dual-decoder training: the encoder's survivors train against
+# BOTH decoders (one family picked per batch; qwen_decoder_prob biases the
+# split toward Falcon). Decoders are loaded from phase1_checkpoint above (the
+# co-trained summarization decoders), not re-initialised from HF. Memory
+# permits both here — Stage A is the small live-L0 bootstrap. Stage B (KILT)
+# runs Falcon-only; a Qwen fix-up pass comes later.
+# Round-robin dual-decoder: the encoder's survivors train against BOTH the
+# Qwen-0.8B and Falcon-H1-90M decoders (one family per microbatch; qwen_decoder_prob
+# biases toward Falcon). RESTORED 2026-06-28 — the ~104GB OOM was NOT inherent to
+# round-robin; it was the UNBOUNDED live-L0 forward over huge scopes (memory L0
+# 0.40 + 50+-article turns / narrativeqa outliers). With memory L0=0.15 + the
+# max_sample_l0_tokens trim, the per-step L0 forward is bounded and both decoders
+# fit. Decoders load from phase1_checkpoint (the co-trained summarization decoders).
+round_robin: true
+# 2026-06-28: 0.3 -> 0.15 (speed). The Qwen-0.8B decoder is ~9x the Falcon-90M;
+# fewer Qwen microbatches = faster steps. Falcon is the primary target here; Qwen
+# gets a Stage-B / fix-up pass later.
+qwen_decoder_prob: 0.15
+decoder_qwen:
+  family: qwen35
+  backbone_name: Qwen/Qwen3.5-0.8B
+decoder_falcon:
+  family: falcon_h1
+  backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct

@@ -335,6 +335,28 @@ survive on top of this). Provenance JSONL builders for each dataset
 are in `scripts/build_provenance_*.py`; the runbook for converting
 each dataset is in `CLAUDE.md` "Phase 2 KB-Scale".
 
+### Memory & speed operating rules (DGX Spark — from the 2026-06-28 Stage A bringup)
+
+Apply to every Phase 2 / live-L0 stage:
+
+- **Guard cap ≤ host RAM.** `.env BGKIT_CUDA_MEM_FRACTION=0.80` (~97 GB process
+  cap → ~24 GB host margin). On 121 GB unified memory, *process-at-cap +
+  driver/OS overhead can OOM the host and FREEZE the machine* (`NVRM
+  NV_ERR_NO_MEMORY`). Never turn GC off or raise the peak without first lowering
+  the guard **and** measuring the live peak under it.
+- **Token-budget packing = the throughput win (~2.9× on Stage A).** For any
+  **live-L0** stage set `max_microbatch_l0_tokens >= max_sample_l0_tokens` (the
+  trim) — peak-neutral (a microbatch caps at the largest single sample) while
+  small samples pack ~10/microbatch. Raise only with measured headroom. Packing is
+  currently **live-L0-gated** with a raw-token cost, so it does NOT yet help
+  cached-L0 Stage B — extending it (survivor-count cost) is a high-value follow-up.
+- **Monitor host RAM and step-time**, not just GPU peak/crash — the freeze (host
+  OOM) and a 10× thrash were both invisible to peak/crash monitoring.
+- **Cached-L0 stages (Stage B) need their OWN profiling** — never copy live-L0
+  trim/retention knobs across.
+- **Resume is bf16-bugged for KRKBTrainer** (AdamW optimizer-state upcast) — a
+  crash loses progress until fixed; prefer fresh starts.
+
 ### Stage A: Live-L0 bootstrap (`phase2_kb_stage_a`)
 
 One epoch over the bootstrap mix (PubMedQA + NarrativeQA + git history
@@ -349,6 +371,26 @@ frozen and used to pre-compute the L0 cache for Stage B.
 Config: `configs/training/phase2_kb_stage_a.yaml`. Output:
 `phase2_kb_stage_a_best`.
 
+**L0 conditioning — the query/prompt design split.** Live-L0 Stage A conditions
+L0 on the per-sample **query** (the question is fed to L0 as its compression
+prompt, so within-doc compression is query-aware). But Stage B uses a **cached**
+L0 (one entry per article) — a per-query prompt cannot be baked into a per-article
+cache. So Stage B instead uses **per-task L0 prompts**: a small learnable prompt
+*per dataset* (`encoder.l0_task_prompts`) conditioning L0 on the task. Without
+them, Stage B's cached L0 would be unconditioned — which is why we want them.
+
+### Stage A.5: Prompt-fit (`phase2_kb_prompt_fit`)
+
+The per-task prompts condition L0, but Stage B's L0 is frozen+cached — so they
+must be **learned in a live-L0 pass and baked into the cache before Stage B**.
+This short pass loads Stage A's shaped encoder, **freezes the L0 backbone**
+(`l0_freeze_backbone: true`), and trains only the per-task prompts
+(`l0_prompt_tokens: 16`) — prompt-tuning. Same proven-safe memory config as Stage
+A (GC on, 52K trim, 52K packing, `.env` guard 0.80). Its `datasets` must cover
+every dataset Stage B uses (currently only the 3 with ready live-L0 data; expand
+as data-prep completes). Output: `phase2_kb_prompt_fit_best` (carries
+`l0_task_prompts.*`). *Skip only if you accept a task-unconditioned Stage B cache.*
+
 ### Stage A → B transition
 
 Re-build the L0 cache using Stage A's LoRA weights:
@@ -357,16 +399,20 @@ Re-build the L0 cache using Stage A's LoRA weights:
 python scripts/precompute_l0_subset.py \
   --articles $DATA_DIR/trajectory_sets/stage_b.jsonl \
   --mmap-dir $DATA_DIR/mmap/phase2 \
-  --phase1-checkpoint $CHECKPOINT_DIR/phase1_step3_best \
-  --stage-a-checkpoint $CHECKPOINT_DIR/phase2_kb_stage_a_best \
+  --phase1-checkpoint $CHECKPOINT_DIR/phase1_summarization_round_robin_step51945_... \
+  --stage-a-checkpoint $CHECKPOINT_DIR/phase2_kb_prompt_fit_best \
   --output-dir $DATA_DIR/l0_cache_kb \
   --retention-json configs/phase2_kb/l0_retention.json \
   --lora-rank 32
 ```
 
-Without `--stage-a-checkpoint`, Stage A's training is effectively
-discarded — the cache reflects bare Phase 1 weights. The cache is
-shard-additive and idempotent; re-running on a superset of articles
+Pass the **prompt-fit** checkpoint to `--stage-a-checkpoint`: precompute bakes
+both the shaped L0 weights AND the learned per-task prompts (`l0_task_prompts.*`,
+auto-detected — `scripts/precompute_l0_subset.py:~90-116`) into the cache. (Use
+`phase2_kb_stage_a_best` instead only if you skipped the prompt-fit pass — the
+cache is then task-unconditioned.) Without `--stage-a-checkpoint` at all, the
+cache reflects bare Phase 1 weights and Stage A's training is discarded. The
+cache is shard-additive and idempotent; re-running on a superset of articles
 appends shards rather than rebuilding.
 
 ### Stage B: Cached-L0 full corpus (`phase2_kb_stage_b`)

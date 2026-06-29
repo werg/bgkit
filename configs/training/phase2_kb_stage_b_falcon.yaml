@@ -60,6 +60,12 @@ lora:
   dropout: 0.0
 
 survivorship:
+  # Phase 2 (KRKBTrainer): selection is the least-important signal (reps are
+  # distributed; the pre-trained head already selects decent candidates), so
+  # ALL survivorship aux is OFF — head frozen, no _pending retention, only the
+  # main reconstruction loss + the (still-on) dual-ascent θ control. The
+  # per-level weights below are inert under this flag (kept for re-enable).
+  survivorship_aux: false
   relevance_loss_weight: 0.05
   relevance_gold_boost: 1.5
   relevance_distractor_damp: 0.5

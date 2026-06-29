@@ -1,0 +1,190 @@
+# Phase 2 KB — PROMPT-FIT pass (live L0, FROZEN backbone, learn per-task L0 prompts).
+#
+# WHY THIS STAGE EXISTS — the design split:
+#   - Live-L0 Stage A conditions L0 on the per-sample QUERY (query is available
+#     because L0 runs live).
+#   - Stage B uses a CACHED L0 (one entry per article) — a per-QUERY prompt can't
+#     be baked into a per-article cache. So Stage B's cached L0 would be
+#     UNCONDITIONED unless we give it a per-TASK signal.
+#   - Per-task L0 prompts solve this: a small learnable prompt PER DATASET that
+#     conditions L0 on the task. We DO want them in Stage B — without them the
+#     cached L0 loses the conditioning Stage A's query gave it.
+#
+# But the prompts condition L0, and Stage B's L0 is frozen+cached — so they must
+# be LEARNED in a live-L0 pass and BAKED into the cache by precompute BEFORE
+# Stage B. That is exactly this pass:
+#   l0_freeze_backbone: true + l0_prompt_tokens > 0  =>  prompt-tune a frozen L0
+#   backbone (only the per-task prompts + L0 head/threshold + L1 + decoder train).
+#
+# PIPELINE:
+#   1. Stage A (phase2_kb_stage_a)   — live L0, QUERY-conditioned, backbone trains
+#   2. THIS (phase2_kb_prompt_fit)   — live L0, backbone FROZEN, learn per-task prompts
+#   3. precompute_l0_subset.py --stage-a-checkpoint <prompt_fit_best>  — BAKES the
+#      l0_task_prompts.* into the L0 cache (it auto-loads them; see scripts/
+#      precompute_l0_subset.py:~116)
+#   4. Stage B (phase2_kb_stage_b)   — cached, per-task-prompt-conditioned L0
+#
+# Memory: inherits Stage A's PROVEN-SAFE config — GC ON, batch_size 1, the 52K
+# live-L0 trim, token-budget packing at 52K, and the global guard (.env
+# BGKIT_CUDA_MEM_FRACTION=0.80 ≈ 97GB cap → a host freeze is impossible). See the
+# 2026-06-28 freeze post-mortem in memory before ever raising the peak here.
+phase: phase2_kb
+stage: prompt_fit
+optimizer: adamw
+
+# Short pass — only the per-task prompts are the *new* params (16 tokens ×
+# n_datasets × D), they converge fast. Set explicitly (not null) to avoid the
+# 4-epoch "max_steps = n_batches (un-divided by accum)" inflation. Tune up if
+# eval shows the prompts underfitting; warmup must stay < max_steps.
+max_steps: 800
+warmup_steps: 100
+lr: 1.0e-4
+decoder_lr: 5.0e-5
+l0_lr: 2.0e-4          # also the per-task-prompt LR (own optimizer group)
+l1_lr: 2.0e-4
+eval_every: 200
+save_every: 200
+
+batch_size: 1
+gradient_accumulation_steps: 4
+
+# GC ON — REQUIRED (see the 2026-06-28 HOST FREEZE: GC-off pushed the process to
+# the guard cap and OOM'd the 121GB unified host). Do not turn off.
+activation_checkpointing:
+  encoder: false
+  decoder: false
+gradient_checkpointing: true
+decoder_gradient_checkpointing: "reentrant"
+
+# Per-task L0 prompts — THE POINT of this pass.
+l0_prompt_tokens: 16
+l0_freeze_backbone: true     # freeze L0 backbone; train only the prompts (+ head/threshold)
+
+# DATASETS: must cover every dataset Stage B will use, so the cache has a prompt
+# for each. CURRENTLY ONLY pubmedqa/narrativeqa/memory have live-L0 data ready
+# (the Stage A bootstrap mix). Add kilt_wikipedia / newsqa / msmarco_passage /
+# searchqa / git_history here AS THEIR Phase-2 data-prep completes (mmap +
+# browse_tree + trajectories + token store). A dataset with no prompt here gets
+# an UNCONDITIONED cached L0 in Stage B.
+datasets:
+  - pubmedqa
+  - narrativeqa
+  - memory
+  # - kilt_wikipedia   # add when data ready
+  # - newsqa           # add when data ready
+  # - msmarco_passage  # add when data ready
+  # - searchqa         # add when data ready
+  # - git_history      # add when its QA is generated
+
+# Keep the live-L0 working set small — the prompts need only enough per-dataset
+# samples to learn their conditioning, not the full corpus.
+max_samples_per_dataset_default: 1000
+
+live_l0: true
+
+# --- Safe-memory block, MIRRORED from the live Stage A run (2026-06-28) ---
+# 52K live-L0 trim: bounds the per-step L0 forward (the dominant peak); memory
+# retention 0.10 shrinks L1+decoder activations. See the Stage A freeze/thrash
+# post-mortems in memory — do NOT raise these without re-measuring the peak.
+max_sample_l0_tokens: 52000
+# Token-budget microbatch packing — the ~2.9x throughput win. Budget = the trim
+# (peak-neutral: a microbatch is capped at the largest single sample, ~73GB GC-on
+# peak; small QA samples pack ~10/microbatch). RULE for any live-L0 stage:
+# max_microbatch_l0_tokens >= max_sample_l0_tokens, and only raise with a measured
+# peak under the .env 0.80 guard.
+max_microbatch_l0_tokens: 52000
+
+l0_retention:
+  kilt_wikipedia: 0.05
+  pubmedqa: 0.20
+  narrativeqa: 0.20
+  newsqa: 0.10
+  msmarco_passage: 0.40
+  searchqa: 0.40
+  git_history: 0.20
+  memory: 0.10
+l1_retention: 0.15
+
+l0_retention_jitter:
+  enabled: true
+  mode: jitter
+  jitter_abs: 0.01
+  jitter_rel: 0.10
+  anchor_sampling_prob: 0.30
+l1_retention_jitter:
+  enabled: true
+  mode: jitter
+  jitter_abs: 0.01
+  jitter_rel: 0.10
+  anchor_sampling_prob: 0.30
+
+lora:
+  enabled: false       # direct training (matches Stage A); backbone frozen via l0_freeze_backbone
+  train_l1_direct: true
+  l0_rank: 32
+  l1_rank: 32
+  alpha: 64
+  dropout: 0.0
+
+# Survivorship: the L0 BACKBONE is frozen, so its backbone-shaping losses (BCE
+# warmup, moment-match) are moot — turned off. The prompt gradient flows from the
+# decoder/soft-attn (utility_grad) back through the frozen backbone to the prompts.
+survivorship:
+  # Phase 2 (KRKBTrainer): selection is the least-important signal (reps are
+  # distributed; the pre-trained head already selects decent candidates), so
+  # ALL survivorship aux is OFF — head frozen, no _pending retention, only the
+  # main reconstruction loss + the (still-on) dual-ascent θ control. The
+  # per-level weights below are inert under this flag (kept for re-enable).
+  survivorship_aux: false
+  relevance_loss_weight: 0.05
+  relevance_gold_boost: 1.5
+  relevance_distractor_damp: 0.5
+  n_distractors: 3
+  ratio_loss_weight: 0.1
+  decisiveness_loss_weight: 0.05
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    utility_grad_loss_weight: 0.3     # the signal that trains the prompts
+    moment_match_weight: 0.0          # backbone frozen
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+
+# Backbone frozen → no ICE re-anchor needed.
+ice_distillation:
+  l0:
+    enabled: false
+  l1:
+    enabled: false
+
+moment_match_reference:
+  l0:
+    path: null
+  l1:
+    path: null
+
+# LOAD STAGE A's SHAPED ENCODER as the starting point (the backbone we freeze +
+# prompt-tune). PIN this to the Stage A best checkpoint once it exists.
+# ⚠ VERIFY: confirm the trainer's phase1_checkpoint loader accepts a phase2_kb
+# (Stage A) checkpoint layout (the "model"/_KBModel state), not only the
+# summarization handoff layout. If it doesn't, the loader needs the same
+# encoder.l0.* / "model" handling precompute_l0_subset.py already has. A fresh
+# run loading these weights (NOT a resume) sidesteps the known bf16
+# optimizer-state resume bug.
+phase1_checkpoint: auto   # -> pin to $CHECKPOINT_DIR/phase2_kb_stage_a_best
+
+# Round-robin dual decoder (same as Stage A) — provides the reconstruction
+# supervision that the prompts learn against. qwen 0.15 for speed.
+round_robin: true
+qwen_decoder_prob: 0.15

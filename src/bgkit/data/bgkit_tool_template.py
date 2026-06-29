@@ -157,6 +157,12 @@ SYSTEM_FLAT = (
 # Unique, long-random sentinel strings so tokenization collisions are effectively zero.
 BGKIT_SENTINEL = "<<<BGKIT_L1_SURVIVORS_7f31a4c2>>>"
 BGKIT_TOPIC_SENTINEL = "<<<BGKIT_TOPIC_KNOWLEDGE_3f82a1e0>>>"
+# Recursive-L1 (Phase 3): each ``browse`` tool response carries a dense
+# node-rep splice point in ADDITION to its text child listing, so a browse
+# turn becomes learnable compression instead of a text-only side channel.
+# Only emitted when ``tokenize_trajectory(..., browse_node_sentinel=True)``;
+# the non-recursive path leaves browse responses text-only (back-compatible).
+BGKIT_BROWSE_SENTINEL = "<<<BGKIT_BROWSE_NODEREP_5d9e2b16>>>"
 
 
 def make_system_prompt(
@@ -237,6 +243,15 @@ class RenderedTrajectory:
     browse call JSON — the ``id`` argument). Excludes the tool-response
     payload. Aligned by index with :attr:`browse_turns`.
     """
+    browse_sentinel_positions: list[int] = field(default_factory=list)
+    """Per ``browse_turns[i]``, the absolute position of the
+    ``BGKIT_BROWSE_SENTINEL`` token inside the browse tool response, or empty
+    when ``tokenize_trajectory`` was called without ``browse_node_sentinel``.
+    The recursive-L1 trainer (Phase 3) splices a dense path-selective node-rep
+    at this sentinel exactly the way bgkit survivors are spliced at
+    :attr:`bgkit_sentinel_positions`. Aligned by index with
+    :attr:`browse_turns` when populated.
+    """
     topic_sentinel_position: int | None = None
     """Absolute position of the ``BGKIT_TOPIC_SENTINEL`` token in
     ``token_ids`` when topic knowledge is enabled for this sample, else
@@ -313,6 +328,7 @@ def tokenize_trajectory(
     trajectory: list[TrajectoryTurn],
     *,
     topic_knowledge_tags: list[str] | None = None,
+    browse_node_sentinel: bool = False,
 ) -> RenderedTrajectory:
     """Tokenize a multi-turn trajectory with per-turn loss masking.
 
@@ -338,6 +354,14 @@ def tokenize_trajectory(
             and the tool-response body carries ``BGKIT_TOPIC_SENTINEL``.
             The trainer splices the topic embedding block at the sentinel
             position exactly the way bgkit survivors are spliced.
+        browse_node_sentinel: recursive-L1 (Phase 3) toggle. When True, each
+            ``browse`` tool response gets a :data:`BGKIT_BROWSE_SENTINEL`
+            appended after its text child listing, and the sentinel's absolute
+            token position is recorded in
+            :attr:`RenderedTrajectory.browse_sentinel_positions` (aligned with
+            ``browse_turns``). The trainer then splices a dense path-selective
+            node-rep there. Default False keeps browse responses text-only
+            (the non-recursive path is byte-for-byte unchanged).
     """
     tools = [BROWSE_TOOL, BGKIT_TOOL, BGKIT_TOPIC_KNOWLEDGE_TOOL]
 
@@ -363,6 +387,7 @@ def tokenize_trajectory(
     bgkit_call_spans: list[tuple[int, int]] = []
     browse_turns: list[TrajectoryTurn] = []
     browse_call_spans: list[tuple[int, int]] = []
+    browse_sentinel_positions: list[int] = []
     answer_span: tuple[int, int] | None = None
     topic_sentinel_position: int | None = None
     resolved_topic_tags: list[str] = list(topic_knowledge_tags or [])
@@ -425,9 +450,18 @@ def tokenize_trajectory(
     for turn in trajectory:
         # Build the sub-messages this turn adds.
         if turn.kind == "browse":
+            # Recursive-L1: append a node-rep sentinel after the text child
+            # listing so the browse response carries a dense splice point.
+            browse_content = turn.response
+            if browse_node_sentinel:
+                browse_content = (
+                    f"{turn.response}\n{BGKIT_BROWSE_SENTINEL}"
+                    if turn.response
+                    else BGKIT_BROWSE_SENTINEL
+                )
             sub = [
                 _tool_call_assistant_message("browse", dict(turn.args)),
-                {"role": "tool", "name": "browse", "content": turn.response},
+                {"role": "tool", "name": "browse", "content": browse_content},
             ]
         elif turn.kind == "bgkit":
             # The bgkit tool response is JUST the sentinel. There is no
@@ -468,6 +502,9 @@ def tokenize_trajectory(
         tool_turn_tokens: list[int]
         assistant_tokens: list[int]
         tool_turn_tokens_start = -1
+        # Offset of BGKIT_BROWSE_SENTINEL within this browse turn's
+        # ``tool_turn_tokens`` (None when no browse sentinel was emitted).
+        browse_sentinel_offset: int | None = None
 
         if turn.kind == "answer":
             assistant_tokens = tokenizer.encode(turn_text, add_special_tokens=False)
@@ -508,7 +545,24 @@ def tokenize_trajectory(
             assistant_tokens = tokenizer.encode(partial_added, add_special_tokens=False)
             # remaining text
             remaining = turn_text[len(partial_added):]
-            tool_turn_tokens = tokenizer.encode(remaining, add_special_tokens=False)
+            if browse_node_sentinel and BGKIT_BROWSE_SENTINEL in remaining:
+                # Split the tool response on the node-rep sentinel so the
+                # trainer can replace it with the path-selective node-rep
+                # embeddings (mirrors the bgkit-turn split above).
+                s_idx = remaining.find(BGKIT_BROWSE_SENTINEL)
+                before = remaining[:s_idx]
+                after = remaining[s_idx + len(BGKIT_BROWSE_SENTINEL):]
+                before_ids = tokenizer.encode(before, add_special_tokens=False)
+                sentinel_ids = tokenizer.encode(
+                    BGKIT_BROWSE_SENTINEL, add_special_tokens=False,
+                )
+                after_ids = tokenizer.encode(after, add_special_tokens=False)
+                tool_turn_tokens = before_ids + sentinel_ids + after_ids
+                browse_sentinel_offset = len(before_ids)
+            else:
+                tool_turn_tokens = tokenizer.encode(
+                    remaining, add_special_tokens=False,
+                )
 
         # For answer turns, capture the absolute [start, end) token range so
         # the trainer's eval path can compute EM/F1 over only the answer
@@ -539,6 +593,12 @@ def tokenize_trajectory(
                 abs_start = len(token_ids) + tool_turn_tokens_start
                 bgkit_turns.append(turn)
                 bgkit_sentinel_positions.append(abs_start)
+            elif turn.kind == "browse" and browse_sentinel_offset is not None:
+                # Recursive-L1: capture the browse node-rep sentinel position.
+                # Aligned with ``browse_turns`` (appended just above).
+                browse_sentinel_positions.append(
+                    len(token_ids) + browse_sentinel_offset,
+                )
             token_ids.extend(tool_turn_tokens)
             loss_mask.extend([False] * len(tool_turn_tokens))
 
@@ -557,6 +617,7 @@ def tokenize_trajectory(
         bgkit_call_spans=bgkit_call_spans,
         browse_turns=browse_turns,
         browse_call_spans=browse_call_spans,
+        browse_sentinel_positions=browse_sentinel_positions,
         topic_sentinel_position=topic_sentinel_position,
         topic_tags=resolved_topic_tags,
     )

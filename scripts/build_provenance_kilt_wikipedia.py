@@ -152,6 +152,18 @@ def build_provenance(
     output.parent.mkdir(parents=True, exist_ok=True)
     n_written = 0
     n_skipped = 0
+    n_dup = 0
+    # The ``orionweller/kilt_wikipedia_split`` corpus is passage-split: each
+    # Wikipedia article appears as several consecutive rows sharing one
+    # ``document_id`` (wikipedia_id). We want ONE provenance row per article
+    # (as the docstring promises and the KILT category hierarchy expects —
+    # article_id == document_id, 1:1). Emitting one row per passage would
+    # repeat the same "Tell me about <id>" question with different gold
+    # answers (different passage prefixes) — contradictory supervision. Keep
+    # the first passage per article: rows are corpus-ordered, so the first
+    # passage is the article's lead/intro, the correct gold for the synthetic
+    # "tell me about the whole article" question.
+    seen_doc_ids: set[str] = set()
 
     with output.open("w") as f:
         for idx, row in enumerate(metadata):
@@ -165,6 +177,12 @@ def build_provenance(
                 )
                 n_skipped += 1
                 continue
+
+            doc_id = str(doc_id)
+            if doc_id in seen_doc_ids:
+                n_dup += 1
+                continue
+            seen_doc_ids.add(doc_id)
 
             doc_ids = _slice_ids(
                 doc_tokens, doc_offsets, idx, max_len=answer_prefix_tokens,
@@ -193,7 +211,7 @@ def build_provenance(
                 json.dumps({
                     "question": question_str,
                     "gold_answer": gold_answer_str,
-                    "gold_article_id": str(doc_id),
+                    "gold_article_id": doc_id,
                     "scope_template": "topic_list",
                     "scope_description": "",
                 }) + "\n",
@@ -201,7 +219,8 @@ def build_provenance(
             n_written += 1
 
     logger.info(
-        "kilt_wikipedia provenance: wrote=%d skipped=%d", n_written, n_skipped,
+        "kilt_wikipedia provenance: wrote=%d skipped=%d dup_passages_collapsed=%d",
+        n_written, n_skipped, n_dup,
     )
     return n_written
 
