@@ -1,7 +1,8 @@
 """Tests for ``scripts/precompute_l1_tree.py`` on a tiny toy tree.
 
-Stubs the encoder (identity bridges + mean-pool encode_node) so the bottom-up
-walk + cache indexing are exercised on CPU with no real backbone.
+Stubs the encoder (identity bridges + mean-pool ``run_l1_and_project``) so the
+bottom-up walk (through the SHARED ``encode_tree_node`` primitive) + cache
+indexing are exercised on CPU with no real backbone.
 """
 
 from __future__ import annotations
@@ -59,18 +60,35 @@ def _populate_l0(cache_dir: Path, dim: int = 4) -> None:
     update_dataset_index(cache_dir, "toy", "shard_0000", rows)
 
 
-def _stub_encoder() -> types.SimpleNamespace:
-    def _encode_node(children_reps_l1in, children_cu_seqlens, target_ratio):
-        # Collapse a node's bridged children into one mean-pooled survivor.
-        return (
-            children_reps_l1in.mean(dim=0, keepdim=True),
-            torch.tensor([0, 1], dtype=torch.int32),
+class _StubTok:
+    def encode(self, text, add_special_tokens=False):
+        # Single deterministic id token — the primitive injects [id | survivors].
+        return [1]
+
+
+def _stub_encoder(dim: int = 4) -> types.SimpleNamespace:
+    embed = torch.nn.Embedding(8, dim)
+
+    def run_l1_and_project(
+        *, l1_input_embeddings, l1_input_cu_seqlens, target_ratio_l1, **kw
+    ):
+        # Collapse the node's [id | survivors] content into one mean-pooled
+        # survivor (id rows are pinned via pinned_positions_l1, ignored here).
+        surv = l1_input_embeddings.mean(dim=0, keepdim=True)
+        l1_out = types.SimpleNamespace(
+            survivor_embeddings=surv,
+            survivor_cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
         )
+        proj_out = types.SimpleNamespace(projected_embeddings=surv)
+        return l1_out, proj_out, torch.tensor([0, 1], dtype=torch.int32)
 
     return types.SimpleNamespace(
-        l0=types.SimpleNamespace(auto_reproduce=lambda x: x),
+        l0=types.SimpleNamespace(
+            auto_reproduce=lambda x: x,
+            backbone=types.SimpleNamespace(get_input_embeddings=lambda: embed),
+        ),
         l1_auto_reproduce=lambda x: x,
-        encode_node=_encode_node,
+        run_l1_and_project=run_l1_and_project,
     )
 
 
@@ -88,6 +106,7 @@ def test_precompute_tree_bottom_up_indexes_all_nodes(tmp_path):
         tree=tree,
         dataset="toy",
         encoder=enc,
+        tokenizer=_StubTok(),
         l0_cache=L0Cache(str(l0_dir)),
         retention=retention,
         output_dir=out_dir,
@@ -126,9 +145,11 @@ def test_precompute_tree_idempotent_resume(tmp_path):
         shard_size=8192,
     )
 
-    mod.precompute_tree(encoder=_stub_encoder(), **kwargs)
+    mod.precompute_tree(encoder=_stub_encoder(), tokenizer=_StubTok(), **kwargs)
     # Second run: everything already indexed → all skipped, nothing re-encoded.
-    n_enc, n_skip = mod.precompute_tree(encoder=_stub_encoder(), **kwargs)
+    n_enc, n_skip = mod.precompute_tree(
+        encoder=_stub_encoder(), tokenizer=_StubTok(), **kwargs,
+    )
     assert n_enc == 0
     assert n_skip == 5
 
