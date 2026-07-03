@@ -76,9 +76,9 @@ def test_kb_trajectory_dataset_roundtrip(tmp_path):
     assert sample.dataset_name == "toy"
     assert sample.scope_template == "topic_list"
     assert sample.topic_list == tree.top_level_topic_list()
-    # Trajectory must have at least one browse and one bgkit turn
+    # Trajectory must have at least one bgkit turn
     kinds = [t.kind for t in sample.trajectory]
-    assert "browse" in kinds and "bgkit" in kinds
+    assert "bgkit" in kinds
 
 
 def test_l0_cache_extend_only(tmp_path):
@@ -193,7 +193,6 @@ def test_build_decoder_segments_interleaves_tokens_and_survivors():
         question="q?",
         gold_answer="a",
         trajectory=[
-            TrajectoryTurn(kind="browse", args={"id": "Physics"}, response="kids", loss=True),
             TrajectoryTurn(
                 kind="bgkit",
                 args={"ids": ["Physics/sub1"], "query": "q?"},
@@ -1067,7 +1066,7 @@ def test_checkpointed_encoder_matches_plain_forward():
 
 def test_trajectory_json_roundtrip():
     turns = [
-        TrajectoryTurn(kind="browse", args={"id": "root"}, response="x", loss=True),
+        TrajectoryTurn(kind="bgkit", args={"ids": ["root"], "query": ""}, response="x", loss=True),
         TrajectoryTurn(kind="bgkit", args={"ids": ["x"], "query": "q"}, loss=False),
         TrajectoryTurn(kind="answer", response="answer", loss=True),
     ]
@@ -1271,3 +1270,89 @@ def test_live_l0_encode_feeds_actual_query_when_no_task_prompt():
     trainer._live_l0_encode("ds_a", ["x", "y"], query_emb=q_emb)
     p2 = trainer.encoder.l0.calls[-1]["prompt_embeddings"]
     assert p2.shape == (2 * 3, hidden_dim)  # per-task tokens (3), not query (5)
+
+
+def test_ablation_span_ce_splits_nav_and_recon():
+    """The read-only ablation probe's per-position CE helpers split the gap by
+    token type: nav_ce over the bgkit drill-id tool-call spans, recon_ce over
+    the gold answer span. Uses a stubbed decoder output (identity lm_head so
+    logits == hidden) with KNOWN per-position CE and known SHIFTED spans, and
+    asserts the correct target positions are selected (next-token p-1 shift,
+    loss-mask filtering, span union, past-end clamping).
+    """
+    import types
+
+    import torch.nn.functional as F
+
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer, _KBDecodeTrace
+
+    torch.manual_seed(0)
+    seq_len, dim = 12, 4  # dim == vocab (identity lm_head)
+    hidden = torch.randn(1, seq_len, dim)
+    token_ids = torch.randint(0, dim, (1, seq_len))
+    loss_mask = torch.ones(1, seq_len, dtype=torch.bool)
+    loss_mask[0, 3] = False  # masked position INSIDE a nav span → excluded
+
+    out = types.SimpleNamespace(
+        token_ids=token_ids,
+        loss_mask=loss_mask,
+        hidden_states=hidden,
+        lm_head=lambda h: h,  # identity → logits == predictor hidden
+    )
+
+    def expected(spans):
+        sel = torch.zeros(seq_len, dtype=torch.bool)
+        for a, b in spans:
+            lo, hi = max(1, a), min(seq_len, b)
+            if hi > lo:
+                sel[lo:hi] = True
+        sel &= loss_mask[0]
+        pos = sel.nonzero(as_tuple=False).squeeze(-1)
+        if pos.numel() == 0:
+            return 0.0, 0
+        logits = hidden[0].index_select(0, pos - 1).float()
+        tgt = token_ids[0].index_select(0, pos)
+        ce = F.cross_entropy(logits, tgt, reduction="none")
+        return float(ce.sum().item()), int(pos.numel())
+
+    nav_spans = [(2, 5), (7, 8)]  # positions 2,3(masked),4 + 7 → {2,4,7}
+    recon_span = (9, 20)  # positions 9,10,11 (12..19 clamped past seq_len)
+
+    # Static helper: navigation spans.
+    ns, nc = KRKBTrainer._span_ce_sum_count(out, nav_spans)
+    en_s, en_c = expected(nav_spans)
+    assert nc == en_c == 3  # position 3 filtered out by loss_mask
+    assert abs(ns - en_s) < 1e-5
+
+    # Static helper: reconstruction span (clamped to seq_len).
+    rs, rc = KRKBTrainer._span_ce_sum_count(out, [recon_span])
+    er_s, er_c = expected([recon_span])
+    assert rc == er_c == 3
+    assert abs(rs - er_s) < 1e-5
+
+    # A span fully past the decoded length contributes nothing.
+    assert KRKBTrainer._span_ce_sum_count(out, [(seq_len + 1, seq_len + 5)]) == (
+        0.0, 0,
+    )
+
+    # _accumulate_span_ce routes bgkit_call_spans → nav, answer_span → recon.
+    trace = _KBDecodeTrace(
+        answer_span=recon_span, bgkit_turns=[], bgkit_call_spans=nav_spans,
+    )
+    accum = {"nav_sum": 0.0, "nav_count": 0, "recon_sum": 0.0, "recon_count": 0}
+    stub = KRKBTrainer.__new__(KRKBTrainer)  # no __init__ — helpers are pure
+    KRKBTrainer._accumulate_span_ce(stub, accum, out, trace)
+    assert accum["nav_count"] == 3
+    assert accum["recon_count"] == 3
+    assert abs(accum["nav_sum"] - en_s) < 1e-5
+    assert abs(accum["recon_sum"] - er_s) < 1e-5
+
+    # Nav CE is computed over DIFFERENT positions than recon CE → distinct means.
+    nav_mean = accum["nav_sum"] / accum["nav_count"]
+    recon_mean = accum["recon_sum"] / accum["recon_count"]
+    assert nav_mean != recon_mean
+
+    # Accumulation is additive across samples (two decodes summed).
+    KRKBTrainer._accumulate_span_ce(stub, accum, out, trace)
+    assert accum["nav_count"] == 6
+    assert abs(accum["nav_sum"] - 2 * en_s) < 1e-5

@@ -99,8 +99,9 @@ class _TinyInnerModel(torch.nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        **kwargs,  # absorb FA4 packed args (position_ids / cu_seqlens / max_seqlen)
     ) -> SimpleNamespace:
-        del attention_mask  # unused in toy model
+        del attention_mask, kwargs  # unused in toy model
         return SimpleNamespace(last_hidden_state=self.layer(inputs_embeds))
 
 
@@ -251,9 +252,26 @@ def _new_trainer(
             if entry is None:
                 results.append(zero_fallback)
                 continue
+            ds = entry.get("dataset", "toy")
+            if "mode" in entry:
+                # Drill-down navigation turn (head/node). The real trainer
+                # resolves these from the per-repo shared tree; the QA cached-tree
+                # runtime is deferred, so here we stub-resolve the node to its
+                # articles (same L0-cache path as a leaf drill) so the pipeline
+                # still exercises the multi-turn splice.
+                nid = entry.get("node_id", "")
+                t = self._trees[ds]
+                if nid in t:
+                    node = t.get(nid)
+                    aids = list(node.articles) if node.is_leaf_tag else list(t.articles(nid))
+                else:
+                    aids = []
+                aids = [a for a in aids if self._l0_cache.has(ds, a)]
+            else:
+                aids = list(entry["article_ids"])
             rows_list = [
-                self._l0_cache.get(entry["dataset"], aid).float().to(self.device)
-                for aid in entry["article_ids"]
+                self._l0_cache.get(ds, aid).float().to(self.device)
+                for aid in aids
             ]
             if not rows_list:
                 results.append(zero_fallback)

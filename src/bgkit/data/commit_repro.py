@@ -43,6 +43,8 @@ import pygit2
 
 from bgkit.data.bgkit_tool_template import TrajectoryTurn
 from bgkit.data.browse_tree import BrowseNode, BrowseTree
+from bgkit.data.drilldown import DrillTarget, build_drilldown_trajectory
+from bgkit.data.opaque_ids import bip39_id
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -67,9 +69,24 @@ QUERY_TEMPLATES = (
 )
 
 # Reconstruction-walk defaults (tunable via scripts/args).
-MAX_PRECEDING_COMMITS = 6  # K — preceding file-touching commits to walk
-DRILL_PROB = 0.5  # P(bgkit-drill the target file's diff at a PRECEDING commit)
+MAX_PRECEDING_COMMITS = 6  # K — preceding file-touching commits to walk (legacy browse walk)
+DRILL_PROB = 0.5  # P(bgkit-drill the target file's diff at a PRECEDING commit) (legacy)
 GOLD_TOKEN_CAP = 8192  # a (file, commit) is a target only if its blob ≤ this
+
+# --- Drill-down redesign (2026-07-03) defaults ---
+# Cap on the number of touching-diff drill targets per sample (a file is touched
+# by many commits; the drill-down finds up to this many, most-recent first).
+MAX_TOUCHING_DIFFS = 8
+# 0..this distractor branches (wrong siblings, loss=False) sprinkled per sample.
+MAX_DISTRACTORS = 4
+
+# Head-node task query — the sample-specific compression prompt that orients the
+# drill-down (distinct from the reconstruction question). Query-navigation phrasing.
+HEAD_QUERY_TEMPLATES = (
+    "find the diffs that touched {filename} up to the commit with this message: "
+    "{message}",
+    "locate every change to {filename} through the commit described by: {message}",
+)
 
 # Target average commit count per repo. The global token budget B is derived
 # from this so that mean(N) ≈ TARGET_AVG_COMMITS across the corpus.
@@ -136,22 +153,113 @@ class ReproCommit:
     n_diff_tokens: int = 0  # sum over file_changes
 
     # -- id helpers (stable keys shared by mmap / tree / trajectory) --
+    #
+    # Opaque, token-friendly ids (2026-07-03): interior tree node ids are
+    # BIP-39 words derived from a stable content hash, NOT the guessable ordinal
+    # position; leaf (file-change) ids are the file PATH scoped by the commit's
+    # opaque node id. See ``opaque_ids.bip39_id`` and ``commit_node_id`` below.
 
     @property
     def commit_key(self) -> str:
-        """Stable ``(repo, window, ordinal)`` key used by the node-id sidecar."""
-        return f"{self.repo}@w{self.window_idx:03d}:{self.ordinal:04d}"
+        """Positional ``(repo, window, ordinal)`` LOOKUP key.
+
+        This is *not* a model-facing id — it keys the ``commit_node_ids`` sidecar
+        (``commit_key -> opaque node id``) so the trajectory builder, which knows
+        a target by ``(repo, window, ordinal)``, can find the commit's opaque
+        tree-node id. The node id the decoder actually navigates by is
+        :attr:`commit_node_id`.
+        """
+        return commit_key(self.repo, self.window_idx, self.ordinal)
+
+    @property
+    def commit_node_id(self) -> str:
+        """Opaque browse-tree node id for this commit's leaf-tag.
+
+        ``f"{repo}/{bip39(sha)}"`` — the repo prefix keeps it globally unique in
+        the forest's single node namespace; the BIP-39 suffix (derived from the
+        commit sha) is unguessable from the commit's ordinal, so the decoder must
+        read it out of the parent chunk's compressed rep to navigate here.
+        """
+        return commit_node_id(self.repo, self.sha)
+
+    def _duplicated_paths(self) -> set[str]:
+        """Paths that appear on more than one file-change in this commit.
+
+        Practically always empty (git emits one delta per path per commit), but
+        we disambiguate defensively so leaf ids stay unique per commit.
+        """
+        seen: set[str] = set()
+        dup: set[str] = set()
+        for fc in self.file_changes:
+            if fc.path in seen:
+                dup.add(fc.path)
+            seen.add(fc.path)
+        return dup
 
     def file_change_id(self, file_idx: int) -> str:
-        """mmap document_id for one file-change leaf."""
-        return f"{self.commit_key}#f{file_idx:03d}"
+        """mmap document_id / browse-tree article id for one file-change leaf.
+
+        ``f"{commit_node_id}/{path}"`` — the human-readable file path scoped by
+        the commit's opaque node id. Globally unique (repo in the prefix, opaque
+        commit id, path unique per commit). If a commit ever touches two
+        identically-pathed entries the colliding leaves get a minimal
+        ``#f{file_idx:03d}`` suffix.
+        """
+        fc = next(f for f in self.file_changes if f.file_idx == file_idx)
+        return file_change_leaf_id(
+            self.commit_node_id, fc.path, file_idx,
+            duplicated=fc.path in self._duplicated_paths(),
+        )
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 def commit_key(repo: str, window_idx: int, ordinal: int) -> str:
+    """Positional sidecar lookup key (see :attr:`ReproCommit.commit_key`)."""
     return f"{repo}@w{window_idx:03d}:{ordinal:04d}"
+
+
+# ---------------------------------------------------------------------------
+# Opaque node-id construction (shared by tree / mmap / trajectory builders)
+# ---------------------------------------------------------------------------
+
+
+def commit_node_id(repo: str, sha: str) -> str:
+    """Opaque browse-tree node id for a commit: ``f"{repo}/{bip39(sha)}"``."""
+    return f"{repo}/{bip39_id(sha)}"
+
+
+def chunk_node_id(repo: str, descendant_shas: list[str]) -> str:
+    """Opaque node id for a positional chunk (chunk4 / chunk16).
+
+    Hashes the ``|``-joined descendant commit shas in their (deterministic,
+    ordinal-ascending) order, so the id is stable but not derivable from the
+    chunk's ordinal position. Repo-prefixed for global uniqueness.
+    """
+    return f"{repo}/{bip39_id('|'.join(descendant_shas))}"
+
+
+def window_node_id(repo: str, window_idx: int) -> str:
+    """Opaque node id for a ``(repo, window)`` node.
+
+    ``f"{repo}/{bip39(f'{repo}:{window_idx}')}"`` — the drill-down head. Its
+    children are the 2nd-level survivors the per-sample head L1 runs over.
+    Repo-prefixed for global uniqueness in the forest namespace.
+    """
+    return f"{repo}/{bip39_id(f'{repo}:{window_idx}')}"
+
+
+def file_change_leaf_id(
+    commit_node_id: str, path: str, file_idx: int, *, duplicated: bool = False,
+) -> str:
+    """Leaf (file-change) id: the file ``path`` scoped by the commit node id.
+
+    ``duplicated`` (a commit touching two identical paths) appends a minimal
+    ``#f{file_idx:03d}`` discriminator; otherwise the bare path is used.
+    """
+    base = f"{commit_node_id}/{path}"
+    return f"{base}#f{file_idx:03d}" if duplicated else base
 
 
 # ---------------------------------------------------------------------------
@@ -280,29 +388,35 @@ def build_window_subtree_nodes(
     Returns ``(nodes, ord_to_node_id, window_node_id)`` where ``nodes`` covers
     the window node, any chunk16 / chunk4 grouping nodes, and one leaf-tag node
     per commit (``articles`` = file-change ids); ``ord_to_node_id`` maps each
-    commit's in-window ``ordinal`` to its leaf-tag node id (the id embeds the
-    full chunk path, so callers can't reconstruct it). The window node's
-    ``parent`` is the repo node id. Sized proportionally to the window's commit
-    count (flat / one chunk level / two chunk levels), so a short final window
-    gets a shallower subtree.
+    commit's in-window ``ordinal`` to its opaque leaf-tag node id
+    (:attr:`ReproCommit.commit_node_id`). The window node's ``parent`` is the
+    repo node id. All interior ids are opaque BIP-39 words (unguessable from
+    ordinal position); the tree's parent/child links carry the hierarchy, so the
+    ids no longer embed the chunk path. Sized proportionally to the window's
+    commit count (flat / one chunk level / two chunk levels), so a short final
+    window gets a shallower subtree.
     """
     assert commits, "window must be non-empty"
     repo_id = commits[0].repo
     window_idx = commits[0].window_idx
-    window_id = f"{repo_id}/w{window_idx:03d}"
+    window_id = window_node_id(repo_id, window_idx)
     nodes: list[BrowseNode] = []
     ord_to_node: dict[int, str] = {}
 
-    def commit_leaf(c: ReproCommit, parent: str, path_id: str) -> BrowseNode:
-        ord_to_node[c.ordinal] = path_id
+    def commit_leaf(c: ReproCommit, parent: str) -> BrowseNode:
+        node_id = c.commit_node_id
+        ord_to_node[c.ordinal] = node_id
         article_ids = tuple(c.file_change_id(fc.file_idx) for fc in c.file_changes)
         return BrowseNode(
-            id=path_id, parent=parent, kind="sub-tag",
+            id=node_id, parent=parent, kind="sub-tag",
             size=len(article_ids), children=(), articles=article_ids,
         )
 
     def size_of(cs: list[ReproCommit]) -> int:
         return sum(len(c.file_changes) for c in cs)
+
+    def shas_of(cs: list[ReproCommit]) -> list[str]:
+        return [c.sha for c in cs]
 
     n = len(commits)
     window_size = size_of(commits)
@@ -315,9 +429,9 @@ def build_window_subtree_nodes(
 
     if n < CHUNK_FANOUT:
         # Flat: commits directly under the window node.
-        child_ids = [f"{window_id}/cm_{c.ordinal:04d}" for c in commits]
-        for c, cid in zip(commits, child_ids, strict=True):
-            nodes.append(commit_leaf(c, window_id, cid))
+        child_ids = [c.commit_node_id for c in commits]
+        for c in commits:
+            nodes.append(commit_leaf(c, window_id))
         nodes.append(window_node(tuple(child_ids)))
         return nodes, ord_to_node, window_id
 
@@ -326,15 +440,15 @@ def build_window_subtree_nodes(
     c4_groups = _chunk(commits, CHUNK_FANOUT)
     two_levels = len(c4_groups) > CHUNK_FANOUT
     c4_specs = [
-        (f"{window_id}/c4_{gi:03d}", group) for gi, group in enumerate(c4_groups)
+        (chunk_node_id(repo_id, shas_of(group)), group) for group in c4_groups
     ]
 
     if not two_levels:
         # window → c4 → commit
         for c4_id, group in c4_specs:
-            child_ids = [f"{c4_id}/cm_{c.ordinal:04d}" for c in group]
-            for c, cid in zip(group, child_ids, strict=True):
-                nodes.append(commit_leaf(c, c4_id, cid))
+            child_ids = [c.commit_node_id for c in group]
+            for c in group:
+                nodes.append(commit_leaf(c, c4_id))
             nodes.append(BrowseNode(
                 id=c4_id, parent=window_id, kind="sub-tag", size=size_of(group),
                 children=tuple(child_ids), articles=(),
@@ -345,13 +459,14 @@ def build_window_subtree_nodes(
     # window → c16 → c4 → commit
     c16_groups = _chunk(c4_specs, CHUNK_FANOUT)
     c16_ids: list[str] = []
-    for hi, c16_group in enumerate(c16_groups):
-        c16_id = f"{window_id}/c16_{hi:03d}"
+    for c16_group in c16_groups:
+        c16_shas = [c.sha for _, group in c16_group for c in group]
+        c16_id = chunk_node_id(repo_id, c16_shas)
         c16_ids.append(c16_id)
         for c4_id, group in c16_group:
-            child_ids = [f"{c4_id}/cm_{c.ordinal:04d}" for c in group]
-            for c, cid in zip(group, child_ids, strict=True):
-                nodes.append(commit_leaf(c, c4_id, cid))
+            child_ids = [c.commit_node_id for c in group]
+            for c in group:
+                nodes.append(commit_leaf(c, c4_id))
             nodes.append(BrowseNode(
                 id=c4_id, parent=c16_id, kind="sub-tag", size=size_of(group),
                 children=tuple(child_ids), articles=(),
@@ -452,58 +567,57 @@ def build_per_file_index(
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class WalkStep:
-    """One commit in a file's reconstruction walk (oldest→target)."""
-
-    commit_node_id: str  # browse-tree leaf-tag id for the commit
-    file_change_id: str  # mmap doc id of the target file's diff at this commit
-    is_target: bool  # the final commit being reconstructed
-    drill: bool  # whether to bgkit-drill the file's diff at this commit
+def build_head_query(filename: str, message: str, template_idx: int = 0) -> str:
+    """Head-node task query — the navigation-oriented compression prompt that
+    orients the drill-down (distinct from the reconstruction question)."""
+    tmpl = HEAD_QUERY_TEMPLATES[template_idx % len(HEAD_QUERY_TEMPLATES)]
+    return tmpl.format(filename=filename, message=message.strip())
 
 
-def build_file_reconstruction_trajectory(
+def build_file_drilldown_trajectory(
     tree: BrowseTree,
-    walk: list[WalkStep],
-    query: str,
+    commit_node_ids: dict[str, str],
+    repo: str,
+    window_idx: int,
+    file_path: str,
+    touching: list[tuple[int, FileChange]],
+    head_message: str,
     gold_blob: str,
-) -> list[TrajectoryTurn]:
-    """Browse-navigate oldest→target across a file's commit history, drilling
-    the target-file diff at each ``drill`` step, then answer the file's blob.
+    *,
+    ord_to_commit: dict[int, ReproCommit],
+    head_template_idx: int = 0,
+    n_distractors: int = MAX_DISTRACTORS,
+    rng=None,
+) -> list[TrajectoryTurn] | None:
+    """Pure recursive drill-down trajectory for one ``(file, target)`` reconstruction.
 
-    Navigation is deduplicated: shared ancestors (window / c16 / c4) are
-    browsed once; each commit node is browsed exactly once (commit nodes never
-    repeat). A PRECEDING commit with ``drill=False`` is still browsed (a
-    no-retrieval "stop at the commit" step → random drill-down depth); the
-    TARGET commit always drills. The final ``answer`` turn carries the file's
-    full blob at the target commit (the reconstruction gold).
+    ``touching`` is the chronological ``[(ordinal, FileChange)]`` for the commits
+    that touched ``file_path`` up to (and including) the target, already capped to
+    :data:`MAX_TOUCHING_DIFFS`. Each becomes a drill target that retrieves that
+    commit's file-change diff. ``ord_to_commit`` maps each in-window ordinal to
+    its :class:`ReproCommit` so the retrieve id can be built via
+    :meth:`ReproCommit.file_change_id` — identical to the tree ``articles`` and
+    mmap ``document_id``. The head is the window node, encoded live with the task
+    query. Returns ``None`` if any required node id is missing.
     """
-    turns: list[TrajectoryTurn] = []
-    visited: set[str] = set()
-    for step in walk:
-        path = tree.path_to(step.commit_node_id)  # [root, repo, window, ..., commit]
-        # Drop root + repo; browse only not-yet-seen ancestors, then the commit.
-        for node_id in path[2:]:
-            if node_id in visited:
-                continue
-            visited.add(node_id)
-            turns.append(TrajectoryTurn(
-                kind="browse",
-                args={"id": node_id},
-                response=tree.render_browse_response(node_id),
-                loss=True,
-            ))
-        if step.drill:
-            turns.append(TrajectoryTurn(
-                kind="bgkit",
-                args={"ids": [step.file_change_id], "query": query},
-                response="",
-                loss=True,
-            ))
-    turns.append(TrajectoryTurn(
-        kind="answer", args={}, response=gold_blob, loss=True,
-    ))
-    return turns
+    head_id = window_node_id(repo, window_idx)
+    if head_id not in tree:
+        return None
+    targets: list[DrillTarget] = []
+    for ord_i, fc_i in touching:
+        node_id = commit_node_ids.get(commit_key(repo, window_idx, ord_i))
+        commit = ord_to_commit.get(ord_i)
+        if node_id is None or node_id not in tree or commit is None:
+            return None
+        fcid = commit.file_change_id(fc_i.file_idx)
+        targets.append(DrillTarget(leaf_node_id=node_id, retrieve_ids=(fcid,)))
+    if not targets:
+        return None
+    task_query = build_head_query(file_path, head_message, head_template_idx)
+    return build_drilldown_trajectory(
+        tree, head_id, targets, task_query, gold_blob,
+        n_distractors=n_distractors, rng=rng,
+    )
 
 
 def summarize_distribution(counts: list[int], label: str = "N") -> dict:

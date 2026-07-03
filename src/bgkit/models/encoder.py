@@ -471,112 +471,22 @@ class BgKITEncoder(nn.Module):
         )
         return l1_out, proj_out, proj_cu
 
-    def encode_node(
-        self,
-        children_reps_l1in: torch.Tensor,
-        children_cu_seqlens: torch.Tensor,
-        target_ratio: float,
-        pinned_id_embeddings: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Recursive-L1 entry point for offline bottom-up tree encoding.
+    def encode_node(self, *args, **kwargs):
+        """RETIRED — use :func:`bgkit.models.recursive_l1.encode_tree_node`.
 
-        Runs ONE recursive L1 compression pass and returns the node's
-        subtree-summary survivors. This is the cached-L1-tree analog of the
-        L1 stage inside :meth:`run_l1_and_project`, with three deliberate
-        differences:
-
-        - **Input space.** ``children_reps_l1in`` is ALREADY in L1's
-          input-embedding space — the caller has bridged its inputs into it:
-
-          * leaf node → the leaf's articles' L0 survivors bridged through
-            :meth:`l0.auto_reproduce` (L0-output → L1-input);
-          * interior node → the children's cached node reps bridged through
-            :meth:`l1_auto_reproduce` (L1-output → L1-input).
-
-          encode_node NEVER bridges its input itself, and the input dim must
-          equal L1's hidden/input dim (asserted below).
-
-        - **Query-agnostic.** Cached node reps are computed offline with no
-          query conditioning, so encode_node takes no query. Per-node
-          conditioning is limited to the optional ``pinned_id_embeddings``
-          (the node's own id embedding, already in L1-input space), prepended
-          once per node as a single-token L1 prompt so the summary can carry
-          its identity. Query-conditioning is re-applied later on the live
-          search path, not here.
-
-        - **No projection.** encode_node returns the node's survivors in
-          L1-OUTPUT space (pre-norm last block), NOT the projected decoder
-          embeddings — it never touches ``projection_blocks``. A parent node
-          bridges these via :meth:`l1_auto_reproduce` back into L1-input space
-          and calls encode_node again, walking the tree bottom-up.
-
-        Args:
-            children_reps_l1in: ``(N, D)`` packed children reps in L1-input
-                space. ``D`` must equal ``self.l1.hidden_dim``.
-            children_cu_seqlens: ``(n_nodes + 1,)`` int32 segment boundaries —
-                one segment per node being encoded in this batch.
-            target_ratio: L1 compression ratio for this node/depth.
-            pinned_id_embeddings: optional ``(n_nodes, D)`` per-node id
-                embeddings (L1-input space), prepended as a 1-token prompt.
-
-        Returns:
-            ``(node_survivors, node_cu_seqlens)`` — survivors in L1-OUTPUT
-            (pre-norm) space and the matching ``(n_nodes + 1,)`` int32 cu.
+        The old ``encode_node`` injected the node's OWN id as a prompt (or no id
+        at all), so a node's rep did not carry its CHILDREN's ids and the decoder
+        could not read a child id to navigate. Every tree-encode path now funnels
+        through the single shared :func:`encode_tree_node` primitive, which
+        interleaves ``[child_id | child_survivors]`` per child and pins the id
+        rows — making it impossible to encode a node without child-ID injection.
+        This shim raises so no path can silently resurrect the old behaviour.
         """
-        if children_reps_l1in.ndim != 2:
-            raise ValueError(
-                "encode_node: children_reps_l1in must be packed (N, D); got "
-                f"{tuple(children_reps_l1in.shape)}"
-            )
-        if int(children_reps_l1in.shape[-1]) != int(self.l1.hidden_dim):
-            raise ValueError(
-                "encode_node: input dim "
-                f"{int(children_reps_l1in.shape[-1])} != L1 input dim "
-                f"{int(self.l1.hidden_dim)} — caller must bridge children reps "
-                "into L1-input space (l0.auto_reproduce for leaves, "
-                "l1_auto_reproduce for interior nodes)."
-            )
-
-        n_nodes = int(children_cu_seqlens.numel()) - 1
-        content_pos = position_ids_from_cu(
-            children_cu_seqlens, int(children_reps_l1in.shape[0]),
+        raise NotImplementedError(
+            "BgKITEncoder.encode_node is retired; encode tree nodes via "
+            "bgkit.models.recursive_l1.encode_tree_node (child-ID injection is "
+            "mandatory and shared across every tree path)."
         )
-
-        prompt_emb = None
-        prompt_cu = None
-        prompt_pos = None
-        if pinned_id_embeddings is not None:
-            if pinned_id_embeddings.ndim != 2 or int(
-                pinned_id_embeddings.shape[0]
-            ) != n_nodes:
-                raise ValueError(
-                    "encode_node: pinned_id_embeddings must be "
-                    f"(n_nodes={n_nodes}, D); got "
-                    f"{tuple(pinned_id_embeddings.shape)}"
-                )
-            if int(pinned_id_embeddings.shape[-1]) != int(self.l1.hidden_dim):
-                raise ValueError(
-                    "encode_node: pinned_id_embeddings dim "
-                    f"{int(pinned_id_embeddings.shape[-1])} != L1 input dim "
-                    f"{int(self.l1.hidden_dim)}"
-                )
-            prompt_emb = pinned_id_embeddings.to(children_reps_l1in.dtype)
-            prompt_cu = torch.arange(
-                0, n_nodes + 1, dtype=torch.int32,
-                device=children_reps_l1in.device,
-            )
-            prompt_pos = position_ids_from_cu(prompt_cu, n_nodes)
-
-        l1_out = self.l1(
-            content_embeddings=children_reps_l1in,
-            content_cu_seqlens=children_cu_seqlens,
-            content_position_ids=content_pos,
-            prompt_embeddings=prompt_emb,
-            prompt_cu_seqlens=prompt_cu,
-            prompt_position_ids=prompt_pos,
-            target_ratio=target_ratio,
-        )
-        return l1_out.survivor_embeddings, l1_out.survivor_cu_seqlens
 
     def forward(
         self,

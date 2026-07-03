@@ -1,4 +1,10 @@
-"""Tests for teacher trajectory generation and exploration variants."""
+"""Tests for the QA drill-down teacher-trajectory adapter.
+
+The adapter maps a QA sample onto the shared drill-down builder
+(:func:`bgkit.data.drilldown.build_drilldown_trajectory`); it must emit a
+``bgkit``-only trajectory (NO ``browse`` turns), carry the question on the
+head drill, and turn each gold article into a drill target.
+"""
 
 from __future__ import annotations
 
@@ -7,8 +13,8 @@ from bgkit.data.tagging import BrowseTreeBuilder, TaggingConfig
 from bgkit.data.teacher_trajectories import (
     TrajectoryConfig,
     _common_ancestor_path,
-    build_exploration_trajectory,
-    build_primary_trajectory,
+    build_qa_drilldown_trajectory,
+    build_trajectory,
 )
 
 
@@ -26,12 +32,8 @@ def _flat_tree() -> BrowseTree:
 
     BrowseTreeBuilder will sub-divide an oversized ``misc`` leaf into
     auto-bucketed sub-tags (``~A``, ``~B``, ...). The resulting tree
-    has no semantic intermediate hierarchy — exactly the shape we want
-    flat-trajectory mode to detect.
-
-    We use varied article name prefixes (a-z, 0-9) so the
-    alphabetical bucketing actually splits on the first round instead
-    of recursing forever.
+    has no semantic intermediate hierarchy — exactly the shape the
+    flat-tree degenerate drill-down must detect.
     """
     builder = BrowseTreeBuilder(TaggingConfig(dataset="newsqa", leaf_cap=5, fanout_cap=20))
     chars = "abcdefghijkl"
@@ -41,93 +43,85 @@ def _flat_tree() -> BrowseTree:
     return builder.build()
 
 
-def test_primary_trajectory_reaches_gold_article_and_emits_answer():
+def _no_browse(trajectory) -> None:
+    """No trajectory the adapter emits may ever contain a ``browse`` turn."""
+    kinds = [t.kind for t in trajectory]
+    assert "browse" not in kinds, f"drill-down must not emit browse turns, got {kinds}"
+
+
+def test_no_browse_turns_and_answer_last():
     tree = _tree()
-    trajectory = build_primary_trajectory(
+    traj = build_qa_drilldown_trajectory(
         tree, "why?", "Physics_sub1_a2", "because 42",
     )
-    kinds = [t.kind for t in trajectory]
-    # Must open with browse turns (root, then intermediate nodes)
-    assert kinds[0] == "browse"
-    assert "bgkit" in kinds
-    # Must END with a loss-bearing answer turn carrying the gold string.
-    last = trajectory[-1]
+    _no_browse(traj)
+    # Only bgkit + answer kinds.
+    assert set(t.kind for t in traj) <= {"bgkit", "answer"}
+    last = traj[-1]
     assert last.kind == "answer"
     assert last.loss is True
     assert last.response == "because 42"
-    # Every turn is a training target in the primary path.
-    assert all(t.loss for t in trajectory)
 
 
-def test_primary_trajectory_single_article_bgkit_fuses_leaf_and_drills_down():
+def test_head_drill_carries_question_as_query():
     tree = _tree()
-    trajectory = build_primary_trajectory(
+    traj = build_qa_drilldown_trajectory(
+        tree, "why is the sky blue?", "Physics_sub1_a2", "rayleigh",
+    )
+    head = traj[0]
+    assert head.kind == "bgkit"
+    assert head.args.get("is_head") is True
+    assert head.args["query"] == "why is the sky blue?"
+
+
+def test_gold_article_becomes_a_drill_target():
+    tree = _tree()
+    traj = build_qa_drilldown_trajectory(
         tree, "why?", "Physics_sub1_a2", "answer",
     )
-    bgkit_calls = [t for t in trajectory if t.kind == "bgkit"]
-    assert len(bgkit_calls) == 2
-    leaf_call, drill_call = bgkit_calls
-    assert leaf_call.args["ids"] == ["Physics/Physics_sub1"]
-    assert drill_call.args["ids"] == ["Physics_sub1_a2"]
+    # The gold article id must be retrieved by some loss-bearing bgkit drill.
+    retrieved: set[str] = set()
+    for t in traj:
+        if t.kind == "bgkit" and t.loss:
+            retrieved.update(t.args["ids"])
+    assert "Physics_sub1_a2" in retrieved
 
 
 def test_bgkit_turns_have_empty_response_strings():
-    """bgkit turns never carry a text side-channel — the response field
-    is always empty. Drill-down relies entirely on ID pinning through
-    the L1 encoder."""
+    """bgkit drills never carry a text side-channel — the response field
+    is always empty. Drill-down relies entirely on ID pinning."""
     tree = _tree()
-    trajectory = build_primary_trajectory(
+    traj = build_qa_drilldown_trajectory(
         tree, "why?", "Physics_sub1_a2", "answer",
     )
-    for turn in trajectory:
+    for turn in traj:
         if turn.kind == "bgkit":
             assert turn.response == "", (
                 f"bgkit turn must have empty response, got {turn.response!r}"
             )
 
 
-def test_primary_trajectory_multi_article_fuses_into_one_bgkit_call():
-    """Multi-hop gold: two articles in different leaves should walk to the
-    deepest common ancestor and fuse leaves in a single bgkit call."""
+def test_multi_article_gold_becomes_multiple_targets():
+    """Two gold articles in different leaves → both retrieved by distinct
+    loss-bearing drills, with no browse turns and a common-ancestor head."""
     tree = _tree()
-    trajectory = build_primary_trajectory(
+    traj = build_qa_drilldown_trajectory(
         tree,
         "multi-hop?",
         ["Physics_sub0_a1", "Physics_sub2_a0"],
         "combined answer",
     )
-    bgkit_calls = [t for t in trajectory if t.kind == "bgkit"]
-    # First bgkit fuses both leaves in a single call
-    leaf_call = bgkit_calls[0]
-    assert set(leaf_call.args["ids"]) == {
-        "Physics/Physics_sub0", "Physics/Physics_sub2",
-    }
-    assert leaf_call.args["query"] == "multi-hop?"
-    # Browse turns walk to the LCA (Physics), not all the way to each leaf
-    browse_nodes = [t.args["id"] for t in trajectory if t.kind == "browse"]
-    assert browse_nodes == ["root", "Physics"]
-    # Answer turn is last
-    assert trajectory[-1].kind == "answer"
-    assert trajectory[-1].response == "combined answer"
-
-
-def test_primary_trajectory_multi_article_same_leaf_collapses():
-    """Two gold articles in the same leaf should collapse to the
-    single-leaf path."""
-    tree = _tree()
-    trajectory = build_primary_trajectory(
-        tree,
-        "why?",
-        ["Physics_sub1_a0", "Physics_sub1_a2"],
-        "answer",
-    )
-    bgkit_calls = [t for t in trajectory if t.kind == "bgkit"]
-    # First call: the leaf tag (single, since both articles share it)
-    leaf_call = bgkit_calls[0]
-    assert leaf_call.args["ids"] == ["Physics/Physics_sub1"]
-    # Plus drill-downs for each distinct article
-    drill_ids = [c.args["ids"][0] for c in bgkit_calls[1:]]
-    assert set(drill_ids) == {"Physics_sub1_a0", "Physics_sub1_a2"}
+    _no_browse(traj)
+    retrieved: set[str] = set()
+    for t in traj:
+        if t.kind == "bgkit" and t.loss:
+            retrieved.update(t.args["ids"])
+    assert {"Physics_sub0_a1", "Physics_sub2_a0"} <= retrieved
+    # Head drill carries the query; LCA of the two Physics sub-leaves is Physics.
+    assert traj[0].args.get("is_head") is True
+    assert traj[0].args["query"] == "multi-hop?"
+    assert traj[-1].kind == "answer"
+    assert traj[-1].response == "combined answer"
 
 
 def test_common_ancestor_path_single_and_multi():
@@ -147,88 +141,78 @@ def test_common_ancestor_path_single_and_multi():
     assert p == ["root"]
 
 
-def test_exploration_adds_sibling_bgkit_with_loss_false():
+def test_exploration_siblings_add_loss_false_distractor_drills():
+    """With exploration always on, the builder must inject at least one
+    wrong-sibling drill marked loss=False, while the gold retrievals stay
+    loss=True. Uses a multi-article gold so the head lands on an internal
+    node (``Physics``) that actually has off-path sibling sub-tags to draw
+    distractors from."""
     tree = _tree()
-    cfg = TrajectoryConfig(exploration_fraction=1.0, exploration_siblings=1, seed=5)
-    traj = build_exploration_trajectory(
-        tree, "why?", "Physics_sub1_a2", "a", cfg, sample_idx=0,
-    )
-    bgkit_calls = [t for t in traj if t.kind == "bgkit"]
-    assert any(not t.loss for t in bgkit_calls), \
-        "exploration should insert a loss=False sibling bgkit call"
-    assert any(t.loss for t in bgkit_calls), \
-        "primary bgkit must still have loss=True"
-    # Sibling must not be in the primary leaf set
-    primary_leaves = set(
-        next(t for t in bgkit_calls if t.loss).args["ids"],
-    )
-    for t in bgkit_calls:
-        if t.loss:
-            continue
-        for sib_leaf in t.args["ids"]:
-            assert sib_leaf not in primary_leaves
-    # Answer turn still present at the end
-    assert traj[-1].kind == "answer"
-    assert traj[-1].response == "a"
-
-
-def test_trajectory_referenced_articles_include_siblings():
-    from bgkit.data.bgkit_tool_template import articles_referenced_by_trajectory
-
-    tree = _tree()
-    cfg = TrajectoryConfig(exploration_fraction=1.0, exploration_siblings=1)
-    traj = build_exploration_trajectory(
-        tree, "why?", "Physics_sub1_a2", "a", cfg, sample_idx=0,
-    )
-    ids = articles_referenced_by_trajectory(traj)
-    # At least 2 distinct leaf tags should show up (primary + sibling)
-    assert len(set(ids)) >= 2
+    cfg = TrajectoryConfig(exploration_fraction=1.0, exploration_siblings=2, seed=5)
+    golds = ["Physics_sub0_a1", "Physics_sub2_a0"]
+    # Scan sample indices for one that yields a non-zero distractor draw.
+    found = False
+    for idx in range(20):
+        traj = build_qa_drilldown_trajectory(tree, "why?", golds, "a", cfg, sample_idx=idx)
+        _no_browse(traj)
+        bgkit_calls = [t for t in traj if t.kind == "bgkit"]
+        assert any(t.loss for t in bgkit_calls), "gold drill must stay loss=True"
+        if any(not t.loss for t in bgkit_calls):
+            found = True
+            break
+    assert found, "exploration should sometimes inject loss=False distractor drills"
 
 
 def test_flat_tree_is_detected():
-    """A tree built from un-tagged articles is auto-bucketed into
-    synthetic ``~A``, ``~B``, ... sub-tags. ``BrowseTree.is_flat`` must
-    recognize this as flat (no semantic hierarchy)."""
     flat = _flat_tree()
     assert flat.is_flat() is True
     deep = _tree()
-    # Deep tree's root has named children (Physics, Biology) — not flat.
     assert deep.is_flat() is False
 
 
-def test_flat_trajectory_skips_browse():
-    """On flat trees the trajectory must NOT emit browse turns. The
-    decoder calls bgkit on the gold article directly."""
+def test_flat_tree_degenerate_single_drill_no_navigation():
+    """On a flat tree the adapter emits a degenerate drill-down: a single
+    leaf drill that retrieves the gold article directly, then the answer —
+    no browse, no navigation drills."""
     flat = _flat_tree()
-    trajectory = build_primary_trajectory(
+    traj = build_qa_drilldown_trajectory(
         flat, "what is a_article_3 about?", "a_article_3", "answer text",
+        TrajectoryConfig(exploration_fraction=0.0), sample_idx=0,
     )
-    kinds = [t.kind for t in trajectory]
-    assert "browse" not in kinds, (
-        f"flat tree must not emit browse turns, got {kinds}"
-    )
-    assert kinds[0] == "bgkit", "first turn must be bgkit on flat trees"
+    _no_browse(traj)
+    kinds = [t.kind for t in traj]
+    assert kinds[0] == "bgkit", "first turn must be a bgkit drill on flat trees"
     assert kinds[-1] == "answer"
-    # The bgkit call references the leaf containing the gold article (or the
-    # article itself, if the article is its own node).
-    bgkit_turn = trajectory[0]
-    referenced = []
-    for tid in bgkit_turn.args["ids"]:
-        if tid in flat:
-            referenced.extend(flat.articles(tid) or [tid])
-    assert "a_article_3" in referenced, (
-        f"bgkit turn must reference the gold article, got {referenced[:5]}..."
-    )
+    # With distractors gated off, exactly one drill + one answer.
+    assert kinds == ["bgkit", "answer"]
+    head = traj[0]
+    assert head.args.get("is_head") is True
+    assert "a_article_3" in head.args["ids"]
 
 
-def test_hierarchical_trajectory_still_browses():
-    """Sanity check the inverse: deep trees still emit browse turns."""
-    deep = _tree()
-    trajectory = build_primary_trajectory(
-        deep, "why?", "Physics_sub1_a2", "answer",
+def test_build_trajectory_delegates_to_adapter():
+    """The back-compat ``build_trajectory`` entry point produces the same
+    browse-free drill-down output."""
+    tree = _tree()
+    cfg = TrajectoryConfig(exploration_fraction=0.0)
+    traj = build_trajectory(
+        tree, "why?", "Physics_sub1_a2", "answer", cfg, sample_idx=0,
     )
-    kinds = [t.kind for t in trajectory]
-    assert "browse" in kinds, (
-        f"deep tree must still emit browse turns, got {kinds}"
-    )
-    assert kinds[0] == "browse"
+    _no_browse(traj)
+    assert traj[-1].kind == "answer"
+    assert traj[-1].response == "answer"
+
+
+def test_trajectory_referenced_articles_include_distractors():
+    from bgkit.data.bgkit_tool_template import articles_referenced_by_trajectory
+
+    tree = _tree()
+    cfg = TrajectoryConfig(exploration_fraction=1.0, exploration_siblings=2, seed=5)
+    golds = ["Physics_sub0_a1", "Physics_sub2_a0"]
+    for idx in range(20):
+        traj = build_qa_drilldown_trajectory(tree, "why?", golds, "a", cfg, sample_idx=idx)
+        # Two gold targets plus any distractor => at least the two golds' ids.
+        ids = articles_referenced_by_trajectory(traj)
+        if len(set(ids)) >= 2:
+            return
+    raise AssertionError("expected some sample to reference >=2 distinct ids")

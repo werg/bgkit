@@ -36,13 +36,6 @@ def test_browse_tree_topic_list():
     assert set(tops) == {"Physics", "Biology", "Chemistry", "Math", "History"}
 
 
-def test_browse_tree_render_browse_response():
-    tree = _small_tree()
-    text = tree.render_browse_response("Physics")
-    # Child sub-tags should appear in the output
-    assert "Physics/Physics_sub0" in text
-
-
 def test_browse_tree_path_to_leaf():
     tree = _small_tree()
     leaves = [n for n in [tree.get(c) for c in tree.get("Physics").children]]

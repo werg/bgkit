@@ -2,10 +2,11 @@
 """Convert the ``git_commit_repro`` commit JSONL into the Phase 2 mmap schema.
 
 Each *file-change* (one changed file in one commit) becomes one mmap document —
-the L0-encodable leaf. The ``document_id`` is the file-change id
-(``{repo}@w{window_idx:03d}:{ordinal:04d}#f{file_idx:03d}``), matching the
-``articles`` lists in the browse tree and the ids enumerated by
-``scripts/build_trajectory_set.py``.
+the L0-encodable leaf. The ``document_id`` is the opaque file-change id
+(``{repo}/{bip39(sha)}/{path}`` — the file path scoped by the commit's opaque
+BIP-39 node id), produced by :meth:`bgkit.data.commit_repro.ReproCommit.file_change_id`
+so it matches the ``articles`` lists in the browse tree, the trajectory
+``retrieve_ids``, and the ids enumerated by ``scripts/build_trajectory_set.py``.
 
 Writes the canonical layout consumed by
 :class:`bgkit.data.article_token_store.ArticleTokenStore`::
@@ -33,7 +34,7 @@ if _src not in sys.path:
 import numpy as np
 import pyarrow as pa
 
-from bgkit.data.commit_repro import DATASET_NAME
+from bgkit.data.commit_repro import DATASET_NAME, FileChange, ReproCommit
 from bgkit.data.mmap_writer import build_csr_offsets, write_mmap_artifacts
 
 
@@ -68,12 +69,25 @@ def main() -> None:
             repo = rec["repo"]
             window = int(rec.get("window_idx", 0))
             ordinal = int(rec["ordinal"])
+            # Reconstruct the ReproCommit so document_id construction (incl. the
+            # opaque BIP-39 commit-node scope + same-path disambiguation) is
+            # bit-identical to the tree / trajectory builders.
+            commit = ReproCommit(
+                repo=repo, sha=str(rec.get("sha", "")), ordinal=ordinal,
+                message=str(rec.get("message", "")),
+                timestamp=int(rec.get("timestamp", 0)), window_idx=window,
+                file_changes=[
+                    FileChange(file_idx=int(fc["file_idx"]), path=str(fc["path"]),
+                               diff_text=str(fc.get("diff_text", "")))
+                    for fc in rec["file_changes"]
+                ],
+            )
             for fc in rec["file_changes"]:
                 ids = tokenizer.encode(fc["diff_text"], add_special_tokens=False)
                 if not ids:
                     continue
                 fi = int(fc["file_idx"])
-                doc_id = f"{repo}@w{window:03d}:{ordinal:04d}#f{fi:03d}"
+                doc_id = commit.file_change_id(fi)
                 chunks.append(np.array(ids, dtype=np.int32))
                 lengths.append(len(ids))
                 document_ids.append(doc_id)

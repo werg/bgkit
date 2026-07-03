@@ -148,7 +148,6 @@ def test_trajectory_step_accuracy_all_correct():
     )
     trace = _KBDecodeTrace(
         answer_span=(5, 6),
-        browse_turns=[], browse_call_spans=[],
         bgkit_turns=[], bgkit_call_spans=[],
     )
     trainer = _ToyTrainer(
@@ -176,7 +175,6 @@ def test_trajectory_step_accuracy_partial():
     )
     trace = _KBDecodeTrace(
         answer_span=None,
-        browse_turns=[], browse_call_spans=[],
         bgkit_turns=[], bgkit_call_spans=[],
     )
     trainer = _ToyTrainer(
@@ -199,7 +197,6 @@ def test_trajectory_step_accuracy_no_loss_positions():
     )
     trace = _KBDecodeTrace(
         answer_span=None,
-        browse_turns=[], browse_call_spans=[],
         bgkit_turns=[], bgkit_call_spans=[],
     )
     trainer = _ToyTrainer(
@@ -215,32 +212,24 @@ def test_trajectory_step_accuracy_no_loss_positions():
 
 
 def test_tool_call_id_accuracy_all_correct():
-    """Teacher browse(id='root') and bgkit(ids=['A/b']) — decoded
-    greedy predictions contain both IDs as substrings → 1.0 on every
-    sub-metric."""
+    """Teacher bgkit(ids=['A/b']) — decoded greedy predictions contain
+    the ID as a substring → 1.0 on every sub-metric."""
     tokenizer = _FakeTokenizer()
     # Concat layout:
-    #   [header, <browse call = "root">, <tool resp>, <bgkit call = "A/b q">]
-    # Browse call assistant-emission span is positions 1..5 (5 chars "root ")
-    # Bgkit call assistant-emission span is positions 9..14 (5 chars "A/b q")
-    browse_text = "root"
+    #   [header, <tool resp>, <bgkit call = "A/b q">]
     bgkit_text = "A/b q"
     header = "H"
     resp = "R" * 3
 
-    full_text = header + browse_text + resp + bgkit_text
+    full_text = header + resp + bgkit_text
     full_ids = _str_to_ids(full_text)
 
     # Concat len: len(full_text). loss_mask is True only on the
-    # browse_call and bgkit_call spans.
+    # bgkit_call span.
     n = len(full_ids)
     loss_mask = [False] * n
-    browse_start = len(header)
-    browse_end = browse_start + len(browse_text)
-    bgkit_start = browse_end + len(resp)
+    bgkit_start = len(header) + len(resp)
     bgkit_end = bgkit_start + len(bgkit_text)
-    for i in range(browse_start, browse_end):
-        loss_mask[i] = True
     for i in range(bgkit_start, bgkit_end):
         loss_mask[i] = True
 
@@ -259,10 +248,6 @@ def test_tool_call_id_accuracy_all_correct():
     )
     trace = _KBDecodeTrace(
         answer_span=None,
-        browse_turns=[
-            TrajectoryTurn(kind="browse", args={"id": "root"}, response="r"),
-        ],
-        browse_call_spans=[(browse_start, browse_end)],
         bgkit_turns=[
             TrajectoryTurn(
                 kind="bgkit", args={"ids": ["A/b"], "query": "q"}, response="",
@@ -274,41 +259,31 @@ def test_tool_call_id_accuracy_all_correct():
     sample = _build_sample(trajectory=[])
 
     result = tool_call_id_accuracy(trainer, sample)
-    assert result["browse"] == pytest.approx(1.0)
     assert result["bgkit"] == pytest.approx(1.0)
     assert result["overall"] == pytest.approx(1.0)
-    assert result["n_browse"] == 1
     assert result["n_bgkit"] == 1
 
 
 def test_tool_call_id_accuracy_wrong_ids():
     """Greedy predicts the wrong tag — substring check fails on all calls."""
     tokenizer = _FakeTokenizer()
-    # Teacher: browse(id="root"), bgkit(ids=["A/b"])
-    # Model predicts "zzzz" / "zzzzz" in those slots → no substring match.
+    # Teacher: bgkit(ids=["A/b"])
+    # Model predicts "zzzzz" in that slot → no substring match.
     header = "H"
-    browse_text = "root"
     resp = "RRR"
     bgkit_text = "A/b q"
-    full_text = header + browse_text + resp + bgkit_text
+    full_text = header + resp + bgkit_text
     full_ids = _str_to_ids(full_text)
 
     n = len(full_ids)
     loss_mask = [False] * n
-    browse_start = len(header)
-    browse_end = browse_start + len(browse_text)
-    bgkit_start = browse_end + len(resp)
+    bgkit_start = len(header) + len(resp)
     bgkit_end = bgkit_start + len(bgkit_text)
-    for i in range(browse_start, browse_end):
-        loss_mask[i] = True
     for i in range(bgkit_start, bgkit_end):
         loss_mask[i] = True
 
     # Model outputs all wrong at the tool-call positions.
     argmax_ids = list(full_ids[1:])
-    # Shifted positions for browse_text are (browse_start-1 .. browse_end-1)
-    for i in range(browse_start - 1, browse_end - 1):
-        argmax_ids[i] = ord("z")
     for i in range(bgkit_start - 1, bgkit_end - 1):
         argmax_ids[i] = ord("z")
 
@@ -322,10 +297,6 @@ def test_tool_call_id_accuracy_wrong_ids():
     )
     trace = _KBDecodeTrace(
         answer_span=None,
-        browse_turns=[
-            TrajectoryTurn(kind="browse", args={"id": "root"}, response="r"),
-        ],
-        browse_call_spans=[(browse_start, browse_end)],
         bgkit_turns=[
             TrajectoryTurn(
                 kind="bgkit", args={"ids": ["A/b"], "query": "q"}, response="",
@@ -337,10 +308,8 @@ def test_tool_call_id_accuracy_wrong_ids():
     sample = _build_sample(trajectory=[])
 
     result = tool_call_id_accuracy(trainer, sample)
-    assert result["browse"] == 0.0
     assert result["bgkit"] == 0.0
     assert result["overall"] == 0.0
-    assert result["n_browse"] == 1
     assert result["n_bgkit"] == 1
 
 
@@ -357,17 +326,14 @@ def test_tool_call_id_accuracy_no_calls():
     )
     trace = _KBDecodeTrace(
         answer_span=None,
-        browse_turns=[], browse_call_spans=[],
         bgkit_turns=[], bgkit_call_spans=[],
     )
     trainer = _ToyTrainer(tokenizer=tokenizer, output=output, trace=trace)
     sample = _build_sample(trajectory=[])
 
     result = tool_call_id_accuracy(trainer, sample)
-    assert result["browse"] == 0.0
     assert result["bgkit"] == 0.0
     assert result["overall"] == 0.0
-    assert result["n_browse"] == 0
     assert result["n_bgkit"] == 0
 
 
@@ -395,7 +361,6 @@ def test_answer_token_f1_perfect_match():
     )
     trace = _KBDecodeTrace(
         answer_span=(1, 1 + len(gold)),
-        browse_turns=[], browse_call_spans=[],
         bgkit_turns=[], bgkit_call_spans=[],
     )
     trainer = _ToyTrainer(tokenizer=tokenizer, output=output, trace=trace)
@@ -427,7 +392,6 @@ def test_answer_token_f1_partial_overlap():
     )
     trace = _KBDecodeTrace(
         answer_span=(1, 1 + len(pred_text)),
-        browse_turns=[], browse_call_spans=[],
         bgkit_turns=[], bgkit_call_spans=[],
     )
     trainer = _ToyTrainer(tokenizer=tokenizer, output=output, trace=trace)
@@ -449,7 +413,6 @@ def test_answer_token_f1_empty_prediction():
     # Empty span → empty pred → 0.0
     trace = _KBDecodeTrace(
         answer_span=None,
-        browse_turns=[], browse_call_spans=[],
         bgkit_turns=[], bgkit_call_spans=[],
     )
     trainer = _ToyTrainer(tokenizer=tokenizer, output=output, trace=trace)
@@ -468,7 +431,6 @@ def test_answer_token_f1_zero_length_span():
     )
     trace = _KBDecodeTrace(
         answer_span=(2, 2),  # zero-length
-        browse_turns=[], browse_call_spans=[],
         bgkit_turns=[], bgkit_call_spans=[],
     )
     trainer = _ToyTrainer(tokenizer=tokenizer, output=output, trace=trace)
@@ -484,21 +446,21 @@ def test_answer_token_f1_zero_length_span():
 def test_evaluate_sample_bundles_all_metrics():
     """One forward call produces trajectory accuracy + tool-call + F1."""
     tokenizer = _FakeTokenizer()
-    # Layout: H | root (browse tool call) | RRR (tool resp) | forty two (answer)
+    # Layout: H | A/b q (bgkit tool call) | RRR (tool resp) | forty two (answer)
     header = "H"
-    browse_text = "root"
+    bgkit_text = "A/b q"
     resp = "RRR"
     gold = "forty two"
-    full_text = header + browse_text + resp + gold
+    full_text = header + bgkit_text + resp + gold
     full_ids = _str_to_ids(full_text)
     n = len(full_ids)
 
     loss_mask = [False] * n
-    browse_start = len(header)
-    browse_end = browse_start + len(browse_text)
-    answer_start = browse_end + len(resp)
+    bgkit_start = len(header)
+    bgkit_end = bgkit_start + len(bgkit_text)
+    answer_start = bgkit_end + len(resp)
     answer_end = answer_start + len(gold)
-    for i in range(browse_start, browse_end):
+    for i in range(bgkit_start, bgkit_end):
         loss_mask[i] = True
     for i in range(answer_start, answer_end):
         loss_mask[i] = True
@@ -514,25 +476,24 @@ def test_evaluate_sample_bundles_all_metrics():
     )
     trace = _KBDecodeTrace(
         answer_span=(answer_start, answer_end),
-        browse_turns=[
-            TrajectoryTurn(kind="browse", args={"id": "root"}, response="r"),
+        bgkit_turns=[
+            TrajectoryTurn(
+                kind="bgkit", args={"ids": ["A/b"], "query": "q"}, response="",
+            ),
         ],
-        browse_call_spans=[(browse_start, browse_end)],
-        bgkit_turns=[], bgkit_call_spans=[],
+        bgkit_call_spans=[(bgkit_start, bgkit_end)],
     )
     trainer = _ToyTrainer(tokenizer=tokenizer, output=output, trace=trace)
     sample = _build_sample(trajectory=[], gold_answer=gold)
 
     result = evaluate_sample(trainer, sample)
     assert result["trajectory_step_accuracy"] == pytest.approx(1.0)
-    assert result["trajectory_total_tokens"] == len(browse_text) + len(gold)
-    assert result["trajectory_correct_tokens"] == len(browse_text) + len(gold)
+    assert result["trajectory_total_tokens"] == len(bgkit_text) + len(gold)
+    assert result["trajectory_correct_tokens"] == len(bgkit_text) + len(gold)
     tc = result["tool_call_id_accuracy"]
-    assert tc["browse"] == 1.0
-    assert tc["bgkit"] == 0.0  # no bgkit calls
+    assert tc["bgkit"] == 1.0
     assert tc["overall"] == 1.0
-    assert tc["n_browse"] == 1
-    assert tc["n_bgkit"] == 0
+    assert tc["n_bgkit"] == 1
     assert result["answer_token_f1"] == pytest.approx(1.0)
     assert result["pred_answer"] == gold
     assert result["gold_answer"] == gold
@@ -551,7 +512,6 @@ def test_evaluate_sample_empty_when_no_loss_tokens():
     )
     trace = _KBDecodeTrace(
         answer_span=None,
-        browse_turns=[], browse_call_spans=[],
         bgkit_turns=[], bgkit_call_spans=[],
     )
     trainer = _ToyTrainer(tokenizer=tokenizer, output=output, trace=trace)

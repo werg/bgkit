@@ -770,3 +770,81 @@ def test_kb_token_budget_set_epoch_reshuffles():
     assert sorted(i for b in b0 for i in b) == list(range(50))
     assert sorted(i for b in b1 for i in b) == list(range(50))
     assert b0 != b1  # reshuffled across epochs
+
+
+def test_repo_grouped_sampler_drop_keys():
+    """drop_keys removes whole groups: their samples never enter a batch, and
+    dropped_keys / dropped_samples report what was removed."""
+    from bgkit.data.samplers import RepoGroupedBatchSampler
+
+    # keys: r1 x3, r2 x2, BIG x4 (the monster), r3 x1
+    group_keys = ["r1", "BIG", "r1", "r2", "BIG", "r1", "BIG", "r2", "BIG", "r3"]
+    s = RepoGroupedBatchSampler(group_keys, shuffle=False, drop_keys={"BIG"})
+
+    batches = list(s)
+    yielded = sorted(i for b in batches for i in b)
+    # BIG's 4 indices (1,4,6,8) are excluded; everything else kept.
+    assert yielded == [0, 2, 3, 5, 7, 9]
+    assert len(s) == 3  # r1, r2, r3 (BIG dropped)
+    assert s.dropped_keys == {"BIG"}
+    assert s.dropped_samples == 4
+    # No batch contains a BIG index.
+    big_idx = {1, 4, 6, 8}
+    assert all(not (set(b) & big_idx) for b in batches)
+
+
+def test_repo_grouped_sampler_no_drop_when_empty():
+    from bgkit.data.samplers import RepoGroupedBatchSampler
+
+    s = RepoGroupedBatchSampler(["a", "a", "b"], shuffle=False)
+    assert len(s) == 2
+    assert s.dropped_samples == 0
+    assert sorted(i for b in s for i in b) == [0, 1, 2]
+
+
+def test_repo_grouped_sampler_inner_loop_subsets():
+    """inner_loop=True emits each repo's indices as K consecutive subset-batches
+    (S, capped at max_inner_steps); same-repo subsets are back-to-back so the
+    trainer's tree-cache hits across them."""
+    from bgkit.data.samplers import RepoGroupedBatchSampler
+
+    # r1 x5, r2 x3
+    group_keys = ["r1"] * 5 + ["r2"] * 3
+    s = RepoGroupedBatchSampler(
+        group_keys, shuffle=False, inner_loop=True,
+        inner_subset_size=2, max_inner_steps=12,
+    )
+    batches = list(s)
+    # r1: 5 -> subsets [2,2,1]; r2: 3 -> [2,1]  => 5 batches.
+    assert [len(b) for b in batches] == [2, 2, 1, 2, 1]
+    assert len(s) == 5
+    # Consecutive subsets of one repo are contiguous (r1's indices 0..4 first,
+    # then r2's 5..7).
+    flat = [i for b in batches for i in b]
+    assert flat[:5] == [0, 1, 2, 3, 4]
+    assert sorted(flat[5:]) == [5, 6, 7]
+    # Each subset <= S.
+    assert all(len(b) <= 2 for b in batches)
+
+
+def test_repo_grouped_sampler_inner_loop_caps_K():
+    """max_inner_steps caps K: a repo with more than K*S files drops the
+    remainder this visit."""
+    from bgkit.data.samplers import RepoGroupedBatchSampler
+
+    group_keys = ["r"] * 100  # 100 files
+    s = RepoGroupedBatchSampler(
+        group_keys, shuffle=False, inner_loop=True,
+        inner_subset_size=16, max_inner_steps=12,
+    )
+    batches = list(s)
+    # ceil(100/16)=7 subsets < cap 12 -> all 7 kept (no drop here).
+    assert len(batches) == 7
+    # Now a repo needing > cap subsets.
+    s2 = RepoGroupedBatchSampler(
+        ["r"] * 100, shuffle=False, inner_loop=True,
+        inner_subset_size=4, max_inner_steps=12,
+    )
+    b2 = list(s2)
+    assert len(b2) == 12  # ceil(100/4)=25 -> capped at 12
+    assert sum(len(b) for b in b2) == 48  # 12*4 files used; remainder dropped

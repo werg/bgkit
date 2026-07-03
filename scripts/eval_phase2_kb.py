@@ -11,9 +11,9 @@ Metrics (see :mod:`bgkit.eval.kb_trajectory_eval` for full semantics):
 
 - ``trajectory_step_accuracy``: micro-averaged greedy-argmax next-token
   accuracy over every loss-bearing position in every trajectory.
-- ``tool_call_id_accuracy``: per-call-type (browse / bgkit) plus
-  overall micro-averaged substring match of the greedy-decoded tool
-  call against the teacher ``id`` / ``ids`` argument.
+- ``tool_call_id_accuracy``: per bgkit call plus overall
+  micro-averaged substring match of the greedy-decoded tool call
+  against the teacher ``ids`` argument.
 - ``answer_token_f1``: token-level F1 between the greedy-decoded
   answer slice and the gold answer, macro-averaged across samples.
 - ``eval/loss``, ``eval/n_samples``, ``eval/tokens_per_sample``: kept
@@ -59,28 +59,23 @@ def _aggregate(
     of correct / sum of total) so longer trajectories get proportional
     weight. ``answer_token_f1`` is macro-averaged across samples (every
     sample gets one vote). Tool-call ID accuracy is micro-averaged by
-    turn count (per browse / per bgkit), not by sample — a sample with
-    5 browse calls counts 5x in the browse average, which is the
-    correct semantics for ``did the model emit the right tag at every
-    call site``.
+    turn count (per bgkit call), not by sample — a sample with 5 bgkit
+    calls counts 5x in the average, which is the correct semantics for
+    ``did the model emit the right tag at every call site``.
     """
     if not per_sample:
         return {
             "kb/trajectory_step_accuracy": 0.0,
-            "kb/tool_call_id_accuracy/browse": 0.0,
             "kb/tool_call_id_accuracy/bgkit": 0.0,
             "kb/tool_call_id_accuracy/overall": 0.0,
             "kb/answer_token_f1": 0.0,
             "kb/n_samples": 0.0,
             "kb/n_samples_with_answer": 0.0,
-            "kb/n_browse_calls": 0.0,
             "kb/n_bgkit_calls": 0.0,
         }
 
     total_tokens = 0
     correct_tokens = 0
-    browse_sum = 0.0
-    browse_n = 0
     bgkit_sum = 0.0
     bgkit_n = 0
     f1_sum = 0.0
@@ -90,11 +85,7 @@ def _aggregate(
         correct_tokens += int(row.get("trajectory_correct_tokens", 0))
         total_tokens += int(row.get("trajectory_total_tokens", 0))
         tc = row.get("tool_call_id_accuracy", {}) or {}
-        n_br = int(tc.get("n_browse", 0))
         n_bg = int(tc.get("n_bgkit", 0))
-        if n_br:
-            browse_sum += float(tc.get("browse", 0.0)) * n_br
-            browse_n += n_br
         if n_bg:
             bgkit_sum += float(tc.get("bgkit", 0.0)) * n_bg
             bgkit_n += n_bg
@@ -106,23 +97,16 @@ def _aggregate(
             f1_n += 1
 
     step_acc = correct_tokens / total_tokens if total_tokens else 0.0
-    browse_acc = browse_sum / browse_n if browse_n else 0.0
     bgkit_acc = bgkit_sum / bgkit_n if bgkit_n else 0.0
-    overall_n = browse_n + bgkit_n
-    overall_acc = (
-        (browse_sum + bgkit_sum) / overall_n if overall_n else 0.0
-    )
     f1 = f1_sum / f1_n if f1_n else 0.0
 
     return {
         "kb/trajectory_step_accuracy": step_acc,
-        "kb/tool_call_id_accuracy/browse": browse_acc,
         "kb/tool_call_id_accuracy/bgkit": bgkit_acc,
-        "kb/tool_call_id_accuracy/overall": overall_acc,
+        "kb/tool_call_id_accuracy/overall": bgkit_acc,
         "kb/answer_token_f1": f1,
         "kb/n_samples": float(len(per_sample)),
         "kb/n_samples_with_answer": float(f1_n),
-        "kb/n_browse_calls": float(browse_n),
         "kb/n_bgkit_calls": float(bgkit_n),
     }
 

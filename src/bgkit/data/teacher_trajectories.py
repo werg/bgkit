@@ -1,59 +1,63 @@
-"""Offline generation of teacher browse+bgkit trajectories.
+"""Offline generation of teacher QA trajectories as chained ``bgkit`` drills.
 
 Given a QA sample with provenance
 ``(question, gold_answer, gold_article_ids)`` and a pre-built
 :class:`bgkit.data.browse_tree.BrowseTree`, this module produces the
-ordered list of ``browse``, ``bgkit``, and ``answer`` turns a well-behaved
-decoder would emit to answer the question.
+ordered list of ``bgkit`` + ``answer`` turns a well-behaved decoder would
+emit to answer the question.
 
-Two trajectory shapes:
+Drill-down, not browse
+----------------------
+This module is a **thin QA adapter over the shared drill-down builder**
+:func:`bgkit.data.drilldown.build_drilldown_trajectory`. It maps a QA
+sample onto that builder's ``(tree, head_node_id, targets, task_query,
+gold_answer)`` interface and returns the builder's output verbatim. There
+are **no ``browse`` turns** — navigation is expressed entirely as chained
+``bgkit`` drills whose child IDs travel through the spliced survivor
+embeddings (ID-pinning), never a plaintext side-channel. This replaces the
+former browse-emitting primary/exploration builders and unifies QA
+trajectory generation with the ``git_commit_repro`` drill-down path.
 
-- **Hierarchical** (deep browse trees, e.g. KILT via DBpedia categories,
-  PubMedQA via MeSH): walk root → ... → leaf-tag via ``browse`` turns,
-  then ``bgkit`` on the leaf, then drill-down ``bgkit`` calls on the gold
-  article(s), then the final answer.
-- **Flat** (datasets without an external hierarchy: NewsQA, MS MARCO,
-  SearchQA, git history, memory, anything that becomes
-  ``root → bucket-bucket-bucket → article``): skip browse entirely
-  and emit a single ``bgkit([gold_article_id], query)`` call directly
-  on the gold article, then the answer. Browsing through alphabet
-  buckets like ``~A → ~AB → ~ABO`` teaches the decoder nothing useful;
-  flat trajectories cut straight to the dense retrieval call.
+The mapping:
 
-Detection is automatic via :meth:`BrowseTree.is_flat` — provenance scripts
-don't need to know which mode their dataset uses.
+- **head node** = the deepest common ancestor (LCA) of the gold-article
+  leaf tags (via :func:`_common_ancestor_path`), giving a focused drill
+  and a natural pool of off-path sibling distractors. Falls back to
+  ``"root"`` when the golds share no ancestor.
+- **targets** = one :class:`~bgkit.data.drilldown.DrillTarget` per gold
+  article, ``leaf_node_id`` = the article's leaf tag (via
+  :meth:`BrowseTree.leaf_tag_for_article`), ``retrieve_ids`` = the gold
+  article id retrieved by the final drill at that leaf. Multiple gold
+  articles (HotpotQA / FEVER multi-evidence, NarrativeQA fallback) become
+  multiple targets → multi-path depth-first drill (already supported by
+  the shared builder).
+- **task_query** = the question (carried on the ``is_head`` drill so the
+  trainer encodes the head node live with the query).
+- **gold_answer** = the answer emitted by the closing ``answer`` turn.
+- **n_distractors** = :attr:`TrajectoryConfig.exploration_siblings`, gated
+  by :attr:`TrajectoryConfig.exploration_fraction` — the drill-down
+  builder auto-picks 0..n wrong siblings as ``loss=False`` context drills.
+  This subsumes the old ``build_exploration_trajectory`` entirely.
 
-Two trajectory variants per sample (orthogonal to shape):
+Flat trees
+----------
+Datasets without a real hierarchy (NewsQA, MS MARCO, SearchQA, git
+history, memory) tag every article under synthetic auto-bucketed nodes
+(``~A → ~AB``). :meth:`BrowseTree.is_flat` detects this. A flat tree has
+no hierarchy to drill, so this adapter short-circuits to a **degenerate
+drill-down**: a single leaf drill that retrieves the gold article(s)
+directly (``is_head`` with the query) followed by the answer — no
+navigation.
 
-- **Primary** (always emitted): root → ... → common ancestor → per-leaf
-  bgkit call(s) → optional per-article drill-down(s) → final answer turn
-  with the gold_answer text. All turns carry ``loss=True`` so the decoder
-  trains on emitting every step *including the answer*.
-- **Exploration** (~20% of samples, configurable): before the primary
-  bgkit call, loads 1+ sibling leaf tags via additional ``bgkit`` calls
-  with ``loss=False``. The decoder is not trained to emit siblings, but
-  the encoder's L1 pass still runs on them — gradient flows through the
-  spliced survivors into the final answer loss. This regularises L1
-  against only ever working when the leaf is perfectly targeted. Works
-  for both flat and hierarchical trajectories.
-
-Multi-article gold
-------------------
-Many knowledge-retrieval tasks (HotpotQA, FEVER with multiple evidence
-articles, NarrativeQA with fallback to the whole book) have more than
-one gold article. The primary trajectory handles this by:
-
-1. Finding the leaf tag for each gold article.
-2. Walking the browse tree to the deepest common ancestor of all gold
-   leaf tags.
-3. Issuing ONE ``bgkit`` call with ``ids=[all leaf tags]`` so L1 fuses
-   across the entire gold set in a single query-conditioned pass.
-4. Optionally drilling down to each specific article with per-article
-   ``bgkit`` calls.
-5. Emitting the answer turn.
-
-When all gold articles share a single leaf tag, this degenerates to the
-single-article path.
+Deferred: QA drill-down RUNTIME resolution
+------------------------------------------
+This module produces drill-down *trajectories* offline. The matching
+RUNTIME resolution — the trainer encoding head / interior node drills from
+a cached L1-tree for large QA browse trees (KILT Wikipedia etc.), the way
+the ``git_commit_repro`` path already does — is **DEFERRED to the big-tree
+regime and is future work**. Do not attempt to wire the cached-tree
+runtime for QA here; this migration only unifies the generation layer onto
+the shared builder.
 """
 
 from __future__ import annotations
@@ -63,18 +67,20 @@ from dataclasses import dataclass
 
 from bgkit.data.bgkit_tool_template import TrajectoryTurn
 from bgkit.data.browse_tree import BrowseTree
+from bgkit.data.drilldown import DrillTarget, build_drilldown_trajectory
 
 
 @dataclass
 class TrajectoryConfig:
-    # Fraction of samples that get an exploration variant instead of a
-    # pure primary-only trajectory.
+    # Fraction of samples that get distractor (wrong-sibling) drills mixed
+    # into their drill-down. Gates whether ``exploration_siblings`` is
+    # passed as ``n_distractors`` to the shared builder for a given sample.
     exploration_fraction: float = 0.20
-    # Number of sibling leaves loaded during exploration turns. Defaults
-    # to 1 (one sibling per exploration trajectory); set to 2 for a
-    # stronger regulariser. Typical range is 1-2.
+    # Max number of wrong-sibling distractor drills to hand the drill-down
+    # builder as ``n_distractors`` (it picks a random 0..n per sample).
+    # Defaults to 1; set to 2 for a stronger regulariser. Typical range 1-2.
     exploration_siblings: int = 1
-    # Seed used for deterministic sibling picking per sample index.
+    # Seed used for deterministic per-sample distractor / gating draws.
     seed: int = 17
 
 
@@ -126,168 +132,96 @@ def _common_ancestor_path(tree: BrowseTree, node_ids: list[str]) -> list[str]:
     return paths[0][:lca_len]
 
 
-def build_primary_trajectory(
+def build_qa_drilldown_trajectory(
     tree: BrowseTree,
     question: str,
     gold_article_ids: list[str] | str,
     gold_answer: str,
+    cfg: TrajectoryConfig | None = None,
+    sample_idx: int = 0,
 ) -> list[TrajectoryTurn]:
-    """Produce the clean primary trajectory for a single QA sample.
+    """Map one QA sample onto :func:`build_drilldown_trajectory`.
+
+    Produces a ``bgkit``-only drill-down trajectory (no ``browse`` turns)
+    ending in a loss-bearing ``answer`` turn carrying ``gold_answer``. See
+    the module docstring for the full ``(head, targets, query)`` mapping,
+    the flat-tree degenerate case, and the DEFERRED runtime-resolution note.
 
     Args:
         tree: browse tree for this sample's dataset.
-        question: the user question string.
-        gold_article_ids: either a single article ID or a list of them.
-            A string is wrapped in a one-element list. The decoder is
-            trained to browse to the deepest common ancestor of all
-            supplied articles, load them in a single bgkit call, drill
-            down to each, and emit the answer.
-        gold_answer: the gold answer text that the decoder is trained to
-            emit at the end of the trajectory. REQUIRED — this is the
-            whole point of the KB-scale training signal.
+        question: the user question (carried on the head drill's query).
+        gold_article_ids: a single article ID or a list of them. Each
+            distinct gold article becomes a drill target.
+        gold_answer: the gold answer text the closing ``answer`` turn
+            trains on. REQUIRED — the whole KB-scale training signal.
+        cfg: trajectory config controlling distractor injection. Defaults
+            to :class:`TrajectoryConfig` when ``None``.
+        sample_idx: per-sample index; seeds the deterministic distractor /
+            gating draws so trajectories are reproducible across processes.
 
     Returns:
-        A list of TrajectoryTurn objects ending with a loss-bearing
-        ``answer`` turn whose ``response`` field is ``gold_answer``.
+        A list of :class:`TrajectoryTurn` (``bgkit`` drills + a final
+        ``answer`` turn). Never contains a ``browse`` turn.
     """
     if isinstance(gold_article_ids, str):
         gold_article_ids = [gold_article_ids]
     if not gold_article_ids:
         raise ValueError("gold_article_ids must be non-empty")
+    cfg = cfg or TrajectoryConfig()
 
-    # Resolve every gold article to (target, leaf_tag).
-    resolved = [_resolve_article_target(tree, g) for g in gold_article_ids]
-    targets = [r[0] for r in resolved]
-    leaf_tags = [r[1] for r in resolved]
-    # Unique leaf tags in first-seen order (important for deterministic trajectories)
-    unique_leaf_tags: list[str] = []
-    seen: set[str] = set()
-    for lt in leaf_tags:
-        if lt not in seen:
-            seen.add(lt)
-            unique_leaf_tags.append(lt)
-
-    # On flat trees, skip the entire browse navigation phase. Browsing
-    # through synthetic alphabet buckets like ``~A → ~AB`` teaches the
-    # decoder nothing useful — there's no semantic content at the
-    # intermediate levels. Instead the decoder learns to call bgkit
-    # directly on the gold article. Hierarchical trees still walk the
-    # LCA path because their intermediate levels carry real category
-    # names (Wikipedia categories, MeSH terms, etc.).
-    flat_tree = tree.is_flat()
-    turns: list[TrajectoryTurn] = []
-    if not flat_tree:
-        # Walk from root to the deepest common ancestor of every leaf tag.
-        lca_path = _common_ancestor_path(tree, unique_leaf_tags)
-        for node_id in lca_path:
-            turns.append(TrajectoryTurn(
-                kind="browse",
-                args={"id": node_id},
-                response=tree.render_browse_response(node_id),
-                loss=True,
-            ))
-    # One bgkit call fusing all leaf tags. Single-article samples get a
-    # single-element list here, which is identical to the pre-multi-hop
-    # behaviour. The dense L1 survivors are spliced into the decoder
-    # context at the sentinel in the tool response; there is no text
-    # side-channel — drill-down relies entirely on ID pinning carrying
-    # article IDs through the L1 pass (see risk 5.8 in
-    # docs/03_ideas_and_risks.md).
-    turns.append(TrajectoryTurn(
-        kind="bgkit",
-        args={"ids": list(unique_leaf_tags), "query": question},
-        response="",
-        loss=True,
-    ))
-    # Drill-down: for each unique gold target that is distinct from its
-    # leaf tag, issue a per-article bgkit call. Single-article samples
-    # collapse to exactly one drill-down (or zero, if gold article == leaf
-    # tag node).
+    # Resolve every gold article to (target_id, leaf_tag), de-duplicating
+    # by target id in first-seen order for deterministic trajectories.
     unique_targets: list[str] = []
-    seen_targets: set[str] = set()
-    for t in targets:
-        if t not in seen_targets:
-            seen_targets.add(t)
-            unique_targets.append(t)
-    for target, leaf_tag in zip(targets, leaf_tags, strict=True):
-        if target == leaf_tag or target not in unique_targets:
-            continue
-        unique_targets.remove(target)
-        turns.append(TrajectoryTurn(
-            kind="bgkit",
-            args={"ids": [target], "query": question},
-            response="",
-            loss=True,
-        ))
-    # Final answer turn — this is the loss-bearing target the decoder
-    # actually trains on. Without it the decoder only learns tool-call
-    # emission and never learns to produce answers.
-    turns.append(TrajectoryTurn(
-        kind="answer",
-        args={},
-        response=gold_answer,
-        loss=True,
-    ))
-    return turns
+    target_leaf: dict[str, str] = {}
+    for g in gold_article_ids:
+        target_id, leaf_tag = _resolve_article_target(tree, g)
+        if target_id not in target_leaf:
+            unique_targets.append(target_id)
+            target_leaf[target_id] = leaf_tag
 
-
-def build_exploration_trajectory(
-    tree: BrowseTree,
-    question: str,
-    gold_article_ids: list[str] | str,
-    gold_answer: str,
-    cfg: TrajectoryConfig,
-    sample_idx: int = 0,
-) -> list[TrajectoryTurn]:
-    """Insert sibling-leaf bgkit turns before the primary bgkit.
-
-    Siblings are sampled deterministically from the primary leaf tag's
-    sibling set (same parent) using a per-sample RNG seeded from
-    ``(cfg.seed, sample_idx)``. The sibling tool calls get ``loss=False``
-    so the decoder is not trained to emit them.
-    """
-    primary = build_primary_trajectory(
-        tree, question, gold_article_ids, gold_answer,
+    # Distractor gating: preserve the old exploration_fraction semantics —
+    # only ~exploration_fraction of samples receive distractor drills, and
+    # then at most exploration_siblings of them (the builder draws 0..n).
+    explore_rng = random.Random(f"{cfg.seed}:variant:{sample_idx}")
+    n_distractors = (
+        cfg.exploration_siblings
+        if explore_rng.random() < cfg.exploration_fraction
+        else 0
     )
-    primary_bgkit_idx = next(
-        (i for i, t in enumerate(primary) if t.kind == "bgkit"),
-        None,
-    )
-    if primary_bgkit_idx is None:
-        return primary
-    # The primary bgkit call may cover multiple leaves (multi-article gold).
-    # Pick siblings of the FIRST leaf in the list — they're guaranteed to
-    # be wrong (the correct ones are already in the primary call).
-    primary_leaves = list(primary[primary_bgkit_idx].args["ids"])
-    if not primary_leaves:
-        return primary
-    first_leaf = primary_leaves[0]
-    parent_id = tree.get(first_leaf).parent or "root"
-    primary_leaf_set = set(primary_leaves)
-    siblings = [
-        c for c in tree.get(parent_id).children
-        if c not in primary_leaf_set and tree.get(c).is_leaf_tag
-    ]
-    if not siblings:
-        return primary
-
+    # Deterministic builder rng (drives distractor pick + 0..n draw).
     rng = random.Random(f"{cfg.seed}:{sample_idx}")
-    rng.shuffle(siblings)
-    chosen = siblings[: max(1, cfg.exploration_siblings)]
 
-    exploration_turns = [
-        TrajectoryTurn(
-            kind="bgkit",
-            args={"ids": [sib], "query": question},
-            response="",
-            loss=False,
+    if tree.is_flat():
+        # No hierarchy to drill: collapse to a single degenerate leaf drill
+        # that retrieves every gold article directly, anchored at the first
+        # gold leaf tag. No navigation — just retrieve + answer.
+        head = target_leaf[unique_targets[0]]
+        targets = [DrillTarget(
+            leaf_node_id=head,
+            retrieve_ids=tuple(unique_targets),
+        )]
+        return build_drilldown_trajectory(
+            tree, head, targets, question, gold_answer,
+            n_distractors=n_distractors, rng=rng,
         )
-        for sib in chosen
+
+    # Hierarchical: head = deepest common ancestor of the gold leaf tags;
+    # one drill target per gold article at its own leaf.
+    unique_leaf_tags: list[str] = []
+    seen_leaves: set[str] = set()
+    for t in unique_targets:
+        lt = target_leaf[t]
+        if lt not in seen_leaves:
+            seen_leaves.add(lt)
+            unique_leaf_tags.append(lt)
+    head = _common_ancestor_path(tree, unique_leaf_tags)[-1]
+    targets = [
+        DrillTarget(leaf_node_id=target_leaf[t], retrieve_ids=(t,))
+        for t in unique_targets
     ]
-    return (
-        primary[:primary_bgkit_idx]
-        + exploration_turns
-        + primary[primary_bgkit_idx:]
+    return build_drilldown_trajectory(
+        tree, head, targets, question, gold_answer,
+        n_distractors=n_distractors, rng=rng,
     )
 
 
@@ -299,12 +233,12 @@ def build_trajectory(
     cfg: TrajectoryConfig,
     sample_idx: int,
 ) -> list[TrajectoryTurn]:
-    """Return either primary or exploration trajectory based on sample idx."""
-    rng = random.Random(f"{cfg.seed}:variant:{sample_idx}")
-    if rng.random() < cfg.exploration_fraction:
-        return build_exploration_trajectory(
-            tree, question, gold_article_ids, gold_answer, cfg, sample_idx,
-        )
-    return build_primary_trajectory(
-        tree, question, gold_article_ids, gold_answer,
+    """Back-compatible entry point — delegates to the QA drill-down adapter.
+
+    Kept for the offline generation script and Phase-2 KB tests that import
+    ``build_trajectory``. The signature is unchanged from the pre-migration
+    browse builder; the output is now a ``bgkit``-only drill-down trajectory.
+    """
+    return build_qa_drilldown_trajectory(
+        tree, question, gold_article_ids, gold_answer, cfg, sample_idx,
     )

@@ -1,4 +1,4 @@
-"""Tests for browse/bgkit tool schemas and multi-sentinel chat rendering."""
+"""Tests for the bgkit tool schema and multi-sentinel chat rendering."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ torch = pytest.importorskip("torch")
 from bgkit.data.bgkit_tool_template import (
     BGKIT_SENTINEL,
     BGKIT_TOOL,
-    BROWSE_TOOL,
     TrajectoryTurn,
     make_system_prompt,
     tokenize_trajectory,
@@ -29,31 +28,31 @@ def tokenizer():
 
 def test_system_prompt_topic_list():
     prompt = make_system_prompt("topic_list", topic_list=["Physics", "Biology"])
-    assert "browse(id)" in prompt
     assert "bgkit(ids, query)" in prompt
+    assert "browse(" not in prompt
     assert "Physics" in prompt and "Biology" in prompt
 
 
 def test_system_prompt_pre_scoped():
     prompt = make_system_prompt("pre_scoped", scope_description="git:foo/bar")
     assert "git:foo/bar" in prompt
-    assert "browse(id=\"root\")" in prompt
+    assert "browse(" not in prompt
+    assert "bgkit(ids" in prompt
 
 
 def test_tool_schemas_present():
-    assert BROWSE_TOOL["function"]["name"] == "browse"
     assert BGKIT_TOOL["function"]["name"] == "bgkit"
     assert "ids" in BGKIT_TOOL["function"]["parameters"]["properties"]
     assert "query" in BGKIT_TOOL["function"]["parameters"]["properties"]
 
 
-def test_qwen_apply_chat_template_renders_both_tools(tokenizer):
-    """Verify Qwen's native apply_chat_template accepts both BROWSE_TOOL
-    and BGKIT_TOOL and emits their schemas in the rendered system context.
+def test_qwen_apply_chat_template_renders_bgkit_tool(tokenizer):
+    """Verify Qwen's native apply_chat_template accepts BGKIT_TOOL and emits
+    its schema in the rendered system context.
 
-    If Qwen's template drops or garbles either tool, training data rendered
-    via ``tokenize_trajectory`` wouldn't include the tool schemas the
-    decoder needs to learn to use them — silent training bug. This test
+    If Qwen's template drops or garbles the tool, training data rendered
+    via ``tokenize_trajectory`` wouldn't include the tool schema the
+    decoder needs to learn to use it — silent training bug. This test
     catches that before it happens.
     """
     messages = [
@@ -62,12 +61,11 @@ def test_qwen_apply_chat_template_renders_both_tools(tokenizer):
     ]
     rendered = tokenizer.apply_chat_template(
         messages,
-        tools=[BROWSE_TOOL, BGKIT_TOOL],
+        tools=[BGKIT_TOOL],
         tokenize=False,
         add_generation_prompt=False,
     )
-    # Both tool names and key parameters must appear in the rendered string.
-    assert "browse" in rendered
+    # Tool name and key parameters must appear in the rendered string.
     assert "bgkit" in rendered
     assert '"ids"' in rendered or "ids" in rendered
     assert '"query"' in rendered or "query" in rendered
@@ -76,7 +74,7 @@ def test_qwen_apply_chat_template_renders_both_tools(tokenizer):
 
 
 def test_qwen_apply_chat_template_accepts_tool_call_roundtrip(tokenizer):
-    """Verify that a tool-call-formatted assistant message with both tools
+    """Verify that a tool-call-formatted assistant message with BGKIT_TOOL
     in ``tools=`` survives rendering AND tokenization without corruption.
 
     This exercises the full path the trainer takes — if Qwen's chat
@@ -87,24 +85,6 @@ def test_qwen_apply_chat_template_accepts_tool_call_roundtrip(tokenizer):
     messages = [
         {"role": "system", "content": "You are a helper."},
         {"role": "user", "content": "test"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "browse",
-                        "arguments": {"id": "Physics"},
-                    },
-                },
-            ],
-        },
-        {
-            "role": "tool",
-            "name": "browse",
-            "content": "Physics/sub_1\nPhysics/sub_2",
-        },
         {
             "role": "assistant",
             "content": "",
@@ -130,13 +110,10 @@ def test_qwen_apply_chat_template_accepts_tool_call_roundtrip(tokenizer):
     ]
     rendered = tokenizer.apply_chat_template(
         messages,
-        tools=[BROWSE_TOOL, BGKIT_TOOL],
+        tools=[BGKIT_TOOL],
         tokenize=False,
         add_generation_prompt=False,
     )
-    # Browse tool name and arg
-    assert "browse" in rendered
-    assert "Physics" in rendered
     # Bgkit tool call appears with its id list
     assert "bgkit" in rendered
     assert "Physics/sub_1" in rendered
@@ -152,10 +129,6 @@ def test_qwen_apply_chat_template_accepts_tool_call_roundtrip(tokenizer):
 
 def test_tokenize_trajectory_loss_mask_and_sentinel(tokenizer):
     trajectory = [
-        TrajectoryTurn(
-            kind="browse", args={"id": "Physics"},
-            response="child1\nchild2", loss=True,
-        ),
         TrajectoryTurn(
             kind="bgkit", args={"ids": ["Physics/sub_1"], "query": "why?"},
             loss=True,

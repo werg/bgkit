@@ -8,20 +8,26 @@ the whole subtree. Those summaries are built BOTTOM-UP via recursive L1:
 
     leaf node      ── L0 survivors of its articles
                       bridged L0-output → L1-input via ``l0.auto_reproduce``
-                      ──► encode_node ──► node rep (L1-output)
+                      ──► encode_tree_node ──► node rep (L1-output)
 
     interior node  ── children's cached node reps (L1-output)
                       bridged L1-output → L1-input via ``l1_auto_reproduce``
-                      ──► encode_node ──► node rep (L1-output)
+                      ──► encode_tree_node ──► node rep (L1-output)
 
 Each node rep is the recursive-L1 survivor set in L1-OUTPUT (pre-norm) space,
 so a parent re-bridges it via ``encoder.l1_auto_reproduce`` and calls
-``encode_node`` again. This mirrors the way leaf L0 survivors are re-bridged
-via ``encoder.l0.auto_reproduce``.
+``encode_tree_node`` again. This mirrors the way leaf L0 survivors are
+re-bridged via ``encoder.l0.auto_reproduce``.
+
+Every node is encoded through the SHARED
+:func:`bgkit.models.recursive_l1.encode_tree_node` primitive — the SAME
+function the live full-backprop and cached-QA tree paths use — so the offline
+cache carries the mandatory child-ID injection (``[child_id | child_survivors]``
+per child, id rows pinned).
 
 LOCKED DESIGN: cached node reps are QUERY-AGNOSTIC — computed with no query
-conditioning. Query-conditioning is re-applied later, only on the live search
-path + final retrieval. ``encode_node`` therefore takes no query here.
+conditioning (``query_emb=None``). Query-conditioning is re-applied later, only
+on the live search path + final retrieval.
 
 Output layout (identical to the L0 cache, see :mod:`bgkit.data.l0_cache`)::
 
@@ -58,6 +64,7 @@ from bgkit.data.l0_cache import (
     update_dataset_index,
     write_l1_tree_cache_manifest,
 )
+from bgkit.models.recursive_l1 import encode_tree_node
 from bgkit.utils.deltanet_patch import (
     patch_fused_rms_norm_gated_for_sm121,
     patch_gated_delta_rule_numerics,
@@ -233,6 +240,7 @@ def _leaf_article_ids(tree: BrowseTree, node_id: str) -> list[str]:
 def _encode_node_reps(
     *,
     encoder: torch.nn.Module,
+    tokenizer,
     tree: BrowseTree,
     dataset: str,
     node_id: str,
@@ -244,13 +252,20 @@ def _encode_node_reps(
 ) -> torch.Tensor | None:
     """Encode one node into its L1-output (pre-norm) survivor set.
 
+    Funnels through the SHARED :func:`encode_tree_node` primitive so the
+    offline cache carries the SAME child-ID injection as the live/cached-QA
+    tree paths — a node's rep interleaves each child's id
+    (``[child_id | child_survivors]``, id rows pinned). ``project=False``: the
+    cache stores L1-output only; query-agnostic (``query_emb=None``).
+
     Returns ``None`` when the node has no usable input (e.g. all its articles
     are missing from the L0 cache, or it is an empty interior node).
     """
     node = tree.get(node_id)
     is_leaf = node.is_article or node.is_leaf_tag
 
-    pieces: list[torch.Tensor] = []
+    children_ids: list[str] = []
+    children_survivors_l1in: list[torch.Tensor] = []
     if is_leaf:
         for aid in _leaf_article_ids(tree, node_id):
             if not l0_cache.has(dataset, aid):
@@ -258,33 +273,33 @@ def _encode_node_reps(
             surv = l0_cache.get(dataset, aid).to(device=device, dtype=dtype)
             if surv.numel() == 0:
                 continue
-            # L0-output (pre-norm) → L1-input space.
-            pieces.append(encoder.l0.auto_reproduce(surv))
+            # L0-output (pre-norm) → L1-input space; id = article id (file name).
+            children_ids.append(aid)
+            children_survivors_l1in.append(encoder.l0.auto_reproduce(surv))
     else:
         for cid in node.children:
             child_rep = reps.get(cid)
             if child_rep is None or child_rep.numel() == 0:
                 continue
             child_rep = child_rep.to(device=device, dtype=dtype)
-            # L1-output (pre-norm) → L1-input space.
-            pieces.append(encoder.l1_auto_reproduce(child_rep))
+            # L1-output (pre-norm) → L1-input space; id = child node id.
+            children_ids.append(cid)
+            children_survivors_l1in.append(encoder.l1_auto_reproduce(child_rep))
 
-    if not pieces:
+    if not children_survivors_l1in:
         return None
 
-    children_reps_l1in = torch.cat(pieces, dim=0)
-    children_cu = torch.tensor(
-        [0, int(children_reps_l1in.shape[0])],
-        dtype=torch.int32,
-        device=device,
-    )
     with torch.no_grad():
-        node_surv, _node_cu = encoder.encode_node(
-            children_reps_l1in=children_reps_l1in,
-            children_cu_seqlens=children_cu,
-            target_ratio=target_ratio,
+        _proj, l1_out = encode_tree_node(
+            encoder,
+            tokenizer,
+            children_ids,
+            children_survivors_l1in,
+            None,  # query-agnostic offline cache
+            target_ratio,
+            project=False,
         )
-    return node_surv.detach()
+    return l1_out.survivor_embeddings.detach()
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +312,7 @@ def precompute_tree(
     tree: BrowseTree,
     dataset: str,
     encoder: torch.nn.Module,
+    tokenizer,
     l0_cache: L0Cache,
     retention: DepthRetention,
     output_dir: Path,
@@ -354,6 +370,7 @@ def precompute_tree(
 
         rep = _encode_node_reps(
             encoder=encoder,
+            tokenizer=tokenizer,
             tree=tree,
             dataset=dataset,
             node_id=node_id,
@@ -446,10 +463,19 @@ def main() -> None:
     encoder.to(device).eval()
     dtype = next(encoder.parameters()).dtype
 
+    # Encoder-side tokenizer for child-ID injection in the shared encode
+    # primitive (same vocab as l0.backbone.get_input_embeddings()).
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.encoder_name, trust_remote_code=True,
+    )
+
     n_encoded, n_skipped = precompute_tree(
         tree=tree,
         dataset=args.dataset,
         encoder=encoder,
+        tokenizer=tokenizer,
         l0_cache=l0_cache,
         retention=retention,
         output_dir=args.output_dir,

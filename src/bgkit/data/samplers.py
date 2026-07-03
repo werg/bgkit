@@ -607,6 +607,24 @@ class RepoGroupedBatchSampler(Sampler[list[int]]):
     internal order are reshuffled from ``seed + epoch``. Call :meth:`set_epoch`
     each epoch. Empty-string keys (samples with no browse turn / no shared
     tree) are kept as their own degenerate group.
+
+    ``drop_keys``: group keys to EXCLUDE entirely — their samples never enter
+    any batch (used by the per-repo size filter to drop over-threshold repos so
+    a monster repo's shared-tree encode never runs). Dropped groups are absent
+    from :meth:`__len__` and never yielded. :attr:`dropped_keys` /
+    :attr:`dropped_samples` expose what was removed for logging.
+
+    **Inner-loop mode** (``inner_loop=True``): the per-repo inner-loop training
+    mode encodes a repo's shared tree ONCE and reuses it across K optimizer
+    steps, each on a file-subset. To make each inner step a real outer
+    optimizer step (so LR/eval/save/global-step all advance), this sampler
+    emits each repo's indices as K CONSECUTIVE subset-batches of size
+    ``inner_subset_size`` (S), K = ceil(len(group)/S) CAPPED at
+    ``max_inner_steps``. The remainder beyond the cap is dropped for that
+    repo-visit (coverage rotates via the per-epoch reshuffle). Consecutive
+    subsets of one repo always appear back-to-back so the trainer's tree-cache
+    (keyed on the repo's window-node id) hits across them. Off (default): one
+    batch per repo (the one-step / warmup path).
     """
 
     def __init__(
@@ -615,16 +633,38 @@ class RepoGroupedBatchSampler(Sampler[list[int]]):
         *,
         shuffle: bool = True,
         seed: int = 42,
+        drop_keys: set[str] | None = None,
+        inner_loop: bool = False,
+        inner_subset_size: int = 16,
+        max_inner_steps: int = 12,
     ):
+        drop = {str(k) for k in (drop_keys or set())}
         self._groups: dict[str, list[int]] = {}
+        self.dropped_keys: set[str] = set()
+        self.dropped_samples: int = 0
         for idx, key in enumerate(group_keys):
-            self._groups.setdefault(str(key), []).append(idx)
+            k = str(key)
+            if k in drop:
+                self.dropped_keys.add(k)
+                self.dropped_samples += 1
+                continue
+            self._groups.setdefault(k, []).append(idx)
         self._shuffle = shuffle
         self._seed = seed
         self._epoch = 0
+        self._inner_loop = bool(inner_loop)
+        self._inner_subset_size = max(1, int(inner_subset_size))
+        self._max_inner_steps = max(1, int(max_inner_steps))
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = epoch
+
+    def _subsets(self, indices: list[int]) -> list[list[int]]:
+        """Partition one repo's indices into ≤ ``max_inner_steps`` subsets of
+        ``inner_subset_size`` (drop the remainder beyond the cap)."""
+        s = self._inner_subset_size
+        subsets = [indices[i:i + s] for i in range(0, len(indices), s)]
+        return subsets[: self._max_inner_steps]
 
     def __iter__(self) -> Iterator[list[int]]:
         rng = random.Random(self._seed + self._epoch)
@@ -635,10 +675,21 @@ class RepoGroupedBatchSampler(Sampler[list[int]]):
             indices = list(self._groups[key])
             if self._shuffle:
                 rng.shuffle(indices)
-            yield indices
+            if self._inner_loop:
+                # K consecutive subset-batches for this repo (tree reused
+                # across them via the trainer's repo-keyed tree cache).
+                yield from self._subsets(indices)
+            else:
+                yield indices
 
     def __len__(self) -> int:
-        return len(self._groups)
+        if not self._inner_loop:
+            return len(self._groups)
+        import math as _m
+        return sum(
+            min(_m.ceil(len(idxs) / self._inner_subset_size), self._max_inner_steps)
+            for idxs in self._groups.values()
+        )
 
 
 class KBTokenBudgetBatchSampler(Sampler[list[int]]):

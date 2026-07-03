@@ -1,10 +1,10 @@
 """Per-dataset browse tree: load, query, render.
 
 A browse tree is a pre-filtered hierarchy of tags → sub-tags → articles that
-the decoder navigates with the ``browse(id)`` tool. Leaves are pre-capped to
-at most ``leaf_cap`` articles at build time (see :mod:`bgkit.data.tagging`);
-intermediate nodes are pre-capped to at most ``fanout_cap`` children per
-browse response.
+the decoder drills through via ``bgkit`` tool calls on the IDs surfaced at each
+level. Leaves are pre-capped to at most ``leaf_cap`` articles at build time
+(see :mod:`bgkit.data.tagging`); intermediate nodes are pre-capped to at most
+``fanout_cap`` children.
 
 The on-disk format is a single parquet per dataset with these columns:
 
@@ -184,41 +184,6 @@ class BrowseTree:
             if n.is_leaf_tag and article_id in n.articles:
                 return n.id
         return None
-
-    # ------------------------------------------------------------------
-    # Text rendering for the browse tool response
-    # ------------------------------------------------------------------
-
-    def render_browse_response(self, node_id: str, fanout_cap: int = 100) -> str:
-        """Render the text response shown to the decoder for a ``browse(id)``.
-
-        The output is capped at ``fanout_cap`` children; the tree build step
-        is expected to have already ensured no node exceeds this cap, but we
-        truncate defensively.
-        """
-        node = self.get(node_id)
-        if node.is_article:
-            return f"{node.id} [article]"
-        if node.is_leaf_tag:
-            count = len(node.articles)
-            head = f"{node.id} [leaf-tag, {count} articles]\n"
-            lines = [f"{aid} [article]" for aid in node.articles[:fanout_cap]]
-            return head + "\n".join(lines)
-        lines: list[str] = []
-        for cid in node.children[:fanout_cap]:
-            child = self._nodes[cid]
-            if child.is_article:
-                lines.append(f"{cid} [article]")
-            elif child.is_leaf_tag:
-                lines.append(f"{cid} [leaf-tag, {len(child.articles)} articles]")
-            else:
-                lines.append(f"{cid} [sub-tag, {child.size} articles]")
-        if len(node.children) > fanout_cap:
-            lines.append(
-                f"... ({len(node.children) - fanout_cap} more children omitted — "
-                "tree build should have sub-divided this node)"
-            )
-        return "\n".join(lines)
 
     def top_level_topic_list(self) -> list[str]:
         """Return the direct children of ``root`` (e.g. Wikipedia top categories).

@@ -1,13 +1,8 @@
-"""Unit tests for the recursive-L1 (Phase 3) path-selective browse encode.
+"""Unit tests for the recursive-L1 (Phase 3) per-repo shared-tree drill path.
 
-Covers, with NO GPU and a fully stubbed encoder:
-
-1. Browse-node sentinel template wiring + back-compat (flag OFF → byte-for-byte
-   identical to the legacy text-only browse path).
-2. Path-selective gradient scope: live search path carries gradient; off-path
-   siblings are read from the L1-tree cache DETACHED (no grad).
-3. Browse sentinel splice: each browse turn injects a dense node-rep
-   EmbeddingSegment without disturbing the surrounding token stream.
+Covers, with NO GPU and a fully stubbed encoder, the per-repo full-backprop
+shared-tree encode + the detach-and-reaccumulate / option-A / inner-loop
+gradient contracts of ``_forward_backward_per_repo``.
 
 These mirror the stubbing pattern in
 ``tests/unit/training/test_kr_kb_trainer_pieces.py`` (build the trainer via
@@ -23,12 +18,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from bgkit.data.bgkit_tool_template import (
-    BGKIT_BROWSE_SENTINEL,
-    TrajectoryTurn,
-    tokenize_trajectory,
-)
-from bgkit.models.decoder import EmbeddingSegment, TokenSegment
+from bgkit.models.decoder import TokenSegment
 
 # ---------------------------------------------------------------------------
 # Stubs
@@ -86,21 +76,6 @@ class _StubTree:
 
     def get(self, nid: str) -> _StubNode:
         return self._nodes[nid]
-
-
-class _StubTreeCache:
-    """Minimal SurvivorBlockCache surface: has/get over an in-memory dict."""
-
-    def __init__(self, data: dict[tuple[str, str], torch.Tensor]):
-        self._data = data
-        self.gets: list[tuple[str, str]] = []
-
-    def has(self, dataset: str, node_id: str) -> bool:
-        return (dataset, node_id) in self._data
-
-    def get(self, dataset: str, node_id: str) -> torch.Tensor:
-        self.gets.append((dataset, node_id))
-        return self._data[(dataset, node_id)]
 
 
 class _RecorderEncoder(torch.nn.Module):
@@ -187,307 +162,6 @@ def _sample(trajectory):
 
 
 # ---------------------------------------------------------------------------
-# 1. Template: sentinel emission + back-compat
-# ---------------------------------------------------------------------------
-
-
-def test_browse_sentinel_off_by_default():
-    tok = _FakeTokenizer()
-    traj = [
-        TrajectoryTurn(kind="browse", args={"id": "root"}, response="root listing"),
-        TrajectoryTurn(kind="bgkit", args={"ids": ["a"], "query": "q"}),
-        TrajectoryTurn(kind="answer", response="the answer"),
-    ]
-    rendered = tokenize_trajectory(tok, "sys", "q?", traj)
-    assert rendered.browse_sentinel_positions == []
-    # No browse sentinel tokens leaked into the stream.
-    sent_ids = tok.encode(BGKIT_BROWSE_SENTINEL)
-    ids = rendered.token_ids.tolist()
-    assert not _contains_subseq(ids, sent_ids)
-
-
-def test_browse_sentinel_emitted_when_enabled():
-    tok = _FakeTokenizer()
-    traj = [
-        TrajectoryTurn(kind="browse", args={"id": "root"}, response="root listing"),
-        TrajectoryTurn(kind="browse", args={"id": "mid"}, response="mid listing"),
-        TrajectoryTurn(kind="bgkit", args={"ids": ["a"], "query": "q"}),
-        TrajectoryTurn(kind="answer", response="the answer"),
-    ]
-    rendered = tokenize_trajectory(tok, "sys", "q?", traj, browse_node_sentinel=True)
-    # One sentinel per browse turn, aligned with browse_turns.
-    assert len(rendered.browse_turns) == 2
-    assert len(rendered.browse_sentinel_positions) == 2
-    sent_ids = tok.encode(BGKIT_BROWSE_SENTINEL)
-    ids = rendered.token_ids.tolist()
-    for pos in rendered.browse_sentinel_positions:
-        assert ids[pos : pos + len(sent_ids)] == sent_ids
-    # Sentinel positions are loss-masked (tool-response region, never trained).
-    lm = rendered.loss_mask.tolist()
-    for pos in rendered.browse_sentinel_positions:
-        assert not any(lm[pos : pos + len(sent_ids)])
-
-
-def _contains_subseq(seq: list[int], sub: list[int]) -> bool:
-    if not sub:
-        return False
-    return any(
-        seq[i : i + len(sub)] == sub
-        for i in range(len(seq) - len(sub) + 1)
-    )
-
-
-# ---------------------------------------------------------------------------
-# 2. Path-selective gradient scope
-# ---------------------------------------------------------------------------
-
-
-def test_path_selective_gradient_scope():
-    dim, dec_dim = 8, 8
-    tok = _FakeTokenizer()
-    enc = _RecorderEncoder(dim, dec_dim)
-
-    # Tree: root -> {mid, sib_root}; mid -> {leaf_gold, sib_mid}.
-    tree = _StubTree({
-        "root": _StubNode("root", ["mid", "sib_root"]),
-        "mid": _StubNode("mid", ["leaf_gold", "sib_mid"]),
-        "sib_root": _StubNode("sib_root", []),
-        "sib_mid": _StubNode("sib_mid", []),
-        "leaf_gold": _StubNode("leaf_gold", []),
-    })
-    cache = _StubTreeCache({
-        ("toy", "sib_root"): torch.randn(3, dim),
-        ("toy", "sib_mid"): torch.randn(2, dim),
-    })
-    t = _make_trainer(enc, tok, tree, cache, dim, dec_dim)
-
-    # Base case: live leaf l1out (requires grad — it is the live search path).
-    live_leaf = torch.randn(4, dim, requires_grad=True)
-    t._encode_path_leaf_l1out = types.MethodType(
-        lambda self, dataset, node, q_emb: live_leaf, t,
-    )
-
-    traj = [
-        TrajectoryTurn(kind="browse", args={"id": "root"}, response="r"),
-        TrajectoryTurn(kind="browse", args={"id": "mid"}, response="m"),
-        TrajectoryTurn(kind="bgkit", args={"ids": ["leaf_gold"], "query": "q"}),
-        TrajectoryTurn(kind="answer", response="a"),
-    ]
-    rendered = tokenize_trajectory(tok, "sys", "q?", traj, browse_node_sentinel=True)
-    reps = t._recursive_browse_node_reps(_sample(traj), rendered)
-
-    # One projected rep per browse turn, all carrying gradient (live path).
-    assert len(reps) == 2
-    for rep in reps:
-        assert rep is not None
-        assert rep.requires_grad, "live-path node-rep must carry gradient"
-        assert rep.shape[-1] == dec_dim
-
-    # Gradient scope: off-path cache reads are DETACHED (requires_grad False);
-    # the live leaf + live on-path child carry gradient. Exactly one off-path
-    # sibling is read (sib_root, at the interior root node). The deepest node
-    # (mid) uses the live base-case leaf and does NOT read its children from
-    # cache (no double-counting), so sib_mid is never fetched.
-    assert ("toy", "sib_root") in cache.gets
-    assert ("toy", "sib_mid") not in cache.gets
-    n_detached = sum(1 for g in enc.bridge_input_grad if not g)
-    n_live = sum(1 for g in enc.bridge_input_grad if g)
-    assert n_detached == 1, f"expected 1 detached off-path read, got {n_detached}"
-    assert n_live >= 2, "live leaf + live on-path child must carry gradient"
-
-    # Backprop reaches the live path (encoder bridge/proj weights get grad)
-    # but never the detached cache tensors.
-    loss = sum(r.float().pow(2).sum() for r in reps)
-    loss.backward()
-    assert enc.W_bridge.weight.grad is not None
-    assert cache._data[("toy", "sib_root")].grad is None
-
-
-# ---------------------------------------------------------------------------
-# 3. Browse sentinel splice into decoder segments
-# ---------------------------------------------------------------------------
-
-
-def test_browse_node_rep_spliced_into_segments():
-    dim, dec_dim = 8, 8
-    tok = _FakeTokenizer()
-    enc = _RecorderEncoder(dim, dec_dim)
-    tree = _StubTree({
-        "root": _StubNode("root", ["mid"]),
-        "mid": _StubNode("mid", ["leaf_gold"]),
-        "leaf_gold": _StubNode("leaf_gold", []),
-    })
-    cache = _StubTreeCache({})
-    t = _make_trainer(enc, tok, tree, cache, dim, dec_dim)
-    t._encode_path_leaf_l1out = types.MethodType(
-        lambda self, dataset, node, q_emb: torch.randn(4, dim, requires_grad=True),
-        t,
-    )
-
-    traj = [
-        TrajectoryTurn(kind="browse", args={"id": "root"}, response="r"),
-        TrajectoryTurn(kind="browse", args={"id": "mid"}, response="m"),
-        TrajectoryTurn(kind="answer", response="a"),
-    ]
-    rendered = tokenize_trajectory(tok, "sys", "q?", traj, browse_node_sentinel=True)
-    reps = t._recursive_browse_node_reps(_sample(traj), rendered)
-
-    sent_ids = tok.encode(BGKIT_BROWSE_SENTINEL)
-    prep = {
-        "rendered": rendered,
-        "token_ids": rendered.token_ids,
-        "loss_mask": rendered.loss_mask,
-        "sentinel_len": 1,
-        "topic_sentinel_len": 1,
-        "topic_block": None,
-        "browse_node_reps": reps,
-        "browse_sentinel_len": len(sent_ids),
-    }
-    segments, _trace = t._assemble_sample_segments(prep, [])
-
-    emb_segs = [s for s in segments if isinstance(s, EmbeddingSegment)]
-    tok_segs = [s for s in segments if isinstance(s, TokenSegment)]
-    # One EmbeddingSegment per browse turn; no sentinel tokens survive in the
-    # token segments.
-    assert len(emb_segs) == 2
-    for seg in tok_segs:
-        ids = seg.token_ids.squeeze(0).tolist()
-        assert not _contains_subseq(ids, sent_ids)
-
-
-def test_recursive_path_noop_when_flag_off():
-    """With the flag OFF, no browse reps are computed and no sentinel emitted —
-    the legacy text-only browse path is preserved."""
-    dim, dec_dim = 8, 8
-    tok = _FakeTokenizer()
-    enc = _RecorderEncoder(dim, dec_dim)
-    tree = _StubTree({"root": _StubNode("root", [])})
-    t = _make_trainer(enc, tok, tree, _StubTreeCache({}), dim, dec_dim)
-    t._recursive_l1 = False
-
-    traj = [
-        TrajectoryTurn(kind="browse", args={"id": "root"}, response="listing"),
-        TrajectoryTurn(kind="answer", response="a"),
-    ]
-    # Flag-off tokenization → no sentinels.
-    rendered = tokenize_trajectory(tok, "sys", "q?", traj, browse_node_sentinel=False)
-    assert rendered.browse_sentinel_positions == []
-    # No encoder bridge calls should occur for browse in the flag-off path
-    # (we don't even call the recursive method when positions are empty).
-    assert enc.bridge_input_grad == []
-
-
-# ---------------------------------------------------------------------------
-# 4. Full-backprop mode: gradient reaches OFF-PATH siblings
-# ---------------------------------------------------------------------------
-
-
-def _stub_l0_for_full_backprop(trainer, dim: int):
-    """Stub L0 leaf access so full-backprop leaves resolve to frozen
-    (non-grad) cached L0 survivors — the precomputed input."""
-    trainer._resolve_article_ids = types.MethodType(
-        lambda self, dataset, ids: [str(i) for i in ids], trainer,
-    )
-
-    def fake_l0(self, dataset, article_ids, query_emb=None):
-        # Frozen/cached L0 survivors: a non-grad leaf tensor. cu is one
-        # segment spanning all rows (single node).
-        flat = torch.randn(2 * max(1, len(article_ids)), dim)
-        cu = torch.tensor([0, flat.shape[0]], dtype=torch.int32)
-        return flat, cu
-
-    trainer._l0_for_articles = types.MethodType(fake_l0, trainer)
-
-
-def test_full_backprop_reaches_off_path_sibling():
-    """In full_backprop mode the WHOLE subtree is re-encoded live, so gradient
-    reaches OFF-PATH siblings — contrast the detached path-selective mode."""
-    dim, dec_dim = 8, 8
-    tok = _FakeTokenizer()
-    enc = _RecorderEncoder(dim, dec_dim)
-    # root browses to two leaf children: one on-path, one off-path. Both are
-    # re-encoded live in full_backprop mode.
-    tree = _StubTree({
-        "root": _StubNode("root", ["onpath_leaf", "offpath_leaf"]),
-        "onpath_leaf": _StubNode("onpath_leaf", []),
-        "offpath_leaf": _StubNode("offpath_leaf", []),
-    })
-    t = _make_trainer(enc, tok, tree, None, dim, dec_dim)
-    t._recursive_l1_full_backprop = True
-    _stub_l0_for_full_backprop(t, dim)
-
-    traj = [
-        TrajectoryTurn(kind="browse", args={"id": "root"}, response="r"),
-        TrajectoryTurn(kind="bgkit", args={"ids": ["onpath_leaf"], "query": "q"}),
-        TrajectoryTurn(kind="answer", response="a"),
-    ]
-    rendered = tokenize_trajectory(tok, "sys", "q?", traj, browse_node_sentinel=True)
-    reps = t._recursive_browse_node_reps(_sample(traj), rendered)
-
-    # One projected rep for the single browse turn (root), carrying gradient.
-    assert len(reps) == 1
-    assert reps[0] is not None and reps[0].requires_grad
-
-    # ALL children are re-encoded LIVE — no detached off-path reads. Both
-    # of root's children (on-path + off-path) appear as live bridge inputs.
-    assert len(enc.bridge_input_grad) == 2
-    assert all(enc.bridge_input_grad), (
-        "full_backprop must re-encode every child LIVE (no detach)"
-    )
-
-    # Backprop reaches the OFF-PATH sibling's L1 encode. root.children order
-    # is [onpath_leaf, offpath_leaf] → bridge_inputs[1] is the off-path one.
-    reps[0].float().pow(2).sum().backward()
-    offpath_input = enc.bridge_inputs[1]
-    assert offpath_input.grad is not None, (
-        "off-path sibling subtree must receive gradient in full_backprop mode"
-    )
-    # The shared L1 weight (used by every node's encode) gets gradient too.
-    assert enc.W_l1.weight.grad is not None
-
-
-def test_full_backprop_vs_path_selective_off_path_grad_contrast():
-    """Same tree, two modes: full_backprop gives the off-path sibling gradient;
-    path-selective detaches it (no gradient)."""
-    dim, dec_dim = 8, 8
-
-    def build(full_backprop: bool):
-        tok = _FakeTokenizer()
-        enc = _RecorderEncoder(dim, dec_dim)
-        tree = _StubTree({
-            "root": _StubNode("root", ["mid", "sib_root"]),
-            "mid": _StubNode("mid", ["leaf"]),
-            "leaf": _StubNode("leaf", []),
-            "sib_root": _StubNode("sib_root", []),
-        })
-        cache = _StubTreeCache({("toy", "sib_root"): torch.randn(2, dim)})
-        t = _make_trainer(enc, tok, tree, cache if not full_backprop else None,
-                          dim, dec_dim)
-        t._recursive_l1_full_backprop = full_backprop
-        _stub_l0_for_full_backprop(t, dim)
-        traj = [
-            TrajectoryTurn(kind="browse", args={"id": "root"}, response="r"),
-            TrajectoryTurn(kind="browse", args={"id": "mid"}, response="m"),
-            TrajectoryTurn(kind="bgkit", args={"ids": ["leaf"], "query": "q"}),
-            TrajectoryTurn(kind="answer", response="a"),
-        ]
-        rendered = tokenize_trajectory(
-            tok, "sys", "q?", traj, browse_node_sentinel=True,
-        )
-        t._recursive_browse_node_reps(_sample(traj), rendered)
-        return enc
-
-    enc_full = build(full_backprop=True)
-    enc_sel = build(full_backprop=False)
-
-    # Full-backprop: no detached bridge inputs (sib_root re-encoded live).
-    assert all(enc_full.bridge_input_grad)
-    # Path-selective: at least one detached bridge input (sib_root from cache).
-    assert not all(enc_sel.bridge_input_grad)
-    assert any(not g for g in enc_sel.bridge_input_grad)
-
-
-# ---------------------------------------------------------------------------
 # 5. PER-REPO full-backprop: shared window-0 tree encoded ONCE per repo
 # ---------------------------------------------------------------------------
 
@@ -558,24 +232,19 @@ def test_per_repo_shared_tree_encoded_once_not_per_file_sample():
     assert bridge_calls_after_tree > 0
 
     # Now THREE file-samples in this repo each look up the shared reps for
-    # their browse turns — NO re-encode (bridge-call count must not grow).
+    # their drill-down ``node`` turns — NO re-encode (bridge-call count must
+    # not grow). The lookup goes through the live ``_shared_tree_node_survivor``
+    # (the surviving per-repo splice/memo lookup).
     t._shared_tree_memo = memo
     t._per_repo_shared_tree_active = True
     for _ in range(3):
-        traj = [
-            TrajectoryTurn(kind="browse", args={"id": "repo/w000"}, response="w"),
-            TrajectoryTurn(kind="browse", args={"id": "repo/w000/c4_0"}, response="c"),
-            TrajectoryTurn(kind="bgkit", args={"ids": ["commitA"], "query": "q"}),
-            TrajectoryTurn(kind="answer", response="blob"),
-        ]
-        rendered = tokenize_trajectory(tok, "sys", "q?", traj, browse_node_sentinel=True)
-        reps = t._recursive_browse_node_reps(_sample(traj), rendered)
-        assert len(reps) == 2
-        # Browse reps are the SHARED memo tensors (same object identity).
-        assert reps[0] is memo["repo/w000"][0]
-        assert reps[1] is memo["repo/w000/c4_0"][0]
+        rep0 = t._shared_tree_node_survivor("repo/w000")
+        rep1 = t._shared_tree_node_survivor("repo/w000/c4_0")
+        # Node reps are the SHARED memo tensors (same object identity).
+        assert rep0 is memo["repo/w000"][0]
+        assert rep1 is memo["repo/w000/c4_0"][0]
     assert len(enc.bridge_input_grad) == bridge_calls_after_tree, (
-        "browse lookups must NOT re-encode the shared tree per file-sample"
+        "shared-tree lookups must NOT re-encode the shared tree per file-sample"
     )
 
 
@@ -807,9 +476,10 @@ def test_aux_off_theta_accumulates_decoupled_from_pending():
 
 
 def test_per_repo_drill_uses_recursive_l1_ramp():
-    """The per-repo drill-down (_encode_sample_turns) requests the SAME
+    """The per-repo drill-down (now via _encode_decode_group) requests the SAME
     recursive L1 ramp ratio as the shared tree (one curriculum), NOT the static
-    top-level l1_retention."""
+    top-level l1_retention. The ramp is threaded as l1_target_ratio to
+    _run_l1_batch."""
     dim, dec_dim = 8, 8
     tok = _FakeTokenizer()
     enc = _RecorderEncoder(dim, dec_dim)
@@ -825,7 +495,18 @@ def test_per_repo_drill_uses_recursive_l1_ramp():
         return [torch.zeros(1, dec_dim) for _ in prepared]
 
     t._run_l1_batch = types.MethodType(fake_run_l1_batch, t)
-    t._encode_sample_turns({"prepared_turns": [{"dummy": True}]})
+    t._prepare_sample_for_decode = types.MethodType(
+        lambda self, s: {"prepared_turns": [{"content": torch.zeros(4, dim)}]}, t,
+    )
+    t._assemble_sample_segments = types.MethodType(
+        lambda self, prep, per_turn: ([], None), t,
+    )
+    # Drive the shared encode→decode core with the recursive ramp (as PASS 2
+    # does): l1_target_ratio must reach _run_l1_batch.
+    t._encode_decode_group(
+        [SimpleNamespace(dataset_name="toy")],
+        l1_target_ratio=t._recursive_l1_retention_now(),
+    )
     # 0.30 -> 0.05 over 4000 steps, at step 2000 -> 0.175 (the ramp, not 0.10).
     assert captured["target_ratio"] == pytest.approx(0.175)
 
@@ -963,10 +644,16 @@ def test_per_repo_normalizes_by_contributing_count():
     t._compute_shared_repo_tree = types.MethodType(
         lambda self, ds, root: ({}, {"nodes": 0}), t,
     )
+    # PASS 1: cheap contributing count (render-only stub).
+    t._sample_contributing_token_count = types.MethodType(
+        lambda self, s: sum(int(seg.loss_mask.sum()) for seg in s._seg), t,
+    )
+    # PASS 2: prep + assemble + decode (group-batched via _encode_decode_group;
+    # empty prepared_turns -> no L1 bucketing, so this stays a pure assemble+
+    # decode path). Default group size folds all 3 samples into one group.
     t._prepare_sample_for_decode = types.MethodType(
         lambda self, s: {"prepared_turns": [], "_seg": s._seg}, t,
     )
-    t._encode_sample_turns = types.MethodType(lambda self, prep: [], t)
     t._assemble_sample_segments = types.MethodType(
         lambda self, prep, per_turn: (prep["_seg"], None), t,
     )
@@ -980,6 +667,94 @@ def test_per_repo_normalizes_by_contributing_count():
     assert float(w.grad) == pytest.approx(1.5)
     assert metrics["per_repo_file_samples"] == pytest.approx(3.0)
     assert metrics["per_repo_contributing_samples"] == pytest.approx(2.0)
+    assert metrics["per_repo_backwarded_samples"] == pytest.approx(2.0)
+
+
+def test_per_repo_pass2_group_batched_bounded_by_g():
+    """PASS 2 processes the contributing samples in groups of G: one
+    _encode_decode_group call (→ one group backward) per group of G, NOT one
+    per sample. The number of groups (and thus backward launches) is
+    ceil(n/G) — bounded by G, never all-N staging. Pass 1 still counts WITHOUT
+    encoding."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    def run(group_size, n=5):
+        t = KRKBTrainer.__new__(KRKBTrainer)
+        t.device = torch.device("cpu")
+        t._round_robin = False
+        t._accum_steps = 1
+        t.topic_embeddings = None
+        t._survivorship_aux = False
+        t._live_l0 = True
+        t._max_file_samples_per_repo = None
+        t._per_repo_sample_group_size = group_size
+        t.step_cfg = {}
+        t.global_step = 0
+        t._recursive_l0_retention_cfg = 0.1
+        t._recursive_l1_retention_cfg = 0.1
+        w = torch.nn.Parameter(torch.zeros(1))
+        t.decoder = SimpleNamespace(
+            forward_interleaved_with_loss=lambda segments: w.sum(),
+        )
+        batch = [SimpleNamespace(dataset_name="toy", idx=i) for i in range(n)]
+
+        count_calls: list[int] = []
+        t._sample_contributing_token_count = types.MethodType(
+            lambda self, s: count_calls.append(s.idx) or 1, t,
+        )
+        t._repo_group_key = types.MethodType(lambda self, s: "root", t)
+        t._compute_shared_repo_tree = types.MethodType(
+            lambda self, ds, root: ({}, {"nodes": 0}), t,
+        )
+        t._prepare_sample_for_decode = types.MethodType(
+            lambda self, s: {"prepared_turns": []}, t,
+        )
+        t._assemble_sample_segments = types.MethodType(
+            lambda self, prep, per_turn: (
+                [TokenSegment(token_ids=torch.ones(1, dtype=torch.long),
+                              loss_mask=torch.ones(1))],
+                None,
+            ),
+            t,
+        )
+        # Count group invocations (= group backwards).
+        n_group_calls = {"n": 0}
+        orig = t._encode_decode_group
+
+        def counting_group(samples, *a, **k):
+            n_group_calls["n"] += 1
+            # group size must never exceed G.
+            assert len(samples) <= group_size
+            return orig(samples, *a, **k)
+
+        t._encode_decode_group = counting_group
+        t._forward_backward_per_repo(batch)
+        return count_calls, n_group_calls["n"]
+
+    import math as _m
+    # Pass 1 counts all without encoding; PASS 2 makes ceil(n/G) group calls.
+    for g in (1, 2, 5, 8):
+        count_calls, n_groups = run(g, n=5)
+        assert count_calls == [0, 1, 2, 3, 4]
+        assert n_groups == _m.ceil(5 / g), f"G={g}: expected {_m.ceil(5/g)} groups"
+
+
+def test_sample_contributing_token_count_is_render_only():
+    """The Pass-1 count derives from the rendered loss_mask alone — no encode,
+    no drill encode (_prepare_l1_turn), no θ side-effect."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    rendered = SimpleNamespace(loss_mask=torch.tensor([0, 1, 1, 0, 1]))
+    t._render_sample = types.MethodType(
+        lambda self, s: (rendered, None, []), t,
+    )
+    # Tripwire: the drill encode must NOT be called by the count.
+    def _boom(self, *a, **k):
+        raise AssertionError("count path must not encode")
+    t._prepare_l1_turn = types.MethodType(_boom, t)
+
+    assert t._sample_contributing_token_count(SimpleNamespace()) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1090,3 +865,1419 @@ def test_dynamic_ckpt_managed_models_single_decoder():
     t.decoder = SimpleNamespace(backbone=dec_bb)
     labels = {label for label, _ in t._dynamic_ckpt_managed_models()}
     assert labels == {"encoder.l0", "encoder.l1", "decoder"}
+
+
+# ---------------------------------------------------------------------------
+# 11. Per-repo SIZE FILTER: over-threshold repos dropped at grouping
+# ---------------------------------------------------------------------------
+
+
+def test_repo_leaf_token_count_metric():
+    """_repo_leaf_token_count sums L0-encoded leaf-diff tokens over the
+    window-0 subtree (the shared-tree-encode memory driver)."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    tree = _StubTree({
+        "repo/w000": _StubNode("repo/w000", ["c4_0"]),
+        "c4_0": _StubNode("c4_0", ["commitA", "commitB"]),
+        "commitA": _StubNode("commitA", []),
+        "commitB": _StubNode("commitB", []),
+    })
+    # BrowseTree.articles recurses leaves; stub it directly.
+    tree.articles = lambda nid: ["a1", "a2", "a3"] if nid == "repo/w000" else []
+
+    class _Store:
+        def length(self, dataset, doc_id):
+            return {"a1": 100, "a2": 250, "a3": 50}[doc_id]
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t._trees = {"toy": tree}
+    t._token_store = _Store()
+    t._article_ids_to_document_ids = types.MethodType(
+        lambda self, ds, ids: list(ids), t,
+    )
+    assert t._repo_leaf_token_count("toy", "repo/w000") == 400
+    # Missing root -> 0; no token store -> 0.
+    assert t._repo_leaf_token_count("toy", "absent") == 0
+    t._token_store = None
+    assert t._repo_leaf_token_count("toy", "repo/w000") == 0
+
+
+def test_per_repo_size_filter_drops_over_threshold_at_grouping():
+    """Simulate the _build_dataloaders filter logic: over-threshold repos (by
+    file-sample count) are dropped so their shared tree never encodes."""
+    from collections import Counter
+
+    from bgkit.data.samplers import RepoGroupedBatchSampler
+
+    # r_small x2, r_ok x3, r_monster x6
+    group_keys = (
+        ["r_small"] * 2 + ["r_ok"] * 3 + ["r_monster"] * 6
+    )
+    group_sizes = Counter(group_keys)
+    max_file_samples = 5
+    dropped = {k for k, sz in group_sizes.items() if sz > max_file_samples}
+    assert dropped == {"r_monster"}
+
+    s = RepoGroupedBatchSampler(group_keys, shuffle=False, drop_keys=dropped)
+    assert len(s) == 2  # r_small, r_ok kept; r_monster dropped
+    assert s.dropped_samples == 6
+    yielded = sorted(i for b in s for i in b)
+    assert yielded == [0, 1, 2, 3, 4]  # the 6 r_monster indices (5..10) gone
+
+
+# ---------------------------------------------------------------------------
+# 12. GATE: detach-and-reaccumulate — gradient match + once-forward
+# ---------------------------------------------------------------------------
+
+
+def _make_detach_reaccum_trainer(tree_w, base, decode, group_size=1 << 30):
+    """Per-repo trainer wired for detach-and-reaccumulate, using a trainable
+    Linear ``W`` as the shared-tree producer (memo[nid] = W(base[nid])) and a
+    fake decoder ``decode(segments)``. Exercises the REAL
+    _shared_tree_node_survivor splice + the REAL _forward_backward_per_repo
+    reaccumulate + group-batched PASS 2 (``group_size``)."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t.device = torch.device("cpu")
+    t._round_robin = False
+    t._accum_steps = 1
+    t.topic_embeddings = None
+    t._survivorship_aux = False
+    t._live_l0 = True
+    t._max_file_samples_per_repo = None
+    t._per_repo_sample_group_size = group_size
+    t.step_cfg = {}
+    t.global_step = 0
+    t._recursive_l0_retention_cfg = 0.1
+    t._recursive_l1_retention_cfg = 0.1
+    t._shared_tree_forward_count = 0
+    t._trees = {"toy": object()}  # non-None; per-repo splice path ignores it
+    t.decoder = SimpleNamespace(forward_interleaved_with_loss=decode)
+
+    def fake_tree(self, ds, root):
+        self._shared_tree_forward_count += 1
+        memo = {nid: (tree_w(base[nid]), None) for nid in base}
+        return memo, {"nodes": len(base)}
+
+    t._compute_shared_repo_tree = types.MethodType(fake_tree, t)
+    t._repo_group_key = types.MethodType(lambda self, s: "repo/w000", t)
+    t._sample_contributing_token_count = types.MethodType(lambda self, s: 1, t)
+
+    def fake_prep(self, sample):
+        rep = self._shared_tree_node_survivor(sample._node)  # REAL splice
+        return {"prepared_turns": [], "_rep": rep, "_v": sample._v}
+
+    t._prepare_sample_for_decode = types.MethodType(fake_prep, t)
+
+    def fake_assemble(self, prep, per_turn):
+        segs = [
+            TokenSegment(token_ids=torch.ones(1, dtype=torch.long),
+                         loss_mask=torch.ones(1)),
+            SimpleNamespace(_rep=prep["_rep"], _v=prep["_v"]),
+        ]
+        return segs, None
+
+    t._assemble_sample_segments = types.MethodType(fake_assemble, t)
+    return t
+
+
+def test_gate_detach_reaccumulate_gradient_match():
+    """GATE (a): group-batched detach-and-reaccumulate gradient on the
+    shared-tree producer params == the ground-truth Σ_i dLi/dparams (single
+    combined backward), within tight tol — and INVARIANT to the group size G
+    (test G=1, G=4, G=all). Proves batching doesn't change the gradient."""
+    d = 8
+    # 6 samples: node A spliced 3x, B 3x -> tests R_d accumulation + spans
+    # multiple groups at G=1 and G=4.
+    n = 6
+
+    def decode(segments):
+        loss = torch.zeros(())
+        for s in segments:
+            if getattr(s, "_rep", None) is not None:
+                loss = loss + (s._rep * s._v).sum()
+        return loss
+
+    def build_samples():
+        nodes = ["A", "B", "A", "B", "A", "B"]
+        return [
+            SimpleNamespace(dataset_name="toy", _node=nodes[i], _v=torch.randn(d))
+            for i in range(n)
+        ]
+
+    # Fixed inputs shared across all G + the reference.
+    torch.manual_seed(0)
+    base = {"A": torch.randn(d), "B": torch.randn(d)}
+    samples = build_samples()
+    ref_w0 = torch.nn.Linear(d, d)
+    ref_state = {k: v.clone() for k, v in ref_w0.state_dict().items()}
+
+    # --- ground truth: ONE combined backward through the live reps ---
+    tree_ref = torch.nn.Linear(d, d)
+    tree_ref.load_state_dict(ref_state)
+    reps_live = {nid: tree_ref(base[nid]) for nid in base}
+    loss_total = sum(
+        (reps_live[s._node] * s._v).sum() for s in samples
+    ) / (n * 1)
+    loss_total.backward()
+    ref = tree_ref.weight.grad.detach().clone()
+    ref_b = tree_ref.bias.grad.detach().clone()
+
+    results = {}
+    for g in (1, 4, n):  # G=1, G=4, G=all
+        tree_w = torch.nn.Linear(d, d)
+        tree_w.load_state_dict(ref_state)
+        t = _make_detach_reaccum_trainer(tree_w, base, decode, group_size=g)
+        batch = [
+            SimpleNamespace(dataset_name="toy", _node=s._node, _v=s._v)
+            for s in samples
+        ]
+        t._forward_backward_per_repo(batch)
+        got = tree_w.weight.grad.detach().clone()
+        got_b = tree_w.bias.grad.detach().clone()
+        max_abs = (got - ref).abs().max().item()
+        max_rel = max_abs / (ref.abs().max().item() or 1.0)
+        results[g] = (max_abs, max_rel)
+        assert torch.allclose(got, ref, atol=1e-6, rtol=1e-5), (
+            f"G={g}: weight grad mismatch max_abs={max_abs:.2e} max_rel={max_rel:.2e}"
+        )
+        assert torch.allclose(got_b, ref_b, atol=1e-6, rtol=1e-5), f"G={g}: bias grad"
+    print("[gradient-match] G -> (max_abs_diff, max_rel_diff):", {
+        ("all" if g == n else g): (f"{a:.2e}", f"{r:.2e}")
+        for g, (a, r) in results.items()
+    })
+
+
+def test_gate_shared_tree_forward_runs_once():
+    """GATE (b): the shared-tree forward runs EXACTLY ONCE per
+    _forward_backward_per_repo, regardless of the number of file-samples (no
+    per-sample re-run / retain_graph chain)."""
+    torch.manual_seed(1)
+    d = 8
+    base = {"A": torch.randn(d), "B": torch.randn(d)}
+    samples_spec = [("A", torch.randn(d)) for _ in range(5)] + [("B", torch.randn(d))]
+
+    def decode(segments):
+        loss = torch.zeros(())
+        for s in segments:
+            if getattr(s, "_rep", None) is not None:
+                loss = loss + (s._rep * s._v).sum()
+        return loss
+
+    tree_w = torch.nn.Linear(d, d)
+    t = _make_detach_reaccum_trainer(tree_w, base, decode)
+    batch = [SimpleNamespace(dataset_name="toy", _node=n, _v=v) for n, v in samples_spec]
+    t._forward_backward_per_repo(batch)
+
+    # 6 file-samples, but the shared-tree forward fired ONCE.
+    assert t._shared_tree_forward_count == 1
+    # Splice state torn down after the step.
+    assert t._shared_tree_splice_reps is None
+    assert t._shared_tree_used_nodes is None
+
+
+# ---------------------------------------------------------------------------
+# 13. profile_timing: per-component timing behind the flag
+# ---------------------------------------------------------------------------
+
+
+def test_timed_helper_off_is_noop():
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t._profile_timing = False
+    store: dict = {}
+    with t._timed(store, "x", gpu=True):
+        pass
+    assert store == {}  # no overhead, no key recorded
+
+
+def test_timed_helper_on_accumulates():
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t._profile_timing = True
+    store: dict = {}
+    for _ in range(2):
+        with t._timed(store, "x"):  # gpu=False -> no cuda sync needed on CPU
+            sum(range(1000))
+    assert "x" in store and store["x"] >= 0.0
+    # Two calls accumulate into the same key.
+    one: dict = {}
+    with t._timed(one, "x"):
+        pass
+    assert store["x"] >= one["x"]
+
+
+def test_per_repo_timing_emitted_under_flag(monkeypatch):
+    """profile_timing=True makes _forward_backward_per_repo emit a
+    `per_repo_timing` event with the component keys; off emits nothing."""
+    import bgkit.training.phase2.kr_kb_trainer as M
+
+    d = 8
+    base = {"A": torch.randn(d), "B": torch.randn(d)}
+    samples_spec = [("A", torch.randn(d)), ("B", torch.randn(d))]
+
+    def decode(segments):
+        loss = torch.zeros(())
+        for s in segments:
+            if getattr(s, "_rep", None) is not None:
+                loss = loss + (s._rep * s._v).sum()
+        return loss
+
+    events: list[tuple[str, dict]] = []
+
+    class _Rec:
+        def info(self, event, **kw):
+            events.append((event, kw))
+        def warning(self, *a, **k):
+            pass
+        def error(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(M, "logger", _Rec())
+
+    # Flag ON.
+    tree_w = torch.nn.Linear(d, d)
+    t = _make_detach_reaccum_trainer(tree_w, base, decode)
+    t._profile_timing = True
+    batch = [SimpleNamespace(dataset_name="toy", _node=nid, _v=v)
+             for nid, v in samples_spec]
+    t._forward_backward_per_repo(batch)
+
+    timing = [kw for ev, kw in events if ev == "per_repo_timing"]
+    assert len(timing) == 1, "exactly one per_repo_timing event per repo"
+    rec = timing[0]
+    for key in (
+        "repo", "n_file_samples", "n_contrib", "n_groups", "group_size",
+        "repo_wall_s", "gpu_op_s", "cpu_op_s", "shared_tree_encode_s",
+        "pass1_count_s", "prep_s", "drill_encode_s", "assemble_s",
+        "decode_fwd_s", "group_backward_s", "final_tree_backward_s",
+    ):
+        assert key in rec, f"missing timing key {key!r}"
+    assert rec["n_file_samples"] == 2 and rec["n_contrib"] == 2
+    assert rec["n_groups"] >= 1
+    assert rec["repo_wall_s"] >= 0.0
+
+    # Flag OFF -> no per_repo_timing event.
+    events.clear()
+    tree_w2 = torch.nn.Linear(d, d)
+    t2 = _make_detach_reaccum_trainer(tree_w2, base, decode)
+    t2._profile_timing = False
+    batch2 = [SimpleNamespace(dataset_name="toy", _node=nid, _v=v)
+              for nid, v in samples_spec]
+    t2._forward_backward_per_repo(batch2)
+    assert not any(ev == "per_repo_timing" for ev, _ in events)
+
+
+# ---------------------------------------------------------------------------
+# 14. Node-count size filter (retained-graph memory bound)
+# ---------------------------------------------------------------------------
+
+
+def test_repo_tree_node_count_metric():
+    """_repo_tree_node_count counts ALL nodes in the window-0 subtree (interior
+    + leaf-tag) — the retained-graph memory driver."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    # window -> [c4a, c4b]; c4a -> [cA, cB]; c4b -> [cC]  => 6 nodes total.
+    tree = _StubTree({
+        "repo/w000": _StubNode("repo/w000", ["c4a", "c4b"]),
+        "c4a": _StubNode("c4a", ["cA", "cB"]),
+        "c4b": _StubNode("c4b", ["cC"]),
+        "cA": _StubNode("cA", []),
+        "cB": _StubNode("cB", []),
+        "cC": _StubNode("cC", []),
+    })
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t._trees = {"toy": tree}
+    assert t._repo_tree_node_count("toy", "repo/w000") == 6
+    assert t._repo_tree_node_count("toy", "absent") == 0
+
+
+# ---------------------------------------------------------------------------
+# 15. Inner-loop COMPUTE primitive gates (driver integration pending)
+# ---------------------------------------------------------------------------
+
+
+def test_gate_inner_loop_first_step_matches_one_step():
+    """GATE (a): the FIRST inner step (subset = ALL files, fresh tree, zero
+    staleness) backproping through the LIVE retained tree gives the SAME
+    encoder grad as the exact one-step detach-reaccumulate path, within tight
+    tol."""
+    d, n = 8, 6
+    torch.manual_seed(0)
+    base = {"A": torch.randn(d), "B": torch.randn(d)}
+    nodes = ["A", "B", "A", "B", "A", "B"]
+    vs = [torch.randn(d) for _ in range(n)]
+
+    def decode(segments):
+        loss = torch.zeros(())
+        for s in segments:
+            if getattr(s, "_rep", None) is not None:
+                loss = loss + (s._rep * s._v).sum()
+        return loss
+
+    ref_state = {k: v.clone() for k, v in torch.nn.Linear(d, d).state_dict().items()}
+
+    def batch():
+        return [SimpleNamespace(dataset_name="toy", _node=nodes[i], _v=vs[i])
+                for i in range(n)]
+
+    # one-step detach-reaccumulate path.
+    tree_ref = torch.nn.Linear(d, d)
+    tree_ref.load_state_dict(ref_state)
+    t_ref = _make_detach_reaccum_trainer(tree_ref, base, decode, group_size=n)
+    t_ref._forward_backward_per_repo(batch())
+    ref = tree_ref.weight.grad.detach().clone()
+
+    # inner-loop first step: encode tree once (live splice) + ONE subset = all.
+    tree_il = torch.nn.Linear(d, d)
+    tree_il.load_state_dict(ref_state)
+    t_il = _make_detach_reaccum_trainer(tree_il, base, decode, group_size=n)
+    t_il._encode_repo_tree_for_inner_loop("toy", "repo/w000")
+    t_il._inner_loop_subset_backward(
+        batch(), l1_target_ratio=t_il._recursive_l1_retention_now(), normalizer=n,
+    )
+    got = tree_il.weight.grad.detach().clone()
+
+    max_abs = (got - ref).abs().max().item()
+    max_rel = max_abs / (ref.abs().max().item() or 1.0)
+    assert torch.allclose(got, ref, atol=1e-6, rtol=1e-5), (
+        f"inner-loop first-step grad mismatch: max_abs={max_abs:.2e} max_rel={max_rel:.2e}"
+    )
+    print(f"[inner-loop gate a] first-step max_abs_diff={max_abs:.2e} max_rel_diff={max_rel:.2e}")
+
+
+def test_gate_inner_loop_k_steps_reuse_tree_once():
+    """GATE (b): K inner steps reuse the tree encoded ONCE; the encoder gets a
+    fresh grad each inner step (retain_graph lets the live tree be reused); the
+    retained graph is freed after the repo."""
+    d, n = 8, 6
+    torch.manual_seed(1)
+    base = {"A": torch.randn(d), "B": torch.randn(d)}
+    nodes = ["A", "B"] * 3
+    vs = [torch.randn(d) for _ in range(n)]
+
+    def decode(segments):
+        loss = torch.zeros(())
+        for s in segments:
+            if getattr(s, "_rep", None) is not None:
+                loss = loss + (s._rep * s._v).sum()
+        return loss
+
+    tree_w = torch.nn.Linear(d, d)
+    t = _make_detach_reaccum_trainer(tree_w, base, decode, group_size=4)
+    t._per_repo_inner_subset_size = 2
+    t._per_repo_max_inner_steps = 12
+    batch = [SimpleNamespace(dataset_name="toy", _node=nodes[i], _v=vs[i])
+             for i in range(n)]
+
+    t._encode_repo_tree_for_inner_loop("toy", "repo/w000")
+    assert t._shared_tree_forward_count == 1  # tree encoded ONCE
+
+    subsets = t._partition_inner_subsets(batch)
+    assert len(subsets) == 3 and all(len(s) == 2 for s in subsets)
+
+    n_steps = 0
+    for subset in subsets:
+        tree_w.weight.grad = None  # simulate optimizer.zero_grad before each step
+        _loss_v, _tok, done, _turns = t._inner_loop_subset_backward(
+            subset, l1_target_ratio=0.2, normalizer=len(subset),
+        )
+        assert done == 2
+        # Encoder got a fresh gradient THIS inner step (backprop through the
+        # reused live tree succeeded — retain_graph kept it alive).
+        assert tree_w.weight.grad is not None
+        n_steps += 1
+
+    assert n_steps == 3
+    assert t._shared_tree_forward_count == 1  # NOT re-encoded across inner steps
+
+    t._free_inner_loop_tree()
+    assert t._shared_tree_memo is None
+    assert t._shared_tree_splice_reps is None
+    assert t._shared_tree_used_nodes is None
+
+
+def test_gate_inner_loop_subset_bounded_by_g():
+    """GATE (c): within an inner step, the subset is processed in groups of G
+    (≤ G samples per _encode_decode_group), so per-step memory is bounded by G
+    + the retained tree, not the whole subset/repo."""
+    d = 8
+    base = {"A": torch.randn(d)}
+
+    def decode(segments):
+        loss = torch.zeros(())
+        for s in segments:
+            if getattr(s, "_rep", None) is not None:
+                loss = loss + (s._rep * s._v).sum()
+        return loss
+
+    tree_w = torch.nn.Linear(d, d)
+    t = _make_detach_reaccum_trainer(tree_w, base, decode, group_size=2)
+    t._encode_repo_tree_for_inner_loop("toy", "repo/w000")
+    subset = [SimpleNamespace(dataset_name="toy", _node="A", _v=torch.randn(d))
+              for _ in range(5)]
+    sizes = []
+    orig = t._encode_decode_group
+    t._encode_decode_group = lambda samples, *a, **k: (
+        sizes.append(len(samples)), orig(samples, *a, **k))[1]
+    t._inner_loop_subset_backward(subset, l1_target_ratio=0.2, normalizer=5)
+    # 5 samples / G=2 -> groups of [2,2,1], each <= G.
+    assert sizes == [2, 2, 1]
+    assert all(s <= 2 for s in sizes)
+
+
+# ---------------------------------------------------------------------------
+# 16. WIRED Model-B inner-loop driver gates (a/b/c/d)
+# ---------------------------------------------------------------------------
+
+
+def _wire_inner_loop_trainer(t):
+    """Flip a _make_detach_reaccum_trainer into the wired inner-loop path."""
+    t._per_repo_full_backprop = True
+    t._per_repo_inner_loop = True
+    t._inner_loop_active = True
+    t._inner_loop_repo_key = None
+    t._inner_loop_repo_steps = 0
+    t._per_repo_inner_subset_size = 2
+    t._per_repo_max_inner_steps = 12
+    t.topic_embeddings = None
+    return t
+
+
+def test_gate_wired_inner_loop_first_step_matches_one_step():
+    """GATE (a) [WIRED]: the first inner step (subset = ALL files, fresh tree)
+    via _forward_backward_inner_loop bit-matches the exact one-step path's
+    encoder grad."""
+    d, n = 8, 6
+    torch.manual_seed(0)
+    base = {"A": torch.randn(d), "B": torch.randn(d)}
+    nodes = ["A", "B"] * 3
+    vs = [torch.randn(d) for _ in range(n)]
+
+    def decode(segments):
+        loss = torch.zeros(())
+        for s in segments:
+            if getattr(s, "_rep", None) is not None:
+                loss = loss + (s._rep * s._v).sum()
+        return loss
+
+    ref_state = {k: v.clone() for k, v in torch.nn.Linear(d, d).state_dict().items()}
+
+    def batch():
+        return [SimpleNamespace(dataset_name="toy", _node=nodes[i], _v=vs[i])
+                for i in range(n)]
+
+    # one-step path.
+    tree_ref = torch.nn.Linear(d, d)
+    tree_ref.load_state_dict(ref_state)
+    t_ref = _make_detach_reaccum_trainer(tree_ref, base, decode, group_size=1)
+    t_ref._forward_backward_per_repo(batch())
+    ref = tree_ref.weight.grad.detach().clone()
+
+    # WIRED inner-loop, ONE subset = all n files (S=n -> K=1).
+    tree_il = torch.nn.Linear(d, d)
+    tree_il.load_state_dict(ref_state)
+    t_il = _make_detach_reaccum_trainer(tree_il, base, decode, group_size=1)
+    _wire_inner_loop_trainer(t_il)
+    t_il._per_repo_inner_subset_size = n  # one subset = all files
+    t_il._forward_backward_inner_loop(batch())  # first (only) subset
+    got = tree_il.weight.grad.detach().clone()
+
+    max_abs = (got - ref).abs().max().item()
+    assert torch.allclose(got, ref, atol=1e-6, rtol=1e-5), f"max_abs={max_abs:.2e}"
+    print(f"[wired inner-loop gate a] first-step max_abs_diff={max_abs:.2e}")
+
+
+def test_gate_wired_inner_loop_structure_and_mid_repo_eval():
+    """GATE (b) [WIRED]: K inner steps reuse a tree encoded ONCE per repo;
+    encoder grad each step; a mid-repo eval does NOT free/corrupt the cached
+    tree; the tree is freed on repo-change."""
+    d = 8
+    torch.manual_seed(1)
+    base = {"A": torch.randn(d), "B": torch.randn(d)}
+
+    def decode(segments):
+        loss = torch.zeros(())
+        for s in segments:
+            if getattr(s, "_rep", None) is not None:
+                loss = loss + (s._rep * s._v).sum()
+        return loss
+
+    tree_w = torch.nn.Linear(d, d)
+    t = _make_detach_reaccum_trainer(tree_w, base, decode, group_size=1)
+    _wire_inner_loop_trainer(t)
+    t._repo_group_key = types.MethodType(lambda self, s: s._repo, t)
+
+    # Repo R1: 3 subsets of 2 files (sampler would emit these consecutively).
+    def mk(repo, node):
+        return SimpleNamespace(dataset_name="toy", _repo=repo, _node=node,
+                               _v=torch.randn(d))
+    r1_subsets = [[mk("R1", "A"), mk("R1", "B")] for _ in range(3)]
+
+    n_steps = 0
+    for i, subset in enumerate(r1_subsets):
+        tree_w.weight.grad = None  # base loop optimizer.zero_grad
+        m = t._forward_backward_inner_loop(subset)
+        assert m["inner_loop"] == 1.0
+        assert tree_w.weight.grad is not None  # encoder updated this inner step
+        assert t._shared_tree_forward_count == 1  # tree encoded ONCE for R1
+        assert t._inner_loop_repo_key == "R1"
+        n_steps += 1
+        # Simulate a mid-repo eval after the 2nd subset: zero grads (as
+        # _release_training_transients does) — must NOT free/stale the tree.
+        if i == 1:
+            t.optimizer = SimpleNamespace(zero_grad=lambda **k: None)
+            t._release_training_transients() if hasattr(t, "_release_training_transients") else None
+            assert t._shared_tree_memo is not None  # tree survives eval
+            assert t._inner_loop_repo_key == "R1"
+    assert n_steps == 3
+    assert t._shared_tree_forward_count == 1
+
+    # Repo change R1 -> R2: the R1 tree is freed and R2's encoded fresh (once).
+    r2_subset = [mk("R2", "A"), mk("R2", "B")]
+    t._forward_backward_inner_loop(r2_subset)
+    assert t._inner_loop_repo_key == "R2"
+    assert t._shared_tree_forward_count == 2  # exactly one re-encode on change
+
+
+def test_gate_wired_inner_loop_memory_g1_one_subset():
+    """GATE (c) [WIRED]: at G=1 the subset is processed ONE sample at a time
+    (≤1 sample per _encode_decode_group call) — no multi-sample concurrency."""
+    d = 8
+    base = {"A": torch.randn(d)}
+
+    def decode(segments):
+        loss = torch.zeros(())
+        for s in segments:
+            if getattr(s, "_rep", None) is not None:
+                loss = loss + (s._rep * s._v).sum()
+        return loss
+
+    tree_w = torch.nn.Linear(d, d)
+    t = _make_detach_reaccum_trainer(tree_w, base, decode, group_size=1)
+    _wire_inner_loop_trainer(t)
+    t._repo_group_key = types.MethodType(lambda self, s: "R", t)
+    sizes = []
+    orig = t._encode_decode_group
+    t._encode_decode_group = lambda samples, *a, **k: (
+        sizes.append(len(samples)), orig(samples, *a, **k))[1]
+    subset = [SimpleNamespace(dataset_name="toy", _repo="R", _node="A",
+                              _v=torch.randn(d)) for _ in range(4)]
+    t._forward_backward_inner_loop(subset)
+    # G=1 -> 4 calls of exactly 1 sample each (one graph at a time).
+    assert sizes == [1, 1, 1, 1]
+
+
+def test_gate_wired_warmup_switch_rebuilds_sampler():
+    """GATE (d): the warmup→inner-loop switch in _pre_step_hook flips
+    _inner_loop_active and rebuilds the loader into a valid subset-emitting
+    sampler at the boundary; before the boundary it stays one-step."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t._per_repo_full_backprop = True
+    t._per_repo_inner_loop = True
+    t._inner_loop_warmup_steps = 300
+    t._inner_loop_active = False
+    t._per_repo_inner_subset_size = 2
+    t._per_repo_max_inner_steps = 12
+    t._repo_group_keys = ["r1", "r1", "r1", "r2", "r2"]
+    t._repo_dropped_keys = set()
+    t._repo_num_workers = 0
+    t.cfg = {"seed": 7}
+    t.epoch = 0
+    t.train_dataset = list(range(5))
+    t._dataloader_invalidated = False
+    # _free_inner_loop_tree needs these.
+    t._shared_tree_memo = None
+    t._shared_tree_splice_reps = None
+    t._shared_tree_used_nodes = None
+    t._per_repo_shared_tree_active = False
+
+    import bgkit.training.phase2.kr_kb_trainer as M
+    orig_dl = M.DataLoader
+    M.DataLoader = lambda *a, **k: ("DL", k.get("batch_sampler"))
+    try:
+        # Before warmup: no switch.
+        t.global_step = 0
+        t._pre_step_hook()
+        assert t._inner_loop_active is False
+        assert t._dataloader_invalidated is False
+        # At the boundary: switch fires.
+        t.global_step = 300
+        t._pre_step_hook()
+        assert t._inner_loop_active is True
+        assert t._dataloader_invalidated is True
+        sampler = t._train_batch_sampler
+        assert sampler._inner_loop is True
+        # Valid subset-emitting state: r1(3)->[2,1], r2(2)->[2] = 3 batches.
+        assert len(sampler) == 3
+        # Idempotent: a later step does not re-switch.
+        t._dataloader_invalidated = False
+        t.global_step = 350
+        t._pre_step_hook()
+        assert t._dataloader_invalidated is False
+    finally:
+        M.DataLoader = orig_dl
+
+
+# ---------------------------------------------------------------------------
+# 17. Single-forward activation-peak bounds (the 4th-OOM fix)
+# ---------------------------------------------------------------------------
+
+
+def test_max_decode_tokens_truncates_long_gold_keeps_all():
+    """A long-gold sample is NOT skipped — its gold OUTPUT is hard-truncated to
+    the first max_decode_tokens gold tokens (no short-file bias). BOTH a short
+    and a long sample decode; the long one's gold is capped."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    w = torch.nn.Parameter(torch.zeros(1))
+    decoded_gold: list[int] = []
+
+    def fake_decode(segments):
+        # record the gold (loss-masked) token count actually decoded.
+        g = sum(
+            int(s.loss_mask.sum()) for s in segments
+            if isinstance(s, TokenSegment) and s.loss_mask is not None
+        )
+        decoded_gold.append(g)
+        return w.sum()
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t.device = torch.device("cpu")
+    t._max_decode_tokens = 100
+    t._per_repo_sample_group_size = 1
+    t._recursive_l1_retention_cfg = 0.1
+    t.global_step = 0
+    t.decoder = SimpleNamespace(forward_interleaved_with_loss=fake_decode)
+    t.encoder = SimpleNamespace(active_projection_output_dim=8)
+
+    # The assemble returns a gold segment of the sample's gold length.
+    gold_len = {"S": 50, "L": 5000}
+    t._prepare_sample_for_decode = types.MethodType(
+        lambda self, s: {"prepared_turns": [], "_g": gold_len[s]}, t,
+    )
+    t._assemble_sample_segments = types.MethodType(
+        lambda self, prep, per_turn: (
+            [TokenSegment(token_ids=torch.ones(prep["_g"], dtype=torch.long),
+                          loss_mask=torch.ones(prep["_g"]))],
+            None,
+        ),
+        t,
+    )
+
+    _loss, _tk, n_done, _nt, _ = t._encode_decode_group(["S", "L"])
+    # BOTH samples decoded (no skip); the long one's gold capped at 100.
+    assert n_done == 2
+    assert sorted(decoded_gold) == [50, 100]
+
+
+def test_max_decode_tokens_off_decodes_all():
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    w = torch.nn.Parameter(torch.zeros(1))
+    decoded: list[int] = []
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t.device = torch.device("cpu")
+    t._max_decode_tokens = 0  # off
+    t._per_repo_sample_group_size = 1
+    t._recursive_l1_retention_cfg = 0.1
+    t.global_step = 0
+    t.decoder = SimpleNamespace(
+        forward_interleaved_with_loss=lambda segs: decoded.append(1) or w.sum())
+    t.encoder = SimpleNamespace(active_projection_output_dim=8)
+    long_ = {"prepared_turns": [], "token_ids": torch.ones(5000, dtype=torch.long)}
+    t._prepare_sample_for_decode = types.MethodType(lambda self, s: long_, t)
+    t._assemble_sample_segments = types.MethodType(
+        lambda self, prep, per_turn: (
+            [TokenSegment(token_ids=torch.ones(1, dtype=torch.long),
+                          loss_mask=torch.ones(1))], None), t)
+    _l, _tk, n_done, _nt, _ = t._encode_decode_group(["x"])
+    assert n_done == 1 and len(decoded) == 1  # cap off -> decodes
+
+
+def test_max_l0_encode_tokens_truncates_buffer():
+    """_live_l0_encode truncates the per-leaf token buffer to the cap (bounds
+    the window-0 initial-import commit's single L0 forward + retained tree)."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    captured = {}
+
+    class _Store:
+        def get(self, dataset, aid):
+            # two "files": 30 + 90 tokens = 120 total.
+            return torch.ones(30 if aid == "a" else 90, dtype=torch.long)
+
+    class _Embed(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(8))
+        def forward(self, ids):
+            captured["n_tokens"] = int(ids.shape[0])  # the buffer fed to L0
+            return torch.zeros(int(ids.shape[0]), 8)
+
+    embed = _Embed()
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t.device = torch.device("cpu")
+    t._token_store = _Store()
+    t._max_l0_encode_tokens = 64  # < 120 -> truncate
+    t.encoder = SimpleNamespace(
+        l0=SimpleNamespace(backbone=SimpleNamespace(get_input_embeddings=lambda: embed)),
+    )
+    # Stub the heavy bits after the buffer is built.
+    t._sample_l0_retention_for = types.MethodType(lambda self, ds: 0.1, t)
+    t._surv_l0 = None
+    t._l0_prompt_tokens = 0
+    t._checkpointed_level = types.MethodType(
+        lambda self, level, **kw: SimpleNamespace(
+            survivor_embeddings=torch.zeros(1, 8),
+            survivor_cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
+        ), t,
+    )
+    from bgkit.training.survivorship_helpers import LevelLossCfg
+    t._surv_l0 = LevelLossCfg()
+    t.encoder.training = True
+
+    t._live_l0_encode("git_commit_repro", ["a", "b"])
+    # The L0 input buffer was truncated from 120 -> 64 tokens.
+    assert captured["n_tokens"] == 64
+
+
+# ---------------------------------------------------------------------------
+# 18. FIX 2: tree-encode checkpointing — gradient parity + θ-once
+# ---------------------------------------------------------------------------
+
+
+def test_fix2_tree_encode_checkpoint_gradient_parity():
+    """Checkpointing the per-node L1 forward gives the SAME gradient as the
+    non-checkpointed path (checkpoint recompute is exact), AND θ is accumulated
+    exactly ONCE (hoisted outside the checkpoint — the recompute must not
+    double-count)."""
+    import contextlib as _ctx
+
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+    from bgkit.training.survivorship_helpers import init_state
+
+    d = 8
+    lin = torch.nn.Linear(d, d)
+    # Shared (module-scope) embedding + tokenizer so the shared encode
+    # primitive's child-ID injection is IDENTICAL across the two runs — the
+    # grad-parity assertion compares lin.weight.grad between checkpoint on/off.
+    id_emb = torch.nn.Embedding(4, d)
+
+    def make_run_l1():
+        def fake(*, l1_input_embeddings, l1_input_cu_seqlens, target_ratio_l1, **kw):
+            surv = lin(l1_input_embeddings)
+            proj = lin(l1_input_embeddings)
+            l1_out = SimpleNamespace(
+                survivor_embeddings=surv,
+                survivor_cu_seqlens=torch.tensor([0, surv.shape[0]], dtype=torch.int32),
+                organic_count=torch.tensor(3),
+                controllable_count=torch.tensor(10),
+                valid_count=torch.tensor(10),
+            )
+            proj_out = SimpleNamespace(projected_embeddings=proj)
+            return l1_out, proj_out, None
+        return fake
+
+    def build():
+        t = KRKBTrainer.__new__(KRKBTrainer)
+        t.device = torch.device("cpu")
+        l0 = SimpleNamespace(
+            backbone=SimpleNamespace(get_input_embeddings=lambda: id_emb),
+        )
+        t.encoder = SimpleNamespace(
+            training=True, run_l1_and_project=make_run_l1(), l0=l0,
+        )
+        t.encoder_tokenizer = SimpleNamespace(
+            encode=lambda text, add_special_tokens=False: [1],
+        )
+        t._l1_adapter_context = types.MethodType(lambda self: _ctx.nullcontext(), t)
+        t._recursive_l1_retention_cfg = 0.2
+        t.global_step = 0
+        t._survivorship_aux = False
+        t._surv_state_l0 = init_state()
+        t._surv_state_l1 = init_state()
+        return t
+
+    children = torch.randn(5, d)
+    q = torch.randn(2, d)
+
+    def run(checkpoint: bool):
+        lin.weight.grad = None
+        t = build()
+        t._checkpoint_tree_encode = checkpoint
+        x = children.clone().requires_grad_(True)
+        proj, _l1 = t._encode_tree_node_live(["c0"], [x], q)
+        proj.sum().backward()
+        return (
+            lin.weight.grad.detach().clone(),
+            int(t._surv_state_l1.controllable_count_sum),
+        )
+
+    ref_grad, ref_ctrl = run(checkpoint=False)
+    got_grad, got_ctrl = run(checkpoint=True)
+
+    max_abs = (got_grad - ref_grad).abs().max().item()
+    assert torch.allclose(got_grad, ref_grad, atol=1e-6, rtol=1e-5), (
+        f"checkpointed tree-encode grad mismatch: max_abs={max_abs:.2e}"
+    )
+    # θ accumulated ONCE in both (controllable=10), not doubled (20) by the
+    # checkpoint recompute.
+    assert ref_ctrl == 10 and got_ctrl == 10, (ref_ctrl, got_ctrl)
+    print(f"[fix2 tree-encode] grad max_abs_diff={max_abs:.2e}  theta_ctrl={got_ctrl}")
+
+
+# ---------------------------------------------------------------------------
+# 19. FIX 2b: L0 leaf-encode checkpointing — gradient parity + θ-once
+# ---------------------------------------------------------------------------
+
+
+def test_fix2b_l0_leaf_checkpoint_gradient_parity():
+    """Checkpointing the L0 leaf encode gives the SAME gradient as the
+    non-checkpointed path (exact recompute), AND L0 θ is accumulated exactly
+    ONCE (hoisted outside the checkpoint — no double-count on recompute)."""
+    import contextlib as _ctx
+
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+    from bgkit.training.survivorship_helpers import init_state
+
+    d = 8
+    lin = torch.nn.Linear(d, d)  # the (trainable) L0 stand-in
+
+    class _L0(SimpleNamespace):
+        def auto_reproduce(self, x):
+            return lin(x)  # L0-out -> L1-in, trainable
+
+    def make_live_l0():
+        # Deterministic given ratio (no sampling inside). Survivors from lin.
+        def fake(dataset, article_ids, query_emb=None, ratio=None):
+            base = torch.ones(4, d)  # fixed "tokens" surrogate
+            out = SimpleNamespace(
+                survivor_embeddings=lin(base),
+                survivor_cu_seqlens=torch.tensor([0, 4], dtype=torch.int32),
+                organic_count=torch.tensor(2),
+                controllable_count=torch.tensor(8),
+                valid_count=torch.tensor(8),
+            )
+            return out, torch.tensor([0, 4], dtype=torch.int32), float(ratio or 0.1)
+        return fake
+
+    def build():
+        t = KRKBTrainer.__new__(KRKBTrainer)
+        t.device = torch.device("cpu")
+        t.encoder = SimpleNamespace(training=True, l0=_L0())
+        t._survivorship_aux = False
+        t._surv_state_l0 = init_state()
+        t._surv_state_l1 = init_state()
+        t._live_l0_encode = types.MethodType(
+            lambda self, ds, aids, query_emb=None, ratio=None:
+                make_live_l0()(ds, aids, query_emb, ratio), t,
+        )
+        # _encode_tree_node_live stub: identity-ish over the per-child survivor
+        # list, returns (proj, l1out). (The leaf now splits L0 survivors per
+        # article and injects each article's id via the shared primitive.)
+        t._encode_tree_node_live = types.MethodType(
+            lambda self, children_ids, children_survivors_l1in, q: (
+                torch.cat(list(children_survivors_l1in), 0),
+                torch.cat(list(children_survivors_l1in), 0),
+            ),
+            t,
+        )
+        t._sample_l0_retention_for = types.MethodType(lambda self, ds: 0.15, t)
+
+        # Non-checkpoint reference: mirror _l0_for_articles' aux-off branch
+        # (live encode + θ accumulated inside, return survivors).
+        def _l0_for_articles(self, ds, aids, query_emb=None):
+            out, cu, ratio = self._live_l0_encode(ds, aids, query_emb=query_emb)
+            self._accumulate_theta_from_counts(
+                "l0",
+                torch.tensor([
+                    float(out.organic_count), float(out.controllable_count),
+                    float(out.valid_count),
+                ]),
+                ratio,
+            )
+            return out.survivor_embeddings, cu
+        t._l0_for_articles = types.MethodType(_l0_for_articles, t)
+        return t
+
+    node = SimpleNamespace(id="commitA")
+    q = torch.randn(2, d)
+
+    def run(checkpoint: bool):
+        lin.weight.grad = None
+        t = build()
+        t._checkpoint_tree_encode = checkpoint
+        t._resolve_article_ids = types.MethodType(
+            lambda self, ds, ids: ["a", "b"], t,
+        )
+        proj, _l1 = t._encode_leaf_subtree("toy", node, q)
+        proj.sum().backward()
+        return (
+            lin.weight.grad.detach().clone(),
+            int(t._surv_state_l0.controllable_count_sum),
+        )
+
+    ref_grad, ref_ctrl = run(checkpoint=False)
+    got_grad, got_ctrl = run(checkpoint=True)
+    max_abs = (got_grad - ref_grad).abs().max().item()
+    assert torch.allclose(got_grad, ref_grad, atol=1e-6, rtol=1e-5), (
+        f"L0-leaf checkpoint grad mismatch: max_abs={max_abs:.2e}"
+    )
+    # L0 θ accumulated ONCE (controllable=8), not doubled (16) on recompute.
+    assert ref_ctrl == 8 and got_ctrl == 8, (ref_ctrl, got_ctrl)
+    print(f"[fix2b L0-leaf] grad max_abs_diff={max_abs:.2e}  theta_ctrl={got_ctrl}")
+
+
+def test_conditional_encode_checkpoint_gated_by_tree_size():
+    """SPEED: the encode checkpoint fires ONLY when _tree_encode_ckpt_active is
+    True (set per-tree from the node count). With _checkpoint_tree_encode on but
+    the per-tree flag off (small tree), _encode_tree_node_live runs the forward
+    DIRECTLY (no torch.utils.checkpoint call) → no recompute → fast."""
+    import contextlib as _ctx
+
+    import torch.utils.checkpoint as _ckpt_mod
+
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+    from bgkit.training.survivorship_helpers import init_state
+
+    d = 8
+    lin = torch.nn.Linear(d, d)
+
+    def fake_run_l1(*, l1_input_embeddings, l1_input_cu_seqlens, target_ratio_l1, **kw):
+        surv = lin(l1_input_embeddings)
+        proj = lin(l1_input_embeddings)
+        l1_out = SimpleNamespace(
+            survivor_embeddings=surv,
+            survivor_cu_seqlens=torch.tensor([0, surv.shape[0]], dtype=torch.int32),
+            organic_count=torch.tensor(3),
+            controllable_count=torch.tensor(10),
+            valid_count=torch.tensor(10),
+        )
+        return l1_out, SimpleNamespace(projected_embeddings=proj), None
+
+    id_emb = torch.nn.Embedding(4, d)
+
+    def build(active: bool):
+        t = KRKBTrainer.__new__(KRKBTrainer)
+        t.device = torch.device("cpu")
+        l0 = SimpleNamespace(
+            backbone=SimpleNamespace(get_input_embeddings=lambda: id_emb),
+        )
+        t.encoder = SimpleNamespace(
+            training=True, run_l1_and_project=fake_run_l1, l0=l0,
+        )
+        t.encoder_tokenizer = SimpleNamespace(
+            encode=lambda text, add_special_tokens=False: [1],
+        )
+        t._l1_adapter_context = types.MethodType(lambda self: _ctx.nullcontext(), t)
+        t._recursive_l1_retention_cfg = 0.2
+        t.global_step = 0
+        t._survivorship_aux = False
+        t._surv_state_l0 = init_state()
+        t._surv_state_l1 = init_state()
+        t._checkpoint_tree_encode = True
+        t._tree_encode_ckpt_active = active
+        return t
+
+    q = torch.randn(2, d)
+
+    def run(active: bool, monkeypatch_calls: list):
+        t = build(active)
+        x = torch.randn(5, d, requires_grad=True)
+        orig = _ckpt_mod.checkpoint
+
+        def spy(*a, **kw):
+            monkeypatch_calls.append(1)
+            return orig(*a, **kw)
+
+        _ckpt_mod.checkpoint = spy
+        try:
+            proj, _l1 = t._encode_tree_node_live(["c0"], [x], q)
+        finally:
+            _ckpt_mod.checkpoint = orig
+        proj.sum().backward()
+        return len(monkeypatch_calls)
+
+    on_calls = run(active=True, monkeypatch_calls=[])
+    off_calls = run(active=False, monkeypatch_calls=[])
+    assert on_calls == 1, f"expected 1 checkpoint call when active, got {on_calls}"
+    assert off_calls == 0, f"expected 0 checkpoint calls when inactive, got {off_calls}"
+
+
+# ---------------------------------------------------------------------------
+# Option A — crash-free amortized per-repo (decoder K-step / encoder 1-step)
+# ---------------------------------------------------------------------------
+
+
+def _option_a_trainer(dec_params, enc_params, *, dec_lr=0.0, enc_lr=0.0):
+    """A KRKBTrainer shell with a real single optimizer over a decoder group
+    and an encoder group, and the decoder param-id set installed — enough to
+    exercise the selective-step / group-classification helpers."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t.device = torch.device("cpu")
+    t.optimizer = torch.optim.SGD(
+        [
+            {"params": list(dec_params), "lr": dec_lr},
+            {"params": list(enc_params), "lr": enc_lr},
+        ],
+        lr=0.0,
+    )
+    t._option_a_decoder_param_ids = frozenset(id(p) for p in dec_params)
+    return t
+
+
+def test_option_a_group_classification_by_identity():
+    """_option_a_group_indices classifies each param-group as decoder vs
+    encoder by param identity (robust to Muon-style group splitting)."""
+    dec = torch.nn.Parameter(torch.randn(3, 3))
+    enc_a = torch.nn.Parameter(torch.randn(3, 3))
+    enc_b = torch.nn.Parameter(torch.randn(3))
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t.device = torch.device("cpu")
+    # Three groups: [decoder], [encoder 2D], [encoder 1D] (mimics a Muon split
+    # that put the encoder's 2D and 1D params in separate groups).
+    t.optimizer = torch.optim.SGD(
+        [
+            {"params": [dec], "lr": 0.1},
+            {"params": [enc_a], "lr": 0.1},
+            {"params": [enc_b], "lr": 0.1},
+        ],
+        lr=0.0,
+    )
+    t._option_a_decoder_param_ids = frozenset({id(dec)})
+    dec_idx, enc_idx = t._option_a_group_indices()
+    assert dec_idx == [0]
+    assert enc_idx == [1, 2]
+    assert t._option_a_params_for_groups(dec_idx) == [dec]
+    assert t._option_a_params_for_groups(enc_idx) == [enc_a, enc_b]
+
+
+def test_option_a_selective_step_moves_only_chosen_group():
+    """_option_a_step_groups steps ONLY the selected param-group; the other
+    group's weights are untouched even when it has a grad."""
+    dec = torch.nn.Parameter(torch.zeros(2))
+    enc = torch.nn.Parameter(torch.zeros(2))
+    t = _option_a_trainer([dec], [enc], dec_lr=1.0, enc_lr=1.0)
+    dec_idx, _enc_idx = t._option_a_group_indices()
+    dec.grad = torch.ones(2)
+    enc.grad = torch.ones(2)
+    t._option_a_step_groups(dec_idx)  # SGD lr=1 → dec -= 1
+    assert torch.allclose(dec, torch.full((2,), -1.0))
+    assert torch.allclose(enc, torch.zeros(2)), "encoder must NOT move"
+    # param_groups restored after the partial step.
+    assert len(t.optimizer.param_groups) == 2
+
+
+def test_option_a_decoder_grad_matches_standalone_subset():
+    """GATE (a): a subset's DECODER grad (reading the DETACHED tree_rd) is bit-exact
+    vs a standalone forward+backward of that subset with the same decoder
+    weights + same tree_rd (detachment isolates the decoder graph)."""
+    torch.manual_seed(0)
+    d = 4
+    enc_w = torch.nn.Parameter(torch.randn(d, d))
+    x = torch.randn(d)
+    tree_r = enc_w @ x
+    tree_rd = tree_r.detach().requires_grad_(True)
+
+    dec_w = torch.nn.Parameter(torch.randn(d, d))
+    # Option-A-style subset decode reading tree_rd.
+    loss = (dec_w @ tree_rd).sum()
+    loss.backward()
+    got = dec_w.grad.clone()
+
+    # Standalone: same weights, same tree_rd, fresh graph.
+    dec_w2 = torch.nn.Parameter(dec_w.detach().clone())
+    tree_rd2 = tree_r.detach().requires_grad_(True)
+    (dec_w2 @ tree_rd2).sum().backward()
+    ref = dec_w2.grad
+
+    assert torch.equal(got, ref), (got - ref).abs().max().item()
+
+
+def test_option_a_encoder_tree_grad_bitexact_sum_of_rd_grads():
+    """GATE (b): the ENCODER grad from ONE final tree-backward fed the
+    ACCUMULATED tree_rd.grad is bit-exact vs feeding the explicit SUM of the
+    per-file tree_rd.grad through one tree-backward. Validates that (1) repeated
+    ``loss.backward()`` accumulation sums correctly into ``tree_rd.grad`` and (2)
+    one tree-backward of that accumulated grad equals one tree-backward of the
+    explicit sum (same input tensor → bit-identical encoder grad)."""
+    torch.manual_seed(1)
+    d = 4
+    x = torch.randn(d)
+
+    # Decoder + K "subset" decodes reading the DETACHED tree_rd → accumulate
+    # tree_rd.grad via repeated backward (the production path).
+    enc1 = torch.nn.Parameter(torch.randn(d, d))
+    tree_r1 = (enc1 ** 2) @ x
+    tree_rd1 = tree_r1.detach().requires_grad_(True)
+    dec = torch.randn(d)
+    for k in range(3):
+        ((dec * (k + 1)) * tree_rd1).sum().backward()  # leaf tree_rd1 → no retain needed
+    accum = tree_rd1.grad.clone()
+    # The accumulation IS the sum of per-file dL/dR_d (= Σ_k dec*(k+1) = 6·dec).
+    assert torch.allclose(accum, dec * 6.0, atol=1e-6)
+
+    # One tree-backward of the accumulated grad.
+    torch.autograd.backward([tree_r1], [accum])
+    enc_grad_accum = enc1.grad.clone()
+
+    # Reference: feed the explicit sum (same tensor) through ONE tree-backward
+    # on a fresh identical graph → bit-exact.
+    enc2 = torch.nn.Parameter(enc1.detach().clone())
+    tree_r2 = (enc2 ** 2) @ x
+    torch.autograd.backward([tree_r2], [accum.clone()])
+    enc_grad_ref = enc2.grad.clone()
+
+    assert torch.equal(enc_grad_accum, enc_grad_ref), (
+        (enc_grad_accum - enc_grad_ref).abs().max().item()
+    )
+
+
+def test_option_a_no_inplace_crash_decoder_steps_then_encoder_backward():
+    """GATE (c): stepping the DECODER between subset backwards does NOT
+    invalidate tree_r's retained graph — the final encoder tree-backward succeeds.
+    Mirrors Option A's exact op sequence (detached tree_rd, drill touches encoder,
+    decoder-only step per subset, deferred single encoder backward)."""
+    torch.manual_seed(2)
+    d = 4
+    enc_w = torch.nn.Parameter(torch.randn(d, d))
+    dec_w = torch.nn.Parameter(torch.randn(d))
+    x = torch.randn(d)
+
+    tree_r = (enc_w ** 2) @ x                # retained tree output (enc_w value-bearing)
+    tree_rd = tree_r.detach().requires_grad_(True)
+    t = _option_a_trainer([dec_w], [enc_w], dec_lr=0.5, enc_lr=0.5)
+    dec_idx, enc_idx = t._option_a_group_indices()
+
+    dec_before = dec_w.detach().clone()
+    n_subsets = 3
+    for k in range(n_subsets):
+        t._option_a_zero_grads([dec_w])  # null ONLY decoder grad
+        # subset decode reads tree_rd (detached) AND a live "drill" touching enc_w.
+        loss = (dec_w * tree_rd).sum() + (enc_w * (k + 1)).sum()
+        loss.backward()                  # dec grad + enc drill grad(+=) + tree_rd.grad(+=)
+        assert dec_w.grad is not None
+        t._option_a_step_groups(dec_idx)  # step ONLY decoder; enc_w untouched
+    # decoder moved (K updates); encoder NOT yet stepped.
+    assert not torch.equal(dec_w.detach(), dec_before)
+
+    # accumulated drill grad on enc_w = 1+2+3 = 6 per element (before tree).
+    enc_drill_grad = enc_w.grad.clone()
+    assert torch.allclose(enc_drill_grad, torch.full((d, d), 6.0))
+
+    # FINAL: null decoder grad, ONE tree-backward through the still-valid tree_r.
+    t._option_a_zero_grads([dec_w])
+    enc_before = enc_w.detach().clone()
+    # This is the line that would raise "modified by an inplace operation" if
+    # the encoder had been stepped mid-loop.
+    torch.autograd.backward([tree_r], [tree_rd.grad])  # MUST NOT raise
+    # enc_w.grad now = drill (6) + tree contribution (d(tree_r)/d(enc_w) · tree_rd.grad).
+    assert not torch.equal(enc_w.grad, enc_drill_grad)
+    t._option_a_step_groups(enc_idx)          # encoder stepped ONCE
+    assert not torch.equal(enc_w.detach(), enc_before)
+
+
+def test_option_a_negative_control_stepping_encoder_midloop_crashes():
+    """Negative control proving the crux is load-bearing: if the ENCODER is
+    stepped mid-loop (mutating a weight tree_r's retained graph depends on), the
+    later tree-backward RAISES — exactly the original inner-loop crash."""
+    torch.manual_seed(3)
+    d = 4
+    enc_w = torch.nn.Parameter(torch.randn(d, d))
+    x = torch.randn(d)
+    # (enc_w ** 2) @ x makes enc_w's VALUE load-bearing in tree_r's backward (the
+    # pow saves enc_w), so an in-place step on enc_w trips the version guard.
+    tree_r = (enc_w ** 2) @ x
+    tree_rd = tree_r.detach().requires_grad_(True)
+    t = _option_a_trainer([], [enc_w], enc_lr=0.5)
+    _dec_idx, enc_idx = t._option_a_group_indices()
+
+    # Populate an encoder grad and STEP it (the wrong thing to do mid-repo).
+    enc_w.grad = torch.ones(d, d)
+    t._option_a_step_groups(enc_idx)  # mutates enc_w in place
+    # Now the retained tree_r graph references the pre-step enc_w version.
+    (tree_rd.sum()).backward()  # fills tree_rd.grad
+    with pytest.raises(RuntimeError):
+        torch.autograd.backward([tree_r], [tree_rd.grad])
+
+
+
+# ---------------------------------------------------------------------------
+# Full-tree Option A: drill-checkpoint, gold-output truncation, token gate
+# ---------------------------------------------------------------------------
+
+
+def test_partition_option_a_uncapped_vs_inner_capped():
+    """Option A partitions into ALL ceil(n/S) subsets (no K-cap → no file
+    dropped); the legacy inner-loop partition caps at per_repo_max_inner_steps."""
+    import math as _m
+
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t._per_repo_inner_subset_size = 16
+    t._per_repo_max_inner_steps = 4
+    t._option_a_max_subsets = 0  # unlimited
+    samples = list(range(100))  # 100 files, S=16 → 7 subsets
+    opt_a = t._partition_option_a_subsets(samples)
+    assert len(opt_a) == _m.ceil(100 / 16)            # all 7 — no file dropped
+    assert sum(len(s) for s in opt_a) == 100
+    # Legacy inner-loop drops the remainder beyond the K-cap.
+    inner = t._partition_inner_subsets(samples)
+    assert len(inner) == 4 and sum(len(s) for s in inner) == 64
+
+
+def test_truncate_segments_to_gold_budget():
+    """The gold OUTPUT is hard-cut to the first N gold tokens (prefix kept,
+    tail + subsequent segments dropped), the sample is NOT skipped."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+
+    def tok_seg(n, gold):
+        return TokenSegment(
+            token_ids=torch.arange(n, dtype=torch.long),
+            loss_mask=(torch.ones(n) if gold else torch.zeros(n)),
+        )
+
+    # prefix (10 non-gold) + gold(20) + trailing (5 non-gold "suffix/end").
+    segs = [tok_seg(10, False), tok_seg(20, True), tok_seg(5, False)]
+
+    # N=8 < 20 → cut inside the gold segment after the 8th gold token; drop the
+    # gold tail + the trailing segment.
+    out = t._truncate_segments_to_gold_budget(segs, 8)
+    assert len(out) == 2  # prefix + truncated gold (trailing dropped)
+    assert int(out[0].loss_mask.sum()) == 0
+    assert int(out[1].loss_mask.sum()) == 8       # first-8 gold only
+    assert out[1].token_ids.shape[0] == 8
+
+    # N >= total gold → unchanged (no truncation, sample kept whole).
+    out2 = t._truncate_segments_to_gold_budget(segs, 50)
+    assert out2 is segs or len(out2) == 3
+    assert sum(int(s.loss_mask.sum()) for s in out2) == 20
+
+    # N=0 → no-op.
+    assert t._truncate_segments_to_gold_budget(segs, 0) is segs
+
+
+def test_drill_checkpoint_gradient_parity_and_theta_once():
+    """GATE (a): the drill (run_l1_and_project) checkpointed gives a bit-exact
+    encoder gradient vs un-checkpointed, AND θ is accumulated exactly ONCE
+    (hoisted outside the checkpoint — recompute must not double-count)."""
+    import contextlib as _ctx
+
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+    from bgkit.training.survivorship_helpers import LevelLossCfg, init_state
+
+    d = 8
+    lin = torch.nn.Linear(d, d)
+
+    def make_enc():
+        def run_l1(*, l1_input_embeddings, l1_input_cu_seqlens, target_ratio_l1,
+                   **kw):
+            surv = lin(l1_input_embeddings)
+            out = SimpleNamespace(
+                survivor_embeddings=surv,
+                organic_count=torch.tensor(3),
+                controllable_count=torch.tensor(10),
+                valid_count=torch.tensor(10),
+            )
+            proj_out = SimpleNamespace(
+                projected_embeddings=surv, survivor_cu_seqlens=None,
+            )
+            return out, proj_out, l1_input_cu_seqlens
+        return SimpleNamespace(
+            training=True,
+            active_projection_output_dim=d,
+            l0=SimpleNamespace(auto_reproduce=lambda x: x),
+            run_l1_and_project=run_l1,
+        )
+
+    def build(threshold):
+        t = KRKBTrainer.__new__(KRKBTrainer)
+        t.device = torch.device("cpu")
+        t.encoder = make_enc()
+        t._l1_adapter_context = types.MethodType(lambda self: _ctx.nullcontext(), t)
+        t._survivorship_aux = False
+        t._surv_l1 = LevelLossCfg()
+        t._surv_state_l0 = init_state()
+        t._surv_state_l1 = init_state()
+        t._drill_checkpoint_min_seqlen = threshold
+        return t
+
+    # content length 6 (> threshold 2 when checkpointing; > 0 always requires_grad).
+    def turn():
+        return {
+            "content": torch.randn(6, d, requires_grad=True),
+            "query_emb": torch.randn(2, d),
+            "pinned": torch.zeros(6, dtype=torch.bool),
+            "relevance_mask": torch.zeros(6, dtype=torch.bool),
+            "survivor_mask": torch.zeros(6, dtype=torch.bool),
+        }
+
+    base_turn = turn()
+
+    def run(threshold):
+        lin.weight.grad = None
+        t = build(threshold)
+        tn = {k: (v.clone().detach().requires_grad_(True)
+                  if k == "content" else v) for k, v in base_turn.items()}
+        out = t._run_l1_batch([tn], target_ratio=0.2)
+        out[0].sum().backward()
+        return lin.weight.grad.detach().clone(), int(
+            t._surv_state_l1.controllable_count_sum
+        )
+
+    ref_grad, ref_ctrl = run(0)     # checkpoint OFF
+    got_grad, got_ctrl = run(2)     # checkpoint ON (seqlen 6 > 2)
+    max_abs = (got_grad - ref_grad).abs().max().item()
+    assert torch.allclose(got_grad, ref_grad, atol=1e-6, rtol=1e-5), (
+        f"drill-checkpoint grad mismatch: max_abs={max_abs:.2e}"
+    )
+    assert ref_ctrl == 10 and got_ctrl == 10, (ref_ctrl, got_ctrl)
+    print(f"[drill-ckpt] grad max_abs_diff={max_abs:.2e}  theta_ctrl={got_ctrl}")
+
+
+def test_tree_checkpoint_token_gate_fires_on_low_node_big_leaf():
+    """GATE (e, basis): the token gate activates the tree-encode checkpoint for
+    a LOW-node repo with a big initial-import leaf (full-tree case), where the
+    node gate alone would skip it."""
+    dim, dec_dim = 8, 8
+    tok = _FakeTokenizer()
+    enc = _RecorderEncoder(dim, dec_dim)
+    t = _make_per_repo_trainer(enc, tok, _commit_repro_tree(), dim, dec_dim)
+    _stub_live_l0_per_repo(t, enc, dim)
+    t._checkpoint_tree_encode = True
+    # Low-node tree but a "big leaf": stub the counts so the NODE gate would
+    # skip (4 <= 64) while the TOKEN gate fires (90k > 16384).
+    t._repo_tree_node_count = types.MethodType(lambda self, ds, r: 4, t)
+    t._repo_leaf_token_count = types.MethodType(lambda self, ds, r: 90_000, t)
+    t._tree_checkpoint_min_nodes = 64
+    t._tree_checkpoint_min_tokens = 16384
+
+    captured = {}
+
+    # Capture the per-tree decision mid-encode (set before _encode_subtree,
+    # restored in finally). No-op encode → isolates the gate logic.
+    def capturing_encode(self, ds, tree, root, q, memo, stats):
+        captured["active"] = self._tree_encode_ckpt_active
+
+    t._encode_subtree = types.MethodType(capturing_encode, t)
+    t._compute_shared_repo_tree("toy", "repo/w000")
+
+    assert captured["active"] is True, (
+        "token gate must activate the per-node checkpoint for the big-leaf "
+        "low-node (full-tree) repo"
+    )

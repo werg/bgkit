@@ -33,6 +33,8 @@ import argparse
 import json
 import random
 import sys
+from collections import OrderedDict
+from collections.abc import Iterator
 from pathlib import Path
 
 _src = str(Path(__file__).resolve().parent.parent / "src")
@@ -46,50 +48,98 @@ from bgkit.data.bgkit_tool_template import trajectory_to_json
 from bgkit.data.browse_tree import BrowseTree
 from bgkit.data.commit_repro import (
     DATASET_NAME,
-    DRILL_PROB,
-    MAX_PRECEDING_COMMITS,
+    HEAD_QUERY_TEMPLATES,
+    MAX_DISTRACTORS,
+    MAX_TOUCHING_DIFFS,
     QUERY_TEMPLATES,
     FileChange,
     ReproCommit,
-    WalkStep,
-    build_file_reconstruction_trajectory,
+    build_file_drilldown_trajectory,
     build_per_file_index,
     build_query,
     commit_key,
 )
 
+# Trajectory rows buffered before each incremental parquet RecordBatch write.
+# Bounds peak memory to (this many rows) + one repo's commits, never the corpus.
+FLUSH_ROWS = 2000
 
-def _load_commits(path: Path) -> dict[tuple[str, int], list[ReproCommit]]:
-    """Group commits by ``(repo, window)`` → ascending-ordinal commit list."""
-    groups: dict[tuple[str, int], list[ReproCommit]] = {}
+
+def _parse_commit(rec: dict) -> ReproCommit:
+    """Deserialize one JSONL record into a :class:`ReproCommit`."""
+    return ReproCommit(
+        repo=str(rec["repo"]), sha=str(rec.get("sha", "")),
+        ordinal=int(rec["ordinal"]), message=str(rec.get("message", "")),
+        timestamp=int(rec.get("timestamp", 0)),
+        window_idx=int(rec.get("window_idx", 0)),
+        file_changes=[
+            FileChange(
+                file_idx=int(fc["file_idx"]), path=str(fc["path"]),
+                diff_text=str(fc.get("diff_text", "")),
+                n_tokens=int(fc.get("n_tokens", 0)),
+                blob_text=str(fc.get("blob_text", "")),
+                n_blob_tokens=int(fc.get("n_blob_tokens", 0)),
+                is_target=bool(fc.get("is_target", False)),
+            )
+            for fc in rec["file_changes"]
+        ],
+        n_diff_tokens=int(rec.get("n_diff_tokens", 0)),
+    )
+
+
+def _iter_repo_groups(
+    path: Path,
+) -> Iterator[tuple[str, OrderedDict[int, list[ReproCommit]]]]:
+    """Stream the JSONL one ``repo`` at a time.
+
+    The corpus is written contiguously by ``repo`` (verified: 13346 repos,
+    13346 transitions, 0 reappearances over the 11 GB file), so a single pass
+    that accumulates the current repo's commits and flushes on the repo boundary
+    bounds peak memory to one repo (max 512 commits / 12.7 MB observed) instead
+    of the whole corpus.
+
+    For each repo it yields ``(repo, windows)`` where ``windows`` maps
+    ``window_idx`` → ascending-ordinal commit list, with windows in first-seen
+    order — reproducing the ``(repo, window)`` grouping + per-group ordinal sort
+    of the old whole-file ``_load_commits`` exactly. A fail-fast guard raises if
+    a repo ever reappears after being flushed (i.e. the contiguity assumption is
+    violated), rather than silently splitting a repo's grouping.
+    """
+    seen_repos: set[str] = set()
+    cur_repo: str | None = None
+    cur_commits: list[ReproCommit] = []
+
+    def _finish(repo: str, commits: list[ReproCommit]) -> tuple[
+        str, OrderedDict[int, list[ReproCommit]]
+    ]:
+        windows: OrderedDict[int, list[ReproCommit]] = OrderedDict()
+        for c in commits:
+            windows.setdefault(c.window_idx, []).append(c)
+        for group in windows.values():
+            group.sort(key=lambda c: c.ordinal)
+        return repo, windows
+
     with path.open() as f:
         for line in f:
             if not line.strip():
                 continue
-            rec = json.loads(line)
-            repo = str(rec["repo"])
-            window = int(rec.get("window_idx", 0))
-            commit = ReproCommit(
-                repo=repo, sha=str(rec.get("sha", "")),
-                ordinal=int(rec["ordinal"]), message=str(rec.get("message", "")),
-                timestamp=int(rec.get("timestamp", 0)), window_idx=window,
-                file_changes=[
-                    FileChange(
-                        file_idx=int(fc["file_idx"]), path=str(fc["path"]),
-                        diff_text=str(fc.get("diff_text", "")),
-                        n_tokens=int(fc.get("n_tokens", 0)),
-                        blob_text=str(fc.get("blob_text", "")),
-                        n_blob_tokens=int(fc.get("n_blob_tokens", 0)),
-                        is_target=bool(fc.get("is_target", False)),
+            commit = _parse_commit(json.loads(line))
+            if commit.repo != cur_repo:
+                if cur_repo is not None:
+                    yield _finish(cur_repo, cur_commits)
+                if commit.repo in seen_repos:
+                    raise RuntimeError(
+                        f"repo {commit.repo!r} reappears non-contiguously in "
+                        f"{path}; streaming-by-repo grouping would be wrong. "
+                        "Re-sort the input by repo or switch to a two-pass "
+                        "offset index.",
                     )
-                    for fc in rec["file_changes"]
-                ],
-                n_diff_tokens=int(rec.get("n_diff_tokens", 0)),
-            )
-            groups.setdefault((repo, window), []).append(commit)
-    for commits in groups.values():
-        commits.sort(key=lambda c: c.ordinal)
-    return groups
+                seen_repos.add(commit.repo)
+                cur_repo = commit.repo
+                cur_commits = []
+            cur_commits.append(commit)
+    if cur_repo is not None:
+        yield _finish(cur_repo, cur_commits)
 
 
 def main() -> None:
@@ -99,80 +149,19 @@ def main() -> None:
     parser.add_argument("--commit-node-ids", type=Path, required=True,
                         help="sidecar {repo@wWWW:OOOO: node_id} from build_commit_repro_tree")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--K", type=int, default=MAX_PRECEDING_COMMITS,
-                        help="max preceding file-touching commits to walk")
-    parser.add_argument("--drill-prob", type=float, default=DRILL_PROB,
-                        help="P(bgkit-drill the file's diff at a PRECEDING commit)")
+    parser.add_argument("--max-touching", type=int, default=MAX_TOUCHING_DIFFS,
+                        help="cap on touching-diff drill targets per sample (most-recent)")
+    parser.add_argument("--n-distractors", type=int, default=MAX_DISTRACTORS,
+                        help="0..this distractor branches (loss=False) per sample")
     parser.add_argument("--seed", type=int, default=17)
     args = parser.parse_args()
 
     tree = BrowseTree.load(args.browse_tree, dataset=DATASET_NAME)
     commit_node_ids = json.loads(args.commit_node_ids.read_text())
-    groups = _load_commits(args.input)
-
-    rows = []
-    n_dropped = 0
-    n_targets = 0
-    for (repo, window), commits in groups.items():
-        ord_to_message = {c.ordinal: c.message for c in commits}
-        file_index = build_per_file_index(commits)
-        for file_path, history in file_index.items():
-            # history: oldest→ list of (ordinal, FileChange) touching this file
-            for tpos, (target_ord, target_fc) in enumerate(history):
-                if not target_fc.is_target:
-                    continue
-                n_targets += 1
-                # Preceding commits touching the file: up to K closest before
-                # the target, kept in chronological order, then the target.
-                preceding = history[max(0, tpos - args.K):tpos]
-                walk_entries = [*preceding, (target_ord, target_fc)]
-
-                # Per-target deterministic RNG for drill decisions + template.
-                key = commit_key(repo, window, target_ord) + f"#f{target_fc.file_idx:03d}"
-                rng = random.Random(f"{args.seed}:{key}")
-
-                walk: list[WalkStep] = []
-                ok = True
-                for ord_i, fc_i in walk_entries:
-                    node_id = commit_node_ids.get(commit_key(repo, window, ord_i))
-                    if node_id is None or node_id not in tree:
-                        ok = False
-                        break
-                    is_target = ord_i == target_ord
-                    drill = is_target or (rng.random() < args.drill_prob)
-                    walk.append(WalkStep(
-                        commit_node_id=node_id,
-                        file_change_id=f"{commit_key(repo, window, ord_i)}#f{fc_i.file_idx:03d}",
-                        is_target=is_target, drill=drill,
-                    ))
-                if not ok:
-                    n_dropped += 1
-                    continue
-
-                template_idx = rng.randrange(len(QUERY_TEMPLATES))
-                query = build_query(
-                    file_path, ord_to_message.get(target_ord, ""), template_idx,
-                )
-                gold_blob = target_fc.blob_text
-                trajectory = build_file_reconstruction_trajectory(
-                    tree, walk, query, gold_blob,
-                )
-                rows.append({
-                    "dataset_name": DATASET_NAME,
-                    "scope_template": "pre_scoped",
-                    "scope_description": (
-                        f"git repository {repo} (history window {window}) — "
-                        f"reconstruct the full state of a file from its diff history"
-                    ),
-                    "topic_list_json": json.dumps([]),
-                    "question": query,
-                    "gold_answer": gold_blob,
-                    "trajectory_json": trajectory_to_json(trajectory),
-                })
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     out = args.output_dir / f"{DATASET_NAME}.parquet"
-    table = pa.Table.from_pylist(rows, schema=pa.schema([
+    schema = pa.schema([
         ("dataset_name", pa.string()),
         ("scope_template", pa.string()),
         ("scope_description", pa.string()),
@@ -180,10 +169,89 @@ def main() -> None:
         ("question", pa.string()),
         ("gold_answer", pa.string()),
         ("trajectory_json", pa.string()),
-    ]))
-    pq.write_table(table, out)
+    ])
+
+    # Incremental write: buffer trajectory rows and flush a RecordBatch once the
+    # buffer reaches FLUSH_ROWS, so peak memory is bounded by the buffer + the
+    # current repo's commits, never the whole corpus.
+    writer = pq.ParquetWriter(out, schema)
+    rows: list[dict] = []
+    n_rows = 0
+    n_dropped = 0
+    n_targets = 0
+
+    def _flush() -> None:
+        if not rows:
+            return
+        writer.write_table(pa.Table.from_pylist(rows, schema=schema))
+        rows.clear()
+
+    for repo, windows in _iter_repo_groups(args.input):
+        for window, commits in windows.items():
+            ord_to_message = {c.ordinal: c.message for c in commits}
+            ord_to_commit = {c.ordinal: c for c in commits}
+            file_index = build_per_file_index(commits)
+            for file_path, history in file_index.items():
+                # history: oldest→ list of (ordinal, FileChange) touching file
+                for tpos, (target_ord, target_fc) in enumerate(history):
+                    if not target_fc.is_target:
+                        continue
+                    n_targets += 1
+                    # All commits touching the file up to + including the
+                    # target, capped to the most-recent --max-touching (the
+                    # diffs the drill-down must find, one drill target each).
+                    touching = history[:tpos + 1]
+                    if len(touching) > args.max_touching:
+                        touching = touching[-args.max_touching:]
+
+                    # Per-sample deterministic RNG for distractor + template.
+                    key = (
+                        commit_key(repo, window, target_ord)
+                        + f"#f{target_fc.file_idx:03d}"
+                    )
+                    rng = random.Random(f"{args.seed}:{key}")
+                    head_template_idx = rng.randrange(len(HEAD_QUERY_TEMPLATES))
+
+                    gold_blob = target_fc.blob_text
+                    trajectory = build_file_drilldown_trajectory(
+                        tree, commit_node_ids, repo, window, file_path, touching,
+                        ord_to_message.get(target_ord, ""), gold_blob,
+                        ord_to_commit=ord_to_commit,
+                        head_template_idx=head_template_idx,
+                        n_distractors=args.n_distractors, rng=rng,
+                    )
+                    if trajectory is None:
+                        n_dropped += 1
+                        continue
+
+                    # The user question is the reconstruction request; the head
+                    # task (navigation) query lives inside the head drill.
+                    template_idx = rng.randrange(len(QUERY_TEMPLATES))
+                    query = build_query(
+                        file_path, ord_to_message.get(target_ord, ""),
+                        template_idx,
+                    )
+                    rows.append({
+                        "dataset_name": DATASET_NAME,
+                        "scope_template": "pre_scoped",
+                        "scope_description": (
+                            f"git repository {repo} (history window {window}) — "
+                            "reconstruct the full state of a file from its diff "
+                            "history"
+                        ),
+                        "topic_list_json": json.dumps([]),
+                        "question": query,
+                        "gold_answer": gold_blob,
+                        "trajectory_json": trajectory_to_json(trajectory),
+                    })
+                    n_rows += 1
+                    if len(rows) >= FLUSH_ROWS:
+                        _flush()
+
+    _flush()
+    writer.close()
     print(
-        f"wrote {out} — {len(rows)} reconstruction trajectories "
+        f"wrote {out} — {n_rows} reconstruction trajectories "
         f"({n_targets} targets, {n_dropped} dropped)",
     )
 

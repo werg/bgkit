@@ -7,9 +7,9 @@ Phase 2 KB-scale evaluation:
 
 1. :func:`trajectory_step_accuracy` — strictly per-token greedy-argmax
    match over every loss-bearing position in the trajectory.
-2. :func:`tool_call_id_accuracy` — per browse/bgkit call, does the greedy
-   decode of the assistant tool-call tokens contain the teacher's ``id``
-   / ``ids`` argument as a substring of the decoded text?
+2. :func:`tool_call_id_accuracy` — per bgkit call, does the greedy
+   decode of the assistant tool-call tokens contain the teacher's
+   ``ids`` argument as a substring of the decoded text?
 3. :func:`answer_token_f1` — token-level F1 between the decoded
    predicted answer and ``sample.gold_answer``.
 
@@ -60,10 +60,8 @@ EMPTY_RESULT: dict = {
     "trajectory_total_tokens": 0,
     "trajectory_correct_tokens": 0,
     "tool_call_id_accuracy": {
-        "browse": 0.0,
         "bgkit": 0.0,
         "overall": 0.0,
-        "n_browse": 0,
         "n_bgkit": 0,
     },
     "answer_token_f1": 0.0,
@@ -143,9 +141,6 @@ def trajectory_step_accuracy(
 def _tool_call_gold_ids(turn) -> list[str]:
     """Normalize a trajectory turn's ``id`` / ``ids`` argument into a list."""
     args = getattr(turn, "args", {}) or {}
-    if turn.kind == "browse":
-        raw = args.get("id", "")
-        return [str(raw)] if raw else []
     if turn.kind == "bgkit":
         raw = args.get("ids", [])
         if isinstance(raw, (list, tuple)):
@@ -201,38 +196,24 @@ def _score_call_span(
 def tool_call_id_accuracy(
     trainer: KRKBTrainer, sample: KBSample,
 ) -> dict[str, float]:
-    """Per browse/bgkit call, score whether greedy decode matches gold IDs.
+    """Per bgkit call, score whether greedy decode matches gold IDs.
 
     Returns a dict with keys:
 
-    - ``browse``: mean browse-call accuracy (1.0 if all tool-call tokens
-      under greedy decode contain the gold ``id``, else 0.0), averaged
-      across browse calls. ``0.0`` when no browse calls.
-    - ``bgkit``: same for bgkit calls, substring-matching every ID in
-      ``ids``. ``0.0`` when no bgkit calls.
-    - ``overall``: micro-averaged across all tool calls (browse +
-      bgkit). ``0.0`` when no tool calls.
-    - ``n_browse``, ``n_bgkit``: counts used for the averages, so the
-      caller can aggregate across a dataset with the correct weighting.
+    - ``bgkit``: mean bgkit-call accuracy (1.0 if all tool-call tokens
+      under greedy decode contain every gold ID in ``ids``, else 0.0),
+      averaged across bgkit calls. ``0.0`` when no bgkit calls.
+    - ``overall``: micro-averaged across all tool calls. Equal to
+      ``bgkit`` now that browse is gone. ``0.0`` when no tool calls.
+    - ``n_bgkit``: count used for the average, so the caller can
+      aggregate across a dataset with the correct weighting.
     """
     fwd = _run_forward(trainer, sample)
     if fwd is None:
-        return {
-            "browse": 0.0, "bgkit": 0.0, "overall": 0.0,
-            "n_browse": 0, "n_bgkit": 0,
-        }
+        return {"bgkit": 0.0, "overall": 0.0, "n_bgkit": 0}
     output, trace = fwd
     preds, _shift_t, shift_m = _greedy_shift_view(output)
     tokenizer = trainer.tokenizer
-
-    browse_scores: list[float] = []
-    for turn, span in zip(
-        trace.browse_turns, trace.browse_call_spans, strict=True,
-    ):
-        gold_ids = _tool_call_gold_ids(turn)
-        browse_scores.append(
-            _score_call_span(preds, shift_m, span, gold_ids, tokenizer)
-        )
 
     bgkit_scores: list[float] = []
     for turn, span in zip(
@@ -243,20 +224,11 @@ def tool_call_id_accuracy(
             _score_call_span(preds, shift_m, span, gold_ids, tokenizer)
         )
 
-    n_browse = len(browse_scores)
     n_bgkit = len(bgkit_scores)
-    browse_mean = sum(browse_scores) / n_browse if n_browse else 0.0
     bgkit_mean = sum(bgkit_scores) / n_bgkit if n_bgkit else 0.0
-    overall_total = n_browse + n_bgkit
-    overall_mean = (
-        (sum(browse_scores) + sum(bgkit_scores)) / overall_total
-        if overall_total else 0.0
-    )
     return {
-        "browse": browse_mean,
         "bgkit": bgkit_mean,
-        "overall": overall_mean,
-        "n_browse": n_browse,
+        "overall": bgkit_mean,
         "n_bgkit": n_bgkit,
     }
 
@@ -365,14 +337,6 @@ def evaluate_sample(
     correct_tokens = int(((preds == shift_t) & shift_m).sum().item())
     step_acc = correct_tokens / total_tokens
 
-    browse_scores: list[float] = []
-    for turn, span in zip(
-        trace.browse_turns, trace.browse_call_spans, strict=True,
-    ):
-        gold_ids = _tool_call_gold_ids(turn)
-        browse_scores.append(
-            _score_call_span(preds, shift_m, span, gold_ids, tokenizer)
-        )
     bgkit_scores: list[float] = []
     for turn, span in zip(
         trace.bgkit_turns, trace.bgkit_call_spans, strict=True,
@@ -381,17 +345,11 @@ def evaluate_sample(
         bgkit_scores.append(
             _score_call_span(preds, shift_m, span, gold_ids, tokenizer)
         )
-    n_browse = len(browse_scores)
     n_bgkit = len(bgkit_scores)
-    tool_total = n_browse + n_bgkit
+    bgkit_mean = sum(bgkit_scores) / n_bgkit if n_bgkit else 0.0
     tool_call_metrics = {
-        "browse": sum(browse_scores) / n_browse if n_browse else 0.0,
-        "bgkit": sum(bgkit_scores) / n_bgkit if n_bgkit else 0.0,
-        "overall": (
-            (sum(browse_scores) + sum(bgkit_scores)) / tool_total
-            if tool_total else 0.0
-        ),
-        "n_browse": n_browse,
+        "bgkit": bgkit_mean,
+        "overall": bgkit_mean,
         "n_bgkit": n_bgkit,
     }
 
