@@ -9,8 +9,9 @@ defaults:
   - _self_
 
 run_name: phase2_kb_git_repro_fullbackprop
-# RESUME from the live run's latest checkpoint to load the enhanced ablation
-# probe (nav/recon CE split) without losing training progress. The initial
-# drill-down launch used "none" (fresh from summarization step51945); now we
-# resume the in-progress run. Revert to "none" only for a from-scratch restart.
-resume_checkpoint: /workspace/checkpoints/phase2_kb_step200_20260703_173150
+# FRESH from summarization step51945 ("none" disables auto-resume). The
+# 2026-07-03 opaque-BIP-39-ID + child-ID-injection redesign + data regen makes
+# ALL prior git-repro checkpoints incompatible (they trained on positional IDs
+# with no child-ID in the tree reps), so restart the task from the clean phase1
+# base to learn navigation from the reps.
+resume_checkpoint: "none"
