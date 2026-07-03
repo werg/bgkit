@@ -460,10 +460,16 @@ def test_auto_resolution_prefers_on_disk(tmp_path):
 class _FakeTrainer:
     """Minimal stand-in for BaseTrainer to test registry helpers without GPU."""
 
-    def __init__(self, tmp_path):
+    def __init__(self, tmp_path, run_name=None):
         from types import SimpleNamespace
 
-        self.cfg = SimpleNamespace(training=SimpleNamespace(phase="ice"))
+        # Mirror the production OmegaConf cfg, which supports BOTH attribute
+        # access (cfg.training) and dict-style .get("run_name", default).
+        class _Cfg(SimpleNamespace):
+            def get(self, key, default=None):
+                return getattr(self, key, default)
+
+        self.cfg = _Cfg(training=SimpleNamespace(phase="ice"), run_name=run_name)
         self.global_step = 500
         self.epoch = 1
         self._last_checkpoint_path = None
@@ -711,3 +717,101 @@ def test_resolve_latest_checkpoint_finds_latest(tmp_path):
 def test_resolve_latest_checkpoint_returns_none_when_empty(tmp_path):
     result = resolve_latest_checkpoint(tmp_path, phase="ice")
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Run-scoped auto-resume (FIX 1): a run must only auto-resume its OWN
+# checkpoints, never another run sharing the same phase.
+# ---------------------------------------------------------------------------
+
+
+def _make_ckpt_on_disk_with_run(tmp_path, name, step, run_name, phase="phase2_kb"):
+    """Create a mock checkpoint dir whose metadata.json records a run_name."""
+    ckpt = tmp_path / name
+    ckpt.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "phase": phase,
+        "step": step,
+        "epoch": 0,
+        "parent_checkpoint": None,
+        "run_name": run_name,
+    }
+    (ckpt / "metadata.json").write_text(json.dumps(meta))
+    (ckpt / "model.pt").write_text("fake weights")
+    return ckpt
+
+
+def test_run_scoped_does_not_resume_other_run(tmp_path):
+    """A run_name-B run must NOT auto-resume run_name-A's checkpoint, even
+    though both share phase=phase2_kb (the latent-crash scenario)."""
+    _make_ckpt_on_disk_with_run(tmp_path, "phase2_kb_step100_20260220_220522", 100, "run_a")
+    # run_b asks for its own latest; there is none → cold start (None).
+    result = resolve_latest_checkpoint(tmp_path, phase="phase2_kb", run_name="run_b")
+    assert result is None
+
+
+def test_run_scoped_resumes_same_run(tmp_path):
+    """Same-run resume still works: run_a resolves its own latest checkpoint."""
+    _make_ckpt_on_disk_with_run(tmp_path, "phase2_kb_step100_20260220_220522", 100, "run_a")
+    _make_ckpt_on_disk_with_run(tmp_path, "phase2_kb_step200_20260221_100000", 200, "run_a")
+    result = resolve_latest_checkpoint(tmp_path, phase="phase2_kb", run_name="run_a")
+    assert result == tmp_path / "phase2_kb_step200_20260221_100000"
+
+
+def test_run_scoped_picks_own_among_mixed_runs(tmp_path):
+    """With interleaved runs sharing a phase, each resolves only its own
+    latest — the higher-step foreign checkpoint is ignored."""
+    _make_ckpt_on_disk_with_run(tmp_path, "phase2_kb_step100_20260220_220522", 100, "run_a")
+    _make_ckpt_on_disk_with_run(tmp_path, "phase2_kb_step300_20260222_100000", 300, "run_b")
+    _make_ckpt_on_disk_with_run(tmp_path, "phase2_kb_step200_20260221_100000", 200, "run_a")
+    result = resolve_latest_checkpoint(tmp_path, phase="phase2_kb", run_name="run_a")
+    assert result == tmp_path / "phase2_kb_step200_20260221_100000"
+
+
+def test_run_scoped_ignores_checkpoints_without_run_name(tmp_path):
+    """Old checkpoints lacking a recorded run_name are never cross-matched to
+    a named run — the run cold-starts instead of grabbing them."""
+    _make_ckpt_on_disk(tmp_path, "phase2_kb_step100_20260220_220522", 100, phase="phase2_kb")
+    result = resolve_latest_checkpoint(tmp_path, phase="phase2_kb", run_name="run_a")
+    assert result is None
+
+
+def test_no_run_name_preserves_phase_only_behavior(tmp_path):
+    """When run_name is None (unnamed run), behaviour is unchanged: phase-only,
+    latest step wins — including over run-tagged checkpoints."""
+    _make_ckpt_on_disk_with_run(tmp_path, "phase2_kb_step100_20260220_220522", 100, "run_a")
+    _make_ckpt_on_disk_with_run(tmp_path, "phase2_kb_step200_20260221_100000", 200, "run_b")
+    result = resolve_latest_checkpoint(tmp_path, phase="phase2_kb", run_name=None)
+    assert result == tmp_path / "phase2_kb_step200_20260221_100000"
+
+
+def test_latest_run_name_filter(tmp_path):
+    """CheckpointRegistry.latest(run_name=...) filters in memory too."""
+    reg = CheckpointRegistry(tmp_path)
+    reg.register(_make_entry(name="a", phase="phase2_kb", step=100, run_name="run_a"))
+    reg.register(_make_entry(name="b", phase="phase2_kb", step=200, run_name="run_b"))
+    reg.register(_make_entry(name="c", phase="phase2_kb", step=150, run_name="run_a"))
+    latest_a = reg.latest(phase="phase2_kb", run_name="run_a")
+    assert latest_a.name == "c"
+    assert reg.latest(phase="phase2_kb", run_name="run_missing") is None
+    # No filter → phase-only, highest step.
+    assert reg.latest(phase="phase2_kb").name == "b"
+
+
+def test_backfill_records_run_name_from_metadata(tmp_path):
+    """backfill() reads run_name out of metadata.json into the registry entry."""
+    _make_ckpt_on_disk_with_run(tmp_path, "phase2_kb_step100_20260220_220522", 100, "run_a")
+    reg = CheckpointRegistry(tmp_path)
+    reg.backfill(tmp_path)
+    entry = reg.get("phase2_kb_step100_20260220_220522")
+    assert entry is not None
+    assert entry.run_name == "run_a"
+
+
+def test_build_registry_entry_records_run_name(tmp_path):
+    """_build_registry_entry captures cfg.run_name."""
+    trainer = _FakeTrainer(tmp_path, run_name="run_a")
+    ckpt = tmp_path / "ice_step500_20260224_120000"
+    ckpt.mkdir()
+    entry = trainer._build_registry_entry(ckpt, None, wandb_run=None)
+    assert entry.run_name == "run_a"

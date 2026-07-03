@@ -1325,6 +1325,71 @@ class BaseTrainer(ABC):
                 "param the optimizer touches.",
             )
 
+    def _graceful_shutdown_save(
+        self,
+        *,
+        checkpoint_dir: Path,
+        registry,
+        ckpt_manager,
+        wandb_run,
+        es_best,
+        es_evals_without_improvement,
+        step: int,
+        interruptor,
+        already_saved: bool,
+    ) -> None:
+        """Write a rescue checkpoint on SIGTERM/SIGINT.
+
+        Called from every graceful-shutdown detection point (mid-accumulation,
+        or at the end-of-step check). Two guarantees that keep the save inside a
+        short ``docker stop`` grace window:
+
+        * **Fast path only.** ``save_checkpoint`` routes through
+          ``_write_checkpoint``, which writes to the NVMe ``_fast_checkpoint_dir``
+          when configured. The NVMe copy is authoritative (resume prefers it), so
+          we never block the grace window fsync'ing the ~15 GB checkpoint to the
+          slow HDD.
+        * **No HDD drain here.** We do NOT ``wait_idle`` on the async archiver.
+          ``self._graceful_shutdown`` is set so the outer ``finally`` bounds its
+          drain too. Anything not yet copied to the HDD is recovered on next
+          startup by ``archive_pending_into``.
+
+        The step watchdog is paused around the serialize so a slow fsync isn't
+        mistaken for a hang and ``os._exit``'d mid-write (2026-06-10 regression).
+        """
+        self._graceful_shutdown = True
+        if not already_saved:
+            self._training_state = self._build_training_state(
+                es_best, es_evals_without_improvement, wandb_run,
+            )
+            parent = self._registry_parent()
+            self._release_training_transients()
+            from bgkit.utils.step_watchdog import pause as _wd_pause
+            from bgkit.utils.step_watchdog import resume as _wd_resume
+
+            _wd_pause()
+            try:
+                with memory_budget_scope("save_checkpoint_shutdown"):
+                    ckpt_path = self.save_checkpoint(checkpoint_dir)
+            finally:
+                _wd_resume()
+            registry.register(self._build_registry_entry(
+                ckpt_path, None, wandb_run,
+                status="interrupted",
+                parent_checkpoint=parent,
+            ))
+            if ckpt_manager is not None:
+                ckpt_manager.record(ckpt_path, step, None)
+                ckpt_manager.prune()
+            (checkpoint_dir / ".last_checkpoint").write_text(str(ckpt_path))
+        logger.info(
+            "graceful_shutdown_complete",
+            step=step,
+            signal=interruptor.received_signal.name
+            if interruptor.received_signal
+            else None,
+        )
+
     def save_checkpoint(
         self, checkpoint_dir: Path, metrics: dict[str, float] | None = None
     ) -> Path:
@@ -1349,6 +1414,7 @@ class BaseTrainer(ABC):
             schedule_params=self._schedule_params,
             training_state=self._training_state,
             optimizer_type=self._optimizer_type,
+            run_name=self.cfg.get("run_name", None),
         )
         return self._write_checkpoint(
             checkpoint_dir,
@@ -2303,6 +2369,7 @@ class BaseTrainer(ABC):
             disk_size_bytes=disk_size,
             parent_checkpoint=parent_checkpoint,
             input_sources=self._input_sources,
+            run_name=self.cfg.get("run_name", None),
         )
 
     @staticmethod
@@ -2329,12 +2396,23 @@ class BaseTrainer(ABC):
         - ``metric`` (str, default "eval/loss"): eval metric to track (must be present
           in evaluate() results; lower is better)
         """
+        # Arm SIGTERM/SIGINT handling BEFORE setup. setup() + resume can spend
+        # minutes loading the Phase-1 checkpoint, verifying caches, and
+        # restoring ~12 GB of Muon optimizer state; a `docker stop` in that
+        # window used to hit python's default disposition and SIGKILL mid-setup
+        # (exit 137) with no clean exit. The SAME interruptor is reused by the
+        # training loop below (which no longer installs its own).
+        self._graceful_shutdown = False
+        interruptor = GracefulInterruptor()
+        interruptor.install()
         self.setup()
-        # Loud, hard-to-miss checkpoint provenance summary so the
-        # operator can confirm what actually loaded before training
-        # starts. Catches "wrong config key, silent pristine encoder"
-        # class of bugs.
-        self._log_startup_banner()
+        # NOTE: the loud "STARTUP CHECKPOINT SUMMARY" banner is emitted below,
+        # AFTER the resume-checkpoint load — not here. Emitting it right after
+        # setup() (its historical position) meant it ran BEFORE resume applied,
+        # so a resume run always printed "FRESH / RANDOM INIT" for
+        # encoder/decoder/optimizer even though the resume checkpoint was about
+        # to overwrite them. That structural lie made a perfectly good resume
+        # look like a cold start (2026-07-03 phase2_kb git-repro incident).
 
         tcfg = self.cfg.training
         if (
@@ -2385,6 +2463,7 @@ class BaseTrainer(ABC):
                 archive_dir=checkpoint_dir,
                 phase=phase_for_ckpt,
                 keep_last_n=int(self.cfg.get("fast_checkpoint_keep_last_n", 3)),
+                archive_keep_last_n=self.cfg.get("archive_keep_last_n", None),
             )
             logger.info(
                 "checkpoint_fast_dir_enabled",
@@ -2410,25 +2489,105 @@ class BaseTrainer(ABC):
 
         # Resume from checkpoint: explicit path, "none" to disable, or auto-resolve
         resume_path = self.cfg.get("resume_checkpoint", None)
+        # Auto-resume is RUN-SCOPED: it exists to resume the SAME run after an
+        # interruption. Phase alone is NOT a safe scope — many runs share a
+        # phase (all Phase 2 KB runs use phase="phase2_kb"), so a phase-only
+        # resolve could grab a DIFFERENT run's checkpoint and crash on the
+        # strict state-dict load (e.g. a checkpoint predating a new module).
+        # Passing run_name restricts resolution to this run's own checkpoints;
+        # if none exist (or they predate the run_name field), we cold-start.
+        # NOTE: cross-phase handoffs (Step1→Step2 etc.) use SEPARATE explicit
+        # checkpoint configs (bgkit_checkpoint, step1_checkpoint) — NOT this
+        # auto-resume path — and are unaffected.
+        auto_resolved_resume = False
         if resume_path == "none":
             resume_path = None  # explicitly disabled
         elif resume_path is None:
             phase = getattr(tcfg, "phase", None)
             if phase:
                 auto_resolved = resolve_latest_checkpoint(
-                    checkpoint_dir, phase, fast_dir=self._fast_checkpoint_dir
+                    checkpoint_dir,
+                    phase,
+                    fast_dir=self._fast_checkpoint_dir,
+                    run_name=self.cfg.get("run_name", None),
                 )
                 if auto_resolved is not None:
                     resume_path = str(auto_resolved)
-                    logger.info("auto_resume_resolved", checkpoint=resume_path, phase=phase)
+                    auto_resolved_resume = True
+                    logger.info(
+                        "auto_resume_resolved",
+                        checkpoint=resume_path,
+                        phase=phase,
+                        run_name=self.cfg.get("run_name", None),
+                    )
         is_resuming = False
         resume_step: int | None = None
+        if resume_path is not None and auto_resolved_resume:
+            # Belt-and-suspenders: an auto-resolved checkpoint can still be
+            # incompatible (e.g. a same-run checkpoint saved before a model
+            # change). A strict state-dict load would crash; instead log and
+            # cold-start. Explicit resume paths still raise below — the user
+            # asked for that specific checkpoint, so a mismatch is a real error.
+            try:
+                self.load_checkpoint(Path(resume_path))
+            except RuntimeError as exc:
+                logger.warning(
+                    "auto_resume_load_failed_cold_start",
+                    checkpoint=resume_path,
+                    error=str(exc),
+                    hint="auto-resolved checkpoint is incompatible with the "
+                    "current model (missing/unexpected keys); cold-starting "
+                    "this run instead of crashing",
+                )
+                resume_path = None
+                self.global_step = 0
+                self.epoch = 0
+                self._schedule_params = None
+                self._training_state = None
+                self._last_checkpoint_path = None
+        elif resume_path is not None:
+            # EXPLICIT resume path (user pointed resume_checkpoint at a specific
+            # checkpoint). This is the resume-the-same-run path. Two guarantees:
+            #
+            # * OBSERVABLE: log BEFORE the load. load_checkpoint only logs
+            #   ``checkpoint_loaded`` on COMPLETION, and a ~10 GB model +
+            #   optimizer read from the spinning HDD can take many minutes; the
+            #   silent gap used to be indistinguishable from "resume skipped"
+            #   and let an operator kill a run mid-load thinking it cold-started.
+            # * LOUD ON FAILURE: an explicit resume that fails to load is a real
+            #   error — the user asked for THIS checkpoint. Never swallow it into
+            #   a silent cold start (that is reserved for AUTO-resolved resumes
+            #   above, which are best-effort). Re-raise with a greppable log.
+            logger.info("resume_checkpoint_loading", path=resume_path)
+            try:
+                self.load_checkpoint(Path(resume_path))
+            except Exception as exc:
+                logger.error(
+                    "resume_checkpoint_load_failed",
+                    checkpoint=resume_path,
+                    error=str(exc),
+                    hint="explicit resume_checkpoint failed to load — refusing "
+                    "to silently cold-start. Fix the path/checkpoint or set "
+                    "resume_checkpoint=none to intentionally start fresh.",
+                )
+                raise
         if resume_path is not None:
-            self.load_checkpoint(Path(resume_path))
             # Checkpoint was saved after step completed, so resume from next step
             self.global_step += 1
             is_resuming = True
             resume_step = self.global_step
+            # The resume checkpoint supersedes whatever setup() loaded as the
+            # base (e.g. a Phase-1 checkpoint) for every component it carries.
+            # Reflect that in the startup banner (emitted just below) so the
+            # summary is truthful instead of showing setup()'s base — or, for
+            # trainers that register no sources at all, "FRESH / RANDOM INIT".
+            self.register_checkpoint_source("encoder", resume_path)
+            self.register_checkpoint_source("decoder", resume_path)
+            self.register_checkpoint_source("optimizer_state", resume_path)
+            self.register_startup_note(
+                f"RESUMED from {resume_path} at step {self.global_step} "
+                "(supersedes any setup() base for the components above)",
+            )
             # Restore early stopping state
             if self._training_state is not None:
                 es_best = self._training_state.get("es_best")
@@ -2441,6 +2600,13 @@ class BaseTrainer(ABC):
                 es_best=es_best,
                 es_evals_without_improvement=es_evals_without_improvement,
             )
+
+        # Loud, hard-to-miss checkpoint provenance summary so the operator can
+        # confirm what ACTUALLY loaded — emitted here, after resume, so a resume
+        # run reports its resume source instead of setup()'s pre-resume base.
+        # Catches the "wrong config key, silent pristine encoder" class of bugs
+        # AND the "resume silently didn't apply" class.
+        self._log_startup_banner()
 
         # LR schedule params: use restored values from checkpoint if available,
         # otherwise use current config. This ensures schedule continuity on resume
@@ -2711,9 +2877,28 @@ class BaseTrainer(ABC):
         last_eval_metrics: dict[str, float] | None = None
         last_eval_step = -1
 
+        # A `docker stop` arrived during setup/resume: nothing new was trained
+        # (the last checkpoint is already on disk), so exit cleanly instead of
+        # letting the SIGKILL land. This is why the interruptor is armed before
+        # setup() above.
+        if interruptor.should_stop:
+            logger.warning(
+                "graceful_shutdown_during_setup",
+                signal=interruptor.received_signal.name
+                if interruptor.received_signal
+                else None,
+            )
+            interruptor.restore()
+            if wandb_run is not None:
+                wandb_run.finish()
+            return
+
         stopped_early = False
         try:
-            with GracefulInterruptor() as interruptor:
+            # Reuse the interruptor armed before setup() — do NOT install a new
+            # one (which would reset the captured signal). nullcontext keeps the
+            # loop body's indentation; restore() happens in the finally below.
+            with contextlib.nullcontext():
                 step = self.global_step
                 while step < max_steps:
                     self.global_step = step
@@ -2745,6 +2930,27 @@ class BaseTrainer(ABC):
                     self.optimizer.zero_grad()
                     accum_metrics = []
                     for _micro in range(accum_steps):
+                        # Detect a `docker stop` BEFORE launching the next
+                        # microbatch. A full-backprop git-repro step accumulates
+                        # many microbatches and a single one can be seconds; the
+                        # end-of-step check alone can miss a short grace window
+                        # (e.g. `docker stop -t 85`). Bail here, skip the
+                        # optimizer step (partial grads), and rescue-save now.
+                        if interruptor.should_stop:
+                            self._graceful_shutdown_save(
+                                checkpoint_dir=checkpoint_dir,
+                                registry=registry,
+                                ckpt_manager=ckpt_manager,
+                                wandb_run=wandb_run,
+                                es_best=es_best,
+                                es_evals_without_improvement=(
+                                    es_evals_without_improvement
+                                ),
+                                step=step,
+                                interruptor=interruptor,
+                                already_saved=False,
+                            )
+                            return
                         try:
                             batch = next(dataloader_iter)
                             self._microbatches_in_epoch += 1
@@ -3035,61 +3241,23 @@ class BaseTrainer(ABC):
                         )
                         saved_this_step = True
 
-                    # Graceful shutdown check
+                    # Graceful shutdown check (end of step). Mid-accumulation
+                    # detection above handles the long-step case; this catches a
+                    # signal that arrived during eval / the periodic save.
                     if interruptor.should_stop:
-                        if not saved_this_step:
-                            self._training_state = self._build_training_state(
-                                es_best, es_evals_without_improvement, wandb_run,
-                            )
-                            parent = self._registry_parent()
-                            self._release_training_transients()
-                            from bgkit.utils.step_watchdog import pause as _wd_pause
-                            from bgkit.utils.step_watchdog import resume as _wd_resume
-
-                            # Graceful shutdown: do NOT enforce the cap — we
-                            # want the rescue-save to succeed even under
-                            # memory pressure that may be causing the
-                            # shutdown.  Still scope it for logging/reclaim.
-                            #
-                            # PAUSE THE WATCHDOG around the save. On a slow
-                            # (spinning-disk) CHECKPOINT_DIR a ~9 GB rescue save
-                            # blocks the main thread for ~5 min — longer than the
-                            # step-watchdog timeout — so without this pause the
-                            # watchdog mistakes the save for a hang and calls
-                            # os._exit(1) mid-fsync, destroying the emergency
-                            # checkpoint (it never gets its atomic rename, left as
-                            # a ._tmp_ dir). The normal save path already pauses;
-                            # the shutdown path historically did not — silently
-                            # eating emergency checkpoints (2026-06-10).
-                            _wd_pause()
-                            try:
-                                with memory_budget_scope("save_checkpoint_shutdown"):
-                                    ckpt_path = self.save_checkpoint(checkpoint_dir)
-                            finally:
-                                _wd_resume()
-                            registry.register(self._build_registry_entry(
-                                ckpt_path, None, wandb_run,
-                                status="interrupted",
-                                parent_checkpoint=parent,
-                            ))
-                            if ckpt_manager is not None:
-                                ckpt_manager.record(ckpt_path, step, None)
-                                ckpt_manager.prune()
-                            (checkpoint_dir / ".last_checkpoint").write_text(
-                                str(ckpt_path)
-                            )
-                        logger.info(
-                            "graceful_shutdown_complete",
+                        self._graceful_shutdown_save(
+                            checkpoint_dir=checkpoint_dir,
+                            registry=registry,
+                            ckpt_manager=ckpt_manager,
+                            wandb_run=wandb_run,
+                            es_best=es_best,
+                            es_evals_without_improvement=(
+                                es_evals_without_improvement
+                            ),
                             step=step,
-                            signal=interruptor.received_signal.name
-                            if interruptor.received_signal
-                            else None,
+                            interruptor=interruptor,
+                            already_saved=saved_this_step,
                         )
-                        if self._archiver is not None:
-                            # Best-effort: land in-flight archives on the HDD.
-                            # Resume prefers the NVMe copy (a persistent host
-                            # bind-mount), so an incomplete archive loses nothing.
-                            self._archiver.wait_idle(timeout=120.0)
                         return
 
                     step += 1
@@ -3132,10 +3300,21 @@ class BaseTrainer(ABC):
                     ckpt_manager.prune()
                 (checkpoint_dir / ".last_checkpoint").write_text(str(ckpt_path))
         finally:
+            interruptor.restore()
             if getattr(self, "_archiver", None) is not None:
-                # Training done — drain all pending archives to the HDD so the
-                # full checkpoint history is durable before the process exits.
-                self._archiver.wait_idle()
+                if getattr(self, "_graceful_shutdown", False):
+                    # On a `docker stop`, do NOT block the grace window draining
+                    # the ~15 GB checkpoint to the slow (~27 MB/s USB) HDD — an
+                    # unbounded wait_idle() here was a root cause of the SIGKILL:
+                    # even after the fast NVMe rescue-save completed, `return`
+                    # hit this finally and blocked minutes on the HDD copy. The
+                    # NVMe copy is authoritative (resume prefers it) and
+                    # archive_pending_into lands it on the HDD at next startup.
+                    self._archiver.wait_idle(timeout=5.0)
+                else:
+                    # Training done normally — drain all pending archives to the
+                    # HDD so the full checkpoint history is durable before exit.
+                    self._archiver.wait_idle()
             if wandb_run is not None:
                 wandb_run.finish()
 

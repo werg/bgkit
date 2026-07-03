@@ -30,6 +30,11 @@ class CheckpointMetadata:
     # Optimizer type used when saving ("adamw", "adamw8bit", "muon").
     # None for checkpoints saved before this field was added.
     optimizer_type: str | None = None
+    # Originating run name (cfg.run_name). Used to scope auto-resume so a run
+    # only resumes its OWN checkpoints, never another run sharing the same phase
+    # (e.g. all Phase 2 KB runs share phase="phase2_kb"). None for checkpoints
+    # saved before this field was added — never cross-matched to a named run.
+    run_name: str | None = None
 
 
 def save_checkpoint(

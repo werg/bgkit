@@ -134,6 +134,41 @@ def _prune_fast_dir(fast_dir: Path, archive_dir: Path, phase: str, keep_last_n: 
             logger.info("checkpoint_fast_pruned", name=stale.name)
 
 
+def _prune_archive_dir(archive_dir: Path, phase: str, keep_last_n: int) -> None:
+    """Remove HDD archive checkpoints older than the ``keep_last_n`` most recent.
+
+    Mirrors :func:`_prune_fast_dir` but operates on the permanent HDD archive so
+    it cannot grow unbounded (the 2026-06 3.6 TB-full crash). Safety rules:
+
+    * Only ``{phase}_step*`` dirs are considered — other phases / other runs are
+      never touched.
+    * A dir mid-write (no ``metadata.json`` yet, or an ``._`` staging prefix) is
+      skipped, so a checkpoint still being archived is never removed.
+    * The single newest dir is always kept regardless of ``keep_last_n``.
+    """
+    def _step(p: Path) -> int:
+        import re
+        m = re.search(r"step(\d+)", p.name)
+        return int(m.group(1)) if m else -1
+
+    archived = sorted(
+        (p for p in archive_dir.glob(f"{phase}_step*") if p.is_dir()
+         and not p.name.startswith("._")),
+        key=_step,
+        reverse=True,
+    )
+    if not archived:
+        return
+    newest = archived[0]
+    for stale in archived[max(keep_last_n, 1):]:
+        if stale == newest:
+            continue  # never delete the single newest
+        if not (stale / "metadata.json").exists():
+            continue  # mid-write / incomplete — do not touch
+        shutil.rmtree(stale, ignore_errors=True)
+        logger.info("checkpoint_archive_pruned", name=stale.name)
+
+
 class CheckpointArchiver:
     """Single-process background archiver (one daemon worker, FIFO queue).
 
@@ -143,10 +178,17 @@ class CheckpointArchiver:
     process exit so the HDD has every checkpoint).
     """
 
-    def __init__(self, archive_dir: Path, phase: str, keep_last_n: int = 3) -> None:
+    def __init__(
+        self,
+        archive_dir: Path,
+        phase: str,
+        keep_last_n: int = 3,
+        archive_keep_last_n: int | None = None,
+    ) -> None:
         self._archive_dir = Path(archive_dir)
         self._phase = phase
         self._keep_last_n = keep_last_n
+        self._archive_keep_last_n = archive_keep_last_n
         self._q: queue.Queue[tuple[Path, Path] | None] = queue.Queue()
         self._thread = threading.Thread(
             target=self._run, name="ckpt-archiver", daemon=True
@@ -181,6 +223,16 @@ class CheckpointArchiver:
                     dst=str(dst),
                 )
                 _prune_fast_dir(fast_dir, self._archive_dir, self._phase, self._keep_last_n)
+                if self._archive_keep_last_n is not None:
+                    try:
+                        _prune_archive_dir(
+                            self._archive_dir, self._phase, self._archive_keep_last_n
+                        )
+                    except Exception as exc:  # never let a prune kill the archiver
+                        logger.error(
+                            "checkpoint_archive_prune_failed",
+                            error=str(exc),
+                        )
             except Exception as exc:
                 logger.error(
                     "checkpoint_archive_failed",

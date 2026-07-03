@@ -45,11 +45,21 @@ def resolve_latest_checkpoint(
     checkpoint_dir: Path,
     phase: str,
     fast_dir: Path | None = None,
+    run_name: str | None = None,
 ) -> Path | None:
     """Find the latest on-disk checkpoint for a phase, or None if no match.
 
     Used for auto-resume: silently returns None when no checkpoint exists
     (first run), unlike resolve_checkpoint which raises.
+
+    When ``run_name`` is given, resolution is RUN-SCOPED: only checkpoints
+    whose registry entry records the same ``run_name`` are considered. This
+    prevents a run with ``resume_checkpoint: null`` from grabbing a DIFFERENT
+    run's latest checkpoint when they share a phase (all Phase 2 KB runs share
+    ``phase="phase2_kb"``). Checkpoints lacking a recorded run_name (saved
+    before the field existed) are never matched to a named run, so the run
+    cold-starts rather than resuming an incompatible foreign checkpoint. When
+    ``run_name`` is None, behaviour is unchanged (phase-only, latest wins).
 
     When ``fast_dir`` (the NVMe live dir) is given, both it and
     ``checkpoint_dir`` (the HDD archive) are scanned, and the physical path
@@ -60,7 +70,7 @@ def resolve_latest_checkpoint(
     registry = CheckpointRegistry(checkpoint_dir)
     extra = [Path(fast_dir)] if fast_dir is not None else None
     registry.backfill(checkpoint_dir, extra_dirs=extra)
-    latest = registry.latest(phase=phase)
+    latest = registry.latest(phase=phase, run_name=run_name)
     if latest is None:
         return None
     if fast_dir is not None:
@@ -104,6 +114,12 @@ class RegistryEntry:
     # Lineage
     parent_checkpoint: str | None = None  # within-phase, dir name
     input_sources: dict[str, str] | None = None  # cross-phase, e.g. {"ice": "ice_step29999_..."}
+
+    # Originating run name (cfg.run_name). Scopes auto-resume so a run only
+    # resumes its OWN checkpoints, never another run sharing the same phase.
+    # None for checkpoints saved before this field — never cross-matched to a
+    # named run.
+    run_name: str | None = None
 
     # Annotations
     notes: str | None = None
@@ -235,17 +251,25 @@ class CheckpointRegistry:
         self,
         phase: str,
         on_disk_only: bool = True,
+        run_name: str | None = None,
     ) -> RegistryEntry | None:
         """Find the latest (highest step) checkpoint for a phase.
 
         Args:
             phase: Filter to this training phase.
             on_disk_only: If True (default), exclude pruned checkpoints.
+            run_name: If given, restrict to checkpoints whose recorded
+                ``run_name`` matches exactly. Entries lacking a run_name
+                (saved before the field existed) are excluded, so a named run
+                never resumes a foreign / pre-field checkpoint. When None,
+                no run filter is applied (phase-only — legacy behaviour).
 
         Returns:
             Latest RegistryEntry or None if no matching entries.
         """
         candidates = [e for e in self._entries.values() if e.phase == phase]
+        if run_name is not None:
+            candidates = [e for e in candidates if e.run_name == run_name]
         if on_disk_only:
             candidates = [e for e in candidates if e.on_disk]
         if not candidates:
@@ -380,6 +404,7 @@ class CheckpointRegistry:
                 wandb_run_id=wandb_run_id,
                 disk_size_bytes=disk_size,
                 parent_checkpoint=parent,
+                run_name=meta.get("run_name"),
             )
             self._entries[name] = entry
             count += 1

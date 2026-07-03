@@ -1021,6 +1021,7 @@ class SummarizationRoundRobinTrainer(CompressionCurriculumMixin, BaseTrainer):
             schedule_params=self._schedule_params,
             training_state=self._training_state,
             optimizer_type=self._optimizer_type,
+            run_name=self.cfg.get("run_name", None),
         )
         # Route through the base helper so the NVMe fast-dir + async HDD archive
         # apply here too (this override used to call save_checkpoint() directly,

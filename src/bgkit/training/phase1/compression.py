@@ -3229,6 +3229,7 @@ class CompressionTrainer(CompressionCurriculumMixin, BaseTrainer):
             schedule_params=self._schedule_params,
             training_state=self._training_state,
             optimizer_type=self._optimizer_type,
+            run_name=self.cfg.get("run_name", None),
         )
         save_kwargs = dict(
             encoder=self.encoder.state_dict(),

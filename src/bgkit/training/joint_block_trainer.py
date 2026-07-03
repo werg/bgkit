@@ -552,6 +552,7 @@ class JointBlockTrainer(BaseTrainer):
             schedule_params=self._schedule_params,
             training_state=self._training_state,
             optimizer_type=self._optimizer_type,
+            run_name=self.cfg.get("run_name", None),
         )
         ckpt_path = save_checkpoint(
             checkpoint_dir,

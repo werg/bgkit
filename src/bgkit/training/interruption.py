@@ -43,6 +43,23 @@ class GracefulInterruptor:
     def received_signal(self) -> signal.Signals | None:
         return self._received_signal
 
+    def install(self) -> GracefulInterruptor:
+        """Install the SIGTERM/SIGINT handlers now.
+
+        Separated from ``__enter__`` so the trainer can arm signal handling
+        *before* the ``with`` block — e.g. to cover the (potentially
+        minutes-long) setup + optimizer-state restore window, where a
+        ``docker stop`` would otherwise hit python's default disposition and
+        SIGKILL mid-setup with no chance for a clean exit. Idempotent: a
+        second call while already installed is a no-op.
+        """
+        if self._original_handlers:
+            return self
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            self._original_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, self._handler)
+        return self
+
     def restore(self) -> None:
         """Restore original signal handlers."""
         for signum, handler in self._original_handlers.items():
@@ -50,10 +67,7 @@ class GracefulInterruptor:
         self._original_handlers.clear()
 
     def __enter__(self) -> GracefulInterruptor:
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            self._original_handlers[sig] = signal.getsignal(sig)
-            signal.signal(sig, self._handler)
-        return self
+        return self.install()
 
     def __exit__(self, *exc_info) -> None:
         self.restore()
