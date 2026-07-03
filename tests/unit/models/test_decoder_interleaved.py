@@ -343,3 +343,156 @@ def test_interleaved_rejects_batch_size_mismatch():
     ]
     with pytest.raises(ValueError, match="batch size"):
         decoder.forward_interleaved_with_loss(segments)
+
+
+# ---------------------------------------------------------------------------
+# FIX 1: interleaved decode routes through FA4 VARLEN (O(S)), not O(S^2) padded
+# ---------------------------------------------------------------------------
+
+
+def test_inner_forward_routes_single_sequence_through_varlen():
+    """A single contiguous (B=1, all-valid) interleaved sequence is routed
+    through _packed_forward with cu_seqlens=[0,S] + position_ids=arange(S) —
+    the FA4 varlen path (O(S)) — NOT the O(S^2) padded attention_mask path."""
+    import types as _types
+
+    d = ReconstructionDecoder.__new__(ReconstructionDecoder)
+    captured: dict = {}
+
+    def fake_packed(self, emb, cu, max_s, pos, mamba_seq_idx=None):
+        captured["cu"] = cu.tolist()
+        captured["max_s"] = int(max_s)
+        captured["pos"] = pos.tolist()
+        return torch.zeros_like(emb), 0
+
+    d._packed_forward = _types.MethodType(fake_packed, d)
+    seq = 13
+    emb = torch.randn(1, seq, 8)
+
+    # None mask (the KRKBTrainer / typical call) -> varlen.
+    h, pad = d._inner_forward(emb, None)
+    assert captured["cu"] == [0, seq]
+    assert captured["pos"] == list(range(seq))
+    assert captured["max_s"] == seq
+    assert pad == 0 and h.shape == emb.shape
+
+    # Explicit all-ones mask -> still varlen.
+    captured.clear()
+    d._inner_forward(emb, torch.ones(1, seq, dtype=torch.bool))
+    assert captured["cu"] == [0, seq]
+
+
+def test_inner_forward_legacy_fallback_for_padded_mask():
+    """A non-all-valid mask (the unused padded case) does NOT take the varlen
+    path — it falls back to the legacy padded forward (kept for B>1 / masks)."""
+    import types as _types
+
+    d = ReconstructionDecoder.__new__(ReconstructionDecoder)
+    d._use_te = False
+    called = {"packed": False, "inner": False}
+
+    def fake_packed(self, *a, **k):
+        called["packed"] = True
+        return torch.zeros(1), 0
+
+    class _Inner:
+        def __call__(self, *, inputs_embeds, attention_mask, use_cache):
+            called["inner"] = True
+            return _InnerOut(inputs_embeds)
+
+    d._packed_forward = _types.MethodType(fake_packed, d)
+    d._get_inner_model_and_head = _types.MethodType(
+        lambda self: (_Inner(), None), d,
+    )
+    emb = torch.randn(1, 6, 8)
+    mask = torch.tensor([[1, 1, 1, 1, 0, 0]], dtype=torch.bool)  # trailing pad
+    d._inner_forward(emb, mask)
+    assert called["packed"] is False  # NOT the varlen path
+    assert called["inner"] is True    # legacy padded path
+
+
+# ---------------------------------------------------------------------------
+# FIX 1b: force per-layer GC on the inner model in the interleaved decode
+# ---------------------------------------------------------------------------
+
+
+class _GCLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gradient_checkpointing = False
+        self._gradient_checkpointing_func = None
+
+
+class _GCInner(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([_GCLayer(), _GCLayer(), _GCLayer()])
+        self._enable_calls = 0
+
+    def gradient_checkpointing_enable(self, **kw):
+        self._enable_calls += 1
+        for lyr in self.layers:
+            # HF populates the func on enable.
+            lyr._gradient_checkpointing_func = object()
+
+
+def _make_gc_decoder(mode="reentrant", min_seqlen=4096):
+    d = ReconstructionDecoder.__new__(ReconstructionDecoder)
+    d.decoder_family = "qwen35"
+    d._interleaved_gc_mode = mode
+    d._decode_gc_min_seqlen = min_seqlen
+    return d
+
+
+def test_ensure_interleaved_gc_conditional_on_seqlen():
+    """SPEED: GC engages ONLY when max_seqlen > _decode_gc_min_seqlen.
+    Short decodes leave layers un-checkpointed (fast); long decodes force the
+    per-layer flag + FLA-safe reentrant func."""
+    from bgkit.training.gradient_utils import _reentrant_checkpoint_func
+
+    d = _make_gc_decoder(min_seqlen=4096)
+    inner = _GCInner()
+
+    # Below threshold -> NO GC (no enable, layers stay un-checkpointed).
+    d._ensure_interleaved_gradient_checkpointing(inner, max_seqlen=2000)
+    assert inner._enable_calls == 0
+    assert all(lyr.gradient_checkpointing is False for lyr in inner.layers)
+    assert d._interleaved_gc_active is False
+
+    # Above threshold -> GC engaged on every layer.
+    d._ensure_interleaved_gradient_checkpointing(inner, max_seqlen=8000)
+    assert inner._enable_calls == 1
+    assert all(lyr.gradient_checkpointing is True for lyr in inner.layers)
+    assert all(lyr._gradient_checkpointing_func is _reentrant_checkpoint_func
+               for lyr in inner.layers)
+    assert d._interleaved_gc_active is True
+    assert d._interleaved_gc_layers == 3
+
+
+def test_ensure_interleaved_gc_toggles_idempotently():
+    """Re-evaluated every forward; a swap only happens on a state change, and
+    enable() is called at most once (cached via _interleaved_gc_initialized)."""
+    d = _make_gc_decoder(min_seqlen=4096)
+    inner = _GCInner()
+
+    d._ensure_interleaved_gradient_checkpointing(inner, max_seqlen=8000)  # ON
+    d._ensure_interleaved_gradient_checkpointing(inner, max_seqlen=9000)  # still ON
+    assert inner._enable_calls == 1  # not re-enabled
+    assert d._interleaved_gc_active is True
+
+    d._ensure_interleaved_gradient_checkpointing(inner, max_seqlen=1000)  # OFF
+    assert all(lyr.gradient_checkpointing is False for lyr in inner.layers)
+    assert d._interleaved_gc_active is False
+
+    d._ensure_interleaved_gradient_checkpointing(inner, max_seqlen=8000)  # ON again
+    assert all(lyr.gradient_checkpointing is True for lyr in inner.layers)
+    assert inner._enable_calls == 1  # enable still only ever called once
+
+
+def test_ensure_interleaved_gc_noop_when_mode_none():
+    """mode None -> no-op regardless of seqlen (non-opted phases unchanged)."""
+    d = _make_gc_decoder(mode=None)
+    inner = _GCInner()
+    d._ensure_interleaved_gradient_checkpointing(inner, max_seqlen=99999)
+    assert inner._enable_calls == 0
+    assert all(lyr.gradient_checkpointing is False for lyr in inner.layers)

@@ -18,6 +18,38 @@ from bgkit.data.datasets.base_mmap_dataset import (
 from bgkit.data.datasets.qa_sample import QASample
 
 
+class _LazyArrowRows:
+    """Sequence view over a pyarrow ``Table`` that materializes one row dict
+    on access instead of eagerly building a full list-of-dicts.
+
+    Indexing, iteration, and ``len`` produce output byte-identical to
+    ``table.to_pylist()`` — ``self[i]`` equals ``table.to_pylist()[i]`` and
+    iterating yields the same dicts in the same order. This keeps the whole
+    per-row metadata (potentially millions of dicts) out of RAM; only the
+    underlying Arrow table is retained (a column-projected subset already
+    held by the dataset).
+    """
+
+    __slots__ = ("_table",)
+
+    def __init__(self, table):
+        self._table = table
+
+    def __len__(self) -> int:
+        return self._table.num_rows
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            return [self[i] for i in range(*idx.indices(self._table.num_rows))]
+        if idx < 0:
+            idx += self._table.num_rows
+        return self._table.slice(idx, 1).to_pylist()[0]
+
+    def __iter__(self):
+        for batch in self._table.to_batches():
+            yield from batch.to_pylist()
+
+
 def merge_metadata_columns(
     data_dir: str,
     extra: tuple[str, ...],
@@ -140,7 +172,11 @@ class Phase2QADataset(Dataset):
             self._data_path / "metadata.parquet",
             columns=metadata_columns,
         )
-        self._metadata_rows = self._metadata.to_pylist()
+        # Lazy per-row view over the Arrow table — avoids eagerly
+        # materializing a full list-of-dicts (~one dict per corpus row) into
+        # RAM at construction. Indexing/iteration are byte-identical to the
+        # former ``self._metadata.to_pylist()``.
+        self._metadata_rows = _LazyArrowRows(self._metadata)
 
     def _validate_parallel_counts(self, manifest: dict) -> None:
         row_count = len(self._offsets) - 1
@@ -175,7 +211,7 @@ class Phase2QADataset(Dataset):
 
     @property
     def metadata(self) -> list[dict[str, object]]:
-        return self._metadata_rows
+        return self._metadata.to_pylist()
 
     def __len__(self) -> int:
         return len(self._valid_indices)

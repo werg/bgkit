@@ -27,6 +27,18 @@ backward does not rebuild chunk cumsums, chunk states, and ``CB``. Set
 ``BGKIT_FALCON_H1_MAMBA_SAVE_SCAN=0`` to fall back to the upstream backward
 wrapper's recompute path.
 
+For long Falcon decodes (8k--16k tokens) the persisted per-position scan
+intermediates dominate the saved-activation footprint. Set
+``BGKIT_FALCON_H1_MAMBA_SCAN_CHECKPOINT=1`` for a gradient-checkpointing-style
+scan: the forward keeps only the small chunk-boundary states (``O(nchunks)``)
+and drops the large ``O(L)`` per-position tensors (``out_x`` / ``CB`` /
+``dt_scan`` / ``dA_cumsum`` / the pre-out-projection activation); backward
+rebuilds them from the saved boundary states with the same forward kernels
+before running the existing scan backward. This implies ``SAVE_OUT=0``
+behaviour (the pre-out-projection activation is recomputed via
+``recompute_output``). The flag is off by default until GPU parity is
+validated.
+
 The same autograd boundary can also own Falcon's Mamba ``in_proj``. Passing
 ``inproj_weight`` (and optional ``inproj_bias``) makes the first tensor argument
 the pre-projection hidden state and returns full trainable input-projection
@@ -557,7 +569,13 @@ class _FalconH1MambaSplitConv1dScanFn(torch.autograd.Function):
         c = c.view(batch, seqlen, 1, dstate)
         z = z.view(batch, seqlen, nheads, headdim)
 
-        save_scan_for_bwd = falcon_h1_env_truthy("BGKIT_FALCON_H1_MAMBA_SAVE_SCAN")
+        scan_checkpoint = falcon_h1_env_truthy("BGKIT_FALCON_H1_MAMBA_SCAN_CHECKPOINT")
+        # Checkpoint mode reuses the saved-intermediates scan to obtain the
+        # chunk-boundary states, then drops the O(L) per-position tensors and
+        # recomputes them in backward (see the scan-checkpoint recompute block).
+        save_scan_for_bwd = scan_checkpoint or falcon_h1_env_truthy(
+            "BGKIT_FALCON_H1_MAMBA_SAVE_SCAN"
+        )
         timer = _record_start(x)
         if save_scan_for_bwd:
             out, out_x, dt_scan, da_cumsum, states, cb, _final_states = (
@@ -601,6 +619,20 @@ class _FalconH1MambaSplitConv1dScanFn(torch.autograd.Function):
         _record_end("mamba_fwd_scan", timer)
         out_for_linear = out.reshape(batch, seqlen, dim)
 
+        if scan_checkpoint:
+            # Persist only the chunk-boundary states (O(nchunks)); the large
+            # O(L) per-position intermediates (out_x / CB / dt_scan / dA_cumsum)
+            # are recomputed from these in backward.
+            saved_out_x = None
+            saved_cb = None
+            saved_dt_scan = None
+            saved_da_cumsum = None
+        else:
+            saved_out_x = out_x
+            saved_cb = cb
+            saved_dt_scan = dt_scan
+            saved_da_cumsum = da_cumsum
+
         ctx.stock_fn = stock_fn
         ctx.chunk_size = chunk_size
         ctx.headdim = headdim
@@ -608,7 +640,13 @@ class _FalconH1MambaSplitConv1dScanFn(torch.autograd.Function):
         ctx.has_inproj = has_inproj
         ctx.has_inproj_bias = inproj_bias is not None
         ctx.input_shape = input_shape
-        save_out_for_bwd = falcon_h1_env_truthy("BGKIT_FALCON_H1_MAMBA_SAVE_OUT")
+        ctx.scan_checkpoint = scan_checkpoint
+        # SAVE_OUT is mutually exclusive with checkpoint mode: backward rebuilds
+        # the pre-out-projection activation via recompute_output when it replays
+        # the scan from the saved boundary states.
+        save_out_for_bwd = (not scan_checkpoint) and falcon_h1_env_truthy(
+            "BGKIT_FALCON_H1_MAMBA_SAVE_OUT"
+        )
         if torch.is_autocast_enabled():
             dtype = torch.get_autocast_gpu_dtype()
             out_for_linear = out_for_linear.to(dtype)
@@ -619,7 +657,7 @@ class _FalconH1MambaSplitConv1dScanFn(torch.autograd.Function):
             zxbcdt,
             conv1d_weight,
             conv1d_bias,
-            out_x,
+            saved_out_x,
             a,
             d,
             dt_bias,
@@ -628,10 +666,10 @@ class _FalconH1MambaSplitConv1dScanFn(torch.autograd.Function):
             outproj_bias,
             saved_out_for_linear,
             saved_xbc_conv,
-            dt_scan,
-            da_cumsum,
+            saved_dt_scan,
+            saved_da_cumsum,
             states,
-            cb,
+            saved_cb,
             input_states,
             inproj_weight,
         )
@@ -710,6 +748,31 @@ class _FalconH1MambaSplitConv1dScanFn(torch.autograd.Function):
         dout = F.linear(dout, outproj_weight.t())
         _record_end("mamba_bwd_outproj_input", timer)
         dout = dout.view(batch, seqlen, nheads, headdim)
+
+        if ctx.scan_checkpoint:
+            # Forward persisted only the chunk-boundary states; rebuild the O(L)
+            # per-position scan intermediates (dt_scan / dA_cumsum / CB) and the
+            # pre-out-projection scan output from those boundaries, using the
+            # same forward kernels so the saved-intermediate contract is exact.
+            timer = _record_start(dt)
+            # Upstream clones dt before re-running _chunk_cumsum_fwd inside
+            # backward (Triton "invalid device context" quirk on the recompute
+            # path); mirror that here.
+            da_cumsum, dt_scan = ssd._chunk_cumsum_fwd(
+                dt.clone(),
+                a,
+                ctx.chunk_size,
+                dt_bias=dt_bias,
+                dt_softplus=True,
+                dt_limit=ctx.dt_limit,
+            )
+            cb = ssd._bmm_chunk_fwd(
+                c, b, ctx.chunk_size, seq_idx=seq_idx, output_dtype=torch.float32
+            )
+            _out_ckpt, out_x = ssd._chunk_scan_fwd(
+                cb, x, dt_scan, da_cumsum, c, states, D=d, z=z, seq_idx=seq_idx
+            )
+            _record_end("mamba_bwd_scan_recompute", timer)
 
         recompute_output = saved_out_for_linear is None
         timer = _record_start(dout)

@@ -86,6 +86,12 @@ x-gpu-common: &gpu-common
     # BGKIT_GDN_BACKEND=flashqla for explicit FlashQLA testing, or =auto to
     # prefer FlashQLA when it becomes faster and falls back cleanly.
     - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+    - BGKIT_MEM_BREAKDOWN=${BGKIT_MEM_BREAKDOWN:-0}
+    # Cap the phase2_kb setup-time trajectory coverage scan to a bounded random
+    # sample per split (the full O(n) parse is pathological at 1.87M+ samples,
+    # e.g. git_commit_repro / Stage B). Only triggers when a split exceeds the
+    # cap; smaller datasets still full-scan. Unset/<=0 = full scan.
+    - BGKIT_COVERAGE_SCAN_MAX_SAMPLES=${BGKIT_COVERAGE_SCAN_MAX_SAMPLES:-2000}
     # Apple Cut Cross Entropy is the GB10 default for decoder LM loss:
     # measured 2026-05-07 at seq2048 as ~7% lower total step time and
     # ~2.8 GiB lower peak memory than BgKIT chunked CE. Set =chunked for
@@ -122,6 +128,7 @@ x-gpu-common: &gpu-common
     - BGKIT_FALCON_H1_MAMBA_SAVE_OUT=${BGKIT_FALCON_H1_MAMBA_SAVE_OUT:-1}
     - BGKIT_FALCON_H1_MAMBA_SAVE_CONV=${BGKIT_FALCON_H1_MAMBA_SAVE_CONV:-1}
     - BGKIT_FALCON_H1_MAMBA_SAVE_SCAN=${BGKIT_FALCON_H1_MAMBA_SAVE_SCAN:-1}
+    - BGKIT_FALCON_H1_MAMBA_SCAN_CHECKPOINT=${BGKIT_FALCON_H1_MAMBA_SCAN_CHECKPOINT:-0}
     - BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL=${BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL:-1}
     - BGKIT_FALCON_H1_FUSED_INPUT_PROJ=${BGKIT_FALCON_H1_FUSED_INPUT_PROJ:-0}
     - BGKIT_FALCON_H1_FUSED_LAYER_LOOP=${BGKIT_FALCON_H1_FUSED_LAYER_LOOP:-0}
@@ -244,6 +251,12 @@ x-gpu-common: &gpu-common
     - /home/werg/bgkit-data-nvme/multi_news_v1/processed:/workspace/data/multi_news_v1/processed
     - /home/werg/bgkit-data-nvme/arxiv_v1/processed_qwen_target:/workspace/data/arxiv_v1/processed_qwen_target
     - /home/werg/bgkit-data-nvme/arxiv_v1/processed:/workspace/data/arxiv_v1/processed
+    # git_commit_repro recursive-L1 full-backprop hot data NVMe overlay (2026-06-30):
+    # the 23 GB paged .arrow + 3.1 GB token store random-paging off the HDD
+    # (sda 99% util, ~19 MB/s, GPU starved ~54%) — canonical copies stay on the HDD.
+    - /home/werg/bgkit-data-nvme/trajectories/git_commit_repro.arrow:/workspace/data/trajectories/git_commit_repro.arrow
+    - /home/werg/bgkit-data-nvme/mmap/phase2/git_commit_repro:/workspace/data/mmap/phase2/git_commit_repro
+    - /home/werg/bgkit-data-nvme/browse_trees/git_commit_repro.parquet:/workspace/data/browse_trees/git_commit_repro.parquet
     - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
     - ${CHECKPOINT_DIR}:/workspace/checkpoints
     # NVMe fast-checkpoint staging (host NVMe). Recent checkpoints land here
@@ -638,6 +651,16 @@ services:
     <<: *gpu-common
     restart: "no"
     command: ["scripts/train.py", "+experiment=phase2_kb_git_repro_smoke"]
+
+  # The real git-commit-repro full-backprop curriculum run. Wide-open config
+  # (max_file_samples_per_repo null + live-tunable via control.json; both
+  # dynamic-ckpt safeguards wired; round-robin decoders). restart: "no" so an
+  # early crash stays crashed (informative for babysitting); flip to
+  # on-failure once the run is stable past the first big windows.
+  train-phase2-kb-git-repro-fullbackprop:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_git_repro_fullbackprop"]
 
   # Recursive-L1 (L1->L1) bridge distillation. Clone of train-phase2-kb-stage-a
   # (gpu-common) with the command overridden. Trains ONLY encoder.l1l1_bridge;

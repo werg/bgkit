@@ -26,6 +26,7 @@ run_name: null  # auto-generated if null
 batch_size: 32
 checkpoint_dir: ${oc.env:CHECKPOINT_DIR}
 resume_checkpoint: null  # auto-resume latest
+archive_keep_last_n: 5  # cap HDD checkpoint archive per phase (was unbounded -> filled 3.6TB /mnt/external 2026-07-02). NVMe fast dir keeps 3; archive keeps 5.
 
 control_file: null  # optional path to live HP control JSON
 

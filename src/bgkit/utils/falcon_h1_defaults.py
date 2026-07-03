@@ -32,6 +32,10 @@ FALCON_H1_FAST_ENV_DEFAULTS: dict[str, str] = {
     "BGKIT_FALCON_H1_MAMBA_SAVE_OUT": "1",
     "BGKIT_FALCON_H1_MAMBA_SAVE_CONV": "1",
     "BGKIT_FALCON_H1_MAMBA_SAVE_SCAN": "1",
+    # Gradient-checkpointing scan: keep only chunk-boundary states, recompute
+    # the O(L) per-position intermediates in backward. Off until GPU parity is
+    # validated; flip to "1" once tests/integration parity passes.
+    "BGKIT_FALCON_H1_MAMBA_SCAN_CHECKPOINT": "0",
     "BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL": "1",
     # Wider experimental rewrites measured slower on the current real profile.
     "BGKIT_FALCON_H1_FUSED_INPUT_PROJ": "0",

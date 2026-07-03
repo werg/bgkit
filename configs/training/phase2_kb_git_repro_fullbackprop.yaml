@@ -48,22 +48,37 @@ decoder_lr: 5.0e-5
 l1_lr: 2.0e-4
 eval_every: 500
 save_every: 500
+reset_wandb: true  # fresh run for the ablation-probe confirmation (throwaway); revert after
 
-# batch_size is IGNORED in per-repo mode: RepoGroupedBatchSampler emits one
-# batch = one repo's window-0 file-samples, micro-batched internally. Keep
-# gradient_accumulation_steps to average over several repos per optimizer step.
+# PROFILING (temporary): per-repo per-component timing. When true,
+# _forward_backward_per_repo logs a `per_repo_timing` event per repo with synced
+# perf_counter splits (shared_tree_encode / pass1_count / prep / drill_encode /
+# assemble / decode_fwd / sample_backward / final_tree_backward + gpu_op_s vs
+# cpu_op_s). The synchronize() is taken ONLY under this flag, so the real run
+# keeps full CPU/GPU overlap. Flip back to false after profiling.
+profile_timing: false
+
+# batch_size is IGNORED in per-repo mode. gradient_accumulation_steps MUST be 1:
+# the inner-loop (Model B) makes ONE subset-batch == ONE optimizer step (so each
+# inner step is a real global step with its own LR/eval/save). accum>1 would
+# fold multiple subsets into one step and break the inner-loop semantics. The
+# warmup (one-step) path also runs one repo per optimizer step at accum=1.
 batch_size: 1
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 1
 
-# Gradient checkpointing — REQUIRED. The shared window-0 subtree holds many
-# live L1 node forwards in the retained graph; per-layer encoder GC + reentrant
-# decoder GC keep that tractable. Turning GC off on this host has frozen the
+# Gradient checkpointing — REQUIRED + NON-REENTRANT. The per-repo path uses
+# detach-and-reaccumulate (shared-tree backward runs ONCE, no retain_graph
+# across the per-sample loop), so reentrant checkpointing — which holds extra
+# state and interacts badly with repeated retain_graph backward — is no longer
+# needed and is dropped: `gradient_checkpointing: true` is HF-default
+# non-reentrant (use_reentrant=False) for the encoder, and the decoder uses the
+# same via `true` (was "reentrant"). Turning GC off on this host has frozen the
 # machine (see Stage A notes). Keep ON.
 activation_checkpointing:
   encoder: false
   decoder: false
 gradient_checkpointing: true
-decoder_gradient_checkpointing: "reentrant"
+decoder_gradient_checkpointing: true
 
 datasets:
   - git_commit_repro
@@ -82,6 +97,25 @@ recursive_l1_tree:
   # shared repo tree. The drill-down bgkit turn uses the SPECIFIC per-turn
   # query (commit message + filename) instead.
   general_prompt: "compress this repository's commit history"
+
+  # BUG-1 FIX — L1 selection mode. This is a FROZEN-POLICY run: survivorship
+  # aux is off, so the L1 survivorship head receives NO gradient (BCE /
+  # moment-match / decisiveness / min-survivors / utility-grad all skipped) and
+  # the hard mask is detached (no STE). On the recursive-tree distribution the
+  # frozen head's tanh(base_raw/T) logits are tanh-saturated near the ceiling,
+  # so the dual-ascent θ controller can never reach the target keep-rate — it
+  # pins θ at ~1.0 and L1 keep-rate sticks ~0.78 vs the ~0.25 target (the L1
+  # compression won't tighten). Diagnosed via checkpoint weight-diff
+  # (l1.head changed exactly 0.0) + code trace.
+  #
+  # ``exact_topk`` switches EVERY L1 selection (recursive tree nodes, the HEAD
+  # drill, and the drill-down bgkit turn) to DETERMINISTIC per-sample top-k,
+  # realizing the L1 retention ramp's target ratio directly from the fixed head
+  # logits and bypassing θ entirely. The L1 dual-ascent θ step is then skipped
+  # (KRKBTrainer._theta_skip_levels / _post_optimizer_step) so a now-irrelevant
+  # threshold cannot drift. Default (elsewhere) is ``threshold`` (θ-controlled),
+  # unchanged for every other dataset/run.
+  selection_mode_l1: exact_topk
   # Step-interpolated retention ramps (start -> end over ramp_steps, by
   # global_step). Recursive L0 (shared-tree diff leaves) 0.15 -> 0.05;
   # recursive L1 (up the tree) 0.30 -> 0.05.
@@ -93,17 +127,169 @@ recursive_l1_tree:
     start: 0.30
     end: 0.05
     ramp_steps: 4000
-  # Per-step cost knob (M1/M2). Each file-sample's backward recomputes the GC'd
-  # shared-tree forward once (Nx per repo) and stages a drill graph, so per-step
-  # cost + memory scale with a repo's window size. null = use every file-sample
-  # (WIDE-OPEN / aggressive — this run relies on the trainer's memory safeguards:
-  # the dynamic-ckpt adaptive cache-flush AND the GC mode-flip, both wired for
-  # KRKBTrainer); an int K subsamples up to K file-samples per repo-batch
-  # (re-seeded per epoch so coverage rotates).
+  # Per-repo file-sample cap. REFRAMED to a COMPUTE knob, not a memory knob:
+  # _forward_backward_per_repo is now count-then-stream (Pass 1 counts cheaply
+  # with NO encode; Pass 2 encodes+decodes+backwards ONE sample at a time and
+  # frees its graph each iteration), so per-sample graph memory is O(1)
+  # regardless of repo size — a monster repo (e.g. simple-icons, thousands of
+  # SVG file-samples) no longer holds thousands of live encode graphs / freezes
+  # the host. What K still bounds: per-step COMPUTE — each contributing sample's
+  # backward re-runs the GC'd shared-tree forward once (Nx recompute per repo) —
+  # plus per-repo data balance (one monster repo shouldn't dominate a step). 32
+  # caps that recompute/balance while keeping plenty of coverage; an int K
+  # subsamples up to K file-samples per repo-batch (re-seeded per epoch so
+  # coverage rotates), null = every file-sample.
   # LIVE-TUNABLE: write {"phase2_kb": {"max_file_samples_per_repo": <K-or-null>}}
   # to ${CHECKPOINT_DIR}/control.json to clamp down OR open back up mid-run
   # (takes effect on the next repo-batch, no restart).
   max_file_samples_per_repo: null
+
+  # PASS-2 group-batch size G. The contributing samples are processed in groups
+  # of G: per group ONE packed (FA4-varlen) L1 drill encode + per-sample decode
+  # summed into ONE group backward — recovers GPU occupancy vs the previous
+  # one-at-a-time (~32 tiny ops at ~38% occupancy) WITHOUT dropping samples and
+  # WITHOUT re-running the shared tree (browse splices read the detached R_d;
+  # the single FINAL detach-reaccumulate backward handles the tree once). Memory
+  # stays bounded by G (+ gradient checkpointing of the group's forwards), not
+  # by N. Gradient is invariant to G. LIVE-TUNABLE via control.json
+  # {"phase2_kb": {"per_repo_sample_group_size": <G>}} to trade occupancy↔memory
+  # mid-run (next repo, no restart). 8 is a safe start; raise if memory allows.
+  per_repo_sample_group_size: 1
+
+  # --- Per-repo SIZE FILTERS (DROP whole repos at grouping; null = off) ------
+  # These DROP an over-threshold repo entirely (its window-0 tree is never
+  # encoded), unlike max_file_samples_per_repo which only SUBSAMPLES a kept
+  # repo. Logged as `phase2_kb_per_repo_size_filter` (n_repos/n_samples
+  # before+after).
+  #
+  # EMPIRICAL NOTE (measured over the real git_commit_repro browse tree +
+  # trajectories, 13342 repos / 1.868M samples — see the relaunch report):
+  # window-0 is TOKEN-BUDGET-bounded, so leaf size is uniform, NOT heavy-tailed:
+  #   leaf-diff TOKENS/window: p50 74k, p99 85k, MAX 90k (no outliers)
+  #   leaf-diff COUNT/window:  p50 147, p99 389, max 1643
+  #   file-SAMPLES/window:     p50 135, p99 374, MAX 1539 (the only real tail)
+  # simple-icons/w000 is MID-PACK on all three (76k tok / 112 leaves / 104
+  # samples), so it is NOT a size outlier — the earlier OOM hit a normal-sized
+  # window. The only genuinely heavy-tailed metric is file-SAMPLES.
+  #
+  # max_repo_leaf_tokens: total L0-encoded leaf-diff tokens in window-0 (the
+  #   shared-tree-encode memory driver). null here: windows are token-capped
+  #   (~90k max) so no value both keeps the bulk AND drops monsters. Setting it
+  #   scans the token store once at setup.
+  max_repo_leaf_tokens: null
+  # max_repo_file_samples: drop repos with more than this many (file,target)
+  # reconstruction samples — the genuine outlier tail (mega doc/generated repos)
+  # + a low-signal proxy. 500 drops 13 repos (0.1%, ~9.6k samples, e.g.
+  # HackTricks 1539, yaml-test-suite 1126), keeping 99.5%.
+  max_repo_file_samples: 500
+  # max_repo_tree_nodes: drop repos whose window-0 SUBTREE has more than this
+  # many nodes (interior + leaf-tag). This is the RETAINED-GRAPH memory driver
+  # (one L0/L1 forward per node, held live by the final reaccumulate / across K
+  # inner steps) and — unlike leaf-tokens — is HEAVY-TAILED, so it isolates the
+  # OOM tail. Measured node-count/window: p50 68, p90 162, p95 203, p98 257,
+  # max 673; an n_nodes=187 repo OOM'd at the 0.86 CUDA cap. 160 drops ~12.5%
+  # (~1.67k repos), keeping windows below the n187 OOM point with margin. Raise
+  # live (control.json) if the profile shows headroom; lower if it still OOMs.
+  max_repo_tree_nodes: 160
+
+  # --- INNER-LOOP per-repo mode (Model B; ENABLED for this run) -------------
+  # Encode the tree ONCE per repo, then do K optimizer steps each on a
+  # file-subset (S files), REUSING the progressively-stale retained LIVE tree
+  # (delayed gradient — a deliberate choice; staleness bounded by K). Wiring
+  # (no base_trainer.train() change): RepoGroupedBatchSampler emits each repo's
+  # files as K consecutive subset-batches; the trainer encodes+caches the live
+  # tree on a repo's first subset and reuses it for the rest, freeing on
+  # repo-change (window-node id change). Each subset-batch flows through the
+  # NORMAL outer step (optimizer.step/scheduler/eval/save/global-step), so each
+  # inner step is a real global step. Requires gradient_accumulation_steps: 1.
+  # WARMUP: the first inner_loop_warmup_steps global steps use the exact
+  # one-step detach-reaccumulate path (clean gradient); at the boundary the
+  # sampler is rebuilt into subset mode (a repo-boundary switch — no half-repo).
+  # All four knobs are live-tunable via control.json.
+  per_repo_inner_loop: false
+  per_repo_inner_subset_size: 16     # S — files per inner step
+  per_repo_max_inner_steps: 12       # K cap — bounds staleness + retained graph
+  inner_loop_warmup_steps: 0       # first N global steps use the exact
+                                     # one-step (clean-gradient) path
+
+  # OPTION A (crash-free amortized per-repo; live-tunable). The CONVERGED
+  # design for the full-tree git-repro run. Fixes the original inner-loop's
+  # autograd crash (it stepped the encoder between K backwards through the LIVE
+  # retained tree → "variable modified by an inplace operation"). Option A
+  # SEPARATES the cadences: encode the FULL tree ONCE → R; the DECODER reads a
+  # DETACHED snapshot R_d and is stepped per file-subset (K = ceil(n_files/S)
+  # updates, optimal batch S, over ALL files — NO file cap); the ENCODER (every
+  # param R depends on — shared by the live drill AND the tree) accumulates grad
+  # across the subsets (incl. the drill) and is NOT stepped until the end, so
+  # R's retained graph stays valid for ONE deferred tree-backward, then the
+  # encoder steps ONCE/repo. Whole-repo batches; partitioned internally
+  # (UNCAPPED — option_a_max_subsets below, 0 = all files). Mutually exclusive
+  # with per_repo_inner_loop. ONE base-loop global step == ONE repo (K decoder +
+  # 1 encoder update), so eval/save cadence counts REPOS. profile_timing: true
+  # emits the per_repo_timing breakdown.
+  per_repo_option_a: true
+  # 0 = UNLIMITED (process ALL files across ceil(n_contrib/S) subsets — the
+  # user's core motivation: no file cap). Optional safety cap only.
+  option_a_max_subsets: 0
+  # DRILL CHECKPOINT (Option A retained-drill OOM fix): the deferred encoder
+  # backward holds the per-file drill (live L1 encode) activations; without
+  # this they accumulate O(files) → OOM. When the drill's flat content seqlen
+  # exceeds this, the per-group run_l1_and_project forward is checkpointed so
+  # its activations free after the forward and recompute (bit-exact) during the
+  # encoder backward → peak bounded to ~one file's drill. 0 = off; parallel to
+  # decode_gc_min_seqlen.
+  drill_checkpoint_min_seqlen: 4096
+
+  # --- SINGLE-FORWARD ACTIVATION-PEAK bounds (0 = off; live-tunable) ---------
+  #   max_l0_encode_tokens: 0 = OFF = FULL TREE (no truncation). We WANT the
+  #     full repo context — truncating the per-leaf L0 buffer (the old 16384)
+  #     chopped the big initial-import commit to a 16k prefix, defeating the
+  #     purpose. The full window is already budget-bounded at build time
+  #     (~75-90k tokens). The full-tree L0 encode is now LARGE + RETAINED (R is
+  #     held for the deferred encoder backward), so the tree-encode checkpoint
+  #     (checkpoint_tree_encode + tree_checkpoint_min_tokens below) is now
+  #     LOAD-BEARING to bound both the encode forward AND retained R to ~one
+  #     node/chunk.
+  #   max_decode_tokens: TRUNCATE the gold OUTPUT to its first N tokens (HARD
+  #     cut — drop the tail + end-token + any suffix), KEEPING every file (no
+  #     skip → no short-file bias, no data loss). The first portion of a file
+  #     already exercises extracting info from the tree, so reconstructing the
+  #     first-N gold is a valid target. Bounds the decode seqlen to
+  #     ≈ prefix + survivors + N. The TREE/input is NOT truncated. 4096 keeps
+  #     the decode ≤ the decode_gc_min_seqlen below, so the decode stays under
+  #     the GC threshold → no recompute → fast.
+  max_l0_encode_tokens: 0
+  max_decode_tokens: 4096
+
+  # FIX 2 (encode-chunking): checkpoint each tree node's L1 forward so its
+  # activations are recomputed (one node at a time) on the final backward
+  # instead of all being retained at once. Bounds the BIG-tree ENCODE peak
+  # (measured ~0.7GB/node → ~78.5GB at 116 nodes, ~109GB at the 160-node cap)
+  # to ~one node, regardless of tree size. Gradient is exact (checkpoint
+  # recompute reaches every node); θ is accumulated once outside the checkpoint.
+  checkpoint_tree_encode: true
+
+  # SPEED (conditional checkpoint/GC): the checkpoint above + the interleaved
+  # decode GC recompute in the backward, so they slow down EVERY step even
+  # though only the rare large step needs them. Make both CONDITIONAL on size:
+  #   tree_checkpoint_min_nodes — encode is only checkpointed when the repo's
+  #     window-0 subtree has MORE than this many nodes. Small trees (the
+  #     majority) encode un-checkpointed (~0.38GB/node → e.g. 64 nodes ≈ 24GB,
+  #     fits) and skip recompute → fast; large trees checkpoint → bounded peak.
+  #     Tune so (min_nodes * ~0.38GB) + baseline stays ≤ ~40GB.
+  #   decode_gc_min_seqlen — decoder GC in the interleaved decode only engages
+  #     when the decode seqlen exceeds this. Short decodes (~7-10GB/1000 tok,
+  #     so S≤4096 ≈ ≤40GB) run un-GC'd → fast; long decodes GC → bounded.
+  # Both are live-tunable via control.json (KRKBTrainer LIVE_CONFIG_HANDLERS).
+  tree_checkpoint_min_nodes: 64
+  #   tree_checkpoint_min_tokens — LOAD-BEARING for the FULL (uncapped-L0) tree:
+  #     a LOW-node repo can still hold a huge initial-import leaf (~75-90k
+  #     tokens); the node gate alone would skip it and retain the unbounded L0
+  #     forward. This forces the per-node checkpoint when total L0 leaf tokens
+  #     exceed it, bounding BOTH the encode forward AND the retained R to ~one
+  #     node/chunk regardless of tree shape. (OR'd with the node gate.)
+  tree_checkpoint_min_tokens: 16384
+  decode_gc_min_seqlen: 4096
 
 # L0 retention for the DRILL-DOWN bgkit encode (the file-diff at the target
 # commit, with the specific query). Matched to the recursive L0 ramp for a
@@ -157,7 +343,10 @@ survivorship:
   relevance_loss_weight: 0.05
   relevance_gold_boost: 1.5
   relevance_distractor_damp: 0.5
-  n_distractors: 3
+  # Within-drill relevance distractors OFF — the drill-down redesign authors
+  # NAVIGATION distractors into the trajectory data (wrong-sibling drills,
+  # loss=False), a distinct mechanism. Avoid stacking within-drill distractors.
+  n_distractors: 0
   ratio_loss_weight: 0.1
   decisiveness_loss_weight: 0.05
   l0:
@@ -193,13 +382,16 @@ moment_match_reference:
   l1:
     path: null
 
-# ── Encoder source: the distilled L1->L1 bridge checkpoint ──────────────────
-# Loads L0 + L1 + the distilled l1l1_bridge (encoder.pt carries l1l1_bridge.*).
-# STAGE BOTH DECODERS FIRST: copy decoder_qwen.pt + decoder_falcon.pt from the
-# summarization round-robin ckpt into this dir so the co-trained decoders load
-# (load_checkpoint globs *.pt by stem -> decoder_qwen / decoder_falcon). Do NOT
-# overwrite encoder.pt. See the implementation report for the copy command.
-phase1_checkpoint: /workspace/checkpoints/phase2_kb_l1l1_step200_20260629_054912
+# ── Encoder source: the CLEAN summarization round-robin checkpoint ──────────
+# Drill-down redesign (2026-07-03): restart from the summarization checkpoint,
+# discarding the misguided git-repro work. step51945 is self-contained — it
+# already holds encoder.pt + decoder_qwen.pt + decoder_falcon.pt (both decoders
+# co-trained), so NO decoder staging/copy is needed. It predates the l1l1_bridge
+# distillation, so l1l1_bridge.* is ABSENT — from_pretrained_with_state_dict
+# (strict=False) + _clone_l1l1_bridge_if_absent auto-clones it from
+# l0.auto_repro_head, then _set_trainability unfreezes it. Full-backprop through
+# the whole tree (the central goal) trains the bridge end-to-end from there.
+phase1_checkpoint: /workspace/checkpoints/phase1_summarization_round_robin_step51945_20260624_060459
 
 # ── Decoder: ROUND-ROBIN both families (Qwen-0.8B + Falcon-H1-90M) ──────────
 # Both decoders resident; one family picked per repo-batch. The summarization
@@ -207,7 +399,7 @@ phase1_checkpoint: /workspace/checkpoints/phase2_kb_l1l1_step200_20260629_054912
 # encoder ckpt dir (above) loads them warm rather than fresh-HF. qwen_decoder_prob
 # biases the split (Qwen-0.8B is ~9x Falcon-90M; fewer Qwen batches = faster).
 round_robin: true
-qwen_decoder_prob: 0.3
+qwen_decoder_prob: 0.08
 decoder_qwen:
   family: qwen35
   backbone_name: Qwen/Qwen3.5-0.8B

@@ -5422,6 +5422,69 @@ class ReconstructionDecoder(nn.Module):
             pass
         return backbone.model, backbone.lm_head
 
+    def _ensure_interleaved_gradient_checkpointing(
+        self, inner_model, max_seqlen: int
+    ) -> None:
+        """CONDITIONALLY force per-layer gradient checkpointing on ``inner_model``
+        (the model actually run by the packed/interleaved decode), using the
+        FLA-DeltaNet-safe REENTRANT checkpoint func.
+
+        Gated by ``self._interleaved_gc_mode`` (set by the trainer from
+        ``decoder_gradient_checkpointing``); ``None`` → no-op (so non-opted
+        phases are unchanged). GC is engaged ONLY when the decode sequence
+        length exceeds ``self._decode_gc_min_seqlen`` (default 4096): short
+        decodes (the majority) keep full O(S) activations and skip recompute
+        → fast; long decodes (the rare OOM cases) checkpoint → bounded peak.
+
+        The decision is re-evaluated every forward and the per-layer flag is
+        toggled idempotently — a swap only happens when the desired state
+        differs from the current one (``self._interleaved_gc_active``), so the
+        per-forward cost is just a cheap int compare on healthy steps.
+
+        Enabling sets each layer's ``gradient_checkpointing`` flag +
+        ``_gradient_checkpointing_func`` (FLA-safe reentrant) so the layer
+        ``__call__`` checkpoints when ``self.training`` — dropping the decode
+        forward from O(S) full activations to ~one-layer-at-a-time. Disabling
+        clears the flag so short decodes run un-checkpointed. No-op in eval
+        (the layer ``__call__`` gates on ``self.training``)."""
+        mode = getattr(self, "_interleaved_gc_mode", None)
+        if not mode:
+            return
+        min_seqlen = int(getattr(self, "_decode_gc_min_seqlen", 4096))
+        want_gc = int(max_seqlen) > min_seqlen
+        if want_gc == getattr(self, "_interleaved_gc_active", None):
+            return  # already in the desired state — nothing to toggle.
+
+        # On first activation, let HF populate each layer's
+        # _gradient_checkpointing_func + flag.
+        if want_gc and not getattr(self, "_interleaved_gc_initialized", False):
+            if hasattr(inner_model, "gradient_checkpointing_enable"):
+                try:
+                    inner_model.gradient_checkpointing_enable()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "interleaved_gc_enable_failed", error=str(exc)[:200],
+                    )
+            self._interleaved_gc_initialized = True
+
+        from bgkit.training.gradient_utils import _reentrant_checkpoint_func
+
+        swapped = 0
+        for module in inner_model.modules():
+            if not hasattr(module, "_gradient_checkpointing_func"):
+                continue
+            module.gradient_checkpointing = want_gc
+            if want_gc:
+                module._gradient_checkpointing_func = _reentrant_checkpoint_func
+            swapped += 1
+        self._interleaved_gc_active = want_gc
+        self._interleaved_gc_layers = swapped
+        logger.info(
+            "interleaved_gc_toggled", mode=mode, active=want_gc, layers=swapped,
+            max_seqlen=int(max_seqlen), min_seqlen=min_seqlen,
+            decoder_family=self.decoder_family,
+        )
+
     def _packed_forward(
         self,
         inputs_embeds: torch.Tensor,
@@ -5454,6 +5517,17 @@ class ReconstructionDecoder(nn.Module):
             strips ``seq_pad`` alignment positions appended by NVFP4.
         """
         inner_model, _lm_head = self._get_inner_model_and_head()
+        # FIX 1b: force per-layer gradient checkpointing on the INNER model
+        # actually run here. ``maybe_enable_decoder_gradient_checkpointing`` is
+        # applied to the ForCausalLM wrapper in setup, but the interleaved
+        # decode (the OOM path) ran the inner model with FULL O(S) activations —
+        # GC was not engaging on the FLA-DeltaNet layers under non-reentrant
+        # mode. This idempotently sets the per-layer flag + the FLA-safe
+        # reentrant checkpoint func on ``inner_model`` so GC fires here — but
+        # ONLY when ``max_seqlen`` exceeds ``_decode_gc_min_seqlen`` (short
+        # decodes skip recompute and run fast). No-op in eval (the layer
+        # __call__ gates on ``self.training``).
+        self._ensure_interleaved_gradient_checkpointing(inner_model, max_seqlen)
 
         # Promote position_ids to (1, N) for the HF model signature.
         pos_ids_2d = position_ids.unsqueeze(0)  # (1, N)
@@ -6774,15 +6848,36 @@ class ReconstructionDecoder(nn.Module):
         """Run ``inner_model`` with TE/NVFP4 seq alignment applied.
 
         Used by :meth:`forward_interleaved_with_loss` for the segment-based
-        API (used by KRKBTrainer). Accepts ``(B, S, D)`` + ``(B, S)`` mask
-        and delegates to the backbone in ``(B, S, D)`` form without
-        ``cu_seqlens``. This path is retained for the interleaved-segment
-        callers until Wave 3 trainer rewrites land.
+        API (used by KRKBTrainer). Accepts ``(B, S, D)`` + ``(B, S)`` mask.
+
+        The interleaved sequence is ONE contiguous causal sequence (segments
+        concatenated; no internal padding — the only padding is the optional
+        trailing NVFP4 alignment pad). The common single-sample (B=1, all-valid)
+        case is therefore routed through the FA4 **varlen** path
+        (:meth:`_packed_forward` with ``cu_seqlens=[0, S]``): the full-attention
+        sublayers then run O(S) flash-varlen instead of materialising the
+        O(S^2) padded ``S*S`` mask — the activation-peak fix for long-file
+        decodes. This matches the decoder's packed-only convention (module
+        docstring); the legacy padded forward is kept only as a guarded
+        fallback for the unused ``B>1`` / caller-supplied-mask case.
 
         Returns ``(hidden_states, seq_pad)`` where ``seq_pad`` is the number
         of alignment-padding positions appended to the end; the caller strips
         them before computing loss.
         """
+        b, s, _h = inputs_embeds.shape
+        all_valid = attention_mask is None or bool(attention_mask.all())
+        if b == 1 and all_valid:
+            # Single contiguous causal sequence → FA4 varlen [0, S] (O(S)).
+            device = inputs_embeds.device
+            cu_seqlens = torch.tensor([0, s], dtype=torch.int32, device=device)
+            position_ids = torch.arange(s, dtype=torch.long, device=device)
+            return self._packed_forward(
+                inputs_embeds, cu_seqlens, s, position_ids,
+            )
+
+        # Legacy padded fallback (no current caller — B>1 or a custom mask).
+        # WARNING: this materialises the O(S²) padded attention mask.
         inner_model, _lm_head = self._get_inner_model_and_head()
         seq_pad = 0
         padded_embeds = inputs_embeds
