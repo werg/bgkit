@@ -9,9 +9,12 @@ defaults:
   - _self_
 
 run_name: phase2_kb_git_repro_fullbackprop
-# FRESH from summarization step51945 ("none" disables auto-resume). The
-# 2026-07-03 opaque-BIP-39-ID + child-ID-injection redesign + data regen makes
-# ALL prior git-repro checkpoints incompatible (they trained on positional IDs
-# with no child-ID in the tree reps), so restart the task from the clean phase1
-# base to learn navigation from the reps.
-resume_checkpoint: "none"
+# Auto-resume ENABLED (no resume_checkpoint key): on restart the trainer
+# resolves the latest run-scoped checkpoint (resolve_latest_checkpoint, keyed on
+# run_name above) and resumes; on the first launch — or if the latest checkpoint
+# is incompatible — it gracefully cold-starts from the summarization base loaded
+# by the training config. So restarts (instrumentation/tuning/crash) CONTINUE
+# instead of re-starting from summarization and losing progress.
+# (Was pinned "none" for the 2026-07-03 opaque-BIP-39-ID + child-ID-injection
+# redesign that made prior checkpoints incompatible; that migration is done, and
+# incompatible checkpoints now cold-start gracefully rather than crash.)
