@@ -2010,12 +2010,12 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             # repo's file-samples bounds the per-step decoder peak.
             from collections import Counter
 
-            if hasattr(self.train_dataset, "group_keys"):
-                # Bulk turns-only read (reads just trajectory_json, never pages
-                # the gold blob) — the per-sample parse below is a >1h hang at
-                # 1.87M git-repro samples.
-                group_keys = self.train_dataset.group_keys()
-            else:
+            # Bulk turns-only read (reads just trajectory_json, never pages the
+            # gold blob) — unwraps the random_split Subset / ConcatDataset to
+            # reach KBTrajectoryDataset.group_keys(). The per-sample fallback is
+            # a >1h hang at 1.87M git-repro samples.
+            group_keys = self._dataset_group_keys(self.train_dataset)
+            if group_keys is None:
                 group_keys = [
                     self._repo_group_key(self.train_dataset[i])
                     for i in range(len(self.train_dataset))
@@ -4013,6 +4013,29 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     # ------------------------------------------------------------------
     # Per-repo shared tree (git_commit_repro full-backprop)
     # ------------------------------------------------------------------
+
+    def _dataset_group_keys(self, ds) -> list[str] | None:
+        """Bulk per-repo group keys for ``ds``, unwrapping the random_split
+        ``Subset`` and ``ConcatDataset`` wrappers to reach
+        :meth:`KBTrajectoryDataset.group_keys` (a turns-only bulk read, ~20s vs
+        >1h for the per-sample parse). Returns ``None`` if no wrapped dataset
+        exposes ``group_keys`` (caller falls back to the per-sample path)."""
+        from torch.utils.data import ConcatDataset, Subset
+
+        if hasattr(ds, "group_keys"):
+            return list(ds.group_keys())
+        if isinstance(ds, Subset):
+            parent = self._dataset_group_keys(ds.dataset)
+            return None if parent is None else [parent[i] for i in ds.indices]
+        if isinstance(ds, ConcatDataset):
+            parts = [self._dataset_group_keys(d) for d in ds.datasets]
+            if any(p is None for p in parts):
+                return None
+            out: list[str] = []
+            for p in parts:
+                out.extend(p)
+            return out
+        return None
 
     def _repo_group_key(self, sample: KBSample) -> str:
         """Return the shared-subtree root node id for a git_commit_repro
