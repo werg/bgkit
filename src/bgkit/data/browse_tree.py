@@ -59,6 +59,7 @@ class BrowseTree:
     def __init__(self, dataset: str, nodes: dict[str, BrowseNode]):
         self.dataset = dataset
         self._nodes = nodes
+        self._article_to_leaf_tag: dict[str, str] | None = None  # lazy O(1) index
         if "root" not in nodes:
             raise ValueError(f"Browse tree for {dataset!r} must contain a 'root' node")
 
@@ -179,11 +180,18 @@ class BrowseTree:
         node = self._nodes.get(article_id)
         if node is not None and node.is_article and node.parent is not None:
             return node.parent
-        # Fallback — linear scan over leaf tags.
-        for n in self._nodes.values():
-            if n.is_leaf_tag and article_id in n.articles:
-                return n.id
-        return None
+        # O(1) fallback via a lazily-built article -> leaf-tag index. The
+        # naive per-call linear scan is O(nodes) — catastrophic on large trees
+        # (git-repro: ~79K nodes x millions of coverage checks = a >1h setup
+        # hang). Build the index once, then look up in O(1).
+        if self._article_to_leaf_tag is None:
+            idx: dict[str, str] = {}
+            for n in self._nodes.values():
+                if n.is_leaf_tag:
+                    for aid in n.articles:
+                        idx[aid] = n.id
+            self._article_to_leaf_tag = idx
+        return self._article_to_leaf_tag.get(article_id)
 
     def top_level_topic_list(self) -> list[str]:
         """Return the direct children of ``root`` (e.g. Wikipedia top categories).
