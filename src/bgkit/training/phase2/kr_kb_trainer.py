@@ -2010,10 +2010,16 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             # repo's file-samples bounds the per-step decoder peak.
             from collections import Counter
 
-            group_keys = [
-                self._repo_group_key(self.train_dataset[i])
-                for i in range(len(self.train_dataset))
-            ]
+            if hasattr(self.train_dataset, "group_keys"):
+                # Bulk turns-only read (reads just trajectory_json, never pages
+                # the gold blob) — the per-sample parse below is a >1h hang at
+                # 1.87M git-repro samples.
+                group_keys = self.train_dataset.group_keys()
+            else:
+                group_keys = [
+                    self._repo_group_key(self.train_dataset[i])
+                    for i in range(len(self.train_dataset))
+                ]
             # --- Per-repo SIZE FILTER (drop monster / low-signal repos) -------
             # Two thresholds (either may be null = off), evaluated per UNIQUE
             # repo-window group key:

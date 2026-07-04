@@ -129,3 +129,30 @@ class KBTrajectoryDataset(Dataset):
             gold_answer=str(row["gold_answer"]),
             trajectory=trajectory_from_json(str(row["trajectory_json"])),
         )
+
+    def group_keys(self) -> list[str]:
+        """Bulk-extract each sample's ``is_head`` window-node id (the per-repo
+        shared-subtree group key) reading ONLY the ``trajectory_json`` column —
+        never paging the (large) gold blob. Batch-level iteration with a single
+        column materialization per batch makes this ~30x faster than
+        ``[_repo_group_key(self[i]) for i in range(len(self))]`` (which pages
+        every row's full record incl. the gold answer — an >1h hang at 1.87M
+        samples). Same key semantics as ``KRKBTrainer._repo_group_key``: the
+        first ``is_head`` bgkit turn's ``ids[0]`` (``""`` if none)."""
+        def _head_key(tj: str) -> str:
+            for turn in trajectory_from_json(tj):
+                if turn.kind == "bgkit" and bool(turn.args.get("is_head")):
+                    ids = turn.args.get("ids", [])
+                    return str(ids[0]) if ids else ""
+            return ""
+
+        keys: list[str] = []
+        if self._mode == "ipc":
+            fi = self._reader.schema.get_field_index("trajectory_json")
+            for bi in range(self._reader.num_record_batches):
+                col = self._reader.get_batch(bi).column(fi).to_pylist()
+                keys.extend(_head_key(str(tj)) for tj in col)
+        else:
+            col = self._table.column("trajectory_json").to_pylist()
+            keys.extend(_head_key(str(tj)) for tj in col)
+        return keys
