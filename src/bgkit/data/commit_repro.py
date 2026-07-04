@@ -226,28 +226,41 @@ def commit_key(repo: str, window_idx: int, ordinal: int) -> str:
 
 
 def commit_node_id(repo: str, sha: str) -> str:
-    """Opaque browse-tree node id for a commit: ``f"{repo}/{bip39(sha)}"``."""
-    return f"{repo}/{bip39_id(sha)}"
+    """Opaque browse-tree node id for a commit: ``f"{repo}/{bip39('cm|'+sha)}"``.
+
+    The ``cm|`` type prefix namespaces the hash input so a commit can never
+    collide with a chunk or window node — critical on single-child chains where
+    a chunk's ``'|'.join([sha])`` would otherwise equal the bare ``sha`` and the
+    chunk would hash to the same id as its only commit child (a self-loop /
+    cycle in the drill-down tree).
+    """
+    return f"{repo}/{bip39_id(f'cm|{sha}')}"
 
 
-def chunk_node_id(repo: str, descendant_shas: list[str]) -> str:
+def chunk_node_id(repo: str, descendant_shas: list[str], level: str) -> str:
     """Opaque node id for a positional chunk (chunk4 / chunk16).
 
-    Hashes the ``|``-joined descendant commit shas in their (deterministic,
-    ordinal-ascending) order, so the id is stable but not derivable from the
-    chunk's ordinal position. Repo-prefixed for global uniqueness.
+    Hashes the ``level`` tag (``"c4"`` / ``"c16"``) followed by the ``|``-joined
+    descendant commit shas in their (deterministic, ordinal-ascending) order, so
+    the id is stable but not derivable from the chunk's ordinal position. The
+    ``level`` prefix keeps a c16 node distinct from the c4 node that shares its
+    descendant-sha list on a single-child chain (they would otherwise collide),
+    and distinct from a single commit's ``cm|`` namespace. Repo-prefixed for
+    global uniqueness.
     """
-    return f"{repo}/{bip39_id('|'.join(descendant_shas))}"
+    return f"{repo}/{bip39_id(f'{level}|' + '|'.join(descendant_shas))}"
 
 
 def window_node_id(repo: str, window_idx: int) -> str:
     """Opaque node id for a ``(repo, window)`` node.
 
-    ``f"{repo}/{bip39(f'{repo}:{window_idx}')}"`` — the drill-down head. Its
-    children are the 2nd-level survivors the per-sample head L1 runs over.
-    Repo-prefixed for global uniqueness in the forest namespace.
+    ``f"{repo}/{bip39(f'w|{repo}:{window_idx}')}"`` — the drill-down head. Its
+    children are the 2nd-level survivors the per-sample head L1 runs over. The
+    ``w|`` type prefix namespaces it away from commit / chunk hash inputs so a
+    window node can never collide with a node below it. Repo-prefixed for global
+    uniqueness in the forest namespace.
     """
-    return f"{repo}/{bip39_id(f'{repo}:{window_idx}')}"
+    return f"{repo}/{bip39_id(f'w|{repo}:{window_idx}')}"
 
 
 def file_change_leaf_id(
@@ -440,7 +453,7 @@ def build_window_subtree_nodes(
     c4_groups = _chunk(commits, CHUNK_FANOUT)
     two_levels = len(c4_groups) > CHUNK_FANOUT
     c4_specs = [
-        (chunk_node_id(repo_id, shas_of(group)), group) for group in c4_groups
+        (chunk_node_id(repo_id, shas_of(group), "c4"), group) for group in c4_groups
     ]
 
     if not two_levels:
@@ -461,7 +474,7 @@ def build_window_subtree_nodes(
     c16_ids: list[str] = []
     for c16_group in c16_groups:
         c16_shas = [c.sha for _, group in c16_group for c in group]
-        c16_id = chunk_node_id(repo_id, c16_shas)
+        c16_id = chunk_node_id(repo_id, c16_shas, "c16")
         c16_ids.append(c16_id)
         for c4_id, group in c16_group:
             child_ids = [c.commit_node_id for c in group]
