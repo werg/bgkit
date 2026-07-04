@@ -3528,6 +3528,10 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         cached = memo.get(node_id)
         if cached is not None:
             return cached
+        # In-progress sentinel to break cycles: a browse tree SHOULD be acyclic,
+        # but an id collision can introduce one, and this recursion would then
+        # hang forever. A cyclic re-entry now returns (None, None) (skipped).
+        memo[node_id] = (None, None)
         node = tree.get(node_id)
         if not node.children:
             result = self._encode_leaf_subtree(dataset, node, q_emb)
@@ -4577,15 +4581,19 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         tree = self._trees.get(dataset)
         if tree is None or root_node_id not in tree:
             return 0
-        seen = 0
+        # Visited-set: a browse tree SHOULD be acyclic, but an id-collision bug
+        # (or any future data issue) can introduce a cycle, and a naive DFS then
+        # loops forever (this exact hang cost a debugging session). Count distinct
+        # reachable nodes and never revisit.
+        seen: set[str] = set()
         stack = [root_node_id]
         while stack:
             nid = stack.pop()
-            if nid not in tree:
+            if nid in seen or nid not in tree:
                 continue
-            seen += 1
+            seen.add(nid)
             stack.extend(tree.get(nid).children)
-        return seen
+        return len(seen)
 
     def _repo_leaf_token_count(self, dataset: str, root_node_id: str) -> int:
         """Total L0-encoded TOKEN count of a repo's window-0 leaf diffs — the
