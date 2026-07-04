@@ -43,7 +43,13 @@ import pygit2
 
 from bgkit.data.bgkit_tool_template import TrajectoryTurn
 from bgkit.data.browse_tree import BrowseNode, BrowseTree
-from bgkit.data.drilldown import DrillTarget, build_drilldown_trajectory
+from bgkit.data.drilldown import (
+    DEFAULT_MODE_WEIGHTS,
+    DEFAULT_TRUNCATION_MAX_DEPTH,
+    DEFAULT_TRUNCATION_MIN_DEPTH,
+    DrillTarget,
+    build_drilldown_trajectory,
+)
 from bgkit.data.opaque_ids import bip39_id
 
 # ---------------------------------------------------------------------------
@@ -600,6 +606,9 @@ def build_file_drilldown_trajectory(
     ord_to_commit: dict[int, ReproCommit],
     head_template_idx: int = 0,
     n_distractors: int = MAX_DISTRACTORS,
+    mode_weights: tuple[float, float, float] = DEFAULT_MODE_WEIGHTS,
+    truncation_min_depth: int = DEFAULT_TRUNCATION_MIN_DEPTH,
+    truncation_max_depth: int = DEFAULT_TRUNCATION_MAX_DEPTH,
     rng=None,
 ) -> list[TrajectoryTurn] | None:
     """Pure recursive drill-down trajectory for one ``(file, target)`` reconstruction.
@@ -612,6 +621,13 @@ def build_file_drilldown_trajectory(
     :meth:`ReproCommit.file_change_id` — identical to the tree ``articles`` and
     mmap ``document_id``. The head is the window node, encoded live with the task
     query. Returns ``None`` if any required node id is missing.
+
+    ``mode_weights`` ``(full, no_drill, truncated)`` selects the per-sample drill
+    shape (see :func:`bgkit.data.drilldown.build_drilldown_trajectory`);
+    ``truncation_{min,max}_depth`` bound the truncated-mode branch depths. The
+    git-repro tree levels map to truncation depths as
+    ``window(1) → c16(2) → c4(3) → cm(4)``; the file-diff leaf sits below cm and
+    is never reached in ``no_drill`` / ``truncated`` mode.
     """
     head_id = window_node_id(repo, window_idx)
     if head_id not in tree:
@@ -629,7 +645,11 @@ def build_file_drilldown_trajectory(
     task_query = build_head_query(file_path, head_message, head_template_idx)
     return build_drilldown_trajectory(
         tree, head_id, targets, task_query, gold_blob,
-        n_distractors=n_distractors, rng=rng,
+        n_distractors=n_distractors,
+        mode_weights=mode_weights,
+        truncation_min_depth=truncation_min_depth,
+        truncation_max_depth=truncation_max_depth,
+        rng=rng,
     )
 
 

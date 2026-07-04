@@ -59,6 +59,11 @@ from bgkit.data.commit_repro import (
     build_query,
     commit_key,
 )
+from bgkit.data.drilldown import (
+    DEFAULT_MODE_WEIGHTS,
+    DEFAULT_TRUNCATION_MAX_DEPTH,
+    DEFAULT_TRUNCATION_MIN_DEPTH,
+)
 
 # Trajectory rows buffered before each incremental parquet RecordBatch write.
 # Bounds peak memory to (this many rows) + one repo's commits, never the corpus.
@@ -153,8 +158,31 @@ def main() -> None:
                         help="cap on touching-diff drill targets per sample (most-recent)")
     parser.add_argument("--n-distractors", type=int, default=MAX_DISTRACTORS,
                         help="0..this distractor branches (loss=False) per sample")
+    parser.add_argument(
+        "--drill-mode-weights", type=float, nargs=3,
+        metavar=("FULL", "NO_DRILL", "TRUNCATED"),
+        default=list(DEFAULT_MODE_WEIGHTS),
+        help=(
+            "per-sample sampling weights for the three drill shapes "
+            "(full no_drill truncated); need not sum to 1. "
+            f"default {DEFAULT_MODE_WEIGHTS}"
+        ),
+    )
+    parser.add_argument(
+        "--truncation-min-depth", type=int, default=DEFAULT_TRUNCATION_MIN_DEPTH,
+        help=(
+            "truncated mode: min branch depth (path-node count from head, "
+            "1=head only) — clamped to each branch length; the file-diff leaf "
+            "is never reached"
+        ),
+    )
+    parser.add_argument(
+        "--truncation-max-depth", type=int, default=DEFAULT_TRUNCATION_MAX_DEPTH,
+        help="truncated mode: max branch depth (clamped to each branch length)",
+    )
     parser.add_argument("--seed", type=int, default=17)
     args = parser.parse_args()
+    mode_weights = tuple(args.drill_mode_weights)
 
     tree = BrowseTree.load(args.browse_tree, dataset=DATASET_NAME)
     commit_node_ids = json.loads(args.commit_node_ids.read_text())
@@ -218,7 +246,11 @@ def main() -> None:
                         ord_to_message.get(target_ord, ""), gold_blob,
                         ord_to_commit=ord_to_commit,
                         head_template_idx=head_template_idx,
-                        n_distractors=args.n_distractors, rng=rng,
+                        n_distractors=args.n_distractors,
+                        mode_weights=mode_weights,
+                        truncation_min_depth=args.truncation_min_depth,
+                        truncation_max_depth=args.truncation_max_depth,
+                        rng=rng,
                     )
                     if trajectory is None:
                         n_dropped += 1

@@ -131,7 +131,7 @@ def test_drilldown_trajectory_uses_consistent_ids():
     traj = build_file_drilldown_trajectory(
         tree, node_ids, "owner/repo", 0, "README.md", touching,
         "msg", "GOLD", ord_to_commit=ord_to_commit,
-        n_distractors=0, rng=random.Random(0),
+        n_distractors=0, mode_weights=(1.0, 0.0, 0.0), rng=random.Random(0),
     )
     assert traj is not None
     refs = set(articles_referenced_by_trajectory(traj))

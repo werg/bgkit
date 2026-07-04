@@ -191,6 +191,12 @@ def build_qa_drilldown_trajectory(
     # Deterministic builder rng (drives distractor pick + 0..n draw).
     rng = random.Random(f"{cfg.seed}:{sample_idx}")
 
+    # QA drill-down (KILT / PubMedQA / NarrativeQA) always drills every gold
+    # article to its retrieval leaf: pin ``full`` mode. The three-mode
+    # (full / no_drill / truncated) retrieval-from-compressed sampling is scoped
+    # to the git-repro reconstruction task, which opts in via commit_repro.
+    full_mode_weights = (1.0, 0.0, 0.0)
+
     if tree.is_flat():
         # No hierarchy to drill: collapse to a single degenerate leaf drill
         # that retrieves every gold article directly, anchored at the first
@@ -202,7 +208,7 @@ def build_qa_drilldown_trajectory(
         )]
         return build_drilldown_trajectory(
             tree, head, targets, question, gold_answer,
-            n_distractors=n_distractors, rng=rng,
+            n_distractors=n_distractors, mode_weights=full_mode_weights, rng=rng,
         )
 
     # Hierarchical: head = deepest common ancestor of the gold leaf tags;
@@ -221,7 +227,7 @@ def build_qa_drilldown_trajectory(
     ]
     return build_drilldown_trajectory(
         tree, head, targets, question, gold_answer,
-        n_distractors=n_distractors, rng=rng,
+        n_distractors=n_distractors, mode_weights=full_mode_weights, rng=rng,
     )
 
 
