@@ -4886,6 +4886,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     decoder_family=getattr(self, "_decoder_family", None),
                     decode_seqlen=decode_len,
                     loss_tokens=sample_tokens,
+                    n_drills=len(prep.get("prepared_turns", [])),
                 )
             group_loss = group_loss + sample_loss
             total_tokens += sample_tokens
