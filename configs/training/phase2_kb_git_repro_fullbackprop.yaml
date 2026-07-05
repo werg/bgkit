@@ -47,6 +47,14 @@ lr: 1.0e-4
 decoder_lr: 5.0e-5
 l1_lr: 2.0e-4
 eval_every: 500
+# Comprehensive ablation matrix run at every eval: re-runs the eval set under
+# each mode and logs eval/ablation/{mode}/{loss,exact_match,token_f1,kb/tool_call_id_accuracy/bgkit}.
+# zeroed=survivors→0, noise=survivors→gaussian, neither=survivors+topics→0.
+# Baseline-vs-ablated GAP on exact_match/token_f1 = reconstruction dependence on reps;
+# on bgkit tool-call-ID accuracy = navigation dependence. Plus eval/recon_gap + eval/nav_gap
+# (CE split) below. Catches the decorative-reps shortcut (recon_gap→0) instead of hiding it.
+eval_ablation_modes: [zeroed, noise, neither]
+eval_gap_probe: true          # emit eval/recon_gap + eval/nav_gap (CE split, present-vs-zeroed)
 save_every: 500
 reset_wandb: true  # fresh run for the ablation-probe confirmation (throwaway); revert after
 

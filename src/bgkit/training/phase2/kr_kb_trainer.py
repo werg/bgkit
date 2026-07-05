@@ -7240,6 +7240,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 for k, v in sub.items():
                     if k.startswith("eval/"):
                         metrics[f"eval/ablation/{mode_str}/{k[len('eval/'):]}"] = v
+            # recon/nav ablation GAPS: how much reconstruction / navigation CE
+            # DEGRADES when the survivor reps are zeroed. gap ≈ 0 ⇒ reps decorative
+            # (the shortcut); gap > 0 ⇒ reps load-bearing (the objective). Present
+            # only when eval_gap_probe is on AND 'zeroed' is in eval_ablation_modes.
+            base_r = metrics.get("eval/recon_loss")
+            base_n = metrics.get("eval/nav_loss")
+            z_r = metrics.get("eval/ablation/zeroed/recon_loss")
+            z_n = metrics.get("eval/ablation/zeroed/nav_loss")
+            if base_r is not None and z_r is not None:
+                metrics["eval/recon_gap"] = z_r - base_r
+            if base_n is not None and z_n is not None:
+                metrics["eval/nav_gap"] = z_n - base_n
         finally:
             self.model.train()
         return metrics
@@ -7272,6 +7284,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         kb_f1_n = 0
         self._eval_family_counter = 0
 
+        # Optional recon/nav CE split accumulator (eval/recon_loss + eval/nav_loss).
+        # evaluate() diffs these across ablation modes to get eval/recon_gap + eval/nav_gap.
+        gap_probe = bool(self.step_cfg.get("eval_gap_probe", False))
+        span_accum = (
+            {"nav_sum": 0.0, "nav_count": 0, "recon_sum": 0.0, "recon_count": 0}
+            if gap_probe else None
+        )
+
         for batch in self.eval_dataloader:
             for sample in batch:
                 if self._round_robin:
@@ -7282,7 +7302,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                         else "falcon_h1"
                     )
                     self._eval_family_counter += 1
-                result = self._eval_one_sample(sample)
+                result = self._eval_one_sample(sample, span_accum)
                 if result is None:
                     continue
                 sample_loss = result["loss"]
@@ -7354,10 +7374,21 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         for ds, scores in per_dataset_f1.items():
             if scores:
                 metrics[f"eval/{ds}/token_f1"] = sum(scores) / len(scores)
+        # recon/nav CE split (present when eval_gap_probe). evaluate() diffs
+        # these across ablation modes to form eval/recon_gap + eval/nav_gap.
+        if span_accum is not None:
+            rc = span_accum["recon_count"]
+            nc = span_accum["nav_count"]
+            if rc > 0:
+                metrics["eval/recon_loss"] = span_accum["recon_sum"] / rc
+                metrics["eval/recon_tokens"] = float(rc)
+            if nc > 0:
+                metrics["eval/nav_loss"] = span_accum["nav_sum"] / nc
+                metrics["eval/nav_tokens"] = float(nc)
         return metrics
 
     @torch.no_grad()
-    def _eval_one_sample(self, sample: KBSample) -> dict | None:
+    def _eval_one_sample(self, sample: KBSample, span_accum: dict | None = None) -> dict | None:
         """Run one eval sample: loss, next-token argmax accuracy, EM/F1.
 
         ``loss`` and ``correct`` are computed over *all* loss-bearing
@@ -7386,6 +7417,11 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         )
         token_ids_full = output.token_ids
         loss_mask_full = output.loss_mask
+
+        # Optional recon/nav CE split (for eval/recon_gap + eval/nav_gap): reuse
+        # the same trace-span splitter as the training-step ablation probe.
+        if span_accum is not None:
+            self._accumulate_span_ce(span_accum, output, trace)
 
         # Shifted CE positions: hidden[i] predicts token[i+1].
         shift_t = token_ids_full[:, 1:]
