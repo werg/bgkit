@@ -2727,6 +2727,19 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 l0_prompt_cu, int(l0_prompt_emb.shape[0]),
             )
 
+        # Hard per-article survivor floor DURING the recursive shared-tree encode
+        # only (gated on _recursive_l0_override, set/cleared inside
+        # _compute_shared_repo_tree). Without it, as recursive-L0 retention ramps
+        # 0.15→0.05 the L0 head selects ZERO survivors on small leaf diffs
+        # (0% zero-rate @0.15 → 98% @0.07), collapsing whole leaf subtrees to
+        # (None,None) → n_nodes=0 → NO whole-tree full-backprop gradient on ~40%
+        # (→~100%) of repos. Flat single-doc paths keep min_per_sample=0 (a
+        # zero-survivor distractor is a legitimate signal there).
+        _tree_leaf_floor = (
+            max(1, int(getattr(self, "_recursive_leaf_min_survivors", 1)))
+            if getattr(self, "_recursive_l0_override", None) is not None
+            else 0
+        )
         out = self._checkpointed_level(
             "l0",
             content_embeddings=input_embeddings,
@@ -2736,6 +2749,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             prompt_cu_seqlens=l0_prompt_cu,
             prompt_position_ids=l0_prompt_pos,
             target_ratio=ratio,
+            min_per_sample=_tree_leaf_floor,
             utility_grad_active=util_active,
             utility_grad_capture=grad_capture,
         )
@@ -4689,6 +4703,22 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             l0_retention=self._recursive_l0_retention_now(),
             l1_retention=self._recursive_l1_retention_now(),
         )
+        # LOUD guard: a non-empty tree that encodes to 0 nodes means the whole-tree
+        # full-backprop objective (the point of this run) got NO gradient for this
+        # repo. With the min-survivors floor above this should be ~0; if it fires
+        # the floor regressed or a new collapse path appeared — surface, don't hide.
+        if stats.get("nodes", 0) == 0 and n_nodes_tree > 0:
+            logger.warning(
+                "phase2_kb_shared_tree_collapsed",
+                dataset=dataset,
+                root=root_node_id,
+                tree_node_count=n_nodes_tree,
+                tree_leaf_tokens=n_leaf_tokens,
+                l0_retention=self._recursive_l0_retention_now(),
+                l1_retention=self._recursive_l1_retention_now(),
+                msg="whole-tree encode produced 0 nodes despite a non-empty "
+                    "tree; repo contributes NO whole-tree gradient this step",
+            )
         return memo, stats
 
     def _truncate_segments_to_gold_budget(
