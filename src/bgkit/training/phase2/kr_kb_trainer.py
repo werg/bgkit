@@ -2727,19 +2727,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 l0_prompt_cu, int(l0_prompt_emb.shape[0]),
             )
 
-        # Hard per-article survivor floor DURING the recursive shared-tree encode
-        # only (gated on _recursive_l0_override, set/cleared inside
-        # _compute_shared_repo_tree). Without it, as recursive-L0 retention ramps
-        # 0.15→0.05 the L0 head selects ZERO survivors on small leaf diffs
-        # (0% zero-rate @0.15 → 98% @0.07), collapsing whole leaf subtrees to
-        # (None,None) → n_nodes=0 → NO whole-tree full-backprop gradient on ~40%
-        # (→~100%) of repos. Flat single-doc paths keep min_per_sample=0 (a
-        # zero-survivor distractor is a legitimate signal there).
-        _tree_leaf_floor = (
-            max(1, int(getattr(self, "_recursive_leaf_min_survivors", 1)))
-            if getattr(self, "_recursive_l0_override", None) is not None
-            else 0
-        )
+        # NOTE: a recursive tree-leaf survivor floor (min_per_sample>0 gated on
+        # _recursive_l0_override) was tried here to fix the retention-ramp 0-node
+        # collapse but caused a checkpoint forward/recompute tensor-count mismatch
+        # (the changed L0 survivor count propagates into downstream checkpointed
+        # encodes whose recompute then diverges — 243 vs 232). Reverted; the floor
+        # needs GPU debugging (debug=True) to place min_per_sample where it's
+        # recompute-stable. See plans/git_repro_shortcut_fix_2026_07_06.md.
         out = self._checkpointed_level(
             "l0",
             content_embeddings=input_embeddings,
@@ -2749,7 +2743,6 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             prompt_cu_seqlens=l0_prompt_cu,
             prompt_position_ids=l0_prompt_pos,
             target_ratio=ratio,
-            min_per_sample=_tree_leaf_floor,
             utility_grad_active=util_active,
             utility_grad_capture=grad_capture,
         )
