@@ -125,14 +125,17 @@ recursive_l1_tree:
   # unchanged for every other dataset/run.
   selection_mode_l1: exact_topk
   # Step-interpolated retention ramps (start -> end over ramp_steps, by
-  # global_step). Recursive L0 (shared-tree diff leaves) 0.15 -> 0.05;
-  # recursive L1 (up the tree) 0.30 -> 0.05.
+  # global_step). Recursive L0 (shared-tree diff leaves) 0.50 -> 0.05;
+  # recursive L1 (up the tree) 0.50 -> 0.05.
+  # HIGH START (2026-07-06): begin content-RICH so the reps actually carry the
+  # diff content and we can see whether the model USES it (recon_gap), THEN ramp
+  # to 0.05 to test compression. Was 0.15/0.30. Live-tunable (no restart).
   l0_retention:
-    start: 0.15
+    start: 0.50
     end: 0.05
     ramp_steps: 4000
   l1_retention:
-    start: 0.30
+    start: 0.50
     end: 0.05
     ramp_steps: 4000
   # Per-repo file-sample cap. REFRAMED to a COMPUTE knob, not a memory knob:
@@ -301,10 +304,11 @@ recursive_l1_tree:
 
 # L0 retention for the DRILL-DOWN bgkit encode (the file-diff at the target
 # commit, with the specific query). Matched to the recursive L0 ramp for a
-# coherent within-document compression curriculum.
+# coherent within-document compression curriculum (high start 0.50 -> 0.05,
+# 2026-07-06 — keep the drill's retrieval-leaf content rich early too).
 l0_retention:
   git_commit_repro:
-    start: 0.15
+    start: 0.50
     end: 0.05
     ramp_steps: 4000
 

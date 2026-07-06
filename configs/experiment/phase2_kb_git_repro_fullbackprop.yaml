@@ -9,6 +9,13 @@ defaults:
   - _self_
 
 run_name: phase2_kb_git_repro_fullbackprop
+# FRESH cold-start (2026-07-06): the prior run is shortcut-poisoned (learned the
+# AR fallback while the tree was collapsed). To test whether the collapse fix +
+# high-start retention let the reps become load-bearing, cold-start from the
+# summarization base — a poisoned model won't un-learn the shortcut by resuming.
+# REMOVE this line once the fresh run has saved its first checkpoint so future
+# crash-restarts auto-resume the fresh run instead of cold-starting again.
+resume_checkpoint: "none"
 # Auto-resume ENABLED (no resume_checkpoint key): on restart the trainer
 # resolves the latest run-scoped checkpoint (resolve_latest_checkpoint, keyed on
 # run_name above) and resumes; on the first launch — or if the latest checkpoint
