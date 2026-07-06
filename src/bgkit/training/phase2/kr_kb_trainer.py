@@ -2760,6 +2760,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     def _l0_for_articles(
         self, dataset: str, article_ids: list[str],
         query_emb: torch.Tensor | None = None,
+        selection_mode: str = "threshold",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return packed L0 survivors for each article.
 
@@ -2784,6 +2785,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         if self._live_l0:
             out, content_cu, ratio = self._live_l0_encode(
                 dataset, article_ids, query_emb=query_emb,
+                selection_mode=selection_mode,
             )
             survivors = out.survivor_embeddings  # (N_survivors, D)
             cu_seqlens = out.survivor_cu_seqlens  # (B+1,)
@@ -3621,10 +3623,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             if not getattr(self, "_survivorship_aux", True):
                 self._accumulate_theta_from_counts("l0", l0_counts, ratio_l0)
         else:
-            # Default path (preserves _l0_for_articles' θ / _pending behaviour
-            # for the non-checkpointed recursive modes, incl. aux-ON).
+            # Default (non-checkpointed) path. Also a TREE LEAF, so it must use
+            # exact_topk (>=1 survivor) — the θ path here was the ~16% residual
+            # 0-node collapse on small trees after the checkpointed path was
+            # fixed. Non-checkpointed → no recompute risk; selection_mode is
+            # captured anyway so the inner L0 encode is stable regardless.
             l0_flat, surv_cu = self._l0_for_articles(
                 dataset, article_ids, query_emb=q_emb,
+                selection_mode="exact_topk",
             )
             if l0_flat.numel() == 0:
                 return None, None
