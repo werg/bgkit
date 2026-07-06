@@ -1335,9 +1335,13 @@ def test_ablation_span_ce_splits_nav_and_recon():
         0.0, 0,
     )
 
-    # _accumulate_span_ce routes bgkit_call_spans → nav, answer_span → recon.
+    # _accumulate_span_ce routes bgkit_call_spans → nav, answer_span → recon,
+    # and DROPS the first (head) drill — it is causally survivor-independent
+    # (nav tokens render before its own survivor) so it can't be rep-dependent.
+    # Prepend a dummy head span; the measured nav is exactly nav_spans below.
     trace = _KBDecodeTrace(
-        answer_span=recon_span, bgkit_turns=[], bgkit_call_spans=nav_spans,
+        answer_span=recon_span, bgkit_turns=[],
+        bgkit_call_spans=[(5, 6)] + nav_spans,
     )
     accum = {"nav_sum": 0.0, "nav_count": 0, "recon_sum": 0.0, "recon_count": 0}
     stub = KRKBTrainer.__new__(KRKBTrainer)  # no __init__ — helpers are pure

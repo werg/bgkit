@@ -3840,10 +3840,28 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     # Pure drill-down survivor dispatch (git_commit_repro)
     # ------------------------------------------------------------------
 
-    def _drilldown_zero_survivor(self) -> torch.Tensor:
+    def _drilldown_zero_survivor(self, reason: str = "unknown") -> torch.Tensor:
         """1-vector zero survivor (decoder/projection space) so a sentinel
         splice always has something to drop in when a drill resolves to
-        nothing."""
+        nothing.
+
+        INSTRUMENTED: a zero survivor means the decoder sees NOTHING at that
+        splice — and if it fires broadly (tree collapse, or a trajectory
+        node-id ↔ tree/memo-key mismatch), any ablation gap reads ~0 and the
+        reps look "decorative" when they are actually ABSENT (this masked the
+        shared-tree collapse for a long time — 2026-07-06). Counted per reason;
+        logged on first few + every 200th so a systematic miss is visible."""
+        c = getattr(self, "_zero_survivor_counts", None)
+        if c is None:
+            c = self._zero_survivor_counts = {}
+        c[reason] = c.get(reason, 0) + 1
+        if c[reason] <= 3 or c[reason] % 200 == 0:
+            logger.warning(
+                "phase2_kb_drilldown_zero_survivor",
+                reason=reason,
+                count=c[reason],
+                n_spliced=len(getattr(self, "_shared_tree_splice_reps", {}) or {}),
+            )
         return torch.zeros(
             (1, self.encoder.active_projection_output_dim),
             device=self.device, dtype=torch.bfloat16,
@@ -4765,8 +4783,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 cut = int(gold_idx[remaining - 1].item()) + 1
                 out.append(
                     TokenSegment(
-                        token_ids=seg.token_ids[:cut],
-                        loss_mask=lm[:cut],
+                        # Runtime segments are (1, L) (_assemble_sample_segments
+                        # unsqueeze(0)); cut is a flat/sequence index, so slice the
+                        # LAST dim (works for both (1,L) and 1-D). The old
+                        # seg.token_ids[:cut] sliced the batch dim (size 1) → a
+                        # no-op for cut>=1, so max_decode_tokens never truncated
+                        # and long-file gold decodes ran unbounded.
+                        token_ids=seg.token_ids[..., :cut],
+                        loss_mask=lm[..., :cut],
                     )
                 )
                 return out  # drop the tail + all subsequent segments
@@ -6471,7 +6495,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         the (sum, count) into ``accum`` (keys ``nav_sum``/``nav_count``/
         ``recon_sum``/``recon_count``). Reuses the trace's already-shifted spans.
         """
-        nav_spans = list(trace.bgkit_call_spans)
+        # nav_gap over DRILL ids: exclude the FIRST bgkit call (the head). The
+        # head's nav tokens render BEFORE its own survivor is spliced, so its
+        # prediction is causally survivor-INDEPENDENT (gap structurally 0), and
+        # its query text is a copyable paraphrase of the question — both dilute
+        # nav_gap toward 0. Only depth>=1 drills (child ids after the parent's
+        # rep) can be rep-dependent, so measure those. (Measurement only — does
+        # not change the training loss.)
+        nav_spans = list(trace.bgkit_call_spans)[1:]
         recon_spans = (
             [trace.answer_span] if trace.answer_span is not None else []
         )

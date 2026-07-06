@@ -176,7 +176,7 @@ def _stub_live_l0_per_repo(trainer, enc, dim: int):
     )
     enc.l0_query_embs: list[torch.Tensor] = []
 
-    def live_l0(self, dataset, article_ids, query_emb=None):
+    def live_l0(self, dataset, article_ids, query_emb=None, selection_mode="threshold"):
         enc.l0_query_embs.append(query_emb)
         n = 2 * max(1, len(article_ids))
         ids = torch.arange(n, dtype=torch.long) % enc.embed.num_embeddings
@@ -1777,7 +1777,7 @@ def test_fix2b_l0_leaf_checkpoint_gradient_parity():
         t._surv_state_l0 = init_state()
         t._surv_state_l1 = init_state()
         t._live_l0_encode = types.MethodType(
-            lambda self, ds, aids, query_emb=None, ratio=None:
+            lambda self, ds, aids, query_emb=None, ratio=None, selection_mode="threshold":
                 make_live_l0()(ds, aids, query_emb, ratio), t,
         )
         # _encode_tree_node_live stub: identity-ish over the per-child survivor
@@ -1794,8 +1794,10 @@ def test_fix2b_l0_leaf_checkpoint_gradient_parity():
 
         # Non-checkpoint reference: mirror _l0_for_articles' aux-off branch
         # (live encode + θ accumulated inside, return survivors).
-        def _l0_for_articles(self, ds, aids, query_emb=None):
-            out, cu, ratio = self._live_l0_encode(ds, aids, query_emb=query_emb)
+        def _l0_for_articles(self, ds, aids, query_emb=None, selection_mode="threshold"):
+            out, cu, ratio = self._live_l0_encode(
+                ds, aids, query_emb=query_emb, selection_mode=selection_mode
+            )
             self._accumulate_theta_from_counts(
                 "l0",
                 torch.tensor([
