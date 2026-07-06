@@ -2453,6 +2453,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         "pinned_positions",
         "target_ratio",
         "min_per_sample",
+        "selection_mode",
         "utility_grad_active",
         "utility_grad_capture",
     )
@@ -2463,6 +2464,12 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         "pinned_positions": None,
         "target_ratio": None,
         "min_per_sample": 0,
+        # Captured so the L0-forward checkpoint replays it. The DECISION is made
+        # by the caller (_l0_leaf_forward hardcodes "exact_topk"), NOT by reading
+        # transient _recursive_l0_override inside the encode — so the L1-node
+        # checkpoint's recompute (which re-runs _l0_leaf_forward) re-derives the
+        # SAME mode. Default "threshold" preserves flat _l0_for_articles.
+        "selection_mode": "threshold",
         "utility_grad_active": False,
         "utility_grad_capture": None,
     }
@@ -2615,6 +2622,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         article_ids: list[str],
         query_emb: torch.Tensor | None = None,
         ratio: float | None = None,
+        selection_mode: str = "threshold",
     ):
         """Run the encoder live on each article's tokens to produce L0 survivors.
 
@@ -2727,13 +2735,11 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 l0_prompt_cu, int(l0_prompt_emb.shape[0]),
             )
 
-        # NOTE: a recursive tree-leaf survivor floor (min_per_sample>0 gated on
-        # _recursive_l0_override) was tried here to fix the retention-ramp 0-node
-        # collapse but caused a checkpoint forward/recompute tensor-count mismatch
-        # (the changed L0 survivor count propagates into downstream checkpointed
-        # encodes whose recompute then diverges — 243 vs 232). Reverted; the floor
-        # needs GPU debugging (debug=True) to place min_per_sample where it's
-        # recompute-stable. See plans/git_repro_shortcut_fix_2026_07_06.md.
+        # selection_mode is a CALLER decision threaded in (NOT read from transient
+        # _recursive_l0_override here) so the L1-node checkpoint's recompute —
+        # which re-runs _l0_leaf_forward → this method — re-derives the SAME mode.
+        # _l0_leaf_forward passes "exact_topk" (tree leaf: ceil>=1, never 0 → fixes
+        # the collapse); flat _l0_for_articles keeps "threshold".
         out = self._checkpointed_level(
             "l0",
             content_embeddings=input_embeddings,
@@ -2743,6 +2749,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             prompt_cu_seqlens=l0_prompt_cu,
             prompt_position_ids=l0_prompt_pos,
             target_ratio=ratio,
+            selection_mode=selection_mode,
             utility_grad_active=util_active,
             utility_grad_capture=grad_capture,
         )
@@ -3679,8 +3686,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         and ``counts`` is a detached ``[organic, controllable, valid]`` tensor
         for θ accumulation OUTSIDE the checkpoint. Returns
         ``(None, empty, zeros)`` when the leaf resolves to no survivors."""
+        # exact_topk (ceil(count*ratio) >= 1, never 0) fixes the retention-ramp
+        # 0-node collapse. Hardcoded here (a tree leaf is ALWAYS exact_topk) so the
+        # L1-node checkpoint recompute re-derives it identically — no transient
+        # _recursive_l0_override read, which is what crashed the earlier attempts.
         out, _content_cu, _ratio = self._live_l0_encode(
             dataset, article_ids, query_emb=q_emb, ratio=ratio,
+            selection_mode="exact_topk",
         )
         survivors = out.survivor_embeddings
         if survivors is None or survivors.numel() == 0:
