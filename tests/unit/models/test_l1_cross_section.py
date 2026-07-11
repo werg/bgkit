@@ -100,3 +100,37 @@ def test_combined_pack_default_mask_all_content_selectable():
     )
     # [prompt(1)|sep(1)|content(3)] = 5; content all True
     assert mask.tolist() == [False, False, True, True, True]
+
+
+def test_combined_pack_vectorized_multi_sample_preserves_order_and_gradients():
+    hidden_dim = 2
+    content = torch.arange(10, dtype=torch.float32).reshape(5, hidden_dim).requires_grad_()
+    prompt = torch.arange(6, dtype=torch.float32).reshape(3, hidden_dim).requires_grad_()
+    separator = torch.tensor([-1.0, -1.0], requires_grad=True)
+    content_cu = torch.tensor([0, 2, 5], dtype=torch.int32)
+    prompt_cu = torch.tensor([0, 1, 3], dtype=torch.int32)
+
+    packed, cu, pos, mask, max_len = _build_combined_pack(
+        content,
+        content_cu,
+        torch.tensor([0, 1, 0, 1, 2]),
+        prompt,
+        prompt_cu,
+        torch.tensor([0, 0, 1]),
+        separator,
+    )
+
+    expected = torch.cat([
+        prompt[:1], separator[None], content[:2],
+        prompt[1:], separator[None], content[2:],
+    ])
+    assert torch.equal(packed, expected)
+    assert cu.tolist() == [0, 4, 10]
+    assert pos.tolist() == [0, 1, 2, 3, 0, 1, 2, 3, 4, 5]
+    assert mask.tolist() == [False, False, True, True, False, False, False, True, True, True]
+    assert max_len == 6
+
+    packed.sum().backward()
+    assert torch.equal(content.grad, torch.ones_like(content))
+    assert torch.equal(prompt.grad, torch.ones_like(prompt))
+    assert torch.equal(separator.grad, torch.tensor([2.0, 2.0]))

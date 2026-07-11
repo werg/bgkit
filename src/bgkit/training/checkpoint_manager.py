@@ -37,6 +37,7 @@ class CheckpointManager:
         metric: str = "eval/loss",
         lower_is_better: bool = True,
         phase: str | None = None,
+        run_name: str | None = None,
         registry=None,
     ) -> None:
         self.keep_best = keep_best
@@ -44,6 +45,7 @@ class CheckpointManager:
         self.metric = metric
         self.lower_is_better = lower_is_better
         self.phase = phase
+        self.run_name = run_name
         self._registry = registry
         self._records: list[_CheckpointRecord] = []
 
@@ -54,8 +56,8 @@ class CheckpointManager:
     def load_existing(self, checkpoint_dir: Path) -> None:
         """Scan existing checkpoints and populate records from metadata.json.
 
-        Only loads checkpoints matching ``self.phase`` (if set), so checkpoints
-        from other training phases in the same directory are never pruned.
+        Only loads checkpoints matching ``self.phase`` and ``self.run_name``
+        (when set), so experiments sharing a phase never prune one another.
         Records are sorted by step so that ``keep_latest`` works correctly
         regardless of filesystem or lexicographic ordering.
         """
@@ -69,6 +71,8 @@ class CheckpointManager:
                 meta = json.loads(meta_file.read_text())
                 # Skip checkpoints from other phases
                 if self.phase is not None and meta.get("phase") != self.phase:
+                    continue
+                if self.run_name is not None and meta.get("run_name") != self.run_name:
                     continue
                 step = meta.get("step", 0)
                 metrics = meta.get("metrics", None)
@@ -107,7 +111,11 @@ class CheckpointManager:
             rec for rec in self._records
             if rec.metrics is not None and self.metric in rec.metrics
         ]
-        scored.sort(key=lambda r: r.metrics[self.metric], reverse=not self.lower_is_better)
+        def metric_value(record: _CheckpointRecord) -> float:
+            assert record.metrics is not None
+            return record.metrics[self.metric]
+
+        scored.sort(key=metric_value, reverse=not self.lower_is_better)
         for rec in scored[: self.keep_best]:
             keep.add(rec.path)
 
@@ -118,7 +126,7 @@ class CheckpointManager:
         # raw value is misleading and was the 2026-05-12 / 2026-05-14
         # Phase C pitfall. Warn loudly.
         if len(scored) >= 2:
-            vals = [r.metrics[self.metric] for r in scored]
+            vals = [metric_value(r) for r in scored]
             non_zero_vals = [abs(v) for v in vals if v != 0]
             if non_zero_vals:
                 scale = max(non_zero_vals) / max(min(non_zero_vals), 1e-9)

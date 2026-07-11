@@ -89,6 +89,13 @@ class SWETrajectoryDataset(Dataset):
             "instance_id": str(record.get("instance_id", f"idx_{idx}")),
             "repo": str(record.get("repo", "")),
             "base_commit": str(record.get("base_commit", "")),
+            # Optional wall-clock ordering for leakage-safe prior-session
+            # context. Commit SHAs are identifiers, not chronological values.
+            "trajectory_timestamp": (
+                record.get("trajectory_timestamp")
+                or record.get("created_at")
+                or record.get("timestamp")
+            ),
         }
 
         # Tokenize if tokenizer available

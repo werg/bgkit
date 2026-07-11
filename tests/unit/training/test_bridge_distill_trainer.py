@@ -211,6 +211,7 @@ def _make_trainer_skeleton() -> BridgeDistillTrainer:
     t = BridgeDistillTrainer(cfg)
     t.device = torch.device("cpu")
     t._teacher_ratio = 0.30  # 3/10 will survive
+    t._min_per_sample = 0
     t._mse_weight = 1.0
     t._cos_weight = 1.0
     t._curriculum_steps = 100

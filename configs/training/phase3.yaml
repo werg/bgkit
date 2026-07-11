@@ -1,9 +1,9 @@
 # Phase 3: SWE-bench teacher trajectory distillation
 #
 # Distills teacher agent trajectories (OpenHands / Llama-70B / Claude Sonnet)
-# into the student (Qwen3.5-0.8B + BgKIT context). Three context sources
-# assembled per sample: compressed filesystem, git history commit chains,
-# and prior agentic sessions ordered by base_commit.
+# into the student (Qwen3.5-0.8B + BgKIT context). The filesystem source is
+# implemented end-to-end. Git-history and prior-session sources use the same
+# manifest interface but remain disabled until their producers are available.
 #
 # Gate: Phase 2 Stage B checkpoint + encoded SWE-bench repos
 # (scripts/encode_swe_repos.py → $DATA_DIR/swe_embeddings/)
@@ -39,13 +39,20 @@ no_injection_fraction: 0.30
 
 # Phase 2 checkpoint to load encoder weights from (auto = registry best).
 # If null, the encoder is not loaded and context injection is disabled.
-# TODO: set to 'auto' once Phase 2 Stage B has a registered checkpoint.
 phase2_checkpoint: auto
+# Optional: restrict auto resolution to one Phase-2 run name.
+phase2_run_name: null
 
 # Pre-computed BgKIT cache directory (from scripts/encode_swe_repos.py).
 # Layout: $bgkit_cache_dir/{filesystem,git_history,prior_sessions}/manifest.parquet
 # TODO: set DATA_DIR/swe_embeddings once encode_swe_repos.py has run.
 bgkit_cache_dir: ${oc.env:DATA_DIR}/swe_embeddings
+context_sources:
+  - filesystem
+
+# Bounded host-memory cache for survivor arrays. Removes per-step np.load I/O
+# after first access without allowing the full corpus to occupy RAM.
+survivor_cache_gib: 2.0
 
 # Default decoder contract: full decoder training, no adapter-only shortcut.
 decoder_lora:

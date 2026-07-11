@@ -45,6 +45,16 @@ def _make_ckpt_on_disk(tmp_path, name, step, phase="ice", metrics=None, parent=N
     return ckpt
 
 
+def test_backfill_parses_microsecond_run_scoped_checkpoint_name(tmp_path):
+    name = "phase2_kb_step42_20260711_123456_654321_run-stage-b"
+    _make_ckpt_on_disk(tmp_path, name, 42, phase="phase2_kb")
+    registry = CheckpointRegistry(tmp_path)
+    registry.backfill(tmp_path)
+    entry = registry.get(name)
+    assert entry is not None
+    assert entry.timestamp == "2026-07-11T12:34:56.654321+00:00"
+
+
 # ---------------------------------------------------------------------------
 # normalize_checkpoint_name
 # ---------------------------------------------------------------------------

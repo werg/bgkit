@@ -20,9 +20,9 @@ def _trainer(phase: str) -> FalconProjectionSeedTrainer:
     return FalconProjectionSeedTrainer(cfg)
 
 
-def test_dense_seed_auto_uses_phase1_projection_repair_checkpoint():
+def test_dense_seed_auto_uses_phase1_step5_checkpoint():
     trainer = _trainer("phase1_falcon_dense_seed")
-    source = Path("/tmp/ckpts/phase1_step2p5_step3000_20260501")
+    source = Path("/tmp/ckpts/phase1_step5_step6000_20260501")
 
     with patch(
         "bgkit.training.phase1.projection_seed_falcon.resolve_checkpoint",
@@ -32,7 +32,7 @@ def test_dense_seed_auto_uses_phase1_projection_repair_checkpoint():
 
     mock_resolve.assert_called_once_with(
         Path("/tmp/ckpts"),
-        phase="phase1_step2p5",
+        phase="phase1_step5",
         metric="eval/loss",
         label="bgkit_checkpoint",
     )
@@ -58,9 +58,9 @@ def test_forced_adapt_auto_prefers_dense_seed_checkpoint():
     assert result == str(source)
 
 
-def test_forced_adapt_auto_falls_back_to_step2p5_when_dense_seed_missing():
+def test_forced_adapt_auto_falls_back_to_step5_when_dense_seed_missing():
     trainer = _trainer("phase1_falcon_forced_adapt")
-    source = Path("/tmp/ckpts/phase1_step2p5_step3000_20260501")
+    source = Path("/tmp/ckpts/phase1_step5_step6000_20260501")
 
     with patch(
         "bgkit.training.phase1.projection_seed_falcon.resolve_checkpoint",
@@ -71,7 +71,7 @@ def test_forced_adapt_auto_falls_back_to_step2p5_when_dense_seed_missing():
     assert result == str(source)
     assert [call.kwargs["phase"] for call in mock_resolve.call_args_list] == [
         "phase1_falcon_dense_seed",
-        "phase1_step2p5",
+        "phase1_step5",
     ]
 
 

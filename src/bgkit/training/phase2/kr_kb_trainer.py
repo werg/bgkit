@@ -792,6 +792,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # --- LoRA adapters ---
         self._install_lora()
 
+        # Stage B (and the prompt-fit bridge stage) must continue from the
+        # complete Phase-2 state, not merely use Stage A to build the detached
+        # L0 cache.  Apply the deferred overlay only after task prompts and
+        # optional LoRA wrappers exist, otherwise their checkpoint keys have no
+        # destination and are silently dropped by ``strict=False``.
+        self._apply_phase2_handoff_state()
+
         # --- L0 survivor cache (Stages B/C) ---
         if not self._live_l0:
             cache_dir = self._resolve_dir("l0_cache_dir", "l0_cache")
@@ -1240,9 +1247,15 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         phase1_ckpt = self._resolve_phase1_checkpoint(required=False)
         phase1_path = Path(str(phase1_ckpt)) if phase1_ckpt else None
 
-        stage_a_ckpt = self._resolve_stage_a_checkpoint(
-            required=bool(self.step_cfg.get("stage_a_checkpoint")),
+        stage_a_ckpt = (
+            None
+            if getattr(self, "_phase2_handoff_is_phase1", False)
+            else getattr(self, "_phase2_handoff_checkpoint", None)
         )
+        if stage_a_ckpt is None:
+            stage_a_ckpt = self._resolve_stage_a_checkpoint(
+                required=bool(self.step_cfg.get("stage_a_checkpoint")),
+            )
         stage_a_path = Path(str(stage_a_ckpt)) if stage_a_ckpt else None
 
         lora_cfg = self.step_cfg.get("lora", {}) or {}
@@ -1256,6 +1269,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             retention = float(self._l0_retention.get(name, 0.10)) if self._l0_retention else None
             manifest = read_cache_manifest(cache_dir, name)
             if manifest is None:
+                if getattr(self, "_phase2_handoff_checkpoint", None) is not None:
+                    raise L0CacheManifestMismatch(
+                        f"Dataset {name!r} has no cache_manifest.json, but "
+                        f"Stage B loads Phase-2 handoff {stage_a_path}. Rebuild "
+                        "the cache with precompute_l0_subset.py using the exact "
+                        "same --phase1-checkpoint and --stage-a-checkpoint."
+                    )
                 logger.warning(
                     "phase2_kb_l0_cache_no_manifest",
                     dataset=name,
@@ -1358,6 +1378,19 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         registry.backfill(checkpoint_dir)
         family = str(getattr(self, "_decoder_family", "qwen35") or "qwen35")
 
+        # Prompt-fit is the latest intentional Stage-A-family handoff for the
+        # normal Stage B pipeline.  The prompt-fit stage itself must start from
+        # plain Stage A.  Operators can override the accepted order for custom
+        # pipelines via ``stage_a_source_stages``.
+        configured_stages = self.step_cfg.get("stage_a_source_stages", None)
+        if configured_stages:
+            preferred_stages = [str(s).upper() for s in configured_stages]
+        elif self._stage() == "PROMPT_FIT":
+            preferred_stages = ["A"]
+        else:
+            preferred_stages = ["PROMPT_FIT", "A"]
+        stage_rank = {stage: idx for idx, stage in enumerate(preferred_stages)}
+
         candidates = []
         for entry in registry.list_entries(phase="phase2_kb", status="completed"):
             metrics = entry.metrics or {}
@@ -1365,22 +1398,26 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             if not entry.on_disk or eval_loss is None:
                 continue
             snapshot = entry.config_snapshot or {}
-            if snapshot.get("stage") != "A":
+            entry_stage = str(snapshot.get("stage", "")).upper()
+            if entry_stage not in stage_rank:
                 continue
             decoder_cfg = (snapshot.get("model") or {}).get("decoder") or {}
             entry_family = normalize_decoder_family(decoder_cfg.get("family", "qwen35"))
             if entry_family != family:
                 continue
-            candidates.append((entry, float(eval_loss)))
+            candidates.append((entry, stage_rank[entry_stage], float(eval_loss)))
 
         if candidates:
-            best, _loss = min(candidates, key=lambda item: item[1])
+            best, _rank, _loss = min(
+                candidates, key=lambda item: (item[1], item[2]),
+            )
             return str(checkpoint_dir / best.name)
         if not required:
             return None
         raise ValueError(
             "stage_a_checkpoint=auto could not resolve a completed Stage A "
-            f"phase2_kb checkpoint for decoder family {family!r}"
+            f"phase2_kb checkpoint for decoder family {family!r}; accepted "
+            f"stages={preferred_stages}"
         )
 
     def _load_encoder(self) -> None:
@@ -1401,6 +1438,30 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         if not encoder_state:
             raise ValueError(
                 f"Checkpoint {phase1_ckpt} does not contain an encoder state"
+            )
+
+        # Resolve the Phase-2 handoff independently of the Phase-1 base.  A
+        # legacy config may point ``phase1_checkpoint`` directly at a Phase-2
+        # checkpoint; retain that supported form, but new configs use the
+        # explicit ``stage_a_checkpoint`` key so cache and trainer provenance
+        # name the same two sources.
+        stage_a_ckpt = self._resolve_stage_a_checkpoint(required=False)
+        self._phase2_handoff_checkpoint: str | None = None
+        self._phase2_handoff_state_dicts: dict | None = None
+        self._phase2_handoff_is_phase1 = False
+        if stage_a_ckpt:
+            _stage_meta, stage_state_dicts = load_checkpoint(Path(stage_a_ckpt))
+            self._phase2_handoff_checkpoint = str(stage_a_ckpt)
+            self._phase2_handoff_state_dicts = stage_state_dicts
+        elif str(getattr(_meta, "phase", "")) == "phase2_kb":
+            self._phase2_handoff_checkpoint = str(phase1_ckpt)
+            self._phase2_handoff_state_dicts = state_dicts
+            self._phase2_handoff_is_phase1 = True
+        elif self._stage() in {"B", "PROMPT_FIT"}:
+            raise ValueError(
+                f"Phase 2 stage {self._stage()} requires a complete Phase-2 "
+                "handoff. Configure training.stage_a_checkpoint (normally "
+                "'auto'), or point phase1_checkpoint at a Phase-2 checkpoint."
             )
 
         encoder_cfg = self.cfg.model.get("encoder", {})
@@ -1473,6 +1534,95 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         maybe_enable_gradient_checkpointing(self.encoder.l0.backbone, self.cfg)
         if getattr(self.encoder, "l1", None) is not None:
             maybe_enable_gradient_checkpointing(self.encoder.l1.backbone, self.cfg)
+
+    @staticmethod
+    def _prefixed_component_state(
+        state_dicts: dict,
+        prefix: str,
+    ) -> dict[str, torch.Tensor]:
+        """Extract ``prefix.*`` from a standard ``model`` checkpoint payload."""
+        model_state = state_dicts.get("model", {}) or {}
+        dotted = f"{prefix}."
+        return {
+            key[len(dotted):]: value
+            for key, value in model_state.items()
+            if key.startswith(dotted)
+        }
+
+    def _apply_phase2_handoff_state(self) -> None:
+        """Overlay all load-bearing Stage-A/prompt-fit model components.
+
+        This runs after model structure is complete and restores the encoder
+        (L0, L0→L1 bridge, L1, L1→L1 bridge, projection blocks, thresholds and
+        task prompts) plus whichever decoder families are active.  Loading only
+        the cached L0 survivors is insufficient: Stage B consumes those
+        survivors through the co-trained bridge and L1 distribution.
+        """
+        state_dicts = getattr(self, "_phase2_handoff_state_dicts", None)
+        checkpoint = getattr(self, "_phase2_handoff_checkpoint", None)
+        if not state_dicts or not checkpoint:
+            return
+
+        encoder_state = state_dicts.get("encoder") or self._prefixed_component_state(
+            state_dicts, "encoder",
+        )
+        if not encoder_state:
+            raise ValueError(
+                f"Phase-2 handoff checkpoint {checkpoint} has no encoder state"
+            )
+        missing, unexpected = self.encoder.load_state_dict(encoder_state, strict=False)
+        # Missing task prompts are allowed when continuing from plain Stage A;
+        # everything else denotes an architecture/config mismatch that would
+        # make the claimed handoff incomplete.
+        material_missing = [
+            key for key in missing if not key.startswith("l0_task_prompts.")
+        ]
+        material_unexpected = [
+            key for key in unexpected if not key.startswith("l0_task_prompts.")
+        ]
+        if material_missing or material_unexpected:
+            raise RuntimeError(
+                f"Incomplete Phase-2 encoder handoff from {checkpoint}: "
+                f"missing={material_missing[:20]}, "
+                f"unexpected={material_unexpected[:20]}"
+            )
+
+        loaded_families: list[str] = []
+        for family, decoder in getattr(self, "_decoders_by_family", {}).items():
+            decoder_state = self._prefixed_component_state(
+                state_dicts, f"decoders.{family}",
+            )
+            if not decoder_state:
+                decoder_state = self._prefixed_component_state(state_dicts, "decoder")
+            if not decoder_state:
+                legacy_key = {
+                    "qwen35": "decoder_qwen",
+                    "falcon_h1": "decoder_falcon",
+                }.get(family)
+                decoder_state = state_dicts.get(legacy_key, {}) if legacy_key else {}
+            if not decoder_state:
+                raise ValueError(
+                    f"Phase-2 handoff checkpoint {checkpoint} has no decoder "
+                    f"state for family {family!r}"
+                )
+            dec_missing, dec_unexpected = decoder.load_state_dict(
+                decoder_state, strict=False,
+            )
+            if dec_missing or dec_unexpected:
+                raise RuntimeError(
+                    f"Incomplete Phase-2 decoder handoff for {family!r} from "
+                    f"{checkpoint}: missing={dec_missing[:20]}, "
+                    f"unexpected={dec_unexpected[:20]}"
+                )
+            loaded_families.append(family)
+
+        self.register_checkpoint_source("phase2_handoff", checkpoint)
+        logger.info(
+            "phase2_kb_complete_handoff_loaded",
+            checkpoint=checkpoint,
+            encoder_keys=len(encoder_state),
+            decoder_families=loaded_families,
+        )
 
     def _assert_vocab_alignment(self) -> None:
         """Verify encoder-tokenizer and decoder-tokenizer IDs index into
@@ -1997,11 +2147,16 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             self.step_cfg.get("batch_size", self.cfg.get("batch_size", 1))
         )
         num_workers = int(self.cfg.compute.get("num_workers", 0))
-        # Token-budget microbatch packing (opt-in via max_microbatch_l0_tokens).
-        # Packs small trajectories together / isolates large ones, bounding the
-        # per-microbatch live-L0 peak while raising GPU utilization vs a fixed
-        # batch_size. Off (0) -> the legacy fixed-batch_size path is unchanged.
-        mb_budget = int(self.step_cfg.get("max_microbatch_l0_tokens", 0) or 0)
+        # Token-budget microbatch packing. Live L0 is costed in input tokens;
+        # cached L0 is costed in survivor rows, which is the actual Stage-B L1
+        # and decoder work.  Keeping separate config keys prevents accidental
+        # reuse of a raw-token budget for a fundamentally smaller unit.
+        mb_budget_key = (
+            "max_microbatch_l0_tokens"
+            if self._live_l0
+            else "max_microbatch_l0_survivors"
+        )
+        mb_budget = int(self.step_cfg.get(mb_budget_key, 0) or 0)
         self._train_batch_sampler = None
         if getattr(self, "_per_repo_full_backprop", False):
             # PER-REPO: one batch = all of a repo's window-0 file-samples
@@ -2094,11 +2249,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 inner_subset_size=self._per_repo_inner_subset_size,
                 max_inner_steps=self._per_repo_max_inner_steps,
             )
-        elif mb_budget > 0 and self._live_l0:
-            loads = getattr(self, "_train_token_loads", None)
+        elif mb_budget > 0:
+            loads = (
+                getattr(self, "_train_token_loads", None)
+                if self._live_l0 else None
+            )
             if loads is None or len(loads) != len(self.train_dataset):
                 loads = [
-                    self._sample_l0_token_load(self.train_dataset[i])
+                    (
+                        self._sample_l0_token_load(self.train_dataset[i])
+                        if self._live_l0
+                        else self._sample_l0_survivor_load(self.train_dataset[i])
+                    )
                     for i in range(len(self.train_dataset))
                 ]
             from bgkit.data.samplers import KBTokenBudgetBatchSampler
@@ -2121,6 +2283,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             n_train_batches = len(self._train_batch_sampler)
             logger.info(
                 "phase2_kb_token_budget_packing",
+                unit=("input_tokens" if self._live_l0 else "cached_survivors"),
                 budget=mb_budget,
                 n_samples=len(self.train_dataset),
                 n_microbatches=n_train_batches,
@@ -2926,6 +3089,35 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             for d in doc_ids:
                 try:
                     total += self._token_store.length(sample.dataset_name, d)
+                except KeyError:
+                    continue
+        return total
+
+    def _sample_l0_survivor_load(self, sample) -> int:
+        """Cached-L0 cost for one sample, measured in survivor rows.
+
+        This reads only shard offsets; survivor embeddings stay memory-mapped
+        and are not materialized during sampler construction.
+        """
+        if self._l0_cache is None:
+            return 0
+        total = 0
+        for turn in sample.trajectory:
+            if turn.kind != "bgkit":
+                continue
+            ids = list(turn.args.get("ids", []))
+            if not ids:
+                continue
+            try:
+                article_ids = self._resolve_article_ids(sample.dataset_name, ids)
+                doc_ids = self._article_ids_to_document_ids(
+                    sample.dataset_name, article_ids,
+                )
+            except Exception:
+                continue
+            for doc_id in doc_ids:
+                try:
+                    total += self._l0_cache.length(sample.dataset_name, doc_id)
                 except KeyError:
                     continue
         return total

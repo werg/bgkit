@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import structlog
 import torch
@@ -56,11 +59,22 @@ def save_checkpoint(
     Returns:
         Path to the saved checkpoint directory.
     """
-    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    ckpt_name = f"{metadata.phase}_step{metadata.step}_{timestamp}"
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
+    run_suffix = ""
+    if metadata.run_name:
+        safe_run = re.sub(r"[^A-Za-z0-9_.-]+", "-", metadata.run_name).strip("-.")
+        if safe_run:
+            run_suffix = f"_run-{safe_run[:80]}"
+    ckpt_name = f"{metadata.phase}_step{metadata.step}_{timestamp}{run_suffix}"
     tmp_path = checkpoint_dir / f"._tmp_{ckpt_name}"
     final_path = checkpoint_dir / ckpt_name
-    tmp_path.mkdir(parents=True, exist_ok=True)
+    if tmp_path.exists() or final_path.exists():
+        # Extremely unlikely with microsecond timestamps, but two workers can
+        # checkpoint the same run concurrently. Never merge payloads.
+        ckpt_name = f"{ckpt_name}_{uuid4().hex[:8]}"
+        tmp_path = checkpoint_dir / f"._tmp_{ckpt_name}"
+        final_path = checkpoint_dir / ckpt_name
+    tmp_path.mkdir(parents=True, exist_ok=False)
 
     # Save metadata
     meta_path = tmp_path / "metadata.json"
@@ -99,10 +113,8 @@ def save_checkpoint(
             # single shared LPDDR5X pool. DONTNEED returns those bytes to the
             # pool immediately instead of waiting for LRU eviction under
             # pressure.
-            try:
+            with contextlib.suppress(AttributeError, OSError):
                 os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-            except (AttributeError, OSError):
-                pass  # posix_fadvise is Linux-only; best-effort
         finally:
             os.close(fd)
 

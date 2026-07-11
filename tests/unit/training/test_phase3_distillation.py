@@ -371,6 +371,30 @@ class TestGetBgkitContext:
         assert flat.ndim == 2
         assert flat.shape[1] == HIDDEN_DIM
 
+    def test_prior_sessions_use_timestamps_not_commit_sha_order(self, tmp_path):
+        trainer = _make_trainer_stub(batch_size=1)
+        import numpy as np
+
+        old_path = tmp_path / "old.npy"
+        future_path = tmp_path / "future.npy"
+        np.save(old_path, torch.ones(2, HIDDEN_DIM).numpy())
+        np.save(future_path, torch.ones(3, HIDDEN_DIM).numpy())
+        cache = _ContextSourceCache.__new__(_ContextSourceCache)
+        cache._key_columns = ["repo"]
+        cache._index = {
+            ("repo",): [
+                {"path": str(old_path), "timestamp": 100},
+                # Lexically smaller SHA-like values must not affect ordering.
+                {"path": str(future_path), "timestamp": 300},
+            ],
+        }
+
+        survivors = trainer._load_source_survivors(
+            cache, "repo", before_timestamp=200,
+        )
+        assert survivors is not None
+        assert survivors.shape == (2, HIDDEN_DIM)
+
 
 # ---------------------------------------------------------------------------
 # Tests: _build_decoder_inputs
@@ -615,6 +639,16 @@ class TestForwardBackward:
         cu = kwargs["survivor_cu_seqlens"]
         assert surv.shape[0] == 0  # no survivors
         assert int(cu[-1].item()) == 0  # all zero
+        # The baseline arm omits the synthetic BgKIT tool wrapper too.
+        issue_lengths = (
+            batch["issue_cu_seqlens"][1:] - batch["issue_cu_seqlens"][:-1]
+        ).tolist()
+        trajectory_lengths = (
+            batch["trajectory_cu_seqlens"][1:]
+            - batch["trajectory_cu_seqlens"][:-1]
+        ).tolist()
+        assert [len(x) for x in kwargs["prefix_ids"]] == issue_lengths
+        assert [len(x) for x in kwargs["suffix_ids"]] == trajectory_lengths
 
     def test_decoder_called_with_lists_for_prefix_and_suffix(self):
         """prefix_ids and suffix_ids must be Python lists (not tensors)."""
@@ -680,6 +714,14 @@ class TestEvaluate:
         trainer, _batches = self._make_eval_trainer()
         metrics = trainer.evaluate()
         assert "eval/context_coverage" in metrics
+
+    def test_evaluation_is_paired_on_every_batch(self):
+        trainer, batches = self._make_eval_trainer()
+        metrics = trainer.evaluate()
+        assert len(trainer.decoder._call_kwargs) == 2 * len(batches)
+        assert "eval/loss_with_context" in metrics
+        assert "eval/loss_no_context" in metrics
+        assert "eval/context_delta" in metrics
 
     def test_evaluate_sets_model_to_train_after(self):
         trainer, _batches = self._make_eval_trainer()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -78,6 +80,34 @@ def test_select_floor_activates_for_zero_organic_sample():
     assert out.organic_keep_rate == pytest.approx(1.0 / 5.0)
     # Floor trigger rate: 1 of 2 samples needed floor.
     assert out.floor_trigger_rate.item() == pytest.approx(0.5)
+
+
+def test_floor_trigger_rate_is_zero_when_floor_is_disabled():
+    logits = torch.tensor([-3.0, -2.0, -1.0])
+    out = adaptive_threshold_select(
+        logits,
+        torch.ones_like(logits, dtype=torch.bool),
+        _theta(0.0),
+        cu_seqlens=_cu([3]),
+        min_per_sample=0,
+    )
+    assert not out.mask.any()
+    assert out.floor_trigger_rate.item() == 0.0
+
+
+def test_segment_topk_uses_one_global_argsort():
+    logits = torch.tensor([0.1, 0.9, 0.2, -0.5, 0.7, 0.6])
+    valid = torch.ones_like(logits, dtype=torch.bool)
+    original_argsort = torch.argsort
+    with patch("torch.argsort", wraps=original_argsort) as argsort:
+        out = exact_ratio_topk_select(
+            logits,
+            valid,
+            target_ratio=0.5,
+            cu_seqlens=_cu([3, 3]),
+        )
+    assert argsort.call_count == 1
+    assert out.mask.tolist() == [False, True, True, False, True, True]
 
 
 def test_select_pinned_overlaid_excluded_from_rate():

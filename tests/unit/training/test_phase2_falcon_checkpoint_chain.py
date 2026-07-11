@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+import torch.nn as nn
 from omegaconf import OmegaConf
 
 from bgkit.training.base_trainer import BaseTrainer
@@ -138,3 +141,83 @@ def test_stage_a_auto_accepts_single_or_legacy_double_eval_prefix():
         result = trainer._resolve_stage_a_checkpoint()
 
     assert result == "/tmp/ckpts/stage_a_current"
+
+
+def test_stage_b_auto_prefers_prompt_fit_over_lower_loss_plain_stage_a():
+    trainer = _trainer("qwen35")
+    trainer.step_cfg.stage = "B"
+    trainer.step_cfg.stage_a_checkpoint = "auto"
+    entries = [
+        RegistryEntry(
+            name="plain_a", phase="phase2_kb", step=100, epoch=0,
+            timestamp="", metrics={"eval/loss": 0.1},
+            config_snapshot={
+                "stage": "A", "model": {"decoder": {"family": "qwen35"}},
+            },
+        ),
+        RegistryEntry(
+            name="prompt_fit", phase="phase2_kb", step=200, epoch=0,
+            timestamp="", metrics={"eval/loss": 0.5},
+            config_snapshot={
+                "stage": "prompt_fit",
+                "model": {"decoder": {"family": "qwen35"}},
+            },
+        ),
+    ]
+
+    class _Registry:
+        def __init__(self, _checkpoint_dir):
+            pass
+
+        def backfill(self, _checkpoint_dir):
+            pass
+
+        def list_entries(self, phase=None, status=None):
+            return entries
+
+    with patch("bgkit.training.checkpoint_registry.CheckpointRegistry", _Registry):
+        assert trainer._resolve_stage_a_checkpoint() == "/tmp/ckpts/prompt_fit"
+
+
+def test_complete_phase2_handoff_restores_encoder_and_family_decoder():
+    trainer = _trainer("qwen35")
+    trainer.encoder = nn.Linear(2, 2, bias=False)
+    decoder = nn.Linear(2, 2, bias=False)
+    trainer._decoders_by_family = {"qwen35": decoder}
+    encoder_weight = torch.full((2, 2), 3.0)
+    decoder_weight = torch.full((2, 2), 7.0)
+    trainer._phase2_handoff_checkpoint = "/tmp/stage-a"
+    trainer._phase2_handoff_state_dicts = {
+        "model": {
+            "encoder.weight": encoder_weight,
+            "decoders.qwen35.weight": decoder_weight,
+        },
+    }
+
+    trainer._apply_phase2_handoff_state()
+
+    assert torch.equal(trainer.encoder.weight, encoder_weight)
+    assert torch.equal(decoder.weight, decoder_weight)
+    assert trainer._startup_sources["phase2_handoff"] == "/tmp/stage-a"
+
+
+def test_cached_stage_b_sampler_cost_uses_survivor_rows():
+    trainer = _trainer("qwen35")
+
+    class _Cache:
+        @staticmethod
+        def length(dataset, node_id):
+            assert dataset == "ds"
+            return {"a": 3, "b": 5}[node_id]
+
+    trainer._l0_cache = _Cache()
+    trainer._resolve_article_ids = lambda _dataset, ids: ids
+    trainer._article_ids_to_document_ids = lambda _dataset, ids: ids
+    sample = SimpleNamespace(
+        dataset_name="ds",
+        trajectory=[
+            SimpleNamespace(kind="browse", args={}),
+            SimpleNamespace(kind="bgkit", args={"ids": ["a", "b"]}),
+        ],
+    )
+    assert trainer._sample_l0_survivor_load(sample) == 8

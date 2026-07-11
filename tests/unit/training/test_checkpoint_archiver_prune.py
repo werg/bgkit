@@ -27,6 +27,12 @@ def _make_ckpt(parent: Path, phase: str, step: int, *, with_metadata: bool = Tru
     return d
 
 
+def _set_run(path: Path, run_name: str) -> None:
+    meta = json.loads((path / "metadata.json").read_text())
+    meta["run_name"] = run_name
+    (path / "metadata.json").write_text(json.dumps(meta))
+
+
 def _steps(parent: Path, phase: str) -> list[int]:
     return sorted(
         int(p.name.split("step")[1].split("_")[0]) for p in parent.glob(f"{phase}_step*")
@@ -74,3 +80,18 @@ def test_prune_noop_when_under_cap(tmp_path: Path) -> None:
         _make_ckpt(tmp_path, PHASE, step)
     _prune_archive_dir(tmp_path, PHASE, keep_last_n=3)
     assert _steps(tmp_path, PHASE) == [5, 10]
+
+
+def test_prune_is_scoped_to_run_name(tmp_path: Path) -> None:
+    own_old = _make_ckpt(tmp_path, PHASE, 5)
+    own_new = _make_ckpt(tmp_path, PHASE, 10)
+    other = _make_ckpt(tmp_path, PHASE, 999)
+    _set_run(own_old, "stage_b")
+    _set_run(own_new, "stage_b")
+    _set_run(other, "smoke")
+
+    _prune_archive_dir(tmp_path, PHASE, keep_last_n=1, run_name="stage_b")
+
+    assert not own_old.exists()
+    assert own_new.exists()
+    assert other.exists()

@@ -16,8 +16,9 @@ survivor embeddings are extracted from the same ``survivor_mask``.
 
 Two instances are composed inside :class:`bgkit.models.encoder.BgKITEncoder`:
 ``encoder.l0`` (with prompt support, with auto_repro_head) and ``encoder.l1``
-(no prompt, no auto_repro_head — its input is L0 survivor embeddings bridged
-through ``encoder.l0.auto_repro_head``). ``encoder.l1.backbone`` is
+(with query-prompt support, no auto_repro_head — its input is L0 survivor
+embeddings bridged through ``encoder.l0.auto_repro_head``).
+``encoder.l1.backbone`` is
 initialized at construction by deepcopy of ``encoder.l0.backbone`` and then
 evolves independently.
 """
@@ -36,7 +37,11 @@ from bgkit.models.components.selection import (
 )
 from bgkit.models.components.survivorship_head import SurvivorshipHead
 from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
-from bgkit.utils.packing import lengths_from_cu
+from bgkit.utils.packing import (
+    lengths_from_cu,
+    position_ids_from_cu,
+    segment_ids_from_cu,
+)
 
 
 def _build_combined_pack(
@@ -58,8 +63,10 @@ def _build_combined_pack(
     """
     device = content_embeddings.device
     D = content_embeddings.shape[-1]  # noqa: N806
-    content_lengths = lengths_from_cu(content_cu_seqlens).to(torch.int64).tolist()
-    B = len(content_lengths)  # noqa: N806
+    content_lengths = lengths_from_cu(content_cu_seqlens).to(
+        device=device, dtype=torch.int64,
+    )
+    B = int(content_lengths.shape[0])  # noqa: N806
 
     if prompt_embeddings is None:
         mask = (
@@ -71,7 +78,7 @@ def _build_combined_pack(
                 device=device,
             )
         )
-        max_seq = int(max(content_lengths)) if content_lengths else 0
+        max_seq = int(content_lengths.max().item()) if B else 0
         return (
             content_embeddings,
             content_cu_seqlens,
@@ -80,55 +87,81 @@ def _build_combined_pack(
             max_seq,
         )
 
-    prompt_lengths = lengths_from_cu(prompt_cu_seqlens).to(torch.int64).tolist()
-    if len(prompt_lengths) != B:
+    if prompt_cu_seqlens is None:
+        raise ValueError("prompt_cu_seqlens is required with prompt_embeddings")
+    prompt_cu_device = prompt_cu_seqlens.to(device=device)
+    content_cu_device = content_cu_seqlens.to(device=device)
+    prompt_lengths = lengths_from_cu(prompt_cu_device).to(torch.int64)
+    if int(prompt_lengths.shape[0]) != B:
         raise ValueError(
-            f"prompt_cu_seqlens implies batch size {len(prompt_lengths)} but "
+            f"prompt_cu_seqlens implies batch size {prompt_lengths.shape[0]} but "
             f"content_cu_seqlens implies {B}"
         )
 
-    blocks: list[torch.Tensor] = []
-    pos_blocks: list[torch.Tensor] = []
-    mask_blocks: list[torch.Tensor] = []
-    combined_lengths: list[int] = []
-
-    sep_emb = separator_embedding.unsqueeze(0).to(device=device, dtype=content_embeddings.dtype)
-    content_starts = content_cu_seqlens.to(torch.int64).tolist()
-    prompt_starts = prompt_cu_seqlens.to(torch.int64).tolist()
-
-    for i in range(B):
-        p_len = prompt_lengths[i]
-        c_len = content_lengths[i]
-        p_slice = prompt_embeddings[prompt_starts[i] : prompt_starts[i] + p_len]
-        c_slice = content_embeddings[content_starts[i] : content_starts[i] + c_len]
-        block = torch.cat([p_slice, sep_emb, c_slice], dim=0)
-        blocks.append(block)
-        total_len = p_len + 1 + c_len
-        combined_lengths.append(total_len)
-        pos_blocks.append(
-            torch.arange(total_len, dtype=torch.int64, device=device),
-        )
-        mask_block = torch.zeros(total_len, dtype=torch.bool, device=device)
-        if content_selectable_mask is not None:
-            mask_block[p_len + 1 :] = content_selectable_mask[
-                content_starts[i] : content_starts[i] + c_len
-            ]
-        else:
-            mask_block[p_len + 1 :] = True
-        mask_blocks.append(mask_block)
-
-    combined_embeddings = torch.cat(blocks, dim=0)
-    combined_position_ids = torch.cat(pos_blocks, dim=0)
-    content_position_mask = torch.cat(mask_blocks, dim=0)
-
+    # Vectorized packed interleave.  The former implementation copied both CU
+    # arrays to the CPU and built B Python slices/cats on every encoder forward.
+    # Compute destination indices entirely on device and perform three indexed
+    # copies: prompt tokens, one separator per sample, and content tokens.
+    combined_lengths = prompt_lengths + content_lengths + 1
     combined_cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=device)
-    cumsum = 0
-    for i, length in enumerate(combined_lengths):
-        cumsum += length
-        combined_cu_seqlens[i + 1] = cumsum
+    if B:
+        combined_cu_seqlens[1:] = torch.cumsum(
+            combined_lengths.to(torch.int32), dim=0,
+        )
+    total = int(prompt_embeddings.shape[0] + content_embeddings.shape[0] + B)
+    combined_starts = combined_cu_seqlens[:-1].to(torch.int64)
 
-    combined_max_seqlen = int(max(combined_lengths)) if combined_lengths else 0
-    assert combined_embeddings.shape[0] == cumsum
+    prompt_n = int(prompt_embeddings.shape[0])
+    prompt_seg = segment_ids_from_cu(prompt_cu_device, prompt_n)
+    prompt_within = (
+        torch.arange(prompt_n, dtype=torch.int64, device=device)
+        - prompt_cu_device.to(torch.int64)[prompt_seg]
+    )
+    prompt_dest = combined_starts[prompt_seg] + prompt_within
+
+    content_n = int(content_embeddings.shape[0])
+    content_seg = segment_ids_from_cu(content_cu_device, content_n)
+    content_within = (
+        torch.arange(content_n, dtype=torch.int64, device=device)
+        - content_cu_device.to(torch.int64)[content_seg]
+    )
+    content_dest = (
+        combined_starts[content_seg]
+        + prompt_lengths[content_seg]
+        + 1
+        + content_within
+    )
+    separator_dest = combined_starts + prompt_lengths
+
+    combined_embeddings = content_embeddings.new_zeros((total, D))
+    combined_embeddings = combined_embeddings.index_copy(
+        0, prompt_dest, prompt_embeddings,
+    )
+    combined_embeddings = combined_embeddings.index_copy(
+        0,
+        separator_dest,
+        separator_embedding.to(
+            device=device, dtype=content_embeddings.dtype,
+        ).unsqueeze(0).expand(B, -1),
+    )
+    combined_embeddings = combined_embeddings.index_copy(
+        0, content_dest, content_embeddings,
+    )
+    combined_position_ids = position_ids_from_cu(combined_cu_seqlens, total)
+    content_position_mask = torch.zeros(total, dtype=torch.bool, device=device)
+    selectable = (
+        content_selectable_mask
+        if content_selectable_mask is not None
+        else torch.ones(content_n, dtype=torch.bool, device=device)
+    )
+    content_position_mask = content_position_mask.index_copy(
+        0, content_dest, selectable,
+    )
+
+    # Attention kernels require a Python integer. This is the sole device sync
+    # in the prompt-pack path (down from several full ``tolist`` transfers).
+    combined_max_seqlen = int(combined_lengths.max().item()) if B else 0
+    assert combined_embeddings.shape[0] == total
     assert combined_embeddings.shape[-1] == D
     return (
         combined_embeddings,

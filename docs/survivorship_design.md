@@ -11,6 +11,12 @@
 > state; the rest of this doc is retained as the historical record of why
 > the two-head path was tried and what the pieces were meant to do.
 
+> **Current Phase-2 caveat (2026-07-11):** the active Stage-A/Stage-B presets
+> set `survivorship_aux: false`, so the hard selection policy is inherited and
+> frozen; the loss recipes below are available mechanisms, not active Phase-2
+> behavior. The controller is now a monotone ratio-conditioned threshold curve,
+> not one universal scalar threshold. See `01_overview.md`.
+
 This document captures the rationale behind the survivorship-head architecture
 introduced in the 2026-04-15 pivot. The plan that drove it was discarded after
 implementation; this is the durable record of *why* the pieces look the way

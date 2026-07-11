@@ -28,6 +28,7 @@ Sample segmentation is carried in ``cu_seqlens`` (``(B+1,) int32``) — see
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from dataclasses import dataclass
 
 import torch
@@ -234,26 +235,9 @@ def _segment_topk_mask(
     lengths = lengths_from_cu(cu_seqlens).to(torch.int64)
     num_segs = lengths.shape[0]
 
-    # Sentinel -inf for invalid / empty-sample positions so argsort buries them.
-    neg_inf = float("-inf")
-    masked_logits = logits.masked_fill(~valid_mask, neg_inf)
-    # Also mask out positions that belong to samples that don't need the floor.
     empty_per_pos = empty_samples[seg_ids]
-    masked_logits = masked_logits.masked_fill(~empty_per_pos, neg_inf)
-
-    # Segment-local rank via a stable global sort: sort by (seg_id ASC, logit DESC).
-    # Equivalent: compose a key ``(seg_id * (1 + 1e-7)) - rank_in_seg`` but that's
-    # subject to fp precision. Cleaner: sort by ``-logit`` stable, then by seg_id
-    # stable. `torch.argsort` is stable in pytorch 2.5+.
-    # Sort by -logit first so within a segment the largest logits come first.
-    neg_logits = -masked_logits
-    order_by_logit = torch.argsort(neg_logits, stable=True)
-    # Now reorder by seg_id (stable) so sample blocks are contiguous.
-    seg_ids_by_logit = seg_ids[order_by_logit]
-    order_by_seg = torch.argsort(seg_ids_by_logit, stable=True)
-    # Composed order: positions are grouped by segment; within each segment,
-    # highest logit first.
-    composed = order_by_logit[order_by_seg]
+    eligible = valid_mask & empty_per_pos & torch.isfinite(logits)
+    composed = _segment_descending_order(logits, seg_ids, eligible)
 
     # rank within segment (0-based): cumulative counter that resets at each seg boundary
     starts = cu_seqlens.to(torch.int64)
@@ -269,13 +253,38 @@ def _segment_topk_mask(
     out[composed] = mask_sorted
     # Restrict to valid + empty-sample positions (defence in depth; the
     # -inf masking above already suppresses them).
-    out &= valid_mask & empty_per_pos
-    # Suppress any position whose logit landed at -inf (can happen when
-    # a segment has fewer than k valid positions).
-    out &= logits > neg_inf
+    out &= eligible
     # Limit to segments that actually wanted it.
     _ = num_segs  # variable retained for readability; used only via broadcasts
     return out
+
+
+def _segment_descending_order(
+    logits: Tensor,
+    seg_ids: Tensor,
+    eligible: Tensor,
+) -> Tensor:
+    """Lexicographically sort by ``(segment ASC, float32 logit DESC)`` once.
+
+    A previous stable-lexsort emulation performed two full global argsorts.
+    Float32 IEEE bits can be mapped monotonically to unsigned 32-bit ranks, so
+    segment and descending-logit rank fit into one int64 composite key without
+    lossy scaling. Ineligible entries receive the largest within-segment key and
+    are filtered after ranking.
+    """
+    values = logits.float().contiguous()
+    mask32 = (1 << 32) - 1
+    sign32 = 1 << 31
+    bits = values.view(torch.int32).to(torch.int64) & mask32
+    ascending = torch.where(
+        (bits & sign32) != 0,
+        (~bits) & mask32,
+        bits ^ sign32,
+    )
+    descending = mask32 - ascending
+    descending = descending.masked_fill(~eligible, mask32)
+    composite = seg_ids.to(torch.int64) * (1 << 32) + descending
+    return torch.argsort(composite, stable=True)
 
 
 def adaptive_threshold_select(
@@ -356,7 +365,7 @@ def adaptive_threshold_select(
 
     # Zero-dim tensors so training hot-path callers can keep them on device
     # and sync only once per optimizer step.
-    if num_segs > 0:
+    if min_per_sample > 0 and num_segs > 0:
         organic_counts_for_logs = torch.zeros(
             num_segs,
             dtype=torch.int64,
@@ -364,7 +373,18 @@ def adaptive_threshold_select(
         )
         if n > 0:
             organic_counts_for_logs.index_add_(0, seg_ids, organic.to(torch.int64))
-        floor_trigger_rate = (organic_counts_for_logs == 0).float().mean()
+        valid_counts_for_logs = torch.zeros(
+            num_segs, dtype=torch.int64, device=device,
+        )
+        if n > 0:
+            valid_counts_for_logs.index_add_(
+                0, seg_ids, valid_mask.to(torch.int64),
+            )
+        eligible = valid_counts_for_logs > 0
+        triggered = (organic_counts_for_logs == 0) & eligible
+        floor_trigger_rate = (
+            triggered.float().sum() / eligible.float().sum().clamp(min=1.0)
+        )
     else:
         floor_trigger_rate = torch.tensor(0.0, device=device)
     num_pinned = pinned_mask.sum()
@@ -467,12 +487,8 @@ def exact_ratio_topk_select(
     target_counts = torch.minimum(target_counts, valid_counts)
     remaining_counts = (target_counts - pinned_counts).clamp(min=0)
 
-    neg_inf = float("-inf")
-    masked_logits = logits.float().masked_fill(~controllable, neg_inf)
-    order_by_logit = torch.argsort(-masked_logits, stable=True)
-    seg_ids_by_logit = seg_ids[order_by_logit]
-    order_by_seg = torch.argsort(seg_ids_by_logit, stable=True)
-    composed = order_by_logit[order_by_seg]
+    eligible = controllable & torch.isfinite(logits)
+    composed = _segment_descending_order(logits, seg_ids, eligible)
     seg_ids_sorted = seg_ids[composed]
     rank_in_seg = (
         torch.arange(n, dtype=torch.int64, device=device)
@@ -481,7 +497,7 @@ def exact_ratio_topk_select(
     take_sorted = rank_in_seg < remaining_counts[seg_ids_sorted]
     topk_mask = torch.zeros(n, dtype=torch.bool, device=device)
     topk_mask[composed] = take_sorted
-    topk_mask &= controllable
+    topk_mask &= eligible
 
     final_mask = (topk_mask | pinned_mask) & valid_mask
     selected_controllable = final_mask & controllable
@@ -531,6 +547,10 @@ class ThresholdCurveController(nn.Module):
         0.64,
         0.95,
     )
+    anchor_ratios: Tensor
+    anchor_thetas: Tensor
+    _anchor_velocity: Tensor
+    _last_target_rate: Tensor
 
     def __init__(
         self,
@@ -597,6 +617,14 @@ class ThresholdCurveController(nn.Module):
             "anchor_ratios",
             torch.tensor(anchor_vals, dtype=torch.float32),
         )
+        # Immutable host mirror for ratio lookup. ``theta_for_ratio`` is called
+        # in every encoder forward; consulting the CUDA buffer there caused
+        # several ``.item()`` synchronizations per call even though the anchor
+        # grid never changes during training.
+        self._anchor_ratios_host = tuple(float(v) for v in anchor_vals)
+        self._anchor_transformed_host = tuple(
+            float(self._transform_ratio(v)) for v in anchor_vals
+        )
         self.register_buffer(
             "anchor_thetas",
             torch.tensor(anchor_thetas, dtype=torch.float32),
@@ -655,6 +683,31 @@ class ThresholdCurveController(nn.Module):
             )
         return result
 
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        ratios = self.anchor_ratios.detach().cpu().tolist()
+        self._anchor_ratios_host = tuple(float(v) for v in ratios)
+        self._anchor_transformed_host = tuple(
+            float(self._transform_ratio(v)) for v in ratios
+        )
+
     @staticmethod
     def _affine_theta(ratio: float) -> float:
         return 1.0 - 2.0 * float(ratio)
@@ -665,39 +718,34 @@ class ThresholdCurveController(nn.Module):
     def _transform_ratio(self, ratio: float | Tensor) -> float | Tensor:
         eps = 1e-6
         if isinstance(ratio, torch.Tensor):
-            r = ratio.float().clamp(min=eps, max=1.0 - eps)
+            r_tensor = ratio.float().clamp(min=eps, max=1.0 - eps)
             if self.ratio_space == "linear":
-                return r
+                return r_tensor
             if self.ratio_space == "log":
-                return torch.log(r)
-            return torch.log(r / (1.0 - r))
-        r = min(max(float(ratio), eps), 1.0 - eps)
+                return torch.log(r_tensor)
+            return torch.log(r_tensor / (1.0 - r_tensor))
+        r_float = min(max(float(ratio), eps), 1.0 - eps)
         if self.ratio_space == "linear":
-            return r
+            return r_float
         if self.ratio_space == "log":
-            return math.log(r)
-        return math.log(r / (1.0 - r))
+            return math.log(r_float)
+        return math.log(r_float / (1.0 - r_float))
 
     def _interpolation_state(self, target_rate: float) -> tuple[int, int, float, float]:
-        ratios = self.anchor_ratios.float()
-        target_t = torch.tensor(
-            float(self._transform_ratio(target_rate)),
-            dtype=torch.float32,
-            device=ratios.device,
-        )
-        anchor_t = self._transform_ratio(ratios)
-        if float(target_t.item()) <= float(anchor_t[0].item()):
+        target_t = float(self._transform_ratio(target_rate))
+        anchor_t = self._anchor_transformed_host
+        if target_t <= anchor_t[0]:
             return 0, 0, 1.0, 0.0
-        last = int(anchor_t.shape[0] - 1)
-        if float(target_t.item()) >= float(anchor_t[last].item()):
+        last = len(anchor_t) - 1
+        if target_t >= anchor_t[last]:
             return last, last, 1.0, 0.0
 
-        right = int(torch.bucketize(target_t, anchor_t).item())
+        right = bisect_left(anchor_t, target_t)
         left = right - 1
-        left_t = float(anchor_t[left].item())
-        right_t = float(anchor_t[right].item())
+        left_t = anchor_t[left]
+        right_t = anchor_t[right]
         span = max(right_t - left_t, 1e-12)
-        right_w = (float(target_t.item()) - left_t) / span
+        right_w = (target_t - left_t) / span
         left_w = 1.0 - right_w
         return left, right, left_w, right_w
 
@@ -772,9 +820,10 @@ class ThresholdCurveController(nn.Module):
         all anchors stays at ``lr * gap`` (vs. the legacy code's
         ``sum(w/denom)`` which boosts above 1 for uneven weights).
         """
+        assert self.kernel_bandwidth is not None
         sigma = max(float(self.kernel_bandwidth), 1e-6)
         target_t = float(self._transform_ratio(target_rate))
-        anchor_t = self._transform_ratio(self.anchor_ratios.float()).cpu().tolist()
+        anchor_t = self._anchor_transformed_host
         log_weights = [-((t - target_t) ** 2) / (2.0 * sigma * sigma) for t in anchor_t]
         # Stable softmax so far-away anchors round to 0 cleanly.
         max_lw = max(log_weights)

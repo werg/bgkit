@@ -1,7 +1,7 @@
 # Phase 2 KB-scale Stage B: full-corpus training (merged with the
 # old Stage C — we no longer ship a separate Stage C config).
 #
-# L0 LoRA frozen (the Stage A result); L1 LoRA + decoder train. L0
+# L0 is frozen/cached; direct-trained L1 + decoder continue from Stage A. L0
 # survivors come from a pre-computed cache built by
 # scripts/precompute_l0_subset.py with --stage-a-checkpoint pointing at
 # the trained Stage A checkpoint.
@@ -26,18 +26,13 @@ l1_lr: 2.0e-4
 eval_every: 1000
 save_every: 5000
 
-# batch_size=4 is a conservative baseline pending a fresh profiler run
-# (profile-phase2-kb-stage-b). Cached L0 is cheaper per step than Stage A's live
-# L0, so there is likely headroom — but PROFILE first (cached-L0 caveat above).
-#
-# SPEEDUP FOLLOW-UP — token-budget packing: Stage A's ~2.9x packing win
-# (max_microbatch_l0_tokens) is currently GATED ON live_l0 in
-# kr_kb_trainer._build_dataloaders, so it does NOT apply to Stage B's cached path —
-# and its cost fn (_sample_l0_token_load = raw token load) is the wrong unit for
-# cached survivors anyway. HIGH-VALUE TRAINER FOLLOW-UP: extend packing to the
-# cached path with a survivor-count cost so Stage B's 60k steps get the same
-# throughput win. Until then Stage B uses fixed batch_size.
+# Fallback only when survivor-budget packing is disabled.
 batch_size: 4
+# Pack by the cached survivor rows that actually drive Stage-B L1/decoder cost.
+# Oversized samples become singletons; max_microbatch_samples bounds sequential
+# decoder work even when many tiny trajectories fit the row budget.
+max_microbatch_l0_survivors: 8192
+max_microbatch_samples: 8
 
 datasets:
   - kilt_wikipedia
@@ -110,13 +105,17 @@ l1_retention_jitter:
   anchor_sampling_prob: 0.30
 
 lora:
+  # Stage A trains L1 directly. Keep the same module topology so the complete
+  # Stage-A state loads exactly rather than inserting fresh LoRA wrappers.
+  enabled: false
+  train_l1_direct: true
   l0_rank: 32
   l1_rank: 32
   alpha: 64
   dropout: 0.0
 
-# Survivorship head auxiliary losses. Stage B: L0 is cached + L0 LoRA
-# frozen, so L0 survivorship losses are zeroed and the trainer skips L0
+# Survivorship head auxiliary losses. Stage B: L0 is cached + frozen, so L0
+# survivorship losses are zeroed and the trainer skips L0
 # θ/μ updates in post-step. L1 continues from Stage A's cold-start.
 survivorship:
   # Phase 2 (KRKBTrainer): selection is the least-important signal (reps are
@@ -154,7 +153,7 @@ survivorship:
 
 ice_distillation:
   l0:
-    enabled: false            # L0 frozen (Stage A baked LoRA into cache)
+    enabled: false            # L0 frozen (Stage-A state is baked into cache)
   l1:
     enabled: false
 
@@ -164,11 +163,12 @@ moment_match_reference:
   l1:
     path: null
 
-phase1_checkpoint: auto
-# stage_a_checkpoint — consumed by precompute_l0_subset.py (NOT by Stage B
-# directly; Stage B reads l0_cache_dir). Point it at the PROMPT-FIT best checkpoint
-# (phase2_kb_prompt_fit) so precompute bakes BOTH the shaped L0 weights AND the
-# learned per-task prompts (l0_task_prompts.*) into the cache:
+# Must match the base used by Stage A and cache precompute exactly.
+phase1_checkpoint: /workspace/checkpoints/phase1_summarization_round_robin_step51945_20260624_060459
+stage_a_checkpoint: auto
+# The same resolved prompt-fit/Stage-A checkpoint MUST be passed to cache
+# precompute. Stage B now loads its complete encoder/bridge/L1/projection and
+# decoder state directly as well as verifying the cached L0 provenance:
 #   python scripts/precompute_l0_subset.py \
 #     --articles $DATA_DIR/trajectory_sets/stage_b.jsonl \
 #     --mmap-dir $DATA_DIR/mmap/phase2 \

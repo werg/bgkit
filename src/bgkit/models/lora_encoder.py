@@ -1,7 +1,8 @@
-"""Per-level LoRA adapters for the BgKIT encoder.
+"""Optional per-level LoRA adapters for the BgKIT encoder.
 
-The Phase 2 KB-scale pipeline freezes the encoder base weights (from Phase 1)
-and trains small LoRA adapters at each compression level:
+Some Phase-2 experiments freeze encoder base weights and train small LoRA
+adapters. Current Stage-A/Stage-B presets use direct level training instead;
+this module remains the supported adapter ablation path:
 
 - **L0 LoRA** — trained in Stage A, then frozen. Shapes within-document
   salience on top of the code-trained Phase 1 encoder.

@@ -1,5 +1,8 @@
 # DGX Spark perf playbook (Phase 1/2/3 training)
 
+> Historical measurement notes. Model topology and phase presets have changed;
+> verify each recommendation against current configs and re-profile before use.
+
 Distilled from the 2026-04-26 phase1_step3 70 → 12.5 s/step investigation.
 Apply this in order when a stage feels slow.
 
@@ -111,7 +114,7 @@ revert. Don't trust early-run readings.
 Stages where ckpt-off is **definitely too risky** (skip the test):
 - **Step 2 (PruningDistillTrainer)** — teacher and student both
   in memory.
-- **Phase 2 Stage A** — live L0 + L0/L1 LoRA + decoder all training.
+- **Phase 2 Stage A** — live L0 + L1 + decoder all training.
 - **Phase 3** — large distillation footprint.
 - **Step 3 and similar** (Step 1, 4, 6) — confirmed too risky on
   the 04-26 live test; spike tail of long samples blows the cap.

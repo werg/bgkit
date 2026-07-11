@@ -238,11 +238,11 @@ def test_legacy_step4_conversion_builds_correct_split_encoder():
     assert migrated_encoder.l1 is not None
     assert migrated_encoder.projection_block is not None
 
-    # L0 has auto_repro_head and prompt separator; L1 does not.
+    # L0 has auto_repro_head; both levels support prompts.
     assert migrated_encoder.l0.auto_repro_head is not None
     assert migrated_encoder.l1.auto_repro_head is None
     assert migrated_encoder.l0.prompt_separator_embedding is not None
-    assert migrated_encoder.l1.prompt_separator_embedding is None
+    assert migrated_encoder.l1.prompt_separator_embedding is not None
 
     # head_tanh_temperatures preserved per level from legacy.
     assert torch.allclose(

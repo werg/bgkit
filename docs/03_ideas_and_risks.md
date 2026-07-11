@@ -2,6 +2,10 @@
 
 **Everything we might do, everything that could go wrong, and decisions still to be made**
 
+> **Proposal catalog, not implementation status.** For current behavior see
+> `00_status.md`, `01_overview.md`, and `02_training_plan.md`. In particular,
+> frozen-teacher KL and runtime integrations described here are unimplemented.
+
 ---
 
 ## Table of Contents
@@ -39,13 +43,13 @@ Two mechanisms to strengthen attention pathways to BgKIT positions when transiti
 
 ### 1.3 Phase 2: Knowledge Retrieval
 
-Pivot from code compression to knowledge-intensive retrieval. **One trainer (`KRKBTrainer`), two stages**: Stage A bootstraps L0 LoRA live on a small mixed corpus; Stage B trains L1 LoRA + decoder on cached L0 over the full corpus. Every dataset — IR benchmarks (KILT/Wikipedia, MS MARCO, PubMedQA, NarrativeQA, NewsQA, SearchQA), git commit history, and multi-session conversation memory (MSC, SHARE, Conversation Chronicles, PerLTQA, LAPS) — feeds into the same trainer through the same browse-tree + trajectory format. Hierarchical datasets emit `browse → bgkit → answer` trajectories; flat datasets emit single-`bgkit` trajectories.
+Pivot from code compression to knowledge-intensive retrieval. **One trainer (`KRKBTrainer`), staged workflow**: current presets train L0/L1 directly rather than with encoder LoRA. Stage A uses live L0, optional prompt-fit learns task prompts, and Stage B continues the complete model state over provenance-checked cached L0. Dataset readiness varies; inclusion in a config is not proof that its data/evaluation pipeline has run.
 
 Earlier-iteration plans had two parallel strands ("flat Steps 1–4" plus "KB Stages A/B/C") and three independent tracks (A/B/C); both have been collapsed into the single pipeline above. See `docs/02_training_plan.md` Phase 2 for staging and retention ratios.
 
 ### 1.4 Phase 3: Agentic Coding via Frozen-Teacher Self-Distillation
 
-Train the BgKIT-augmented 0.8B student on SWE-bench by distilling from frozen Qwen3.5-0.8B reading file-level repo context plus mined hints. Teacher and student are the same architecture, the same weights — the teacher reads rich context, the student reads BgKIT-compressed context. KL divergence on patch tokens (top-K=64, temperature 2.0). External SWE-bench trajectories (Qwen3-Coder-480B, swe-agent-llama-70b, Claude 3.7 Sonnet, OpenHands, Nemotron) supply the hints — edit-target file paths, bug-class regex matches, expected-test patterns — but the trajectory body is **not** the imitation target. The off-policy gap between Sonnet/480B and a 0.8B student is precisely the failure mode this framing avoids.
+**Proposed successor to the current Phase-3 prototype:** train the BgKIT-augmented 0.8B student on SWE-bench by distilling from frozen Qwen3.5-0.8B reading file-level repo context plus mined hints, using top-K KL on patch tokens. The code currently does external-trajectory CE imitation and does not implement this teacher or hint pipeline.
 
 The shared distillation infrastructure (`bgkit.training.distillation`: `FrozenQwenTeacher`, `forward_kl_loss`, `hidden_mse_loss`, `TeacherContextBuilder`) is designed in `plans/self-distillation.md` Phase A; the SWE-bench-specific hint-enriched-teacher build is Phase F.
 
@@ -154,11 +158,11 @@ Two options, both with justifications:
 
 **Diagnostic:** Compare (i) cosine similarity between survivors and nearest token embeddings, (ii) cross-target projection loss from a freshly initialized MLP, (iii) reconstruction quality at matched compute. The training plan starts with (a) and switches to (b) if embedding drift is observed.
 
-### 4.2 Weight Sharing Across Levels
+### 4.2 Independent Levels vs. Shared Alternatives
 
-The plan uses shared compressor weights for level 0 and level 1. The auto-reproduction objective in joint block pretraining (which regularizes the compressor's output toward its own input embedding space) is intended to keep the input distributions compatible. However, level 0 processes natural token distributions while level 1 processes curated, compressed survivors. These may require different attention patterns.
+The implementation initializes level 1 by deep-copying level 0 and then evolves the two backbones independently. The auto-reproduction objective and L0→L1 bridge keep their representation spaces compatible. A truly shared-weight alternative remains a possible parameter-efficiency ablation, but is not the current architecture.
 
-**Fallback:** Separate LoRA adapters per level on top of shared compressor base weights. This should be an explicit ablation (shared vs. per-level adapters) and a hard go/no-go gate, not an afterthought.
+**Ablation:** independent full levels vs. tied base weights with separate adapters.
 
 ### 4.3 Promptable Compression at Inference
 
@@ -171,13 +175,13 @@ This tension needs resolution. Most likely the right answer is generic prompts f
 
 ### 4.4 BgKIT Freezing in Phase 2
 
-The current Phase 2 commits to **frozen encoder base + per-level LoRA** (L0 trainable in Stage A then frozen; L1 trainable in both stages; decoder trains throughout). This was previously listed as one of four candidate regimes; the others are kept here for reference if the chosen regime turns out not to work:
+Current Phase-2 presets directly train enabled encoder levels: live L0/L1 in Stage A, cached/frozen L0 and live L1 in Stage B, with decoder training throughout. Adapter-based alternatives remain available but are not the active default:
 
 - **Frozen compressor + frozen projection block:** Train only the decoder. Simplest, no risk of encoder representational degradation. Analogous to frozen vision encoders in VLM training.
 - **Frozen compressor + unfrozen projection block:** Train projection block + decoder. The projection block adapts to the decoder's evolving token-embedding distribution while the compressor's representations stay stable.
 - **Unfrozen compressor + unfrozen projection block:** End-to-end gradients through the full pipeline. Compression may improve, but Phase 1's representations might degrade under QA-driven gradients.
 
-The compressor may not be "good enough" after Phase 1 the way a pretrained CLIP is — Phase 1 trains new capabilities (compression, consolidation) that may benefit from further refinement. The per-level-LoRA default keeps Phase 1 stable while still allowing Phase 2 to reshape per-level behaviour; if Stage B's eval gates fail, switching to "unfrozen compressor base" is the next thing to try.
+The compressor may not be "good enough" after Phase 1 the way a pretrained CLIP is—Phase 1 trains new capabilities that may need task refinement. Compare direct training, frozen-base adapters, and frozen-encoder baselines explicitly rather than assuming one topology is safer.
 
 ### 4.5 Knowledge Source Ablation During Training
 
@@ -197,7 +201,7 @@ Randomly omit individual tool-call knowledge frames (independently, ~20% drop pr
 
 ### 5.2 Gradient Flow Through Recursive Application
 
-**Risk:** End-to-end backpropagation from decoder loss through the projection block, through level 1, through level 0 is a deep computation graph with shared weights. Vanishing or exploding gradients.
+**Risk:** End-to-end backpropagation from decoder loss through the projection block, through level 1, through level 0 is a deep computation graph across independently evolving levels. Vanishing or exploding gradients.
 
 **Mitigation:** The compressor is one layer shorter (23 vs 24 layers) than the full base model, marginally helping gradient flow. More importantly: gradient checkpointing, separate learning rates for the projection block vs. compressor layers, and a curriculum of verifiable knowledge extraction at every level. Freezing the compressor during Phase 2 (Section 4.4) eliminates the deepest gradient path if viable.
 
@@ -298,11 +302,11 @@ For repositories exceeding the level 1 context budget: increase compression rati
 
 BgKIT deployment requires the decoder to accept projected vectors via the LLaVA multimodal embedding pathway. Two inference runtimes support this:
 
-**llama.cpp (recommended for DGX Spark).** Well-tested on ARM64 + Blackwell. GGUF quantized models load directly. The multimodal embedding pathway (used for LLaVA image patches) is the injection point for BgKIT vectors. Stable, no build patches required.
+**llama.cpp (serving proposal).** GGUF support makes it attractive on ARM64 + Blackwell, but BgKIT does not ship an adapter that maps arbitrary survivor vectors into its multimodal embedding pathway. Integration and validation are required.
 
 **vLLM.** Requires building from source with sm_121 (Blackwell GB10) patches — standard pip wheels don't support this compute capability. CUDA graphs are not supported on sm_121, requiring `--enforce-eager` mode with a ~20–30% throughput penalty. ARM64 support has limited testing. When it works, vLLM's continuous batching and OpenAI-compatible API are convenient, but the build and maintenance burden is high on this hardware.
 
-**Recommendation:** Use llama.cpp for DGX Spark inference. If vLLM is needed for its batching/API features (e.g., serving multiple concurrent agent sessions), build and test it as a separate effort after v1 training validates the approach.
+**Recommendation if serving work is authorized:** prototype and test an explicit injection adapter after the training quality gate. Do not assume either runtime accepts BgKIT vectors unchanged.
 
 ---
 

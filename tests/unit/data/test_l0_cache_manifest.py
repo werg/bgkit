@@ -10,6 +10,7 @@ import pytest
 from bgkit.data.l0_cache import (
     L0CacheManifestMismatch,
     assert_cache_manifest_matches,
+    checkpoint_fingerprint,
     file_sha256,
     read_cache_manifest,
     write_cache_manifest,
@@ -66,6 +67,38 @@ def test_manifest_history_grows_on_rewrite(tmp_path: Path):
     assert len(manifest["manifest_history"]) == 1
     # The current sha reflects v2; the historical record carries v1.
     assert manifest["phase1_sha"] == file_sha256(phase1)
+
+
+def test_checkpoint_directory_fingerprint_is_recorded_and_validated(tmp_path: Path):
+    phase1 = tmp_path / "phase1"
+    stage_a = tmp_path / "stage_a"
+    phase1.mkdir()
+    stage_a.mkdir()
+    (phase1 / "metadata.json").write_text('{"phase":"phase1"}')
+    (phase1 / "encoder.pt").write_bytes(b"base")
+    (stage_a / "metadata.json").write_text('{"phase":"phase2_kb"}')
+    (stage_a / "model.pt").write_bytes(b"stage-a")
+
+    write_cache_manifest(
+        tmp_path / "cache",
+        "ds",
+        phase1_checkpoint=phase1,
+        stage_a_checkpoint=stage_a,
+        lora_rank=0,
+        lora_alpha=None,
+        retention=0.1,
+    )
+    manifest = read_cache_manifest(tmp_path / "cache", "ds")
+    assert manifest["phase1_sha"] == checkpoint_fingerprint(phase1)
+    assert manifest["stage_a_sha"] == checkpoint_fingerprint(stage_a)
+    assert_cache_manifest_matches(
+        tmp_path / "cache",
+        "ds",
+        phase1_checkpoint=phase1,
+        stage_a_checkpoint=stage_a,
+        lora_rank=0,
+        retention=0.1,
+    )
 
 
 def test_assert_passes_on_match(tmp_path: Path):

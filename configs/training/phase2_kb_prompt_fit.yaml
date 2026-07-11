@@ -174,15 +174,11 @@ moment_match_reference:
   l1:
     path: null
 
-# LOAD STAGE A's SHAPED ENCODER as the starting point (the backbone we freeze +
-# prompt-tune). PIN this to the Stage A best checkpoint once it exists.
-# ⚠ VERIFY: confirm the trainer's phase1_checkpoint loader accepts a phase2_kb
-# (Stage A) checkpoint layout (the "model"/_KBModel state), not only the
-# summarization handoff layout. If it doesn't, the loader needs the same
-# encoder.l0.* / "model" handling precompute_l0_subset.py already has. A fresh
-# run loading these weights (NOT a resume) sidesteps the known bf16
-# optimizer-state resume bug.
-phase1_checkpoint: auto   # -> pin to $CHECKPOINT_DIR/phase2_kb_stage_a_best
+# Preserve the two-source lineage explicitly: the Phase-1 base constructs the
+# model, then the complete Stage-A model state is overlaid after prompts/module
+# wrappers exist. ``auto`` resolves the best completed Stage A for this decoder.
+phase1_checkpoint: /workspace/checkpoints/phase1_summarization_round_robin_step51945_20260624_060459
+stage_a_checkpoint: auto
 
 # Round-robin dual decoder (same as Stage A) — provides the reconstruction
 # supervision that the prompts learn against. qwen 0.15 for speed.

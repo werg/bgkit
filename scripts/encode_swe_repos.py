@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
 from collections import defaultdict
@@ -54,12 +55,13 @@ def _load_encoder(checkpoint_path: str, device: torch.device):
     from bgkit.training.checkpointing import load_checkpoint
 
     _metadata, state_dicts = load_checkpoint(Path(checkpoint_path))
-    model_state = state_dicts.get("model", {})
-
-    encoder_state = {
+    model_state = state_dicts.get("model", {}) or {}
+    encoder_state = state_dicts.get("encoder") or {
         k.replace("encoder.", "", 1): v
         for k, v in model_state.items() if k.startswith("encoder.")
     }
+    if not encoder_state:
+        raise ValueError(f"Checkpoint {checkpoint_path} contains no encoder state")
     encoder = BgKITEncoder.from_pretrained_with_state_dict(
         "Qwen/Qwen3.5-0.8B-Base", encoder_state, hidden_dim=1024,
     )
@@ -121,6 +123,41 @@ def _read_blob(repo_path: Path, blob_sha: str) -> bytes | None:
     return None
 
 
+def _commit_timestamp(repo_path: Path, commit_sha: str) -> int | None:
+    try:
+        import pygit2
+
+        commit = pygit2.Repository(str(repo_path)).get(commit_sha)
+        return int(commit.commit_time) if commit is not None else None
+    except Exception:
+        return None
+
+
+def _blob_cache_path(cache_root: Path, blob_sha: str) -> Path:
+    return cache_root / blob_sha[:2] / f"{blob_sha}.npy"
+
+
+def _save_npy_atomic(path: Path, array: np.ndarray) -> None:
+    """Persist an array without exposing a truncated cache hit after a crash."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    with tmp.open("wb") as handle:
+        np.save(handle, array)
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp.replace(path)
+
+
+def _valid_blob_cache(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        arr = np.load(path, mmap_mode="r")
+        return arr.ndim == 2
+    except (OSError, ValueError):
+        return False
+
+
 def encode_swe_repos(
     checkpoint_path: str,
     trajectories_path: str,
@@ -134,6 +171,8 @@ def encode_swe_repos(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    filesystem_path = output_path / "filesystem"
+    filesystem_path.mkdir(parents=True, exist_ok=True)
 
     # Load model
     print(f"Loading checkpoint from {checkpoint_path}")
@@ -159,10 +198,12 @@ def encode_swe_repos(
     print(f"Found {len(repo_commits)} unique repos, "
           f"{sum(len(c) for c in repo_commits.values())} (repo, commit) pairs")
 
-    # Blob SHA cache: blob_sha -> survivor embeddings (numpy)
-    blob_cache: dict[str, np.ndarray] = {}
+    # Persistent content-addressed blob cache. A restart reuses every completed
+    # blob instead of recomputing the repository history from zero.
     cache_path = output_path / "blob_cache"
     cache_path.mkdir(exist_ok=True)
+    skipped_blobs: set[str] = set()
+    valid_cached_blobs: set[str] = set()
 
     # Per-trajectory manifest
     manifest_rows = []
@@ -187,7 +228,17 @@ def encode_swe_repos(
             # Identify new blobs to encode
             new_blobs: dict[str, str] = {}  # blob_sha -> file_path (for logging)
             for file_path, blob_sha in files.items():
-                if blob_sha not in blob_cache:
+                blob_is_cached = blob_sha in valid_cached_blobs
+                if not blob_is_cached:
+                    blob_is_cached = _valid_blob_cache(
+                        _blob_cache_path(cache_path, blob_sha),
+                    )
+                    if blob_is_cached:
+                        valid_cached_blobs.add(blob_sha)
+                if (
+                    not blob_is_cached
+                    and blob_sha not in skipped_blobs
+                ):
                     new_blobs[blob_sha] = file_path
 
             # Batch-encode new blobs
@@ -201,6 +252,7 @@ def encode_swe_repos(
                     for sha in batch_shas:
                         content = _read_blob(repo_path, sha)
                         if content is None:
+                            skipped_blobs.add(sha)
                             continue
                         try:
                             text = content.decode("utf-8", errors="replace")
@@ -209,41 +261,49 @@ def encode_swe_repos(
                         # Reject minified / bundled files from the Phase 3
                         # context cache. Same heuristic as Phase 1 data-prep.
                         if looks_minified(text):
+                            skipped_blobs.add(sha)
                             continue
                         tokens = tokenizer.encode(text, add_special_tokens=False)[:max_file_tokens]
                         if tokens:
                             batch_texts.append(tokens)
                             valid_shas.append(sha)
+                        else:
+                            skipped_blobs.add(sha)
 
                     if not batch_texts:
                         continue
 
-                    # Encode each blob independently using packed (varlen) format.
+                    # One packed encoder launch for the entire variable-length
+                    # batch (the former loop issued one forward per blob).
                     embed_tokens = encoder.l0.backbone.get_input_embeddings()
 
                     with torch.no_grad():
-                        for sha, tokens in zip(valid_shas, batch_texts, strict=True):
-                            length = len(tokens)
-                            token_tensor = torch.tensor(
-                                tokens, dtype=torch.long, device=device,
-                            )
-                            content_emb = embed_tokens(token_tensor)  # (L, D)
-
-                            # Build single-sample packed metadata (B=1).
-                            cu = _make_cu_seqlens([length]).to(device)
-                            pos = position_ids_from_cu(cu, length).to(device)
-
-                            output = encoder(
-                                content_embeddings=content_emb,
-                                content_cu_seqlens=cu,
-                                content_position_ids=pos,
-                                target_ratio_l0=retention_ratio,
-                            )
-                            # survivor_embeddings is flat (K, D); no mask needed.
-                            survivors = (
-                                output.survivor_embeddings.cpu().to(torch.float16).numpy()
-                            )
-                            blob_cache[sha] = survivors
+                        lengths = [len(tokens) for tokens in batch_texts]
+                        flat_ids = torch.tensor(
+                            [token for tokens in batch_texts for token in tokens],
+                            dtype=torch.long,
+                            device=device,
+                        )
+                        content_emb = embed_tokens(flat_ids)
+                        cu = _make_cu_seqlens(lengths).to(device)
+                        pos = position_ids_from_cu(cu, flat_ids.numel()).to(device)
+                        output = encoder(
+                            content_embeddings=content_emb,
+                            content_cu_seqlens=cu,
+                            content_position_ids=pos,
+                            target_ratio_l0=retention_ratio,
+                        )
+                        survivor_cu = output.survivor_cu_seqlens.detach().cpu().tolist()
+                        survivors_all = output.survivor_embeddings.detach().cpu().to(
+                            torch.float16,
+                        ).numpy()
+                        for idx, sha in enumerate(valid_shas):
+                            survivors = survivors_all[
+                                int(survivor_cu[idx]):int(survivor_cu[idx + 1])
+                            ]
+                            blob_path = _blob_cache_path(cache_path, sha)
+                            _save_npy_atomic(blob_path, survivors)
+                            valid_cached_blobs.add(sha)
                             total_blobs_encoded += 1
 
                 total_blobs_cached += len(files) - len(new_blobs)
@@ -252,23 +312,28 @@ def encode_swe_repos(
             file_survivors = []
             for file_path in sorted(files):
                 blob_sha = files[file_path]
-                if blob_sha in blob_cache:
-                    file_survivors.append(blob_cache[blob_sha])
+                blob_path = _blob_cache_path(cache_path, blob_sha)
+                if blob_sha in valid_cached_blobs or _valid_blob_cache(blob_path):
+                    valid_cached_blobs.add(blob_sha)
+                    file_survivors.append(np.load(blob_path, mmap_mode="r"))
 
             if file_survivors:
                 combined = np.concatenate(file_survivors, axis=0)
                 # Save per-(repo, commit)
                 safe_repo = repo.replace("/", "_")
-                ctx_dir = output_path / safe_repo / commit_sha[:8]
+                ctx_dir = filesystem_path / "contexts" / safe_repo / commit_sha
                 ctx_dir.mkdir(parents=True, exist_ok=True)
                 np.save(ctx_dir / "survivors.npy", combined)
 
                 manifest_rows.append({
                     "repo": repo,
                     "base_commit": commit_sha,
+                    "commit_timestamp": _commit_timestamp(repo_path, commit_sha),
                     "num_files": len(files),
                     "num_survivors": len(combined),
-                    "path": str(ctx_dir / "survivors.npy"),
+                    "path": str(
+                        (ctx_dir / "survivors.npy").relative_to(filesystem_path),
+                    ),
                 })
 
         if (repo_idx + 1) % 10 == 0:
@@ -284,11 +349,14 @@ def encode_swe_repos(
         manifest_table = pa.table({
             "repo": pa.array([r["repo"] for r in manifest_rows], type=pa.string()),
             "base_commit": pa.array([r["base_commit"] for r in manifest_rows], type=pa.string()),
+            "commit_timestamp": pa.array(
+                [r["commit_timestamp"] for r in manifest_rows], type=pa.int64(),
+            ),
             "num_files": pa.array([r["num_files"] for r in manifest_rows], type=pa.int64()),
             "num_survivors": pa.array([r["num_survivors"] for r in manifest_rows], type=pa.int64()),
             "path": pa.array([r["path"] for r in manifest_rows], type=pa.string()),
         })
-        pq.write_table(manifest_table, output_path / "manifest.parquet")
+        pq.write_table(manifest_table, filesystem_path / "manifest.parquet")
 
     elapsed = time.time() - start_time
     print(

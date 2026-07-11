@@ -122,9 +122,8 @@ def test_scope_is_episode_id(tmp_path):
         assert r["scope_template"] == "pre_scoped"
 
 
-def test_row_unique_gold_article_within_episode(tmp_path):
-    """When multiple rows share the same episode_id, each must get a
-    unique gold_article_id so the browse tree sees distinct leaves."""
+def test_rows_from_one_episode_share_the_episode_article(tmp_path):
+    """Episode turns intentionally resolve to one browse-tree article."""
     src = tmp_path / "msc"
     out = tmp_path / "memory.jsonl"
     _write_mmap(
@@ -148,13 +147,7 @@ def test_row_unique_gold_article_within_episode(tmp_path):
 
     rows = _read_jsonl(out)
     gold_ids = [r["gold_article_id"] for r in rows]
-    # Must be unique.
-    assert len(set(gold_ids)) == len(gold_ids)
-    # Prefix is the episode id.
-    assert gold_ids[0].startswith("e0#r")
-    assert gold_ids[1].startswith("e0#r")
-    assert gold_ids[2].startswith("e0#r")
-    assert gold_ids[3].startswith("e1#r")
+    assert gold_ids == ["e0", "e0", "e0", "e1"]
 
 
 def test_skips_rows_with_empty_tokens(tmp_path):

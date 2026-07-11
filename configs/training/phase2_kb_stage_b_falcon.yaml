@@ -9,6 +9,8 @@ l1_lr: 2.0e-4
 eval_every: 1000
 save_every: 5000
 batch_size: 4
+max_microbatch_l0_survivors: 8192
+max_microbatch_samples: 8
 
 datasets:
   - kilt_wikipedia
@@ -103,7 +105,8 @@ moment_match_reference:
   l1:
     path: null
 
-phase1_checkpoint: auto
+# Must match phase2_kb_stage_a_falcon and cache precompute exactly.
+phase1_checkpoint: /workspace/checkpoints/phase1_falcon_l0_step10000_20260521_071410
 stage_a_checkpoint: auto
 
 model:

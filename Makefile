@@ -26,7 +26,7 @@ install-gpu-local-fa4: install-gpu install-fa4-local
 test: test-unit
 
 test-unit:
-	uv run pytest tests/unit -v
+	CUDA_VISIBLE_DEVICES='' uv run pytest tests/unit -v -m "not gpu"
 
 test-gpu:
 	$(DC) run --rm --no-deps \

@@ -5,11 +5,13 @@ import json
 from bgkit.training.checkpoint_manager import CheckpointManager
 
 
-def _make_ckpt(tmp_path, name, step, metrics=None, phase="test"):
+def _make_ckpt(tmp_path, name, step, metrics=None, phase="test", run_name=None):
     """Create a mock checkpoint dir with metadata.json."""
     ckpt = tmp_path / name
     ckpt.mkdir()
     meta = {"phase": phase, "step": step, "epoch": 0, "parent_checkpoint": None}
+    if run_name is not None:
+        meta["run_name"] = run_name
     if metrics is not None:
         meta["metrics"] = metrics
     (ckpt / "metadata.json").write_text(json.dumps(meta))
@@ -147,6 +149,31 @@ def test_load_existing_filters_by_phase(tmp_path):
     assert (tmp_path / "ice_step30").exists()
     # Joint checkpoint untouched
     assert (tmp_path / "joint_step20").exists()
+
+
+def test_load_existing_filters_by_run_name_within_phase(tmp_path):
+    own_old = _make_ckpt(
+        tmp_path, "own_old", 10, phase="phase2_kb", run_name="stage_b",
+    )
+    own_new = _make_ckpt(
+        tmp_path, "own_new", 20, phase="phase2_kb", run_name="stage_b",
+    )
+    other = _make_ckpt(
+        tmp_path, "smoke_newer", 999, phase="phase2_kb", run_name="smoke",
+    )
+
+    mgr = CheckpointManager(
+        keep_best=0,
+        keep_latest=1,
+        phase="phase2_kb",
+        run_name="stage_b",
+    )
+    mgr.load_existing(tmp_path)
+    mgr.prune()
+
+    assert not own_old.exists()
+    assert own_new.exists()
+    assert other.exists()
 
 
 def test_load_existing_sorts_by_step_not_lexical(tmp_path):

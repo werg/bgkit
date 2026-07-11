@@ -23,7 +23,8 @@ then save often. This module does that:
    allocations can never accumulate. Full file history is preserved on the HDD.
 3. After a checkpoint is safely on the HDD, the archiver prunes the NVMe copy if
    it is older than the ``keep_last_n`` most recent (by step) — keeping recent
-   checkpoints on NVMe for fast resume while the HDD holds everything.
+   checkpoints on NVMe for fast resume while the HDD keeps the configured
+   run-scoped archive history.
 
 Crash robustness: resume prefers the NVMe copy if present, else the HDD copy
 (see ``checkpoint_registry.resolve_latest_checkpoint``). A crash mid-archive
@@ -33,6 +34,7 @@ therefore loses nothing — the just-written checkpoint is intact on NVMe.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import queue
 import shutil
@@ -111,7 +113,24 @@ def _archive_dir_throttled(src_dir: Path, dst_dir: Path) -> None:
         os.close(dfd)
 
 
-def _prune_fast_dir(fast_dir: Path, archive_dir: Path, phase: str, keep_last_n: int) -> None:
+def _matches_run(path: Path, phase: str, run_name: str | None) -> bool:
+    """Return whether checkpoint metadata belongs to the requested run."""
+    try:
+        meta = json.loads((path / "metadata.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if meta.get("phase") != phase:
+        return False
+    return run_name is None or meta.get("run_name") == run_name
+
+
+def _prune_fast_dir(
+    fast_dir: Path,
+    archive_dir: Path,
+    phase: str,
+    keep_last_n: int,
+    run_name: str | None = None,
+) -> None:
     """Remove NVMe checkpoint copies older than the ``keep_last_n`` most recent.
 
     Only removes a NVMe copy whose HDD archive exists — never deletes the only
@@ -124,7 +143,7 @@ def _prune_fast_dir(fast_dir: Path, archive_dir: Path, phase: str, keep_last_n: 
 
     live = sorted(
         (p for p in fast_dir.glob(f"{phase}_step*") if p.is_dir()
-         and not p.name.startswith("._")),
+         and not p.name.startswith("._") and _matches_run(p, phase, run_name)),
         key=_step,
         reverse=True,
     )
@@ -134,7 +153,12 @@ def _prune_fast_dir(fast_dir: Path, archive_dir: Path, phase: str, keep_last_n: 
             logger.info("checkpoint_fast_pruned", name=stale.name)
 
 
-def _prune_archive_dir(archive_dir: Path, phase: str, keep_last_n: int) -> None:
+def _prune_archive_dir(
+    archive_dir: Path,
+    phase: str,
+    keep_last_n: int,
+    run_name: str | None = None,
+) -> None:
     """Remove HDD archive checkpoints older than the ``keep_last_n`` most recent.
 
     Mirrors :func:`_prune_fast_dir` but operates on the permanent HDD archive so
@@ -153,7 +177,7 @@ def _prune_archive_dir(archive_dir: Path, phase: str, keep_last_n: int) -> None:
 
     archived = sorted(
         (p for p in archive_dir.glob(f"{phase}_step*") if p.is_dir()
-         and not p.name.startswith("._")),
+         and not p.name.startswith("._") and _matches_run(p, phase, run_name)),
         key=_step,
         reverse=True,
     )
@@ -182,11 +206,13 @@ class CheckpointArchiver:
         self,
         archive_dir: Path,
         phase: str,
+        run_name: str | None = None,
         keep_last_n: int = 3,
         archive_keep_last_n: int | None = None,
     ) -> None:
         self._archive_dir = Path(archive_dir)
         self._phase = phase
+        self._run_name = run_name
         self._keep_last_n = keep_last_n
         self._archive_keep_last_n = archive_keep_last_n
         self._q: queue.Queue[tuple[Path, Path] | None] = queue.Queue()
@@ -222,11 +248,20 @@ class CheckpointArchiver:
                     name=fast_path.name,
                     dst=str(dst),
                 )
-                _prune_fast_dir(fast_dir, self._archive_dir, self._phase, self._keep_last_n)
+                _prune_fast_dir(
+                    fast_dir,
+                    self._archive_dir,
+                    self._phase,
+                    self._keep_last_n,
+                    self._run_name,
+                )
                 if self._archive_keep_last_n is not None:
                     try:
                         _prune_archive_dir(
-                            self._archive_dir, self._phase, self._archive_keep_last_n
+                            self._archive_dir,
+                            self._phase,
+                            self._archive_keep_last_n,
+                            self._run_name,
                         )
                     except Exception as exc:  # never let a prune kill the archiver
                         logger.error(
@@ -259,7 +294,12 @@ class CheckpointArchiver:
         return True
 
 
-def archive_pending_into(archive_dir: Path, fast_dir: Path, phase: str) -> list[str]:
+def archive_pending_into(
+    archive_dir: Path,
+    fast_dir: Path,
+    phase: str,
+    run_name: str | None = None,
+) -> list[str]:
     """Synchronously archive any NVMe checkpoints missing from the HDD.
 
     Recovery helper for startup: if the process died mid-archive, this lands any
@@ -272,7 +312,9 @@ def archive_pending_into(archive_dir: Path, fast_dir: Path, phase: str) -> list[
     copied: list[str] = []
     cands: Iterable[Path] = sorted(
         p for p in fast_dir.glob(f"{phase}_step*")
-        if p.is_dir() and not p.name.startswith("._")
+        if p.is_dir()
+        and not p.name.startswith("._")
+        and _matches_run(p, phase, run_name)
     )
     for p in cands:
         if not (archive_dir / p.name).exists():

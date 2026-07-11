@@ -3,8 +3,8 @@
 **Historical planning document** — describes the first prototyping
 work done after environment setup. All three tracks have since been
 implemented; this file is preserved for onboarding context. See
-`docs/02_training_plan.md` for the current training plan and the
-"Execution Runbook" section of `CLAUDE.md` for the active task list.
+`docs/02_training_plan.md` for the current training plan and
+`docs/runbook.md` for operations.
 
 ---
 

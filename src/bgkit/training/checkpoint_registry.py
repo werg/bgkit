@@ -420,15 +420,17 @@ def _infer_timestamp(name: str) -> str:
 
     Falls back to empty string if parsing fails.
     """
-    parts = name.split("_")
-    if len(parts) >= 4:
-        # Last two parts should be date and time
-        date_part = parts[-2]
-        time_part = parts[-1]
-        if len(date_part) == 8 and len(time_part) == 6:
-            try:
-                dt = datetime.strptime(f"{date_part}_{time_part}", "%Y%m%d_%H%M%S")
-                return dt.replace(tzinfo=UTC).isoformat()
-            except ValueError:
-                pass
+    import re
+
+    # Accept legacy second-resolution names and current microsecond/run-suffixed
+    # names. The timestamp no longer has to be the final path component.
+    match = re.search(r"(\d{8})_(\d{6})(?:_(\d{6}))?", name)
+    if match:
+        date_part, time_part, micros = match.groups()
+        fmt = "%Y%m%d_%H%M%S_%f" if micros else "%Y%m%d_%H%M%S"
+        value = f"{date_part}_{time_part}_{micros}" if micros else f"{date_part}_{time_part}"
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=UTC).isoformat()
+        except ValueError:
+            pass
     return ""

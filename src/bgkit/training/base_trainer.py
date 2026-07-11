@@ -520,7 +520,7 @@ class BaseTrainer(ABC):
         from collections import deque
 
         tcfg = self.cfg.training
-        compute_mem = self.cfg.compute.get("memory", {}) or {}
+        compute_mem = (self.cfg.get("compute", {}) or {}).get("memory", {}) or {}
         compute_dyn = compute_mem.get("dynamic_ckpt", {}) or {}
         train_dyn = tcfg.get("dynamic_ckpt", {}) or {}
         self._unified_memory = self._detect_unified_memory()
@@ -2430,7 +2430,9 @@ class BaseTrainer(ABC):
         save_every = tcfg.save_every
         empty_cache_cadence = _coerce_empty_cache_cadence(
             tcfg.get("cuda_empty_cache_every_step", None),
-            self.cfg.compute.get("cuda_empty_cache_every_step", False),
+            (self.cfg.get("compute", {}) or {}).get(
+                "cuda_empty_cache_every_step", False,
+            ),
         )
         checkpoint_dir = Path(self.cfg.get("checkpoint_dir", "checkpoints"))
 
@@ -2457,11 +2459,15 @@ class BaseTrainer(ABC):
             self._fast_checkpoint_dir.mkdir(parents=True, exist_ok=True)
             # Recover any NVMe-only checkpoints from a prior crash onto the HDD.
             archive_pending_into(
-                checkpoint_dir, self._fast_checkpoint_dir, phase_for_ckpt
+                checkpoint_dir,
+                self._fast_checkpoint_dir,
+                phase_for_ckpt,
+                run_name=self.cfg.get("run_name", None),
             )
             self._archiver = CheckpointArchiver(
                 archive_dir=checkpoint_dir,
                 phase=phase_for_ckpt,
+                run_name=self.cfg.get("run_name", None),
                 keep_last_n=int(self.cfg.get("fast_checkpoint_keep_last_n", 3)),
                 archive_keep_last_n=self.cfg.get("archive_keep_last_n", None),
             )
@@ -2868,6 +2874,7 @@ class BaseTrainer(ABC):
                 metric=prune_cfg.get("metric", es_metric),
                 lower_is_better=prune_cfg.get("lower_is_better", True),
                 phase=tcfg.phase,
+                run_name=self.cfg.get("run_name", None),
                 registry=registry,
             )
             ckpt_manager.load_existing(checkpoint_dir)

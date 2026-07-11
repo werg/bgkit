@@ -27,6 +27,25 @@ def _make_simple_model():
 
 
 class TestBaseTrainerSaveMetrics:
+    def test_names_are_run_identified_and_collision_safe(self, tmp_path):
+        from bgkit.training.base_trainer import BaseTrainer
+
+        class DummyTrainer(BaseTrainer):
+            def setup(self): pass
+            def _forward_backward(self, batch): return {}
+            def evaluate(self): return {}
+
+        trainer = DummyTrainer(_make_cfg(run_name="stage b / smoke"))
+        trainer.model = _make_simple_model()
+        trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.01)
+
+        first = trainer.save_checkpoint(tmp_path)
+        second = trainer.save_checkpoint(tmp_path)
+
+        assert first != second
+        assert "_run-stage-b-smoke" in first.name
+        assert "_run-stage-b-smoke" in second.name
+
     def test_metrics_persisted(self, tmp_path):
         from bgkit.training.base_trainer import BaseTrainer
 

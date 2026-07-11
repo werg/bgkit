@@ -41,6 +41,7 @@ import hashlib
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -183,6 +184,12 @@ class SurvivorBlockCache:
         end = int(offsets[row_index + 1])
         rows = np.asarray(arrays["survivors"][start:end])
         return torch.from_numpy(np.array(rows))
+
+    def length(self, dataset: str, node_id: str) -> int:
+        """Return the survivor count without materializing the embedding rows."""
+        arrays, row_index = self._lookup(dataset, node_id)
+        offsets = arrays["offsets"]
+        return int(offsets[row_index + 1] - offsets[row_index])
 
     def get_batch(
         self,
@@ -358,6 +365,44 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def checkpoint_fingerprint(path: Path) -> str:
+    """Return a content fingerprint for a checkpoint file *or directory*.
+
+    Training checkpoints are directories containing ``metadata.json`` and one
+    or more ``*.pt`` payloads.  The old cache manifest only hashed plain files,
+    so every production checkpoint directory was recorded as ``null`` and the
+    Stage-A compatibility check could never fire.  Directory fingerprints hash
+    the relative name, size, and contents of every regular file in stable order.
+
+    The result is cached for the life of the process because cache generation
+    writes one manifest per dataset while all datasets normally share the same
+    multi-gigabyte checkpoints.
+    """
+    path = Path(path)
+    if path.is_file():
+        return file_sha256(path)
+    if not path.is_dir():
+        raise FileNotFoundError(f"Checkpoint path does not exist: {path}")
+
+    return _checkpoint_directory_fingerprint(path)
+
+
+@lru_cache(maxsize=16)
+def _checkpoint_directory_fingerprint(path: Path) -> str:
+    """Cached implementation for immutable checkpoint directories."""
+
+    h = hashlib.sha256()
+    files = sorted(p for p in path.rglob("*") if p.is_file())
+    if not files:
+        raise ValueError(f"Checkpoint directory contains no files: {path}")
+    for file_path in files:
+        rel = file_path.relative_to(path).as_posix()
+        h.update(rel.encode("utf-8"))
+        h.update(str(file_path.stat().st_size).encode("ascii"))
+        h.update(file_sha256(file_path).encode("ascii"))
+    return h.hexdigest()
+
+
 def tensor_state_sha256(state: dict[str, torch.Tensor]) -> str:
     """Content fingerprint of a (small) tensor state dict.
 
@@ -412,15 +457,13 @@ def write_cache_manifest(
         "dataset": dataset,
         "phase1_path": str(phase1_checkpoint) if phase1_checkpoint else None,
         "phase1_sha": (
-            file_sha256(phase1_checkpoint)
-            if phase1_checkpoint and phase1_checkpoint.is_file()
-            else None
+            checkpoint_fingerprint(phase1_checkpoint)
+            if phase1_checkpoint else None
         ),
         "stage_a_path": str(stage_a_checkpoint) if stage_a_checkpoint else None,
         "stage_a_sha": (
-            file_sha256(stage_a_checkpoint)
-            if stage_a_checkpoint and stage_a_checkpoint.is_file()
-            else None
+            checkpoint_fingerprint(stage_a_checkpoint)
+            if stage_a_checkpoint else None
         ),
         "lora_rank": int(lora_rank),
         "lora_alpha": float(lora_alpha) if lora_alpha is not None else None,
@@ -547,7 +590,7 @@ def assert_cache_manifest_matches(
         return  # Caller decides whether a missing manifest is fatal.
 
     def _norm_sha(p: Path | None) -> str | None:
-        return file_sha256(p) if p and p.is_file() else None
+        return checkpoint_fingerprint(p) if p else None
 
     expected_phase1_sha = _norm_sha(phase1_checkpoint)
     expected_stage_a_sha = _norm_sha(stage_a_checkpoint)

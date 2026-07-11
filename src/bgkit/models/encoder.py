@@ -14,7 +14,7 @@ active, otherwise from L0) flow through the active decoder-family
 
 L1's backbone is initialized at construction by deep-copying L0's backbone
 state, then evolves independently. L1 has no ``embed_tokens`` (its input is
-always survivor embeddings), no prompt support, and no ``auto_repro_head``
+always survivor embeddings), supports query prompts, and has no ``auto_repro_head``
 (one bridge per pair, on the L0 side).
 """
 
