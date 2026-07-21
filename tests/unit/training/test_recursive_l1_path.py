@@ -2283,3 +2283,86 @@ def test_tree_checkpoint_token_gate_fires_on_low_node_big_leaf():
         "token gate must activate the per-node checkpoint for the big-leaf "
         "low-node (full-tree) repo"
     )
+
+
+def test_ensure_eval_shared_tree_installs_reps_and_memoizes():
+    """EVAL fix: _ensure_eval_shared_tree encodes the shared repo tree so drill
+    reps resolve to REAL survivors (not _drilldown_zero_survivor). Verifies the
+    memo/splice install, the forward-count is not inflated, memoization by root,
+    the per_repo_full_backprop gate, and _clear teardown."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t.device = torch.device("cpu")
+    t._per_repo_full_backprop = True
+    t._shared_tree_forward_count = 5
+    t._eval_shared_tree_root = None
+    t._shared_tree_memo = None
+    t._shared_tree_splice_reps = None
+    t._shared_tree_used_nodes = None
+    t._shared_tree_child_l1_reps = {"stale": 1}
+    t._shared_tree_child_l1_used = {"stale"}
+    t._per_repo_shared_tree_active = False
+
+    calls = {"n": 0}
+
+    def fake_tree(self, ds, root):
+        calls["n"] += 1
+        proj = torch.randn(3, 8)
+        l1 = torch.randn(3, 8)
+        return {f"{root}/n1": (proj, l1), f"{root}/n2": (proj, l1)}, {"nodes": 2}
+
+    t._repo_group_key = types.MethodType(lambda self, s: s.root, t)
+    t._compute_shared_repo_tree = types.MethodType(fake_tree, t)
+
+    s_a = SimpleNamespace(dataset_name="git_commit_repro", root="repo/w000")
+    t._ensure_eval_shared_tree(s_a)
+
+    # Installed real reps for both nodes; forward-count NOT inflated (stays 5).
+    assert set(t._shared_tree_splice_reps.keys()) == {"repo/w000/n1", "repo/w000/n2"}
+    assert t._shared_tree_memo is not None
+    assert t._per_repo_shared_tree_active is True
+    assert t._eval_shared_tree_root == "repo/w000"
+    assert t._shared_tree_forward_count == 5
+    # reaccumulate dicts nulled so the head reads memo[c][1] directly (eval path)
+    assert t._shared_tree_child_l1_reps is None
+    assert calls["n"] == 1
+
+    # Same root -> memoized, no re-encode.
+    t._ensure_eval_shared_tree(SimpleNamespace(dataset_name="git_commit_repro", root="repo/w000"))
+    assert calls["n"] == 1
+
+    # Different root -> re-encode.
+    t._ensure_eval_shared_tree(SimpleNamespace(dataset_name="git_commit_repro", root="repo/w001"))
+    assert calls["n"] == 2
+    assert t._eval_shared_tree_root == "repo/w001"
+
+    # Teardown clears everything.
+    t._clear_eval_shared_tree()
+    assert t._shared_tree_memo is None
+    assert t._shared_tree_splice_reps is None
+    assert t._per_repo_shared_tree_active is False
+    assert t._eval_shared_tree_root is None
+
+
+def test_ensure_eval_shared_tree_gated_off_when_not_per_repo():
+    """Flat QA datasets (not per-repo full-backprop) must not touch shared-tree
+    state — _run_l1_batch owns their splice reps."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t.device = torch.device("cpu")
+    t._per_repo_full_backprop = False
+    t._eval_shared_tree_root = None
+    t._shared_tree_memo = None
+    t._shared_tree_splice_reps = None
+
+    called = {"n": 0}
+    t._repo_group_key = types.MethodType(lambda self, s: "root", t)
+    t._compute_shared_repo_tree = types.MethodType(
+        lambda self, ds, root: (called.update(n=called["n"] + 1) or ({}, {}), {}), t,
+    )
+    t._ensure_eval_shared_tree(SimpleNamespace(dataset_name="pubmedqa"))
+    assert called["n"] == 0
+    assert t._shared_tree_memo is None
+    assert t._shared_tree_splice_reps is None

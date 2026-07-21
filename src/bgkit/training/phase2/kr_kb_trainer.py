@@ -477,6 +477,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # accumulated gradient back into ``memo[child][1]``.
         self._shared_tree_child_l1_reps: dict | None = None
         self._shared_tree_child_l1_used: set | None = None
+        # EVAL-only: root id of the shared repo tree currently installed for
+        # eval decoding (see _ensure_eval_shared_tree). None outside eval.
+        self._eval_shared_tree_root: str | None = None
         # General (query-agnostic) compression prompt fed to BOTH L0 and L1 of
         # the shared repo tree.  Per-repo mode only; set in setup().
         self._recursive_general_prompt: str = DEFAULT_RECURSIVE_GENERAL_PROMPT
@@ -3880,7 +3883,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         ``torch.utils.checkpoint(use_reentrant=False)`` segment, so the whole
         node forward is recomputed on backward. Leaving the backbone's own
         block-level checkpointing on means the backbone blocks get recomputed a
-        SECOND time inside that recompute — pure redundant compute (~1.5× the
+        SECOND time inside that recompute — pure redundant compute (~1.5x the
         node cost) with no memory benefit, since the outer segment already
         discards the node's activations. Disabling it here trades a modestly
         higher transient per-node activation peak (bounded to a single node's
@@ -7556,8 +7559,68 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             if base_n is not None and z_n is not None:
                 metrics["eval/nav_gap"] = z_n - base_n
         finally:
+            self._clear_eval_shared_tree()
             self.model.train()
         return metrics
+
+    def _ensure_eval_shared_tree(self, sample: KBSample) -> None:
+        """EVAL: install the shared repo tree so recursive drill reps resolve.
+
+        The training Option-A step encodes the window-0 subtree once per repo
+        (:meth:`_compute_shared_repo_tree`) and installs ``_shared_tree_memo`` /
+        ``_shared_tree_splice_reps``, so every ``bgkit`` drill splices a REAL
+        survivor rep. Eval's single-sample decode path never did this, so every
+        ``node`` / ``head`` drill fell through to
+        :meth:`_drilldown_zero_survivor` (ZERO reps). That both starves the eval
+        decode (understating quality) AND pins ``eval/recon_gap`` +
+        ``eval/nav_gap`` at ~0 — a MEASUREMENT ARTIFACT, not a training collapse:
+        the in-step ablation probe, which runs with the tree live, shows the
+        reps are load-bearing (recon_gap ~0.1). Populate the same state here
+        (under no_grad) so eval metrics + the ablation gaps reflect the real
+        rep-using decode.
+
+        Gated to the recursive per-repo full-backprop path (git_commit_repro);
+        flat QA datasets keep the ``_run_l1_batch`` splice and are untouched.
+        Memoized by root so consecutive same-repo eval samples reuse the encode.
+        """
+        if not getattr(self, "_per_repo_full_backprop", False):
+            return
+        root = self._repo_group_key(sample)
+        if not root:
+            return
+        if getattr(self, "_eval_shared_tree_root", None) == root:
+            return
+        saved_count = getattr(self, "_shared_tree_forward_count", 0)
+        with torch.no_grad():
+            memo, _stats = self._compute_shared_repo_tree(
+                sample.dataset_name, root,
+            )
+        # The eval encode is not a training-step forward — don't inflate the
+        # once-per-step tripwire counter.
+        self._shared_tree_forward_count = saved_count
+        self._shared_tree_memo = memo
+        self._shared_tree_splice_reps = {
+            nid: proj.detach()
+            for nid, (proj, _l1out) in memo.items()
+            if proj is not None
+        }
+        self._shared_tree_used_nodes = set()
+        # None → the head survivor reads memo[c][1] directly (the eval path); the
+        # per-group reaccumulate bookkeeping is a training-backward concern only.
+        self._shared_tree_child_l1_reps = None
+        self._shared_tree_child_l1_used = None
+        self._per_repo_shared_tree_active = True
+        self._eval_shared_tree_root = root
+
+    def _clear_eval_shared_tree(self) -> None:
+        """Tear down any eval-installed shared repo tree (see
+        :meth:`_ensure_eval_shared_tree`) so a following training step starts
+        from a clean shared-tree state."""
+        self._shared_tree_memo = None
+        self._shared_tree_splice_reps = None
+        self._shared_tree_used_nodes = None
+        self._per_repo_shared_tree_active = False
+        self._eval_shared_tree_root = None
 
     def _eval_pass(self) -> dict[str, float]:
         """Single pass over the eval dataloader. Assumes the model is
@@ -7595,6 +7658,11 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             if gap_probe else None
         )
 
+        # Fresh per pass: evaluate() calls _eval_pass once per ablation mode, so
+        # the shared tree is re-installed each pass (reps are identical across
+        # modes — the ablation is applied at splice, not encode). Torn down in
+        # evaluate()'s finally via _clear_eval_shared_tree.
+        self._eval_shared_tree_root = None
         for batch in self.eval_dataloader:
             for sample in batch:
                 if self._round_robin:
@@ -7605,6 +7673,10 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                         else "falcon_h1"
                     )
                     self._eval_family_counter += 1
+                # Install the sample's shared repo tree so recursive drill reps
+                # resolve to real survivors (git_commit_repro); no-op for flat
+                # QA datasets. Without this every drill splices ZERO reps.
+                self._ensure_eval_shared_tree(sample)
                 result = self._eval_one_sample(sample, span_accum)
                 if result is None:
                     continue

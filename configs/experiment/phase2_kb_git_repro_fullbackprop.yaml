@@ -22,7 +22,7 @@ run_name: phase2_kb_git_repro_fullbackprop
 # the nest-fix (suspend inner backbone ckpt) also cuts big-node recompute ~1.5x.
 # CONTAINER path (host /mnt/external/bgkit-checkpoints is mounted at
 # /workspace/checkpoints inside the container — the host path FileNotFound'd).
-resume_checkpoint: "/workspace/checkpoints/phase2_kb_step975_20260707_140219"
+resume_checkpoint: "/workspace/checkpoints/phase2_kb_step1075_20260721_234212_550583_run-phase2_kb_git_repro_fullbackprop"
 # Auto-resume ENABLED (no resume_checkpoint key): on restart the trainer
 # resolves the latest run-scoped checkpoint (resolve_latest_checkpoint, keyed on
 # run_name above) and resumes; on the first launch — or if the latest checkpoint
