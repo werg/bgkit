@@ -13,9 +13,16 @@ run_name: phase2_kb_git_repro_fullbackprop
 # AR fallback while the tree was collapsed). To test whether the collapse fix +
 # high-start retention let the reps become load-bearing, cold-start from the
 # summarization base — a poisoned model won't un-learn the shortcut by resuming.
-# REMOVE this line once the fresh run has saved its first checkpoint so future
-# crash-restarts auto-resume the fresh run instead of cold-starting again.
-resume_checkpoint: "none"
+# RESUME the fixed-run step-975 checkpoint (2026-07-07 14:02, last save before the
+# 2026-07-08 host reboot/kernel-upgrade killed the container). This is the latest
+# GOOD post-collapse-fix checkpoint (fresh run reached 375 -> 975, reps confirmed
+# load-bearing). Pinned explicitly (NOT "auto" — auto-resume picks highest step =
+# the POISONED old-run step-4825, which learned the AR shortcut). Relaunched with a
+# raised BGKIT_STEP_TIMEOUT (host env) so a big-tree Option-A backward completes;
+# the nest-fix (suspend inner backbone ckpt) also cuts big-node recompute ~1.5x.
+# CONTAINER path (host /mnt/external/bgkit-checkpoints is mounted at
+# /workspace/checkpoints inside the container — the host path FileNotFound'd).
+resume_checkpoint: "/workspace/checkpoints/phase2_kb_step975_20260707_140219"
 # Auto-resume ENABLED (no resume_checkpoint key): on restart the trainer
 # resolves the latest run-scoped checkpoint (resolve_latest_checkpoint, keyed on
 # run_name above) and resumes; on the first launch — or if the latest checkpoint

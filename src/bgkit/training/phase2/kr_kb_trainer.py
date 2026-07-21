@@ -3870,6 +3870,39 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             survivors.append(l1in[start:end])
         return children_ids, survivors
 
+    @contextlib.contextmanager
+    def _suspend_inner_backbone_ckpt(self, *backbones):
+        """Temporarily disable per-block gradient checkpointing on the given
+        encoder ``backbone``(s) for the duration of an OUTER tree/leaf
+        checkpoint segment.
+
+        The Option-A tree-encode already wraps each leaf / interior node in a
+        ``torch.utils.checkpoint(use_reentrant=False)`` segment, so the whole
+        node forward is recomputed on backward. Leaving the backbone's own
+        block-level checkpointing on means the backbone blocks get recomputed a
+        SECOND time inside that recompute — pure redundant compute (~1.5× the
+        node cost) with no memory benefit, since the outer segment already
+        discards the node's activations. Disabling it here trades a modestly
+        higher transient per-node activation peak (bounded to a single node's
+        backbone, well within headroom) for the removed double-recompute.
+
+        Toggled INSIDE the checkpoint target fn with try/finally so the flag is
+        identical on the forward and recompute passes (bit-exact, keeps
+        ``use_reentrant=False`` tensor-metadata matching) and restored for every
+        other path (decoder, flat ``_l0_for_articles``, eval)."""
+        saved = [
+            (b, getattr(b, "_gradient_checkpointing", False))
+            for b in backbones
+            if b is not None and hasattr(b, "_gradient_checkpointing")
+        ]
+        for b, _ in saved:
+            b._gradient_checkpointing = False
+        try:
+            yield
+        finally:
+            for b, prev in saved:
+                b._gradient_checkpointing = prev
+
     def _l0_leaf_forward(
         self, dataset: str, article_ids: list[str], q_emb: torch.Tensor,
         ratio: float,
@@ -3888,10 +3921,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # 0-node collapse. Hardcoded here (a tree leaf is ALWAYS exact_topk) so the
         # L1-node checkpoint recompute re-derives it identically — no transient
         # _recursive_l0_override read, which is what crashed the earlier attempts.
-        out, _content_cu, _ratio = self._live_l0_encode(
-            dataset, article_ids, query_emb=q_emb, ratio=ratio,
-            selection_mode="exact_topk",
-        )
+        with self._suspend_inner_backbone_ckpt(
+            getattr(getattr(self.encoder, "l0", None), "backbone", None),
+        ):
+            out, _content_cu, _ratio = self._live_l0_encode(
+                dataset, article_ids, query_emb=q_emb, ratio=ratio,
+                selection_mode="exact_topk",
+            )
         survivors = out.survivor_embeddings
         if survivors is None or survivors.numel() == 0:
             return (
@@ -3965,9 +4001,12 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         :meth:`_encode_tree_node_forward`; the child-ID embeddings are rebuilt
         INSIDE (recomputed on backward, so ``embed_tokens`` gradient flows)."""
         survivors = list(torch.split(surv_cat, list(sizes), dim=0))
-        return self._encode_tree_node_forward(
-            list(children_ids), survivors, q_emb, ratio,
-        )
+        with self._suspend_inner_backbone_ckpt(
+            getattr(getattr(self.encoder, "l1", None), "backbone", None),
+        ):
+            return self._encode_tree_node_forward(
+                list(children_ids), survivors, q_emb, ratio,
+            )
 
     def _encode_tree_node_live(
         self,
