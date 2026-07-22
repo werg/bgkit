@@ -36,6 +36,7 @@ its own query.
 
 from __future__ import annotations
 
+import hashlib
 import statistics
 from dataclasses import asdict, dataclass, field
 
@@ -226,6 +227,55 @@ def commit_key(repo: str, window_idx: int, ordinal: int) -> str:
     return f"{repo}@w{window_idx:03d}:{ordinal:04d}"
 
 
+def surrogate_sha(
+    repo: str, window_idx: int, ordinal: int, message: str, timestamp: int,
+) -> str:
+    """Stable UNIQUE per-commit hash used as the commit's ``sha`` for id
+    derivation.
+
+    The upstream extractor never recorded the real git sha (``sha=""`` hardcoded
+    in ``extract_commit_repro.py``), so ``commit_node_id = bip39('cm|'+sha)``
+    collapsed EVERY commit of a repo onto one id — 99.3% of repos had all commits
+    map to a single node, destroying commit-level navigation. This surrogate
+    restores the intended property: a stable, unique, content-linked hash per
+    commit (the ``(repo, window, ordinal)`` positional key guarantees
+    uniqueness; the message + timestamp fold in commit content). ``bip39_id``
+    then maps it to opaque, tokenizer-friendly words exactly as designed —
+    unguessable from the ordinal because the model cannot invert sha256.
+
+    NOTE: this is not the real git sha (recovering that needs a full
+    re-extraction / re-tokenization). It is functionally equivalent for the id
+    scheme: unique + stable + opaque. A later real-sha re-extraction and/or
+    per-epoch id re-salting (anti-memorization) can supersede it.
+    """
+    payload = f"{repo}\x00{window_idx}\x00{ordinal}\x00{message}\x00{timestamp}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def sha_for_record(rec: dict) -> str:
+    """Compute :func:`surrogate_sha` from a raw JSONL commit record.
+
+    Single source of truth so the tree / mmap / trajectory build stages derive
+    BIT-IDENTICAL commit shas (and therefore identical node ids) from the same
+    record — a divergence here would silently break the mmap document_id ↔
+    trajectory file_change_id join.
+
+    Prefers a REAL git sha when the record carries one (a future re-extraction
+    that populates ``sha``); falls back to :func:`surrogate_sha` for the current
+    ``sha=""`` corpus.
+    """
+    real = str(rec.get("sha", "")).strip()
+    if real:
+        return real
+    return surrogate_sha(
+        repo=str(rec["repo"]),
+        window_idx=int(rec.get("window_idx", 0)),
+        ordinal=int(rec["ordinal"]),
+        message=str(rec.get("message", "")),
+        timestamp=int(rec.get("timestamp", 0)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Opaque node-id construction (shared by tree / mmap / trajectory builders)
 # ---------------------------------------------------------------------------
@@ -322,13 +372,15 @@ def walk_repo_commits_oldest_first(
     exclude_merges: bool = True,
     max_walked: int | None = None,
 ):
-    """Yield ``(message, timestamp, [(path, diff_text, blob_text)])`` oldest-first.
+    """Yield ``(sha, message, timestamp, [(path, diff_text, blob_text)])`` oldest-first.
 
-    ``message`` is the FULL commit message (used verbatim in the reconstruction
-    prompt). ``blob_text`` is the file's full content at this commit (the gold
-    for file-state reconstruction) or ``None`` for deletions/binary. Token
-    counting / budgeting / gating is done by the caller so this stays
-    tokenizer-free (cheap to reuse in calibration).
+    ``sha`` is the full commit hex id (the real git sha — used to build the
+    opaque, unique commit node id; historically dropped, which collapsed every
+    commit of a repo onto one id). ``message`` is the FULL commit message (used
+    verbatim in the reconstruction prompt). ``blob_text`` is the file's full
+    content at this commit (the gold for file-state reconstruction) or ``None``
+    for deletions/binary. Token counting / budgeting / gating is done by the
+    caller so this stays tokenizer-free (cheap to reuse in calibration).
     """
     repo = pygit2.Repository(repo_path)
     try:
@@ -368,7 +420,7 @@ def walk_repo_commits_oldest_first(
             files.append((path, diff_text, blob_text))
         if not files:
             continue
-        yield commit.message.strip(), int(commit.commit_time), files
+        yield str(commit.id), commit.message.strip(), int(commit.commit_time), files
 
 
 # ---------------------------------------------------------------------------

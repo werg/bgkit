@@ -32,6 +32,7 @@ from bgkit.data.commit_repro import (
     FileChange,
     ReproCommit,
     build_forest,
+    sha_for_record,
 )
 
 
@@ -53,7 +54,7 @@ def _load_commits(path: Path) -> dict[str, list[ReproCommit]]:
             ]
             commit = ReproCommit(
                 repo=str(rec["repo"]),
-                sha=str(rec.get("sha", "")),
+                sha=sha_for_record(rec),
                 ordinal=int(rec["ordinal"]),
                 message=str(rec.get("message", "")),
                 timestamp=int(rec.get("timestamp", 0)),

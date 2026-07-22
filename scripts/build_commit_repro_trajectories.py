@@ -58,6 +58,7 @@ from bgkit.data.commit_repro import (
     build_per_file_index,
     build_query,
     commit_key,
+    sha_for_record,
 )
 from bgkit.data.drilldown import (
     DEFAULT_MODE_WEIGHTS,
@@ -73,7 +74,7 @@ FLUSH_ROWS = 2000
 def _parse_commit(rec: dict) -> ReproCommit:
     """Deserialize one JSONL record into a :class:`ReproCommit`."""
     return ReproCommit(
-        repo=str(rec["repo"]), sha=str(rec.get("sha", "")),
+        repo=str(rec["repo"]), sha=sha_for_record(rec),
         ordinal=int(rec["ordinal"]), message=str(rec.get("message", "")),
         timestamp=int(rec.get("timestamp", 0)),
         window_idx=int(rec.get("window_idx", 0)),

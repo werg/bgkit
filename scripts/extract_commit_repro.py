@@ -81,7 +81,7 @@ def _collect_repo(
     file), the file's full blob (the reconstruction gold). No budgeting yet."""
     commits: list[ReproCommit] = []
     ordinal = 0
-    for message, ts, files in walk_repo_commits_oldest_first(
+    for sha, message, ts, files in walk_repo_commits_oldest_first(
         str(repo_path), repo_id, max_walked=max_walked,
     ):
         file_changes: list[FileChange] = []
@@ -117,7 +117,7 @@ def _collect_repo(
         if skip or not file_changes or total > max_commit_tokens:
             continue
         commits.append(ReproCommit(
-            repo=repo_id, sha="", ordinal=ordinal, message=message,
+            repo=repo_id, sha=sha, ordinal=ordinal, message=message,
             timestamp=ts, file_changes=file_changes, n_diff_tokens=total,
         ))
         ordinal += 1

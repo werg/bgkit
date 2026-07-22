@@ -158,3 +158,41 @@ def test_drilldown_returns_none_on_missing_commit():
         "msg", "GOLD", ord_to_commit={}, n_distractors=0, rng=random.Random(0),
     )
     assert traj is None
+
+
+def test_surrogate_sha_uniqueness_fixes_collapse():
+    """Regression: sha='' collapsed EVERY commit of a repo onto one commit_node_id
+    (99.3% of repos). sha_for_record must give each commit a distinct, stable sha
+    so commit_node_id / chunk_node_id / file_change_id are unique per commit."""
+    from bgkit.data.commit_repro import commit_node_id, sha_for_record, surrogate_sha
+
+    repo = "owner/repo"
+    recs = [
+        {"repo": repo, "window_idx": 0, "ordinal": i, "message": f"m{i}", "timestamp": 1700 + i}
+        for i in range(50)
+    ]
+    # The OLD bug: sha="" -> all identical.
+    assert len({commit_node_id(repo, "") for _ in recs}) == 1
+    # The FIX: distinct per commit.
+    node_ids = {commit_node_id(repo, sha_for_record(r)) for r in recs}
+    assert len(node_ids) == 50
+    # Stable / deterministic (same record -> same sha).
+    assert sha_for_record(recs[7]) == sha_for_record(dict(recs[7]))
+    # Distinct commits differ even with identical message/timestamp (ordinal breaks ties).
+    a = surrogate_sha(repo, 0, 1, "same", 100)
+    b = surrogate_sha(repo, 0, 2, "same", 100)
+    assert a != b
+    # ids stay tokenizer-friendly bip39 words ("word-word" after the repo prefix).
+    sample = commit_node_id(repo, sha_for_record(recs[3]))
+    assert sample.startswith(repo + "/") and "-" in sample.split("/")[-1]
+
+
+def test_sha_for_record_prefers_real_sha():
+    """A future re-extraction that populates the real git sha must be used
+    verbatim (not overridden by the surrogate)."""
+    from bgkit.data.commit_repro import sha_for_record, surrogate_sha
+
+    rec = {"repo": "o/r", "window_idx": 0, "ordinal": 3, "message": "m", "timestamp": 9}
+    assert sha_for_record(rec) == surrogate_sha("o/r", 0, 3, "m", 9)  # empty -> surrogate
+    rec_real = dict(rec, sha="deadbeef" * 5)
+    assert sha_for_record(rec_real) == "deadbeef" * 5  # real sha wins

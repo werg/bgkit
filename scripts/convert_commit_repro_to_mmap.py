@@ -34,7 +34,12 @@ if _src not in sys.path:
 import numpy as np
 import pyarrow as pa
 
-from bgkit.data.commit_repro import DATASET_NAME, FileChange, ReproCommit
+from bgkit.data.commit_repro import (
+    DATASET_NAME,
+    FileChange,
+    ReproCommit,
+    sha_for_record,
+)
 from bgkit.data.mmap_writer import build_csr_offsets, write_mmap_artifacts
 
 
@@ -73,7 +78,7 @@ def main() -> None:
             # opaque BIP-39 commit-node scope + same-path disambiguation) is
             # bit-identical to the tree / trajectory builders.
             commit = ReproCommit(
-                repo=repo, sha=str(rec.get("sha", "")), ordinal=ordinal,
+                repo=repo, sha=sha_for_record(rec), ordinal=ordinal,
                 message=str(rec.get("message", "")),
                 timestamp=int(rec.get("timestamp", 0)), window_idx=window,
                 file_changes=[
@@ -92,7 +97,7 @@ def main() -> None:
                 lengths.append(len(ids))
                 document_ids.append(doc_id)
                 repos.append(repo)
-                shas.append(str(rec.get("sha", "")))
+                shas.append(commit.sha)
                 windows.append(window)
                 ordinals.append(ordinal)
                 file_idxs.append(fi)
