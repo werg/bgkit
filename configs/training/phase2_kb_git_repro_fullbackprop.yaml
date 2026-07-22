@@ -56,7 +56,8 @@ eval_every: 500
 eval_ablation_modes: [zeroed, noise, neither]
 eval_gap_probe: true          # emit eval/recon_gap + eval/nav_gap (CE split, present-vs-zeroed)
 save_every: 500
-reset_wandb: true  # fresh run for the ablation-probe confirmation (throwaway); revert after
+reset_wandb: false  # continue the same wandb run across restarts (chart continuity);
+                    # was true for the 2026-07-21 fresh-run bringup (now run gfb9j36x)
 
 # PROFILING (temporary): per-repo per-component timing. When true,
 # _forward_backward_per_repo logs a `per_repo_timing` event per repo with synced
