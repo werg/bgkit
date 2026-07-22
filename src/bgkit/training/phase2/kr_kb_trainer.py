@@ -480,6 +480,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # EVAL-only: root id of the shared repo tree currently installed for
         # eval decoding (see _ensure_eval_shared_tree). None outside eval.
         self._eval_shared_tree_root: str | None = None
+        # EVAL-only: per-evaluate() cache {root: (memo, splice)} reused across
+        # ablation-mode passes so each repo's tree is encoded once, not per mode.
+        self._eval_tree_cache: dict | None = None
         # General (query-agnostic) compression prompt fed to BOTH L0 and L1 of
         # the shared repo tree.  Per-repo mode only; set in setup().
         self._recursive_general_prompt: str = DEFAULT_RECURSIVE_GENERAL_PROMPT
@@ -7533,6 +7536,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         roughly doubles eval wall-clock; sized by ``max_eval_samples``.
         """
         self.model.eval()
+        # Per-evaluate() cache of encoded repo trees, reused across every
+        # ablation-mode pass (see _ensure_eval_shared_tree). Cleared in finally.
+        self._eval_tree_cache = {}
         try:
             metrics = self._eval_pass()
             extra_modes = list(self.step_cfg.get("eval_ablation_modes", []) or [])
@@ -7590,20 +7596,32 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             return
         if getattr(self, "_eval_shared_tree_root", None) == root:
             return
-        saved_count = getattr(self, "_shared_tree_forward_count", 0)
-        with torch.no_grad():
-            memo, _stats = self._compute_shared_repo_tree(
-                sample.dataset_name, root,
-            )
-        # The eval encode is not a training-step forward — don't inflate the
-        # once-per-step tripwire counter.
-        self._shared_tree_forward_count = saved_count
+        # Cross-ABLATION-MODE cache: evaluate() runs _eval_pass once per mode
+        # (neither/zeroed/noise/headline), but the encoded tree is IDENTICAL
+        # across modes (ablation is applied at splice, not encode). Encode each
+        # repo's tree ONCE per evaluate() and reuse — else it's ~4x redundant
+        # tree encodes (the 44-min-eval regression).
+        cache = getattr(self, "_eval_tree_cache", None)
+        if cache is not None and root in cache:
+            memo, splice = cache[root]
+        else:
+            saved_count = getattr(self, "_shared_tree_forward_count", 0)
+            with torch.no_grad():
+                memo, _stats = self._compute_shared_repo_tree(
+                    sample.dataset_name, root,
+                )
+            # The eval encode is not a training-step forward — don't inflate the
+            # once-per-step tripwire counter.
+            self._shared_tree_forward_count = saved_count
+            splice = {
+                nid: proj.detach()
+                for nid, (proj, _l1out) in memo.items()
+                if proj is not None
+            }
+            if cache is not None:
+                cache[root] = (memo, splice)
         self._shared_tree_memo = memo
-        self._shared_tree_splice_reps = {
-            nid: proj.detach()
-            for nid, (proj, _l1out) in memo.items()
-            if proj is not None
-        }
+        self._shared_tree_splice_reps = splice
         self._shared_tree_used_nodes = set()
         # None → the head survivor reads memo[c][1] directly (the eval path); the
         # per-group reaccumulate bookkeeping is a training-backward concern only.
@@ -7621,6 +7639,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._shared_tree_used_nodes = None
         self._per_repo_shared_tree_active = False
         self._eval_shared_tree_root = None
+        self._eval_tree_cache = None
 
     def _eval_pass(self) -> dict[str, float]:
         """Single pass over the eval dataloader. Assumes the model is

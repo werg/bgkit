@@ -2366,3 +2366,43 @@ def test_ensure_eval_shared_tree_gated_off_when_not_per_repo():
     assert called["n"] == 0
     assert t._shared_tree_memo is None
     assert t._shared_tree_splice_reps is None
+
+
+def test_eval_tree_cache_reuses_across_ablation_modes():
+    """Perf: _eval_tree_cache makes each repo's tree encode ONCE per evaluate(),
+    reused across the ablation-mode passes (fixes the 4x-redundant-encode eval
+    regression)."""
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t.device = torch.device("cpu")
+    t._per_repo_full_backprop = True
+    t._shared_tree_forward_count = 0
+    t._eval_shared_tree_root = None
+    t._eval_tree_cache = {}  # as evaluate() sets it
+    for a in ("_shared_tree_memo", "_shared_tree_splice_reps", "_shared_tree_used_nodes",
+              "_shared_tree_child_l1_reps", "_shared_tree_child_l1_used", "_per_repo_shared_tree_active"):
+        setattr(t, a, None)
+
+    calls = {"n": 0}
+
+    def fake_tree(self, ds, root):
+        calls["n"] += 1
+        return {f"{root}/n1": (torch.randn(2, 4), torch.randn(2, 4))}, {}
+
+    t._repo_group_key = types.MethodType(lambda self, s: s.root, t)
+    t._compute_shared_repo_tree = types.MethodType(fake_tree, t)
+
+    s = SimpleNamespace(dataset_name="git_commit_repro", root="repo/w000")
+    # Pass 1 (mode A): encode.
+    t._ensure_eval_shared_tree(s)
+    assert calls["n"] == 1
+    # Simulate the next mode's pass: _eval_pass resets _eval_shared_tree_root.
+    t._eval_shared_tree_root = None
+    t._ensure_eval_shared_tree(s)      # same root -> from cache, NO re-encode
+    assert calls["n"] == 1
+    assert set(t._shared_tree_splice_reps.keys()) == {"repo/w000/n1"}
+    # A different repo still encodes once, then caches.
+    t._eval_shared_tree_root = None
+    t._ensure_eval_shared_tree(SimpleNamespace(dataset_name="git_commit_repro", root="repo/w001"))
+    assert calls["n"] == 2
