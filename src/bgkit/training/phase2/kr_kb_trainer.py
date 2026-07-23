@@ -5131,6 +5131,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         n_done = 0
         n_turns = 0
         decode_cap = int(getattr(self, "_max_decode_tokens", 0) or 0)
+        # Phase 3a: assemble every sample's segments (drop empties / zero-loss).
+        batch_segments: list = []
+        batch_meta: list = []  # (trace, sample_tokens, n_prep_turns, decode_len)
         for s_idx, prep in enumerate(preps):
             per_turn = [
                 survivors_by_address[(s_idx, t_idx)]
@@ -5152,48 +5155,57 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     segments, decode_cap,
                 )
             sample_tokens = 0
+            decode_len = 0
             for seg in segments:
                 if isinstance(seg, TokenSegment) and seg.loss_mask is not None:
                     sample_tokens += int(seg.loss_mask.sum().item())
+                tk = getattr(seg, "token_ids", None)
+                if tk is not None:
+                    decode_len += int(tk.reshape(-1).shape[0])
+                else:
+                    emb = getattr(seg, "embeddings", None)
+                    if emb is not None:
+                        decode_len += int(emb.reshape(-1, emb.shape[-1]).shape[0])
             if sample_tokens == 0:
                 continue
+            batch_segments.append(segments)
+            batch_meta.append(
+                (_trace, sample_tokens, len(prep["prepared_turns"]), decode_len),
+            )
+
+        # Phase 3b: decode the WHOLE group in ONE packed FA4-varlen forward.
+        # Per-file CE runs on each file's isolated hidden slice, so the
+        # per-file losses are BIT-EXACT vs a per-file loop — but we pay ONE
+        # forward instead of G (the batching speedup; cu_seqlens isolates
+        # attention + resets the DeltaNet/Mamba state per file). At group_size 1
+        # this is exactly the prior single-sample path.
+        if batch_segments:
+            want_hidden = span_ce_accum is not None
             with _tm("decode_fwd", gpu=True):
-                if span_ce_accum is not None:
-                    # Probe-only: request hidden states so per-position CE can
-                    # be split by token type (navigation vs reconstruction).
-                    # The scalar ``out.loss`` is IDENTICAL to the scalar-only
-                    # path — only the extra hidden-state return differs.
-                    out = self.decoder.forward_interleaved_with_loss(
-                        segments, return_hidden_states=True,
-                    )
+                outs = self.decoder.forward_interleaved_packed(
+                    batch_segments, return_hidden_states=want_hidden,
+                )
+            for (_trace, sample_tokens, n_prep, decode_len), out in zip(
+                batch_meta, outs, strict=True,
+            ):
+                if want_hidden:
                     sample_loss = out.loss
                     self._accumulate_span_ce(span_ce_accum, out, _trace)
                 else:
-                    sample_loss = self.decoder.forward_interleaved_with_loss(segments)
-            # (c) per-file decode breakdown: which decoder family + the decode
-            #     seqlen (concat length actually fed to the decoder). Captures a
-            #     Falcon decode under round-robin (qwen_decoder_prob<1).
-            if _MEM_BREAKDOWN:
-                decode_len = 0
-                for seg in segments:
-                    tk = getattr(seg, "token_ids", None)
-                    if tk is not None:
-                        decode_len += int(tk.reshape(-1).shape[0])
-                    else:
-                        emb = getattr(seg, "embeddings", None)
-                        if emb is not None:
-                            decode_len += int(emb.reshape(-1, emb.shape[-1]).shape[0])
-                self._mem_breakdown(
-                    "after_decode_fwd",
-                    decoder_family=getattr(self, "_decoder_family", None),
-                    decode_seqlen=decode_len,
-                    loss_tokens=sample_tokens,
-                    n_drills=len(prep.get("prepared_turns", [])),
-                )
-            group_loss = group_loss + sample_loss
-            total_tokens += sample_tokens
-            n_done += 1
-            n_turns += len(prep["prepared_turns"])
+                    sample_loss = out
+                # per-file decode breakdown (decoder family + concat seqlen).
+                if _MEM_BREAKDOWN:
+                    self._mem_breakdown(
+                        "after_decode_fwd",
+                        decoder_family=getattr(self, "_decoder_family", None),
+                        decode_seqlen=decode_len,
+                        loss_tokens=sample_tokens,
+                        n_drills=n_prep,
+                    )
+                group_loss = group_loss + sample_loss
+                total_tokens += sample_tokens
+                n_done += 1
+                n_turns += n_prep
         return group_loss, total_tokens, n_done, n_turns, len(buckets)
 
     # ------------------------------------------------------------------

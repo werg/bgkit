@@ -18,6 +18,25 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+
+def _packed_mock(single_fn):
+    """Wrap a fake single-sample ``forward_interleaved_with_loss`` into a
+    ``forward_interleaved_packed`` (returns a per-sample list) so tests exercise
+    the batched decode path. The real method's per-file CE on isolated hidden
+    slices is bit-identical to calling the single-sample forward per sample, so
+    the per-sample fake is the correct stub."""
+
+    def _packed(segments_per_sample, *, return_hidden_states=False, chunk_size=None):
+        outs = []
+        for segs in segments_per_sample:
+            try:
+                outs.append(single_fn(segs, return_hidden_states=return_hidden_states))
+            except TypeError:
+                outs.append(single_fn(segs))
+        return outs
+
+    return _packed
+
 from bgkit.models.decoder import TokenSegment
 
 # ---------------------------------------------------------------------------
@@ -627,7 +646,10 @@ def test_per_repo_normalizes_by_contributing_count():
     t.global_step = 0
     t._recursive_l0_retention_cfg = 0.1
     t._recursive_l1_retention_cfg = 0.1
-    t.decoder = SimpleNamespace(forward_interleaved_with_loss=fake_decode)
+    t.decoder = SimpleNamespace(
+        forward_interleaved_with_loss=fake_decode,
+        forward_interleaved_packed=_packed_mock(fake_decode),
+    )
 
     # 3 samples: two contributors (mult 1 and 2) + one non-contributor (empty).
     def make(seg):
@@ -693,8 +715,10 @@ def test_per_repo_pass2_group_batched_bounded_by_g():
         t._recursive_l0_retention_cfg = 0.1
         t._recursive_l1_retention_cfg = 0.1
         w = torch.nn.Parameter(torch.zeros(1))
+        _dec = lambda segments: w.sum()  # noqa: E731
         t.decoder = SimpleNamespace(
-            forward_interleaved_with_loss=lambda segments: w.sum(),
+            forward_interleaved_with_loss=_dec,
+            forward_interleaved_packed=_packed_mock(_dec),
         )
         batch = [SimpleNamespace(dataset_name="toy", idx=i) for i in range(n)]
 
@@ -954,7 +978,10 @@ def _make_detach_reaccum_trainer(tree_w, base, decode, group_size=1 << 30):
     t._recursive_l1_retention_cfg = 0.1
     t._shared_tree_forward_count = 0
     t._trees = {"toy": object()}  # non-None; per-repo splice path ignores it
-    t.decoder = SimpleNamespace(forward_interleaved_with_loss=decode)
+    t.decoder = SimpleNamespace(
+        forward_interleaved_with_loss=decode,
+        forward_interleaved_packed=_packed_mock(decode),
+    )
 
     def fake_tree(self, ds, root):
         self._shared_tree_forward_count += 1
@@ -1555,7 +1582,10 @@ def test_max_decode_tokens_truncates_long_gold_keeps_all():
     t._per_repo_sample_group_size = 1
     t._recursive_l1_retention_cfg = 0.1
     t.global_step = 0
-    t.decoder = SimpleNamespace(forward_interleaved_with_loss=fake_decode)
+    t.decoder = SimpleNamespace(
+        forward_interleaved_with_loss=fake_decode,
+        forward_interleaved_packed=_packed_mock(fake_decode),
+    )
     t.encoder = SimpleNamespace(active_projection_output_dim=8)
 
     # The assemble returns a gold segment of the sample's gold length.
@@ -1589,8 +1619,10 @@ def test_max_decode_tokens_off_decodes_all():
     t._per_repo_sample_group_size = 1
     t._recursive_l1_retention_cfg = 0.1
     t.global_step = 0
+    _dec2 = lambda segs: decoded.append(1) or w.sum()  # noqa: E731
     t.decoder = SimpleNamespace(
-        forward_interleaved_with_loss=lambda segs: decoded.append(1) or w.sum())
+        forward_interleaved_with_loss=_dec2,
+        forward_interleaved_packed=_packed_mock(_dec2))
     t.encoder = SimpleNamespace(active_projection_output_dim=8)
     long_ = {"prepared_turns": [], "token_ids": torch.ones(5000, dtype=torch.long)}
     t._prepare_sample_for_decode = types.MethodType(lambda self, s: long_, t)
@@ -2380,8 +2412,9 @@ def test_eval_tree_cache_reuses_across_ablation_modes():
     t._shared_tree_forward_count = 0
     t._eval_shared_tree_root = None
     t._eval_tree_cache = {}  # as evaluate() sets it
-    for a in ("_shared_tree_memo", "_shared_tree_splice_reps", "_shared_tree_used_nodes",
-              "_shared_tree_child_l1_reps", "_shared_tree_child_l1_used", "_per_repo_shared_tree_active"):
+    for a in ("_shared_tree_memo", "_shared_tree_splice_reps",
+              "_shared_tree_used_nodes", "_shared_tree_child_l1_reps",
+              "_shared_tree_child_l1_used", "_per_repo_shared_tree_active"):
         setattr(t, a, None)
 
     calls = {"n": 0}

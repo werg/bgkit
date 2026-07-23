@@ -7001,6 +7001,103 @@ class ReconstructionDecoder(nn.Module):
             )
         return loss
 
+    def forward_interleaved_packed(
+        self,
+        segments_per_sample: list[list[Segment]],
+        *,
+        chunk_size: int | None = None,
+        return_hidden_states: bool = False,
+    ) -> list[torch.Tensor] | list[InterleavedForwardOutput]:
+        """Batched FA4-varlen interleaved forward over G samples at once.
+
+        Concatenates every sample's segments into ONE packed ``(1, N)``
+        sequence with per-sample ``cu_seqlens`` + restarting ``position_ids``,
+        runs a SINGLE :meth:`_packed_forward` (the varlen path isolates
+        attention AND resets the Mamba/DeltaNet recurrent state at each sample
+        boundary), then computes the CE PER SAMPLE on the corresponding shared
+        hidden slice via the unchanged :meth:`_compute_lm_ce`.
+
+        Because each sample's CE runs on its own ``hidden[:, span_i, :]`` slice
+        with its own token/loss masks, the returned per-sample losses are
+        BIT-IDENTICAL to calling :meth:`forward_interleaved_with_loss` on each
+        sample separately — no cross-sample shift, no boundary leak — while
+        paying ONE forward (the expensive part) instead of G. This is the pure
+        speedup that fixes the sequential per-file decode + low GPU occupancy.
+
+        Returns a list aligned with ``segments_per_sample``: per-sample scalar
+        loss, or :class:`InterleavedForwardOutput` when ``return_hidden_states``
+        (each carrying that sample's hidden slice + masks for metric/probe use).
+        """
+        if not segments_per_sample:
+            return []
+        inner_model, lm_head = self._get_inner_model_and_head()
+        embed_fn = inner_model.get_input_embeddings()
+
+        per_embeds: list[torch.Tensor] = []
+        per_tokens: list[torch.Tensor] = []
+        per_loss: list[torch.Tensor] = []
+        lengths: list[int] = []
+        for segs in segments_per_sample:
+            e, t, lm = self._concat_segments(segs, embed_fn)  # (1, L, D)/(1, L)/(1, L)
+            if e.size(0) != 1:
+                raise ValueError(
+                    "forward_interleaved_packed requires B==1 per sample; "
+                    f"got batch {e.size(0)}",
+                )
+            per_embeds.append(e)
+            per_tokens.append(t)
+            per_loss.append(lm)
+            lengths.append(int(e.size(1)))
+
+        inputs_embeds = torch.cat(per_embeds, dim=1)  # (1, N, D)
+        token_ids_full = torch.cat(per_tokens, dim=1)  # (1, N)
+        device = inputs_embeds.device
+        cu_seqlens = torch.zeros(
+            len(lengths) + 1, dtype=torch.int32, device=device,
+        )
+        cu_seqlens[1:] = torch.tensor(
+            lengths, dtype=torch.int32, device=device,
+        ).cumsum(0)
+        position_ids = torch.cat(
+            [torch.arange(n, dtype=torch.long, device=device) for n in lengths],
+        )
+        max_seqlen = max(lengths)
+
+        hidden, seq_pad = self._packed_forward(
+            inputs_embeds, cu_seqlens, max_seqlen, position_ids,
+        )
+        if seq_pad > 0:
+            hidden = hidden[:, :-seq_pad, :]
+
+        starts = cu_seqlens.tolist()
+        out: list = []
+        for i, n in enumerate(lengths):
+            s, e = int(starts[i]), int(starts[i + 1])
+            h_i = hidden[:, s:e, :]
+            tok_i = token_ids_full[:, s:e]
+            lm_i = per_loss[i]
+            am_i = torch.ones(1, n, dtype=torch.bool, device=device)
+            loss_i = self._compute_lm_ce(
+                lm_head=lm_head,
+                hidden_states=h_i,
+                token_ids_full=tok_i,
+                attention_mask=am_i,
+                loss_mask_full=lm_i,
+                chunk_size=chunk_size,
+            )
+            if return_hidden_states:
+                out.append(InterleavedForwardOutput(
+                    loss=loss_i,
+                    hidden_states=h_i,
+                    token_ids=tok_i,
+                    loss_mask=lm_i,
+                    attention_mask=am_i,
+                    lm_head=lm_head,
+                ))
+            else:
+                out.append(loss_i)
+        return out
+
     def apply_lora(self, lora_config: dict) -> None:
         """Wrap backbone with LoRA adapters.
 
