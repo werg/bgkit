@@ -5173,18 +5173,33 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 (_trace, sample_tokens, len(prep["prepared_turns"]), decode_len),
             )
 
-        # Phase 3b: decode the WHOLE group in ONE packed FA4-varlen forward.
-        # Per-file CE runs on each file's isolated hidden slice, so the
-        # per-file losses are BIT-EXACT vs a per-file loop — but we pay ONE
-        # forward instead of G (the batching speedup; cu_seqlens isolates
-        # attention + resets the DeltaNet/Mamba state per file). At group_size 1
-        # this is exactly the prior single-sample path.
+        # Phase 3b: decode the group.
+        #
+        # G==1 (the default live-run path, per_repo_sample_group_size=1) uses the
+        # proven per-file forward — NO packing, zero cross-sample risk.
+        #
+        # G>1 packs the whole group into ONE FA4-varlen forward (the batching
+        # speedup) and computes per-file CE on each file's isolated hidden slice.
+        # This is GATED behind group_size>1 because packing does not yet preserve
+        # cross-sample isolation for the decoders' stateful mixers: the parity
+        # gate scripts/test_decode_batching_parity.py shows file 0 exact but
+        # files 1+ leaking (DeltaNet recurrent state on Qwen3.5; Mamba + the
+        # custom falcon_h1 packed-attention path on Falcon-H1 do not reset at
+        # cu_seqlens boundaries). Do NOT raise per_repo_sample_group_size above 1
+        # until that harness prints "ALL PARITY CHECKS PASS".
         if batch_segments:
             want_hidden = span_ce_accum is not None
             with _tm("decode_fwd", gpu=True):
-                outs = self.decoder.forward_interleaved_packed(
-                    batch_segments, return_hidden_states=want_hidden,
-                )
+                if len(batch_segments) == 1:
+                    outs = [
+                        self.decoder.forward_interleaved_with_loss(
+                            batch_segments[0], return_hidden_states=want_hidden,
+                        )
+                    ]
+                else:
+                    outs = self.decoder.forward_interleaved_packed(
+                        batch_segments, return_hidden_states=want_hidden,
+                    )
             for (_trace, sample_tokens, n_prep, decode_len), out in zip(
                 batch_meta, outs, strict=True,
             ):

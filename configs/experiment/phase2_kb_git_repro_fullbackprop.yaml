@@ -26,9 +26,17 @@ run_name: phase2_kb_git_repro_fullbackprop
 # (regen with surrogate shas — unique ids, tree 85k -> 1.1M nodes). New ids mean
 # the model must re-learn navigation from scratch, so cold-start from the
 # summarization base rather than resuming the (id-collapsed) step-1075 run.
-# Update to the newest fresh ckpt on the next restart (auto-resume would grab the
-# POISONED old-run step-4825 still in the registry).
-resume_checkpoint: "none"
+# ---------------------------------------------------------------------------
+# 2026-07-23: graceful-stopped the fresh run (wandb pk8oy766) at step 1654 to run
+# the decode-batching GPU parity gate (scripts/test_decode_batching_parity.py).
+# Result: multi-sample packing leaks across sample boundaries, so batching stays
+# gated behind per_repo_sample_group_size>1 (default 1 = proven per-file path).
+# RESUME from the exact stop step (user rule: a graceful stop resumes live from
+# where it stopped, not the last cadence checkpoint). Pinned EXPLICITLY to the
+# step-1654 rescue save (NOT "none" — that cold-starts; NOT auto — the registry
+# still holds the POISONED old-run step-4825). CONTAINER path (host
+# /home/werg/bgkit-ckpt-fast is mounted at /workspace/checkpoints_fast).
+resume_checkpoint: "/workspace/checkpoints_fast/phase2_kb_step1654_20260723_133738_394720_run-phase2_kb_git_repro_fullbackprop"
 # Auto-resume ENABLED (no resume_checkpoint key): on restart the trainer
 # resolves the latest run-scoped checkpoint (resolve_latest_checkpoint, keyed on
 # run_name above) and resumes; on the first launch — or if the latest checkpoint

@@ -37,6 +37,22 @@ def _packed_mock(single_fn):
 
     return _packed
 
+
+def _single_mock(single_fn):
+    """Wrap a fake single-sample forward so it tolerates the real
+    ``forward_interleaved_with_loss`` signature (``return_hidden_states`` /
+    ``chunk_size`` kwargs). The G==1 decode fast-path calls this method directly
+    (bypassing the packed forward), so minimal per-sample fakes need the same
+    kwarg tolerance ``_packed_mock`` provides."""
+
+    def _single(segs, *, return_hidden_states=False, chunk_size=None):
+        try:
+            return single_fn(segs, return_hidden_states=return_hidden_states)
+        except TypeError:
+            return single_fn(segs)
+
+    return _single
+
 from bgkit.models.decoder import TokenSegment
 
 # ---------------------------------------------------------------------------
@@ -647,7 +663,7 @@ def test_per_repo_normalizes_by_contributing_count():
     t._recursive_l0_retention_cfg = 0.1
     t._recursive_l1_retention_cfg = 0.1
     t.decoder = SimpleNamespace(
-        forward_interleaved_with_loss=fake_decode,
+        forward_interleaved_with_loss=_single_mock(fake_decode),
         forward_interleaved_packed=_packed_mock(fake_decode),
     )
 
@@ -717,7 +733,7 @@ def test_per_repo_pass2_group_batched_bounded_by_g():
         w = torch.nn.Parameter(torch.zeros(1))
         _dec = lambda segments: w.sum()  # noqa: E731
         t.decoder = SimpleNamespace(
-            forward_interleaved_with_loss=_dec,
+            forward_interleaved_with_loss=_single_mock(_dec),
             forward_interleaved_packed=_packed_mock(_dec),
         )
         batch = [SimpleNamespace(dataset_name="toy", idx=i) for i in range(n)]
@@ -979,7 +995,7 @@ def _make_detach_reaccum_trainer(tree_w, base, decode, group_size=1 << 30):
     t._shared_tree_forward_count = 0
     t._trees = {"toy": object()}  # non-None; per-repo splice path ignores it
     t.decoder = SimpleNamespace(
-        forward_interleaved_with_loss=decode,
+        forward_interleaved_with_loss=_single_mock(decode),
         forward_interleaved_packed=_packed_mock(decode),
     )
 
@@ -1583,7 +1599,7 @@ def test_max_decode_tokens_truncates_long_gold_keeps_all():
     t._recursive_l1_retention_cfg = 0.1
     t.global_step = 0
     t.decoder = SimpleNamespace(
-        forward_interleaved_with_loss=fake_decode,
+        forward_interleaved_with_loss=_single_mock(fake_decode),
         forward_interleaved_packed=_packed_mock(fake_decode),
     )
     t.encoder = SimpleNamespace(active_projection_output_dim=8)
@@ -1621,7 +1637,7 @@ def test_max_decode_tokens_off_decodes_all():
     t.global_step = 0
     _dec2 = lambda segs: decoded.append(1) or w.sum()  # noqa: E731
     t.decoder = SimpleNamespace(
-        forward_interleaved_with_loss=_dec2,
+        forward_interleaved_with_loss=_single_mock(_dec2),
         forward_interleaved_packed=_packed_mock(_dec2))
     t.encoder = SimpleNamespace(active_projection_output_dim=8)
     long_ = {"prepared_turns": [], "token_ids": torch.ones(5000, dtype=torch.long)}

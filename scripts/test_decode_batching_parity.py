@@ -39,14 +39,24 @@ from bgkit.utils.attention_backend import (
     resolve_decoder_attention_implementation,
 )
 
-# Deterministic file shapes (prefix_no_loss_tokens, survivor_embeds, gold_loss_tokens)
-# — a spread of lengths so the packed sequence has genuinely varied per-file spans.
-FILE_SHAPES = [
+# Deterministic file shapes (prefix_no_loss_tokens, survivor_embeds, gold_loss_tokens).
+# MID-CHUNK: totals 276/186/514/183 — segment boundaries fall mid-64-chunk, the
+# realistic case. ALIGNED: totals 256/192/512/192 — every boundary is a multiple
+# of 64, so it lands on an FLA DeltaNet chunk boundary. Comparing the two isolates
+# whether a residual Qwen divergence is an FLA varlen mid-chunk-boundary artifact.
+FILE_SHAPES_MIDCHUNK = [
     (48, 8, 220),
     (130, 16, 40),
     (30, 4, 480),
     (75, 12, 96),
 ]
+FILE_SHAPES_ALIGNED = [
+    (48, 8, 200),   # 256
+    (120, 8, 64),   # 192
+    (32, 16, 464),  # 512
+    (60, 4, 128),   # 192
+]
+FILE_SHAPES = FILE_SHAPES_MIDCHUNK
 LOSS_ATOL = 2e-3   # bf16 CE reduction tolerance
 GRAD_RTOL = 3e-2
 GRAD_ATOL = 2e-3
@@ -64,11 +74,11 @@ def build_decoder(name: str, family: str, device: torch.device) -> Reconstructio
     return dec
 
 
-def make_files(vocab: int, hidden: int, device: torch.device, gen: torch.Generator):
+def make_files(vocab, hidden, device, gen, shapes=FILE_SHAPES):
     """One list of segments per file: [prefix tokens (no loss) | survivor
     embeddings (grad leaf) | gold tokens (loss)] — mirrors a drill+decode."""
     files, survs = [], []
-    for pfx, ns, gold in FILE_SHAPES:
+    for pfx, ns, gold in shapes:
         prefix = TokenSegment(
             token_ids=torch.randint(0, vocab, (pfx,), generator=gen, device=device),
             loss_mask=torch.zeros(pfx, dtype=torch.bool, device=device),
@@ -99,13 +109,15 @@ def _clone_grad_leaf(files, survs):
     return new_files, new_survs
 
 
-def run_family(name: str, family: str, device: torch.device) -> bool:
-    print(f"\n=== {family} ({name}) ===")
+def run_family(name: str, family: str, device: torch.device, shapes=FILE_SHAPES) -> bool:
+    tot = [sum(s) for s in shapes]
+    print(f"\n=== {family} ({name}) — file totals {tot}, cu boundaries "
+          f"{[sum(tot[:i+1]) for i in range(len(tot))]} ===")
     dec = build_decoder(name, family, device)
     vocab = dec._get_inner_model_and_head()[1].weight.shape[0]
     hidden = dec.hidden_dim
     gen = torch.Generator(device=device).manual_seed(1234)
-    files, survs = make_files(vocab, hidden, device, gen)
+    files, survs = make_files(vocab, hidden, device, gen, shapes)
 
     ok = True
     for mode in ("eval", "train"):
@@ -146,16 +158,25 @@ def main() -> None:
     ap.add_argument("--qwen", default="Qwen/Qwen3.5-0.8B")
     ap.add_argument("--falcon", default="tiiuae/Falcon-H1-Tiny-90M-Instruct")
     ap.add_argument("--only", choices=["qwen35", "falcon_h1"], default=None)
+    ap.add_argument("--shapes", choices=["midchunk", "aligned", "both"], default="both")
     args = ap.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         print("WARNING: no CUDA — the FA4 varlen path is not exercised on CPU.")
 
+    shape_sets = []
+    if args.shapes in ("midchunk", "both"):
+        shape_sets.append(("midchunk", FILE_SHAPES_MIDCHUNK))
+    if args.shapes in ("aligned", "both"):
+        shape_sets.append(("aligned", FILE_SHAPES_ALIGNED))
+
     results = {}
-    if args.only in (None, "qwen35"):
-        results["qwen35"] = run_family(args.qwen, "qwen35", device)
-    if args.only in (None, "falcon_h1"):
-        results["falcon_h1"] = run_family(args.falcon, "falcon_h1", device)
+    for tag, shapes in shape_sets:
+        if args.only in (None, "qwen35"):
+            results[f"qwen35/{tag}"] = run_family(args.qwen, "qwen35", device, shapes)
+        if args.only in (None, "falcon_h1"):
+            results[f"falcon_h1/{tag}"] = run_family(
+                args.falcon, "falcon_h1", device, shapes)
 
     print("\n" + "=" * 40)
     all_ok = all(results.values())
