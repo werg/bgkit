@@ -219,7 +219,19 @@ def tool_call_id_accuracy(
     for turn, span in zip(
         trace.bgkit_turns, trace.bgkit_call_spans, strict=True,
     ):
+        # Score ONLY the supervised, rep-dependent nav drills. Skip:
+        #  - the head drill (is_head): its opaque id has no prior rep to read
+        #    from (its own rep is spliced AFTER the id) — pure memorization, not
+        #    a nav test.
+        #  - distractors (loss=False): never trained, and _score_call_span would
+        #    score the model's UNMASKED prediction over their span (no loss
+        #    tokens) → guaranteed ~0, pinning the micro-average near zero
+        #    regardless of what the real nav drills learn.
+        if turn.args.get("is_head") or not getattr(turn, "loss", True):
+            continue
         gold_ids = _tool_call_gold_ids(turn)
+        if not gold_ids:
+            continue
         bgkit_scores.append(
             _score_call_span(preds, shift_m, span, gold_ids, tokenizer)
         )

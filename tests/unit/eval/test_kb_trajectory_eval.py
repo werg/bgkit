@@ -523,3 +523,50 @@ def test_evaluate_sample_empty_when_no_loss_tokens():
     assert result["trajectory_step_accuracy"] == 0.0
     assert result["answer_token_f1"] == 0.0
     assert result["tool_call_id_accuracy"]["overall"] == 0.0
+
+
+def test_tool_call_id_accuracy_excludes_head_and_distractors():
+    """Only supervised, non-head drills count: the head (is_head) and
+    distractors (loss=False) must be EXCLUDED, so a poisoned metric that
+    scored them (head unpredictable, distractor unmasked→~0) is fixed."""
+    tokenizer = _FakeTokenizer()
+    header = "H"
+    resp = "RR"
+    # three bgkit calls, all decoded perfectly (argmax=perfect)
+    head_txt = "a/hd q"
+    dist_txt = "a/ds q"
+    good_txt = "a/gd q"
+    full_text = header + resp + head_txt + dist_txt + good_txt
+    full_ids = _str_to_ids(full_text)
+    n = len(full_ids)
+    loss_mask = [False] * n
+    s0 = len(header) + len(resp)
+    s1 = s0 + len(head_txt)
+    s2 = s1 + len(dist_txt)
+    s3 = s2 + len(good_txt)
+    # loss-bearing on head span (is_head) + good span; NOT on distractor span
+    for i in range(s0, s1):  # head — loss-bearing but is_head -> excluded
+        loss_mask[i] = True
+    for i in range(s2, s3):  # good on-path drill -> the ONLY one that should count
+        loss_mask[i] = True
+    argmax = full_ids[1:]  # perfect prediction everywhere
+    output = _FakeOutput(
+        token_ids=torch.tensor([full_ids], dtype=torch.long),
+        loss_mask=torch.tensor([loss_mask], dtype=torch.bool),
+        loss=torch.tensor(0.0), _argmax=torch.tensor([argmax], dtype=torch.long),
+    )
+    trace = _KBDecodeTrace(
+        answer_span=None,
+        bgkit_turns=[
+            TrajectoryTurn(kind="bgkit", args={"ids": ["a/hd"], "is_head": True}, response="", loss=True),
+            TrajectoryTurn(kind="bgkit", args={"ids": ["a/ds"]}, response="", loss=False),
+            TrajectoryTurn(kind="bgkit", args={"ids": ["a/gd"]}, response="", loss=True),
+        ],
+        bgkit_call_spans=[(s0, s1), (s1, s2), (s2, s3)],
+    )
+    trainer = _ToyTrainer(tokenizer=tokenizer, output=output, trace=trace)
+    sample = _build_sample(trajectory=[])
+    result = tool_call_id_accuracy(trainer, sample)
+    # Only the on-path non-head drill is scored (n=1), and it's correct.
+    assert result["n_bgkit"] == 1
+    assert result["bgkit"] == pytest.approx(1.0)
