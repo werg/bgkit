@@ -979,10 +979,112 @@ def _patch_mixer_unit_scalings(mixer: nn.Module) -> bool:
             **dt_limit_kwargs,
         )
 
+    # ----- Patched eval packed path -----
+    # Mirror of the stock ``cuda_kernels_forward`` no-cache NON-training
+    # branch (separate causal_conv1d_fn + mamba_chunk_scan_combined), with
+    # ``seq_idx`` threaded into BOTH kernels so the conv window and the
+    # chunked scan state reset at packed sample boundaries. The stock eval
+    # branch hardcodes ``seq_idx=None`` and therefore runs the packed stream
+    # as ONE sequence — the eval-mode half of the decode-batching state leak.
+    # Kernel-identical to the stock eval branch otherwise (the dropped unit
+    # ``ssm_in_multiplier`` / all-ones ``mup_vector`` muls are bitwise
+    # no-ops, verified at patch time), so a packed segment matches the
+    # stock single-sample eval forward up to varlen chunk-boundary
+    # accumulation-order noise.
+    def patched_eval_packed_path(
+        self,
+        hidden_states,
+        attention_mask,
+        seq_idx,
+    ):
+        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+        projected_states = self.in_proj(hidden_states)
+        batch_size, seq_len, _ = hidden_states.shape
+        groups_time_state_size = self.n_groups * self.ssm_state_size
+
+        a_log_exp = -torch.exp(self.A_log.float())
+        dt_limit_kwargs = (
+            {}
+            if self.time_step_limit == (0.0, float("inf"))
+            else {"dt_limit": self.time_step_limit}
+        )
+
+        d_mlp = (
+            projected_states.shape[-1]
+            - 2 * self.intermediate_size
+            - 2 * self.n_groups * self.ssm_state_size
+            - self.num_heads
+        ) // 2
+        if attention_mask is not None:
+            projected_states = projected_states * attention_mask[..., None]
+        _, gate, hidden_states_bc, dt = projected_states.split(
+            [
+                2 * d_mlp,
+                self.intermediate_size,
+                self.conv_dim,
+                self.num_heads,
+            ],
+            dim=-1,
+        )
+
+        time_step = nn.functional.softplus(dt + self.dt_bias)
+
+        # Resolve through the HF module (mirrors the stock branch; keeps
+        # profiler monkey-patches observable).
+        causal_conv1d_fn = fh1.causal_conv1d_fn
+        if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
+            raise RuntimeError(
+                "Falcon-H1 packed eval path requires causal_conv1d with a "
+                f"silu/swish activation; got causal_conv1d_fn="
+                f"{causal_conv1d_fn} activation={self.activation!r}. The "
+                "nn.Conv1d fallback cannot reset at packed sample boundaries."
+            )
+        hidden_states_bc = causal_conv1d_fn(
+            x=hidden_states_bc.transpose(1, 2),
+            weight=self.conv1d.weight.squeeze(1),
+            bias=self.conv1d.bias,
+            activation=self.activation,
+            seq_idx=seq_idx,
+        ).transpose(1, 2)[:, :seq_len]
+
+        hidden_states, b_states, c_states = torch.split(
+            hidden_states_bc,
+            [
+                self.intermediate_size,
+                groups_time_state_size,
+                groups_time_state_size,
+            ],
+            dim=-1,
+        )
+
+        mamba_chunk_scan_combined = fh1.mamba_chunk_scan_combined
+        with torch.cuda.device(hidden_states.device):
+            scan_output = mamba_chunk_scan_combined(
+                hidden_states.view(batch_size, seq_len, -1, self.head_dim),
+                time_step,
+                a_log_exp,
+                b_states.view(batch_size, seq_len, self.n_groups, -1),
+                c_states.view(batch_size, seq_len, self.n_groups, -1),
+                chunk_size=self.chunk_size,
+                D=self.D,
+                z=None,
+                seq_idx=seq_idx,
+                return_final_states=False,
+                **dt_limit_kwargs,
+            )
+        scan_output = scan_output.view(batch_size, seq_len, -1)
+        if self.mamba_rms_norm:
+            out = self.norm(scan_output, gate)
+        else:
+            out = scan_output * torch.nn.functional.silu(gate)
+        return self.out_proj(out)
+
     # ----- Replacement forward -----
-    # Route ONLY the fast training path through the patched kernel. All other
-    # branches (use_precomputed_states, eval-mode with cache, cpu fallback,
-    # generation) defer to the stock implementation so they remain bit-exact.
+    # Route the fast training path through the patched kernel, and packed
+    # (``seq_idx``-carrying) eval calls through the seq_idx-aware eval
+    # mirror. All other branches (use_precomputed_states, eval-mode with
+    # cache, cpu fallback, generation) defer to the stock implementation so
+    # they remain bit-exact.
     def forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
         seq_idx = kwargs.pop("seq_idx", None)
         precomputed_zxbcdt = kwargs.pop("bgkit_precomputed_zxbcdt", None)
@@ -991,15 +1093,34 @@ def _patch_mixer_unit_scalings(mixer: nn.Module) -> bool:
             is_fast_path_available
             and "cuda" in self.in_proj.weight.device.type
             and not is_torchdynamo_compiling()
-            and self.training
             and cache_params is None
         ):
-            return patched_training_fused_path(
-                self,
-                hidden_states,
-                attention_mask,
-                seq_idx,
-                precomputed_zxbcdt,
+            if self.training:
+                return patched_training_fused_path(
+                    self,
+                    hidden_states,
+                    attention_mask,
+                    seq_idx,
+                    precomputed_zxbcdt,
+                )
+            if seq_idx is not None:
+                return patched_eval_packed_path(
+                    self,
+                    hidden_states,
+                    attention_mask,
+                    seq_idx,
+                )
+        if seq_idx is not None:
+            # A packed multi-sample call reached a branch that cannot reset
+            # state at sample boundaries (cache / CPU / torchdynamo
+            # fallback). Running it would silently leak state across
+            # samples — refuse instead.
+            raise RuntimeError(
+                "FalconH1Mixer received a packed seq_idx but no "
+                "seq_idx-capable kernel path is available "
+                f"(fast_path={is_fast_path_available}, "
+                f"cache={cache_params is not None}) — refusing to run a "
+                "cross-sample-leaking forward."
             )
         # Everything else: route through the stock forward (which itself dispatches
         # to cuda_kernels_forward or torch_forward as appropriate).
@@ -1147,6 +1268,85 @@ def _patch_decoder_layer_unit_multipliers(layer: nn.Module) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _run_packed_seqidx_model_forward(
+    self,
+    *,
+    create_causal_mask,
+    dynamic_cache,
+    output_cls,
+    input_ids,
+    attention_mask,
+    position_ids,
+    past_key_values,
+    inputs_embeds,
+    use_cache,
+    mamba_seq_idx,
+    **kwargs,
+):
+    """Non-fused FalconH1Model layer loop that threads ``mamba_seq_idx``.
+
+    Mirrors the stock model forward, plus two packed-isolation deltas the
+    stock loop lacks: ``mamba_seq_idx`` is handed to every layer (Mamba
+    conv+scan boundary reset) and ``**kwargs`` — carrying the FA varlen
+    ``cu_seq_lens_q``/``max_length_q`` metadata — are threaded into the
+    decoder layers (the stock loop drops them, which would leave attention
+    running the packed stream as one causal sequence).
+
+    Shared by the packed-seqidx model patch (its main body) and the fused
+    training-loop patch (its non-training packed fallback).
+    """
+    if (input_ids is None) ^ (inputs_embeds is not None):
+        raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids) * self.embedding_multiplier
+    hidden_states = inputs_embeds
+
+    if use_cache and past_key_values is None:
+        past_key_values = dynamic_cache(config=self.config)
+
+    if position_ids is None:
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
+        position_ids = (
+            torch.arange(hidden_states.shape[1], device=hidden_states.device)
+            + past_seen_tokens
+        )
+        position_ids = position_ids.unsqueeze(0)
+
+    causal_mask = create_causal_mask(
+        config=self.config,
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        past_key_values=past_key_values,
+        position_ids=position_ids,
+    )
+    mamba_mask = self._update_mamba_mask(attention_mask, past_key_values)
+    position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+
+    for decoder_layer in self.layers:
+        layer_outputs = decoder_layer(
+            hidden_states,
+            attention_mask=causal_mask,
+            mamba_attention_mask=mamba_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            position_embeddings=position_embeddings,
+            mamba_seq_idx=mamba_seq_idx,
+            **kwargs,
+        )
+        hidden_states = layer_outputs[0]
+
+    hidden_states = self.final_layernorm(hidden_states)
+
+    return output_cls(
+        last_hidden_state=hidden_states,
+        past_key_values=past_key_values,
+    )
+
+
 def _patch_model_packed_seqidx_loop(model: nn.Module) -> bool:
     """Patch FalconH1Model.forward to pass ``mamba_seq_idx`` into each layer.
 
@@ -1181,7 +1381,7 @@ def _patch_model_packed_seqidx_loop(model: nn.Module) -> bool:
         **kwargs,
     ):
         mamba_seq_idx = kwargs.pop("mamba_seq_idx", None)
-        if mamba_seq_idx is None or use_cache or past_key_values is not None:
+        if mamba_seq_idx is None:
             return stock_forward(
                 self,
                 input_ids=input_ids,
@@ -1192,55 +1392,29 @@ def _patch_model_packed_seqidx_loop(model: nn.Module) -> bool:
                 use_cache=use_cache,
                 **kwargs,
             )
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids) * self.embedding_multiplier
-        hidden_states = inputs_embeds
-
-        if use_cache and past_key_values is None:
-            past_key_values = dynamic_cache(config=self.config)
-
-        if position_ids is None:
-            past_seen_tokens = (
-                past_key_values.get_seq_length() if past_key_values is not None else 0
+        if use_cache or past_key_values is not None:
+            # The stock loop drops mamba_seq_idx AND the varlen attention
+            # kwargs — running a packed multi-sample batch through it would
+            # silently leak state across samples. Packing never uses a cache.
+            raise RuntimeError(
+                "FalconH1Model received packed mamba_seq_idx together with "
+                "use_cache/past_key_values — the cached path cannot isolate "
+                "packed samples; refusing to run a cross-sample-leaking "
+                "forward."
             )
-            position_ids = (
-                torch.arange(hidden_states.shape[1], device=hidden_states.device)
-                + past_seen_tokens
-            )
-            position_ids = position_ids.unsqueeze(0)
-
-        causal_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
+        return _run_packed_seqidx_model_forward(
+            self,
+            create_causal_mask=create_causal_mask,
+            dynamic_cache=dynamic_cache,
+            output_cls=BaseModelOutputWithPast,
+            input_ids=input_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
             position_ids=position_ids,
-        )
-        mamba_mask = self._update_mamba_mask(attention_mask, past_key_values)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
-
-        for decoder_layer in self.layers:
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=causal_mask,
-                mamba_attention_mask=mamba_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                position_embeddings=position_embeddings,
-                mamba_seq_idx=mamba_seq_idx,
-                **kwargs,
-            )
-            hidden_states = layer_outputs[0]
-
-        hidden_states = self.final_layernorm(hidden_states)
-
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
             past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            mamba_seq_idx=mamba_seq_idx,
+            **kwargs,
         )
 
     model.forward = forward.__get__(model, type(model))
@@ -1311,6 +1485,14 @@ def _patch_model_fused_training_loop(model: nn.Module) -> bool:
     ):
         mamba_seq_idx = kwargs.pop("mamba_seq_idx", None)
         if use_cache or past_key_values is not None:
+            if mamba_seq_idx is not None:
+                # See _patch_model_packed_seqidx_loop: the cached path cannot
+                # isolate packed samples — refuse rather than silently leak.
+                raise RuntimeError(
+                    "FalconH1Model received packed mamba_seq_idx together "
+                    "with use_cache/past_key_values — refusing to run a "
+                    "cross-sample-leaking forward."
+                )
             return stock_forward(
                 self,
                 input_ids=input_ids,
@@ -1322,6 +1504,26 @@ def _patch_model_fused_training_loop(model: nn.Module) -> bool:
                 **kwargs,
             )
         if not self.training:
+            if mamba_seq_idx is not None:
+                # Packed eval forward: the fused loop below is training-only,
+                # but the seq_idx must still reach the mixers (and the varlen
+                # attention kwargs the layers). Run the non-fused packed
+                # seqidx loop instead of dropping the isolation metadata into
+                # the stock loop.
+                return _run_packed_seqidx_model_forward(
+                    self,
+                    create_causal_mask=create_causal_mask,
+                    dynamic_cache=fh1.DynamicCache,
+                    output_cls=BaseModelOutputWithPast,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    use_cache=use_cache,
+                    mamba_seq_idx=mamba_seq_idx,
+                    **kwargs,
+                )
             return stock_forward(
                 self,
                 input_ids=input_ids,
@@ -1338,6 +1540,12 @@ def _patch_model_fused_training_loop(model: nn.Module) -> bool:
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids) * self.embedding_multiplier
         if not inputs_embeds.is_cuda:
+            if mamba_seq_idx is not None:
+                raise RuntimeError(
+                    "FalconH1Model received packed mamba_seq_idx on a "
+                    "non-CUDA input — no seq_idx-capable kernel path exists "
+                    "on CPU; refusing to run a cross-sample-leaking forward."
+                )
             return stock_forward(
                 self,
                 input_ids=None,

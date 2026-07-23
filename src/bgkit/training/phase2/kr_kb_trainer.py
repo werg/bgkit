@@ -5179,14 +5179,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # proven per-file forward — NO packing, zero cross-sample risk.
         #
         # G>1 packs the whole group into ONE FA4-varlen forward (the batching
-        # speedup) and computes per-file CE on each file's isolated hidden slice.
-        # This is GATED behind group_size>1 because packing does not yet preserve
-        # cross-sample isolation for the decoders' stateful mixers: the parity
-        # gate scripts/test_decode_batching_parity.py shows file 0 exact but
-        # files 1+ leaking (DeltaNet recurrent state on Qwen3.5; Mamba + the
-        # custom falcon_h1 packed-attention path on Falcon-H1 do not reset at
-        # cu_seqlens boundaries). Do NOT raise per_repo_sample_group_size above 1
-        # until that harness prints "ALL PARITY CHECKS PASS".
+        # speedup) and computes per-file CE on each file's isolated hidden
+        # slice. Cross-sample isolation is provided by
+        # ``forward_interleaved_packed``: attention rides on cu_seqlens; the
+        # stateful mixers reset via per-token seq_idx (Qwen3.5 DeltaNet
+        # delta-rule + short-conv; Falcon-H1 Mamba conv + chunked scan, with
+        # Falcon sample starts chunk-aligned because mamba_ssm's seq_idx
+        # reset is exact only at chunk boundaries). Certified 2026-07-23 by
+        # scripts/test_decode_batching_parity.py ("ALL PARITY CHECKS PASS"):
+        # exact cross-grad + content-swap isolation probes at zero for both
+        # families, eval+train, plus noise-calibrated per-file loss/grad
+        # agreement vs the sequential reference. Re-run that gate before
+        # trusting any change to the packed decode path.
         if batch_segments:
             want_hidden = span_ce_accum is not None
             with _tm("decode_fwd", gpu=True):

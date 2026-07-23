@@ -199,8 +199,23 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
     def _clamped(*args, **kwargs):
         # chunk_gated_delta_rule signature: (q, k, v, g, beta, ...)
         # HF calls with g= keyword; handle positional args too for robustness.
+        # NOTE: transformers >= 5.12 passes ``cu_seqlens=kwargs.get("cu_seq_lens_q")``
+        # EXPLICITLY (None when the layer forward received no kwargs — which is
+        # exactly what happens under this patch's layer-forward wrapper), so the
+        # guard must inject whenever the incoming value is None, not merely when
+        # the key is absent. The old ``"cu_seqlens" not in kwargs`` guard silently
+        # disabled the packed-context reset on 5.12+ → cross-sample DeltaNet
+        # state leak on every multi-segment packed forward.
+        # Only multi-segment contexts are injected: a single-segment [0, S]
+        # context is semantically identical to cu_seqlens=None, and leaving
+        # the proven G==1 path on its existing dense-batch kernel dispatch
+        # keeps its numerics bit-identical.
         context_cu, _context_position_ids = current_deltanet_packed_context()
-        if context_cu is not None and "cu_seqlens" not in kwargs:
+        if (
+            context_cu is not None
+            and context_cu.numel() > 2
+            and kwargs.get("cu_seqlens") is None
+        ):
             kwargs["cu_seqlens"] = context_cu
         raw_a = getattr(layer, "_bgkit_last_raw_gate_a", None)
         if _raw_gate_in_kernel_enabled() and isinstance(raw_a, torch.Tensor):
@@ -228,6 +243,59 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
     layer.chunk_gated_delta_rule = _clamped
     layer._unpatch_chunk_gdr = original_fn  # keep reference for idempotency
     layer._bgkit_g_clamp_min = float(g_clamp_min)
+
+    # ---- 1b. Patch causal_conv1d_fn: reset the short conv at packed sample
+    #          boundaries. The HF DeltaNet forward runs a depthwise causal
+    #          conv (kernel 4) over the packed (1, C, N) stream BEFORE the
+    #          delta rule; without a ``seq_idx`` each sample's first
+    #          ``kernel_size - 1`` positions read the PREVIOUS sample's tail
+    #          — a cross-sample leak the delta-rule ``cu_seqlens`` reset does
+    #          not cover. Derive the per-token segment ids from the packed
+    #          context and inject them whenever the caller supplied none.
+    #          Single-segment contexts skip injection so the proven G==1 path
+    #          stays bit-identical.
+    #          Install rules: wrap only a live, not-yet-wrapped callable.
+    #          - A second patch call leaves the existing wrapper in place
+    #            (its closure already holds the original — no re-stacking).
+    #          - When a caller NULLS ``causal_conv1d_fn`` after patching
+    #            (``bidirectional_qwen35._make_conv_bidirectional`` does this
+    #            to force the bidirectional nn.Conv1d fallback), a re-patch
+    #            must NOT resurrect the causal CUDA conv from the stash.
+    current_conv_fn = getattr(layer, "causal_conv1d_fn", None)
+    already_wrapped = layer_vars.get("_unpatch_causal_conv1d_fn") is not None
+    original_conv_fn = current_conv_fn if not already_wrapped else None
+    if callable(original_conv_fn):
+
+        def _conv_with_packed_seq_idx(*args, **kwargs):
+            if kwargs.get("seq_idx") is None:
+                context_cu, context_pos = current_deltanet_packed_context()
+                x = kwargs.get("x", args[0] if args else None)
+                if (
+                    isinstance(context_cu, torch.Tensor)
+                    and context_cu.numel() > 2
+                    and isinstance(context_pos, torch.Tensor)
+                    and isinstance(x, torch.Tensor)
+                    and x.dim() == 3
+                    and x.shape[0] == 1
+                    # Guard: only when the conv input covers the full packed
+                    # stream (position_ids length is host-side metadata — no
+                    # device sync). Prefix-cache / other partial-length calls
+                    # fall through untouched.
+                    and context_pos.numel() == x.shape[-1]
+                ):
+                    n_seg = context_cu.numel() - 1
+                    seg_ids = torch.arange(
+                        n_seg, device=x.device, dtype=torch.int32,
+                    )
+                    kwargs["seq_idx"] = torch.repeat_interleave(
+                        seg_ids,
+                        (context_cu[1:] - context_cu[:-1]).to(torch.long),
+                        output_size=int(x.shape[-1]),
+                    ).unsqueeze(0)
+            return original_conv_fn(*args, **kwargs)
+
+        layer.causal_conv1d_fn = _conv_with_packed_seq_idx
+        layer._unpatch_causal_conv1d_fn = original_conv_fn
 
     # ---- 2. Patch layer.forward to accept cu_seqlens / position_ids ----
     # Wave 1.1 will call:
@@ -274,8 +342,17 @@ def patch_deltanet_layer(layer: nn.Module, g_clamp_min: float = DEFAULT_G_CLAMP_
                 if isinstance(_value, torch.Tensor):
                     cu_seqlens = _value
                     break
-        if cu_seqlens is None:
-            cu_seqlens, context_position_ids = current_deltanet_packed_context()
+        if cu_seqlens is None or position_ids is None:
+            # Consult the context for BOTH fields independently: when HF
+            # threads cu via the TransformersKwargs aliases the loop above
+            # resolves it, but position_ids never reaches the DeltaNet layer
+            # that way — and the causal-conv1d seq_idx injection below keys
+            # its full-length guard on the context position_ids. Re-entering
+            # the context with position_ids=None would silently disable the
+            # conv boundary reset on packed multi-sample forwards.
+            context_cu, context_position_ids = current_deltanet_packed_context()
+            if cu_seqlens is None:
+                cu_seqlens = context_cu
             if position_ids is None:
                 position_ids = context_position_ids
 

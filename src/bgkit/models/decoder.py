@@ -4796,6 +4796,30 @@ class ReconstructionDecoder(nn.Module):
             return False
         return not self._falcon_h1_can_use_packed_mamba_seqidx(device)
 
+    def _falcon_h1_mamba_chunk_size(self) -> int:
+        """Resolve the Falcon-H1 Mamba chunk size from the loaded mixers.
+
+        mamba_ssm's chunked-scan ``seq_idx`` reset is exact only at chunk
+        boundaries, so packed multi-sample layouts must chunk-align sample
+        starts (see :meth:`forward_interleaved_packed`). Read from the mixer
+        modules (not the config) so a ``BGKIT_FALCON_H1_MAMBA_CHUNK_SIZE``
+        override applied by the runtime patch is honored. Cached per decoder.
+        """
+        cached = getattr(self, "_falcon_h1_chunk_size_cache", None)
+        if cached is not None:
+            return cached
+        inner_model, _lm_head = self._get_inner_model_and_head()
+        for layer in inner_model.layers:
+            mixer = getattr(layer, "mamba", None)
+            chunk = getattr(mixer, "chunk_size", None) if mixer is not None else None
+            if chunk:
+                self._falcon_h1_chunk_size_cache = int(chunk)
+                return int(chunk)
+        raise RuntimeError(
+            "could not resolve Falcon-H1 mamba chunk_size from the backbone "
+            "mixers — packed multi-sample decode cannot chunk-align samples."
+        )
+
     def enable_liger_ce(self, enabled: bool = True) -> None:
         """Toggle the fused linear+CE path used inside ``forward_interleaved_with_loss``.
 
@@ -5542,7 +5566,18 @@ class ReconstructionDecoder(nn.Module):
             "max_length_k": max_seqlen,
         }
         if mamba_seq_idx is not None:
-            packed_attn_kwargs["mamba_seq_idx"] = mamba_seq_idx
+            if self.decoder_family == "falcon_h1":
+                # Popped by the bgkit FalconH1Model packed-seqidx loop
+                # (falcon_h1_patch) and threaded to every Mamba mixer as
+                # ``seq_idx`` — the stock HF loop drops unknown kwargs, so
+                # the patched loop is load-bearing for isolation.
+                packed_attn_kwargs["mamba_seq_idx"] = mamba_seq_idx
+            else:
+                # Qwen3.5 GatedDeltaNet natively consumes the ``seq_idx``
+                # TransformersKwarg for its short-conv boundary reset
+                # (transformers >= 5.12); the delta-rule reset flows through
+                # ``cu_seq_lens_q``. Unknown-kwarg-tolerant modules absorb it.
+                packed_attn_kwargs["seq_idx"] = mamba_seq_idx
 
         seq_pad = 0
         padded_embeds = inputs_embeds
@@ -7049,22 +7084,77 @@ class ReconstructionDecoder(nn.Module):
             per_loss.append(lm)
             lengths.append(int(e.size(1)))
 
-        inputs_embeds = torch.cat(per_embeds, dim=1)  # (1, N, D)
-        token_ids_full = torch.cat(per_tokens, dim=1)  # (1, N)
-        device = inputs_embeds.device
+        device = per_embeds[0].device
+
+        # --- Cross-sample isolation metadata -------------------------------
+        # Attention isolation flows through ``cu_seqlens``; the STATEFUL
+        # sequence mixers need a per-token segment-id tensor instead:
+        # Falcon-H1's Mamba conv+scan reset via the bgkit packed-seqidx model
+        # loop, Qwen3.5's DeltaNet short-conv reset via the native
+        # ``seq_idx`` TransformersKwarg / the deltanet-patch context (the
+        # delta-rule reset itself rides on ``cu_seq_lens_q``). Without it
+        # every mixer treats the packed stream as ONE sequence and samples
+        # i>0 are contaminated by their predecessors.
+        #
+        # Falcon-H1 additionally requires CHUNK-ALIGNED sample starts:
+        # mamba_ssm's chunked-scan seq_idx reset is exact only at chunk
+        # boundaries — its inter-chunk state passing carries the previous
+        # sample's state across a mid-chunk boundary chunk (verified by
+        # scripts/diag_falcon_kernel_leak.py: mid-chunk = leak, aligned =
+        # bit-exact zero). Each sample except the last is therefore padded
+        # with trailing zero-embedding positions to a multiple of the mixer
+        # chunk size. Every kernel in the stack is causal, so a sample's own
+        # trailing pads cannot influence its real positions; the pads only
+        # corrupt the OUTGOING mixer state, which the next sample's
+        # chunk-aligned seq_idx reset discards exactly.
+        multi = len(lengths) > 1
+        pads = [0] * len(lengths)
+        if multi and self.decoder_family == "falcon_h1":
+            if not self._falcon_h1_can_use_packed_mamba_seqidx(device):
+                raise RuntimeError(
+                    "forward_interleaved_packed with >1 sample requires the "
+                    "Falcon-H1 packed-seqidx model loop (BGKIT_FALCON_H1_PATCH "
+                    "+ BGKIT_FALCON_H1_PACKED_MAMBA_SEQIDX); without it the "
+                    "Mamba mixer state leaks across sample boundaries."
+                )
+            chunk = self._falcon_h1_mamba_chunk_size()
+            for i in range(len(lengths) - 1):
+                pads[i] = (-lengths[i]) % chunk
+
+        embed_parts: list[torch.Tensor] = []
+        padded_lengths: list[int] = []
+        for e, p in zip(per_embeds, pads, strict=True):
+            embed_parts.append(e)
+            if p:
+                embed_parts.append(e.new_zeros(1, p, e.size(2)))
+            padded_lengths.append(int(e.size(1)) + p)
+        inputs_embeds = torch.cat(embed_parts, dim=1)  # (1, N_padded, D)
         cu_seqlens = torch.zeros(
-            len(lengths) + 1, dtype=torch.int32, device=device,
+            len(padded_lengths) + 1, dtype=torch.int32, device=device,
         )
         cu_seqlens[1:] = torch.tensor(
-            lengths, dtype=torch.int32, device=device,
+            padded_lengths, dtype=torch.int32, device=device,
         ).cumsum(0)
         position_ids = torch.cat(
-            [torch.arange(n, dtype=torch.long, device=device) for n in lengths],
+            [
+                torch.arange(n, dtype=torch.long, device=device)
+                for n in padded_lengths
+            ],
         )
-        max_seqlen = max(lengths)
+        max_seqlen = max(padded_lengths)
+
+        seq_idx: torch.Tensor | None = None
+        if multi:
+            seq_idx = torch.cat(
+                [
+                    torch.full((n,), i, dtype=torch.int32, device=device)
+                    for i, n in enumerate(padded_lengths)
+                ],
+            ).unsqueeze(0)
 
         hidden, seq_pad = self._packed_forward(
             inputs_embeds, cu_seqlens, max_seqlen, position_ids,
+            mamba_seq_idx=seq_idx,
         )
         if seq_pad > 0:
             hidden = hidden[:, :-seq_pad, :]
@@ -7072,9 +7162,11 @@ class ReconstructionDecoder(nn.Module):
         starts = cu_seqlens.tolist()
         out: list = []
         for i, n in enumerate(lengths):
-            s, e = int(starts[i]), int(starts[i + 1])
-            h_i = hidden[:, s:e, :]
-            tok_i = token_ids_full[:, s:e]
+            # Slice the REAL positions only — [start, start + L_i) — the
+            # trailing chunk-alignment pads (falcon) are dropped here.
+            s = int(starts[i])
+            h_i = hidden[:, s:s + n, :]
+            tok_i = per_tokens[i]
             lm_i = per_loss[i]
             am_i = torch.ones(1, n, dtype=torch.bool, device=device)
             loss_i = self._compute_lm_ce(
