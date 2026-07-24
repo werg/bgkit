@@ -477,11 +477,15 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # accumulated gradient back into ``memo[child][1]``.
         self._shared_tree_child_l1_reps: dict | None = None
         self._shared_tree_child_l1_used: set | None = None
-        # EVAL-only: root id of the shared repo tree currently installed for
-        # eval decoding (see _ensure_eval_shared_tree). None outside eval.
-        self._eval_shared_tree_root: str | None = None
-        # EVAL-only: per-evaluate() cache {root: (memo, splice)} reused across
-        # ablation-mode passes so each repo's tree is encoded once, not per mode.
+        # EVAL-only: (root, decoder_family) of the shared repo tree currently
+        # installed for eval decoding (see _ensure_eval_shared_tree). The family
+        # is part of the key because round-robin alternates decoders per sample
+        # and each family's projection emits a different survivor dim. None
+        # outside eval.
+        self._eval_shared_tree_key: tuple[str, str | None] | None = None
+        # EVAL-only: per-evaluate() cache {(root, family): (memo, splice)} reused
+        # across ablation-mode passes so each (repo, family) tree is encoded once,
+        # not per mode.
         self._eval_tree_cache: dict | None = None
         # General (query-agnostic) compression prompt fed to BOTH L0 and L1 of
         # the shared repo tree.  Per-repo mode only; set in setup().
@@ -7625,16 +7629,26 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         root = self._repo_group_key(sample)
         if not root:
             return
-        if getattr(self, "_eval_shared_tree_root", None) == root:
+        # Key by (root, decoder_family): under round-robin, _eval_pass alternates
+        # the active decoder family PER SAMPLE (_set_active_decoder), and each
+        # family's projection block emits survivors at THAT family's hidden dim
+        # (qwen35 1024 vs falcon_h1 512). The shared tree reps are therefore
+        # family-specific — memoizing by root alone reuses one family's reps
+        # against the other family's decoder → the "survivor hidden dim != decoder
+        # hidden dim" crash. A repo with both families in the eval set encodes its
+        # tree once per family (still cheap vs no cache).
+        family = getattr(self, "_decoder_family", None)
+        key = (root, family)
+        if getattr(self, "_eval_shared_tree_key", None) == key:
             return
         # Cross-ABLATION-MODE cache: evaluate() runs _eval_pass once per mode
         # (neither/zeroed/noise/headline), but the encoded tree is IDENTICAL
         # across modes (ablation is applied at splice, not encode). Encode each
-        # repo's tree ONCE per evaluate() and reuse — else it's ~4x redundant
-        # tree encodes (the 44-min-eval regression).
+        # (repo, family) tree ONCE per evaluate() and reuse — else it's ~4x
+        # redundant tree encodes (the 44-min-eval regression).
         cache = getattr(self, "_eval_tree_cache", None)
-        if cache is not None and root in cache:
-            memo, splice = cache[root]
+        if cache is not None and key in cache:
+            memo, splice = cache[key]
         else:
             saved_count = getattr(self, "_shared_tree_forward_count", 0)
             with torch.no_grad():
@@ -7650,7 +7664,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 if proj is not None
             }
             if cache is not None:
-                cache[root] = (memo, splice)
+                cache[key] = (memo, splice)
         self._shared_tree_memo = memo
         self._shared_tree_splice_reps = splice
         self._shared_tree_used_nodes = set()
@@ -7659,7 +7673,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._shared_tree_child_l1_reps = None
         self._shared_tree_child_l1_used = None
         self._per_repo_shared_tree_active = True
-        self._eval_shared_tree_root = root
+        self._eval_shared_tree_key = key
 
     def _clear_eval_shared_tree(self) -> None:
         """Tear down any eval-installed shared repo tree (see
@@ -7669,7 +7683,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._shared_tree_splice_reps = None
         self._shared_tree_used_nodes = None
         self._per_repo_shared_tree_active = False
-        self._eval_shared_tree_root = None
+        self._eval_shared_tree_key = None
         self._eval_tree_cache = None
 
     def _eval_pass(self) -> dict[str, float]:
@@ -7712,7 +7726,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # the shared tree is re-installed each pass (reps are identical across
         # modes — the ablation is applied at splice, not encode). Torn down in
         # evaluate()'s finally via _clear_eval_shared_tree.
-        self._eval_shared_tree_root = None
+        self._eval_shared_tree_key = None
         for batch in self.eval_dataloader:
             for sample in batch:
                 if self._round_robin:

@@ -36,7 +36,7 @@ run_name: phase2_kb_git_repro_fullbackprop
 # step-1654 rescue save (NOT "none" — that cold-starts; NOT auto — the registry
 # still holds the POISONED old-run step-4825). CONTAINER path (host
 # /home/werg/bgkit-ckpt-fast is mounted at /workspace/checkpoints_fast).
-resume_checkpoint: "/workspace/checkpoints_fast/phase2_kb_step1654_20260723_133738_394720_run-phase2_kb_git_repro_fullbackprop"
+resume_checkpoint: "/workspace/checkpoints/phase2_kb_step1950_20260724_001245_023487_run-phase2_kb_git_repro_fullbackprop"
 # Auto-resume ENABLED (no resume_checkpoint key): on restart the trainer
 # resolves the latest run-scoped checkpoint (resolve_latest_checkpoint, keyed on
 # run_name above) and resumes; on the first launch — or if the latest checkpoint

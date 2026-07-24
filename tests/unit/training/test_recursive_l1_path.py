@@ -2344,7 +2344,8 @@ def test_ensure_eval_shared_tree_installs_reps_and_memoizes():
     t.device = torch.device("cpu")
     t._per_repo_full_backprop = True
     t._shared_tree_forward_count = 5
-    t._eval_shared_tree_root = None
+    t._eval_shared_tree_key = None
+    t._decoder_family = "qwen35"
     t._shared_tree_memo = None
     t._shared_tree_splice_reps = None
     t._shared_tree_used_nodes = None
@@ -2370,27 +2371,37 @@ def test_ensure_eval_shared_tree_installs_reps_and_memoizes():
     assert set(t._shared_tree_splice_reps.keys()) == {"repo/w000/n1", "repo/w000/n2"}
     assert t._shared_tree_memo is not None
     assert t._per_repo_shared_tree_active is True
-    assert t._eval_shared_tree_root == "repo/w000"
+    assert t._eval_shared_tree_key == ("repo/w000", "qwen35")
     assert t._shared_tree_forward_count == 5
     # reaccumulate dicts nulled so the head reads memo[c][1] directly (eval path)
     assert t._shared_tree_child_l1_reps is None
     assert calls["n"] == 1
 
-    # Same root -> memoized, no re-encode.
+    # Same root, SAME family -> memoized, no re-encode.
     t._ensure_eval_shared_tree(SimpleNamespace(dataset_name="git_commit_repro", root="repo/w000"))
     assert calls["n"] == 1
 
-    # Different root -> re-encode.
-    t._ensure_eval_shared_tree(SimpleNamespace(dataset_name="git_commit_repro", root="repo/w001"))
+    # Same root, DIFFERENT family (round-robin alternates decoders per sample) ->
+    # RE-ENCODE. Each family's projection emits a different survivor dim, so
+    # reusing one family's reps against the other family's decoder is the crash
+    # this key fixes.
+    t._decoder_family = "falcon_h1"
+    t._ensure_eval_shared_tree(SimpleNamespace(dataset_name="git_commit_repro", root="repo/w000"))
     assert calls["n"] == 2
-    assert t._eval_shared_tree_root == "repo/w001"
+    assert t._eval_shared_tree_key == ("repo/w000", "falcon_h1")
+
+    # Different root -> re-encode.
+    t._decoder_family = "qwen35"
+    t._ensure_eval_shared_tree(SimpleNamespace(dataset_name="git_commit_repro", root="repo/w001"))
+    assert calls["n"] == 3
+    assert t._eval_shared_tree_key == ("repo/w001", "qwen35")
 
     # Teardown clears everything.
     t._clear_eval_shared_tree()
     assert t._shared_tree_memo is None
     assert t._shared_tree_splice_reps is None
     assert t._per_repo_shared_tree_active is False
-    assert t._eval_shared_tree_root is None
+    assert t._eval_shared_tree_key is None
 
 
 def test_ensure_eval_shared_tree_gated_off_when_not_per_repo():
