@@ -50,7 +50,6 @@ from bgkit.data.commit_repro import (
     DATASET_NAME,
     HEAD_QUERY_TEMPLATES,
     MAX_DISTRACTORS,
-    MAX_TOUCHING_DIFFS,
     QUERY_TEMPLATES,
     FileChange,
     ReproCommit,
@@ -155,8 +154,15 @@ def main() -> None:
     parser.add_argument("--commit-node-ids", type=Path, required=True,
                         help="sidecar {repo@wWWW:OOOO: node_id} from build_commit_repro_tree")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--max-touching", type=int, default=MAX_TOUCHING_DIFFS,
-                        help="cap on touching-diff drill targets per sample (most-recent)")
+    parser.add_argument("--max-touching", type=int, default=0,
+                        help="cap on touching-diff drill targets per sample; 0 = NO "
+                             "cap (keep the file's FULL history so historical targets "
+                             "are drilled, not just recent ones)")
+    parser.add_argument("--touching-sample", choices=("recent", "uniform"),
+                        default="uniform",
+                        help="when --max-touching>0, which touching commits to keep: "
+                             "'uniform' spreads across the whole history (target always "
+                             "included); 'recent' keeps the most-recent K (legacy).")
     parser.add_argument("--n-distractors", type=int, default=MAX_DISTRACTORS,
                         help="0..this distractor branches (loss=False) per sample")
     parser.add_argument(
@@ -226,19 +232,32 @@ def main() -> None:
                     if not target_fc.is_target:
                         continue
                     n_targets += 1
-                    # All commits touching the file up to + including the
-                    # target, capped to the most-recent --max-touching (the
-                    # diffs the drill-down must find, one drill target each).
-                    touching = history[:tpos + 1]
-                    if len(touching) > args.max_touching:
-                        touching = touching[-args.max_touching:]
-
-                    # Per-sample deterministic RNG for distractor + template.
+                    # Per-sample deterministic RNG (distractors, template, and the
+                    # historical touching-sample below).
                     key = (
                         commit_key(repo, window, target_ord)
                         + f"#f{target_fc.file_idx:03d}"
                     )
                     rng = random.Random(f"{args.seed}:{key}")
+
+                    # All commits touching the file up to + including the target
+                    # (chronological), one drill target each. Default: keep the
+                    # FULL history so HISTORICAL diffs are drilled — the earlier
+                    # "most-recent K" cap biased every trajectory toward recent
+                    # commits and starved historical-target navigation. If a cap
+                    # is set, sample across the whole history (target always kept
+                    # as the last element) rather than truncating to the tail.
+                    touching = history[:tpos + 1]
+                    if args.max_touching and len(touching) > args.max_touching:
+                        if args.touching_sample == "recent":
+                            touching = touching[-args.max_touching:]
+                        else:  # uniform across history, target always included
+                            k = args.max_touching
+                            head = touching[:-1]
+                            idx = sorted(
+                                rng.sample(range(len(head)), k - 1)
+                            ) if len(head) >= k - 1 else list(range(len(head)))
+                            touching = [head[i] for i in idx] + [touching[-1]]
                     head_template_idx = rng.randrange(len(HEAD_QUERY_TEMPLATES))
 
                     gold_blob = target_fc.blob_text

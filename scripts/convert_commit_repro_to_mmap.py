@@ -2,11 +2,14 @@
 """Convert the ``git_commit_repro`` commit JSONL into the Phase 2 mmap schema.
 
 Each *file-change* (one changed file in one commit) becomes one mmap document —
-the L0-encodable leaf. The ``document_id`` is the opaque file-change id
-(``{repo}/{bip39(sha)}/{path}`` — the file path scoped by the commit's opaque
-BIP-39 node id), produced by :meth:`bgkit.data.commit_repro.ReproCommit.file_change_id`
-so it matches the ``articles`` lists in the browse tree, the trajectory
-``retrieve_ids``, and the ids enumerated by ``scripts/build_trajectory_set.py``.
+the L0-encodable leaf. The ``document_id`` is the positional-path file-change id
+(``{repo}/w000/c16.00/c4.01/cm.03/{path}`` — the file path scoped by the commit's
+chunk PATH id). Because the path depth depends on the window's commit count, the
+commit path ids are assigned by the tree builder and read here from the
+``--commit-node-ids`` sidecar (``commit_key -> path id``); the doc id is then
+``file_change_leaf_id(path_id, file_name, ...)`` — identical to the ``articles``
+lists in the browse tree, the trajectory ``retrieve_ids``, and the ids
+enumerated by ``scripts/build_trajectory_set.py``.
 
 Writes the canonical layout consumed by
 :class:`bgkit.data.article_token_store.ArticleTokenStore`::
@@ -38,6 +41,8 @@ from bgkit.data.commit_repro import (
     DATASET_NAME,
     FileChange,
     ReproCommit,
+    commit_key,
+    file_change_leaf_id,
     sha_for_record,
 )
 from bgkit.data.mmap_writer import build_csr_offsets, write_mmap_artifacts
@@ -48,8 +53,14 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True, help="commit JSONL")
     parser.add_argument("--output-dir", type=Path, required=True,
                         help="mmap root ($DATA_DIR/mmap/phase2); dataset subdir appended")
+    parser.add_argument("--commit-node-ids", type=Path, required=True,
+                        help="{commit_key: path node id} sidecar from "
+                             "build_commit_repro_tree.py — the source of the commit "
+                             "PATH ids the document_id must match")
     parser.add_argument("--tokenizer", default="Qwen/Qwen3.5-0.8B")
     args = parser.parse_args()
+
+    commit_node_ids: dict[str, str] = json.loads(args.commit_node_ids.read_text())
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
@@ -74,9 +85,13 @@ def main() -> None:
             repo = rec["repo"]
             window = int(rec.get("window_idx", 0))
             ordinal = int(rec["ordinal"])
-            # Reconstruct the ReproCommit so document_id construction (incl. the
-            # opaque BIP-39 commit-node scope + same-path disambiguation) is
-            # bit-identical to the tree / trajectory builders.
+            # Commit PATH id from the tree-builder sidecar; skip commits the tree
+            # dropped (fail-closed — a missing path id means the join would break).
+            commit_path_id = commit_node_ids.get(commit_key(repo, window, ordinal))
+            if commit_path_id is None:
+                continue
+            # Reconstruct the ReproCommit only for same-path disambiguation so the
+            # document_id is bit-identical to the tree / trajectory builders.
             commit = ReproCommit(
                 repo=repo, sha=sha_for_record(rec), ordinal=ordinal,
                 message=str(rec.get("message", "")),
@@ -87,12 +102,16 @@ def main() -> None:
                     for fc in rec["file_changes"]
                 ],
             )
+            dup = commit._duplicated_paths()
             for fc in rec["file_changes"]:
                 ids = tokenizer.encode(fc["diff_text"], add_special_tokens=False)
                 if not ids:
                     continue
                 fi = int(fc["file_idx"])
-                doc_id = commit.file_change_id(fi)
+                doc_id = file_change_leaf_id(
+                    commit_path_id, str(fc["path"]), fi,
+                    duplicated=str(fc["path"]) in dup,
+                )
                 chunks.append(np.array(ids, dtype=np.int32))
                 lengths.append(len(ids))
                 document_ids.append(doc_id)
