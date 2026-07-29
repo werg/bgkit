@@ -6784,6 +6784,22 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         accum["nav_count"] += nav_count
         accum["recon_sum"] += recon_sum
         accum["recon_count"] += recon_count
+        # DIAGNOSTIC: bucket recon/nav CE by DRILL DEPTH (number of bgkit drill
+        # turns). recon_loss should DROP with depth — deeper drills retrieve more
+        # of the real diff content, so reconstruction gets easier; a full-depth
+        # drill that STILL has high recon_loss would be the concerning case (the
+        # model has the diffs but can't use them). depth 1 == no_drill (recon from
+        # the compressed head rep alone → hardest). Measurement only.
+        depth = len(trace.bgkit_call_spans)
+        bd = accum.setdefault("by_depth", {}).setdefault(
+            depth, {"recon_sum": 0.0, "recon_count": 0,
+                    "nav_sum": 0.0, "nav_count": 0, "n": 0},
+        )
+        bd["recon_sum"] += recon_sum
+        bd["recon_count"] += recon_count
+        bd["nav_sum"] += nav_sum
+        bd["nav_count"] += nav_count
+        bd["n"] += 1
 
     def _run_ablation_gap_probe(
         self, group: list, l1_target_ratio: float | None,
@@ -7824,6 +7840,17 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             if nc > 0:
                 metrics["eval/nav_loss"] = span_accum["nav_sum"] / nc
                 metrics["eval/nav_tokens"] = float(nc)
+            # per-drill-depth recon/nav loss (does recon scale with drill depth?)
+            for d, bd in sorted(span_accum.get("by_depth", {}).items()):
+                if bd["recon_count"] > 0:
+                    metrics[f"eval/recon_loss_by_depth/d{d:02d}"] = (
+                        bd["recon_sum"] / bd["recon_count"]
+                    )
+                if bd["nav_count"] > 0:
+                    metrics[f"eval/nav_loss_by_depth/d{d:02d}"] = (
+                        bd["nav_sum"] / bd["nav_count"]
+                    )
+                metrics[f"eval/samples_by_depth/d{d:02d}"] = float(bd["n"])
         return metrics
 
     @torch.no_grad()
