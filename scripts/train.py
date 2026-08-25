@@ -26,6 +26,11 @@ def _create_trainer(cfg: DictConfig):
     if phase is None:
         raise ValueError("No training phase specified. Use a training config override.")
 
+    if phase == "blob_sft":
+        # Family-A blob compaction SFT (capability-packaging §4).
+        from bgkit.training.blob_sft_trainer import BlobSFTTrainer
+
+        return BlobSFTTrainer(cfg)
     if phase == "joint_block_pretrain":
         from bgkit.training.joint_block_trainer import JointBlockTrainer
 

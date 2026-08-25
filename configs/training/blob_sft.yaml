@@ -1,0 +1,46 @@
+# @package _global_
+# Family-A blob compaction SFT (capability-packaging plan §4).
+# Lean trainer: src/bgkit/training/blob_sft_trainer.py over BlobSFTDataset
+# (SWE-Zero trajectory shards → compaction samples with <bgkit_blob> blocks).
+# Starts from a Phase-2 wide-net checkpoint (encoder + Qwen decoder already
+# co-trained on the splice contract).
+training:
+  phase: blob_sft
+  stage: A
+  # REQUIRED: Phase-2 checkpoint carrying encoder + qwen decoder state.
+  init_checkpoint: ???
+  data:
+    train_shards: []
+    # Legacy shard-level eval split; prefer repo_holdout_fraction.
+    eval_shards: []
+    # REPO-level holdout over train_shards (crc32 bucket of the row's repo):
+    # train and eval are guaranteed repo-disjoint. Overrides eval_shards.
+    repo_holdout_fraction: 0.0
+
+  draws_per_trajectory: 4
+  max_rows_per_shard: null
+  min_blob_content_tokens: 64
+  max_blob_content_tokens: 45000
+  max_decode_tokens: 40000
+
+  # Blob encode retention (query-free, exact_topk both levels). ~6× to start —
+  # the semantic-compression operating point; ratio descent across stages
+  # follows the continuous-descent doctrine once multi-stage runs exist.
+  l0_ratio: 0.35
+  l1_ratio: 0.5
+  freeze_encoder: false
+
+  lr: 5.0e-5
+  max_steps: 2000
+  warmup_steps: 100
+  eval_every: 250
+  save_every: 500
+  gradient_accumulation_steps: 4
+  max_eval_samples: 128
+  eval_ablation_zeroed: true
+  optimizer: muon
+  num_workers: 2
+
+  # Per-backbone-layer encoder GC + reentrant decoder GC (the proven forms).
+  gradient_checkpointing: true
+  decoder_gradient_checkpointing: "reentrant"
