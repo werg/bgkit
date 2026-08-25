@@ -174,6 +174,11 @@ def main(cfg: DictConfig) -> None:
     free_running = bool(eval_cfg.get("free_running", True))
     max_tool_calls = int(eval_cfg.get("max_tool_calls", 16))
     max_new_tokens = int(eval_cfg.get("max_new_tokens", 8192))
+    # Seed the gold retrieval turn instead of making the model emit it:
+    # for a benchmark arm whose baselines are simply handed their context,
+    # charging ours for retrieval too makes the comparison unfair (and an
+    # out-of-distribution id format masks the capability entirely).
+    force_first_call = bool(eval_cfg.get("force_first_call", False))
     ablation = str(eval_cfg.get("ablation", "") or "")
     if ablation:
         # e.g. +eval.ablation=oracle_span — applies to BOTH the trainer metric
@@ -215,6 +220,7 @@ def main(cfg: DictConfig) -> None:
                         sample,
                         max_tool_calls=max_tool_calls,
                         max_new_tokens=max_new_tokens,
+                        force_first_call=force_first_call,
                     )
                     if free_running else None
                 )

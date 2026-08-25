@@ -59,6 +59,7 @@ run_arm() {  # $1 = experiment, $2 = checkpoint, $3 = tag
     python scripts/eval_phase2_kb.py "+experiment=$exp" \
       "+eval.checkpoint=$ckpt" +eval.per_sample=true +eval.max_samples=400 \
       +eval.free_running=true +eval.max_tool_calls=2 +eval.max_new_tokens=128 \
+      +eval.force_first_call=true \
       "+eval.output_dir=$COUT/$tag" 2>&1 | tail -40
   local report
   report=$(ls -t "$OUT/$tag"/eval_phase2_kb_stage_*.json 2>/dev/null | head -1)

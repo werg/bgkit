@@ -66,9 +66,11 @@ training:
     p_skip_topic: 0.0
     p_noise_bgkit: 0.0
 
-  # The per-sample loop in eval_phase2_kb.py carries the measurement; keep
-  # the trainer's own teacher-forced pass cheap and its free-running pass off.
-  max_eval_samples: 8
+  # max_eval_samples TRUNCATES THE EVAL DATASET ITSELF, so it also caps the
+  # per-sample loop that carries this measurement (the first run scored 8
+  # samples, not 400). Keep it at the full cell count; the trainer's own
+  # free-running pass stays off so the cost is one teacher-forced pass.
+  max_eval_samples: 400
   eval_free_running_samples: 0
   eval_ablation_modes: []
   eval_train_subset_samples: 0

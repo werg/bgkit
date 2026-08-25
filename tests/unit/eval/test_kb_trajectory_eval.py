@@ -786,3 +786,33 @@ def test_tool_call_id_accuracy_excludes_head_and_distractors():
     # Only the on-path non-head drill is scored (n=1), and it's correct.
     assert result["n_bgkit"] == 1
     assert result["bgkit"] == pytest.approx(1.0)
+
+
+def test_free_running_eval_can_force_the_gold_first_call():
+    """A benchmark arm whose baselines are simply HANDED their context must
+    not also be charged for retrieving it — and an out-of-distribution id
+    format otherwise masks the capability entirely (2026-08-25: the BABILong
+    arm scored invalid on 100% of samples because the wide net hallucinated a
+    `file:` id instead of copying the `babilong:` entrypoint). With the call
+    forced, the model's FIRST generation is the answer."""
+    trainer, sample = _free_running_fixture(["gold state"])
+    trainer._trees["toy"] = BrowseTree.from_nodes("toy", [
+        BrowseNode(id="root", parent=None, kind="sub-tag", size=1,
+                   children=(), articles=("evidence",)),
+        BrowseNode(id="evidence", parent="root", kind="article", size=1,
+                   children=(), articles=()),
+    ])
+    sample.group_id = "owner/repo"
+    sample.scope_description = "a long story transcript; entrypoint id: `evidence`"
+    sample.trajectory = [
+        TrajectoryTurn(kind="bgkit", args={"ids": ["evidence"], "query": "q"}),
+        TrajectoryTurn(kind="answer", response="gold state"),
+    ]
+    result = evaluate_free_running_sample(trainer, sample, force_first_call=True)
+    assert result["invalid_reason"] == ""
+    assert result["answer_exact_match"] == 1.0
+    # The seeded call counts as the model's route and reaches the trainer as
+    # the plain leaf form, so the reps are actually spliced.
+    assert result["tool_calls"] == 1
+    assert result["route_exact"] == 1.0
+    assert trainer.histories[-1][0].args == {"ids": ["evidence"], "query": "q"}

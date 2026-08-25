@@ -331,6 +331,7 @@ def evaluate_free_running_sample(
     *,
     max_tool_calls: int = 16,
     max_new_tokens: int = 8192,
+    force_first_call: bool = False,
 ) -> dict:
     """Evaluate autonomous navigation without rendering future teacher turns.
 
@@ -338,6 +339,16 @@ def evaluate_free_running_sample(
     scope or surfaced by an already executed tree node. Accepted calls are
     appended to the observed history and re-encoded before generation resumes.
     The first non-call output is the model's final answer.
+
+    ``force_first_call`` seeds the history with the sample's first gold
+    retrieval turn instead of making the model produce it. Use it when
+    retrieval is NOT what is under test — a benchmark arm compared against
+    baselines that are simply *handed* their context (BABILong's ``full`` /
+    ``truncate``) must not additionally be charged for finding it. It also
+    keeps an out-of-distribution ID format from masking the capability: the
+    2026-08-25 BABILong arm scored invalid on 100% of samples because the
+    wide net, trained on ``file:``/``log:`` ids, hallucinated one rather than
+    copying the ``babilong:`` entrypoint out of the scope line.
     """
     tree = trainer._trees[sample.dataset_name]
     entrypoint = str(getattr(sample, "group_id", "") or "")
@@ -368,6 +379,24 @@ def evaluate_free_running_sample(
     history: list[TrajectoryTurn] = []
     generated_calls: list[list[str]] = []
     called_ids: set[str] = set()
+    if force_first_call:
+        gold_first = next(
+            (t for t in sample.trajectory if t.kind == "bgkit" and getattr(t, "loss", True)),
+            None,
+        )
+        if gold_first is not None:
+            ids = [str(i) for i in gold_first.args.get("ids", [])]
+            history.append(
+                TrajectoryTurn(
+                    kind="bgkit",
+                    args=dict(gold_first.args),
+                    response="",
+                    loss=True,
+                )
+            )
+            generated_calls.append(ids)
+            called_ids.update(ids)
+            available.update(ids)
     invalid_reason = ""
     pred_answer = ""
     final_answer_emitted = False

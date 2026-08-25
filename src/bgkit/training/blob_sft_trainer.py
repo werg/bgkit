@@ -468,6 +468,12 @@ class BlobSFTTrainer(BaseTrainer):
         zero_loss = zero_tokens = 0.0
         zero_correct = 0.0
         zero_probe_hits = zero_probe_n = 0
+        # Per-qtype zeroed loss + verdict agreement (2026-08-25). EM is
+        # all-or-nothing over the whole answer, so equal EM counts do not
+        # prove the reps changed nothing: probe LOSS moves continuously, and
+        # agreement says whether the very same probes were right both ways.
+        zero_per_qtype: dict[str, list[float]] = {}
+        probe_agree = 0
         per_qtype: dict[str, list[float]] = {}
         probe_hits = probe_n = 0
         n_seen = 0
@@ -519,10 +525,12 @@ class BlobSFTTrainer(BaseTrainer):
                     & z_out.loss_mask[:, 1:]
                 )
                 zero_correct += float(z_correct.sum().item())
+                zero_per_qtype.setdefault(qtype, []).append(float(z_out.loss.item()))
                 if qtype == "recall_probe":
                     zero_probe_n += 1
-                    if bool(z_correct[z_out.loss_mask[:, 1:]].all().item()):
-                        zero_probe_hits += 1
+                    z_hit = bool(z_correct[z_out.loss_mask[:, 1:]].all().item())
+                    zero_probe_hits += int(z_hit)
+                    probe_agree += int(z_hit == bool(correct[mask].all().item()))
 
         if tot_tokens == 0:
             return {"eval/loss": float("nan"), "eval/n_samples": 0.0}
@@ -541,6 +549,12 @@ class BlobSFTTrainer(BaseTrainer):
             metrics["eval/ablation/zeroed/loss"] = zero_loss / zero_tokens
             metrics["eval/zeroed_gap"] = metrics["eval/ablation/zeroed/loss"] - metrics["eval/loss"]
             metrics["eval/ablation/zeroed/token_accuracy"] = zero_correct / zero_tokens
+            for qtype, losses in zero_per_qtype.items():
+                zl = sum(losses) / len(losses)
+                metrics[f"eval/ablation/zeroed/{qtype}/loss"] = zl
+                base = metrics.get(f"eval/{qtype}/loss")
+                if base is not None:
+                    metrics[f"eval/zeroed_gap/{qtype}"] = zl - base
             if zero_probe_n:
                 metrics["eval/ablation/zeroed/probe_exact_match"] = (
                     zero_probe_hits / zero_probe_n
@@ -551,4 +565,7 @@ class BlobSFTTrainer(BaseTrainer):
                     metrics.get("eval/probe_exact_match", 0.0)
                     - metrics["eval/ablation/zeroed/probe_exact_match"]
                 )
+                # Equal EM counts can still hide churn (different probes right
+                # each way). 1.0 = the reps flipped no probe at all.
+                metrics["eval/probe_zeroed_agreement"] = probe_agree / zero_probe_n
         return metrics
