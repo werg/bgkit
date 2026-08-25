@@ -78,11 +78,24 @@ def lm_health_metrics(
 ) -> dict[str, float]:
     """Mean next-token CE (and perplexity) of ``decoder`` on ``chunks``.
 
-    ``decoder`` may be a bgkit ``ReconstructionDecoder`` (``.backbone``) or a
-    bare HF causal LM. No splice, no reps, no prompt — just the tokens.
+    MUST go through the decoder's own supported forward. bgkit's in-training
+    decoders are patched for FA4 varlen PACKED attention and have no padded
+    fallback, so a bare ``model(input_ids=(B, L))`` hits the packed path with
+    no ``cu_seqlens`` and triggers a device-side assert — which poisons the
+    CUDA context and kills the whole run, not just the metric. That is
+    exactly what happened on the first lrprobe launch (2026-08-25), so this
+    routes plain text through ``forward_interleaved_with_loss`` as a single
+    all-loss ``TokenSegment`` — the same primitive the trainers already use
+    every step. A ``try/except`` cannot save you here: by the time Python
+    sees the error the context is already dead, so the call has to be
+    correct, not merely guarded.
+
+    Falls back to a bare HF call only for objects with no interleaved API
+    (the standalone probes, which load weights into a stock HF model).
     """
     if not chunks:
         return {}
+    interleaved = getattr(decoder, "forward_interleaved_with_loss", None)
     model = getattr(decoder, "backbone", decoder)
     was_training = model.training
     model.eval()
@@ -90,16 +103,27 @@ def lm_health_metrics(
     total_tok = 0
     try:
         for ids in chunks:
-            ids = ids.unsqueeze(0).to(device)
-            logits = model(input_ids=ids).logits[:, :-1].float()
-            targets = ids[:, 1:]
-            nll = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                targets.reshape(-1),
-                reduction="sum",
-            )
-            total_nll += float(nll.item())
-            total_tok += int(targets.numel())
+            ids = ids.to(device)
+            if interleaved is not None:
+                from bgkit.models.decoder import TokenSegment
+
+                mask = torch.ones_like(ids, dtype=torch.bool)
+                out = interleaved([TokenSegment(ids, loss_mask=mask)])
+                loss = out.loss if hasattr(out, "loss") else out
+                n = int(ids.shape[-1]) - 1
+                total_nll += float(loss.item()) * n
+                total_tok += n
+            else:
+                batched = ids.unsqueeze(0)
+                logits = model(input_ids=batched).logits[:, :-1].float()
+                targets = batched[:, 1:]
+                nll = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    targets.reshape(-1),
+                    reduction="sum",
+                )
+                total_nll += float(nll.item())
+                total_tok += int(targets.numel())
     finally:
         if was_training:
             model.train()

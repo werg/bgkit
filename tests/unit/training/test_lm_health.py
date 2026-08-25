@@ -71,3 +71,31 @@ def test_accepts_a_reconstruction_decoder_wrapper():
 
     out = lm_health_metrics(_Wrapper(_FakeLM()), [torch.arange(8) % 16], torch.device("cpu"))
     assert "eval/lm_health/ce" in out
+
+
+def test_uses_the_interleaved_forward_when_the_decoder_has_one():
+    """bgkit's in-training decoders are patched for FA4 varlen PACKED
+    attention with no padded fallback: a bare model(input_ids=(B, L)) hits the
+    packed path with no cu_seqlens and triggers a device-side assert, which
+    poisons the CUDA context and kills the RUN (2026-08-25, first lrprobe
+    launch). The metric must route through the decoder's own primitive."""
+
+    class _Out:
+        loss = torch.tensor(2.0)
+
+    class _Dec:
+        def __init__(self):
+            self.backbone = _FakeLM()
+            self.calls = []
+
+        def forward_interleaved_with_loss(self, segments, **kw):
+            self.calls.append(segments)
+            return _Out()
+
+    dec = _Dec()
+    out = lm_health_metrics(dec, [torch.arange(8) % 16], torch.device("cpu"))
+    assert len(dec.calls) == 1
+    seg = dec.calls[0][0]
+    # One all-loss token segment — plain text, nothing spliced.
+    assert seg.loss_mask.all() and seg.token_ids.shape[-1] == 8
+    assert out["eval/lm_health/ce"] == pytest.approx(2.0)
