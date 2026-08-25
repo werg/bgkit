@@ -328,11 +328,12 @@ class BlobSFTTrainer(BaseTrainer):
 
         # --- optimizer ---
         # Freeze the decoder's tied embedding / LM head BEFORE collecting
-        # trainable params. Qwen3.5 ties lm_head to embed_tokens, so every
-        # softmax step otherwise rewrites the input embedding of all 248,320
-        # tokens to fit this task's narrow target distribution — the mechanism
-        # that took the wide-net decoder from PPL 33 to 2585 on plain text
-        # (2026-08-25). Family A inherits that decoder and would compound it.
+        # trainable params. HYGIENE, NOT A FIX for the Phase-2 language
+        # collapse — see KRKBTrainer._freeze_decoder_embeddings for the
+        # measurements that refuted that diagnosis (the embedding is
+        # essentially identical in the healthy base and the destroyed
+        # checkpoints). Pinning a 248,320-row tied matrix against ~107
+        # loss-bearing tokens per sample is still the right default.
         if bool(self.step_cfg.get("freeze_decoder_embeddings", True)):
             frozen = 0
             bb = getattr(self.decoder, "backbone", self.decoder)

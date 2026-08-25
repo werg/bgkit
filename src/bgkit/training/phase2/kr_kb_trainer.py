@@ -7336,34 +7336,30 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     def _freeze_decoder_embeddings(self) -> None:
         """Freeze each decoder's token embedding (and, when tied, its LM head).
 
-        THE 2026-08-25 REGRESSION. Wide-net Phase-2 training took the decoder
-        from PPL 33 (summarization base) to 671 (v6) to 2585 (v7) on held-out
-        plain text — catastrophic, monotonic, and invisible to every
-        in-distribution metric. The mechanism is the tied embedding:
+        HYGIENE, NOT A FIX — read this before citing it. It was added on
+        2026-08-25 as the supposed cure for the Phase-2 language collapse
+        (decoder plain-text PPL 31 at the summarization base -> 671 at
+        wide-net v6 -> 2585 at v7). That diagnosis was WRONG and the measured
+        refutation is worth keeping:
 
-        - Qwen3.5 has ``tie_word_embeddings=True``, so ``lm_head`` IS
-          ``embed_tokens`` — one matrix of 248,320 rows.
-        - Every optimizer step, the softmax denominator puts gradient on
-          EVERY row of that matrix; because it is tied, each step rewrites the
-          INPUT embedding of every token in the vocabulary.
-        - Phase-2 targets are ~107 loss-bearing tokens per sample of tool-call
-          scaffolding and short code answers — an extremely narrow output
-          distribution to reshape a whole vocabulary around.
-        - At lr 1e-4 for 2629 steps, AdamW's per-element update budget
-          (~0.26) is ~65x the per-element scale of an embedding row
-          (norm 0.63 over 1024 dims). Measured drift: row-wise cosine 0.56 to
-          pristine, norm 0.80x.
-        - The backbone then co-adapts to the deformed embedding, which is why
-          swapping the pristine embedding back in makes perplexity WORSE
-          (1125 vs 611): the halves only function as a degenerate pair.
-        - Each run resumes from the last, so the damage compounds across runs.
+        - The embedding is essentially IDENTICAL in the healthy base and the
+          destroyed checkpoints — norm/pristine 0.798 / 0.797 / 0.797 and
+          row-wise cosine 0.557 / 0.561 / 0.561 for base / v6 / v7. A model
+          carrying that exact embedding scores PPL 31. The cosine-0.56
+          rotation happened during PHASE 1 and is benign.
+        - v6 -> v7 moved it by nothing (cosine 0.5605 -> 0.5606) while
+          perplexity went 671 -> 2585.
 
-        Phase 1 never had this problem because it keeps the decoder's
-        embedding as a fixed ANCHOR and repairs the projection against it
-        (Step 2.5, "projection embed-anchor repair"). Phase 2 dropped that
-        discipline and let the anchor itself move. Freezing restores it: the
-        backbone still adapts to the splice, but the token geometry the whole
-        model is built on stops moving.
+        So freezing it prevents a drift that was not happening. It is kept
+        because a 248,320-row tied matrix reshaped by ~107 loss-bearing
+        tokens per sample is worth pinning on general principle, and because
+        Phase 1 treats the decoder embedding as a fixed ANCHOR for the
+        projection (Step 2.5, "projection embed-anchor repair") — but do NOT
+        expect it to restore language health. The live hypothesis for that is
+        the rep-scale operating point (wide-net splices reps at ~218x the
+        embedding norm against git-repro's ~4x; git-repro moved the backbone
+        FURTHER over 8700 steps and stayed at PPL 64), which
+        ``eval/lm_health/*`` now measures every eval.
 
         ``training.freeze_decoder_embeddings: false`` opts out.
         """
