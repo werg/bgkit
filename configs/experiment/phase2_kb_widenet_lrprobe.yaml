@@ -1,0 +1,82 @@
+# @package _global_
+# LR-FIX PROBE (2026-08-25) — the controlled test of the one confirmed bug.
+#
+# The wide-net decoder's held-out plain-text perplexity goes 30 (summarization
+# base) -> 2425 (v5b step 655) -> ~585 (v6, healed) -> 5450 (v7 step 500) ->
+# 2353 (v7 step 999). It spikes at each run start and partially recovers;
+# steps 9/15/31 of v5 are still at ~30, so the blow-up develops over hundreds
+# of steps rather than at init. Ruled out by measurement: the token embedding
+# (identical in healthy and damaged checkpoints), raw weight drift (git-repro
+# moved further and stayed at PPL 64), and input mis-scaling (every checkpoint
+# peaks at scale 1.0).
+#
+# What IS confirmed is a code defect: KRKBTrainer's param groups set only
+# "lr" while the schedule reads pg.get("base_lr", <global>), so decoder_lr /
+# l0_lr / l1_lr never took effect and every group ran at training.lr. The
+# wide-net decoder therefore trained at 1e-4 against a configured 5e-5 — and
+# git-repro, whose config sets every rate to the same 5e-5, was immune. Fixed
+# in commit 26fc012.
+#
+# This run is v6's configuration from the same base with that fix in place,
+# short, with lm_health on every eval. Read eval/lm_health/qwen35/ppl:
+#   holds ~30-60  -> the LR flattening was the cause (or most of it)
+#   climbs to 1e3 -> it was not; the objective/replay hypothesis is next
+#     (blob_sft healed 585 -> 123 on natural-language targets, so the damage
+#      is recoverable and the objective plainly matters)
+#
+# Deliberately NOT a capability run — 400 steps buys the diagnosis, nothing
+# more. Everything else is v6 verbatim so the comparison is clean.
+defaults:
+  - /config
+  - /training/phase2_kb_stage_a
+  - _self_
+
+run_name: phase2_kb_widenet_lrprobe
+
+training:
+  dynamic_ckpt:
+    enabled: true
+    flush_when_free_below_gb: 30
+  # Dense language-health sampling is the whole point of the run.
+  eval_every: 50
+  save_every: 200
+  warmup_steps: 200
+  lm_health_samples: 32
+  # Keep the eval cheap so a 50-step cadence is affordable; the headline
+  # metric here is lm_health, not task quality.
+  max_eval_samples: 32
+  eval_free_running_samples: 0
+  eval_ablation_modes: []
+  eval_train_subset_samples: 0
+  profile_timing: true
+
+  datasets:
+    - lognav
+    - fileneedle
+    - grepset
+    - swerecall
+  max_samples_per_dataset_default: 100000
+
+  l0_retention:
+    lognav: 0.10
+    fileneedle: 0.10
+    grepset: 0.10
+    swerecall: 0.10
+  l1_retention: 0.15
+  selection_mode:
+    l0: exact_topk
+    l1: exact_topk
+
+  qwen_decoder_prob: 1.0
+  training_time_ablation:
+    p_skip_bgkit: 0.0
+    p_skip_topic: 0.0
+    p_noise_bgkit: 0.0
+
+  survivorship:
+    survivorship_aux: true
+    span_relevance_weight: 2.0
+    ratio_loss_weight: 0.5
+    n_distractors: 0
+
+  max_steps: 400

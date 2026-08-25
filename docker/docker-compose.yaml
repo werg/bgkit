@@ -696,6 +696,13 @@ services:
     restart: "no"
     command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v7_ratio6x"]
 
+  # LR-fix probe: v6's config from the base for 400 steps with lm_health on
+  # every eval — the controlled test of the per-group-LR defect (26fc012).
+  train-phase2-kb-widenet-lrprobe:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_lrprobe"]
+
   # Long-prose semantic fact recall (babilong_style) alongside the code
   # wide-net datasets; the zero-shot BABILong arm scored 0.00 on every cell
   # (2026-08-25), teacher-forced and free-running alike.
