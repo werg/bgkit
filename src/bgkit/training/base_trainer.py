@@ -2562,6 +2562,52 @@ class BaseTrainer(ABC):
             for key, value in metrics.items()
         }
 
+    def _audit_optimizer_coverage(self) -> None:
+        """Warn about parameters that require grad but reach no param group.
+
+        Such a parameter LOOKS trainable — it is unfrozen, it accumulates
+        gradient, it shows up in any requires_grad count — and it never
+        moves, because no optimizer group owns it. Nothing else in the stack
+        reports that. It is the omission twin of the duplicate-parameter case
+        rejected in ``_create_optimizer``, and the same silent class as the
+        per-group-LR flattening that cost months (2026-08-25).
+
+        Warns rather than raises: a trainer may deliberately hold parameters
+        out (a frozen-but-unflagged tensor, a module stepped by a second
+        optimizer), and killing a long run over a diagnostic would be worse
+        than the defect. The count is the signal — check it at launch.
+        """
+        model = getattr(self, "model", None)
+        opt = getattr(self, "optimizer", None)
+        if model is None or opt is None:
+            return
+        try:
+            owned = {
+                id(p) for group in opt.param_groups for p in group["params"]
+            }
+            orphan_tensors = 0
+            orphan_params = 0
+            for _name, p in model.named_parameters():
+                if p.requires_grad and id(p) not in owned:
+                    orphan_tensors += 1
+                    orphan_params += p.numel()
+            if orphan_tensors:
+                sample = [
+                    n for n, p in model.named_parameters()
+                    if p.requires_grad and id(p) not in owned
+                ][:5]
+                logger.warning(
+                    "optimizer_coverage_gap",
+                    tensors=orphan_tensors,
+                    params=orphan_params,
+                    sample=sample,
+                    detail="require grad but are in NO optimizer group — they will never update",
+                )
+            else:
+                logger.info("optimizer_coverage_ok", groups=len(opt.param_groups))
+        except Exception as exc:  # a diagnostic must never take down a run
+            logger.warning("optimizer_coverage_audit_failed", error=str(exc))
+
     def train(self) -> None:
         """Main training loop.
 
@@ -3024,6 +3070,7 @@ class BaseTrainer(ABC):
             early_stopping=es_enabled,
             gradient_accumulation_steps=accum_steps,
         )
+        self._audit_optimizer_coverage()
 
         # Apply YAML-default min/max_sample_length once at training-loop
         # start. The handlers no-op gracefully if the trainer lacks the

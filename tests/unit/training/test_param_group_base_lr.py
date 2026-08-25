@@ -69,3 +69,38 @@ def test_duplicate_param_across_groups_is_rejected():
             [{"params": [p], "lr": 1e-4}, {"params": [p], "lr": 2e-4}],
             default_lr=1e-4,
         )
+
+
+def test_coverage_audit_flags_params_owned_by_no_group(monkeypatch):
+    """A param that requires grad but reaches no optimizer group LOOKS
+    trainable and never moves. Nothing else in the stack reports it."""
+    from bgkit.training import base_trainer as bt
+
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        bt.logger, "warning", lambda ev, **kw: events.append((ev, kw)),
+    )
+
+    model = torch.nn.Linear(4, 4)
+    model.orphan = torch.nn.Linear(4, 4)
+
+    t = _trainer()
+    t.model = model
+    t.optimizer = t._create_optimizer(
+        [{"params": [model.weight, model.bias], "lr": 1e-4}], default_lr=1e-4,
+    )
+    t._audit_optimizer_coverage()
+    gaps = [kw for ev, kw in events if ev == "optimizer_coverage_gap"]
+    assert gaps, f"no coverage-gap warning; saw {[e for e, _ in events]}"
+    assert gaps[0]["tensors"] == 2
+    assert "orphan.weight" in gaps[0]["sample"]
+
+
+def test_coverage_audit_is_quiet_when_every_param_is_owned():
+    model = torch.nn.Linear(4, 4)
+    t = _trainer()
+    t.model = model
+    t.optimizer = t._create_optimizer(
+        [{"params": list(model.parameters()), "lr": 1e-4}], default_lr=1e-4,
+    )
+    t._audit_optimizer_coverage()  # must not raise
