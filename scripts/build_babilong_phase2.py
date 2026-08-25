@@ -45,16 +45,18 @@ from bgkit.data.flat_phase2_writer import flat_trajectory_row, write_flat_phase2
 def compose_question(cfg: dict, question: str, *, with_examples: bool) -> str:
     """BABILong's own instruction / examples / post-prompt around the question.
 
-    ``get_formatted_input`` in the babilong repo wraps these around the
-    *context*; here the context is spliced in as reps by the trainer, so the
-    same pieces are assembled without it. Keeping them verbatim is what makes
-    the bgkit arm comparable to the ``full`` / ``truncate`` arms.
+    Mirrors babilong's ``DEFAULT_TEMPLATE`` —
+    ``{instruction}\\n\\n{examples}\\n\\n{post_prompt}\\n\\n<context>…</context>
+    \\n\\nQuestion: {question}`` — with the ``<context>`` block removed,
+    because here the context is spliced in as reps by the trainer. Order and
+    the ``Question:`` prefix are kept verbatim: they are what makes the bgkit
+    arm comparable to the ``full`` / ``truncate`` arms.
     """
     parts = [str(cfg.get("instruction") or "").strip()]
     if with_examples:
         parts.append(str(cfg.get("examples") or "").strip())
-    parts.append(question.strip())
     parts.append(str(cfg.get("post_prompt") or "").strip())
+    parts.append(f"Question: {question.strip()}")
     return "\n\n".join(p for p in parts if p)
 
 
