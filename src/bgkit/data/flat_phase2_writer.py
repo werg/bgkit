@@ -43,6 +43,7 @@ def flat_trajectory_row(
     split: str,
     group_id: str,
     gold_span_json: str | None = None,
+    query: str | None = None,
 ) -> dict:
     """One flat single-bgkit trajectory row (retrieval call + answer).
 
@@ -54,6 +55,12 @@ def flat_trajectory_row(
     every splice silently resolved to a ZERO survivor and the encoder never ran
     (the v1→v4 widenet runs, diagnosed 2026-08-22). The trainer now raises on
     that misrouting; this writer is the data-side half of the contract.
+
+    ``query`` overrides the retrieval call's query string, which defaults to
+    ``question``. They differ when the user turn carries prompt scaffolding
+    that must NOT condition L0 selection — e.g. BABILong's few-shot examples
+    name every candidate answer label, so querying with the composed prompt
+    would bias survivor selection toward the wrong locations.
 
     ``gold_span_json`` = ``"[tok_start, tok_end)"`` of the answer inside the
     tokenized article (see :mod:`bgkit.data.gold_span`) — the v5 span-level
@@ -75,7 +82,7 @@ def flat_trajectory_row(
     trajectory = [
         TrajectoryTurn(
             kind="bgkit",
-            args={"ids": [doc_id], "query": question},
+            args={"ids": [doc_id], "query": query if query is not None else question},
             response="",
             loss=True,
         ),

@@ -52,3 +52,22 @@ def test_flat_row_emits_plain_leaf_drill():
             dataset_name="x", doc_id="bad`id", question="q", answer="a",
             scope_description="s", split="train", group_id="g",
         )
+
+
+def test_query_override_separates_selection_query_from_user_turn():
+    """L0 selection is query-conditioned, so prompt scaffolding in the user
+    turn must be keepable OUT of the retrieval query — BABILong's few-shot
+    examples name every candidate answer label and would bias survivors."""
+    row = flat_trajectory_row(
+        dataset_name="babilong_qa1_16k",
+        doc_id="babilong:qa1:16k:0000",
+        question="<example>...hallway...kitchen...</example>\n\nWhere is John?",
+        answer="hallway",
+        scope_description="a long story transcript",
+        split="eval",
+        group_id="babilong:qa1:16k:0000",
+        query="Where is John?",
+    )
+    traj = json.loads(row["trajectory_json"])
+    assert traj[0]["args"]["query"] == "Where is John?"
+    assert "hallway" in row["question"]  # user turn keeps the full prompt

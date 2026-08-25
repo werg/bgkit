@@ -1,0 +1,65 @@
+# @package _global_
+# BABILong bgkit arm — the third arm next to baseline_babilong.py's `full`
+# and `truncate` (2026-08-25). Same BABILong samples, same prompt pieces;
+# the difference is that the haystack reaches the decoder as COMPRESSED
+# SURVIVOR REPS instead of tokens.
+#
+# Why BABILong and not RULER: the oracle-span + v7 verdicts showed verbatim
+# token extraction from dense reps is architecture-bound, while SEMANTIC
+# recall works. BABILong qa1/qa2 ("Where is John?" over bAbI facts buried in
+# PG19 prose) is semantic fact recall — bgkit's actual strength — and the
+# stock 0.8B degrades hard with length there, so there is a real gap to
+# close (truncate-4k qa1: 0.41 @16k, 0.35 @32k).
+#
+# Retention here is v6's 67x: a 32k context lands ~470 reps in the decoder,
+# 8x FEWER positions than the truncate-4k baseline gets. Budget-matched
+# comparison is the 6x sibling config (babilong_bgkit_6x.yaml, ~5.4k reps).
+#
+# EVAL ONLY — the babilong_* datasets carry a 4-row split=train filler purely
+# to satisfy the trainer's non-empty-partition contract; nothing trains here.
+#
+# Run (GPU container, no trainer running):
+#   python scripts/eval_phase2_kb.py +experiment=babilong_bgkit_67x \
+#     "+eval.checkpoint=<v6 final>" +eval.per_sample=true \
+#     +eval.max_samples=400 +eval.output_dir=/workspace/checkpoints_fast/babilong_bgkit
+#   .venv/bin/python scripts/score_babilong_bgkit.py --report <report.json> \
+#     --repo-dir $BL/babilong-repo --traj-dir $DATA_DIR/trajectories
+defaults:
+  - /config
+  - /training/phase2_kb_stage_a
+  - _self_
+
+run_name: babilong_bgkit_67x
+
+training:
+  datasets:
+    - babilong_qa1_16k
+    - babilong_qa1_32k
+    - babilong_qa2_16k
+    - babilong_qa2_32k
+  max_samples_per_dataset_default: 1000
+
+  # 0.10 * 0.15 = 0.015 of content tokens reach the decoder (v6's ratio).
+  l0_retention:
+    babilong_qa1_16k: 0.10
+    babilong_qa1_32k: 0.10
+    babilong_qa2_16k: 0.10
+    babilong_qa2_32k: 0.10
+  l1_retention: 0.15
+  selection_mode:
+    l0: exact_topk
+    l1: exact_topk
+
+  qwen_decoder_prob: 1.0
+  training_time_ablation:
+    p_skip_bgkit: 0.0
+    p_skip_topic: 0.0
+    p_noise_bgkit: 0.0
+
+  # The per-sample loop in eval_phase2_kb.py carries the measurement; keep
+  # the trainer's own teacher-forced pass cheap and its free-running pass off.
+  max_eval_samples: 8
+  eval_free_running_samples: 0
+  eval_ablation_modes: []
+  eval_train_subset_samples: 0
+  batch_size: 1

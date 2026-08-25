@@ -221,6 +221,12 @@ def main(cfg: DictConfig) -> None:
                 row = {
                     "dataset": getattr(sample, "dataset_name", ""),
                     "decoder_family": getattr(trainer, "_decoder_family", ""),
+                    # Keep the prompt question with the prediction: the report
+                    # is then self-contained for spot checks, and external
+                    # scorers that need it (BABILong's ``compare_answers``
+                    # excludes labels already named in the question) don't have
+                    # to re-join against the trajectory parquet.
+                    "question": getattr(sample, "question", ""),
                     **result,
                 }
                 if free_result is not None:

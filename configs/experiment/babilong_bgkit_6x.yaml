@@ -1,0 +1,19 @@
+# @package _global_
+# BABILong bgkit arm at v7's ~6x retention — the BUDGET-MATCHED comparison.
+# A 32k context lands ~5.4k reps in the decoder, next to the truncate-4k
+# baseline's 4k tokens. See babilong_bgkit_67x.yaml for the rationale and
+# the run/scoring commands; only the retention and run_name differ.
+defaults:
+  - /experiment/babilong_bgkit_67x
+  - _self_
+
+run_name: babilong_bgkit_6x
+
+training:
+  # 0.35 * 0.5 = 0.175 of content tokens reach the decoder (v7's ratio).
+  l0_retention:
+    babilong_qa1_16k: 0.35
+    babilong_qa1_32k: 0.35
+    babilong_qa2_16k: 0.35
+    babilong_qa2_32k: 0.35
+  l1_retention: 0.5
