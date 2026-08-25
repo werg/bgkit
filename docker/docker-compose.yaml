@@ -696,6 +696,14 @@ services:
     restart: "no"
     command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v7_ratio6x"]
 
+  # Long-prose semantic fact recall (babilong_style) alongside the code
+  # wide-net datasets; the zero-shot BABILong arm scored 0.00 on every cell
+  # (2026-08-25), teacher-forced and free-running alike.
+  train-phase2-kb-babilong-v1:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_babilong_v1"]
+
   # Family-A blob compaction SFT (lean trainer over SWE-Zero trajectories;
   # capability-packaging §4, built 2026-08-24).
   train-blob-sft-v1:
