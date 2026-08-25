@@ -57,3 +57,15 @@ def test_explicit_base_lr_is_not_overwritten():
         [{"params": [p], "lr": 1e-5, "base_lr": 7e-5}], default_lr=1e-4,
     )
     assert opt.param_groups[0]["base_lr"] == pytest.approx(7e-5)
+
+
+def test_duplicate_param_across_groups_is_rejected():
+    """A parameter in two groups is stepped twice per iteration; one in no
+    group never trains. Both are silent, and both are the same class of
+    defect as the LR flattening that cost months (2026-08-25)."""
+    p = torch.nn.Parameter(torch.zeros(4))
+    with pytest.raises(ValueError, match="updated twice"):
+        _trainer()._create_optimizer(
+            [{"params": [p], "lr": 1e-4}, {"params": [p], "lr": 2e-4}],
+            default_lr=1e-4,
+        )

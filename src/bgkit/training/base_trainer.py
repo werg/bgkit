@@ -923,6 +923,33 @@ class BaseTrainer(ABC):
             if "base_lr" not in group:
                 group["base_lr"] = float(group.get("lr", default_lr))
 
+        # NO SILENT CONFIG. The per-group-LR bug survived months because
+        # nothing ever printed the rates actually in force — the yaml said
+        # decoder_lr 5e-5, the checkpoint said 1e-4, and no log line
+        # contradicted either. One line per group at construction makes the
+        # resolved schedule greppable in every run.
+        for i, group in enumerate(param_groups):
+            n_params = sum(p.numel() for p in group["params"])
+            logger.info(
+                "optimizer_param_group",
+                index=i,
+                base_lr=float(group["base_lr"]),
+                params=n_params,
+                tensors=len(group["params"]),
+            )
+        # A parameter in two groups gets stepped twice per iteration; one in
+        # none never trains at all. Both are silent — and both are the same
+        # class of defect as the LR flattening.
+        seen: dict[int, int] = {}
+        for i, group in enumerate(param_groups):
+            for p in group["params"]:
+                if id(p) in seen:
+                    raise ValueError(
+                        f"parameter appears in optimizer groups {seen[id(p)]} and {i}: "
+                        "it would be updated twice per step"
+                    )
+                seen[id(p)] = i
+
         if optimizer_type == "muon":
             from bgkit.training.muon import Muon
 
