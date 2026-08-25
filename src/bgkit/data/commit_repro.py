@@ -1,44 +1,24 @@
-"""Git-commit-reproduction Phase 2 dataset (``git_commit_repro``).
+"""Versioned git-history knowledge-base contract.
 
-This module is the shared library behind the four ``scripts/*_commit_repro*``
-build stages. It replaces the flat ``git_qa`` / ``git_history`` task with a
-*multi-level commit-diff reproduction* task:
+Schema v2 walks the coherent HEAD first-parent chain, preserves real commit and
+parent SHAs, complete unified patches, and rename lineages, and admits a file
+state as a target only after exact structured-hunk replay. Periodic base
+snapshots make every window independently and boundedly reconstructable.
 
-- **Per repo** we walk the OLDEST commits first (chronological ascending from
-  the root commit) and take commits until the cumulative diff-token count
-  reaches a per-repo token budget ``B``. ``B`` is chosen globally so the
-  AVERAGE commit count across repos ≈ 64 (commits vary in size, so the actual
-  count ``N`` varies per repo).
-
-- **Leaf content** is the *per-file diff patch* — one mmap document per changed
-  file per commit, L0-encodable exactly like a Phase 2 article.
-
-- **Tree** (one balanced ~4-ary subtree per repo, all under a shared synthetic
-  ``root`` — a forest): ``root → repo → chunk16 → chunk4 → commit``. ``commit``
-  is a BrowseTree *leaf-tag* whose ``articles`` list holds that commit's
-  file-change document ids. The chunk levels are positional (commit order),
-  not semantic. Proportionally sized to ``N``:
-
-  * ``N < 4``    → flat: ``root → repo → commit``
-  * ``4 ≤ N ≤ 16`` → one chunk level: ``root → repo → chunk4 → commit``
-  * ``N > 16``   → two chunk levels: ``root → repo → chunk16 → chunk4 → commit``
-
-- **Task / trajectory**: reproduce the commit's full diff. The *query* is the
-  commit message wrapped in a prompt (the message is NOT stored in the tree).
-  ``gold_answer`` is the full serialized diff. The trajectory walks
-  ``browse(repo) → browse(chunk16) → browse(chunk4) → bgkit([commit], query)
-  → answer(diff)`` over the SHARED per-repo tree; each commit gets its own
-  trajectory keyed by its message-query.
-
-The shared tree means: encode the repo's tree once, reproduce each commit by
-its own query.
+The tree is a balanced opaque-ID forest, roughly
+``root → repo → window → chunk16 → chunk4 → commit → evidence``.
+Repository splits and generation fingerprints bind the raw, tree, mmap, and
+trajectory artifacts so mixed builds fail before training.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import statistics
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
 
 import pygit2
 
@@ -51,47 +31,41 @@ from bgkit.data.drilldown import (
     DrillTarget,
     build_drilldown_trajectory,
 )
+from bgkit.data.opaque_ids import bip39_id
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 DATASET_NAME = "git_commit_repro"
+GIT_REPRO_SCHEMA_VERSION = 2
+ID_SCHEME_VERSION = 2
+DEFAULT_ID_SALT = "bgkit/git_commit_repro/v2"
+DEFAULT_RECONSTRUCTION_ANCHOR_INTERVAL = 8
+SUPPORTED_CHANGE_TYPES = frozenset({
+    "added", "copied", "deleted", "modified", "renamed", "typechange",
+})
 
-# File-state-reconstruction prompt templates. The decoder is given a filename
-# + the FULL target-commit message and must emit the file's full content as it
-# stands AFTER that commit, reconstructed from the file's diff history (and
-# imputed where history is partial). The commit messages / filenames are the
-# query — never part of the encodable tree content (the tree holds only diffs).
+# File-state-reconstruction prompt templates. The decoder is given an exact
+# commit key as well as the human-readable message.  Schema-v2 evidence stores
+# the same key + message in the commit's leaves, making navigation a real join
+# rather than a semantic guess or a repository-memorisation shortcut.
 QUERY_TEMPLATES = (
-    "give me the state of {filename} after applying the commit with this "
-    "message: {message}",
-    "show the full contents of {filename} as of the commit described by: "
-    "{message}",
-    "reconstruct {filename} as it stands after the change with commit message: "
-    "{message}",
-    "what does {filename} look like after the commit whose message is: "
-    "{message}",
+    "give me the state of {filename} at commit {sha} ({message})",
+    "show the full contents of {filename} after commit {sha}; message: {message}",
+    "reconstruct {filename} at git commit {sha}, described as: {message}",
+    "what does {filename} look like after {sha}? Commit message: {message}",
 )
 
-# Reconstruction-walk defaults (tunable via scripts/args).
-MAX_PRECEDING_COMMITS = 6  # K — preceding file-touching commits to walk (legacy browse walk)
-DRILL_PROB = 0.5  # P(bgkit-drill the target file's diff at a PRECEDING commit) (legacy)
-GOLD_TOKEN_CAP = 8192  # a (file, commit) is a target only if its blob ≤ this
-
 # --- Drill-down redesign (2026-07-03) defaults ---
-# Cap on the number of touching-diff drill targets per sample (a file is touched
-# by many commits; the drill-down finds up to this many, most-recent first).
-MAX_TOUCHING_DIFFS = 8
 # 0..this distractor branches (wrong siblings, loss=False) sprinkled per sample.
 MAX_DISTRACTORS = 4
 
 # Head-node task query — the sample-specific compression prompt that orients the
 # drill-down (distinct from the reconstruction question). Query-navigation phrasing.
 HEAD_QUERY_TEMPLATES = (
-    "find the diffs that touched {filename} up to the commit with this message: "
-    "{message}",
-    "locate every change to {filename} through the commit described by: {message}",
+    "find the reconstruction chain for {filename} through commit {sha} ({message})",
+    "locate every required change to {filename} through git commit {sha}: {message}",
 )
 
 # Target average commit count per repo. The global token budget B is derived
@@ -101,15 +75,6 @@ TARGET_AVG_COMMITS = 64
 # Positional chunking fan-out (~4-ary). chunk4 groups ~4 commits; chunk16
 # groups ~4 chunk4 nodes (so ~16 commits).
 CHUNK_FANOUT = 4
-
-# pygit2 sort: oldest-ancestor first.
-try:  # pygit2 >= 1.15 exposes enums
-    from pygit2.enums import SortMode as _SortMode
-
-    _SORT_OLDEST_FIRST = _SortMode.TOPOLOGICAL | _SortMode.REVERSE
-except Exception:  # pragma: no cover - very old pygit2
-    _SORT_OLDEST_FIRST = pygit2.GIT_SORT_TOPOLOGICAL | pygit2.GIT_SORT_REVERSE
-
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -130,11 +95,22 @@ class FileChange:
 
     file_idx: int
     path: str
-    diff_text: str  # "--- {path}\n{hunks...}"
+    diff_text: str  # complete unified patch, including hunk coordinates
     n_tokens: int = 0  # diff tokens
     blob_text: str = ""  # full file content at this commit (only stored for targets)
     n_blob_tokens: int = 0  # gold blob token count (0 == deleted / no blob)
     is_target: bool = False  # blob decodable AND ≤ gold cap
+    old_path: str = ""
+    change_type: str = "modified"
+    lineage_id: str = ""
+    # Structured hunks are the machine-verifiable form of ``diff_text``.  The
+    # text is encoded into the KB; these records let the artifact builder prove
+    # that applying the evidence reproduces ``blob_text`` exactly.
+    hunks: list[dict[str, Any]] = field(default_factory=list)
+    base_blob_text: str = ""
+    base_blob_available: bool = False
+    is_anchor: bool = False
+    reconstruction_valid: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -151,25 +127,21 @@ class ReproCommit:
 
     repo: str  # "owner/repo"
     sha: str
+    parent_sha: str
     ordinal: int  # 0 == oldest commit within this window
     message: str
     timestamp: int
     window_idx: int = 0
     file_changes: list[FileChange] = field(default_factory=list)
     n_diff_tokens: int = 0  # sum over file_changes
+    schema_version: int = GIT_REPRO_SCHEMA_VERSION
 
     # -- id helpers (stable keys shared by mmap / tree / trajectory) --
     #
-    # POSITIONAL-PATH ids (2026-07): interior tree node ids are the node's
-    # root-relative chunk path (``{repo}/w000/c16.00/c4.01/cm.03``), so a drill
-    # turn emits the known parent path + one new small-index segment (learnable
-    # navigation) instead of copying an arbitrary opaque token. Leaf (file-change)
-    # ids are the file PATH scoped by the commit PATH id. The path components
-    # depend on the commit's position WITHIN its window's chunking, which only the
-    # tree builder knows — so the commit/leaf ids are produced by
-    # :func:`build_window_subtree_nodes` and carried to the mmap / trajectory
-    # builders via the ``commit_node_ids`` sidecar (``commit_key -> path id``).
-    # There is no pure ``(repo, sha) -> id`` function any more.
+    # Model-facing ids are opaque hashes.  Positional paths and filenames were a
+    # copy shortcut: the decoder could manufacture a child/article id without
+    # reading the parent representation.  The sidecar remains the authoritative
+    # join between independently-built tree/mmap/trajectory artifacts.
 
     @property
     def commit_key(self) -> str:
@@ -205,52 +177,27 @@ def commit_key(repo: str, window_idx: int, ordinal: int) -> str:
     return f"{repo}@w{window_idx:03d}:{ordinal:04d}"
 
 
-def surrogate_sha(
-    repo: str, window_idx: int, ordinal: int, message: str, timestamp: int,
-) -> str:
-    """Stable UNIQUE per-commit hash used as the commit's ``sha`` for id
-    derivation.
+def _opaque_id(namespace: str, key: str, *, salt: str = DEFAULT_ID_SALT) -> str:
+    """Return a short, non-positional model-facing id.
 
-    The upstream extractor never recorded the real git sha (``sha=""`` hardcoded
-    in ``extract_commit_repro.py``), so ``commit_node_id = bip39('cm|'+sha)``
-    collapsed EVERY commit of a repo onto one id — 99.3% of repos had all commits
-    map to a single node, destroying commit-level navigation. This surrogate
-    restores the intended property: a stable, unique, content-linked hash per
-    commit (the ``(repo, window, ordinal)`` positional key guarantees
-    uniqueness; the message + timestamp fold in commit content). ``bip39_id``
-    then maps it to opaque, tokenizer-friendly words exactly as designed —
-    unguessable from the ordinal because the model cannot invert sha256.
-
-    NOTE: this is not the real git sha (recovering that needs a full
-    re-extraction / re-tokenization). It is functionally equivalent for the id
-    scheme: unique + stable + opaque. A later real-sha re-extraction and/or
-    per-epoch id re-salting (anti-memorization) can supersede it.
+    Four BIP-39 words provide a 44-bit space.  Builders additionally reject any
+    collision across the concrete artifact, so a collision can never silently
+    alias two nodes.
     """
-    payload = f"{repo}\x00{window_idx}\x00{ordinal}\x00{message}\x00{timestamp}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return bip39_id(
+        f"{ID_SCHEME_VERSION}\x00{salt}\x00{namespace}\x00{key}",
+        n_words=4,
+    )
 
 
 def sha_for_record(rec: dict) -> str:
-    """Compute :func:`surrogate_sha` from a raw JSONL commit record.
-
-    Single source of truth so the tree / mmap / trajectory build stages derive
-    BIT-IDENTICAL commit shas (and therefore identical node ids) from the same
-    record — a divergence here would silently break the mmap document_id ↔
-    trajectory file_change_id join.
-
-    Prefers a REAL git sha when the record carries one (a future re-extraction
-    that populates ``sha``); falls back to :func:`surrogate_sha` for the current
-    ``sha=""`` corpus.
-    """
+    """Return the real git SHA, rejecting legacy surrogate-only records."""
     real = str(rec.get("sha", "")).strip()
     if real:
         return real
-    return surrogate_sha(
-        repo=str(rec["repo"]),
-        window_idx=int(rec.get("window_idx", 0)),
-        ordinal=int(rec["ordinal"]),
-        message=str(rec.get("message", "")),
-        timestamp=int(rec.get("timestamp", 0)),
+    raise ValueError(
+        "git_commit_repro record has no real commit SHA; re-extract schema-v2 "
+        "artifacts instead of manufacturing an identity from row position"
     )
 
 
@@ -259,33 +206,33 @@ def sha_for_record(rec: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def window_node_id(repo: str, window_idx: int) -> str:
-    """Positional-path id for a ``(repo, window)`` node: ``f"{repo}/w{window:03d}"``.
+def window_node_id(
+    repo: str, window_idx: int, *, id_salt: str = DEFAULT_ID_SALT,
+) -> str:
+    """Opaque id for a repository history window."""
+    return _opaque_id("window", f"{repo}\x00{window_idx}", salt=id_salt)
 
-    The drill-down head, and the root of every commit's chunk path. Path-based
-    (was opaque BIP-39): the id IS the node's root-relative address, so a drill
-    turn emits the parent path + one new segment — learnable positional
-    navigation. This is a pure function of ``(repo, window)``, so the tree
-    builder and the trajectory head compute the identical string; the deeper
-    (c16 / c4 / commit) path ids need the window's chunking and are assigned by
-    :func:`build_window_subtree_nodes` (carried via the sidecar).
-    """
-    return f"{repo}/w{window_idx:03d}"
+
+def commit_node_id(commit: ReproCommit, *, id_salt: str = DEFAULT_ID_SALT) -> str:
+    """Opaque id for a commit; never depends on its displayed position."""
+    return _opaque_id(
+        "commit", f"{commit.repo}\x00{commit.sha}", salt=id_salt,
+    )
 
 
 def file_change_leaf_id(
-    commit_node_id: str, path: str, file_idx: int, *, duplicated: bool = False,
+    commit_node_id: str,
+    path: str,
+    file_idx: int,
+    *,
+    duplicated: bool = False,
+    id_salt: str = DEFAULT_ID_SALT,
 ) -> str:
-    """Leaf (file-change) id: the file ``path`` scoped by the commit PATH id.
-
-    ``commit_node_id`` is now the commit's positional chunk path, so the leaf id
-    is ``{repo}/w000/c16.00/c4.01/cm.03/{path}`` — a globally-unique address whose
-    final component is the file name the query already names. ``duplicated`` (a
-    commit touching two identical paths) appends a minimal ``#f{file_idx:03d}``
-    discriminator; otherwise the bare path is used.
-    """
-    base = f"{commit_node_id}/{path}"
-    return f"{base}#f{file_idx:03d}" if duplicated else base
+    """Opaque file-evidence id scoped to its opaque commit id."""
+    discriminator = file_idx if duplicated else 0
+    return _opaque_id(
+        "file", f"{commit_node_id}\x00{path}\x00{discriminator}", salt=id_salt,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -293,17 +240,72 @@ def file_change_leaf_id(
 # ---------------------------------------------------------------------------
 
 
-def _per_file_diff_text(patch: pygit2.Patch) -> tuple[str, str]:
-    """Return ``(path, "--- {path}\\n{hunks}")`` for one file patch."""
-    path = patch.delta.new_file.path
-    parts = [f"--- {path}"]
-    for hunk in patch.hunks:
-        parts.append("".join(f"{ln.origin}{ln.content}" for ln in hunk.lines))
-    return path, "\n".join(parts)
+@dataclass(frozen=True)
+class WalkedFileChange:
+    """A lossless textual delta emitted by the git walker."""
+
+    path: str
+    old_path: str
+    change_type: str
+    lineage_id: str
+    diff_text: str
+    hunks: list[dict[str, Any]]
+    base_blob_text: str | None
+    blob_text: str | None
+
+
+def _delta_type(delta: pygit2.DiffDelta) -> str:
+    names = {
+        pygit2.GIT_DELTA_ADDED: "added",
+        pygit2.GIT_DELTA_DELETED: "deleted",
+        pygit2.GIT_DELTA_MODIFIED: "modified",
+        pygit2.GIT_DELTA_RENAMED: "renamed",
+        pygit2.GIT_DELTA_COPIED: "copied",
+        pygit2.GIT_DELTA_TYPECHANGE: "typechange",
+    }
+    return names.get(int(delta.status), f"delta-{int(delta.status)}")
+
+
+def _structured_hunks(patch: pygit2.Patch) -> list[dict[str, Any]]:
+    """Serialize every hunk coordinate and line needed for exact replay."""
+    return [
+        {
+            "old_start": int(h.old_start),
+            "old_lines": int(h.old_lines),
+            "new_start": int(h.new_start),
+            "new_lines": int(h.new_lines),
+            "lines": [
+                {"origin": str(line.origin), "content": str(line.content)}
+                for line in h.lines
+                if str(line.origin) in {" ", "+", "-"}
+            ],
+        }
+        for h in patch.hunks
+    ]
+
+
+def _per_file_diff_text(patch: pygit2.Patch) -> str:
+    """Return the complete unified patch, including headers and coordinates."""
+    try:
+        return str(patch.text)
+    except (AttributeError, UnicodeDecodeError):
+        delta = patch.delta
+        parts = [
+            f"diff --git a/{delta.old_file.path} b/{delta.new_file.path}",
+            f"--- a/{delta.old_file.path}",
+            f"+++ b/{delta.new_file.path}",
+        ]
+        for hunk in patch.hunks:
+            parts.append(
+                f"@@ -{hunk.old_start},{hunk.old_lines} "
+                f"+{hunk.new_start},{hunk.new_lines} @@"
+            )
+            parts.append("".join(f"{ln.origin}{ln.content}" for ln in hunk.lines))
+        return "\n".join(parts)
 
 
 def _blob_text_at_commit(
-    commit: pygit2.Commit, path: str,
+    commit: pygit2.Commit | None, path: str,
 ) -> str | None:
     """Return the file's full decoded content at ``commit``, or ``None``.
 
@@ -312,6 +314,8 @@ def _blob_text_at_commit(
     file-change has no valid reconstruction target, though its diff leaf may
     still exist for navigation in another file's history.
     """
+    if commit is None:
+        return ""
     try:
         data = commit.tree[path].data
     except (KeyError, AttributeError):
@@ -322,14 +326,61 @@ def _blob_text_at_commit(
         return None  # binary / undecodable
 
 
+def apply_structured_patch(base_text: str, hunks: list[dict[str, Any]]) -> str:
+    """Apply serialized textual hunks, validating coordinates and context."""
+    base = base_text.splitlines(keepends=True)
+    output: list[str] = []
+    cursor = 0
+    for hunk in hunks:
+        old_start = int(hunk["old_start"])
+        start = 0 if old_start == 0 else old_start - 1
+        if start < cursor or start > len(base):
+            raise ValueError(
+                f"invalid/overlapping hunk start {old_start} for {len(base)} base lines"
+            )
+        output.extend(base[cursor:start])
+        cursor = start
+        consumed = 0
+        produced = 0
+        for line in hunk.get("lines", []):
+            origin = str(line["origin"])
+            content = str(line["content"])
+            if origin in {" ", "-"}:
+                if cursor >= len(base) or base[cursor] != content:
+                    actual = "<eof>" if cursor >= len(base) else repr(base[cursor])
+                    raise ValueError(
+                        f"patch context mismatch at line {cursor + 1}: "
+                        f"expected {content!r}, got {actual}"
+                    )
+                if origin == " ":
+                    output.append(content)
+                    produced += 1
+                cursor += 1
+                consumed += 1
+            elif origin == "+":
+                output.append(content)
+                produced += 1
+            else:
+                raise ValueError(f"unsupported patch line origin {origin!r}")
+        if consumed != int(hunk["old_lines"]):
+            raise ValueError(
+                f"hunk consumed {consumed} old lines, expected {hunk['old_lines']}"
+            )
+        if produced != int(hunk["new_lines"]):
+            raise ValueError(
+                f"hunk produced {produced} new lines, expected {hunk['new_lines']}"
+            )
+    output.extend(base[cursor:])
+    return "".join(output)
+
+
 def walk_repo_commits_oldest_first(
     repo_path: str,
     repo_id: str,
     *,
-    exclude_merges: bool = True,
     max_walked: int | None = None,
 ):
-    """Yield ``(sha, message, timestamp, [(path, diff_text, blob_text)])`` oldest-first.
+    """Yield a coherent HEAD first-parent history, oldest first.
 
     ``sha`` is the full commit hex id (the real git sha — used to build the
     opaque, unique commit node id; historically dropped, which collapsed every
@@ -339,18 +390,29 @@ def walk_repo_commits_oldest_first(
     for deletions/binary. Token counting / budgeting / gating is done by the
     caller so this stays tokenizer-free (cheap to reuse in calibration).
     """
+    if max_walked is not None and max_walked < 1:
+        raise ValueError("max_walked must be >= 1 or None")
     repo = pygit2.Repository(repo_path)
     try:
         head = repo.head.target
     except pygit2.GitError:
         return
-    walked = 0
-    for commit in repo.walk(head, _SORT_OLDEST_FIRST):
-        walked += 1
-        if max_walked is not None and walked > max_walked:
+    chain: list[pygit2.Commit] = []
+    commit = repo[head]
+    while isinstance(commit, pygit2.Commit):
+        chain.append(commit)
+        # Walk from HEAD so a cap keeps the most recent history and also bounds
+        # traversal work. The old implementation traversed the entire repo and
+        # then retained the *oldest* N commits after reversing the list.
+        if max_walked is not None and len(chain) >= max_walked:
             break
-        if exclude_merges and len(commit.parents) > 1:
-            continue
+        if not commit.parents:
+            break
+        commit = commit.parents[0]
+    chain.reverse()
+
+    lineage_by_path: dict[str, str] = {}
+    for commit in chain:
         parent = commit.parents[0] if commit.parents else None
         try:
             diff = (
@@ -361,23 +423,327 @@ def walk_repo_commits_oldest_first(
             diff.find_similar()
         except (pygit2.GitError, ValueError, KeyError):
             continue
-        files: list[tuple[str, str, str | None]] = []
+        files: list[WalkedFileChange] = []
         for patch in diff:
             try:
-                # Skip binary files (pygit2 yields no text hunks) and
-                # content-less changes (pure rename / mode-only): both would
-                # otherwise become trivial header-only "--- path" leaves that
-                # pollute the reproduction targets with unreproducible noise.
-                if patch.delta.is_binary or not patch.hunks:
+                if patch.delta.is_binary:
                     continue
-                path, diff_text = _per_file_diff_text(patch)
+                delta = patch.delta
+                old_path = str(delta.old_file.path or "")
+                path = str(delta.new_file.path or old_path)
+                change_type = _delta_type(delta)
+                if change_type not in SUPPORTED_CHANGE_TYPES:
+                    continue
+                if change_type == "deleted":
+                    path = old_path
+
+                if change_type == "renamed":
+                    lineage_id = lineage_by_path.pop(old_path, "")
+                    if not lineage_id:
+                        lineage_id = hashlib.sha256(
+                            f"{repo_id}\x00{commit.id}\x00{old_path}".encode()
+                        ).hexdigest()
+                    lineage_by_path[path] = lineage_id
+                elif change_type == "copied":
+                    lineage_id = hashlib.sha256(
+                        f"{repo_id}\x00{commit.id}\x00copy\x00{path}".encode()
+                    ).hexdigest()
+                    lineage_by_path[path] = lineage_id
+                else:
+                    lineage_id = lineage_by_path.get(path, "")
+                    if not lineage_id:
+                        lineage_id = hashlib.sha256(
+                            f"{repo_id}\x00{commit.id}\x00{path}".encode()
+                        ).hexdigest()
+                    if change_type == "deleted":
+                        lineage_by_path.pop(path, None)
+                    else:
+                        lineage_by_path[path] = lineage_id
+
+                diff_text = _per_file_diff_text(patch)
+                hunks = _structured_hunks(patch)
             except (pygit2.GitError, ValueError):
                 continue
-            blob_text = _blob_text_at_commit(commit, path)
-            files.append((path, diff_text, blob_text))
+            files.append(WalkedFileChange(
+                path=path,
+                old_path=old_path,
+                change_type=change_type,
+                lineage_id=lineage_id,
+                diff_text=diff_text,
+                hunks=hunks,
+                base_blob_text=_blob_text_at_commit(parent, old_path),
+                blob_text=(
+                    None if change_type == "deleted"
+                    else _blob_text_at_commit(commit, path)
+                ),
+            ))
         if not files:
             continue
-        yield str(commit.id), commit.message.strip(), int(commit.commit_time), files
+        yield (
+            str(commit.id),
+            str(parent.id) if parent is not None else "",
+            commit.message.strip(),
+            int(commit.commit_time),
+            files,
+        )
+
+
+def require_record_schema(rec: dict[str, Any]) -> None:
+    """Reject legacy git-repro records before they contaminate new artifacts."""
+    version = int(rec.get("schema_version", 0) or 0)
+    if version != GIT_REPRO_SCHEMA_VERSION:
+        raise ValueError(
+            "git_commit_repro artifact schema mismatch: "
+            f"expected {GIT_REPRO_SCHEMA_VERSION}, got {version}. "
+            "Re-run scripts/extract_commit_repro.py; schema-v1 records omit "
+            "reconstruction anchors, parent SHAs, and lossless hunks."
+        )
+    sha = str(rec.get("sha", "")).strip()
+    if not sha:
+        raise ValueError("schema-v2 git_commit_repro record has no real commit SHA")
+    if len(sha) not in {40, 64} or any(c not in "0123456789abcdef" for c in sha.lower()):
+        raise ValueError(f"schema-v2 git_commit_repro record has invalid SHA {sha!r}")
+    if "parent_sha" not in rec:
+        raise ValueError("schema-v2 git_commit_repro record has no parent_sha")
+    parent_sha = str(rec.get("parent_sha", "")).strip()
+    if parent_sha and (
+        len(parent_sha) not in {40, 64}
+        or any(c not in "0123456789abcdef" for c in parent_sha.lower())
+    ):
+        raise ValueError(f"schema-v2 record has invalid parent SHA {parent_sha!r}")
+    if not str(rec.get("repo", "")).strip():
+        raise ValueError("schema-v2 git_commit_repro record has no repository id")
+    if int(rec.get("window_idx", -1)) < 0 or int(rec.get("ordinal", -1)) < 0:
+        raise ValueError("schema-v2 git_commit_repro window/ordinal must be non-negative")
+    file_changes = rec.get("file_changes", [])
+    if not isinstance(file_changes, list) or not file_changes:
+        raise ValueError("schema-v2 git_commit_repro record has no file changes")
+    file_indices: set[int] = set()
+    for fc in file_changes:
+        required = {
+            "file_idx", "path", "old_path", "change_type", "lineage_id",
+            "diff_text", "hunks", "base_blob_text", "base_blob_available",
+            "blob_text", "is_target", "is_anchor", "reconstruction_valid",
+        }
+        missing = required - set(fc)
+        if missing:
+            raise ValueError(
+                f"schema-v2 file change is missing required fields: {sorted(missing)}"
+            )
+        file_idx = int(fc.get("file_idx", -1))
+        if file_idx < 0 or file_idx in file_indices:
+            raise ValueError("schema-v2 file_idx values must be unique and non-negative")
+        file_indices.add(file_idx)
+        if not str(fc.get("path", "")) or not str(fc.get("lineage_id", "")):
+            raise ValueError("schema-v2 file change has an empty path or lineage")
+        if str(fc.get("change_type")) not in SUPPORTED_CHANGE_TYPES:
+            raise ValueError("schema-v2 file change has an invalid change_type")
+        if not isinstance(fc.get("diff_text"), str):
+            raise ValueError("schema-v2 file-change diff_text must be text")
+        if not isinstance(fc.get("base_blob_text"), str):
+            raise ValueError("schema-v2 file-change base_blob_text must be text")
+        if not isinstance(fc.get("blob_text"), str):
+            raise ValueError("schema-v2 file-change blob_text must be text")
+        if not isinstance(fc.get("hunks"), list):
+            raise ValueError("schema-v2 file-change hunks must be a list")
+        if bool(fc.get("is_target")) != bool(fc.get("reconstruction_valid")):
+            raise ValueError(
+                "schema-v2 target and reconstruction_valid flags must agree"
+            )
+        if bool(fc.get("is_anchor")) and not (
+            bool(fc.get("reconstruction_valid"))
+            and bool(fc.get("base_blob_available"))
+        ):
+            raise ValueError("schema-v2 reconstruction anchor has no valid base")
+
+
+def file_sha256(path: str | Path) -> str:
+    """Stream a file fingerprint used to bind independently-built artifacts."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_commit_node_sidecar(
+    path: str | Path,
+    *,
+    expected_source_sha256: str | None = None,
+) -> tuple[dict[str, str], str, dict[str, Any]]:
+    """Load and validate the versioned tree/mmap/trajectory ID join."""
+    payload = json.loads(Path(path).read_text())
+    if int(payload.get("schema_version", 0)) != GIT_REPRO_SCHEMA_VERSION:
+        raise ValueError(
+            "legacy or invalid commit-node sidecar; rebuild the browse tree "
+            "with scripts/build_commit_repro_tree.py"
+        )
+    if int(payload.get("id_scheme_version", 0)) != ID_SCHEME_VERSION:
+        raise ValueError("commit-node sidecar uses an unsupported id scheme")
+    source_sha = str(payload.get("source_sha256", ""))
+    if not source_sha or not str(payload.get("tree_sha256", "")):
+        raise ValueError("commit-node sidecar has incomplete provenance hashes")
+    id_salt = str(payload.get("id_salt", ""))
+    if not id_salt:
+        raise ValueError("commit-node sidecar has no ID salt")
+    if expected_source_sha256 is not None and source_sha != expected_source_sha256:
+        raise ValueError(
+            "commit-node sidecar was built from a different raw JSONL; rebuild "
+            "tree, mmap, and trajectories together"
+        )
+    mapping = payload.get("commit_node_ids")
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError("commit-node sidecar has no commit_node_ids mapping")
+    if len(mapping) != len(set(str(value) for value in mapping.values())):
+        raise ValueError("commit-node sidecar aliases multiple commits to one node")
+    return (
+        {str(key): str(value) for key, value in mapping.items()},
+        id_salt,
+        payload,
+    )
+
+
+def stable_repo_split(
+    repo: str,
+    *,
+    eval_fraction: float = 0.05,
+    seed: int = 42,
+) -> str:
+    """Assign a repository—not a row—to a deterministic train/eval split."""
+    if not 0.0 < eval_fraction < 1.0:
+        raise ValueError(f"eval_fraction must be in (0, 1), got {eval_fraction}")
+    digest = hashlib.sha256(f"{seed}\x00{repo}".encode()).digest()
+    bucket = int.from_bytes(digest[:8], "big") / float(1 << 64)
+    return "eval" if bucket < eval_fraction else "train"
+
+
+def prepare_reconstruction_chains(
+    commits: list[ReproCommit],
+    *,
+    anchor_interval: int = DEFAULT_RECONSTRUCTION_ANCHOR_INTERVAL,
+    state: dict[str, tuple[str, int]] | None = None,
+) -> dict[str, int]:
+    """Validate every target and install periodic exact base snapshots.
+
+    A target is retained only when applying its structured patch to the actual
+    parent blob exactly reproduces the gold blob.  Within each file lineage, a
+    base snapshot is retained at the first target, after any discontinuity
+    caused by filtering/deletion/binary data, and at least every
+    ``anchor_interval`` changes.  Consequently every target has a bounded,
+    deterministic evidence chain and later windows are self-contained.
+    """
+    if anchor_interval < 1:
+        raise ValueError("anchor_interval must be >= 1")
+
+    stats = {
+        "targets_checked": 0,
+        "targets_valid": 0,
+        "targets_rejected": 0,
+        "anchors": 0,
+    }
+    chain_state = state if state is not None else {}
+    for commit in sorted(commits, key=lambda c: c.ordinal):
+        for fc in commit.file_changes:
+            fc.is_anchor = False
+            fc.reconstruction_valid = False
+            lineage = fc.lineage_id or fc.path
+            if not fc.is_target:
+                # An unobserved textual state breaks the patch chain.  The next
+                # eligible target re-anchors against its real git parent blob.
+                chain_state.pop(lineage, None)
+                continue
+
+            stats["targets_checked"] += 1
+            if not fc.base_blob_available:
+                fc.is_target = False
+                fc.blob_text = ""
+                stats["targets_rejected"] += 1
+                chain_state.pop(lineage, None)
+                continue
+            try:
+                reconstructed = apply_structured_patch(fc.base_blob_text, fc.hunks)
+            except ValueError:
+                reconstructed = None
+            if reconstructed is None or reconstructed != fc.blob_text:
+                fc.is_target = False
+                fc.blob_text = ""
+                fc.base_blob_text = ""
+                stats["targets_rejected"] += 1
+                chain_state.pop(lineage, None)
+                continue
+
+            prior = chain_state.get(lineage)
+            continuous = prior is not None and prior[0] == fc.base_blob_text
+            distance = prior[1] + 1 if continuous else anchor_interval
+            if not continuous or distance >= anchor_interval:
+                fc.is_anchor = True
+                distance = 0
+                stats["anchors"] += 1
+            else:
+                # The previous validated target supplies this transition's
+                # base, so the raw artifact does not need another full copy.
+                fc.base_blob_text = ""
+            fc.reconstruction_valid = True
+            chain_state[lineage] = (fc.blob_text, distance)
+            stats["targets_valid"] += 1
+    return stats
+
+
+def reconstruction_chain(
+    history: list[tuple[int, FileChange]], target_pos: int,
+) -> list[tuple[int, FileChange]]:
+    """Return the complete validated anchor→target evidence chain."""
+    if target_pos < 0 or target_pos >= len(history):
+        raise IndexError(target_pos)
+    target = history[target_pos][1]
+    if not target.is_target or not target.reconstruction_valid:
+        raise ValueError("target is not exactly reconstructable")
+    anchor_pos = target_pos
+    while anchor_pos >= 0 and not history[anchor_pos][1].is_anchor:
+        anchor_pos -= 1
+    if anchor_pos < 0:
+        raise ValueError("reconstructable target has no base-snapshot anchor")
+    chain = history[anchor_pos:target_pos + 1]
+    if not all(fc.reconstruction_valid for _ordinal, fc in chain):
+        raise ValueError("reconstruction chain contains an invalid state transition")
+    state = chain[0][1].base_blob_text
+    if not chain[0][1].base_blob_available:
+        raise ValueError("reconstruction chain anchor has no base snapshot")
+    for ordinal, fc in chain:
+        try:
+            state = apply_structured_patch(state, fc.hunks)
+        except ValueError as exc:
+            raise ValueError(
+                f"reconstruction chain patch failed at ordinal {ordinal}: {exc}"
+            ) from exc
+        if state != fc.blob_text:
+            raise ValueError(
+                f"reconstruction chain does not reproduce ordinal {ordinal}"
+            )
+    return chain
+
+
+def render_file_change_evidence(commit: ReproCommit, fc: FileChange) -> str:
+    """Render the exact, query-addressable evidence encoded into the KB."""
+    message = commit.message.strip()
+    fields = [
+        f"bgkit-git-evidence-v{GIT_REPRO_SCHEMA_VERSION}",
+        f"commit-sha: {commit.sha}",
+        f"parent-sha: {commit.parent_sha or '<root>'}",
+        f"commit-message: {message}",
+        f"timestamp: {commit.timestamp}",
+        f"change-type: {fc.change_type}",
+        f"old-path: {fc.old_path or fc.path}",
+        f"path: {fc.path}",
+        f"lineage: {fc.lineage_id}",
+        f"base-snapshot: {'present' if fc.is_anchor else 'previous-state'}",
+    ]
+    if fc.is_anchor:
+        fields.extend(("--- BEGIN BASE SNAPSHOT ---", fc.base_blob_text,
+                       "--- END BASE SNAPSHOT ---"))
+    fields.extend(("--- BEGIN UNIFIED PATCH ---", fc.diff_text,
+                   "--- END UNIFIED PATCH ---"))
+    return "\n".join(fields)
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +776,8 @@ def _chunk(seq: list, size: int) -> list[list]:
 
 def build_window_subtree_nodes(
     commits: list[ReproCommit],
+    *,
+    id_salt: str = DEFAULT_ID_SALT,
 ) -> tuple[list[BrowseNode], dict[int, str], str]:
     """Build the BrowseNodes for ONE ``(repo, window)`` (excluding root + repo).
 
@@ -430,16 +798,19 @@ def build_window_subtree_nodes(
     assert commits, "window must be non-empty"
     repo_id = commits[0].repo
     window_idx = commits[0].window_idx
-    window_id = window_node_id(repo_id, window_idx)
+    window_id = window_node_id(repo_id, window_idx, id_salt=id_salt)
+    repo_node = _opaque_id("repo", repo_id, salt=id_salt)
     nodes: list[BrowseNode] = []
     ord_to_node: dict[int, str] = {}
 
-    def commit_leaf(c: ReproCommit, parent: str, node_id: str) -> BrowseNode:
+    def commit_leaf(c: ReproCommit, parent: str) -> BrowseNode:
+        node_id = commit_node_id(c, id_salt=id_salt)
         ord_to_node[c.ordinal] = node_id
         dup = c._duplicated_paths()
         article_ids = tuple(
             file_change_leaf_id(
                 node_id, fc.path, fc.file_idx, duplicated=fc.path in dup,
+                id_salt=id_salt,
             )
             for fc in c.file_changes
         )
@@ -456,15 +827,14 @@ def build_window_subtree_nodes(
 
     def window_node(children: tuple[str, ...]) -> BrowseNode:
         return BrowseNode(
-            id=window_id, parent=repo_id, kind="sub-tag", size=window_size,
+            id=window_id, parent=repo_node, kind="sub-tag", size=window_size,
             children=children, articles=(),
         )
 
     if n < CHUNK_FANOUT:
-        # Flat: commits directly under the window node → {window}/cm.{i:02d}.
-        child_ids = [f"{window_id}/cm.{i:02d}" for i in range(n)]
-        for i, c in enumerate(commits):
-            nodes.append(commit_leaf(c, window_id, child_ids[i]))
+        child_ids = [commit_node_id(c, id_salt=id_salt) for c in commits]
+        for c in commits:
+            nodes.append(commit_leaf(c, window_id))
         nodes.append(window_node(tuple(child_ids)))
         return nodes, ord_to_node, window_id
 
@@ -476,12 +846,16 @@ def build_window_subtree_nodes(
     if not two_levels:
         # window → c4.{g} → cm.{i}
         c4_ids: list[str] = []
-        for g, group in enumerate(c4_groups):
-            c4_id = f"{window_id}/c4.{g:02d}"
+        for group in c4_groups:
+            c4_id = _opaque_id(
+                "chunk4",
+                f"{repo_id}\x00{window_idx}\x00" + "\x00".join(c.sha for c in group),
+                salt=id_salt,
+            )
             c4_ids.append(c4_id)
-            child_ids = [f"{c4_id}/cm.{i:02d}" for i in range(len(group))]
-            for i, c in enumerate(group):
-                nodes.append(commit_leaf(c, c4_id, child_ids[i]))
+            child_ids = [commit_node_id(c, id_salt=id_salt) for c in group]
+            for c in group:
+                nodes.append(commit_leaf(c, c4_id))
             nodes.append(BrowseNode(
                 id=c4_id, parent=window_id, kind="sub-tag", size=size_of(group),
                 children=tuple(child_ids), articles=(),
@@ -492,16 +866,26 @@ def build_window_subtree_nodes(
     # window → c16.{a} → c4.{b} → cm.{i}
     c16_groups = _chunk(c4_groups, CHUNK_FANOUT)
     c16_ids: list[str] = []
-    for a, c16_group in enumerate(c16_groups):
-        c16_id = f"{window_id}/c16.{a:02d}"
+    for c16_group in c16_groups:
+        c16_commits = [c for group in c16_group for c in group]
+        c16_id = _opaque_id(
+            "chunk16",
+            f"{repo_id}\x00{window_idx}\x00"
+            + "\x00".join(c.sha for c in c16_commits),
+            salt=id_salt,
+        )
         c16_ids.append(c16_id)
         c4_ids = []
-        for b, group in enumerate(c16_group):
-            c4_id = f"{c16_id}/c4.{b:02d}"
+        for group in c16_group:
+            c4_id = _opaque_id(
+                "chunk4",
+                f"{repo_id}\x00{window_idx}\x00" + "\x00".join(c.sha for c in group),
+                salt=id_salt,
+            )
             c4_ids.append(c4_id)
-            child_ids = [f"{c4_id}/cm.{i:02d}" for i in range(len(group))]
-            for i, c in enumerate(group):
-                nodes.append(commit_leaf(c, c4_id, child_ids[i]))
+            child_ids = [commit_node_id(c, id_salt=id_salt) for c in group]
+            for c in group:
+                nodes.append(commit_leaf(c, c4_id))
             nodes.append(BrowseNode(
                 id=c4_id, parent=c16_id, kind="sub-tag", size=size_of(group),
                 children=tuple(child_ids), articles=(),
@@ -517,6 +901,8 @@ def build_window_subtree_nodes(
 
 def build_forest(
     repo_commits: dict[str, list[ReproCommit]],
+    *,
+    id_salt: str = DEFAULT_ID_SALT,
 ) -> tuple[BrowseTree, dict[str, str]]:
     """Assemble the full ``git_commit_repro`` browse forest under one root.
 
@@ -543,17 +929,20 @@ def build_forest(
         repo_size = 0
         for window_idx in sorted(windows):
             wcommits = sorted(windows[window_idx], key=lambda c: c.ordinal)
-            sub, ord_to_node, window_id = build_window_subtree_nodes(wcommits)
+            sub, ord_to_node, window_id = build_window_subtree_nodes(
+                wcommits, id_salt=id_salt,
+            )
             all_nodes.extend(sub)
             window_node_ids.append(window_id)
             repo_size += sum(len(c.file_changes) for c in wcommits)
             for ordinal, node_id in ord_to_node.items():
                 commit_node_ids[commit_key(repo_id, window_idx, ordinal)] = node_id
+        repo_node = _opaque_id("repo", repo_id, salt=id_salt)
         all_nodes.append(BrowseNode(
-            id=repo_id, parent="root", kind="sub-tag", size=repo_size,
+            id=repo_node, parent="root", kind="sub-tag", size=repo_size,
             children=tuple(window_node_ids), articles=(),
         ))
-        repo_ids.append(repo_id)
+        repo_ids.append(repo_node)
     total = sum(
         sum(len(c.file_changes) for c in commits)
         for commits in repo_commits.values()
@@ -563,6 +952,13 @@ def build_forest(
         children=tuple(repo_ids), articles=(),
     )
     all_nodes.append(root)
+    model_ids = [node.id for node in all_nodes]
+    model_ids.extend(article for node in all_nodes for article in node.articles)
+    if len(model_ids) != len(set(model_ids)):
+        raise ValueError(
+            "opaque id collision while building git_commit_repro; choose a new "
+            "--id-salt and rebuild all artifacts"
+        )
     return BrowseTree.from_nodes(DATASET_NAME, all_nodes), commit_node_ids
 
 
@@ -571,10 +967,12 @@ def build_forest(
 # ---------------------------------------------------------------------------
 
 
-def build_query(filename: str, message: str, template_idx: int = 0) -> str:
-    """File-state-reconstruction prompt: full filename + FULL commit message."""
+def build_query(
+    filename: str, message: str, sha: str = "", template_idx: int = 0,
+) -> str:
+    """File-state prompt with an unambiguous key also present in the evidence."""
     tmpl = QUERY_TEMPLATES[template_idx % len(QUERY_TEMPLATES)]
-    return tmpl.format(filename=filename, message=message.strip())
+    return tmpl.format(filename=filename, message=message.strip(), sha=sha)
 
 
 # ---------------------------------------------------------------------------
@@ -585,7 +983,7 @@ def build_query(filename: str, message: str, template_idx: int = 0) -> str:
 def build_per_file_index(
     commits: list[ReproCommit],
 ) -> dict[str, list[tuple[int, FileChange]]]:
-    """Within ONE (repo, window), map ``file_path`` → oldest-first list of
+    """Within one window, map stable lineage → oldest-first changes.
     ``(commit_ordinal, FileChange)`` for every commit that touched the file.
 
     Commits must already be the window's commits in ascending ordinal order.
@@ -593,7 +991,7 @@ def build_per_file_index(
     index: dict[str, list[tuple[int, FileChange]]] = {}
     for c in sorted(commits, key=lambda x: x.ordinal):
         for fc in c.file_changes:
-            index.setdefault(fc.path, []).append((c.ordinal, fc))
+            index.setdefault(fc.lineage_id or fc.path, []).append((c.ordinal, fc))
     return index
 
 
@@ -602,11 +1000,13 @@ def build_per_file_index(
 # ---------------------------------------------------------------------------
 
 
-def build_head_query(filename: str, message: str, template_idx: int = 0) -> str:
+def build_head_query(
+    filename: str, message: str, sha: str = "", template_idx: int = 0,
+) -> str:
     """Head-node task query — the navigation-oriented compression prompt that
     orients the drill-down (distinct from the reconstruction question)."""
     tmpl = HEAD_QUERY_TEMPLATES[template_idx % len(HEAD_QUERY_TEMPLATES)]
-    return tmpl.format(filename=filename, message=message.strip())
+    return tmpl.format(filename=filename, message=message.strip(), sha=sha)
 
 
 def build_file_drilldown_trajectory(
@@ -620,6 +1020,7 @@ def build_file_drilldown_trajectory(
     gold_blob: str,
     *,
     ord_to_commit: dict[int, ReproCommit],
+    id_salt: str = DEFAULT_ID_SALT,
     head_template_idx: int = 0,
     n_distractors: int = MAX_DISTRACTORS,
     mode_weights: tuple[float, float, float] = DEFAULT_MODE_WEIGHTS,
@@ -630,8 +1031,8 @@ def build_file_drilldown_trajectory(
     """Pure recursive drill-down trajectory for one ``(file, target)`` reconstruction.
 
     ``touching`` is the chronological ``[(ordinal, FileChange)]`` for the commits
-    that touched ``file_path`` up to (and including) the target, already capped to
-    :data:`MAX_TOUCHING_DIFFS`. Each becomes a drill target that retrieves that
+    that touched ``file_path`` up to (and including) the target. Each becomes a
+    drill target that retrieves that
     commit's file-change diff. ``commit_node_ids`` (the sidecar) maps each
     commit_key to its PATH node id; the retrieve id is
     ``file_change_leaf_id(path_node_id, file_name, ...)`` — identical string to
@@ -647,7 +1048,7 @@ def build_file_drilldown_trajectory(
     ``window(1) → c16(2) → c4(3) → cm(4)``; the file-diff leaf sits below cm and
     is never reached in ``no_drill`` / ``truncated`` mode.
     """
-    head_id = window_node_id(repo, window_idx)
+    head_id = window_node_id(repo, window_idx, id_salt=id_salt)
     if head_id not in tree:
         return None
     targets: list[DrillTarget] = []
@@ -661,11 +1062,16 @@ def build_file_drilldown_trajectory(
         fcid = file_change_leaf_id(
             node_id, fc_i.path, fc_i.file_idx,
             duplicated=fc_i.path in commit._duplicated_paths(),
+            id_salt=id_salt,
         )
         targets.append(DrillTarget(leaf_node_id=node_id, retrieve_ids=(fcid,)))
     if not targets:
         return None
-    task_query = build_head_query(file_path, head_message, head_template_idx)
+    target_commit = ord_to_commit.get(touching[-1][0])
+    target_sha = target_commit.sha if target_commit is not None else ""
+    task_query = build_head_query(
+        file_path, head_message, target_sha, head_template_idx,
+    )
     return build_drilldown_trajectory(
         tree, head_id, targets, task_query, gold_blob,
         n_distractors=n_distractors,

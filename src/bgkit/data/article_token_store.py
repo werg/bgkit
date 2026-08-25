@@ -31,6 +31,8 @@ No sidecar ``{dataset}_tokens.parquet`` is needed.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -41,11 +43,20 @@ import torch
 class _DatasetView:
     """Lazy view over one phase2 mmap dataset."""
 
-    __slots__ = ("_id_to_row", "_mmap_dir", "_offsets", "_tokens")
+    __slots__ = ("_id_to_row", "_manifest", "_mmap_dir", "_offsets", "_tokens")
 
     def __init__(self, mmap_dir: Path) -> None:
         self._mmap_dir = mmap_dir
-        required = ["tokens.npy", "offsets.npy", "metadata.parquet"]
+        if (mmap_dir / ".building").exists():
+            raise ValueError(
+                f"ArticleTokenStore: {mmap_dir} contains an incomplete build marker"
+            )
+        required = [
+            "tokens.npy",
+            "offsets.npy",
+            "metadata.parquet",
+            "manifest.json",
+        ]
         missing = [f for f in required if not (mmap_dir / f).exists()]
         if missing:
             raise FileNotFoundError(
@@ -55,15 +66,56 @@ class _DatasetView:
             )
         self._tokens: np.ndarray = np.load(mmap_dir / "tokens.npy", mmap_mode="r")
         self._offsets: np.ndarray = np.load(mmap_dir / "offsets.npy")
+        self._manifest = json.loads((mmap_dir / "manifest.json").read_text())
+
+        if self._tokens.ndim != 1 or not np.issubdtype(
+            self._tokens.dtype, np.integer,
+        ):
+            raise ValueError(f"{mmap_dir}/tokens.npy must be a flat integer array")
+        if self._offsets.ndim != 1 or len(self._offsets) == 0:
+            raise ValueError(f"{mmap_dir}/offsets.npy must be a non-empty flat array")
+        if int(self._offsets[0]) != 0 or np.any(np.diff(self._offsets) < 0):
+            raise ValueError(f"{mmap_dir}/offsets.npy is not monotonic from zero")
+        if int(self._offsets[-1]) != len(self._tokens):
+            raise ValueError(
+                f"{mmap_dir} token/offset mismatch: offsets end at "
+                f"{int(self._offsets[-1])}, tokens contain {len(self._tokens)} rows"
+            )
+        offsets_hash = hashlib.sha256(self._offsets.tobytes()).hexdigest()
+        expected_offsets_hash = str(self._manifest.get("offsets_sha256", ""))
+        if expected_offsets_hash and offsets_hash != expected_offsets_hash:
+            raise ValueError(f"{mmap_dir}/offsets.npy does not match manifest.json")
 
         # Build document_id → row_index map. metadata.parquet is small
         # enough (one row per document, tens of millions tops for
         # Wikipedia-scale corpora) to load in full.
         table = pq.read_table(mmap_dir / "metadata.parquet", columns=["document_id"])
         ids = table.column("document_id").to_pylist()
+        n_rows = len(self._offsets) - 1
+        if table.num_rows != n_rows:
+            raise ValueError(
+                f"{mmap_dir} metadata/offset mismatch: {table.num_rows} != {n_rows}"
+            )
+        manifest_rows = int(self._manifest.get("row_count", -1))
+        manifest_tokens = int(self._manifest.get("total_tokens", -1))
+        if manifest_rows != n_rows or manifest_tokens != len(self._tokens):
+            raise ValueError(
+                f"{mmap_dir}/manifest.json counts do not match its mmap arrays"
+            )
+        string_ids = [str(doc_id) for doc_id in ids]
+        if any(not doc_id for doc_id in string_ids):
+            raise ValueError(f"{mmap_dir}/metadata.parquet contains an empty document_id")
+        if len(string_ids) != len(set(string_ids)):
+            raise ValueError(
+                f"{mmap_dir}/metadata.parquet contains duplicate document_id values"
+            )
         self._id_to_row: dict[str, int] = {
-            str(doc_id): i for i, doc_id in enumerate(ids)
+            doc_id: i for i, doc_id in enumerate(string_ids)
         }
+
+    @property
+    def manifest(self) -> dict:
+        return dict(self._manifest)
 
     def __len__(self) -> int:
         return len(self._id_to_row)
@@ -160,3 +212,7 @@ class ArticleTokenStore:
 
     def document_ids(self, dataset: str) -> list[str]:
         return self._view(dataset).document_ids()
+
+    def manifest(self, dataset: str) -> dict:
+        """Return the validated generation manifest for ``dataset``."""
+        return self._view(dataset).manifest

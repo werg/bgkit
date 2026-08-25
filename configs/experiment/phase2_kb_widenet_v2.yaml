@@ -1,0 +1,64 @@
+# @package _global_
+# Capability-packaging Family B v2: lognav + fileneedle joint mix, continuing
+# from the lognav v1 final state via the documented two-identity handoff
+# (phase1_checkpoint = summarization step-51945 base topology;
+# stage_a_checkpoint = the completed lognav v1 run's best/latest Phase-2
+# state). See plans/capability_packaging_2026_08_20.md §5/§12.
+#
+# LAUNCH GATE: only after train-phase2-kb-lognav completes — never alongside.
+defaults:
+  - /config
+  - /training/phase2_kb_stage_a
+  - _self_
+
+run_name: phase2_kb_widenet_v2
+
+training:
+  # Same rationale as lognav v1 (2026-08-21 step-49 crash): KRKB live-L0 is
+  # incompatible with the scheduler's downshift modes; memory profile is
+  # light — pin full checkpointing.
+  dynamic_ckpt:
+    enabled: false
+
+  eval_every: 100
+  save_every: 200
+  warmup_steps: 200
+
+  datasets:
+    - lognav
+    - fileneedle
+  max_samples_per_dataset_default: 100000
+
+  l0_retention:
+    lognav: 0.10
+    fileneedle: 0.10
+
+  qwen_decoder_prob: 0.80
+
+  # v1 finding (2026-08-21): held-out EM pinned at exactly 59/200 for 5+
+  # evals — a deterministic solved subset, no growth. lognav/fileneedle are
+  # needle tasks: if the needle line doesn't survive L0xL1 selection the
+  # decoder can't quote it, so the frozen-head rationale of stage_a
+  # ("selection least important, reps are distributed") is inverted here.
+  # Enable survivorship aux so the utility-grad BCE (decoder-gradient
+  # per-position signal, weights inherited: 0.3 at l0+l1) trains the heads
+  # to keep answer-bearing lines. BCE warmup re-anchor (200 steps, ICE)
+  # also inherited.
+  survivorship:
+    survivorship_aux: true
+
+  # Exact-ratio L1 selection (the BUG-1 lever): v1 ran threshold-mode with a
+  # provably frozen theta (bit-identical across 1400+ steps) — actual
+  # keep-rate unguaranteed. exact_topk guarantees the advertised ratio while
+  # the head's logits still rank which positions survive (compatible with
+  # the aux-trained head above).
+  recursive_l1_tree:
+    selection_mode_l1: exact_topk
+
+  # Continue from lognav v1's trained Phase-2 state. MANDATORY EXPLICIT PIN
+  # (??? = hydra hard-fail until set): `auto` ranks by eval/loss across ALL
+  # completed stage-A phase2_kb checkpoints regardless of run — cross-dataset
+  # losses are incomparable and an old git-repro checkpoint could win. Pin
+  # the v1 final checkpoint path (container path /workspace/checkpoints/...)
+  # at launch.
+  stage_a_checkpoint: /workspace/checkpoints_fast/phase2_kb_step2598_20260821_095926_271248_run-phase2_kb_lognav_v1

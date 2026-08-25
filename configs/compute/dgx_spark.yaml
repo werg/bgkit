@@ -130,6 +130,20 @@ memory:
     # for pre-existing resident state (e.g., gen_eval entering with 30 GB
     # of training state trivially tripped a 15 GB absolute cap even when it
     # allocated ~0.24 GB of new memory).
-    evaluate_gb: 40           # packed eval at 2× training budget, no backward
+    evaluate_gb: 80           # packed eval at 2× training budget, no backward.
+                              # 2026-07-31: 64→80 for the query-conditioned whole-path
+                              # drill — eval re-encodes every trajectory node per sample
+                              # (train big-repo peak hit 67 GB absolute), so the eval
+                              # delta can exceed 64. 80 delta -> ~90 GB absolute, under
+                              # the 97 GB (0.80-fraction) guard + 113.7 GB global CUDA cap.
+                              # Takes effect on next restart (config loaded at startup).
+                              # 2026-07-30: raised 40→64 for the git-repro
+                              # recursive-L1 run at 0.30 retention — eval encodes
+                              # the shared tree + base/zeroed ablation at 6× the
+                              # 0.05-era content, delta-peak 41 GB tripped the old
+                              # 40 GB cap (CUDA peak 50.7 GB, well under the 113.7
+                              # GB global cap; host had 117 GB available — the
+                              # 103 GB "system" was reclaimable dataset mmap). 64
+                              # gives headroom for larger eval repos at 0.30.
     gen_eval_gb: 15           # sequential B=1 generation + KV cache delta
     save_checkpoint_gb: 15    # LoRA merge_and_unload clones decoder transiently; delta ~2 GB

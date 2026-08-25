@@ -9,13 +9,10 @@ per-sample breakdown.
 
 Metrics (see :mod:`bgkit.eval.kb_trajectory_eval` for full semantics):
 
-- ``trajectory_step_accuracy``: micro-averaged greedy-argmax next-token
-  accuracy over every loss-bearing position in every trajectory.
-- ``tool_call_id_accuracy``: per bgkit call plus overall
-  micro-averaged substring match of the greedy-decoded tool call
-  against the teacher ``ids`` argument.
-- ``answer_token_f1``: token-level F1 between the greedy-decoded
-  answer slice and the gold answer, macro-averaged across samples.
+- ``free_running/*``: autonomous route completion, surfaced-ID validity,
+  evidence recall, and answer F1 without future teacher context.
+- ``trajectory_step_accuracy`` / ``tool_call_id_accuracy`` /
+  ``answer_token_f1``: exact teacher-forced diagnostics.
 - ``eval/loss``, ``eval/n_samples``, ``eval/tokens_per_sample``: kept
   for backward compatibility with the existing trainer eval report.
 
@@ -38,7 +35,10 @@ import structlog
 import torch
 from omegaconf import DictConfig
 
-from bgkit.eval.kb_trajectory_eval import evaluate_sample
+from bgkit.eval.kb_trajectory_eval import (
+    evaluate_free_running_sample,
+    evaluate_sample,
+)
 from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
 from bgkit.utils.logging import setup_logging
 
@@ -72,6 +72,11 @@ def _aggregate(
             "kb/n_samples": 0.0,
             "kb/n_samples_with_answer": 0.0,
             "kb/n_bgkit_calls": 0.0,
+            "kb/free_running/route_exact": 0.0,
+            "kb/free_running/valid_navigation": 0.0,
+            "kb/free_running/evidence_recall": 0.0,
+            "kb/free_running/answer_token_f1": 0.0,
+            "kb/free_running/answer_exact_match": 0.0,
         }
 
     total_tokens = 0
@@ -80,6 +85,12 @@ def _aggregate(
     bgkit_n = 0
     f1_sum = 0.0
     f1_n = 0
+    free_rows = 0
+    free_route_exact = 0.0
+    free_valid = 0.0
+    free_evidence = 0.0
+    free_answer_f1 = 0.0
+    free_answer_exact = 0.0
 
     for row in per_sample:
         correct_tokens += int(row.get("trajectory_correct_tokens", 0))
@@ -95,6 +106,14 @@ def _aggregate(
         if row.get("gold_answer"):
             f1_sum += float(row.get("answer_token_f1", 0.0))
             f1_n += 1
+        free = row.get("free_running")
+        if isinstance(free, dict):
+            free_rows += 1
+            free_route_exact += float(free.get("route_exact", 0.0))
+            free_valid += float(free.get("valid_navigation", 0.0))
+            free_evidence += float(free.get("evidence_recall", 0.0))
+            free_answer_f1 += float(free.get("answer_token_f1", 0.0))
+            free_answer_exact += float(free.get("answer_exact_match", 0.0))
 
     step_acc = correct_tokens / total_tokens if total_tokens else 0.0
     bgkit_acc = bgkit_sum / bgkit_n if bgkit_n else 0.0
@@ -108,6 +127,21 @@ def _aggregate(
         "kb/n_samples": float(len(per_sample)),
         "kb/n_samples_with_answer": float(f1_n),
         "kb/n_bgkit_calls": float(bgkit_n),
+        "kb/free_running/route_exact": (
+            free_route_exact / free_rows if free_rows else 0.0
+        ),
+        "kb/free_running/valid_navigation": (
+            free_valid / free_rows if free_rows else 0.0
+        ),
+        "kb/free_running/evidence_recall": (
+            free_evidence / free_rows if free_rows else 0.0
+        ),
+        "kb/free_running/answer_token_f1": (
+            free_answer_f1 / free_rows if free_rows else 0.0
+        ),
+        "kb/free_running/answer_exact_match": (
+            free_answer_exact / free_rows if free_rows else 0.0
+        ),
     }
 
 
@@ -137,6 +171,15 @@ def main(cfg: DictConfig) -> None:
 
     max_samples = int(eval_cfg.get("max_samples", 256))
     collect_per_sample = bool(eval_cfg.get("per_sample", False))
+    free_running = bool(eval_cfg.get("free_running", True))
+    max_tool_calls = int(eval_cfg.get("max_tool_calls", 16))
+    max_new_tokens = int(eval_cfg.get("max_new_tokens", 8192))
+    ablation = str(eval_cfg.get("ablation", "") or "")
+    if ablation:
+        # e.g. +eval.ablation=oracle_span — applies to BOTH the trainer metric
+        # pass and the per-sample teacher-forced + free-running loop below.
+        trainer.set_ablation_mode(ablation)
+        logger.info("kb_eval_ablation_mode", mode=ablation)
 
     # Trainer-side loss metric (backward-compatible baseline). Done
     # before the KB metrics so a failure in the KB path doesn't hide
@@ -157,22 +200,36 @@ def main(cfg: DictConfig) -> None:
             for sample in batch:
                 if samples_seen >= max_samples:
                     break
-                try:
+                if getattr(trainer, "_round_robin", False):
+                    # Same family policy as the trainer's eval pass (follows
+                    # the training mix: Qwen-only runs evaluate Qwen only).
+                    trainer._set_active_decoder(trainer._eval_family_for_index(samples_seen))
+                # Teacher-forced scoring must use the training-mode decoder
+                # forward (Falcon-H1's eval-mode Mixer path is numerically
+                # different); generation below keeps eval mode for the cache.
+                with trainer._teacher_forced_decoders():
                     result = evaluate_sample(trainer, sample)
-                except Exception as exc:
-                    logger.warning(
-                        "kb_eval_sample_failed",
-                        sample_idx=samples_seen,
-                        error=str(exc)[:300],
+                free_result = (
+                    evaluate_free_running_sample(
+                        trainer,
+                        sample,
+                        max_tool_calls=max_tool_calls,
+                        max_new_tokens=max_new_tokens,
                     )
-                    samples_seen += 1
-                    continue
+                    if free_running else None
+                )
                 row = {
                     "dataset": getattr(sample, "dataset_name", ""),
+                    "decoder_family": getattr(trainer, "_decoder_family", ""),
                     **result,
                 }
+                if free_result is not None:
+                    row["free_running"] = free_result
                 per_sample_rows.append(row)
                 samples_seen += 1
+    clear_tree = getattr(trainer, "_clear_eval_shared_tree", None)
+    if callable(clear_tree):
+        clear_tree()
     trainer.model.train()
 
     aggregate = _aggregate(per_sample_rows)
@@ -185,13 +242,22 @@ def main(cfg: DictConfig) -> None:
     per_dataset_metrics: dict[str, dict[str, float]] = {
         ds: _aggregate(rows) for ds, rows in per_dataset.items()
     }
+    per_family: dict[str, list[dict]] = {}
+    for row in per_sample_rows:
+        family = str(row.get("decoder_family", "unknown"))
+        per_family.setdefault(family, []).append(row)
+    per_family_metrics = {
+        family: _aggregate(rows) for family, rows in per_family.items()
+    }
 
     # Keep backward-compat keys from trainer.evaluate()
     report: dict = {
         "trainer_metrics": dict(trainer_metrics),
         "kb_metrics": aggregate,
         "per_dataset": per_dataset_metrics,
+        "per_decoder_family": per_family_metrics,
         "num_samples_evaluated": len(per_sample_rows),
+        "ablation": ablation or None,
     }
     # Ensure the required backward-compat keys show up at the top-level
     # aggregate view too.
@@ -209,13 +275,22 @@ def main(cfg: DictConfig) -> None:
                 v = r.get(fld, "")
                 if isinstance(v, str) and len(v) > 200:
                     r[fld] = v[:200] + "..."
+            free = r.get("free_running")
+            if isinstance(free, dict):
+                free = dict(free)
+                for fld in ("pred_answer", "gold_answer"):
+                    value = free.get(fld, "")
+                    if isinstance(value, str) and len(value) > 200:
+                        free[fld] = value[:200] + "..."
+                r["free_running"] = free
             trimmed.append(r)
         report["per_sample"] = trimmed
 
     output_dir = Path(eval_cfg.get("output_dir", "eval_reports"))
     output_dir.mkdir(parents=True, exist_ok=True)
     stage = str(cfg.training.get("stage", "?")).upper()
-    report_path = output_dir / f"eval_phase2_kb_stage_{stage}.json"
+    suffix = f"_{ablation}" if ablation else ""
+    report_path = output_dir / f"eval_phase2_kb_stage_{stage}{suffix}.json"
     report_path.write_text(json.dumps(report, indent=2, default=str))
     logger.info(
         "kb_eval_report_written",

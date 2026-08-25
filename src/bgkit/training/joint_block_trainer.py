@@ -20,7 +20,7 @@ import structlog
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
-from transformers import AutoModel
+from transformers import AutoModelForCausalLM
 
 from bgkit.data.chat_template import (
     build_encoder_prefix_ids,
@@ -103,7 +103,7 @@ class JointBlockTrainer(BaseTrainer):
         hidden_dim = self.cfg.model.bgkit.get("hidden_dim", 1024)
         logger.info("loading_backbone", model=backbone_name, revision=backbone_revision)
 
-        backbone = AutoModel.from_pretrained(
+        backbone = AutoModelForCausalLM.from_pretrained(
             backbone_name,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
@@ -117,7 +117,7 @@ class JointBlockTrainer(BaseTrainer):
             decoder_name = self.cfg.model.decoder.backbone_name
             decoder_revision = self.cfg.model.decoder.get("backbone_revision", None)
             logger.info("loading_decoder_for_slerp", model=decoder_name, t=slerp_t)
-            decoder_for_slerp = AutoModel.from_pretrained(
+            decoder_for_slerp = AutoModelForCausalLM.from_pretrained(
                 decoder_name,
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
@@ -158,7 +158,7 @@ class JointBlockTrainer(BaseTrainer):
         decoder_name = self.cfg.model.decoder.backbone_name
         decoder_revision = self.cfg.model.decoder.get("backbone_revision", None)
         logger.info("loading_decoder_embeddings", model=decoder_name)
-        decoder_model = AutoModel.from_pretrained(
+        decoder_model = AutoModelForCausalLM.from_pretrained(
             decoder_name,
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,

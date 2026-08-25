@@ -35,7 +35,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Literal
 
+import structlog
 import torch
+
+logger = structlog.get_logger()
 
 BGKIT_TOOL: dict = {
     "type": "function",
@@ -112,8 +115,9 @@ SYSTEM_PRE_SCOPED = (
     "\n"
     "Knowledge base: {scope_description}\n"
     "\n"
-    'Start by calling bgkit(ids=["root"], query=...), then drill down via '
-    "further bgkit calls on the IDs the response surfaces to answer the question."
+    'Start with the entrypoint ID named in the knowledge-base description; if '
+    'none is named, call bgkit(ids=["root"], query=...). Then drill down only '
+    "through IDs surfaced by each response."
 )
 
 
@@ -187,17 +191,19 @@ class RenderedTrajectory:
     bgkit_sentinel_positions: list[int]  # index per bgkit turn, aligned with bgkit_turns
     bgkit_turns: list[TrajectoryTurn]     # the ordered list of bgkit calls
     answer_span: tuple[int, int] | None = None
-    """Absolute ``[start, end)`` token range of the final ``answer`` turn in
-    ``token_ids``, or ``None`` if the trajectory has no answer turn.
+    """Absolute ``[start, end)`` token range of the final ``answer`` turn's
+    CONTENT in ``token_ids`` (the answer text only — no assistant scaffold,
+    no end-of-turn token), or ``None`` if the trajectory has no answer turn.
 
     Used by the KB trainer's eval path to compute EM/F1 only over the
     answer (excluding bgkit calls and tool responses).
     """
     bgkit_call_spans: list[tuple[int, int]] = field(default_factory=list)
     """Per ``bgkit_turns[i]``, the absolute ``[start, end)`` token range of
-    the *assistant tool-call emission* (the loss-bearing tokens that encode
-    the tool call JSON — ``ids`` and ``query``). Excludes the sentinel and
-    tool-response payload. Aligned by index with :attr:`bgkit_turns`.
+    the *tool-call body* the decoder emits (``<tool_call>…</tool_call>`` as
+    the template renders it — JSON for Falcon-H1, XML for Qwen3.5). Excludes
+    the assistant scaffold, end-of-turn token, sentinel and tool-response
+    payload. Aligned by index with :attr:`bgkit_turns`.
     """
     topic_sentinel_position: int | None = None
     """Absolute position of the ``BGKIT_TOPIC_SENTINEL`` token in
@@ -236,6 +242,76 @@ def _tool_call_assistant_message(name: str, args: dict) -> dict:
     }
 
 
+def _trajectory_turn_messages(turn: TrajectoryTurn) -> list[dict]:
+    """Public chat messages for one turn, excluding offline supervision data."""
+    if turn.kind == "bgkit":
+        return [
+            _tool_call_assistant_message(
+                "bgkit",
+                {
+                    "ids": list(turn.args.get("ids", [])),
+                    "query": str(turn.args.get("query", "")),
+                },
+            ),
+            {"role": "tool", "name": "bgkit", "content": BGKIT_SENTINEL},
+        ]
+    if turn.kind == "answer":
+        return [{"role": "assistant", "content": turn.response}]
+    raise ValueError(f"Unknown turn kind: {turn.kind!r}")
+
+
+def assistant_generation_prompt_ids(
+    tokenizer,
+    system_prompt: str,
+    question: str,
+    trajectory: list[TrajectoryTurn],
+    *,
+    topic_knowledge_tags: list[str] | None = None,
+) -> torch.Tensor:
+    """Return only the assistant-generation suffix after an observed history."""
+    tools = [BGKIT_TOOL, BGKIT_TOPIC_KNOWLEDGE_TOOL]
+    messages: list[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
+    ]
+    tags = list(topic_knowledge_tags or [])
+    if tags:
+        messages.extend([
+            _tool_call_assistant_message(
+                "bgkit_topic_knowledge",
+                {"tags": tags},
+            ),
+            {
+                "role": "tool",
+                "name": "bgkit_topic_knowledge",
+                "content": BGKIT_TOPIC_SENTINEL,
+            },
+        ])
+    for turn in trajectory:
+        messages.extend(_trajectory_turn_messages(turn))
+    rendered = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=tools,
+    )
+    with_prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        tools=tools,
+    )
+    if not with_prompt.startswith(rendered):
+        raise RuntimeError(
+            "chat template does not append its assistant generation prompt"
+        )
+    suffix = with_prompt[len(rendered):]
+    return torch.tensor(
+        tokenizer.encode(suffix, add_special_tokens=False),
+        dtype=torch.long,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tokenization with per-turn boundaries and loss masking
 # ---------------------------------------------------------------------------
@@ -268,6 +344,122 @@ def _render_turn_boundary(
     return prefix, with_turn
 
 
+_SCAFFOLD_MARKER = "<<<BGKIT_ASSISTANT_CONTENT_9d2e4b71>>>"
+
+
+def assistant_turn_scaffold(tokenizer, messages: list[dict], tools: list[dict]) -> tuple[str, str]:
+    """``(pre, post)``: the text the chat template wraps around an assistant
+    message's content when appended after ``messages``.
+
+    Discovered from the template itself by rendering a marker message, so
+    it is exact per model: Qwen3.5 gives
+    ``("<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n", "<|im_end|>\\n")``,
+    Falcon-H1 ``("<|im_start|>assistant\\n", "<|im_end|>\\n")``. ``pre`` is
+    exactly what ``assistant_generation_prompt_ids`` feeds the decoder at
+    generation time, so the decoder never emits it.
+    """
+    prior = (
+        tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False, tools=tools
+        )
+        if messages
+        else ""
+    )
+    with_marker = tokenizer.apply_chat_template(
+        [*messages, {"role": "assistant", "content": _SCAFFOLD_MARKER}],
+        tokenize=False,
+        add_generation_prompt=False,
+        tools=tools,
+    )
+    if not with_marker.startswith(prior):
+        raise RuntimeError("chat template is not a prefix-extension over an assistant append")
+    turn = with_marker[len(prior):]
+    if turn.count(_SCAFFOLD_MARKER) != 1:
+        raise RuntimeError("chat template did not render the assistant content exactly once")
+    pre, post = turn.split(_SCAFFOLD_MARKER)
+    return pre, post
+
+
+def _assistant_region_layout(
+    tokenizer,
+    region_text: str,
+    region_ids: list[int],
+    pre: str,
+    post: str,
+) -> tuple[int, int, int]:
+    """Token layout ``(content_start, content_end, end_of_turn_end)`` of one
+    assistant region (``pre + content + trailing``) within its joint encoding
+    ``region_ids``. ``[content_end, end_of_turn_end)`` is the template's
+    end-of-turn emission the decoder must also produce: any glue before the
+    end-of-turn marker plus the marker itself (Qwen3.5: ``<|im_end|>``;
+    Falcon-H1: ``\\n<|im_end|>``). ``end_of_turn_end == content_end`` when
+    no marker token follows the content.
+
+    Offsets come from the JOINT encoding wherever possible (BPE is not
+    concat-distributive); the pieces are only used to locate boundaries and
+    verified against ``region_ids``.
+    """
+    if not region_text.startswith(pre):
+        raise RuntimeError(
+            "assistant turn does not start with the template's assistant scaffold"
+        )
+    split = region_text.find(post, len(pre))
+    if split < 0:
+        raise RuntimeError("assistant turn does not contain the template's end-of-turn text")
+    content = region_text[len(pre):split]
+    trailing = region_text[split:]
+    pre_ids = tokenizer.encode(pre, add_special_tokens=False)
+    content_ids = tokenizer.encode(content, add_special_tokens=False)
+    trailing_ids = tokenizer.encode(trailing, add_special_tokens=False)
+    n = len(region_ids)
+    start = len(pre_ids)
+    end = start + len(content_ids)
+    exact = (
+        region_ids[:start] == pre_ids
+        and region_ids[start:end] == content_ids
+        and region_ids[end:] == trailing_ids
+    )
+    if not exact:
+        # Boundary drift (a merge across pre|content or content|trailing):
+        # fall back to counting the joint encoding from both ends. Logged so
+        # it is visible; never fatal for training.
+        start = min(start, n)
+        end = max(start, n - len(trailing_ids))
+        logger.warning(
+            "assistant_region_bpe_boundary_drift",
+            region_len=n,
+            content_chars=len(content),
+        )
+    from bgkit.data.chat_template import marker_token_ids
+
+    markers = marker_token_ids(tokenizer)
+    eot_end = end
+    for i in range(end, n):
+        if int(region_ids[i]) in markers:
+            eot_end = i + 1
+            break
+    return start, end, eot_end
+
+
+def assistant_turn_end_glue(tokenizer, messages: list[dict], tools: list[dict]) -> str:
+    """Template text between an assistant turn's content and its end-of-turn
+    marker token (``"\\n"`` for Falcon-H1, ``""`` for Qwen3.5). A decoder
+    trained with :func:`tokenize_trajectory` emits this glue before the stop
+    token; generation strips it so the returned text is the content only.
+    """
+    from bgkit.data.chat_template import marker_token_ids
+
+    _pre, post = assistant_turn_scaffold(tokenizer, messages, tools)
+    markers = marker_token_ids(tokenizer)
+    ids = tokenizer.encode(post, add_special_tokens=False)
+    glue_ids: list[int] = []
+    for tok_id in ids:
+        if int(tok_id) in markers:
+            break
+        glue_ids.append(int(tok_id))
+    return tokenizer.decode(glue_ids) if glue_ids else ""
+
+
 def tokenize_trajectory(
     tokenizer,
     system_prompt: str,
@@ -280,9 +472,19 @@ def tokenize_trajectory(
 
     For each turn in the trajectory we render the template before and after
     including that turn and diff the strings to obtain the turn's rendered
-    text. Tokens produced from assistant-role turns (bgkit tool calls or the
-    final answer) are loss-masked according to ``turn.loss``; everything else
-    (system, user, tool responses) is masked out.
+    text. Within an assistant-role turn (bgkit tool call or the final
+    answer) loss applies to the CONTENT the decoder actually emits — the
+    tool-call body or the answer text — plus the template's end-of-turn
+    token (the stop signal it must learn), gated by ``turn.loss``. The
+    leading scaffold (``<|im_start|>assistant\\n`` and Qwen3.5's empty
+    ``<think>`` block) is supplied by the generation prompt at inference
+    and is never a training target; template glue after the end-of-turn
+    token and every system / user / tool-response token is masked out.
+    ``answer_span`` / ``bgkit_call_spans`` cover exactly the content tokens,
+    so EM/F1 and tool-call scoring compare content against content
+    (2026-08-23: spans used to include the scaffold — F1 had a floor from
+    the always-matching ``assistant``/``think`` tokens and the standalone
+    eval compared scaffold-prefixed text against the bare gold answer).
 
     Sentinels for bgkit tool responses are detected and their token positions
     are returned so the trainer can splice survivor embeddings there.
@@ -383,21 +585,9 @@ def tokenize_trajectory(
         prior_str = new_str
 
     for turn in trajectory:
-        # Build the sub-messages this turn adds.
-        if turn.kind == "bgkit":
-            # The bgkit tool response is JUST the sentinel. There is no
-            # text side-channel — drill-down relies entirely on ID
-            # pinning carrying article IDs through the L1 encoder so
-            # the decoder can read them out of the spliced survivor
-            # embeddings. ``turn.response`` is ignored for bgkit turns.
-            sub = [
-                _tool_call_assistant_message("bgkit", dict(turn.args)),
-                {"role": "tool", "name": "bgkit", "content": BGKIT_SENTINEL},
-            ]
-        elif turn.kind == "answer":
-            sub = [{"role": "assistant", "content": turn.response}]
-        else:
-            raise ValueError(f"Unknown turn kind: {turn.kind!r}")
+        # Offline-only metadata (depth/mode markers) is intentionally removed
+        # by this shared message builder before it can reach the model.
+        sub = _trajectory_turn_messages(turn)
 
         new_str = tokenizer.apply_chat_template(
             messages + sub,
@@ -425,23 +615,24 @@ def tokenize_trajectory(
         tool_turn_tokens_start = -1
 
         if turn.kind == "answer":
+            region_text = turn_text
             assistant_tokens = tokenizer.encode(turn_text, add_special_tokens=False)
             tool_turn_tokens = []
         elif turn.kind == "bgkit":
             # Split at the sentinel string. The part before the sentinel is
             # the assistant tool call + the template's opening tool wrapper
-            # (treated as assistant-region tokens for loss purposes); the
-            # sentinel + the trailing tool-response text are the "tool turn"
-            # tokens (loss always False).
+            # (the assistant REGION); the sentinel + the trailing
+            # tool-response text are the "tool turn" tokens (loss always
+            # False).
             sentinel_idx = turn_text.find(BGKIT_SENTINEL)
             if sentinel_idx < 0:
                 raise RuntimeError(
                     "Sentinel missing from rendered bgkit turn — template "
                     "may have dropped the tool content"
                 )
-            before = turn_text[:sentinel_idx]
+            region_text = turn_text[:sentinel_idx]
             after = turn_text[sentinel_idx + len(BGKIT_SENTINEL):]
-            before_ids = tokenizer.encode(before, add_special_tokens=False)
+            before_ids = tokenizer.encode(region_text, add_special_tokens=False)
             sentinel_ids = tokenizer.encode(BGKIT_SENTINEL, add_special_tokens=False)
             after_ids = tokenizer.encode(after, add_special_tokens=False)
             assistant_tokens = before_ids
@@ -451,22 +642,26 @@ def tokenize_trajectory(
         else:
             raise ValueError(f"Unknown turn kind: {turn.kind!r}")
 
-        # For answer turns, capture the absolute [start, end) token range so
-        # the trainer's eval path can compute EM/F1 over only the answer
-        # text (not the bgkit tool call emissions that also bear loss). The
-        # last answer turn wins if a trajectory has multiple.
-        answer_start_abs = len(token_ids) if turn.kind == "answer" else -1
-        # Absolute token offset of the assistant tool-call emission (before
-        # we extend ``token_ids``). Used below to record per-call spans so
-        # downstream eval harnesses can score tool-call ID accuracy over
-        # exactly the tokens that encode the tool arguments.
+        # Content layout inside the assistant region: scaffold | content |
+        # end-of-turn | glue. Loss on content + end-of-turn only.
+        pre, post = assistant_turn_scaffold(tokenizer, messages, tools)
+        c_start, c_end, eot_end = _assistant_region_layout(
+            tokenizer, region_text, assistant_tokens, pre, post
+        )
+        region_mask = [False] * len(assistant_tokens)
+        if turn.loss:
+            for i in range(c_start, eot_end):
+                region_mask[i] = True
+
+        # Absolute token offset of the assistant region (before we extend
+        # ``token_ids``); spans below are content-only.
         assistant_start_abs = len(token_ids)
 
         token_ids.extend(assistant_tokens)
-        loss_mask.extend([bool(turn.loss)] * len(assistant_tokens))
+        loss_mask.extend(region_mask)
         if turn.kind == "bgkit" and assistant_tokens:
             bgkit_call_spans.append(
-                (assistant_start_abs, assistant_start_abs + len(assistant_tokens))
+                (assistant_start_abs + c_start, assistant_start_abs + c_end)
             )
         if tool_turn_tokens:
             if turn.kind == "bgkit":
@@ -477,8 +672,9 @@ def tokenize_trajectory(
             token_ids.extend(tool_turn_tokens)
             loss_mask.extend([False] * len(tool_turn_tokens))
 
+        # The last loss-bearing answer turn wins if a trajectory has several.
         if turn.kind == "answer" and turn.loss:
-            answer_span = (answer_start_abs, answer_start_abs + len(assistant_tokens))
+            answer_span = (assistant_start_abs + c_start, assistant_start_abs + c_end)
 
         messages.extend(sub)
         prior_str = new_str

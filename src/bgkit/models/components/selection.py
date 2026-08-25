@@ -479,13 +479,20 @@ def exact_ratio_topk_select(
     valid_counts.index_add_(0, seg_ids, valid_mask.to(torch.int64))
     pinned_counts = torch.zeros(num_segs, dtype=torch.int64, device=device)
     pinned_counts.index_add_(0, seg_ids, pinned_mask.to(torch.int64))
-    target_counts = torch.ceil(valid_counts.to(torch.float32) * ratio).to(torch.int64)
+    # Pinned positions sit OUTSIDE the controllable count (see docstring): the
+    # target quota is computed over non-pinned positions only, and pinned
+    # survivors are added on top. The old code took the quota over valid_counts
+    # (pinned included) and then subtracted pinned_counts, which let a long
+    # pinned ID prefix starve the content channel to ZERO survivors at low
+    # ratios (ceil(0.05*N) < len(pinned_id)). When pinned is None,
+    # controllable_counts == valid_counts and this is identical to the old path.
+    controllable_counts = (valid_counts - pinned_counts).clamp(min=0)
+    target_counts = torch.ceil(controllable_counts.to(torch.float32) * ratio).to(torch.int64)
     if min_per_sample > 0:
-        min_counts = torch.full_like(valid_counts, int(min_per_sample))
-        min_counts = torch.minimum(min_counts, valid_counts)
+        min_counts = torch.full_like(controllable_counts, int(min_per_sample))
+        min_counts = torch.minimum(min_counts, controllable_counts)
         target_counts = torch.maximum(target_counts, min_counts)
-    target_counts = torch.minimum(target_counts, valid_counts)
-    remaining_counts = (target_counts - pinned_counts).clamp(min=0)
+    remaining_counts = torch.minimum(target_counts, controllable_counts)
 
     eligible = controllable & torch.isfinite(logits)
     composed = _segment_descending_order(logits, seg_ids, eligible)

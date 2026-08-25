@@ -77,9 +77,16 @@ def _is_qwen35_model(model: nn.Module) -> bool:
 
 
 def _extract_text_model(model: nn.Module) -> nn.Module:
-    language_model = getattr(model, "language_model", None)
-    if language_model is not None and hasattr(language_model, "layers"):
-        return language_model
+    if hasattr(model, "layers"):
+        return model
+    # Transformers 5.5 maps Qwen3.5's causal-LM wrapper to ``.model`` and its
+    # multimodal base wrapper to ``.language_model``. Accept both layouts (and
+    # ``base_model`` for compatible third-party wrappers), but only unwrap an
+    # object that is actually the text stack.
+    for attr in ("model", "language_model", "base_model"):
+        candidate = getattr(model, attr, None)
+        if candidate is not None and candidate is not model and hasattr(candidate, "layers"):
+            return candidate
     return model
 
 
@@ -405,6 +412,7 @@ class BgKITEncoder(nn.Module):
         utility_grad_capture_l1: dict | None = None,
         forced_survivor_mask_l1: torch.Tensor | None = None,
         selection_mode_l1: str = "threshold",
+        must_keep_mask_l1: torch.Tensor | None = None,
     ):
         """Shared L1 stage: (cross-section merge →) L1 forward → projection.
 
@@ -433,6 +441,12 @@ class BgKITEncoder(nn.Module):
                     "content_group_cu_seqlens (cross-section L1 re-segments "
                     "the survivor axis, invalidating a per-section mask)."
                 )
+            if must_keep_mask_l1 is not None:
+                raise NotImplementedError(
+                    "must_keep_mask_l1 is not supported with "
+                    "content_group_cu_seqlens (cross-section L1 re-segments "
+                    "the survivor axis, invalidating a per-section mask)."
+                )
             (
                 l1_content,
                 l1_content_cu,
@@ -457,6 +471,7 @@ class BgKITEncoder(nn.Module):
             utility_grad_capture=utility_grad_capture_l1,
             forced_survivor_mask=forced_survivor_mask_l1,
             selection_mode=selection_mode_l1,
+            must_keep_mask=must_keep_mask_l1,
             content_selectable_mask=None,
         )
         proj_cu = l1_out.survivor_cu_seqlens
@@ -614,7 +629,7 @@ class BgKITEncoder(nn.Module):
         projection_num_layers: int = 1,
     ) -> BgKITEncoder:
         if isinstance(backbone_name_or_module, str):
-            from transformers import AutoModel
+            from transformers import AutoModelForCausalLM
 
             load_kwargs: dict = {
                 "dtype": torch_dtype,
@@ -625,11 +640,24 @@ class BgKITEncoder(nn.Module):
             load_kwargs["attn_implementation"] = resolve_attention_implementation(
                 attn_implementation
             )
-            raw_model = AutoModel.from_pretrained(backbone_name_or_module, **load_kwargs)
+            # AutoModel maps Qwen3.5 to its multimodal base wrapper in
+            # Transformers 5.5. Text-only checkpoints use ``model.*`` keys,
+            # while that wrapper expects ``language_model.*`` and silently
+            # initializes a fresh text stack. The causal-LM wrapper has the
+            # correct checkpoint mapping; we discard its LM head below.
+            raw_model = AutoModelForCausalLM.from_pretrained(
+                backbone_name_or_module, **load_kwargs,
+            )
         else:
             raw_model = backbone_name_or_module
 
         raw_model = _extract_text_model(raw_model)
+        # Do not rely on the training entry point having class-patched Qwen
+        # before model construction. Direct library users, evaluators, and unit
+        # tests must get the same packed DeltaNet boundary handling.
+        from bgkit.utils.deltanet_patch import patch_gated_delta_rule_numerics
+
+        patch_gated_delta_rule_numerics(model=raw_model)
 
         if pruned:
             return cls._from_pretrained_pruned(

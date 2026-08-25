@@ -9,10 +9,9 @@ torch = pytest.importorskip("torch")
 import torch.nn as nn
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
-from bgkit.models.encoder import BgKITEncoder, EncoderOutput
+from bgkit.models.encoder import BgKITEncoder, EncoderOutput, _extract_text_model
 from bgkit.models.level_compressor import LevelCompressor
 from bgkit.models.projection_block import ProjectionBlock
-
 
 # ----------------------------- helpers -----------------------------
 
@@ -123,10 +122,10 @@ def _make_encoder(hidden_dim: int = 16) -> BgKITEncoder:
     return BgKITEncoder(l0, l1, projection_block)
 
 
-def _make_packed_content(B: int, lengths: list[int], D: int = 16):
-    N = sum(lengths)
-    content = torch.randn(N, D, requires_grad=True)
-    cu = torch.zeros(B + 1, dtype=torch.int32)
+def _make_packed_content(batch_size: int, lengths: list[int], hidden_dim: int = 16):
+    num_tokens = sum(lengths)
+    content = torch.randn(num_tokens, hidden_dim, requires_grad=True)
+    cu = torch.zeros(batch_size + 1, dtype=torch.int32)
     cu[1:] = torch.tensor(lengths, dtype=torch.int32).cumsum(0)
     pos = torch.cat([torch.arange(L, dtype=torch.int64) for L in lengths])
     return content, cu, pos
@@ -146,9 +145,22 @@ def test_encoder_constructs_with_l0_l1_projection():
     assert enc.l1.prompt_separator_embedding is None
 
 
+def test_extract_text_model_accepts_causal_and_multimodal_wrapper_layouts():
+    text = _StubBackbone()
+
+    class _Wrapper(nn.Module):
+        def __init__(self, attr: str):
+            super().__init__()
+            setattr(self, attr, text)
+
+    assert _extract_text_model(text) is text
+    assert _extract_text_model(_Wrapper("model")) is text
+    assert _extract_text_model(_Wrapper("language_model")) is text
+
+
 def test_l0_only_mode_skips_l1_and_bridge():
     enc = _make_encoder().eval()
-    content, cu, pos = _make_packed_content(B=2, lengths=[5, 3])
+    content, cu, pos = _make_packed_content(batch_size=2, lengths=[5, 3])
     out = enc(
         content_embeddings=content,
         content_cu_seqlens=cu,
@@ -180,7 +192,7 @@ def test_active_decoder_family_controls_projection_shape(monkeypatch):
         output_split_factor=2,
     )
     enc.set_active_decoder_family("falcon_h1")
-    content, cu, pos = _make_packed_content(B=1, lengths=[5])
+    content, cu, pos = _make_packed_content(batch_size=1, lengths=[5])
 
     out = enc(
         content_embeddings=content,
@@ -198,7 +210,7 @@ def test_active_decoder_family_controls_projection_shape(monkeypatch):
 def test_l0_compression_only_passes_through_projection():
     torch.manual_seed(42)
     enc = _make_encoder().eval()
-    content, cu, pos = _make_packed_content(B=2, lengths=[10, 6])
+    content, cu, pos = _make_packed_content(batch_size=2, lengths=[10, 6])
     out = enc(
         content_embeddings=content,
         content_cu_seqlens=cu,
@@ -217,7 +229,7 @@ def test_l0_l1_bridge_via_auto_repro_head():
     """When both target_ratios are set, L0 survivors flow through the bridge to L1."""
     torch.manual_seed(42)
     enc = _make_encoder().eval()
-    content, cu, pos = _make_packed_content(B=2, lengths=[20, 12])
+    content, cu, pos = _make_packed_content(batch_size=2, lengths=[20, 12])
     out = enc(
         content_embeddings=content,
         content_cu_seqlens=cu,
@@ -240,7 +252,7 @@ def test_bridge_grad_flows_through_auto_repro_head():
     torch.manual_seed(42)
     enc = _make_encoder()
     enc.train()
-    content, cu, pos = _make_packed_content(B=1, lengths=[10])
+    content, cu, pos = _make_packed_content(batch_size=1, lengths=[10])
     out = enc(
         content_embeddings=content,
         content_cu_seqlens=cu,
@@ -277,7 +289,7 @@ def test_l1_evolves_independently_after_training_step():
     torch.manual_seed(42)
     enc = _make_encoder()
     enc.train()
-    content, cu, pos = _make_packed_content(B=1, lengths=[8])
+    content, cu, pos = _make_packed_content(batch_size=1, lengths=[8])
 
     sd0_before = {k: v.clone() for k, v in enc.l0.backbone.state_dict().items()}
 

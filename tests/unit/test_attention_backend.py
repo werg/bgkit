@@ -93,7 +93,10 @@ def test_resolve_decoder_attention_implementation_keeps_qwen_on_bgkit_fa4():
 
 
 def test_resolve_decoder_attention_implementation_uses_sdpa_for_falcon():
-    with patch.object(ab, "configure_torch_sdp_flash_only") as configure:
+    with (
+        patch.object(ab, "_resolve_falcon_flash_attention_2_impl", return_value=None),
+        patch.object(ab, "configure_torch_sdp_flash_only") as configure,
+    ):
         assert (
             ab.resolve_decoder_attention_implementation(
                 "auto",

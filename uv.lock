@@ -375,7 +375,7 @@ requires-dist = [
     { name = "structlog" },
     { name = "tokenizers", specifier = ">=0.22" },
     { name = "tqdm" },
-    { name = "transformers", specifier = ">=5.5" },
+    { name = "transformers", specifier = ">=5.5,<5.6" },
     { name = "tree-sitter-language-pack", marker = "extra == 'data'", specifier = ">=0.6" },
     { name = "tree-sitter-language-pack", marker = "extra == 'eval'", specifier = ">=0.6" },
     { name = "wandb", specifier = ">=0.24" },

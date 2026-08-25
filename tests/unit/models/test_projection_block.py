@@ -86,3 +86,16 @@ def test_split_projection_doubles_survivor_boundaries_with_mask(monkeypatch):
     assert out.projected_embeddings.shape == (4, 2)
     assert out.survivor_cu_seqlens.tolist() == [0, 2, 4]
     assert out.survivor_counts.tolist() == [2, 2]
+
+
+def test_projection_head_cannot_inflate_decoder_interface_norm():
+    block = _make_block(hidden_dim=4, split=1)
+    with torch.no_grad():
+        block.projection_head.weight.mul_(1000.0)
+    hidden = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    projected = block._project(hidden)
+    assert torch.allclose(
+        projected.norm(dim=-1),
+        hidden.norm(dim=-1),
+        rtol=1e-5,
+    )

@@ -13,7 +13,6 @@ from bgkit.models.level_compressor import (
     _gather_survivors_packed,
 )
 
-
 # ----------------------------- helpers -----------------------------
 
 
@@ -305,6 +304,9 @@ def test_l1_init_from_l0_clone_evolves_independently():
     """L1 can be init by deepcopy of L0's backbone state and then diverge under training."""
     import copy
 
+    # Deterministic: an unseeded random head can select zero survivors under
+    # threshold mode, leaving no gradient path (observed flake, 2026-08-22).
+    torch.manual_seed(1234)
     backbone_l0 = _StubBackbone(hidden_dim=16)
     backbone_l1 = _StubBackbone(hidden_dim=16)
     # Init L1 from L0 clone
@@ -400,3 +402,152 @@ def test_compression_off_skips_head_and_survive_embedding():
     assert out.survivor_mask.all().item()
     # Hook was not installed — no post-hook capture.
     assert backbone.captured_post_hook is None
+
+
+def test_exact_topk_ranks_on_raw_scores_under_tanh_saturation():
+    """exact_topk must rank on ``base_raw / T`` (2026-08-22): a head at the tanh
+    floor collapses ``tanh(base_raw/T)`` to exact ties and top-k over ties is
+    arbitrary (answer-span survival at the chance rate in v5b). Ranking on the
+    pre-squash score keeps the true order."""
+
+    class _FixedHead(nn.Module):
+        def __init__(self, scores):
+            super().__init__()
+            self.register_buffer("scores", scores)
+
+        def forward(self, h):  # (1, N, D) -> (1, N)
+            return self.scores.unsqueeze(0).to(h.dtype)
+
+    backbone = _StubBackbone(hidden_dim=16)
+    lc = _make_lc(backbone=backbone, hidden_dim=16, with_prompt=False)
+    # Best scores at the END so a first-k tie-break would pick the wrong set.
+    scores = torch.tensor([-37.0, -36.0, -35.0, -34.0, -33.0, -32.0, -31.0, -30.0])
+    lc.head = _FixedHead(scores)
+    with torch.no_grad():
+        lc.head_tanh_temperature.fill_(0.1)  # tanh(-300..-370) == -1.0 exactly: all ties
+    content, cu, pos = _make_packed_content(B=1, lengths=[8], requires_grad=False)
+    out = lc(
+        content_embeddings=content, content_cu_seqlens=cu, content_position_ids=pos,
+        target_ratio=0.5, selection_mode="exact_topk",
+    )
+    # Under exact_topk the operator score is the per-document z-score: O(1),
+    # strictly ordered, and independent of the head's output scale (tanh of
+    # the raw/T score would be exactly -1.0 everywhere here).
+    assert out.logits_for_op.abs().max() < 3.0
+    assert out.logits_for_op.min() < out.logits_for_op.max()
+    assert out.survivor_mask.nonzero().flatten().tolist() == [4, 5, 6, 7]
+
+
+def test_exact_topk_score_is_scale_free_and_per_document():
+    """Multiplying the head's raw scores by 1000 leaves the exact_topk operator
+    score AND the survivors unchanged; standardization is per document."""
+
+    class _FixedHead(nn.Module):
+        def __init__(self, scores):
+            super().__init__()
+            self.register_buffer("scores", scores)
+
+        def forward(self, h):
+            return self.scores.unsqueeze(0).to(h.dtype)
+
+    base = torch.tensor([1.0, 2.0, 3.0, 4.0, 100.0, 101.0, 102.0, 103.0])
+    outs = []
+    for scale in (1.0, 1000.0):
+        backbone = _StubBackbone(hidden_dim=16)
+        lc = _make_lc(backbone=backbone, hidden_dim=16, with_prompt=False)
+        lc.head = _FixedHead(base * scale)
+        content, cu, pos = _make_packed_content(B=2, lengths=[4, 4], requires_grad=False)
+        outs.append(lc(
+            content_embeddings=content, content_cu_seqlens=cu, content_position_ids=pos,
+            target_ratio=0.5, selection_mode="exact_topk",
+        ))
+    a, b = outs
+    assert torch.allclose(a.logits_for_op, b.logits_for_op, atol=1e-4)
+    assert torch.equal(a.survivor_mask, b.survivor_mask)
+    # Per document: each segment is standardized on its own (same z pattern).
+    z = a.logits_for_op
+    assert torch.allclose(z[:4], z[4:], atol=1e-4)
+    assert abs(float(z[:4].mean())) < 1e-4
+    assert abs(float(z[:4].std(unbiased=False)) - 1.0) < 1e-3
+    # Top-50% per document = the two highest raw scores in each segment.
+    assert a.survivor_mask.nonzero().flatten().tolist() == [2, 3, 6, 7]
+
+
+# ----------------------- must_keep_mask (oracle span) -----------------------
+
+
+class _ScoreHead(nn.Module):
+    def __init__(self, scores):
+        super().__init__()
+        self.register_buffer("scores", scores)
+
+    def forward(self, h):  # (1, N, D) -> (1, N)
+        return self.scores.unsqueeze(0).to(h.dtype)
+
+
+def test_must_keep_mask_forces_span_into_topk_at_same_budget():
+    """Oracle-span diagnostic (2026-08-24): must-keep positions win exact_topk
+    even with the WORST head scores, the budget k is unchanged (they displace
+    the lowest-ranked organic picks), and the exported ``logits_for_op`` stays
+    the head's own z-score (aux losses see no boost)."""
+    backbone = _StubBackbone(hidden_dim=16)
+    lc = _make_lc(backbone=backbone, hidden_dim=16, with_prompt=False)
+    scores = torch.tensor([-10.0, -9.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    lc.head = _ScoreHead(scores)
+    content, cu, pos = _make_packed_content(B=1, lengths=[8], requires_grad=False)
+    must_keep = torch.zeros(8, dtype=torch.bool)
+    must_keep[0] = must_keep[1] = True  # the two WORST-scored positions
+    out = lc(
+        content_embeddings=content, content_cu_seqlens=cu, content_position_ids=pos,
+        target_ratio=0.5, selection_mode="exact_topk", must_keep_mask=must_keep,
+    )
+    kept = out.survivor_mask.nonzero().flatten().tolist()
+    # k = 4 (same budget): span [0, 1] forced in + the top-2 organic [6, 7].
+    assert kept == [0, 1, 6, 7]
+    # The exported operator score is unboosted (z-score of the head's scores).
+    baseline = lc(
+        content_embeddings=content, content_cu_seqlens=cu, content_position_ids=pos,
+        target_ratio=0.5, selection_mode="exact_topk",
+    )
+    assert torch.allclose(out.logits_for_op, baseline.logits_for_op, atol=1e-4)
+    assert baseline.survivor_mask.nonzero().flatten().tolist() == [4, 5, 6, 7]
+
+
+def test_must_keep_mask_threshold_mode_raises():
+    backbone = _StubBackbone(hidden_dim=16)
+    lc = _make_lc(backbone=backbone, hidden_dim=16, with_prompt=False)
+    content, cu, pos = _make_packed_content(B=1, lengths=[4], requires_grad=False)
+    with pytest.raises(ValueError, match="exact_topk"):
+        lc(
+            content_embeddings=content, content_cu_seqlens=cu,
+            content_position_ids=pos, target_ratio=0.5,
+            selection_mode="threshold",
+            must_keep_mask=torch.ones(4, dtype=torch.bool),
+        )
+
+
+def test_must_keep_mask_with_forced_survivor_mask_raises():
+    backbone = _StubBackbone(hidden_dim=16)
+    lc = _make_lc(backbone=backbone, hidden_dim=16, with_prompt=False)
+    content, cu, pos = _make_packed_content(B=1, lengths=[4], requires_grad=False)
+    with pytest.raises(ValueError, match="mutually"):
+        lc(
+            content_embeddings=content, content_cu_seqlens=cu,
+            content_position_ids=pos, target_ratio=0.5,
+            selection_mode="exact_topk",
+            forced_survivor_mask=torch.ones(4, dtype=torch.bool),
+            must_keep_mask=torch.ones(4, dtype=torch.bool),
+        )
+
+
+def test_must_keep_mask_shape_mismatch_raises():
+    backbone = _StubBackbone(hidden_dim=16)
+    lc = _make_lc(backbone=backbone, hidden_dim=16, with_prompt=False)
+    content, cu, pos = _make_packed_content(B=1, lengths=[4], requires_grad=False)
+    with pytest.raises(ValueError, match="must_keep_mask must have shape"):
+        lc(
+            content_embeddings=content, content_cu_seqlens=cu,
+            content_position_ids=pos, target_ratio=0.5,
+            selection_mode="exact_topk",
+            must_keep_mask=torch.ones(3, dtype=torch.bool),
+        )

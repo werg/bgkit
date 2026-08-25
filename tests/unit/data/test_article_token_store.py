@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import numpy as np
@@ -21,8 +23,6 @@ def _write_mmap_dataset(
     tag_list: list[str] | None = None,
 ) -> None:
     """Write a minimal Phase 2 mmap layout matching convert_hf_to_mmap.py."""
-    import json
-
     d = root / dataset
     d.mkdir(parents=True, exist_ok=True)
 
@@ -32,7 +32,8 @@ def _write_mmap_dataset(
         tokens.extend(token_ids)
         offsets.append(len(tokens))
     np.save(d / "tokens.npy", np.asarray(tokens, dtype=np.int32))
-    np.save(d / "offsets.npy", np.asarray(offsets, dtype=np.int64))
+    offsets_array = np.asarray(offsets, dtype=np.int64)
+    np.save(d / "offsets.npy", offsets_array)
 
     tl = tag_list or []
     table = pa.Table.from_pylist(
@@ -53,6 +54,12 @@ def _write_mmap_dataset(
         ]),
     )
     pq.write_table(table, d / "metadata.parquet")
+    (d / "manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "row_count": len(docs),
+        "total_tokens": len(tokens),
+        "offsets_sha256": hashlib.sha256(offsets_array.tobytes()).hexdigest(),
+    }))
 
 
 def test_get_by_document_id(tmp_path):
@@ -125,3 +132,21 @@ def test_document_ids_list(tmp_path):
     )
     store = ArticleTokenStore(tmp_path)
     assert set(store.document_ids("ds")) == {"doc_a", "doc_b", "doc_c"}
+
+
+def test_duplicate_document_ids_are_rejected(tmp_path):
+    _write_mmap_dataset(tmp_path, "ds", [("same", [1]), ("same", [2])])
+    store = ArticleTokenStore(tmp_path)
+    with pytest.raises(ValueError, match="duplicate document_id"):
+        store.document_ids("ds")
+
+
+def test_mixed_generation_counts_are_rejected(tmp_path):
+    _write_mmap_dataset(tmp_path, "ds", [("a", [1, 2])])
+    manifest_path = tmp_path / "ds" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["total_tokens"] = 99
+    manifest_path.write_text(json.dumps(manifest))
+    store = ArticleTokenStore(tmp_path)
+    with pytest.raises(ValueError, match="counts do not match"):
+        store.get("ds", "a")

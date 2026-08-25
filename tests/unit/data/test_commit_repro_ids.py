@@ -1,12 +1,4 @@
-"""Tests for the POSITIONAL-PATH git-commit-repro id scheme (2026-07).
-
-Interior tree node ids (window / chunk16 / chunk4 / commit) are the node's
-root-relative chunk path (``{repo}/w000/c16.00/c4.01/cm.03``); leaf (file-change)
-article ids are the file path scoped by the commit PATH id. Every producer
-(tree, mmap, trajectory) must agree on these ids, and each node's id must be
-prefixed by its parent's id (so a drill turn emits the known parent path + one
-new index segment — learnable positional navigation).
-"""
+"""Contract tests for opaque, artifact-consistent git-repro IDs."""
 
 from __future__ import annotations
 
@@ -22,7 +14,6 @@ from bgkit.data.commit_repro import (
     commit_key,
     file_change_leaf_id,
     sha_for_record,
-    surrogate_sha,
     window_node_id,
 )
 
@@ -30,7 +21,7 @@ from bgkit.data.commit_repro import (
 def _commit(repo, ordinal, window, paths, sha=None):
     sha = sha or (f"{'a' * 39}{ordinal:02d}")[-40:]
     return ReproCommit(
-        repo=repo, sha=sha, ordinal=ordinal, message=f"msg {ordinal}",
+        repo=repo, sha=sha, parent_sha="", ordinal=ordinal, message=f"msg {ordinal}",
         timestamp=ordinal, window_idx=window,
         file_changes=[
             FileChange(file_idx=i, path=p, diff_text=f"--- {p}\n+x",
@@ -48,58 +39,48 @@ def _forest(n_commits, paths_per_commit=("README.md", "src/main.py")):
     return commits, tree, node_ids
 
 
-def test_window_id_is_positional_path():
-    assert window_node_id("owner/repo", 0) == "owner/repo/w000"
-    assert window_node_id("owner/repo", 12) == "owner/repo/w012"
+def test_window_id_is_opaque_deterministic_and_salted():
+    first = window_node_id("owner/repo", 0)
+    assert first == window_node_id("owner/repo", 0)
+    assert first != window_node_id("owner/repo", 12)
+    assert first != window_node_id("owner/repo", 0, id_salt="rotated")
+    assert "owner" not in first and "repo" not in first and "/" not in first
+    assert len(first.split("-")) == 4
 
 
-def test_commit_ids_are_positional_paths():
-    # 20 commits in one window -> two chunk levels (window -> c16 -> c4 -> cm).
+def test_commit_ids_are_opaque_and_unique():
     _commits, _tree, node_ids = _forest(20)
-    # ordinal 7: c4-group 1 (commits 4-7), pos 3 within it; that c4-group is
-    # index 1 inside the first c16-group.
-    assert node_ids[commit_key("owner/repo", 0, 7)] == "owner/repo/w000/c16.00/c4.01/cm.03"
-    # ordinal 0: first of everything.
-    assert node_ids[commit_key("owner/repo", 0, 0)] == "owner/repo/w000/c16.00/c4.00/cm.00"
+    ids = [node_ids[commit_key("owner/repo", 0, i)] for i in range(20)]
+    assert len(set(ids)) == 20
+    assert all("/" not in value and len(value.split("-")) == 4 for value in ids)
 
 
 def test_path_depth_scales_with_commit_count():
-    # flat (n<4): window -> cm
-    _c, _t, ids3 = _forest(3)
-    assert ids3[commit_key("owner/repo", 0, 2)] == "owner/repo/w000/cm.02"
-    # one level (4<=n<=16): window -> c4 -> cm
-    _c, _t, ids10 = _forest(10)
-    assert ids10[commit_key("owner/repo", 0, 9)] == "owner/repo/w000/c4.02/cm.01"
-    # two levels (n>16): window -> c16 -> c4 -> cm
-    _c, _t, ids20 = _forest(20)
-    assert ids20[commit_key("owner/repo", 0, 19)].count("/") == 5
+    _c, tree3, ids3 = _forest(3)
+    _c, tree10, ids10 = _forest(10)
+    _c, tree20, ids20 = _forest(20)
+    assert len(tree3.path_to(ids3[commit_key("owner/repo", 0, 2)])) == 4
+    assert len(tree10.path_to(ids10[commit_key("owner/repo", 0, 9)])) == 5
+    assert len(tree20.path_to(ids20[commit_key("owner/repo", 0, 19)])) == 6
 
 
-def test_each_node_id_is_prefixed_by_its_parent():
-    # The learnability property: a child's id == parent id + one new segment,
-    # so the drill emits the known parent path + one index.
+def test_child_ids_cannot_be_derived_by_copying_parent():
     _commits, tree, _node_ids = _forest(20)
-    checked = 0
     for node in tree._nodes.values():
-        # Only the navigable drill subtree (window and below); the synthetic
-        # root + repo scaffolding nodes are exempt.
-        if "/w" not in node.id or node.parent not in tree._nodes:
+        if node.id == "root" or node.parent not in tree._nodes:
             continue
-        checked += 1
-        # child id == parent path + one new segment
-        assert node.id.startswith(node.parent + "/"), (node.id, node.parent)
-        assert node.id[len(node.parent) + 1:].count("/") == 0
-    assert checked > 0
+        assert not node.id.startswith(node.parent)
 
 
-def test_leaf_ids_are_file_names_under_path():
+def test_leaf_ids_are_opaque_not_query_visible_file_names():
     _commits, tree, node_ids = _forest(20)
     cnode = node_ids[commit_key("owner/repo", 0, 7)]
     arts = tree.get(cnode).articles
-    assert arts == (f"{cnode}/README.md", f"{cnode}/src/main.py")
-    assert arts[0].endswith("/README.md")
-    # the leaf id is the commit PATH + file name (no opaque token)
-    assert arts[0] == "owner/repo/w000/c16.00/c4.01/cm.03/README.md"
+    assert arts == (
+        file_change_leaf_id(cnode, "README.md", 0),
+        file_change_leaf_id(cnode, "src/main.py", 1),
+    )
+    assert all("README" not in aid and "main.py" not in aid for aid in arts)
 
 
 def test_all_ids_globally_unique():
@@ -113,7 +94,10 @@ def test_all_ids_globally_unique():
 def test_same_path_across_commits_gets_distinct_leaf_ids():
     _commits, tree, node_ids = _forest(20)
     readmes = [
-        f"{node_ids[commit_key('owner/repo', 0, i)]}/README.md" for i in range(20)
+        file_change_leaf_id(
+            node_ids[commit_key("owner/repo", 0, i)], "README.md", 0,
+        )
+        for i in range(20)
     ]
     assert len(set(readmes)) == 20
     for i, aid in enumerate(readmes):
@@ -123,12 +107,13 @@ def test_same_path_across_commits_gets_distinct_leaf_ids():
 
 
 def test_file_change_leaf_id_helper():
-    assert file_change_leaf_id("owner/repo/w000/c4.00/cm.01", "a/b.py", 3) == (
-        "owner/repo/w000/c4.00/cm.01/a/b.py"
+    value = file_change_leaf_id("opaque-commit", "a/b.py", 3)
+    assert value == file_change_leaf_id("opaque-commit", "a/b.py", 99)
+    assert value != file_change_leaf_id("opaque-commit", "different.py", 3)
+    assert value != file_change_leaf_id(
+        "opaque-commit", "a/b.py", 3, duplicated=True,
     )
-    assert file_change_leaf_id(
-        "owner/repo/w000/c4.00/cm.01", "a/b.py", 3, duplicated=True
-    ) == "owner/repo/w000/c4.00/cm.01/a/b.py#f003"
+    assert "a/b.py" not in value
 
 
 def test_duplicate_path_within_commit_disambiguated():
@@ -139,9 +124,9 @@ def test_duplicate_path_within_commit_disambiguated():
     cnode = node_ids[commit_key("owner/repo", 0, 0)]
     arts = tree.get(cnode).articles
     assert len(set(arts)) == 3
-    assert arts[0] == f"{cnode}/dup.py#f000"
-    assert arts[1] == f"{cnode}/dup.py#f001"
-    assert arts[2] == f"{cnode}/other.py"
+    assert arts[0] == file_change_leaf_id(cnode, "dup.py", 0, duplicated=True)
+    assert arts[1] == file_change_leaf_id(cnode, "dup.py", 1, duplicated=True)
+    assert arts[2] == file_change_leaf_id(cnode, "other.py", 2)
 
 
 def test_drilldown_trajectory_uses_consistent_ids():
@@ -157,15 +142,17 @@ def test_drilldown_trajectory_uses_consistent_ids():
     )
     assert traj is not None
     refs = set(articles_referenced_by_trajectory(traj))
-    # Head is the window PATH node.
+    # Head is the opaque window node.
     assert window_node_id("owner/repo", 0) in refs
     # Every retrieve id equals the tree's article id (path + file name) and
     # resolves in the tree.
     for ord_i, _fc_i in touching:
         cnode = node_ids[commit_key("owner/repo", 0, ord_i)]
-        expected = f"{cnode}/README.md"
+        expected = file_change_leaf_id(cnode, "README.md", 0)
         assert expected in refs
         assert expected in tree.get(cnode).articles
+        calls = [t.args["ids"][0] for t in traj if t.kind == "bgkit"]
+        assert calls.index(cnode) < calls.index(expected)
     # Every emitted nav id resolves to a real tree node OR a tree article
     # (the invariant the trainer relies on).
     all_articles = {a for n in tree._nodes.values() for a in n.articles}
@@ -184,19 +171,20 @@ def test_drilldown_returns_none_on_missing_commit():
     assert traj is None
 
 
-def test_path_ids_unique_regardless_of_sha():
-    """Path ids are derived from (window, chunk position), so they are unique per
-    commit even when shas collide (the old opaque scheme collapsed on sha='')."""
-    commits = [_commit("owner/repo", i, 0, ["f.py"], sha="") for i in range(20)]
-    _tree, node_ids = build_forest({"owner/repo": commits})
-    ids = [node_ids[commit_key("owner/repo", 0, i)] for i in range(20)]
-    assert len(set(ids)) == 20  # all distinct despite identical (empty) shas
+def test_duplicate_or_empty_shas_fail_closed_instead_of_aliasing():
+    import pytest
+
+    commits = [_commit("owner/repo", i, 0, ["f.py"], sha="same-sha") for i in range(20)]
+    with pytest.raises(ValueError, match="opaque id collision"):
+        build_forest({"owner/repo": commits})
 
 
-def test_sha_for_record_prefers_real_sha():
-    """sha_for_record still exists (populates the mmap commit_sha metadata field);
-    a real git sha wins over the surrogate."""
+def test_sha_for_record_requires_real_sha():
+    """Artifact identity must not silently fall back to row position."""
+    import pytest
+
     rec = {"repo": "o/r", "window_idx": 0, "ordinal": 3, "message": "m", "timestamp": 9}
-    assert sha_for_record(rec) == surrogate_sha("o/r", 0, 3, "m", 9)
+    with pytest.raises(ValueError, match="no real commit SHA"):
+        sha_for_record(rec)
     rec_real = dict(rec, sha="deadbeef" * 5)
     assert sha_for_record(rec_real) == "deadbeef" * 5

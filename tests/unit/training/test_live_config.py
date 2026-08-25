@@ -2,6 +2,7 @@
 
 import json
 import time
+from typing import ClassVar
 
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.live_config import LiveConfig
@@ -102,13 +103,64 @@ def test_bad_json_then_fixed_same_mtime(tmp_path):
     assert changes == {"lr": 1e-4}
 
 
+def test_phase_namespace_ignores_other_phases(tmp_path):
+    f = tmp_path / "control.json"
+    f.write_text(json.dumps({"phase2_kb": {"lr": 1e-4}, "phase1_step6": {"lr": 9.0}}))
+    lc = LiveConfig(f, namespace="phase2_kb")
+    assert lc.poll() == {"lr": 1e-4}
+    assert LiveConfig(f, namespace="phase1_step3").poll() == {}
+
+
+def test_run_namespace_overrides_phase_block_keywise(tmp_path):
+    """Run block wins per key; phase keys it doesn't name still apply."""
+    f = tmp_path / "control.json"
+    f.write_text(
+        json.dumps(
+            {
+                "phase2_kb": {"max_steps": 1400, "eval_every": 250},
+                "phase2_kb_widenet_v6": {"max_steps": 2630},
+            }
+        )
+    )
+    lc = LiveConfig(f, namespace="phase2_kb", run_namespace="phase2_kb_widenet_v6")
+    assert lc.poll() == {"max_steps": 2630, "eval_every": 250}
+    # Another run of the same phase sees only the phase block.
+    other = LiveConfig(f, namespace="phase2_kb", run_namespace="phase2_kb_widenet_v7")
+    assert other.poll() == {"max_steps": 1400, "eval_every": 250}
+
+
+def test_first_poll_warns_about_inherited_phase_keys(tmp_path):
+    from structlog.testing import capture_logs
+
+    f = tmp_path / "control.json"
+    f.write_text(json.dumps({"phase2_kb": {"max_steps": 1400, "lr": 1e-4}, "run_x": {"lr": 2e-4}}))
+    lc = LiveConfig(f, namespace="phase2_kb", run_namespace="run_x")
+    with capture_logs() as captured:
+        lc.poll()
+        time.sleep(0.05)
+        f.write_text(
+            json.dumps({"phase2_kb": {"max_steps": 1500, "lr": 1e-4}, "run_x": {"lr": 2e-4}})
+        )
+        assert lc.poll() == {"max_steps": 1500}
+    warned = [e for e in captured if e.get("event") == "live_config_phase_block_inherited"]
+    assert len(warned) == 1  # first poll only
+    assert warned[0]["keys"] == ["max_steps"]  # lr is overridden by the run block
+
+
+def test_malformed_run_block_applies_nothing(tmp_path):
+    f = tmp_path / "control.json"
+    f.write_text(json.dumps({"phase2_kb": {"lr": 1e-4}, "run_x": [1, 2]}))
+    lc = LiveConfig(f, namespace="phase2_kb", run_namespace="run_x")
+    assert lc.poll() == {}
+
+
 # --- Tests for BaseTrainer.apply_live_config ---
 
 
 class _StubTrainer(BaseTrainer):
     """Minimal concrete trainer for testing live config."""
 
-    LIVE_CONFIG_FIELDS = {"weight_a": "w_a", "weight_b": "w_b"}
+    LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {"weight_a": "w_a", "weight_b": "w_b"}
 
     def __init__(self):
         # Skip BaseTrainer.__init__ — we just need the attributes
@@ -131,7 +183,7 @@ class _StubTrainer(BaseTrainer):
 class _ChildTrainer(_StubTrainer):
     """Subclass adding more fields via MRO merge."""
 
-    LIVE_CONFIG_FIELDS = {"weight_c": "w_c"}
+    LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {"weight_c": "w_c"}
 
     def __init__(self):
         super().__init__()
@@ -178,7 +230,7 @@ def test_apply_live_config_preserves_type():
 class _SamplerStubTrainer(BaseTrainer):
     """Trainer with a single ratio sampler config attribute."""
 
-    LIVE_CONFIG_HANDLERS = {
+    LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
         "target_ratio_sampling_window_above": "_handle_ratio_sampling_window_above",
     }
 
@@ -257,7 +309,7 @@ def test_window_above_live_update_rebuilds_all_configured_attrs():
 
 
 class _SamplingEnabledStub(_SamplerStubTrainer):
-    LIVE_CONFIG_HANDLERS = {
+    LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
         "sample_target_ratio_during_training": "_handle_ratio_sampling_enabled",
     }
 
@@ -283,7 +335,7 @@ def test_sampling_enabled_live_update_rejects_non_bool():
 
 
 class _AnchorProbStub(_SamplerStubTrainer):
-    LIVE_CONFIG_HANDLERS = {
+    LIVE_CONFIG_HANDLERS: ClassVar[dict[str, str]] = {
         "target_ratio_anchor_sampling_prob": "_handle_ratio_sampling_anchor_prob",
     }
 

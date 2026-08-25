@@ -9,17 +9,16 @@
 #   L0 + L1 compression.
 #
 # PER-REPO FULL-BACKPROP (recursive_l1_tree.full_backprop_per_repo: true)
-#   A training batch is ONE repo's window-0 file-samples (grouped by
+#   A training batch is ONE (repo, history-window)'s file-samples (grouped by
 #   RepoGroupedBatchSampler on the shared-subtree root = the window node id).
-#   For each repo the WHOLE window-0 subtree is encoded ONCE — L0 LIVE on every
+#   For each group the WHOLE window subtree is encoded ONCE — L0 LIVE on every
 #   diff leaf -> L1 up the tree -> node reps — with a GENERAL query-agnostic
-#   prompt (general_prompt below). Every file-sample's browse turns SPLICE
-#   those shared node reps; only its drill-down bgkit turn re-encodes the
-#   drilled file-diff (+ the commit's other files as distractors) with the
-#   SPECIFIC commit/filename query. The file-samples' decoder losses are
+#   prompt (general_prompt below). Query-conditioned drill nodes reuse that
+#   tree's child states but are encoded live for the file/commit task; the final
+#   evidence drill encodes the relevant diff chain. The file-samples' losses are
 #   backpropped through the SHARED tree (retain_graph across the repo's
 #   file-samples; released by the final aux backward), so one optimizer step
-#   updates L0 (live) + L1 + encoder.l1l1_bridge + the tree reps + the decoder.
+#   updates L0 (live) + L1 + encoder.l1l1_bridge + tree reps + decoder.
 #
 #   This replaces the earlier PER-SAMPLE full-backprop (which re-encoded each
 #   file's whole walk per sample, query-conditioned). Encoding the shared tree
@@ -41,11 +40,20 @@ stage: A                       # live-L0 semantics (live_l0 below)
 optimizer: adamw
 
 # Training horizon — bootstrap sizing; TUNABLE once git_commit_repro size known.
-max_steps: 12000
+max_steps: 18000
 warmup_steps: 300
-lr: 1.0e-4
-decoder_lr: 5.0e-5
-l1_lr: 2.0e-4
+# LR REBALANCE (2026-07-31 collapse fix). Root cause of the 9164 rep-collapse:
+# the encoder LR (lr=1e-4 → l0/projection; l1_lr=2e-4 → l1/l1l1_bridge) OUTRAN
+# the decoder LR (5e-5), so under full-backprop reconstruction the under-
+# constrained encoder reps ran away (readable norm 4x → 12-320x embed-norm)
+# while the decoder couldn't keep its readable code co-trained. Pin ALL of
+# encoder (lr), L1 (l1_lr) and decoder (decoder_lr) to 5e-5 so the encoder can
+# no longer outpace the decoder that has to read its reps. Requirement:
+# encoder LR ≤ decoder LR and L1 LR ≤ decoder LR (here: equal). Still live-
+# tunable — the base `lr` control.json handler scales all groups proportionally.
+lr: 5.0e-5              # was 1.0e-4 — drives l0 + projection_blocks (via lr fallback)
+decoder_lr: 5.0e-5     # unchanged — the ceiling the encoder must not exceed
+l1_lr: 5.0e-5          # was 2.0e-4 — drives encoder.l1 backbone + l1l1_bridge
 eval_every: 500
 # Comprehensive ablation matrix run at every eval: re-runs the eval set under
 # each mode and logs eval/ablation/{mode}/{loss,exact_match,token_f1,kb/tool_call_id_accuracy/bgkit}.
@@ -55,6 +63,15 @@ eval_every: 500
 # (CE split) below. Catches the decorative-reps shortcut (recon_gap→0) instead of hiding it.
 eval_ablation_modes: [zeroed, noise, neither]
 eval_gap_probe: true          # emit eval/recon_gap + eval/nav_gap (CE split, present-vs-zeroed)
+# Small autonomous slice at every checkpoint evaluation. These metrics cannot
+# be inflated by future teacher calls or the gold answer appearing in context.
+# Use scripts/eval_phase2_kb.py for the larger final evaluation.
+eval_free_running_samples: 4
+eval_free_running_max_tool_calls: 16
+eval_free_running_max_new_tokens: 8192
+# Each entry owns a whole window's GPU survivor tensors; never scale this with
+# eval-set size. Consecutive samples already reuse the currently installed tree.
+eval_tree_cache_max_groups: 1
 save_every: 500
 reset_wandb: true
                     # was true for the 2026-07-21 fresh-run bringup (now run gfb9j36x)
@@ -91,6 +108,8 @@ decoder_gradient_checkpointing: true
 
 datasets:
   - git_commit_repro
+# Fail setup if an ablation artifact overwrote the production trajectory path.
+git_repro_allowed_drill_modes: [full]
 
 # LIVE L0 — gradient trains the L0 backbone/head/auto_repro_head on the diff
 # leaves of the shared tree. No L0 precompute / l0_cache needed (the earlier
@@ -107,23 +126,9 @@ recursive_l1_tree:
   # query (commit message + filename) instead.
   general_prompt: "compress this repository's commit history"
 
-  # BUG-1 FIX — L1 selection mode. This is a FROZEN-POLICY run: survivorship
-  # aux is off, so the L1 survivorship head receives NO gradient (BCE /
-  # moment-match / decisiveness / min-survivors / utility-grad all skipped) and
-  # the hard mask is detached (no STE). On the recursive-tree distribution the
-  # frozen head's tanh(base_raw/T) logits are tanh-saturated near the ceiling,
-  # so the dual-ascent θ controller can never reach the target keep-rate — it
-  # pins θ at ~1.0 and L1 keep-rate sticks ~0.78 vs the ~0.25 target (the L1
-  # compression won't tighten). Diagnosed via checkpoint weight-diff
-  # (l1.head changed exactly 0.0) + code trace.
-  #
-  # ``exact_topk`` switches EVERY L1 selection (recursive tree nodes, the HEAD
-  # drill, and the drill-down bgkit turn) to DETERMINISTIC per-sample top-k,
-  # realizing the L1 retention ramp's target ratio directly from the fixed head
-  # logits and bypassing θ entirely. The L1 dual-ascent θ step is then skipped
-  # (KRKBTrainer._theta_skip_levels / _post_optimizer_step) so a now-irrelevant
-  # threshold cannot drift. Default (elsewhere) is ``threshold`` (θ-controlled),
-  # unchanged for every other dataset/run.
+  # Exact top-k makes the requested compression rate deterministic. The
+  # selection head is still trained by survivorship relevance/utility losses;
+  # only the count controller is bypassed, so L1 theta updates are skipped.
   selection_mode_l1: exact_topk
   # Step-interpolated retention ramps (start -> end over ramp_steps, by
   # global_step). Recursive L0 (shared-tree diff leaves) 0.30 -> 0.05;
@@ -135,14 +140,58 @@ recursive_l1_tree:
   # its biggest-repo Option-A backwards ran >300s → step-watchdog kills. 0.30
   # keeps ~50GB headroom + faster backwards. Live-tunable (pinned 0.30 via
   # control.json on the running job).
+  # LESS-COMPRESSION TEST (2026-07-30): hold BOTH levels at 0.30 (constant, no
+  # ramp-down) instead of ramping to 0.05. Rationale: the recon bug was two-layer
+  # — (1) the exact_ratio_topk quota starvation (pinned IDs ate the content quota
+  # → 0 diff survivors; FIXED in selection.py) and (2) query-agnostic drill under
+  # a frozen selection policy so tight retention kept the WRONG survivors. With
+  # the leaf now L0-exact_topk + query-conditioned (see _prepare_sample_for_decode
+  # / _prepare_l1_turn), 0.30/0.30 delivers ~9% net leaf content (the intended
+  # ~0.08 regime) so the decoder can actually reconstruct from it. 0.30 is the
+  # memory-validated ceiling (0.35 tripped the step-watchdog, 0.50 host-OOM'd).
+  # Revisit toward 0.08 once the selection is trained (relevance loss / STE).
   l0_retention:
     start: 0.30
-    end: 0.05
+    end: 0.30
     ramp_steps: 4000
   l1_retention:
     start: 0.30
-    end: 0.05
+    end: 0.30
     ramp_steps: 4000
+
+  # ── QUERY-CONDITIONED DRILL NODES (2026-07-31 redesign) ───────────────────
+  # EVERY trajectory drill turn — the head, the on-path interior nodes
+  # (c16/c4/commit), the wrong-sibling DISTRACTOR node drills (content-driven
+  # rejection needs them encoded under the same query), and the retrieve
+  # leaf — is encoded LIVE per sample, conditioned on the sample's TASK QUERY,
+  # instead of splicing the static general-prompt shared-tree rep (which made
+  # navigation reps query-independent replays). Node turns route through the
+  # generalized _shared_tree_head_survivor → _encode_tree_node_live (the
+  # PROVEN head machinery: shared-tree child l1outs via detach-reaccumulate,
+  # l1_auto_reproduce bridge, one L1 node forward under _head_query_emb) with
+  # a FORCED per-node activation checkpoint, so activations free after each
+  # forward and peak memory does NOT scale with path length. The SHARED TREE
+  # ENCODE IS UNCHANGED (general prompt, ramps above at 0.30) — it remains the
+  # child-survivor source and the single deferred tree backward; its static
+  # proj reps are simply no longer spliced (the `used` list goes empty;
+  # `child_used` carries all nodes). Flag OFF = exact legacy behavior.
+  # LIVE-TUNABLE: {"phase2_kb": {"query_conditioned_drill_nodes": bool,
+  # "drill_node_retention": r, "drill_leaf_l0_retention": r,
+  # "drill_leaf_l1_retention": r}} (null clears an override).
+  query_conditioned_drill_nodes: true
+  # Retention of the per-sample query-conditioned node forwards (head +
+  # interior + distractor node turns). Uniform 0.4 (vs the tree's 0.30).
+  drill_node_retention: 0.4
+  # Retrieve-leaf drill retention — NET 0.4 over the two leaf stages
+  # (L0 × L1 = 0.63 × 0.63 ≈ 0.397): the leaf is the recon evidence, so the
+  # net is what matters. Overrides l0_retention.git_commit_repro (leaf L0)
+  # and the recursive-ramp coupling (leaf L1) for the drill ONLY; ALSO applied
+  # by the single-sample EVAL path (_run_l1_batch None-default), so
+  # recon_gap/decode are measured at the training regime instead of the old
+  # eval quirk (sampled base l1_retention = 0.05).
+  drill_leaf_retention:
+    l0: 0.63
+    l1: 0.63
   # Per-repo file-sample cap. REFRAMED to a COMPUTE knob, not a memory knob:
   # _forward_backward_per_repo is now count-then-stream (Pass 1 counts cheaply
   # with NO encode; Pass 2 encodes+decodes+backwards ONE sample at a time and
@@ -206,7 +255,15 @@ recursive_l1_tree:
   # max 673; an n_nodes=187 repo OOM'd at the 0.86 CUDA cap. 160 drops ~12.5%
   # (~1.67k repos), keeping windows below the n187 OOM point with margin. Raise
   # live (control.json) if the profile shows headroom; lower if it still OOMs.
-  max_repo_tree_nodes: 160
+  # 2026-08-01: 160 → 130. At the host-safe 0.80 CUDA cap (97 GB) a ~157-node
+  # TRAINING repo (eval forward 53 GB × ~1.8 for backward ≈ 95-100 GB) tipped 78
+  # MiB over the cap and crashed (falcon decode _swiglu_forward_packed). The 160
+  # cap was sized for the old 0.86 fraction; we can't raise the fraction (0.80 is
+  # host-calibrated — peak system_used already ~114 GB = the abort). So bound the
+  # big-repo tail instead: 130 nodes ≈ 80 GB training peak (~17 GB margin) and
+  # keeps drill retention (the recon_gap signal knob) at 0.4. Drops the ~p88+
+  # node tail. Raise back toward 160 if the profile shows headroom.
+  max_repo_tree_nodes: 130
 
   # --- INNER-LOOP per-repo mode (Model B; ENABLED for this run) -------------
   # Encode the tree ONCE per repo, then do K optimizer steps each on a
@@ -228,22 +285,11 @@ recursive_l1_tree:
   inner_loop_warmup_steps: 0       # first N global steps use the exact
                                      # one-step (clean-gradient) path
 
-  # OPTION A (crash-free amortized per-repo; live-tunable). The CONVERGED
-  # design for the full-tree git-repro run. Fixes the original inner-loop's
-  # autograd crash (it stepped the encoder between K backwards through the LIVE
-  # retained tree → "variable modified by an inplace operation"). Option A
-  # SEPARATES the cadences: encode the FULL tree ONCE → R; the DECODER reads a
-  # DETACHED snapshot R_d and is stepped per file-subset (K = ceil(n_files/S)
-  # updates, optimal batch S, over ALL files — NO file cap); the ENCODER (every
-  # param R depends on — shared by the live drill AND the tree) accumulates grad
-  # across the subsets (incl. the drill) and is NOT stepped until the end, so
-  # R's retained graph stays valid for ONE deferred tree-backward, then the
-  # encoder steps ONCE/repo. Whole-repo batches; partitioned internally
-  # (UNCAPPED — option_a_max_subsets below, 0 = all files). Mutually exclusive
-  # with per_repo_inner_loop. ONE base-loop global step == ONE repo (K decoder +
-  # 1 encoder update), so eval/save cadence counts REPOS. profile_timing: true
-  # emits the per_repo_timing breakdown.
-  per_repo_option_a: true
+  # One coherent update per repository. The removed Option-A schedule updated
+  # the decoder several times against a stale detached tree and only then
+  # updated the encoder, so its gradients did not describe any single joint
+  # model state.
+  per_repo_option_a: false
   # 0 = UNLIMITED (process ALL files across ceil(n_contrib/S) subsets — the
   # user's core motivation: no file cap). Optional safety cap only.
   option_a_max_subsets: 0
@@ -266,16 +312,11 @@ recursive_l1_tree:
   #     (checkpoint_tree_encode + tree_checkpoint_min_tokens below) is now
   #     LOAD-BEARING to bound both the encode forward AND retained R to ~one
   #     node/chunk.
-  #   max_decode_tokens: TRUNCATE the gold OUTPUT to its first N tokens (HARD
-  #     cut — drop the tail + end-token + any suffix), KEEPING every file (no
-  #     skip → no short-file bias, no data loss). The first portion of a file
-  #     already exercises extracting info from the tree, so reconstructing the
-  #     first-N gold is a valid target. Bounds the decode seqlen to
-  #     ≈ prefix + survivors + N. The TREE/input is NOT truncated. 4096 keeps
-  #     the decode ≤ the decode_gc_min_seqlen below, so the decode stays under
-  #     the GC threshold → no recompute → fast.
+  #   max_decode_tokens: 0 keeps the complete file-state target. Prefix-only
+  #     supervision is not equivalent to the task and made evaluation on the
+  #     configured 8192-token gold cap partly out of distribution.
   max_l0_encode_tokens: 0
-  max_decode_tokens: 4096
+  max_decode_tokens: 0
 
   # FIX 2 (encode-chunking): checkpoint each tree node's L1 forward so its
   # activations are recomputed (one node at a time) on the final backward
@@ -312,18 +353,27 @@ recursive_l1_tree:
 # coherent within-document compression curriculum (higher start 0.30 -> 0.05,
 # 2026-07-06 — keep the drill's retrieval-leaf content richer early too; 0.50
 # ballooned the decode + host RAM, see recursive_l1_tree note above).
+# 2026-07-30: end 0.05 -> 0.30. This is the key that actually pins the DRILL/
+# retrieve-leaf L0 (NOT recursive_l1_tree.l0_retention, which only governs the
+# shared-tree nav nodes). At 0.05 the retrieve leaf delivered ~1.5% net, so the
+# earlier "0.30 test" never reached the leaf. Hold at 0.30 (matches the recursive
+# ramp pin) so the trajectory sees content-rich leaf reps while the channel is
+# (re)built from the 51945 re-anchor.
+# 2026-07-31: SUPERSEDED for the leaf by recursive_l1_tree.drill_leaf_retention
+# (l0: 0.63) while that override is set — this map is now the FALLBACK (and
+# still governs any non-drill live L0 encode for this dataset).
 l0_retention:
   git_commit_repro:
     start: 0.30
-    end: 0.05
+    end: 0.30
     ramp_steps: 4000
 
 # Top-level L1 retention. NOTE: this does NOT pin the drill-down retrieval —
-# the drill shares the L1 controller (θ) with the shared tree and requests the
-# SAME recursive L1 ramp (recursive_l1_tree.l1_retention, 0.30→0.05) at runtime
-# (KRKBTrainer._encode_sample_turns), so the whole L1 compression is ONE
-# curriculum. This scalar only sizes the dual-ascent anchor grid + serves as a
-# fallback; set to the ramp END so the anchor grid covers the ramp's tight end.
+# with drill_leaf_retention.l1 set (above) the leaf drill uses that override
+# (training drivers AND the single-sample eval path); without it the drill
+# shares the recursive L1 ramp (recursive_l1_tree.l1_retention) at runtime.
+# This scalar only sizes the dual-ascent anchor grid + serves as the last
+# fallback for non-recursive runs.
 l1_retention: 0.05
 
 # Jitter off — the recursive ramps drive retention deterministically.
@@ -331,6 +381,14 @@ l0_retention_jitter:
   enabled: false
 l1_retention_jitter:
   enabled: false
+
+# NOTE (2026-07-31): the splice-reconstruction aux + rep_gain canary were
+# REMOVED. They decoded a raw [reps | prompt | text] framing WITHOUT the
+# chat/tool template — garbage input for Falcon and a supervision signal on
+# the wrong channel — so the whole block (aux hook, canary, config, live
+# handler) was ripped out rather than fixed. The correct-template
+# eval/recon_gap + eval/nav_gap metrics (eval_gap_probe above) remain the
+# rep-dependence signal.
 
 # Direct training (no LoRA): L1's LoRA was the only thing that broke GC
 # recompute (LoRARouter thread-local state). L0 trains directly (live).
@@ -344,20 +402,43 @@ lora:
   alpha: 64
   dropout: 0.0
 
-# Survivorship aux losses DISABLED for the recursive-L1 reconstruction run.
-# The pre-trained head already selects decent candidates and selection is the
-# least-important signal here (reps are distributed), so we freeze the head
-# (no aux gradient: BCE / moment-match / min-survivors / decisiveness /
-# relevance / utility-grad all skipped) and train only L0/L1 backbones +
-# l1l1_bridge + projection via the reconstruction loss. This ALSO removes the
-# _pending_l0/l1_outputs retention (they existed only to feed the aux +
-# utility-grad), so the per-repo forward retains NOTHING beyond the shared tree
-# — bounding memory regardless of file-sample count. The dual-ascent θ control
-# stays ON (accumulated per-microbatch at encode time) so L0/L1 retention still
-# track their ramps. The per-level weights below are therefore inert (kept for
-# documentation / easy re-enable via survivorship_aux: true).
+# Train the selection heads on the actual git-history retrieval distribution.
+# Hard top-k controls the count, while the relevance and utility losses below
+# teach which states and distractors should occupy that count.
 survivorship:
-  survivorship_aux: false
+  survivorship_aux: true
+  # --- Projection-output norm-band regularizer (2026-07-31, THE novel collapse
+  # fix). Keeps every projected/spliced survivor-rep's L2 norm inside the
+  # decoder's READABLE band and penalizes the inflation runaway that killed the
+  # 9164 encoder (readable ~4x embed-norm → 12-35x → 320x, + content loss).
+  # NOTE the reps are a CO-TRAINED code, NOT the embed_tokens manifold: even the
+  # good 51945 reps sit at cos≈0 and norm ≈ 4.2x (qwen) / ~0.9x (falcon) of the
+  # decoder embed_tokens row-norm — so we anchor the NORM band only (per family),
+  # never the direction. target[fam] = target_ratio[fam] * mean(embed_tokens
+  # row-L2-norm). Hinge-band (permissive inside [target/tol, target*tol]):
+  #   loss = mean( relu( |log(rep_norm / target)| - log(tolerance) )^2 )
+  # folded into the per-group reconstruction loss so its gradient flows through
+  # projection_blocks[family] into the L1/L0 backbones (that is the point — it
+  # constrains what the encoder PRODUCES). weight is live-tunable via
+  # control.json ({"phase2_kb": {"projection_norm_reg_weight": w}}).
+  projection_norm_reg:
+    enabled: true
+    # weight 0.1 -> 0.3 (2026-08-01): firmer pull on the qwen drift. Harmless
+    # to the in-band falcon — its hinge penalty is exactly 0 inside the band.
+    weight: 0.3
+    # Per-family tolerance (scalar still accepted = one band width for all).
+    # qwen35 rep norm drifted 6.5x -> 8.5x embed-norm (observed 2026-08-01)
+    # against target 4.2 — at tol 2.0 the band ceiling was 8.4, so the drift
+    # was barely penalized. Tighten qwen to 1.4 (ceiling 4.2*1.4 = 5.9)
+    # WITHOUT tightening falcon_h1: falcon is stable in-band at ~0.62x
+    # (target 0.9, band [0.45, 1.8]) and a shared tighten would start
+    # penalizing it.
+    tolerance:
+      qwen35: 1.4           # tighter leash — only penalize outside [3.0, 5.9]
+      falcon_h1: 2.0        # unchanged — only penalize outside [0.45, 1.8]
+    target_ratio:
+      qwen35: 4.2            # measured 51945 readable band (qwen embed-norm x)
+      falcon_h1: 0.9        # measured 51945 readable band (falcon embed-norm x)
   relevance_loss_weight: 0.05
   relevance_gold_boost: 1.5
   relevance_distractor_damp: 0.5
@@ -409,15 +490,28 @@ moment_match_reference:
 # (strict=False) + _clone_l1l1_bridge_if_absent auto-clones it from
 # l0.auto_repro_head, then _set_trainability unfreezes it. Full-backprop through
 # the whole tree (the central goal) trains the bridge end-to-end from there.
+# 2026-07-31 RE-ANCHOR to the CLEAN summarization base (collapse fix). The 9164
+# encoder is the drifted/collapsed artifact we are repairing — starting from the
+# hybrid (enc9164) re-anchors onto the OFF-manifold reps we are trying to escape.
+# Restart instead from the matched summarization round-robin step-51945 checkpoint
+# whose reps are strongly load-bearing (rep_gain +2 nats) and sit in the readable
+# band (norm ≈ 4.2x qwen / 0.9x falcon embed-norm — the target_ratio above). It is
+# self-contained (encoder.pt + decoder_qwen.pt + decoder_falcon.pt, both decoders
+# co-trained), so NO decoder staging/copy is needed. It PREDATES the l1l1_bridge
+# distillation, so l1l1_bridge.* is ABSENT: from_pretrained_with_state_dict
+# (strict=False) + _clone_l1l1_bridge_if_absent auto-clone l1l1_bridge from the
+# trained l0.auto_repro_head (L0->L1 bridge), then _set_trainability unfreezes it.
+# Full-backprop through the whole tree trains the bridge end-to-end from that
+# clone-init (the design intent — no separate re-distillation step; see report for
+# the clone-init verdict + the trade-off vs the hybrid's specialized bridge).
 phase1_checkpoint: /workspace/checkpoints/phase1_summarization_round_robin_step51945_20260624_060459
 
 # ── Decoder: ROUND-ROBIN both families (Qwen-0.8B + Falcon-H1-90M) ──────────
-# Both decoders resident; one family picked per repo-batch. The summarization
-# run co-trained both, so staging decoder_qwen.pt + decoder_falcon.pt into the
-# encoder ckpt dir (above) loads them warm rather than fresh-HF. qwen_decoder_prob
-# biases the split (Qwen-0.8B is ~9x Falcon-90M; fewer Qwen batches = faster).
+# Both decoders resident; one family picked per repo-batch. Use a balanced
+# distribution so the reported round-robin evaluation measures the same
+# objective that training optimizes.
 round_robin: true
-qwen_decoder_prob: 0.08
+qwen_decoder_prob: 0.5
 decoder_qwen:
   family: qwen35
   backbone_name: Qwen/Qwen3.5-0.8B

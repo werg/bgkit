@@ -10,6 +10,7 @@ from bgkit.data.bgkit_tool_template import (
     BGKIT_SENTINEL,
     BGKIT_TOOL,
     TrajectoryTurn,
+    assistant_generation_prompt_ids,
     make_system_prompt,
     tokenize_trajectory,
 )
@@ -158,3 +159,112 @@ def test_tokenize_trajectory_loss_mask_and_sentinel(tokenizer):
     # Sentinel positions must fall in loss-masked-False region (tool response)
     for pos in rendered.bgkit_sentinel_positions:
         assert rendered.loss_mask[pos].item() is False
+
+
+@pytest.fixture(scope="module", params=["Qwen/Qwen3.5-0.8B", "tiiuae/Falcon-H1-Tiny-90M-Instruct"])
+def any_tokenizer(request):
+    """Both decoder families' templates (Qwen3.5 renders XML tool calls and an
+    empty ``<think>`` scaffold; Falcon-H1 renders JSON and closes turns with
+    ``<|im_end|>`` while its eos is ``<|end_of_text|>``)."""
+    pytest.importorskip("transformers")
+    from transformers import AutoTokenizer
+
+    from bgkit.data.chat_template import patch_falcon_h1_chat_template
+
+    try:
+        tok = AutoTokenizer.from_pretrained(request.param, trust_remote_code=True)
+    except Exception:
+        pytest.skip(f"{request.param} tokenizer not available locally")
+    patch_falcon_h1_chat_template(tok)
+    return tok
+
+
+def test_loss_and_spans_cover_content_not_scaffold(any_tokenizer):
+    """Loss applies to the emitted content + the end-of-turn token; the
+    assistant scaffold (header, Qwen's empty think block) and template glue
+    are masked. ``answer_span`` / ``bgkit_call_spans`` decode to exactly the
+    content, and the decoded call body round-trips through the eval parser
+    (ties the parser to what the decoder is trained to emit)."""
+    from bgkit.data.bgkit_tool_template import assistant_turn_scaffold
+    from bgkit.data.chat_template import end_of_turn_token_ids
+    from bgkit.eval.kb_trajectory_eval import parse_bgkit_call
+
+    tok = any_tokenizer
+    trajectory = [
+        TrajectoryTurn(kind="bgkit", args={"ids": ["doc-1"], "query": "why?"}, loss=True),
+        TrajectoryTurn(kind="answer", response="def fetch_page(url):", loss=True),
+    ]
+    system = make_system_prompt("pre_scoped", scope_description="source file a.py")
+    r = tokenize_trajectory(tok, system, "Quote the line.", trajectory)
+    ids = r.token_ids.tolist()
+    mask = r.loss_mask.tolist()
+
+    def end_of_turn_end(start: int) -> int:
+        """Index after the first end-of-turn marker at/after ``start``."""
+        eot = end_of_turn_token_ids(tok)
+        return next(i for i in range(start, len(ids)) if ids[i] in eot) + 1
+
+    a, b = r.answer_span
+    assert tok.decode(ids[a:b]) == "def fetch_page(url):"
+    # Targets: content + end-of-turn emission (glue + marker); nothing after.
+    e_ans = end_of_turn_end(b)
+    assert e_ans - b <= 2 and all(mask[a:e_ans])
+    assert all(not m for m in mask[e_ans:])
+    # Nothing before the answer content inside the answer turn bears loss.
+    history = [{"role": "system", "content": system}, {"role": "user", "content": "Quote the line."}]
+    pre, _post = assistant_turn_scaffold(tok, history, [BGKIT_TOOL])
+    n_pre = len(tok.encode(pre, add_special_tokens=False))
+    assert not any(mask[a - n_pre : a])
+    assert "assistant" in pre and "<think>" not in tok.decode(ids[a:b])
+
+    (c0, c1), = r.bgkit_call_spans
+    body = tok.decode(ids[c0:c1])
+    assert body.startswith("<tool_call>") and body.endswith("</tool_call>")
+    assert parse_bgkit_call(body) == {"ids": ["doc-1"], "query": "why?"}
+    e = end_of_turn_end(c1)
+    assert e - c1 <= 2 and all(mask[c0:e])
+    assert not any(mask[c0 - n_pre : c0])
+    # Tool responses never bear loss.
+    for pos in r.bgkit_sentinel_positions:
+        assert not mask[pos]
+    # Generation-time prompt == the masked scaffold, so the decoder never
+    # has to emit it; the glue it emits before the stop token is known.
+    from bgkit.data.bgkit_tool_template import assistant_turn_end_glue
+
+    gen = assistant_generation_prompt_ids(tok, system, "Quote the line.", trajectory[:1])
+    assert tok.decode(gen) == pre
+    glue = assistant_turn_end_glue(tok, history, [BGKIT_TOOL])
+    assert glue in ("", "\n")
+    assert tok.decode(ids[b : e_ans - 1]) == glue
+
+
+def test_loss_false_turn_has_no_targets(any_tokenizer):
+    trajectory = [
+        TrajectoryTurn(kind="bgkit", args={"ids": ["doc-1"], "query": "q"}, loss=False),
+        TrajectoryTurn(kind="answer", response="x", loss=True),
+    ]
+    r = tokenize_trajectory(
+        any_tokenizer, make_system_prompt("topic_list", topic_list=["T"]), "q", trajectory
+    )
+    (_c0, c1), = r.bgkit_call_spans
+    assert not any(r.loss_mask.tolist()[: c1 + 2])  # incl. its end-of-turn emission
+    assert r.loss_mask[r.answer_span[0]].item()
+
+
+def test_generation_prompt_appends_after_observed_tool_history(tokenizer):
+    history = [TrajectoryTurn(
+        kind="bgkit",
+        args={"ids": ["opaque entrypoint"], "query": "where?", "is_head": True},
+    )]
+    system = make_system_prompt(
+        "pre_scoped",
+        scope_description="repository; entrypoint id: opaque entrypoint",
+    )
+    prompt = assistant_generation_prompt_ids(
+        tokenizer,
+        system,
+        "question",
+        history,
+    )
+    assert prompt.dtype == torch.long
+    assert prompt.numel() > 0

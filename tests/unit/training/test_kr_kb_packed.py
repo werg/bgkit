@@ -401,6 +401,32 @@ def test_l1_ratio_loss_packed_variable_lengths():
     assert metrics["l1_ratio_loss"] == pytest.approx(0.0, abs=1e-5)
 
 
+def test_l1_aux_losses_exclude_forced_pinned_ids():
+    """Pinned IDs are outside the selector's controllable population."""
+    trainer = _make_minimal_trainer(
+        ratio_w=1.0,
+        decisive_w=0.0,
+        relevance_w=1.0,
+        gold_boost=1.0,
+        distractor_damp=1.0,
+    )
+    logits = torch.tensor([20.0, 20.0, 0.0, 0.0])
+    pinned = torch.tensor([True, True, False, False])
+    relevance = torch.tensor([True, True, True, False])
+    entry = {
+        "enc_out": _make_fake_enc_out(logits, torch.tensor(0.0)),
+        "ratio": 0.5,
+        "cu_seqlens": _cu_from_lengths([4]),
+        "relevance_mask": relevance,
+        "pinned": pinned,
+    }
+    trainer._pending_l0_outputs = []
+    trainer._pending_l1_outputs = [entry]
+    _, metrics = trainer._compute_survivorship_aux_losses()
+    assert metrics["l1_ratio_loss"] == pytest.approx(0.0, abs=1e-6)
+    assert metrics["l1_relevance_loss"] == pytest.approx(0.0, abs=1e-6)
+
+
 def test_l1_gold_boost_increases_gold_target():
     """Gold-boosted target > target_ratio; distractor-damped target < target_ratio."""
     trainer = _make_minimal_trainer(

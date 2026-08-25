@@ -447,6 +447,128 @@ class BaseTrainer(ABC):
         """
         return None
 
+    # Gradient-checkpointing modes in increasing memory-safety order: the
+    # scheduler "upshifts" toward ``full`` under pressure, "downshifts" toward
+    # ``off`` when room is plentiful.
+    _CKPT_MODE_ORDER: tuple[str, ...] = ("off", "megatron", "full")
+
+    def _dynamic_ckpt_allowed_modes(self) -> frozenset[str]:
+        """Checkpointing modes the scheduler may flip this trainer's managed
+        models into. Default: every mode.
+
+        A trainer whose forward cannot be RECOMPUTED under a mode must exclude
+        it — e.g. a forward wrapped in an outer non-reentrant
+        ``torch.utils.checkpoint`` breaks strict recompute-match when the
+        inner backbone runs ``megatron``'s selective per-op policy
+        (``CheckpointError 58-vs-55``, 2026-08-21). The scheduler routes a
+        disallowed transition to the nearest allowed mode in the same
+        direction, or skips it (logged) — it never disables the adaptive
+        cache-flush tier, which is mode-independent.
+        """
+        return frozenset(self._CKPT_MODE_ORDER)
+
+    def _resolve_allowed_ckpt_mode(self, target: str) -> str | None:
+        """Map a requested mode to the nearest ALLOWED mode in the direction
+        of the transition (upshift → more checkpointing, downshift → less).
+        Returns ``None`` when no allowed mode differs from the current one in
+        that direction."""
+        allowed = self._dynamic_ckpt_allowed_modes()
+        if target in allowed:
+            return target
+        order = self._CKPT_MODE_ORDER
+        cur = order.index(self._ckpt_mode) if self._ckpt_mode in order else 0
+        tgt = order.index(target)
+        if tgt > cur:  # upshift: first allowed mode at or above the target
+            candidates = [m for m in order[tgt:] if m in allowed]
+        else:  # downshift: first allowed mode at or below the target
+            candidates = [m for m in reversed(order[: tgt + 1]) if m in allowed]
+        for m in candidates:
+            if m != self._ckpt_mode:
+                return m
+        return None
+
+    def _grad_norm_param_groups(self) -> dict[str, list]:
+        """Named parameter groups for the per-group PRE-CLIP gradient-norm
+        diagnostic (``grad_norm/<label>``). Default: none. Trainers override
+        to expose e.g. backbones vs. small heads — global norm clipping scales
+        every gradient by ``max_norm / total``, so a small head whose gradient
+        is a tiny share of a large total is silently starved (2026-08-22: L0
+        survivorship head flat at p≈0.5 under pre-clip norms of 200-400).
+        """
+        return {}
+
+    def _grad_norm_group_metrics(self, step: int) -> dict[str, float]:
+        """Per-group gradient norms, every ``training.grad_norm_groups_every``
+        optimizer steps (default 25; 0 disables). Call BEFORE clipping."""
+        every = int(self.cfg.training.get("grad_norm_groups_every", 25) or 0)
+        if every <= 0 or step % every != 0:
+            return {}
+        groups = self._grad_norm_param_groups()
+        out: dict[str, float] = {}
+        for label, params in groups.items():
+            sq = 0.0
+            for p in params:
+                g = getattr(p, "grad", None)
+                if g is not None:
+                    sq += float(g.detach().float().norm() ** 2)
+            out[f"grad_norm/{label}"] = sq ** 0.5
+        return out
+
+    def _clip_gradients(self, max_norm: float) -> float:
+        """Clip gradients per ``training.grad_clip_mode``; returns the GLOBAL
+        pre-clip norm (the logged ``grad_norm``, unchanged semantics).
+
+        - ``global`` (default, legacy): one ``clip_grad_norm_`` over every
+          trainable parameter. Every gradient is scaled by ``max_norm /
+          total``, so a parameter group whose gradient is a tiny share of a
+          large total (a survivorship head next to a 0.8B decoder) is scaled
+          by the SAME factor and effectively starved.
+        - ``per_group``: each group from :meth:`_grad_norm_param_groups` is
+          clipped to ``max_norm`` on its OWN norm (parameters in no group form
+          a remainder group). A head's update is then bounded by its own
+          gradient scale, not the backbone's.
+        """
+        from bgkit.training.gradient_utils import clip_grad_norm
+
+        mode = str(self.cfg.training.get("grad_clip_mode", "global") or "global")
+        params = list(self.trainable_parameters())
+        if mode == "global":
+            return clip_grad_norm(params, max_norm=max_norm)
+        if mode != "per_group":
+            raise ValueError(
+                f"training.grad_clip_mode must be 'global' or 'per_group'; got {mode!r}"
+            )
+        # Global pre-clip norm for logging (same definition as the global mode).
+        total_sq = 0.0
+        for p in params:
+            g = getattr(p, "grad", None)
+            if g is not None:
+                total_sq += float(g.detach().float().norm() ** 2)
+        groups = self._grad_norm_param_groups()
+        seen: set[int] = set()
+        for _label, gparams in groups.items():
+            gl = [p for p in gparams if id(p) not in seen]
+            seen.update(id(p) for p in gl)
+            if gl:
+                clip_grad_norm(gl, max_norm=max_norm)
+        rest = [p for p in params if id(p) not in seen]
+        if rest:
+            clip_grad_norm(rest, max_norm=max_norm)
+        return total_sq ** 0.5
+
+    def _step_peak_allocated_gb_hook(self) -> float | None:
+        """Optional TRUE per-step CUDA peak (GB) for the ``mem/`` step metrics.
+
+        ``collect_memory_diagnostics`` reads ``torch.cuda.max_memory_allocated``,
+        which a trainer's own per-phase memory probe may reset mid-step (the
+        KRKB ``BGKIT_MEM_BREAKDOWN`` probe) — then the step metric silently
+        reports only the LAST phase's peak (2026-08-22: logged 40 GB while the
+        flush reclaimed 91 GB). A trainer that resets the counter returns the
+        max it observed since the previous log here (and resets its tracker);
+        default ``None`` = use the allocator's value unchanged.
+        """
+        return None
+
     def _dynamic_ckpt_managed_models(self) -> list[tuple[str, torch.nn.Module]]:
         """Models managed by the memory-driven dynamic ckpt scheduler.
 
@@ -587,6 +709,7 @@ class BaseTrainer(ABC):
             logger.info(
                 "dynamic_ckpt_scheduler_armed",
                 mode=self._ckpt_mode,
+                allowed_modes=sorted(self._dynamic_ckpt_allowed_modes()),
                 managed=[label for label, _ in self._dyn_ckpt_models],
                 signal="mem_available_gb" if self._unified_memory else "cuda_free_gb",
                 unified_memory=self._unified_memory,
@@ -715,6 +838,20 @@ class BaseTrainer(ABC):
         from bgkit.training.gradient_utils import set_gradient_checkpointing_mode
         if target == self._ckpt_mode:
             return
+        requested = target
+        resolved = self._resolve_allowed_ckpt_mode(target)
+        if resolved is None:
+            logger.info(
+                "ckpt_mode_transition_skipped",
+                step=step,
+                from_mode=self._ckpt_mode,
+                requested=requested,
+                reason=reason,
+                allowed=sorted(self._dynamic_ckpt_allowed_modes()),
+                cuda_free_gb=free_gb,
+            )
+            return
+        target = resolved
         prev = self._ckpt_mode
         for label, model in self._dyn_ckpt_models:
             try:
@@ -734,6 +871,7 @@ class BaseTrainer(ABC):
             step=step,
             from_mode=prev,
             to_mode=target,
+            requested=requested,
             reason=reason,
             cuda_free_gb=free_gb,
         )
@@ -2855,14 +2993,20 @@ class BaseTrainer(ABC):
         if initial_max_len > 0 and hasattr(self, "_max_batch_tokens"):
             self._handle_max_sample_length(initial_max_len)
 
-        # Live config (file-based HP control)
-        # Clear stale control file so ad-hoc changes don't carry across runs.
+        # Live config (file-based HP control). Blocks are merged run-name over
+        # phase; phase-block keys inherited by a fresh process are logged at
+        # WARNING (see LiveConfig) — the phase block persists across runs.
         control_file = self.cfg.get("control_file", None)
         if control_file is None:
             control_file = checkpoint_dir / "control.json"
         control_path = Path(control_file)
         phase = getattr(tcfg, "phase", None)
-        live_config = LiveConfig(control_path, namespace=phase)
+        run_name = self.cfg.get("run_name", None)
+        live_config = LiveConfig(
+            control_path,
+            namespace=phase,
+            run_namespace=str(run_name) if run_name else None,
+        )
 
         # Checkpoint pruning
         prune_cfg = tcfg.get("checkpoint_pruning", {})
@@ -2971,10 +3115,8 @@ class BaseTrainer(ABC):
                         micro_metrics = self._forward_backward(batch)
                         accum_metrics.append(micro_metrics)
 
-                    grad_norm = clip_grad_norm(
-                        self.trainable_parameters(),
-                        max_norm=self._max_grad_norm,
-                    )
+                    group_norms = self._grad_norm_group_metrics(step)
+                    grad_norm = self._clip_gradients(self._max_grad_norm)
 
                     if not math.isfinite(grad_norm):
                         raise RuntimeError(
@@ -3007,6 +3149,7 @@ class BaseTrainer(ABC):
 
                     metrics = _average_metrics(accum_metrics)
                     metrics["grad_norm"] = grad_norm
+                    metrics.update(group_norms)
                     metrics["lr"] = self.optimizer.param_groups[0]["lr"]
                     if len(self.optimizer.param_groups) > 1:
                         metrics["lr_min"] = min(
@@ -3023,6 +3166,12 @@ class BaseTrainer(ABC):
                     mem_log_every = int(mem_cfg.get("log_every_steps", 50))
                     if mem_log_every > 0 and step % mem_log_every == 0:
                         mem_diag = _collect_memory_diagnostics()
+                        tracked_peak = self._step_peak_allocated_gb_hook()
+                        if tracked_peak is not None and "mem/cuda_max_allocated_gb" in mem_diag:
+                            mem_diag["mem/cuda_max_allocated_gb"] = max(
+                                float(mem_diag["mem/cuda_max_allocated_gb"]),
+                                float(tracked_peak),
+                            )
                         metrics.update(mem_diag)
 
                         # Safety rail — save a final checkpoint and hard-

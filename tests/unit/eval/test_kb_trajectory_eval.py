@@ -8,17 +8,22 @@ inputs without touching real Qwen / Phase 1 checkpoints.
 
 from __future__ import annotations
 
+import json
+from dataclasses import dataclass
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from dataclasses import dataclass
-
 from bgkit.data.bgkit_tool_template import TrajectoryTurn
+from bgkit.data.browse_tree import BrowseNode, BrowseTree
 from bgkit.data.datasets.phase2_kb_dataset import KBSample
 from bgkit.eval.kb_trajectory_eval import (
     answer_token_f1,
+    evaluate_free_running_sample,
     evaluate_sample,
+    parse_bgkit_call,
+    parse_bgkit_call_ids,
     tool_call_id_accuracy,
     trajectory_step_accuracy,
 )
@@ -128,6 +133,212 @@ def _str_to_ids(text: str) -> list[int]:
     return [ord(c) for c in text]
 
 
+def _call_text(*ids: str) -> str:
+    return json.dumps({"ids": list(ids), "query": "q"}, separators=(",", ":"))
+
+
+def test_tool_call_parser_is_structured_and_exact():
+    assert parse_bgkit_call_ids('<tool_call>' + _call_text("opaque-id") + '</tool_call>') == [
+        "opaque-id"
+    ]
+    assert parse_bgkit_call_ids('{"name":"bgkit","arguments":"{\\"ids\\":[\\"x\\"]}"}') == ["x"]
+    assert parse_bgkit_call_ids("the id is opaque-id") is None
+    assert parse_bgkit_call_ids('{"ids":["opaque-id"') is None
+    assert parse_bgkit_call_ids('{"answer":{"ids":["opaque-id"]}}') is None
+    assert parse_bgkit_call_ids('{"ids":["opaque-id"],"offline_depth":3}') is None
+    assert parse_bgkit_call_ids(
+        '<tool_call>' + _call_text("opaque-id") + "</tool_call> trailing",
+    ) is None
+
+
+class _FreeRunningTrainer:
+    def __init__(self, outputs: list[str], tree: BrowseTree):
+        self.outputs = iter(outputs)
+        self._trees = {"toy": tree}
+        self.histories: list[list[TrajectoryTurn]] = []
+
+    def generate_kb_turn(self, _sample, history, *, max_new_tokens):
+        assert max_new_tokens > 0
+        self.histories.append(list(history))
+        return next(self.outputs)
+
+
+def _free_running_fixture(outputs: list[str]):
+    tree = BrowseTree.from_nodes("toy", [
+        BrowseNode(
+            id="root", parent=None, kind="sub-tag", size=1,
+            children=("head",), articles=(),
+        ),
+        BrowseNode(
+            id="head", parent="root", kind="sub-tag", size=1,
+            children=("commit",), articles=(),
+        ),
+        BrowseNode(
+            id="commit", parent="head", kind="sub-tag", size=1,
+            children=(), articles=("evidence",),
+        ),
+    ])
+    trajectory = [
+        TrajectoryTurn(
+            kind="bgkit",
+            args={"ids": ["head"], "query": "q", "is_head": True},
+        ),
+        TrajectoryTurn(kind="bgkit", args={"ids": ["commit"], "query": ""}),
+        TrajectoryTurn(
+            kind="bgkit",
+            args={"ids": ["evidence"], "query": "q", "is_retrieval": True},
+        ),
+        TrajectoryTurn(kind="answer", response="gold state"),
+    ]
+    sample = _build_sample(trajectory=trajectory, gold_answer="gold state")
+    sample.group_id = "head"
+    return _FreeRunningTrainer(outputs, tree), sample
+
+
+_XML_CALL = (
+    "<tool_call>\n<function=bgkit>\n<parameter=ids>\n[\"head\"]\n</parameter>\n"
+    "<parameter=query>\nwhere?\n</parameter>\n</function>\n</tool_call>"
+)
+
+
+def test_tool_call_parser_accepts_qwen_xml_rendering():
+    """Qwen3.5's template renders tool calls as XML — the exact text the
+    decoder is trained on. 2026-08-23: the parser knew only JSON, so every
+    well-formed Qwen call scored ``malformed_tool_call``."""
+    assert parse_bgkit_call(_XML_CALL) == {"ids": ["head"], "query": "where?"}
+    # ids only, no query
+    assert parse_bgkit_call_ids(
+        '<tool_call>\n<function=bgkit>\n<parameter=ids>\n["a","b"]\n</parameter>\n'
+        "</function>\n</tool_call>"
+    ) == ["a", "b"]
+    # wrong function, extra parameter, stray text, bad ids JSON: all fail closed
+    assert parse_bgkit_call(_XML_CALL.replace("function=bgkit", "function=other")) is None
+    assert parse_bgkit_call(
+        _XML_CALL.replace("</function>", "<parameter=depth>\n3\n</parameter>\n</function>")
+    ) is None
+    assert parse_bgkit_call(
+        _XML_CALL.replace("</parameter>\n</function>", "</parameter>\nhi\n</function>")
+    ) is None
+    assert parse_bgkit_call(_XML_CALL.replace('["head"]', "head")) is None
+    assert parse_bgkit_call(_XML_CALL + " trailing prose") is None
+
+
+def test_free_running_eval_accepts_qwen_xml_calls():
+    trainer, sample = _free_running_fixture([
+        _XML_CALL,
+        _XML_CALL.replace('["head"]', '["commit"]'),
+        _XML_CALL.replace('["head"]', '["evidence"]'),
+        "gold state",
+    ])
+    result = evaluate_free_running_sample(trainer, sample)
+    assert result["route_exact"] == 1.0
+    assert result["answer_exact_match"] == 1.0
+    assert result["raw_text"] == "gold state"
+
+
+def test_scope_entrypoint_ids():
+    from bgkit.eval.kb_trajectory_eval import scope_entrypoint_ids
+
+    assert scope_entrypoint_ids("source file a.py; entrypoint id: file:o/r:a.py@1234abcd") == [
+        "file:o/r:a.py@1234abcd"
+    ]
+    # Quoted ids survive spaces and commas in file paths (16 fileneedle rows).
+    assert scope_entrypoint_ids(
+        "source file Google Chrome/x.js; entrypoint id: `file:o/r:Google Chrome/x.js@8cba9029`"
+    ) == ["file:o/r:Google Chrome/x.js@8cba9029"]
+    assert scope_entrypoint_ids("repo; entrypoint ids: `a, b`, `c`") == ["a, b", "c"]
+    assert scope_entrypoint_ids("repository; entrypoint ids: n1, n2") == ["n1", "n2"]
+    assert scope_entrypoint_ids("a log window") == []
+
+
+def test_free_running_eval_accepts_ids_named_in_scope():
+    """Flat single-document rows: group_id is the repo label (split grouping),
+    the document id is named in the scope description — that is what the
+    prompt exposes, so it is available from the first turn. The flat browse
+    tree indexes the document itself as an ARTICLE node (2026-08-23: that made
+    `identifier in tree` classify the call as a head drill and trip the
+    trainer's flat-dataset guard)."""
+    trainer, sample = _free_running_fixture([_call_text("evidence"), "gold state"])
+    trainer._trees["toy"] = BrowseTree.from_nodes("toy", [
+        BrowseNode(id="root", parent=None, kind="sub-tag", size=1,
+                   children=(), articles=("evidence",)),
+        BrowseNode(id="evidence", parent="root", kind="article", size=1,
+                   children=(), articles=()),
+    ])
+    sample.group_id = "owner/repo"
+    sample.scope_description = "source file a.py; entrypoint id: `evidence`"
+    sample.trajectory = [
+        TrajectoryTurn(kind="bgkit", args={"ids": ["evidence"], "query": "q"}),
+        TrajectoryTurn(kind="answer", response="gold state"),
+    ]
+    result = evaluate_free_running_sample(trainer, sample)
+    assert result["invalid_reason"] == ""
+    assert result["route_exact"] == 1.0
+    assert result["answer_exact_match"] == 1.0
+    # The recorded retrieval call is the PLAIN leaf form the trainer routes to
+    # the live L0→L1 path — no head/structural tags (those raise on flat data).
+    assert trainer.histories[-1][0].args == {"ids": ["evidence"], "query": "q"}
+
+
+def test_free_running_eval_tags_tree_node_calls_as_head_drills():
+    trainer, sample = _free_running_fixture([
+        _call_text("head"), _call_text("commit"), _call_text("evidence"), "gold state",
+    ])
+    evaluate_free_running_sample(trainer, sample)
+    head, node, leaf = trainer.histories[-1]
+    assert head.args["is_head"] is True and head.args["is_retrieval"] is False
+    assert node.args["is_head"] is False and node.args["structural_depth"] == 2
+    assert leaf.args == {"ids": ["evidence"], "query": "q"}
+
+
+def test_free_running_eval_executes_only_surfaced_ids():
+    trainer, sample = _free_running_fixture([
+        _call_text("head"),
+        _call_text("commit"),
+        _call_text("evidence"),
+        "gold state",
+    ])
+    result = evaluate_free_running_sample(trainer, sample)
+    assert result["route_exact"] == 1.0
+    assert result["valid_navigation"] == 1.0
+    assert result["evidence_recall"] == 1.0
+    assert result["answer_token_f1"] == 1.0
+    assert result["answer_exact_match"] == 1.0
+    assert [len(history) for history in trainer.histories] == [0, 1, 2, 3]
+
+
+def test_free_running_eval_rejects_unsurfaced_id():
+    trainer, sample = _free_running_fixture([_call_text("evidence")])
+    result = evaluate_free_running_sample(trainer, sample)
+    assert result["valid_navigation"] == 0.0
+    assert result["route_exact"] == 0.0
+    assert result["invalid_reason"] == "unsurfaced_id:evidence"
+
+
+def test_free_running_eval_rejects_malformed_explicit_tool_call():
+    trainer, sample = _free_running_fixture([
+        '<tool_call>{"ids":["head"]}',
+    ])
+    result = evaluate_free_running_sample(trainer, sample)
+    assert result["invalid_reason"] == "malformed_tool_call"
+    assert result["valid_navigation"] == 0.0
+    assert result["pred_answer"] == ""
+
+
+def test_free_running_eval_can_exactly_reconstruct_an_empty_file():
+    trainer, sample = _free_running_fixture([
+        _call_text("head"),
+        _call_text("commit"),
+        _call_text("evidence"),
+        "",
+    ])
+    sample.gold_answer = ""
+    result = evaluate_free_running_sample(trainer, sample)
+    assert result["route_exact"] == 1.0
+    assert result["valid_navigation"] == 1.0
+    assert result["answer_exact_match"] == 1.0
+
+
 # ---------------------------------------------------------------------------
 # trajectory_step_accuracy
 # ---------------------------------------------------------------------------
@@ -217,7 +428,7 @@ def test_tool_call_id_accuracy_all_correct():
     tokenizer = _FakeTokenizer()
     # Concat layout:
     #   [header, <tool resp>, <bgkit call = "A/b q">]
-    bgkit_text = "A/b q"
+    bgkit_text = _call_text("A/b")
     header = "H"
     resp = "R" * 3
 
@@ -271,7 +482,7 @@ def test_tool_call_id_accuracy_wrong_ids():
     # Model predicts "zzzzz" in that slot → no substring match.
     header = "H"
     resp = "RRR"
-    bgkit_text = "A/b q"
+    bgkit_text = _call_text("A/b")
     full_text = header + resp + bgkit_text
     full_ids = _str_to_ids(full_text)
 
@@ -448,7 +659,7 @@ def test_evaluate_sample_bundles_all_metrics():
     tokenizer = _FakeTokenizer()
     # Layout: H | A/b q (bgkit tool call) | RRR (tool resp) | forty two (answer)
     header = "H"
-    bgkit_text = "A/b q"
+    bgkit_text = _call_text("A/b")
     resp = "RRR"
     gold = "forty two"
     full_text = header + bgkit_text + resp + gold
@@ -533,9 +744,9 @@ def test_tool_call_id_accuracy_excludes_head_and_distractors():
     header = "H"
     resp = "RR"
     # three bgkit calls, all decoded perfectly (argmax=perfect)
-    head_txt = "a/hd q"
-    dist_txt = "a/ds q"
-    good_txt = "a/gd q"
+    head_txt = _call_text("a/hd")
+    dist_txt = _call_text("a/ds")
+    good_txt = _call_text("a/gd")
     full_text = header + resp + head_txt + dist_txt + good_txt
     full_ids = _str_to_ids(full_text)
     n = len(full_ids)
@@ -558,7 +769,12 @@ def test_tool_call_id_accuracy_excludes_head_and_distractors():
     trace = _KBDecodeTrace(
         answer_span=None,
         bgkit_turns=[
-            TrajectoryTurn(kind="bgkit", args={"ids": ["a/hd"], "is_head": True}, response="", loss=True),
+            TrajectoryTurn(
+                kind="bgkit",
+                args={"ids": ["a/hd"], "is_head": True},
+                response="",
+                loss=True,
+            ),
             TrajectoryTurn(kind="bgkit", args={"ids": ["a/ds"]}, response="", loss=False),
             TrajectoryTurn(kind="bgkit", args={"ids": ["a/gd"]}, response="", loss=True),
         ],

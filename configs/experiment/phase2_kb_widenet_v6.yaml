@@ -1,0 +1,78 @@
+# @package _global_
+# v6: the CLEAN BASELINE of the wide-net (Family A+B) run — cold start from
+# the summarization base with the final selection operator and settings
+# that v5b converged on mid-run (v5b changed the operator twice after step
+# 655, so its encoder trajectory is not a reference):
+#   - exact_topk at both levels with the per-document z-scored operator
+#     score (scale-free; ranking preserved; losses never saturate),
+#   - per-level aux weights honored (L0 decisiveness 0 as Stage A intends),
+#     aggregate ratio loss 0.5 both levels, gold-span relevance 0.5,
+#   - Qwen3.5-0.8B only (Falcon-H1-90M companion parked: unstable
+#     per-token losses, own investigation), no "answer without reps" roll,
+#   - eval: zeroed-rep ablation + 64-sample train-subset probe every 250.
+# Two epochs (~2,630 optimizer steps at grad-accum 4, ~6.8 s/microbatch ≈
+# 20 h); max_steps / eval cadence / aux weights are live-tunable.
+defaults:
+  - /config
+  - /training/phase2_kb_stage_a
+  - _self_
+
+run_name: phase2_kb_widenet_v6
+
+training:
+  dynamic_ckpt:
+    enabled: true
+    flush_when_free_below_gb: 30
+  eval_every: 250
+  save_every: 500
+  warmup_steps: 200
+  eval_ablation_modes: [zeroed]
+  eval_train_subset_samples: 64
+  # In-training GENERATIVE gate (2026-08-23): free-running decode of the
+  # tool call + answer on a fixed eval slice, reported per dataset under
+  # eval/kb/free_running/<dataset>/answer_exact_match. Needles are short
+  # lines; with the template's end-of-turn stop this finishes in a few
+  # hundred tokens, 512 is the runaway cap. Flat tasks need one call.
+  eval_free_running_samples: 64
+  eval_free_running_max_new_tokens: 512
+  eval_free_running_max_tool_calls: 4
+  profile_timing: true
+  grad_norm_groups_every: 25
+
+  datasets:
+    - lognav
+    - fileneedle
+    - grepset
+    - swerecall
+  max_samples_per_dataset_default: 100000
+
+  l0_retention:
+    lognav: 0.10
+    fileneedle: 0.10
+    grepset: 0.10
+    swerecall: 0.10
+  l1_retention: 0.15
+
+  qwen_decoder_prob: 1.0
+  training_time_ablation:
+    p_skip_bgkit: 0.0
+    p_skip_topic: 0.0
+    p_noise_bgkit: 0.0
+
+  survivorship:
+    survivorship_aux: true
+    # v5b's headline gate (generative verbatim needle EM) stayed 0.000: only
+    # ~25% of answer-span tokens survived L0 and ~20% of those L1 (≈5% of a
+    # needle reached the decoder), so copying a line is impossible. Under the
+    # z-scored operator the span term is the ONLY rank-quality signal
+    # (ratio/decisiveness are ~constant), and at 0.5 it fell to ~0.06 while
+    # survival plateaued ≈0.25. Raised 4× so span-vs-rest separation is the
+    # dominant head objective; live-tunable (`span_relevance_weight`).
+    span_relevance_weight: 2.0
+    ratio_loss_weight: 0.5
+    n_distractors: 0
+  selection_mode:
+    l0: exact_topk
+    l1: exact_topk
+
+  max_steps: 2630

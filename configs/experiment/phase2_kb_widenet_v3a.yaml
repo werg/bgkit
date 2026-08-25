@@ -1,0 +1,42 @@
+# @package _global_
+# Family B ratio-ladder stage v3a (~6x total compression), continuing from
+# widenet v2. Rationale (2026-08-21 per-qtype generative eval of v2-final):
+# at 67x (L0 0.10 x L1 0.15) verbatim needle retrieval is ZERO generatively
+# (EM 0.00 / F1 0.06 on log lines) while negatives are perfect and
+# teacher-forced metrics flattered (EM 0.27). Start the verbatim curriculum
+# loose and DESCEND across stages (v3a ~6x -> v3b ~16x -> v3c 67x), each
+# stage gated on generative needle-EM recovery via scripts/eval_phase2_kb.py.
+# Produces the ratio-vs-quality Pareto curve for docs/05_benchmark_targets.md.
+defaults:
+  - /config
+  - /training/phase2_kb_stage_a
+  - _self_
+
+run_name: phase2_kb_widenet_v3a
+
+training:
+  dynamic_ckpt:
+    enabled: false            # KRKB downshift incompat (see lognav v1 crash)
+  eval_every: 250
+  save_every: 500
+  warmup_steps: 200
+
+  datasets:
+    - lognav
+    - fileneedle
+  max_samples_per_dataset_default: 100000
+
+  # ~6x total: L0 0.35 x L1 0.5 = 17.5% of positions survive to the splice.
+  l0_retention:
+    lognav: 0.35
+    fileneedle: 0.35
+  l1_retention: 0.50
+
+  qwen_decoder_prob: 0.80
+
+  survivorship:
+    survivorship_aux: true
+  recursive_l1_tree:
+    selection_mode_l1: exact_topk
+
+  stage_a_checkpoint: /workspace/checkpoints_fast/phase2_kb_step3843_20260821_115748_589827_run-phase2_kb_widenet_v2

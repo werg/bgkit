@@ -263,6 +263,9 @@ x-gpu-common: &gpu-common
     # first for fast saves; a background daemon archives them to the HDD
     # (${CHECKPOINT_DIR}) and keeps only the last few here.
     - /home/werg/bgkit-ckpt-fast:/workspace/checkpoints_fast
+    # Capability-packaging staging (benchmarks, trajectory corpora, LogHub,
+    # base-checkpoint copy) on NVMe — read-only for evals/baselines.
+    - /home/werg/bgkit-data-nvme/capability_packaging:/workspace/capability_packaging:ro
     # Source code — the ONLY way bgkit code enters the container.
     # Image has deps only; no bgkit in dist-packages.
     - ../src:/workspace/bgkit/src:ro
@@ -644,6 +647,62 @@ services:
     <<: *gpu-common
     command: ["scripts/train.py", "+experiment=phase2_kb_stage_b"]
 
+  # Capability-packaging Family B first run (lognav log-needle QA), Stage-A
+  # recipe from the summarization step-51945 base. restart: "no" for the
+  # bring-up phase so an early crash stays visible; flip to unless-stopped
+  # once stable.
+  train-phase2-kb-lognav:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_lognav"]
+
+  # Family B v2: lognav + fileneedle mix continuing from the lognav v1 final
+  # state, with survivorship aux ON + exact-topk L1 selection.
+  train-phase2-kb-widenet-v2:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v2"]
+
+  # Ratio-ladder stage v3a (~6x), continuing from v2 final.
+  train-phase2-kb-widenet-v3a:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v3a"]
+
+  # Four-dataset mix (lognav+fileneedle+grepset+swerecall) from v3a state.
+  train-phase2-kb-widenet-v4:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v4"]
+
+  # v5: gold-span relevance supervision on the 4-dataset mix, from v4 final.
+  train-phase2-kb-widenet-v5:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v5"]
+
+  # v6: clean wide-net baseline from step 0 with the final selection operator
+  # (z-scored exact_topk), per-level aux weights, Qwen-only (2026-08-22).
+  train-phase2-kb-widenet-v6:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v6"]
+
+  # v7-ratio6x: 1,000-step retention data point at ~6× (L0 0.35 × L1 0.5)
+  # continuing from the v6 final ckpt — the live-reps retention test the
+  # void v3a verdict never ran, and the 2nd Pareto point (2026-08-24).
+  train-phase2-kb-widenet-v7-ratio6x:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v7_ratio6x"]
+
+  # Family-A blob compaction SFT (lean trainer over SWE-Zero trajectories;
+  # capability-packaging §4, built 2026-08-24).
+  train-blob-sft-v1:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=blob_sft_v1"]
+
   # 8-step wall-time / memory SMOKE of the per-repo full-backprop trainer (the
   # review's M1/M2 check) on the worst-case-inclusive git_commit_repro_smoke
   # subset. restart: "no" so the probe runs once and exits (not a real run).
@@ -1019,7 +1078,7 @@ services:
     command: >-
       vllm serve ${VLLM_MODEL_FAST:-Qwen/Qwen3.5-0.8B}
       --gpu-memory-utilization ${VLLM_GPU_UTIL_FAST:-0.10}
-      --max-model-len 32768
+      --max-model-len ${VLLM_MAX_MODEL_LEN_FAST:-32768}
       --enable-prefix-caching
       --enable-chunked-prefill
 

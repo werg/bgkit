@@ -6,7 +6,9 @@ commit reproduction, description generation, and structural reconstruction.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +55,64 @@ def patch_falcon_h1_chat_template(tokenizer) -> bool:
     )
     tokenizer.chat_template = patched
     return True
+
+
+def end_of_turn_token_ids(tokenizer) -> list[int]:
+    """Token ids that END an assistant turn under ``tokenizer``'s chat template.
+
+    Generation must stop on the template's end-of-turn marker, not only on
+    ``eos_token_id``: Falcon-H1-Instruct's ChatML template closes every turn
+    with ``<|im_end|>`` while its ``eos_token`` is ``<|end_of_text|>`` — a
+    greedy decode that only watches ``eos_token_id`` runs past the turn into
+    garbage until ``max_new_tokens`` (2026-08-23 v5b free-running eval:
+    ``____pex____pex…`` answers). Qwen3.5's ``eos_token`` IS ``<|im_end|>``.
+
+    The marker is discovered from the template itself: render a one-message
+    assistant turn around a sentinel and take the first special token after
+    it. Falls back to ``eos_token_id`` when the template is unavailable.
+    """
+    ids: list[int] = []
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is not None:
+        ids.append(int(eos))
+    try:
+        rendered = tokenizer.apply_chat_template(
+            [{"role": "assistant", "content": CONTENT_SENTINEL}],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+    except Exception:
+        return ids
+    after = rendered.split(CONTENT_SENTINEL, 1)[1] if CONTENT_SENTINEL in rendered else ""
+    for tok_id in tokenizer.encode(after, add_special_tokens=False):
+        if int(tok_id) in marker_token_ids(tokenizer):
+            if int(tok_id) not in ids:
+                ids.append(int(tok_id))
+            break
+    return ids
+
+
+_CONTROL_TOKEN_RE = re.compile(r"^(<\|[^<>|]+\|>|</?[A-Za-z_][A-Za-z0-9_]*>)$")
+
+
+def marker_token_ids(tokenizer) -> set[int]:
+    """Ids of the tokenizer's control tokens (``<|im_end|>``, ``</s>`` …).
+
+    HF's ``all_special_ids`` is not enough: Falcon-H1 registers ``<|im_end|>``
+    as an added token but not as a "special" one. Added tokens are admitted
+    only when they LOOK like control tokens (``<|…|>`` / ``<tag>``) — tokenizers
+    also register plain whitespace runs as added tokens, and treating a
+    newline as an end-of-turn marker would stop generation at the first
+    line break.
+    """
+    ids = set(int(i) for i in getattr(tokenizer, "all_special_ids", []) or [])
+    get_added = getattr(tokenizer, "get_added_vocab", None)
+    if callable(get_added):
+        with contextlib.suppress(Exception):
+            ids.update(
+                int(i) for text, i in get_added().items() if _CONTROL_TOKEN_RE.match(text)
+            )
+    return ids
 
 
 @dataclass
@@ -500,7 +560,7 @@ def tokenize_with_sentinel(
 
     # Split on sentinel to get prefix and suffix strings
     prefix_str, suffix_str = template_str.split(CONTENT_SENTINEL)
-    prefix_before_bgkit, _prefix_after_bgkit = prefix_str.split(
+    _prefix_before_bgkit, _prefix_after_bgkit = prefix_str.split(
         BGKIT_TOOL_RESPONSE_SENTINEL,
     )
 

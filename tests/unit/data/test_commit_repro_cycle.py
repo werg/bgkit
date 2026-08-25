@@ -30,7 +30,7 @@ from bgkit.data.commit_repro import (
 def _commit(repo, ordinal, window, paths, sha=None):
     sha = sha or (f"{'a' * 39}{ordinal:02d}")[-40:]
     return ReproCommit(
-        repo=repo, sha=sha, ordinal=ordinal, message=f"msg {ordinal}",
+        repo=repo, sha=sha, parent_sha="", ordinal=ordinal, message=f"msg {ordinal}",
         timestamp=ordinal, window_idx=window,
         file_changes=[
             FileChange(file_idx=i, path=p, diff_text=f"--- {p}\n+x",

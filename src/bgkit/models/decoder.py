@@ -62,6 +62,42 @@ except Exception:  # pragma: no cover - optional CUTE/CUTLASS dependency
 
 logger = structlog.get_logger()
 
+
+def _rep_norm_guard_env_bool(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
+# --- Global spliced-rep norm guard (repr-interface hardening, 2026-07-31) -----
+# The durable safety net for the rep-collapse class: at the splice boundary where
+# EmbeddingSegment reps enter ``inputs_embeds``, a SAMPLED (every N calls) check
+# compares the mean spliced-rep L2-norm against the mean ``embed_tokens`` row-norm
+# and LOG-warns (never raises — a transient must not kill a healthy run) when the
+# ratio leaves a WIDE band. Would have caught the 4x→320x git-repro inflation in
+# ~50 steps. All train/eval decode paths flow through ``_concat_segments`` so this
+# is shared. Env-tunable; default on.
+_REP_NORM_GUARD_ENABLED = _rep_norm_guard_env_bool("BGKIT_REP_NORM_GUARD", "1")
+try:
+    _REP_NORM_GUARD_EVERY = int(os.environ.get("BGKIT_REP_NORM_GUARD_EVERY", "50") or 50)
+except ValueError:
+    _REP_NORM_GUARD_EVERY = 50
+try:
+    _REP_NORM_GUARD_HI = float(os.environ.get("BGKIT_REP_NORM_GUARD_HI", "8.0") or 8.0)
+except ValueError:
+    _REP_NORM_GUARD_HI = 8.0
+# Escalation (2026-08-22): N CONSECUTIVE sampled out-of-band checks (= N x EVERY
+# decoder forwards in a row with unreadable / absent reps) can never be a
+# transient — it is the "reps decorative / absent" class (the widenet v1→v4 runs
+# spliced a single ZERO vector into all 82,500 forwards and the log-only warning
+# was ignored). Raise after N consecutive hits; ``0`` disables the raise.
+try:
+    _REP_NORM_GUARD_RAISE_AFTER = int(
+        os.environ.get("BGKIT_REP_NORM_GUARD_RAISE_AFTER", "10") or 10
+    )
+except ValueError:
+    _REP_NORM_GUARD_RAISE_AFTER = 10
+
 _FROZEN_DELTANET_CORE_TIMER_EVENTS: dict[
     str,
     list[tuple[torch.cuda.Event, torch.cuda.Event]],
@@ -6726,6 +6762,8 @@ class ReconstructionDecoder(nn.Module):
         embeds_list: list[torch.Tensor] = []
         tokens_list: list[torch.Tensor] = []
         loss_list: list[torch.Tensor] = []
+        # Spliced (EmbeddingSegment) reps, collected for the sampled norm guard.
+        rep_segments: list[torch.Tensor] = []
         batch_size: int | None = None
 
         for seg in segments:
@@ -6783,11 +6821,17 @@ class ReconstructionDecoder(nn.Module):
                 if target_dtype is None:
                     target_dtype = emb.dtype
                 embeds_list.append(emb)
+                rep_segments.append(emb)
                 k = emb.size(1)
                 tokens_list.append(torch.zeros(batch_size, k, dtype=torch.long, device=emb.device))
                 loss_list.append(torch.zeros(batch_size, k, dtype=torch.bool, device=emb.device))
             else:
                 raise TypeError(f"unknown segment type: {type(seg).__name__}")
+
+        # Sampled global norm guard on the spliced reps (repr-interface safety
+        # net). Cheap: one bool + a modulo on healthy calls; the vocab-wide embed
+        # norm + rep norms only compute on the sampled call. Never raises.
+        self._maybe_guard_spliced_rep_norm(rep_segments, embed_fn)
 
         inputs_embeds = torch.cat(
             [e.to(dtype=target_dtype) for e in embeds_list],
@@ -6796,6 +6840,112 @@ class ReconstructionDecoder(nn.Module):
         token_ids_full = torch.cat(tokens_list, dim=1)
         loss_mask_full = torch.cat(loss_list, dim=1)
         return inputs_embeds, token_ids_full, loss_mask_full
+
+    def _maybe_guard_spliced_rep_norm(
+        self,
+        rep_segments: list[torch.Tensor],
+        embed_fn: nn.Module,
+    ) -> None:
+        """SAMPLED (every ``_REP_NORM_GUARD_EVERY`` calls) check that spliced reps
+        entering ``inputs_embeds`` are in a readable NORM band relative to the
+        decoder's ``embed_tokens`` row-norm. LOG-only (v1): a loud
+        ``spliced_rep_norm_out_of_band`` warning when the mean-rep / mean-embed
+        norm ratio leaves ``[1/HI, HI]`` (default HI=8x). This is the durable
+        detector for the rep-inflation collapse class (would have caught the
+        git-repro 4x→320x runaway in ~50 steps); it does NOT raise so a transient
+        can't kill a healthy run. Env-gated (``BGKIT_REP_NORM_GUARD`` default on;
+        ``BGKIT_REP_NORM_GUARD_EVERY`` / ``BGKIT_REP_NORM_GUARD_HI``)."""
+        if not _REP_NORM_GUARD_ENABLED or not rep_segments:
+            return
+        # The trainer sets this while an ablation mode deliberately feeds
+        # degenerate reps (zeroed / noise / dropped survivors): those splices
+        # are the experiment — neither counted toward the streak nor logged.
+        if getattr(self, "_rep_norm_guard_expect_degenerate", False):
+            return
+        n = int(getattr(self, "_rep_norm_guard_calls", 0)) + 1
+        self._rep_norm_guard_calls = n
+        if _REP_NORM_GUARD_EVERY <= 0 or (n % _REP_NORM_GUARD_EVERY) != 0:
+            return
+        degenerate = False
+        try:
+            w = getattr(embed_fn, "weight", None)
+            if w is None:
+                return
+            embed_norm = float(w.detach().float().norm(dim=-1).mean())
+            if not embed_norm > 0:
+                return
+            norms = [
+                t.detach().reshape(-1, t.shape[-1]).float().norm(dim=-1)
+                for t in rep_segments
+                if torch.is_tensor(t) and t.numel() > 0
+            ]
+            if not norms:
+                return
+            all_norms = torch.cat(norms)
+            rep_norm_mean = float(all_norms.mean())
+            ratio = rep_norm_mean / embed_norm
+            hi = _REP_NORM_GUARD_HI
+            lo = 1.0 / hi if hi > 0 else 0.0
+            out_of_band = ratio > hi or ratio < lo
+            # Reference ratio = this decoder's first READABLE sample — the
+            # checkpoint family's own operating point (~4x for the git-repro
+            # lineage, ~38x for the summarization-51945 Qwen projection whose
+            # embed rows are tiny). The RAISE criterion is DEGENERACY:
+            # absence/collapse (absolute floor) or DRIFT from the reference by
+            # more than the band (runaway inflation, the 4x->320x class). The
+            # absolute band itself is informational — logged once per decoder.
+            ref = getattr(self, "_rep_norm_guard_ref_ratio", None)
+            if ref is None and ratio >= lo:
+                ref = self._rep_norm_guard_ref_ratio = ratio
+            degenerate = ratio < lo or (
+                ref is not None and hi > 0 and (ratio > ref * hi or ratio < ref / hi)
+            )
+            streak = int(getattr(self, "_rep_norm_guard_oob_streak", 0))
+            streak = streak + 1 if degenerate else 0
+            self._rep_norm_guard_oob_streak = streak
+            # Trend visibility: every sampled check (in band or not) is an INFO
+            # event, so rep-norm drift is greppable per family without a
+            # trainer metric plumb (the guard's warnings only fire on change).
+            logger.info(
+                "spliced_rep_norm_sample",
+                ratio=round(ratio, 4),
+                rep_norm_mean=round(rep_norm_mean, 4),
+                reference_ratio=None if ref is None else round(ref, 4),
+                decoder_family=getattr(self, "decoder_family", None),
+                n_rep_vectors=int(all_norms.numel()),
+                guard_call=n,
+            )
+            abs_warned = bool(getattr(self, "_rep_norm_guard_abs_warned", False))
+            if degenerate or (out_of_band and not abs_warned):
+                if out_of_band:
+                    self._rep_norm_guard_abs_warned = True
+                logger.warning(
+                    "spliced_rep_norm_out_of_band",
+                    rep_norm_mean=round(rep_norm_mean, 4),
+                    embed_norm_mean=round(embed_norm, 4),
+                    ratio=round(ratio, 4),
+                    band_low=round(lo, 4),
+                    band_high=hi,
+                    reference_ratio=None if ref is None else round(ref, 4),
+                    degenerate=degenerate,
+                    decoder_family=getattr(self, "decoder_family", None),
+                    n_rep_vectors=int(all_norms.numel()),
+                    guard_call=n,
+                    consecutive=streak,
+                )
+        except Exception:  # a diagnostic must never kill a decode
+            return
+        if degenerate and 0 < _REP_NORM_GUARD_RAISE_AFTER <= streak:
+            raise RuntimeError(
+                f"spliced reps degenerate on {streak} consecutive sampled checks "
+                f"({streak * _REP_NORM_GUARD_EVERY} decoder forwards): "
+                f"rep_norm_mean={rep_norm_mean:.4g} vs embed_norm_mean={embed_norm:.4g} "
+                f"(ratio={ratio:.3g}, reference_ratio={ref}, band x/÷{hi:.3g}, "
+                f"absolute floor {lo:.3g}, n_rep_vectors={int(all_norms.numel())}). "
+                "Reps are absent, collapsed, or running away from this decoder's "
+                "operating point — the decoder is NOT reading the encoder. Set "
+                "BGKIT_REP_NORM_GUARD_RAISE_AFTER=0 only to deliberately bypass."
+            )
 
     def _compute_lm_ce(
         self,
@@ -7654,6 +7804,49 @@ class ReconstructionDecoder(nn.Module):
         return merged
 
     @torch.no_grad()
+    def generate_with_segments(
+        self,
+        segments: list[Segment],
+        *,
+        tokenizer,
+        max_new_tokens: int = 4096,
+        temperature: float = 0.0,
+    ) -> GenerationOutput:
+        """Autoregress from an arbitrary B=1 interleaved KB context.
+
+        Unlike teacher-forced evaluation, this accepts every token and
+        embedding splice already produced by the trajectory builder and then
+        generates genuinely new tokens. The existing single-splice cache loop
+        is reused by treating the fully assembled prefill as one embedding
+        block, so multiple prior tool responses are supported without a second
+        attention implementation.
+        """
+        inner_model, _lm_head = self._get_inner_model_and_head()
+        embed_fn = inner_model.get_input_embeddings()
+        inputs_embeds, _token_ids, _loss_mask = self._concat_segments(
+            segments,
+            embed_fn,
+        )
+        if inputs_embeds.shape[0] != 1:
+            raise ValueError("generate_with_segments currently requires B=1")
+        n_positions = int(inputs_embeds.shape[1])
+        cu = torch.tensor(
+            [0, n_positions],
+            dtype=torch.int32,
+            device=inputs_embeds.device,
+        )
+        empty = torch.empty(0, dtype=torch.long, device=inputs_embeds.device)
+        return self.generate_with_single_splice(
+            survivor_embeddings=inputs_embeds[0],
+            survivor_cu_seqlens=cu,
+            prefix_ids=empty,
+            suffix_ids=empty,
+            tokenizer=tokenizer,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+        )
+
+    @torch.no_grad()
     def generate_with_single_splice(
         self,
         *,
@@ -7717,6 +7910,11 @@ class ReconstructionDecoder(nn.Module):
         except AttributeError:
             target_dtype = survivor_embeddings.dtype
 
+        from bgkit.data.chat_template import end_of_turn_token_ids
+
+        # Stop on the template's end-of-turn marker(s), not only eos_token_id
+        # (Falcon-H1: eos is <|end_of_text|> but turns close with <|im_end|>).
+        stop_ids = set(end_of_turn_token_ids(tokenizer))
         eos_id = getattr(tokenizer, "eos_token_id", None)
         pad_id = getattr(tokenizer, "pad_token_id", None)
         suffix_ids = suffix_ids.to(device=device, dtype=torch.long)
@@ -7766,7 +7964,7 @@ class ReconstructionDecoder(nn.Module):
                 first_token = first_logits[0, 0].argmax().unsqueeze(0)  # (1,)
 
             generated: list[torch.Tensor] = [first_token]
-            stopped = eos_id is not None and first_token.item() == eos_id
+            stopped = first_token.item() in stop_ids
 
             # Decode loop: one step at a time.
             #
@@ -7820,18 +8018,17 @@ class ReconstructionDecoder(nn.Module):
                     new_token = step_logits[0, 0].argmax().unsqueeze(0)  # (1,)
 
                 generated.append(new_token)
-                if eos_id is not None and new_token.item() == eos_id:
+                if new_token.item() in stop_ids:
                     stopped = True
 
             # Build output tensor.
             gen_ids = torch.cat(generated, dim=0)  # (T,)
             full_ids_list.append(gen_ids)
 
-            # Strip EOS and padding from the end.
+            # Strip end-of-turn / EOS and padding from the end.
             seq = gen_ids
-            if eos_id is not None:
-                while seq.shape[0] > 0 and seq[-1].item() == eos_id:
-                    seq = seq[:-1]
+            while seq.shape[0] > 0 and (seq[-1].item() in stop_ids or seq[-1].item() == eos_id):
+                seq = seq[:-1]
             if pad_id is not None:
                 while seq.shape[0] > 0 and seq[-1].item() == pad_id:
                     seq = seq[:-1]

@@ -7,7 +7,6 @@ from collections import Counter
 
 from bgkit.data.browse_tree import BrowseNode, BrowseTree
 from bgkit.data.drilldown import (
-    DEFAULT_MODE_WEIGHTS,
     DRILL_MODES,
     DrillTarget,
     _sample_mode,
@@ -77,17 +76,22 @@ def test_single_target_path_no_distractors():
         mode_weights=FULL,
     )
     kinds = [t.kind for t in turns]
-    assert kinds == ["bgkit", "bgkit", "bgkit", "answer"]
+    assert kinds == ["bgkit", "bgkit", "bgkit", "bgkit", "answer"]
     # head drill: window, task query, is_head, loss
-    assert turns[0].args == {"ids": ["window"], "query": "find f0", "is_head": True}
+    assert turns[0].args["ids"] == ["window"]
+    assert turns[0].args["query"] == "find f0"
+    assert turns[0].args["is_head"] is True
+    assert turns[0].args["drill_mode"] == "full"
     assert turns[0].loss is True
     # navigation drill: c4, no query, not head
-    assert turns[1].args == {"ids": ["c4"], "query": ""}
-    # retrieval drill: the specific evidence id f0 (not the leaf node id)
-    assert turns[2].args == {"ids": ["f0"], "query": ""}
-    assert turns[2].loss is True
+    assert turns[1].args["ids"] == ["c4"]
+    # The commit node is retrieved before the article ID that it surfaces.
+    assert turns[2].args["ids"] == ["cm0"]
+    assert turns[3].args["ids"] == ["f0"]
+    assert turns[3].args["is_retrieval"] is True
+    assert turns[3].loss is True
     # answer: normal AR gold
-    assert turns[3].kind == "answer" and turns[3].response == "GOLD" and turns[3].loss is True
+    assert turns[4].kind == "answer" and turns[4].response == "GOLD" and turns[4].loss is True
     # NO browse turns anywhere (the whole point)
     assert all(t.kind != "browse" for t in turns)
 
@@ -100,8 +104,9 @@ def test_multi_target_shared_prefix_dedup():
         task_query="q", gold_answer="G", n_distractors=0, mode_weights=FULL,
     )
     ids = [tuple(t.args.get("ids", [])) for t in turns if t.kind == "bgkit"]
-    # window + c4 drilled once (shared prefix), then f0 and f1 retrievals
-    assert ids == [("window",), ("c4",), ("f0",), ("f1",)]
+    assert ids == [
+        ("window",), ("c4",), ("cm0",), ("f0",), ("cm1",), ("f1",),
+    ]
 
 
 def test_distractor_branch_is_loss_false():
@@ -118,7 +123,7 @@ def test_distractor_branch_is_loss_false():
     assert all(t.args["ids"] == ["cm1"] for t in distractor)
     # every loss=True drill is on the correct path
     correct = {tuple(t.args["ids"]) for t in turns if t.kind == "bgkit" and t.loss}
-    assert correct == {("window",), ("c4",), ("f0",)}
+    assert correct == {("window",), ("c4",), ("cm0",), ("f0",)}
 
 
 def test_requires_targets():
@@ -154,8 +159,9 @@ def _all_targets(tree: BrowseTree) -> list[DrillTarget]:
 
 
 def test_sample_mode_distribution_matches_weights():
+    weights = (0.10, 0.30, 0.60)
     counts = Counter(
-        _sample_mode(DEFAULT_MODE_WEIGHTS, random.Random(s)) for s in range(5000)
+        _sample_mode(weights, random.Random(s)) for s in range(5000)
     )
     frac = {m: counts[m] / 5000 for m in DRILL_MODES}
     assert abs(frac["full"] - 0.10) < 0.02, frac
@@ -172,6 +178,7 @@ def test_mode_distribution_end_to_end():
     for s in range(4000):
         turns = build_drilldown_trajectory(
             tree, "window", targets, "q", "G", n_distractors=0,
+            mode_weights=(0.10, 0.30, 0.60),
             rng=random.Random(f"seed:{s}"),
         )
         bgkit = [t for t in turns if t.kind == "bgkit"]
@@ -197,7 +204,10 @@ def test_no_drill_is_head_turn_plus_answer():
     )
     assert [t.kind for t in turns] == ["bgkit", "answer"]
     head = turns[0]
-    assert head.args == {"ids": ["window"], "query": "the query", "is_head": True}
+    assert head.args["ids"] == ["window"]
+    assert head.args["query"] == "the query"
+    assert head.args["is_head"] is True
+    assert head.args["drill_mode"] == "no_drill"
     assert head.loss is True
     assert turns[1].response == "GOLD" and turns[1].loss is True
 

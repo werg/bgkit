@@ -310,6 +310,9 @@ def _base_cfg(**training_overrides):
 
 @pytest.fixture()
 def trainer():
+    # Mock encoder/decoder weights and the test batches are random; unseeded
+    # they occasionally produce a non-finite smoke loss (observed 2026-08-23).
+    torch.manual_seed(1234)
     cfg = _base_cfg()
     t = CommitEncodingTrainer(cfg)
     t.device = torch.device("cpu")

@@ -145,8 +145,10 @@ def test_build_decoder_segments_interleaves_tokens_and_survivors():
             for m in messages:
                 role = m.get("role", "user")
                 if role == "assistant" and m.get("tool_calls"):
+                    # Real templates wrap tool calls in the same assistant
+                    # scaffold as content turns.
                     call = m["tool_calls"][0]["function"]
-                    parts.append(f"<A:call {call['name']}>")
+                    parts.append(f"<A>call {call['name']}</A>")
                 elif role == "tool":
                     parts.append(f"<T>{m.get('content', '')}</T>")
                 else:
@@ -159,7 +161,7 @@ def test_build_decoder_segments_interleaves_tokens_and_survivors():
     prepare_log = []
     batch_log = []
 
-    def fake_prepare(self, dataset, ids, query):
+    def fake_prepare(self, dataset, ids, query, l0_selection_mode="threshold"):
         prepare_log.append((dataset, tuple(ids), query))
         # Return a sentinel dict; real contents are ignored by fake_batch.
         return {"dataset": dataset, "ids": tuple(ids), "query": query}
@@ -526,7 +528,7 @@ def test_topic_embeddings_from_browse_tree_integration():
             for m in messages:
                 role = m.get("role", "user")
                 if role == "assistant" and m.get("tool_calls"):
-                    parts.append(f"<A:{m['tool_calls'][0]['function']['name']}>")
+                    parts.append(f"<A>call {m['tool_calls'][0]['function']['name']}</A>")
                 elif role == "tool":
                     parts.append(f"<T>{m.get('content', '')}</T>")
                 else:
@@ -536,7 +538,7 @@ def test_topic_embeddings_from_browse_tree_integration():
 
     trainer.tokenizer = _FakeTokenizer()
 
-    def fake_prepare(self, dataset, ids, query):
+    def fake_prepare(self, dataset, ids, query, l0_selection_mode="threshold"):
         return {"ids": tuple(ids)}
 
     def fake_batch(self, prepared):
@@ -932,7 +934,7 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
 
     # Mock _l0_for_articles directly to skip the encoder-based L0 path.
     # Packed form: return (flat_rows, cu_seqlens) with K=2 per article.
-    def fake_l0(self, dataset, article_ids, query_emb=None):
+    def fake_l0(self, dataset, article_ids, query_emb=None, selection_mode="threshold"):
         n = len(article_ids)
         k = 2
         flat = torch.arange(n * k * hidden_dim, dtype=torch.float32).reshape(
@@ -1340,8 +1342,16 @@ def test_ablation_span_ce_splits_nav_and_recon():
     # (nav tokens render before its own survivor) so it can't be rep-dependent.
     # Prepend a dummy head span; the measured nav is exactly nav_spans below.
     trace = _KBDecodeTrace(
-        answer_span=recon_span, bgkit_turns=[],
-        bgkit_call_spans=[(5, 6)] + nav_spans,
+        answer_span=recon_span,
+        bgkit_turns=[
+            TrajectoryTurn(
+                kind="bgkit",
+                args={"ids": ["head"], "is_head": True},
+            ),
+            TrajectoryTurn(kind="bgkit", args={"ids": ["child"]}),
+            TrajectoryTurn(kind="bgkit", args={"ids": ["article"]}),
+        ],
+        bgkit_call_spans=[(5, 6), *nav_spans],
     )
     accum = {"nav_sum": 0.0, "nav_count": 0, "recon_sum": 0.0, "recon_count": 0}
     stub = KRKBTrainer.__new__(KRKBTrainer)  # no __init__ — helpers are pure
@@ -1360,3 +1370,60 @@ def test_ablation_span_ce_splits_nav_and_recon():
     KRKBTrainer._accumulate_span_ce(stub, accum, out, trace)
     assert accum["nav_count"] == 6
     assert abs(accum["nav_sum"] - 2 * en_s) < 1e-5
+
+
+def test_periodic_free_running_eval_is_bounded_and_reports_families(monkeypatch):
+    from bgkit.eval import kb_trajectory_eval
+    from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
+
+    outputs = {
+        "a": {
+            "route_exact": 1.0,
+            "valid_navigation": 1.0,
+            "evidence_recall": 1.0,
+            "answer_token_f1": 0.5,
+            "answer_exact_match": 1.0,
+            "invalid_reason": "",
+        },
+        "b": {
+            "route_exact": 0.0,
+            "valid_navigation": 1.0,
+            "evidence_recall": 0.5,
+            "answer_token_f1": 0.25,
+            "answer_exact_match": 0.0,
+            "invalid_reason": "wrong_route",
+        },
+    }
+    calls: list[tuple[str, int, int]] = []
+
+    def fake_eval(_trainer, sample, *, max_tool_calls, max_new_tokens):
+        calls.append((sample, max_tool_calls, max_new_tokens))
+        return outputs[sample]
+
+    monkeypatch.setattr(
+        kb_trajectory_eval, "evaluate_free_running_sample", fake_eval,
+    )
+
+    class _Stub:
+        def __init__(self):
+            self.step_cfg = {
+                "eval_free_running_max_tool_calls": 7,
+                "eval_free_running_max_new_tokens": 99,
+            }
+            self.eval_dataloader = [["a", "b", "ignored"]]
+            self._round_robin = True
+            self._decoder_family = ""
+
+        def _set_active_decoder(self, family):
+            self._decoder_family = family
+
+    stub = _Stub()
+    metrics = KRKBTrainer._eval_free_running_pass(stub, 2)
+
+    assert calls == [("a", 7, 99), ("b", 7, 99)]
+    assert metrics["eval/kb/free_running/n_samples"] == 2.0
+    assert metrics["eval/kb/free_running/route_exact"] == 0.5
+    assert metrics["eval/kb/free_running/evidence_recall"] == 0.75
+    assert metrics["eval/kb/free_running/invalid_rate"] == 0.5
+    assert metrics["eval/kb/free_running/qwen35/n_samples"] == 1.0
+    assert metrics["eval/kb/free_running/falcon_h1/n_samples"] == 1.0

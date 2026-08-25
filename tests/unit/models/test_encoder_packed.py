@@ -115,10 +115,10 @@ def _load_backbone():
             "fla-core is not running on CUDA (Triton unavailable on host venv); "
             "encoder parity test requires the Docker training container."
         )
-    from transformers import AutoModel
+    from transformers import AutoModelForCausalLM
 
     try:
-        model = AutoModel.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(
             "Qwen/Qwen3.5-0.8B-Base",
             dtype=torch.bfloat16,
             trust_remote_code=True,
@@ -281,7 +281,7 @@ def test_encoder_packed_no_compression_parity(monkeypatch):
             content_embeddings=packed_emb,
             content_cu_seqlens=cu,
             content_position_ids=pos_ids,
-            target_ratio=None,
+            target_ratio_l0=None,
         )
 
     # Unpack (N, D) -> (B, L_max, D) for comparison.

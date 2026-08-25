@@ -199,17 +199,28 @@ def build_qa_drilldown_trajectory(
 
     if tree.is_flat():
         # No hierarchy to drill: collapse to a single degenerate leaf drill
-        # that retrieves every gold article directly, anchored at the first
-        # gold leaf tag. No navigation — just retrieve + answer.
-        head = target_leaf[unique_targets[0]]
-        targets = [DrillTarget(
-            leaf_node_id=head,
-            retrieve_ids=tuple(unique_targets),
-        )]
-        return build_drilldown_trajectory(
-            tree, head, targets, question, gold_answer,
-            n_distractors=n_distractors, mode_weights=full_mode_weights, rng=rng,
-        )
+        # that retrieves every gold article directly. Sending this through the
+        # hierarchical full-mode builder would first drill the synthetic leaf
+        # tag and then issue a second retrieval call, inventing navigation that
+        # a flat corpus does not have.
+        return [
+            TrajectoryTurn(
+                kind="bgkit",
+                args={
+                    "ids": list(unique_targets),
+                    "query": question,
+                    "is_head": True,
+                    "is_retrieval": True,
+                    "drill_mode": "full",
+                    "structural_depth": 0,
+                },
+                response="",
+                loss=True,
+            ),
+            TrajectoryTurn(
+                kind="answer", args={}, response=gold_answer, loss=True,
+            ),
+        ]
 
     # Hierarchical: head = deepest common ancestor of the gold leaf tags;
     # one drill target per gold article at its own leaf.

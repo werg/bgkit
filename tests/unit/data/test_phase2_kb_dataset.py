@@ -8,11 +8,13 @@ resident) to a lazy per-row Arrow slice. These tests pin that the lazy
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from bgkit.data.bgkit_tool_template import (
     TrajectoryTurn,
@@ -41,8 +43,30 @@ def _write_parquet(path):
         "question": ["q0", "q1", "q2"],
         "gold_answer": ["g0", "g1", "g2"],
         "trajectory_json": [traj0, traj1, traj0],
+        "group_id": ["head-a", "head-b", "head-c"],
+        "repo_id": ["foo/bar", "baz/qux", "third/repo"],
+        "split": ["train", "eval", "train"],
+        "target_sha": ["a", "b", "c"],
+        "target_path": ["a.py", "b.py", "c.py"],
+        "drill_mode": ["full", "full", "full"],
+        "structural_depth": [4, 3, 2],
+        "artifact_schema_version": [2, 2, 2],
+        "id_scheme_version": [2, 2, 2],
+        "source_sha256": ["source", "source", "source"],
     })
     pq.write_table(table, path)
+    trajectory_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    path.with_suffix(".manifest.json").write_text(json.dumps({
+        "schema_version": 2,
+        "id_scheme_version": 2,
+        "id_salt": "test",
+        "source_sha256": "source",
+        "tree_sha256": "tree",
+        "trajectory_sha256": trajectory_sha,
+        "row_count": 3,
+        "drill_mode_counts": {"full": 3},
+        "build_config": {"max_touching": 0},
+    }))
     return table
 
 
@@ -110,6 +134,12 @@ def _write_ipc(parquet_path, table, *, chunksize):
     import pyarrow as pa
 
     out = parquet_path.with_suffix(".arrow")
+    manifest = json.loads(parquet_path.with_suffix(".manifest.json").read_text())
+    metadata = dict(table.schema.metadata or {})
+    metadata[b"bgkit_source_parquet_sha256"] = manifest[
+        "trajectory_sha256"
+    ].encode()
+    table = table.replace_schema_metadata(metadata)
     with pa.OSFile(str(out), "wb") as sink:
         opts = pa.ipc.IpcWriteOptions(compression=None)
         with pa.ipc.new_file(sink, table.schema, options=opts) as writer:
@@ -176,3 +206,15 @@ def test_convert_script_roundtrip(tmp_path):
     eager_rows = pq.read_table(path).to_pylist()
     for idx in range(len(ds)):
         assert ds._row_at(idx) == eager_rows[idx]
+
+
+def test_git_trajectory_manifest_fingerprint_is_enforced(tmp_path):
+    path = tmp_path / "git_commit_repro.parquet"
+    _write_parquet(path)
+    manifest_path = path.with_suffix(".manifest.json")
+    manifest = json.loads(manifest_path.read_text())
+    manifest["trajectory_sha256"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="does not match its manifest"):
+        KBTrajectoryDataset(path)

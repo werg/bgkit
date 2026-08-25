@@ -15,9 +15,8 @@ Design (see ``plans/git_repro_drilldown_redesign_2026_07_03.md``):
   predicting the next child ID (the discrimination) cannot be solved by copying —
   it forces the decoder to read the node's compressed representation.
 - **The first drill is the head node**, carrying the per-sample ``task_query``
-  and marked ``is_head=True`` so the trainer encodes it live with that query.
-  Deeper drills carry no query, so the trainer presents the shared
-  generic-encoded tree reps for those nodes.
+  and marked ``is_head=True``. Deeper calls omit the duplicate query text; the
+  trainer may still condition their live node encodes on the sample question.
 - **0..N distractor drills** branch off at random points (``loss=False``): a wrong
   sibling the model sees as context but is not trained to emit.
 - A single ``answer`` turn (normal autoregressive gold CE) closes the trajectory.
@@ -60,7 +59,10 @@ DRILL_MODES: tuple[DrillMode, ...] = ("full", "no_drill", "truncated")
 
 # Default per-sample mode weights (full, no_drill, truncated). Truncated
 # dominates so most samples train retrieval-from-compressed-reps.
-DEFAULT_MODE_WEIGHTS: tuple[float, float, float] = (0.10, 0.30, 0.60)
+# The production default is an oracle-auditable full traversal.  Compressed-only
+# modes remain available as explicit ablations after full traversal has passed
+# held-out, free-running evaluation.
+DEFAULT_MODE_WEIGHTS: tuple[float, float, float] = (1.0, 0.0, 0.0)
 
 # Truncation depth range, measured in path-node count from the head (inclusive
 # of the head). ``1`` = head only; a branch truncated at depth ``d`` drills
@@ -113,13 +115,27 @@ def _path_from_head(tree: BrowseTree, head_node_id: str, node_id: str) -> list[s
     return full
 
 
-def _drill_turn(ids: list[str], query: str, loss: bool, is_head: bool = False) -> TrajectoryTurn:
+def _drill_turn(
+    ids: list[str],
+    query: str,
+    loss: bool,
+    is_head: bool = False,
+    *,
+    drill_mode: DrillMode | None = None,
+    structural_depth: int = 0,
+    is_retrieval: bool = False,
+) -> TrajectoryTurn:
     """A single ``bgkit`` drill turn. ``is_head`` selects task-query live encode
     vs shared-tree generic reps at the trainer; it is passed through ``args`` so
     the offline trajectory is self-describing."""
     args: dict = {"ids": list(ids), "query": query}
     if is_head:
         args["is_head"] = True
+    if drill_mode is not None:
+        args["drill_mode"] = drill_mode
+    args["structural_depth"] = int(structural_depth)
+    if is_retrieval:
+        args["is_retrieval"] = True
     return TrajectoryTurn(kind="bgkit", args=args, response="", loss=loss)
 
 
@@ -201,7 +217,10 @@ def _build_no_drill(
 ) -> list[TrajectoryTurn]:
     """``no_drill`` mode: just the head bgkit turn → answer (no intermediate drills)."""
     return [
-        _drill_turn([head_node_id], task_query, loss=True, is_head=True),
+        _drill_turn(
+            [head_node_id], task_query, loss=True, is_head=True,
+            drill_mode="no_drill", structural_depth=0,
+        ),
         _answer_turn(gold_answer),
     ]
 
@@ -243,37 +262,47 @@ def _build_full(
 
     turns: list[TrajectoryTurn] = []
     drilled: set[str] = set()
+    retrieved: set[tuple[str, ...]] = set()
 
-    def emit_node_drill(node_id: str, target: DrillTarget | None) -> None:
-        """Drill ``node_id`` once. If it is a target leaf, retrieve its evidence."""
-        if node_id in drilled:
-            return
-        drilled.add(node_id)
+    def emit_node_drill(
+        node_id: str, target: DrillTarget | None, structural_depth: int,
+    ) -> None:
+        """Drill the node first, then retrieve IDs surfaced by that node."""
         is_head = node_id == head_node_id
-        if target is not None and node_id == target.leaf_node_id and target.retrieve_ids:
-            # Final retrieval drill: pull the specific evidence ids at the leaf.
-            turns.append(_drill_turn(
-                list(target.retrieve_ids),
-                task_query if is_head else "",
-                loss=True,
-                is_head=is_head,
-            ))
-        else:
+        if node_id not in drilled:
+            drilled.add(node_id)
             turns.append(_drill_turn(
                 [node_id],
                 task_query if is_head else "",
                 loss=True,
                 is_head=is_head,
+                drill_mode="full" if is_head else None,
+                structural_depth=structural_depth,
             ))
-        # Distractor branch(es) off this node (wrong sibling, not trained).
-        for wrong in distractor_after.get(node_id, ()):
-            turns.append(_drill_turn([wrong], "", loss=False))
+            # Distractor branch(es) off this node (wrong sibling, not trained).
+            for wrong in distractor_after.get(node_id, ()):
+                turns.append(_drill_turn(
+                    [wrong], "", loss=False,
+                    structural_depth=structural_depth + 1,
+                ))
+
+        if target is not None and node_id == target.leaf_node_id and target.retrieve_ids:
+            retrieval_key = tuple(target.retrieve_ids)
+            if retrieval_key in retrieved:
+                return
+            retrieved.add(retrieval_key)
+            turns.append(_drill_turn(
+                list(target.retrieve_ids), "",
+                loss=True,
+                structural_depth=structural_depth + 1,
+                is_retrieval=True,
+            ))
 
     # Depth-first over the union of target paths, preserving first-seen order.
     for path, target in zip(paths, targets, strict=True):
         for i, node_id in enumerate(path):
             is_leaf = i == len(path) - 1
-            emit_node_drill(node_id, target if is_leaf else None)
+            emit_node_drill(node_id, target if is_leaf else None, i)
 
     turns.append(_answer_turn(gold_answer))
     return turns
@@ -351,7 +380,10 @@ def _build_truncated(
             branches.append({"nodes": dpath, "loss": False})
 
     turns: list[TrajectoryTurn] = [
-        _drill_turn([head_node_id], task_query, loss=True, is_head=True),
+        _drill_turn(
+            [head_node_id], task_query, loss=True, is_head=True,
+            drill_mode="truncated", structural_depth=0,
+        ),
     ]
     drilled: set[str] = {head_node_id}
 
@@ -377,7 +409,10 @@ def _build_truncated(
                 break
             node = branch["nodes"].pop(0)
             drilled.add(node)
-            turns.append(_drill_turn([node], "", loss=branch["loss"]))
+            depth = len(_path_from_head(tree, head_node_id, node)) - 1
+            turns.append(_drill_turn(
+                [node], "", loss=branch["loss"], structural_depth=depth,
+            ))
 
     turns.append(_answer_turn(gold_answer))
     return turns

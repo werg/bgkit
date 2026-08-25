@@ -3,15 +3,14 @@
 Pure-function metrics that take a configured :class:`bgkit.training.phase2.
 kr_kb_trainer.KRKBTrainer` instance and a :class:`bgkit.data.datasets.
 phase2_kb_dataset.KBSample` and report what we actually care about during
-Phase 2 KB-scale evaluation:
+Phase 2 KB-scale evaluation has two deliberately separate layers:
 
-1. :func:`trajectory_step_accuracy` — strictly per-token greedy-argmax
-   match over every loss-bearing position in the trajectory.
-2. :func:`tool_call_id_accuracy` — per bgkit call, does the greedy
-   decode of the assistant tool-call tokens contain the teacher's
-   ``ids`` argument as a substring of the decoded text?
-3. :func:`answer_token_f1` — token-level F1 between the decoded
-   predicted answer and ``sample.gold_answer``.
+1. :func:`evaluate_free_running_sample` is the capability metric. It generates
+   one turn at a time, validates that called IDs were actually surfaced by an
+   executed node, and never renders future teacher calls or the gold answer.
+2. The trajectory/token helpers are teacher-forced diagnostics for training
+   health. Tool calls are parsed as exact structured JSON; substring matches do
+   not count.
 
 All functions run under :func:`torch.no_grad` context: the caller is
 responsible for wrapping if they need to disable autograd globally, but
@@ -26,17 +25,19 @@ for the answer turn and every tool-call emission. That's everything we
 need — we just run one decoder forward, greedy argmax the logits, and
 slice / compare against the teacher tensor.
 
-Pure-function / no state: these helpers do not mutate the trainer or
-wandb, they simply return floats / dicts. Aggregation across a dataset
-is the caller's responsibility (see :mod:`scripts.eval_phase2_kb`).
+The free-running helper necessarily advances the trainer's per-sample shared
+tree cache while executing calls, but does not update model weights or logging.
 """
 
 from __future__ import annotations
 
+import json
+import re
 from typing import TYPE_CHECKING
 
 import torch
 
+from bgkit.data.bgkit_tool_template import TrajectoryTurn
 from bgkit.eval.metrics.qa_metrics import token_f1
 
 if TYPE_CHECKING:
@@ -47,7 +48,10 @@ if TYPE_CHECKING:
 __all__ = [
     "EMPTY_RESULT",
     "answer_token_f1",
+    "evaluate_free_running_sample",
     "evaluate_sample",
+    "parse_bgkit_call",
+    "parse_bgkit_call_ids",
     "tool_call_id_accuracy",
     "trajectory_step_accuracy",
 ]
@@ -84,6 +88,9 @@ def _run_forward(
     loss-bearing positions (shouldn't normally happen for a real
     trajectory, but we guard against it for toy inputs).
     """
+    ensure_tree = getattr(trainer, "_ensure_eval_shared_tree", None)
+    if callable(ensure_tree):
+        ensure_tree(sample)
     segments, trace = trainer._build_decoder_segments_with_trace(sample)
     output = trainer.decoder.forward_interleaved_with_loss(
         segments, return_hidden_states=True,
@@ -149,6 +156,327 @@ def _tool_call_gold_ids(turn) -> list[str]:
     return []
 
 
+def _is_scored_bgkit_turn(turn) -> bool:
+    """Whether a call is supervised and depends on a previously-read rep."""
+    return bool(
+        turn.kind == "bgkit"
+        and getattr(turn, "loss", True)
+        and not turn.args.get("is_head")
+    )
+
+
+def _validated_bgkit_args(value) -> dict | None:
+    """Validate the public argument object without scanning arbitrary JSON."""
+    if not isinstance(value, dict) or "ids" not in value:
+        return None
+    if not set(value).issubset({"ids", "query"}):
+        return None
+    raw = value["ids"]
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        return None
+    query = value.get("query", "")
+    if not isinstance(query, str):
+        return None
+    return {"ids": list(raw), "query": query}
+
+
+def _call_from_json_value(value) -> dict | None:
+    """Validate the exact argument or standard function-call JSON shape."""
+    direct = _validated_bgkit_args(value)
+    if direct is not None:
+        return direct
+    if not isinstance(value, dict):
+        return None
+
+    function = value.get("function")
+    if function is not None:
+        if not isinstance(function, dict):
+            return None
+        return _call_from_json_value(function)
+
+    if "arguments" not in value or value.get("name") != "bgkit":
+        return None
+    arguments = value["arguments"]
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            return None
+    return _validated_bgkit_args(arguments)
+
+
+_SCOPE_ENTRYPOINT_RE = re.compile(
+    r"entrypoint ids?:\s*((?:`[^`]*`(?:\s*,\s*)?)+|[^\s;,]+(?:\s*,\s*[^\s;,]+)*)"
+)
+
+
+def scope_entrypoint_ids(scope_description: str) -> list[str]:
+    """IDs a pre-scoped system prompt names as entrypoints.
+
+    Backtick-quoted ids are taken verbatim (file paths may contain spaces or
+    commas: ``"source file a.py; entrypoint id: `file:o/r:a b.py@1234abcd`"``);
+    unquoted ids are whitespace/comma/semicolon-delimited tokens.
+    """
+    out: list[str] = []
+    for match in _SCOPE_ENTRYPOINT_RE.finditer(scope_description):
+        group = match.group(1)
+        quoted = re.findall(r"`([^`]*)`", group)
+        if quoted:
+            out.extend(q for q in quoted if q)
+        else:
+            out.extend(part.strip() for part in group.split(",") if part.strip())
+    return out
+
+
+_XML_FUNCTION_RE = re.compile(
+    r"\A<function=(?P<name>[A-Za-z0-9_.-]+)>\s*(?P<body>.*?)\s*</function>\Z", re.S
+)
+_XML_PARAMETER_RE = re.compile(
+    r"<parameter=(?P<key>[A-Za-z0-9_]+)>\n?(?P<value>.*?)\n?</parameter>", re.S
+)
+
+
+def _call_from_xml(inner: str) -> dict | None:
+    """Parse the XML function-call body Qwen3.5's chat template renders::
+
+        <function=bgkit>
+        <parameter=ids>
+        ["doc-1"]
+        </parameter>
+        <parameter=query>
+        why?
+        </parameter>
+        </function>
+
+    This is the exact format the decoder is TRAINED on (the template renders
+    ``tool_calls`` this way, see ``bgkit_tool_template.tokenize_trajectory``);
+    Falcon-H1's template renders JSON instead, handled by
+    :func:`_call_from_json_value`. Fails closed on anything else — 2026-08-23:
+    this parser only knew JSON, so every well-formed Qwen call was scored
+    ``malformed_tool_call`` and no answer was ever generated.
+    """
+    match = _XML_FUNCTION_RE.match(inner.strip())
+    if match is None or match.group("name") != "bgkit":
+        return None
+    body = match.group("body")
+    params: dict[str, str] = {}
+    end = 0
+    for pm in _XML_PARAMETER_RE.finditer(body):
+        if body[end:pm.start()].strip():
+            return None  # stray text between parameters
+        if pm.group("key") in params:
+            return None
+        params[pm.group("key")] = pm.group("value")
+        end = pm.end()
+    if body[end:].strip():
+        return None
+    if "ids" not in params or not set(params).issubset({"ids", "query"}):
+        return None
+    try:
+        ids = json.loads(params["ids"])
+    except json.JSONDecodeError:
+        return None
+    return _validated_bgkit_args({**params, "ids": ids})
+
+
+def parse_bgkit_call(text: str) -> dict | None:
+    """Parse a structured bgkit call; malformed/prose-only output fails closed.
+
+    Accepts exactly the two renderings the decoders are trained on: the
+    JSON body (Falcon-H1's template, also bare JSON) and the XML
+    ``<function=bgkit>`` body (Qwen3.5's template), optionally wrapped in
+    ``<tool_call>`` tags that must span the whole turn.
+    """
+    decoder = json.JSONDecoder()
+    stripped = text.strip()
+    candidates = [stripped]
+    open_tag = "<tool_call>"
+    close_tag = "</tool_call>"
+    if open_tag in stripped or close_tag in stripped:
+        # An explicitly tagged call must consume the entire assistant turn.
+        # Otherwise prose after valid inner JSON would be silently ignored.
+        if not (stripped.startswith(open_tag) and stripped.endswith(close_tag)):
+            return None
+        inner = stripped[len(open_tag):-len(close_tag)]
+        if open_tag in inner or close_tag in inner:
+            return None
+        candidates = [inner.strip()]
+    for candidate in candidates:
+        if candidate.startswith("<function="):
+            return _call_from_xml(candidate)
+        if not candidate or candidate[0] not in "[{":
+            continue
+        try:
+            value, end = decoder.raw_decode(candidate)
+        except json.JSONDecodeError:
+            continue
+        if candidate[end:].strip():
+            continue
+        found = _call_from_json_value(value)
+        if found is not None:
+            return found
+    return None
+
+
+def parse_bgkit_call_ids(text: str) -> list[str] | None:
+    """Parse exact IDs from rendered tool-call JSON; malformed text fails closed."""
+    call = parse_bgkit_call(text)
+    return list(call["ids"]) if call is not None else None
+
+
+@torch.no_grad()
+def evaluate_free_running_sample(
+    trainer: KRKBTrainer,
+    sample: KBSample,
+    *,
+    max_tool_calls: int = 16,
+    max_new_tokens: int = 8192,
+) -> dict:
+    """Evaluate autonomous navigation without rendering future teacher turns.
+
+    Each generated call is accepted only if every ID was initially exposed in
+    scope or surfaced by an already executed tree node. Accepted calls are
+    appended to the observed history and re-encoded before generation resumes.
+    The first non-call output is the model's final answer.
+    """
+    tree = trainer._trees[sample.dataset_name]
+    entrypoint = str(getattr(sample, "group_id", "") or "")
+    available: set[str] = {entrypoint} if entrypoint else set(sample.topic_list)
+    # IDs the system prompt names explicitly ("...; entrypoint id: X") are in
+    # scope from the first turn — flat single-document tasks expose their
+    # document this way (2026-08-23: before the writer named it, the trained
+    # call carried an id the prompt never showed, and this evaluator rejected
+    # every flat call as unsurfaced).
+    available.update(scope_entrypoint_ids(str(getattr(sample, "scope_description", "") or "")))
+    if not available and "root" in tree:
+        available.add("root")
+
+    expected_calls = [
+        list(turn.args.get("ids", []))
+        for turn in sample.trajectory
+        if turn.kind == "bgkit" and getattr(turn, "loss", True)
+    ]
+    required_evidence = {
+        str(identifier)
+        for turn in sample.trajectory
+        if turn.kind == "bgkit"
+        and getattr(turn, "loss", True)
+        and turn.args.get("is_retrieval")
+        for identifier in turn.args.get("ids", [])
+    }
+
+    history: list[TrajectoryTurn] = []
+    generated_calls: list[list[str]] = []
+    called_ids: set[str] = set()
+    invalid_reason = ""
+    pred_answer = ""
+    final_answer_emitted = False
+    last_text = ""
+    for call_index in range(max_tool_calls + 1):
+        text = trainer.generate_kb_turn(
+            sample,
+            history,
+            max_new_tokens=max_new_tokens,
+        )
+        last_text = text
+        call = parse_bgkit_call(text)
+        if call is None:
+            if "<tool_call" in text or "</tool_call>" in text:
+                invalid_reason = "malformed_tool_call"
+                break
+            # Keep exact bytes for code-state exact match. Token-F1 performs
+            # its own normalization, but the capability metric must penalize
+            # added/removed leading or trailing whitespace and final newlines.
+            pred_answer = text
+            final_answer_emitted = True
+            break
+        if call_index >= max_tool_calls:
+            invalid_reason = "tool_call_limit"
+            break
+        ids = [str(identifier) for identifier in call["ids"]]
+        if not ids:
+            invalid_reason = "empty_ids"
+            break
+        unavailable = [identifier for identifier in ids if identifier not in available]
+        if unavailable:
+            invalid_reason = f"unsurfaced_id:{unavailable[0]}"
+            break
+
+        is_retrieval = True
+        structural_depth = 0
+        for identifier in ids:
+            called_ids.add(identifier)
+            # Flat browse trees index ARTICLES as nodes too (`is_article`);
+            # only a non-article node is a structural (head / drill) call.
+            node = tree.get(identifier) if identifier in tree else None
+            if node is not None and not node.is_article:
+                is_retrieval = False
+                available.update(node.children)
+                available.update(node.articles)
+                structural_depth = max(
+                    structural_depth,
+                    max(0, len(tree.path_to(identifier)) - 1),
+                )
+            elif node is None and tree.leaf_tag_for_article(identifier) is None:
+                invalid_reason = f"unknown_article:{identifier}"
+                break
+        if invalid_reason:
+            break
+        generated_calls.append(ids)
+        # The recorded turn must match the DATA contract the trainer routes
+        # on: a retrieval call (article ids, the flat datasets' only form) is a
+        # plain leaf drill ``{ids, query}``; only a tree-NODE call is a head /
+        # structural drill. 2026-08-23: tagging every first call ``is_head``
+        # sent the first valid fileneedle call into the head-drill guard and
+        # the exception killed the training run (227 steps lost).
+        args: dict = {"ids": ids, "query": str(call.get("query", ""))}
+        if not is_retrieval:
+            args.update({
+                "is_head": call_index == 0,
+                "is_retrieval": False,
+                "structural_depth": structural_depth,
+                "drill_mode": "free_running",
+            })
+        history.append(TrajectoryTurn(kind="bgkit", args=args, response="", loss=True))
+    else:  # pragma: no cover - loop always exits through its explicit bounds
+        invalid_reason = "tool_call_limit"
+
+    gold_answer = str(getattr(sample, "gold_answer", "") or "")
+    answer_f1 = token_f1(pred_answer, [gold_answer]) if pred_answer and gold_answer else 0.0
+    answer_exact = float(final_answer_emitted and pred_answer == gold_answer)
+    matched_prefix = 0
+    for predicted, expected in zip(generated_calls, expected_calls, strict=False):
+        if predicted != expected:
+            break
+        matched_prefix += 1
+    evidence_recall = (
+        len(required_evidence & called_ids) / len(required_evidence)
+        if required_evidence else 1.0
+    )
+    route_exact = bool(
+        not invalid_reason
+        and final_answer_emitted
+        and generated_calls == expected_calls
+    )
+    return {
+        "route_exact": float(route_exact),
+        "valid_navigation": float(not invalid_reason and final_answer_emitted),
+        "tool_calls": len(generated_calls),
+        "expected_tool_calls": len(expected_calls),
+        "matched_call_prefix": matched_prefix,
+        "evidence_recall": evidence_recall,
+        "answer_token_f1": answer_f1,
+        "answer_exact_match": answer_exact,
+        "pred_answer": pred_answer,
+        "gold_answer": gold_answer,
+        "invalid_reason": invalid_reason,
+        # The last raw generation (truncated) so an invalid verdict can be
+        # inspected without re-running the model — the 2026-08-23 parser /
+        # stop-token defects were only visible in the raw text.
+        "raw_text": last_text[:300],
+    }
+
+
 def _score_call_span(
     preds: torch.Tensor,
     shift_m: torch.Tensor,
@@ -161,17 +489,9 @@ def _score_call_span(
     ``concat_span`` is the concat-coordinate ``[start, end)`` of the
     assistant tool-call tokens (loss-bearing in the teacher mask). We
     translate to shifted coordinates (``i -> i-1``), decode the predicted
-    ids, and return ``1.0`` iff every gold tag/article ID in
-    ``gold_ids`` appears as a substring of the decoded text. Empty gold
-    lists score 0.0 (treated as a no-op turn that can't be correct).
-
-    Rationale: tool-call JSON is serialized many ways by different
-    templates (e.g. ``"ids": ["Physics/sub1"]`` vs ``<tool>ids=
-    Physics/sub1</tool>``). Substring matching is robust across formats
-    and catches the failure mode we actually care about: the decoder
-    emits a different tag ID than the teacher's. Exact-string match
-    against the raw JSON would be brittle against whitespace and quote
-    differences.
+    ids, parse the predicted tool-call JSON, and return ``1.0`` only when
+    the exact ordered ``ids`` list equals ``gold_ids``. Empty gold lists,
+    malformed JSON, prose substrings, and additional IDs all score zero.
     """
     if not gold_ids:
         return 0.0
@@ -189,7 +509,7 @@ def _score_call_span(
     pred_text = tokenizer.decode(
         pred_slice.cpu().tolist(), skip_special_tokens=True,
     )
-    return float(all(gid in pred_text for gid in gold_ids))
+    return float(parse_bgkit_call_ids(pred_text) == gold_ids)
 
 
 @torch.no_grad()
@@ -227,7 +547,7 @@ def tool_call_id_accuracy(
         #    score the model's UNMASKED prediction over their span (no loss
         #    tokens) → guaranteed ~0, pinning the micro-average near zero
         #    regardless of what the real nav drills learn.
-        if turn.args.get("is_head") or not getattr(turn, "loss", True):
+        if not _is_scored_bgkit_turn(turn):
             continue
         gold_ids = _tool_call_gold_ids(turn)
         if not gold_ids:
@@ -353,6 +673,8 @@ def evaluate_sample(
     for turn, span in zip(
         trace.bgkit_turns, trace.bgkit_call_spans, strict=True,
     ):
+        if not _is_scored_bgkit_turn(turn):
+            continue
         gold_ids = _tool_call_gold_ids(turn)
         bgkit_scores.append(
             _score_call_span(preds, shift_m, span, gold_ids, tokenizer)

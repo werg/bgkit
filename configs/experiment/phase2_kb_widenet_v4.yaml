@@ -1,0 +1,47 @@
+# @package _global_
+# Family A+B four-dataset mix (v4): lognav + fileneedle + grepset (Family B)
+# + swerecall (Family A recall probes over compacted SWE-Zero spans).
+# Continues from the v3a step-1019 state.
+#
+# RATIO VERDICT (2026-08-21 generative eval, 192 samples): 6x == 67x on ALL
+# generative metrics (verbatim needle-EM 0.000 at both; gist/absence
+# unchanged) -> ratio is NOT the lever; the verbatim gap is a
+# generation/pinpointing problem (gold-span supervision = v5 lever).
+# Therefore v4 trains at the STRONG ratio 0.10/0.15 (~67x): doctrine-
+# compliant, comparable to v1/v2, 10x cheaper decode.
+defaults:
+  - /config
+  - /training/phase2_kb_stage_a
+  - _self_
+
+run_name: phase2_kb_widenet_v4
+
+training:
+  dynamic_ckpt:
+    enabled: false
+  eval_every: 250
+  save_every: 500
+  warmup_steps: 200
+
+  datasets:
+    - lognav
+    - fileneedle
+    - grepset
+    - swerecall
+  max_samples_per_dataset_default: 100000
+
+  l0_retention:
+    lognav: 0.10
+    fileneedle: 0.10
+    grepset: 0.10
+    swerecall: 0.10
+  l1_retention: 0.15
+
+  qwen_decoder_prob: 0.80
+
+  survivorship:
+    survivorship_aux: true
+  recursive_l1_tree:
+    selection_mode_l1: exact_topk
+
+  stage_a_checkpoint: /workspace/checkpoints_fast/phase2_kb_step1019_20260821_154747_939040_run-phase2_kb_widenet_v3a

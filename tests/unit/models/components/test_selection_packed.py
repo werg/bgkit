@@ -391,13 +391,37 @@ def test_exact_ratio_topk_respects_pinned_and_minimum():
         pinned=pinned,
         min_per_sample=2,
     )
-    # Each sample target is min 2. Pinned consumes one slot per sample,
-    # then the best non-pinned logit fills the remaining slot.
+    # Pinned sits OUTSIDE the controllable count: the ratio quota and the
+    # min_per_sample floor both apply to CONTENT (non-pinned) positions, and
+    # pinned survivors are added on top. min_per_sample=2 -> 2 content survivors
+    # per sample; pinned does NOT consume a content slot.
+    # Sample 0: pinned idx0 + top-2 content idx1(0.9), idx3(0.8).
+    # Sample 1: pinned idx7 + top-2 content idx6(4.0), idx8(3.0).
     assert out.mask.tolist() == [
-        True, True, False, False, False,
-        False, True, True, False,
+        True, True, False, True, False,
+        False, True, True, True,
     ]
     assert int(out.num_pinned.item()) == 2
     # Controllable denominator excludes pinned positions; numerator is the
-    # two non-pinned top-k selections.
-    assert out.organic_keep_rate == pytest.approx(2 / 7)
+    # four non-pinned top-k selections (2 per sample).
+    assert out.organic_keep_rate == pytest.approx(4 / 7)
+
+
+def test_exact_ratio_topk_pinned_does_not_starve_content():
+    # Regression: a long pinned ID prefix must NOT crowd content out of the
+    # quota. Old behavior computed the quota over valid_counts (pinned incl.)
+    # then subtracted pinned -> ceil(0.05*10)=1, 1-6 -> 0 content survivors.
+    cu = _cu([10])
+    logits = torch.arange(10, dtype=torch.float32) / 10.0
+    valid = torch.ones_like(logits, dtype=torch.bool)
+    # First 6 positions pinned (a 6-token ID); 4 controllable content positions.
+    pinned = torch.tensor([True] * 6 + [False] * 4)
+    out = exact_ratio_topk_select(
+        logits, valid, 0.05, cu_seqlens=cu, pinned=pinned,
+    )
+    # ceil(0.05 * 4 controllable) = 1 content survivor -> the best (idx9),
+    # plus the 6 pinned. Never zero content.
+    n_content = int((out.mask & ~pinned).sum().item())
+    assert n_content >= 1
+    assert bool(out.mask[9].item()) is True
+    assert int(out.num_pinned.item()) == 6

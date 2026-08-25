@@ -594,9 +594,9 @@ class RepoGroupedBatchSampler(Sampler[list[int]]):
     """Group dataset indices by a per-index key and yield one batch per group.
 
     Phase-2 ``git_commit_repro`` per-repo full-backprop use: every file-sample
-    of one ``(repo, window-0)`` shares a group key (the window node id), so a
+    of one ``(repo, history-window)`` shares a group key (the window node id), so a
     batch is the whole repo's file-samples. The trainer then encodes that
-    repo's shared window-0 tree ONCE and grad-accumulates the file-samples'
+    group's shared window tree ONCE and grad-accumulates the file-samples'
     losses through it. Unlike :class:`PackedTokenBudgetSampler` /
     :class:`KBTokenBudgetBatchSampler`, a group is NEVER split across batches —
     splitting would force re-encoding the shared tree per sub-batch, defeating

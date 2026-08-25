@@ -41,7 +41,31 @@ from bgkit.utils.packing import (
     lengths_from_cu,
     position_ids_from_cu,
     segment_ids_from_cu,
+    segment_mean,
 )
+
+
+def _segment_zscore(base_raw: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """Per-document standardized head score: ``(raw - mean_doc) / std_doc``.
+
+    The ``exact_topk`` operator score (2026-08-22). Top-k only needs an
+    ordering, which standardization preserves within each document, and
+    every loss defined on the score (``sigmoid(score - theta)``: ratio, span,
+    decisiveness, relevance) becomes SCALE-FREE: a head cannot satisfy
+    them by inflating its output scale (v5b: raw-score std 2.96 → 120 →
+    1030 over 830 steps, re-saturating the sigmoids and freezing the
+    gradient of mis-ranked span tokens), only by re-ordering. Differentiable;
+    ``std`` is computed in float32 with an epsilon floor.
+    """
+    n = int(base_raw.shape[0])
+    seg = segment_ids_from_cu(cu_seqlens, n)
+    num_segs = int(cu_seqlens.shape[0]) - 1
+    raw32 = base_raw.float()
+    mean = segment_mean(raw32, seg, num_segs)
+    centered = raw32 - mean[seg]
+    var = segment_mean(centered * centered, seg, num_segs)
+    std = torch.sqrt(var + 1e-6)
+    return (centered / std[seg]).to(base_raw.dtype)
 
 
 def _build_combined_pack(
@@ -353,6 +377,7 @@ class LevelCompressor(nn.Module):
         utility_grad_capture: dict | None = None,
         forced_survivor_mask: torch.Tensor | None = None,
         selection_mode: str = "threshold",
+        must_keep_mask: torch.Tensor | None = None,
         capture_decoder_only_prefix: bool = False,
         content_selectable_mask: torch.Tensor | None = None,
     ) -> LevelOutput:
@@ -384,6 +409,30 @@ class LevelCompressor(nn.Module):
                 )
             if forced_survivor_mask.dtype != torch.bool:
                 forced_survivor_mask = forced_survivor_mask.to(torch.bool)
+        if must_keep_mask is not None:
+            # Oracle-span selection (eval diagnostic, 2026-08-24): guarantee
+            # these content positions win the exact_topk selection WITHOUT
+            # changing the budget k — their operator score is boosted so they
+            # displace the lowest-ranked organic picks. exact_topk only: under
+            # threshold selection a score boost would change the keep RATE,
+            # not just the ranking, so it is refused fail-closed.
+            if forced_survivor_mask is not None:
+                raise ValueError(
+                    "must_keep_mask and forced_survivor_mask are mutually "
+                    "exclusive — forced_survivor_mask already owns selection"
+                )
+            if selection_mode != "exact_topk":
+                raise ValueError(
+                    "must_keep_mask requires selection_mode='exact_topk'; "
+                    f"got {selection_mode!r}"
+                )
+            if must_keep_mask.shape != (content_embeddings.shape[0],):
+                raise ValueError(
+                    f"must_keep_mask must have shape "
+                    f"({content_embeddings.shape[0]},); got "
+                    f"{tuple(must_keep_mask.shape)}"
+                )
+            must_keep_mask = must_keep_mask.to(torch.bool)
 
         compression_off = (
             forced_survivor_mask is None
@@ -475,7 +524,19 @@ class LevelCompressor(nn.Module):
                 hidden.register_hook(_save_content_grad)
 
             T = self.head_tanh_temperature.to(base_raw.dtype)  # noqa: N806
-            logits_for_op = torch.tanh(base_raw / T)
+            # Operator score. ``threshold``: the bounded ``tanh(base_raw/T)`` that
+            # θ ∈ (-1, 1) is defined against. ``exact_topk``: the per-document
+            # z-score of ``base_raw`` (see ``_segment_zscore``) — top-k needs
+            # only an ordering; a tanh-squashed score loses its gradient at
+            # the rails (v5b: every token at tanh == -1, losses constant for
+            # 130 steps) and an unsquashed ``base_raw/T`` lets the head escape
+            # by inflating its scale (std 120 → 1030 in 170 steps). θ still
+            # acts as the sigmoid offset for the loss probabilities.
+            logits_for_op = (
+                _segment_zscore(base_raw, content_cu_seqlens)
+                if selection_mode == "exact_topk"
+                else torch.tanh(base_raw / T)
+            )
 
             valid = torch.ones_like(base_raw, dtype=torch.bool)
             # When forced_survivor_mask is supplied the head still runs for
@@ -493,8 +554,18 @@ class LevelCompressor(nn.Module):
                     base_raw.device,
                 )
                 if selection_mode == "exact_topk":
+                    # ``logits_for_op`` is the unsquashed ``base_raw / T`` here
+                    # (see above): strictly ordered even where tanh would tie.
+                    # ``must_keep_mask`` (oracle-span diagnostic) boosts ONLY
+                    # the selection copy of the scores — survive_probs and
+                    # every aux loss keep the head's own ordering.
+                    sel_logits = logits_for_op
+                    if must_keep_mask is not None:
+                        sel_logits = logits_for_op + 1.0e4 * must_keep_mask.to(
+                            logits_for_op.device,
+                        ).to(logits_for_op.dtype)
                     sel = exact_ratio_topk_select(
-                        logits=logits_for_op,
+                        logits=sel_logits,
                         valid_mask=valid,
                         target_ratio=float(target_ratio),
                         cu_seqlens=content_cu_seqlens,
@@ -748,7 +819,13 @@ class LevelCompressor(nn.Module):
                 "decoder_only_from_prefix requires a backbone with forward_from_block"
             )
         T = self.head_tanh_temperature.to(base_raw.dtype)  # noqa: N806
-        logits_for_op = torch.tanh(base_raw / T)
+        # Same operator-score convention as the main forward: per-document
+        # z-score under exact_topk, bounded tanh under threshold.
+        logits_for_op = (
+            _segment_zscore(base_raw, content_cu_seqlens)
+            if selection_mode == "exact_topk"
+            else torch.tanh(base_raw / T)
+        )
         valid = torch.ones_like(base_raw, dtype=torch.bool)
         theta = self.threshold.theta_for_ratio(float(target_ratio)).to(base_raw.device)
 

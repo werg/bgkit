@@ -57,16 +57,27 @@ def write_mmap_artifacts(
         The manifest dict that was written.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+    building = output_dir / ".building"
+    building.write_text("mmap artifact generation in progress\n")
 
-    np.save(output_dir / "tokens.npy", tokens)
-    np.save(output_dir / "offsets.npy", offsets)
+    def _save_array(path: Path, array: np.ndarray) -> None:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("wb") as handle:
+            np.save(handle, array)
+        tmp.replace(path)
+
+    _save_array(output_dir / "tokens.npy", tokens)
+    _save_array(output_dir / "offsets.npy", offsets)
 
     if extra_arrays:
         for name, arr in extra_arrays.items():
-            np.save(output_dir / name, arr)
+            _save_array(output_dir / name, arr)
 
     if metadata_table is not None:
-        pq.write_table(metadata_table, output_dir / "metadata.parquet")
+        metadata_path = output_dir / "metadata.parquet"
+        metadata_tmp = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+        pq.write_table(metadata_table, metadata_tmp)
+        metadata_tmp.replace(metadata_path)
 
     offsets_hash = hashlib.sha256(offsets.tobytes()).hexdigest()
 
@@ -83,7 +94,11 @@ def write_mmap_artifacts(
     if manifest_extra:
         manifest.update(manifest_extra)
 
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    manifest_path = output_dir / "manifest.json"
+    manifest_tmp = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    manifest_tmp.write_text(json.dumps(manifest, indent=2))
+    manifest_tmp.replace(manifest_path)
+    building.unlink()
     return manifest
 
 

@@ -89,6 +89,7 @@ class ProjectionBlock(nn.Module):
         rotary_emb: nn.Module,
         hidden_dim: int = 1024,
         output_split_factor: int = 1,
+        enforce_output_norm: bool = True,
         output_dim: int | None = None,
     ):
         super().__init__()
@@ -111,11 +112,10 @@ class ProjectionBlock(nn.Module):
         # Accept either a single nn.Module (legacy) or a list / ModuleList of
         # layers. The forward stacks them with per-layer residual + RMSNorm
         # (same Qwen3.5 block structure for every layer).
-        if isinstance(transformer_layers, nn.ModuleList):
-            layers = list(transformer_layers)
-        elif isinstance(transformer_layers, nn.Sequential):
-            layers = list(transformer_layers)
-        elif isinstance(transformer_layers, (list, tuple)):
+        if isinstance(
+            transformer_layers,
+            (nn.ModuleList, nn.Sequential, list, tuple),
+        ):
             layers = list(transformer_layers)
         elif isinstance(transformer_layers, nn.Module):
             layers = [transformer_layers]
@@ -132,12 +132,29 @@ class ProjectionBlock(nn.Module):
         self.output_split_factor = int(output_split_factor)
         self.output_dim = int(output_dim)
         self.projection_head = nn.Linear(hidden_dim, hidden_dim)
+        self.enforce_output_norm = bool(enforce_output_norm)
 
         object.__setattr__(self, "_rotary_emb", rotary_emb)
 
     @property
     def num_layers(self) -> int:
         return len(self.transformer_layers)
+
+    def _project(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Project while keeping the decoder-facing interface norm bounded.
+
+        A final unconstrained Linear previously sat after ``output_norm`` and
+        could inflate survivor norms hundreds of times while still reducing
+        training CE.  Preserve the learned direction/content of that Linear but
+        rescale each row to the norm of the normalized reference entering it.
+        """
+        reference = self.output_norm(hidden)
+        projected = self.projection_head(reference)
+        if not self.enforce_output_norm or projected.numel() == 0:
+            return projected
+        target = reference.float().norm(dim=-1, keepdim=True).detach()
+        actual = projected.float().norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        return projected * (target / actual).to(projected.dtype)
 
     @property
     def transformer_layer(self) -> nn.Module:
@@ -240,7 +257,7 @@ class ProjectionBlock(nn.Module):
             # Recompute survivor_cu_seqlens from per-sample counts.
             survivor_cu = torch.zeros(num_segs + 1, dtype=torch.int32, device=all_out.device)
             torch.cumsum(counts.to(torch.int32), dim=0, out=survivor_cu[1:])
-            projected = self.projection_head(self.output_norm(survivors))
+            projected = self._project(survivors)
             return ProjectionOutput(
                 _split_projected(projected),
                 _split_cu(survivor_cu),
@@ -248,7 +265,7 @@ class ProjectionBlock(nn.Module):
             )
 
         # No compression: return all positions with counts = original lengths.
-        projected = self.projection_head(self.output_norm(all_out))
+        projected = self._project(all_out)
         counts = lengths_from_cu(cu_seqlens).to(torch.int64)
         projected = _split_projected(projected)
         if self.output_split_factor == 1:

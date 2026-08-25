@@ -8,7 +8,13 @@ defaults:
   - /training/phase2_kb_git_repro_fullbackprop
   - _self_
 
-run_name: phase2_kb_git_repro_fullbackprop
+# 2026-07-31 RE-ANCHOR: fresh run_name isolates this run's checkpoints + wandb
+# from the COLLAPSED old run (which shares the old name). CRITICAL: auto-resume
+# (resolve_latest_checkpoint) is run_name-scoped AND picks the HIGHEST STEP — with
+# the old name it would resolve the poisoned step-9164 over this run's early
+# saves. A distinct name means, once we flip off resume_checkpoint:"none" for
+# crash-recovery, auto-resume can only ever find THIS run's checkpoints.
+run_name: phase2_kb_git_repro_reanchor51945
 # FRESH cold-start (2026-07-06): the prior run is shortcut-poisoned (learned the
 # AR fallback while the tree was collapsed). To test whether the collapse fix +
 # high-start retention let the reps become load-bearing, cold-start from the
@@ -22,8 +28,8 @@ run_name: phase2_kb_git_repro_fullbackprop
 # the nest-fix (suspend inner backbone ckpt) also cuts big-node recompute ~1.5x.
 # CONTAINER path (host /mnt/external/bgkit-checkpoints is mounted at
 # /workspace/checkpoints inside the container — the host path FileNotFound'd).
-# FRESH cold-start (2026-07-22): the sha="" commit-node-id collapse is FIXED
-# (regen with surrogate shas — unique ids, tree 85k -> 1.1M nodes). New ids mean
+# FRESH cold-start (2026-07-22): the sha="" commit-node-id collapse was fixed.
+# Schema v2 now uses real git SHAs plus salted opaque model-facing IDs. New IDs mean
 # the model must re-learn navigation from scratch, so cold-start from the
 # summarization base rather than resuming the (id-collapsed) step-1075 run.
 # ---------------------------------------------------------------------------
@@ -36,7 +42,25 @@ run_name: phase2_kb_git_repro_fullbackprop
 # step-1654 rescue save (NOT "none" — that cold-starts; NOT auto — the registry
 # still holds the POISONED old-run step-4825). CONTAINER path (host
 # /home/werg/bgkit-ckpt-fast is mounted at /workspace/checkpoints_fast).
-resume_checkpoint: "/workspace/checkpoints_fast/phase2_kb_step4999_20260726_025001_459780_run-phase2_kb_git_repro_fullbackprop"
+# 2026-07-31 RE-ANCHOR (collapse fix): FRESH start from the CLEAN summarization
+# base `phase1_summarization_round_robin_step51945_...` (training.phase1_checkpoint)
+# — NOT the drifted 9164 encoder / hybrid, which IS the collapsed artifact we are
+# repairing. The 51945 encoder+decoders are matched, load-bearing (rep_gain +2
+# nats) and in-band. resume_checkpoint=none cold-starts from that base under the
+# collapse fixes: projection norm-band regularizer (survivorship.projection_norm_reg),
+# survivorship aux re-enabled, LR rebalanced so the encoder can't outrun the decoder,
+# and the global spliced-rep-norm runtime guard. Content delivery fixes (quota,
+# exact_topk leaf, query-cond drill, retention pins) are UNCHANGED — not the bug.
+# 2026-08-01: switched "none" → null (AUTO-RESUME) after the step-235 OOM crash.
+# Now SAFE + self-healing: the fresh run_name (phase2_kb_git_repro_reanchor51945)
+# scopes resolve_latest_checkpoint to THIS run's own saves, so it can only ever
+# resume a reanchor checkpoint — never the poisoned old-name step-9164. On THIS
+# launch no reanchor checkpoint exists yet → auto-resolve returns None → clean
+# cold-start from the 51945 base (training.phase1_checkpoint). After the first
+# save (save_every lowered to 200 via control.json) a crash/OOM auto-resumes that
+# checkpoint instead of losing all progress. Incompatible checkpoints cold-start
+# gracefully (base_trainer.py:2537-2547), never crash.
+resume_checkpoint: null
 # Auto-resume ENABLED (no resume_checkpoint key): on restart the trainer
 # resolves the latest run-scoped checkpoint (resolve_latest_checkpoint, keyed on
 # run_name above) and resumes; on the first launch — or if the latest checkpoint

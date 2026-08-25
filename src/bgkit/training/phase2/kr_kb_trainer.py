@@ -26,7 +26,7 @@ import contextlib
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import ClassVar
 
@@ -39,7 +39,11 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset, random_split
 from bgkit.data.article_token_store import ArticleTokenStore
 from bgkit.data.bgkit_tool_template import (
     BGKIT_SENTINEL,
+    BGKIT_TOOL,
+    BGKIT_TOPIC_KNOWLEDGE_TOOL,
     BGKIT_TOPIC_SENTINEL,
+    assistant_generation_prompt_ids,
+    assistant_turn_end_glue,
     make_system_prompt,
     tokenize_trajectory,
 )
@@ -222,7 +226,10 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         "qwen_decoder_prob": "_handle_qwen_decoder_prob",
         # --- Survivorship aux losses (master switch + weights) ---
         "survivorship_aux": "_handle_survivorship_aux",
+        # Projection-output norm-band regularizer weight (collapse fix).
+        "projection_norm_reg_weight": "_handle_projection_norm_reg_weight",
         "ratio_loss_weight": "_handle_ratio_loss_weight",
+        "span_relevance_weight": "_handle_span_relevance_weight",
         "decisiveness_loss_weight": "_handle_decisiveness_loss_weight",
         "relevance_loss_weight": "_handle_relevance_loss_weight",
         "relevance_gold_boost": "_handle_relevance_gold_boost",
@@ -237,6 +244,11 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         "recursive_l1_retention": "_handle_recursive_l1_retention",
         "recursive_l0_retention": "_handle_recursive_l0_retention",
         "recursive_general_prompt": "_handle_recursive_general_prompt",
+        # --- Query-conditioned drill nodes (per-sample task-query re-encode) ---
+        "query_conditioned_drill_nodes": "_handle_query_conditioned_drill_nodes",
+        "drill_node_retention": "_handle_drill_node_retention",
+        "drill_leaf_l0_retention": "_handle_drill_leaf_l0_retention",
+        "drill_leaf_l1_retention": "_handle_drill_leaf_l1_retention",
         # --- Memory / speed toggles ---
         "checkpoint_encoder": "_handle_checkpoint_encoder",
         "profile_timing": "_handle_profile_timing",
@@ -255,6 +267,42 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     ABLATION_NO_TOPICS = "no_topics"  # drop topic embedding segment
     ABLATION_TOPICS_ONLY = "topics_only"  # drop bgkit survivor segments
     ABLATION_NEITHER = "neither"     # drop both topics and bgkit survivors
+    # Oracle-span diagnostic (2026-08-24): gold answer-span tokens are FORCED
+    # to win the exact_topk selection at both levels (same rep budget — they
+    # displace the lowest-ranked organic picks). Splits the verbatim-
+    # extraction failure between selection (oracle EM >> headline) and rep
+    # read-out capacity (oracle EM ≈ headline). Eval-only; requires live L0.
+    ABLATION_ORACLE_SPAN = "oracle_span"
+    # Modes under which the bgkit splice DELIBERATELY carries degenerate reps
+    # (zeros / noise / a single zero placeholder). The decoder's spliced-rep
+    # norm guard raises on sustained out-of-band reps (2026-08-22 escalation);
+    # while one of these modes is active it must stand down — the degenerate
+    # reps are the experiment, not a collapse.
+    _DEGENERATE_REP_ABLATIONS = frozenset({"zeroed", "noise", "topics_only", "neither"})
+
+    @property
+    def _ablation_mode(self) -> str | None:
+        return self.__dict__.get("_ablation_mode_value")
+
+    @_ablation_mode.setter
+    def _ablation_mode(self, mode: str | None) -> None:
+        """Every assignment site (eval sweep, in-step gap probe, training-time
+        random ablation) flows through here, so the decoder-side guard flag
+        can never drift out of sync with the trainer's ablation state."""
+        self.__dict__["_ablation_mode_value"] = mode
+        expect_degenerate = mode in self._DEGENERATE_REP_ABLATIONS
+        for dec in self._guarded_decoders():
+            dec._rep_norm_guard_expect_degenerate = expect_degenerate
+
+    def _guarded_decoders(self) -> list:
+        """Decoders whose splice guard tracks the ablation state (both
+        families under round-robin). getattr-guarded: runs on ``__new__``
+        test doubles and before the decoders are built in ``__init__``."""
+        by_family = getattr(self, "_decoders_by_family", None)
+        if by_family:
+            return list(by_family.values())
+        dec = getattr(self, "decoder", None)
+        return [dec] if dec is not None else []
 
     def __init__(self, cfg) -> None:
         super().__init__(cfg)
@@ -289,7 +337,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._live_l0: bool = False
         self.taxonomy = None
         self.topic_embeddings = None
-        self._ablation_mode: str | None = None
+        self._ablation_mode = None
         # READ-ONLY ablation-gap diagnostic probe. When > 0, the first N
         # per-repo (Option A) steps decode ONE representative group TWICE under
         # ``torch.no_grad()`` — once normally, once with the compressed
@@ -321,6 +369,29 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # behaviour for every other dataset/run. Set in setup() from
         # ``recursive_l1_tree.selection_mode_l1``.
         self._selection_mode_l1: str = "threshold"
+        self._selection_mode_l0: str = "threshold"
+        # QUERY-CONDITIONED drill nodes (2026-07-31 redesign). When True, EVERY
+        # trajectory drill turn — head, on-path interior nodes, wrong-sibling
+        # distractor node drills, and the retrieve leaf — is encoded LIVE per
+        # sample, conditioned on the sample's TASK QUERY, instead of splicing
+        # the static general-prompt shared-tree rep. Interior/head node turns
+        # route through the generalized :meth:`_shared_tree_head_survivor`
+        # (one query-conditioned L1 node forward over the node's shared-tree
+        # child survivors, detach-reaccumulate) at ``drill_node_retention``;
+        # the leaf re-encodes the raw diff at ``drill_leaf_retention.{l0,l1}``.
+        # The shared tree itself (child-survivor source + the single deferred
+        # tree backward) is UNCHANGED at the recursive ramps. Default OFF —
+        # flag-off preserves exact legacy behavior. Set in setup() from
+        # ``recursive_l1_tree.query_conditioned_drill_nodes``.
+        self._query_conditioned_drill_nodes: bool = False
+        # Retention for the per-sample query-conditioned node forwards (scalar
+        # or {start,end,ramp_steps}); None → the recursive L1 ramp (legacy).
+        self._drill_node_retention_cfg: float | dict | None = None
+        # Retrieve-leaf drill retention override (net = l0 * l1); None per
+        # level → legacy source (per-dataset ``l0_retention`` map for L0, the
+        # recursive L1 ramp / sampled L1 for L1).
+        self._drill_leaf_l0_retention_cfg: float | dict | None = None
+        self._drill_leaf_l1_retention_cfg: float | dict | None = None
         # Full-backprop recursive-L1 (git-repro full-tree curriculum). When
         # True, the WHOLE window subtree is re-encoded live every step and
         # gradient flows to ALL nodes (on-path AND off-path) — no cached/
@@ -443,6 +514,24 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # encode; default True so single-node / non-per-repo recursive paths
         # (where no tree-wide count is computed) preserve FIX 2/2b behaviour.
         self._tree_encode_ckpt_active: bool = True
+        # --- Projection-output NORM-BAND regularizer (2026-07-31 collapse fix).
+        # Off by default (only the git-repro config enables it). Keeps every
+        # projected/spliced survivor-rep's L2 norm inside the decoder's readable
+        # band (target[fam] = target_ratio[fam] * mean embed_tokens row-norm) via
+        # a permissive hinge penalty, folded into the per-group reconstruction
+        # loss so its gradient flows through projection_blocks into the backbone.
+        # See _projection_norm_reg_term / setup() parse.
+        self._proj_norm_reg_enabled: bool = False
+        self._proj_norm_reg_weight: float = 0.0
+        # Scalar tolerance = the fallback band width; per-family overrides live
+        # in _proj_norm_reg_tolerances (mirrors _proj_norm_reg_target_ratios).
+        self._proj_norm_reg_tolerance: float = 2.0
+        self._proj_norm_reg_tolerances: dict[str, float] = {}
+        self._proj_norm_reg_target_ratios: dict[str, float] = {}
+        # Cached per-family mean embed_tokens row-L2-norm (computed once, lazily).
+        self._proj_norm_reg_embed_ref_cache: dict[str, float] = {}
+        # Per-step logging accumulator: {family: [rep_norm/embed_ref ratio ...]}.
+        self._proj_norm_ratio_accum: dict[str, list[float]] = {}
         # Recursive retention ramps (float OR {start,end,ramp_steps}); resolved
         # by global_step in _recursive_l{0,1}_retention_now().  ``None`` keeps
         # the legacy scalar fallback (``_recursive_l1_retention``).
@@ -765,17 +854,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         )
         if self._l0_prompt_tokens > 0:
             import torch.nn as _nn
-            _P = self._l0_prompt_tokens
-            _D = int(self.encoder.l0.survive_embedding.shape[-1])
+
+            prompt_count = self._l0_prompt_tokens
+            prompt_dim = int(self.encoder.l0.survive_embedding.shape[-1])
             _ref = next(self.encoder.l0.parameters())
             self.encoder.l0_task_prompts = _nn.ParameterDict({
-                str(_ds): _nn.Parameter(torch.zeros(_P, _D))
+                str(_ds): _nn.Parameter(torch.zeros(prompt_count, prompt_dim))
                 for _ds in list(self.step_cfg.get("datasets", []))
             }).to(device=self.device, dtype=_ref.dtype)
             logger.info(
                 "phase2_kb_l0_task_prompts_built",
                 n_datasets=len(self.encoder.l0_task_prompts),
-                prompt_tokens=_P, hidden_dim=_D,
+                prompt_tokens=prompt_count, hidden_dim=prompt_dim,
                 freeze_backbone=self._l0_freeze_backbone,
             )
 
@@ -851,6 +941,33 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         )
         if self._per_repo_full_backprop:
             self._recursive_l1_full_backprop = True
+        # Per-level SELECTION MODE — first-class, parsed UNCONDITIONALLY.
+        # ``training.selection_mode: {l0: threshold|exact_topk, l1: ...}``;
+        # the legacy ``recursive_l1_tree.selection_mode_l1`` is honored as the
+        # L1 fallback. (2026-08-22: the legacy key was parsed only under
+        # ``recursive_l1_tree.enabled`` — every widenet config's
+        # ``selection_mode_l1: exact_topk`` was silently ignored and BOTH
+        # levels ran threshold mode: L0 on the untrained base keeps 0.0-0.3%
+        # ("confidently silent"), then the aux losses flip the saturated head
+        # to ~100% within ~40 steps → 50-78K-token decodes.) exact_topk
+        # realizes the configured ratio deterministically (ceil ≥ 1) and skips
+        # that level's dual-ascent θ step (θ is irrelevant under top-k).
+        sel_cfg = dict(self.step_cfg.get("selection_mode", {}) or {})
+        legacy_l1 = rec_cfg.get("selection_mode_l1", None)
+        self._selection_mode_l0 = str(sel_cfg.get("l0", "threshold"))
+        self._selection_mode_l1 = str(
+            sel_cfg.get("l1", legacy_l1 if legacy_l1 is not None else "threshold"),
+        )
+        for _lvl, _mode in (("l0", self._selection_mode_l0), ("l1", self._selection_mode_l1)):
+            if _mode not in {"threshold", "exact_topk"}:
+                raise ValueError(
+                    f"selection_mode.{_lvl} must be 'threshold' or 'exact_topk'; got {_mode!r}"
+                )
+        logger.info(
+            "phase2_kb_selection_modes",
+            l0=self._selection_mode_l0,
+            l1=self._selection_mode_l1,
+        )
         if self._recursive_l1:
             # Retention may be a scalar (legacy) OR a step-interpolated ramp
             # ``{start, end, ramp_steps}`` (per-repo curriculum). Store the raw
@@ -866,19 +983,36 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             self._recursive_general_prompt = str(
                 rec_cfg.get("general_prompt", DEFAULT_RECURSIVE_GENERAL_PROMPT),
             )
-            # BUG-1: L1 selection mode for the recursive tree + drill. Default
-            # ``threshold`` (θ-controlled, unchanged for every other run);
-            # ``exact_topk`` realizes the target ratio deterministically from the
-            # frozen head logits, bypassing the grad-starved θ controller. When
-            # exact_topk is active the L1 dual-ascent θ step is skipped (θ is
-            # irrelevant — selection is top-k) in _post_optimizer_step.
-            self._selection_mode_l1 = str(
-                rec_cfg.get("selection_mode_l1", "threshold"),
+            # BUG-1 (L1 selection mode for the recursive tree + drill) is now
+            # parsed unconditionally above (``training.selection_mode`` with the
+            # legacy ``recursive_l1_tree.selection_mode_l1`` fallback).
+            # QUERY-CONDITIONED drill nodes (2026-07-31): per-sample live
+            # task-query re-encode of EVERY trajectory drill node (head +
+            # on-path interiors + distractor node drills) over the shared
+            # tree's child survivors, plus the leaf retention override.
+            # Flag-off = exact legacy behavior (static node splices, tree-ramp
+            # drill ratios). All four knobs live-tunable via control.json.
+            self._query_conditioned_drill_nodes = bool(
+                rec_cfg.get("query_conditioned_drill_nodes", False),
             )
-            if self._selection_mode_l1 not in {"threshold", "exact_topk"}:
-                raise ValueError(
-                    "recursive_l1_tree.selection_mode_l1 must be 'threshold' or "
-                    f"'exact_topk'; got {self._selection_mode_l1!r}"
+            self._drill_node_retention_cfg = rec_cfg.get(
+                "drill_node_retention", None,
+            )
+            _dlr = rec_cfg.get("drill_leaf_retention", {}) or {}
+            self._drill_leaf_l0_retention_cfg = _dlr.get("l0", None)
+            self._drill_leaf_l1_retention_cfg = _dlr.get("l1", None)
+            if self._query_conditioned_drill_nodes:
+                logger.info(
+                    "phase2_kb_query_conditioned_drill_nodes_enabled",
+                    drill_node_retention=self._drill_node_retention_cfg,
+                    drill_leaf_l0=self._drill_leaf_l0_retention_cfg,
+                    drill_leaf_l1=self._drill_leaf_l1_retention_cfg,
+                    note=(
+                        "every trajectory drill node (head + on-path + "
+                        "distractors) re-encoded LIVE per sample under the "
+                        "task query; leaf at drill_leaf_retention; shared "
+                        "tree unchanged at the recursive ramps"
+                    ),
                 )
             # Per-repo cost knob: each file-sample's backward recomputes the
             # GC'd shared-tree forward once (Nx per repo), and the staged drill
@@ -925,11 +1059,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             # encoder-per-repo split-cadence stepping. Mutually exclusive with
             # the legacy live-tree inner loop.
             self._per_repo_option_a = bool(rec_cfg.get("per_repo_option_a", False))
-            if self._per_repo_option_a and self._per_repo_inner_loop:
+            if self._per_repo_option_a:
                 raise ValueError(
-                    "recursive_l1_tree.per_repo_option_a and per_repo_inner_loop "
-                    "are mutually exclusive (Option A replaces the legacy "
-                    "live-tree inner loop). Set exactly one."
+                    "recursive_l1_tree.per_repo_option_a was removed because it "
+                    "performed multiple adaptive decoder updates against one "
+                    "stale tree, then one encoder update from gradients produced "
+                    "by several decoder states. Use the coherent one-step "
+                    "per-repo path (per_repo_option_a=false)."
                 )
             # Option A: uncapped subsets (process all files) + per-file drill
             # activation-checkpoint (bounds the deferred-encoder-grad peak).
@@ -1044,6 +1180,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             enabled_default=False,
             mode_default="jitter",
         )
+        self._l0_ratio_sampler_cfg = self._anchor_free_if_topk("l0", self._l0_ratio_sampler_cfg)
+        self._l1_ratio_sampler_cfg = self._anchor_free_if_topk("l1", self._l1_ratio_sampler_cfg)
         import random as _random
 
         self._l0_ratio_rng = _random.Random(int(self.cfg.get("seed", 42)) + 101)
@@ -1065,27 +1203,64 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         )
 
         surv_cfg = self.step_cfg.get("survivorship", {}) or {}
-        # Master switch for ALL survivorship aux losses (BCE / moment-match /
-        # min-survivors / decisiveness / relevance / utility-grad BCE) AND the
-        # _pending_l0/l1_outputs collection that feeds them. Default OFF: per the
-        # 2026-06-29 decision the survivorship aux is dropped for ALL phase2_kb
-        # runs (KRKBTrainer serves Phase 2 only; selection is the least-important
-        # stage and the reps are distributed, so the head is frozen at its
-        # pre-trained selection). Set survivorship_aux: true to re-enable head
-        # training. (Phase 1 / Joint Block / l1l1-distill use other trainers and
-        # never read this flag.) When OFF (the default): the head gets no gradient
-        # and the forward retains nothing — the dual-ascent θ control is decoupled
-        # and still runs (accumulated per-microbatch at encode time; see
-        # _accumulate_theta_state / _post_optimizer_step).
+        # Master switch for survivorship-head supervision and the pending
+        # LevelOutputs that feed it.  Keep the default backward-compatible for
+        # generic Phase-2 jobs; retrieval jobs are expected to enable this so a
+        # hard top-k policy is not permanently tied to an unrelated checkpoint's
+        # ranking.  Theta control remains available when this is disabled.
         self._survivorship_aux = bool(surv_cfg.get("survivorship_aux", False))
         self._ratio_loss_weight = float(surv_cfg.get("ratio_loss_weight", 0.1))
         self._decisiveness_loss_weight = float(
             surv_cfg.get("decisiveness_loss_weight", 0.05),
         )
         self._relevance_loss_weight = float(surv_cfg.get("relevance_loss_weight", 0.05))
+        # v5: span-level relevance — push the gold answer span's positions to
+        # survive at L0 AND L1 (target prob 1.0). 0.0 = off (default).
+        self._span_relevance_weight = float(surv_cfg.get("span_relevance_weight", 0.0))
 
+        # Which per-level aux weights were EXPLICITLY configured (see _aux_weight).
+        self._level_explicit_aux = {
+            lvl: set(dict(surv_cfg.get(lvl, {}) or {}).keys()) for lvl in ("l0", "l1")
+        }
         self._surv_l0 = resolve_level_loss_cfg(surv_cfg.get("l0", {}))
         self._surv_l1 = resolve_level_loss_cfg(surv_cfg.get("l1", {}))
+
+        # --- Projection-output norm-band regularizer (collapse fix). Config
+        # block ``survivorship.projection_norm_reg``; absent → disabled (so only
+        # the git-repro run turns it on, all other phase2_kb runs are untouched).
+        pnr_cfg = surv_cfg.get("projection_norm_reg", {}) or {}
+        self._proj_norm_reg_enabled = bool(pnr_cfg.get("enabled", False))
+        self._proj_norm_reg_weight = float(pnr_cfg.get("weight", 0.1))
+        # ``tolerance`` accepts a scalar (back-compat, same band width for every
+        # family) OR a per-family dict {family: tol} mirroring ``target_ratio``
+        # — needed so one family's band can be tightened without penalizing
+        # another that is already in-band (qwen35 drift vs stable falcon_h1,
+        # 2026-08-01). The scalar stays as the fallback for families absent
+        # from the dict.
+        _tol = pnr_cfg.get("tolerance", 2.0)
+        if hasattr(_tol, "items"):  # dict / OmegaConf DictConfig → per-family
+            self._proj_norm_reg_tolerances = {
+                str(k): float(v) for k, v in _tol.items()
+            }
+            self._proj_norm_reg_tolerance = 2.0
+        else:
+            self._proj_norm_reg_tolerances = {}
+            self._proj_norm_reg_tolerance = float(_tol)
+        _tr = pnr_cfg.get("target_ratio", {}) or {}
+        # OmegaConf DictConfig → plain dict[str,float].
+        self._proj_norm_reg_target_ratios = {
+            str(k): float(v)
+            for k, v in (_tr.items() if hasattr(_tr, "items") else {})
+        }
+        self._proj_norm_reg_embed_ref_cache = {}
+        if self._proj_norm_reg_enabled:
+            logger.info(
+                "phase2_kb_projection_norm_reg_enabled",
+                weight=self._proj_norm_reg_weight,
+                tolerance=self._proj_norm_reg_tolerance,
+                tolerance_by_family=self._proj_norm_reg_tolerances,
+                target_ratio=self._proj_norm_reg_target_ratios,
+            )
 
         ice_cfg = self.step_cfg.get("ice_distillation", {}) or {}
         self._ice_l0 = resolve_level_ice_cfg(ice_cfg.get("l0", {}))
@@ -2068,6 +2243,111 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             return int(epochs) * math.ceil(n_batches / max(accum_steps, 1))
         return n_batches
 
+    def _validate_git_artifact_generation(
+        self,
+        dataset: KBTrajectoryDataset,
+    ) -> None:
+        """Require tree, mmap, and trajectory artifacts from one build.
+
+        Every component is independently loadable, so checking only article
+        coverage can still accept a mixed generation whose IDs happen to
+        overlap. Provenance hashes make that state an explicit setup error.
+        """
+        import json as _json
+
+        from bgkit.data.commit_repro import (
+            GIT_REPRO_SCHEMA_VERSION,
+            ID_SCHEME_VERSION,
+            file_sha256,
+        )
+
+        trajectory_manifest = dataset.artifact_manifest
+        tree_dir = self._resolve_dir("browse_tree_dir", "browse_trees")
+        tree_path = tree_dir / "git_commit_repro.parquet"
+        tree_manifest_path = tree_dir / "git_commit_repro.manifest.json"
+        mmap_dir = self._resolve_dir("mmap_dir", "mmap/phase2")
+        mmap_manifest_path = mmap_dir / "git_commit_repro" / "manifest.json"
+        for path in (tree_manifest_path, mmap_manifest_path):
+            if not path.exists():
+                raise ValueError(
+                    f"git_commit_repro artifact manifest missing: {path}. "
+                    "Rebuild raw, tree, mmap, trajectories, and Arrow IPC together."
+                )
+        tree_manifest = _json.loads(tree_manifest_path.read_text())
+        mmap_manifest = _json.loads(mmap_manifest_path.read_text())
+        if int(tree_manifest.get("schema_version", 0)) != GIT_REPRO_SCHEMA_VERSION:
+            raise ValueError("git_commit_repro browse-tree schema mismatch")
+        if int(mmap_manifest.get("dataset_schema_version", 0)) != (
+            GIT_REPRO_SCHEMA_VERSION
+        ):
+            raise ValueError("git_commit_repro mmap schema mismatch")
+        actual_tree_sha = file_sha256(tree_path)
+        manifests = {
+            "trajectory": trajectory_manifest,
+            "tree": tree_manifest,
+            "mmap": mmap_manifest,
+        }
+        expected = {
+            "source_sha256": str(trajectory_manifest.get("source_sha256", "")),
+            "tree_sha256": actual_tree_sha,
+            "id_salt": str(trajectory_manifest.get("id_salt", "")),
+            "id_scheme_version": ID_SCHEME_VERSION,
+        }
+        for artifact, manifest in manifests.items():
+            for key, value in expected.items():
+                observed = manifest.get(key)
+                if str(observed) != str(value):
+                    raise ValueError(
+                        "mixed git_commit_repro artifact generations: "
+                        f"{artifact}.{key}={observed!r}, expected {value!r}. "
+                        "Rebuild and deploy the complete artifact set together."
+                    )
+        observed_modes = {
+            str(mode)
+            for mode, count in dict(
+                trajectory_manifest.get("drill_mode_counts", {})
+            ).items()
+            if int(count) > 0
+        }
+        allowed_raw = self.step_cfg.get(
+            "git_repro_allowed_drill_modes", ["full"],
+        )
+        if isinstance(allowed_raw, str):
+            allowed_modes = {allowed_raw}
+        else:
+            allowed_modes = {str(mode) for mode in allowed_raw}
+        if not observed_modes or not observed_modes.issubset(allowed_modes):
+            raise ValueError(
+                "git_commit_repro trajectory modes are incompatible with this "
+                f"run: observed={sorted(observed_modes)}, "
+                f"allowed={sorted(allowed_modes)}"
+            )
+        build_config = trajectory_manifest.get("build_config")
+        if not isinstance(build_config, dict):
+            raise ValueError(
+                "git_commit_repro trajectory manifest has no build_config; rebuild it"
+            )
+        if allowed_modes == {"full"} and int(build_config.get("max_touching", -1)) != 0:
+            raise ValueError(
+                "production git_commit_repro requires the complete anchor-to-target "
+                "history (trajectory build_config.max_touching must be 0)"
+            )
+        if self._live_l0 and self._token_store is not None:
+            tree_articles = set(self._trees["git_commit_repro"].articles("root"))
+            mmap_articles = set(
+                self._token_store.document_ids("git_commit_repro")
+            )
+            if tree_articles != mmap_articles:
+                missing = sorted(tree_articles - mmap_articles)[:5]
+                extra = sorted(mmap_articles - tree_articles)[:5]
+                raise ValueError(
+                    "git_commit_repro tree/mmap article sets differ: "
+                    f"missing={missing}, extra={extra}"
+                )
+            validated = getattr(self, "_artifact_coverage_validated", set())
+            validated.add("git_commit_repro")
+            self._artifact_coverage_validated = validated
+
     def _build_dataloaders(self) -> None:
         """Load per-dataset trajectory parquets, optionally subset them
         according to the stage curriculum, and wrap in DataLoaders.
@@ -2112,6 +2392,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     "Run scripts/build_teacher_trajectories.py first."
                 )
             ds = KBTrajectoryDataset(path)
+            if name == "git_commit_repro":
+                self._validate_git_artifact_generation(ds)
             cap = max_per_dataset_cfg.get(name, max_per_dataset_default)
             whitelist = top_tag_whitelist_cfg.get(name)
             if whitelist is not None:
@@ -2137,15 +2419,49 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         full = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
 
         total = len(full)
-        eval_size = min(
-            max(1, int(total * 0.05)),
-            int(self.step_cfg.get("max_eval_samples", 256)),
-        )
-        train_size = total - eval_size
-        generator = torch.Generator().manual_seed(int(self.cfg.get("seed", 42)))
-        self.train_dataset, self.eval_dataset = random_split(
-            full, [train_size, eval_size], generator=generator,
-        )
+        seed = int(self.cfg.get("seed", 42))
+        split_labels = self._dataset_split_labels(full)
+        self._artifact_group_sizes = None
+        if split_labels:
+            if len(split_labels) != total:
+                raise ValueError("explicit trajectory split column has wrong length")
+            train_indices = [i for i, label in enumerate(split_labels) if label == "train"]
+            eval_indices = [i for i, label in enumerate(split_labels) if label == "eval"]
+            unknown = sorted(set(split_labels) - {"train", "eval"})
+            if unknown or not train_indices or not eval_indices:
+                raise ValueError(
+                    "explicit trajectory splits must contain non-empty train/eval "
+                    f"partitions only; unknown={unknown}"
+                )
+            self.train_dataset = Subset(full, train_indices)
+            self.eval_dataset = Subset(full, eval_indices)
+            all_group_keys = self._dataset_group_keys(full)
+            if all_group_keys is not None:
+                from collections import Counter
+                self._artifact_group_sizes = Counter(all_group_keys)
+            train_repos = set(self._dataset_repo_ids(self.train_dataset) or [])
+            eval_repos = set(self._dataset_repo_ids(self.eval_dataset) or [])
+            overlap = train_repos & eval_repos
+            if overlap:
+                raise ValueError(
+                    "repository leakage in explicit trajectory split: "
+                    f"{len(overlap)} overlapping repos; sample={sorted(overlap)[:5]}"
+                )
+            logger.info(
+                "phase2_kb_explicit_repo_split",
+                train_size=len(train_indices), eval_size=len(eval_indices),
+                train_repos=len(train_repos), eval_repos=len(eval_repos),
+            )
+        else:
+            eval_size = min(
+                max(1, int(total * 0.05)),
+                int(self.step_cfg.get("max_eval_samples", 256)),
+            )
+            train_size = total - eval_size
+            generator = torch.Generator().manual_seed(seed)
+            self.train_dataset, self.eval_dataset = random_split(
+                full, [train_size, eval_size], generator=generator,
+            )
         # Trim outlier samples by live-L0 token budget BEFORE building the
         # dataloader + computing max_steps below, so both reflect the filtered
         # set. Drops the genuine narrativeqa/pubmedqa token-outlier tails
@@ -2198,33 +2514,53 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             n_samples_before = len(group_keys)
             group_sizes = Counter(group_keys)
             n_repos_before = len(group_sizes)
+            eval_group_keys = self._dataset_group_keys(self.eval_dataset)
+            if eval_group_keys is None:
+                eval_group_keys = [
+                    self._repo_group_key(self.eval_dataset[i])
+                    for i in range(len(self.eval_dataset))
+                ]
+            eval_group_sizes = Counter(eval_group_keys)
             max_leaf_tokens = getattr(self, "_max_repo_leaf_tokens", None)
             max_file_samples = getattr(self, "_max_repo_file_samples", None)
             max_tree_nodes = getattr(self, "_max_repo_tree_nodes", None)
             _ds_list = list(self.step_cfg.get("datasets", []))
             _ds = _ds_list[0] if _ds_list else None
-            dropped_keys: set[str] = set()
-            if max_file_samples is not None:
-                dropped_keys |= {
-                    k for k, sz in group_sizes.items() if sz > int(max_file_samples)
-                }
-            if max_tree_nodes is not None and _ds is not None:
-                # NODE-COUNT cap: bounds the retained shared-tree graph (the
-                # OOM driver). Heavy-tailed, so isolates the n187+ tail.
-                for k in group_sizes:
-                    if k in dropped_keys:
-                        continue
-                    if self._repo_tree_node_count(_ds, k) > int(max_tree_nodes):
-                        dropped_keys.add(k)
-            if max_leaf_tokens is not None and _ds is not None:
-                for k in group_sizes:
-                    if k in dropped_keys:
-                        continue
-                    if self._repo_leaf_token_count(_ds, k) > int(max_leaf_tokens):
-                        dropped_keys.add(k)
+            artifact_sizes = getattr(self, "_artifact_group_sizes", None)
+
+            def _ineligible(keys: set[str]) -> set[str]:
+                dropped: set[str] = set()
+                if max_file_samples is not None:
+                    dropped |= {
+                        key for key in keys
+                        if int(
+                            artifact_sizes.get(key, 0)
+                            if artifact_sizes is not None
+                            else group_sizes.get(key, eval_group_sizes.get(key, 0))
+                        ) > int(max_file_samples)
+                    }
+                if max_tree_nodes is not None and _ds is not None:
+                    for key in keys - dropped:
+                        if self._repo_tree_node_count(_ds, key) > int(max_tree_nodes):
+                            dropped.add(key)
+                if max_leaf_tokens is not None and _ds is not None:
+                    for key in keys - dropped:
+                        if self._repo_leaf_token_count(_ds, key) > int(max_leaf_tokens):
+                            dropped.add(key)
+                return dropped
+
+            dropped_keys = _ineligible(set(group_sizes))
+            eval_dropped_keys = _ineligible(set(eval_group_sizes))
             dropped_samples = sum(
                 group_sizes[k] for k in dropped_keys
             )
+            eval_before = len(self.eval_dataset)
+            if eval_dropped_keys:
+                keep_eval = [
+                    index for index, key in enumerate(eval_group_keys)
+                    if key not in eval_dropped_keys
+                ]
+                self.eval_dataset = Subset(self.eval_dataset, keep_eval)
             # Stash sampler-build inputs so the warmup→inner-loop switch in
             # _pre_step_hook can rebuild the loader (subset-emitting mode)
             # without recomputing the filter.
@@ -2249,6 +2585,10 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 n_samples_before=n_samples_before,
                 n_samples_after=n_samples_before - dropped_samples,
                 n_samples_dropped=dropped_samples,
+                eval_repos_before=len(eval_group_sizes),
+                eval_repos_after=len(eval_group_sizes) - len(eval_dropped_keys),
+                eval_samples_before=eval_before,
+                eval_samples_after=len(self.eval_dataset),
             )
             logger.info(
                 "phase2_kb_per_repo_grouping",
@@ -2313,6 +2653,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             n_train_batches = math.ceil(
                 len(self.train_dataset) / max(batch_size, 1)
             )
+        # Explicit repository splits are filtered for eligibility before this
+        # reporting cap.  This avoids the old mixture where training dropped an
+        # oversized repo only after one of its rows had entered evaluation.
+        max_eval_samples = int(self.step_cfg.get("max_eval_samples", 256))
+        if max_eval_samples > 0 and len(self.eval_dataset) > max_eval_samples:
+            generator = torch.Generator().manual_seed(
+                int(self.cfg.get("seed", 42)) + 1,
+            )
+            keep = torch.randperm(
+                len(self.eval_dataset), generator=generator,
+            )[:max_eval_samples].sort().values.tolist()
+            self.eval_dataset = Subset(self.eval_dataset, keep)
         self.eval_dataloader = DataLoader(
             self.eval_dataset,
             batch_size=1,
@@ -2436,16 +2788,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 max_inner_steps=int(self._per_repo_max_inner_steps),
             )
 
-    def _calibrate_head_tanh_temperatures(self, n_probe_batches: int = 4) -> None:
+    def _calibrate_head_tanh_temperatures(
+        self, n_probe_batches: int = 4, levels: tuple[str, ...] = ("l0", "l1"),
+    ) -> None:
         """Probe L0 + L1 head output std against Phase 2 KB content.
 
         Phase 2 batches are lists of ``KBSample`` objects, not dicts of
         tensors, so the shared calibration helper can't read
-        ``content_token_ids`` directly. We plug in a KB-aware extractor
-        that tokenizes each sample's ``question`` + the first rendered
-        trajectory step via ``encoder_tokenizer``. Question + trajectory
-        text is representative Phase 2 content; tokenizing a few of them
-        gives the backbone realistic input for the probe.
+        ``content_token_ids`` directly. We plug in a KB-aware extractor:
+        the first retrieval turn's ARTICLE tokens from the live token store
+        (a 2K-token prefix — what the L0 head actually scores in the flat
+        wide-net path), falling back to the sample's ``question`` text when
+        no article resolves (cached-L0 stages, no retrieval turn).
         """
         from bgkit.training.survivorship_helpers import (
             calibrate_head_tanh_temperature,
@@ -2456,27 +2810,46 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             logger.info("phase2_kb_tanh_calibration_skipped", reason="no_tokenizer")
             return
 
+        store = getattr(self, "_token_store", None)
+
+        def _article_probe(sample):
+            if store is None:
+                return None
+            for turn in getattr(sample, "trajectory", None) or []:
+                if getattr(turn, "kind", None) != "bgkit":
+                    continue
+                ids = list(turn.args.get("ids", []))
+                try:
+                    arts = self._resolve_article_ids(sample.dataset_name, ids)
+                except Exception:
+                    arts = []
+                if arts:
+                    toks = store.get(sample.dataset_name, arts[0])
+                    if toks is not None and int(toks.numel()) > 0:
+                        return toks[:2048].to(torch.long)
+            return None
+
         def _batch_to_content(batch):
-            # batch is a list of KBSample objects post-_collate_kb. Pick
-            # the first sample; tokenize its question text as a probe.
+            # batch is a list of KBSample objects post-_collate_kb. Probe the
+            # first sample's article content; fall back to its question text.
             if not batch:
                 return None
             sample = batch[0]
-            text = getattr(sample, "question", None) or ""
-            if not text:
-                return None
-            ids = tokenizer.encode(text, add_special_tokens=False)
-            if not ids:
-                return None
-            # Truncate to a sensible probe length to bound backbone cost.
-            ids = ids[:512]
+            token_ids = _article_probe(sample)
+            if token_ids is None:
+                text = getattr(sample, "question", None) or ""
+                if not text:
+                    return None
+                ids = tokenizer.encode(text, add_special_tokens=False)
+                if not ids:
+                    return None
+                token_ids = torch.tensor(ids[:512], dtype=torch.long)
             # Packed varlen format: flat (N,) tokens + cu_seqlens (B+1,) int32.
             # Single-sample probe → cu_seqlens = [0, L].
-            token_ids = torch.tensor(ids, dtype=torch.long)
-            cu_seqlens = torch.tensor([0, len(ids)], dtype=torch.int32)
+            cu_seqlens = torch.tensor([0, int(token_ids.numel())], dtype=torch.int32)
             return token_ids, cu_seqlens
 
-        for level in ("l0", "l1"):
+        for level in levels:
             calibrated_t = calibrate_head_tanh_temperature(
                 self.encoder,
                 self.train_dataloader,
@@ -2488,16 +2861,39 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             if calibrated_t is not None:
                 logger.info(
                     "head_tanh_temperature_calibrated",
-                    level=level,
+                    enc_level=level,  # ``level`` is structlog's reserved key
                     T=calibrated_t,
                     phase="phase2_kb",
                 )
             else:
                 logger.info(
                     "phase2_kb_tanh_calibration_skipped",
-                    level=level,
+                    enc_level=level,
                     reason="no_extractable_content",
                 )
+
+    def _pre_train_loop(self) -> None:
+        """After setup AND checkpoint restore: under ``exact_topk`` the head
+        temperature ``T`` is not an operator parameter but the score
+        normalizer every loss is conditioned on (``sigmoid(base_raw/T - theta)``), so
+        it must track the CURRENT head. The setup-time probe runs on the
+        pre-restore weights and the restored checkpoint then overwrites T
+        with its saved value (v5b: T stayed 2.24 while the head's raw scores
+        drifted far below the tanh floor → every loss frozen). Re-estimate
+        it from the loaded head for each exact_topk level on resume.
+        """
+        super()._pre_train_loop()
+        topk_levels = tuple(
+            lvl for lvl in ("l0", "l1")
+            if getattr(self, f"_selection_mode_{lvl}", "threshold") == "exact_topk"
+        )
+        if topk_levels and int(getattr(self, "global_step", 0) or 0) > 0:
+            logger.info(
+                "phase2_kb_tanh_temperature_recalibrated_on_resume",
+                enc_levels=list(topk_levels),
+                step=int(self.global_step),
+            )
+            self._calibrate_head_tanh_temperatures(levels=topk_levels)
 
     # ------------------------------------------------------------------
     # Optimizer
@@ -2627,10 +3023,11 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         "target_ratio",
         "min_per_sample",
         "selection_mode",
+        "must_keep_mask",
         "utility_grad_active",
         "utility_grad_capture",
     )
-    _LEVEL_ARG_DEFAULTS = {
+    _LEVEL_ARG_DEFAULTS: ClassVar[dict[str, object]] = {
         "prompt_embeddings": None,
         "prompt_cu_seqlens": None,
         "prompt_position_ids": None,
@@ -2643,6 +3040,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # checkpoint's recompute (which re-runs _l0_leaf_forward) re-derives the
         # SAME mode. Default "threshold" preserves flat _l0_for_articles.
         "selection_mode": "threshold",
+        "must_keep_mask": None,
         "utility_grad_active": False,
         "utility_grad_capture": None,
     }
@@ -2776,6 +3174,65 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             return float(scalar)
         return self._sample_l1_retention()
 
+    def _drill_node_retention_now(self) -> float:
+        """Retention for the per-sample QUERY-CONDITIONED drill-node forwards
+        (head + interior + distractor node turns). Falls back to the recursive
+        L1 ramp when ``recursive_l1_tree.drill_node_retention`` is unset, so
+        flag-off / knob-off behavior is exactly legacy."""
+        cfg = getattr(self, "_drill_node_retention_cfg", None)
+        if cfg is None:
+            return self._recursive_l1_retention_now()
+        return self._interp_recursive_ratio(cfg, default=0.15)
+
+    def _drill_leaf_l0_retention_now(self) -> float | None:
+        """Retrieve-leaf drill L0 retention override
+        (``recursive_l1_tree.drill_leaf_retention.l0``). ``None`` = knob unset
+        → the per-dataset ``l0_retention`` map applies (legacy)."""
+        cfg = getattr(self, "_drill_leaf_l0_retention_cfg", None)
+        if cfg is None:
+            return None
+        return self._interp_recursive_ratio(cfg, default=0.10)
+
+    def _drill_leaf_l1_retention_override(self) -> float | None:
+        """Retrieve-leaf drill L1 retention override
+        (``recursive_l1_tree.drill_leaf_retention.l1``); ``None`` when unset."""
+        cfg = getattr(self, "_drill_leaf_l1_retention_cfg", None)
+        if cfg is None:
+            return None
+        return self._interp_recursive_ratio(cfg, default=0.15)
+
+    def _drill_leaf_l1_retention_now(self) -> float:
+        """Effective retrieve-leaf drill L1 retention for the per-repo decode
+        drivers: the ``drill_leaf_retention.l1`` knob when set, else the
+        recursive L1 ramp (the legacy drill↔tree coupling)."""
+        override = self._drill_leaf_l1_retention_override()
+        if override is not None:
+            return override
+        return self._recursive_l1_retention_now()
+
+    def _anchor_free_if_topk(self, level: str, cfg):
+        """Anchor sampling (``anchor_sampling_prob``: uniform picks from the
+        FULL θ-anchor grid, up to 0.95) exists to calibrate the threshold
+        curve θ(r) far from the operating point. Under ``exact_topk`` θ is
+        never consulted, so anchor samples buy nothing and cost a lot: a 0.95
+        draw on a 40K-token window splices ~37K reps (memory/time tail seen
+        in v5b). Couple the two at the source: an exact_topk level keeps the
+        window/jitter band (ratio robustness near the operating point) and
+        has anchor sampling disabled. Returns ``cfg`` unchanged otherwise."""
+        mode = getattr(self, f"_selection_mode_{level}", "threshold")
+        prob = float(getattr(cfg, "anchor_sampling_prob", 0.0) or 0.0)
+        if mode != "exact_topk" or prob <= 0.0:
+            return cfg
+        import dataclasses
+
+        logger.info(
+            "phase2_kb_ratio_sampler_anchor_disabled",
+            enc_level=level,  # ``level`` is structlog's reserved log-level key
+            selection_mode=mode,
+            anchor_sampling_prob_was=prob,
+        )
+        return dataclasses.replace(cfg, anchor_sampling_prob=0.0)
+
     def _sample_l1_retention(self) -> float:
         """Sample an L1 retention ratio around the configured base rate."""
         ratio = sample_ratio(
@@ -2796,6 +3253,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         query_emb: torch.Tensor | None = None,
         ratio: float | None = None,
         selection_mode: str = "threshold",
+        gold_spans: dict[str, tuple[int, int]] | None = None,
     ):
         """Run the encoder live on each article's tokens to produce L0 survivors.
 
@@ -2857,6 +3315,40 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             )
         position_ids = position_ids_from_cu(cu_seqlens, int(tokens_flat.shape[0]))
 
+        # Oracle-span ablation (eval diagnostic): force the gold answer span's
+        # token positions to win the L0 exact_topk selection at the same
+        # budget. Built HERE (not in _l0_for_articles) so the offsets are
+        # against the FINAL (possibly cap-truncated) flat buffer.
+        must_keep = None
+        if gold_spans and self._ablation_mode == self.ABLATION_ORACLE_SPAN:
+            must_keep = torch.zeros(
+                int(tokens_flat.shape[0]), dtype=torch.bool, device=self.device,
+            )
+            n_seg = int(cu_seqlens.shape[0]) - 1
+            for i, aid in enumerate(article_ids[:n_seg]):
+                sp = gold_spans.get(aid)
+                if sp is None:
+                    continue
+                a0 = int(cu_seqlens[i].item())
+                a1 = int(cu_seqlens[i + 1].item())
+                s = min(max(a0 + int(sp[0]), a0), a1)
+                e = min(max(a0 + int(sp[1]), a0), a1)
+                if e > s:
+                    must_keep[s:e] = True
+            if not bool(must_keep.any()):
+                must_keep = None
+        if self._ablation_mode == self.ABLATION_ORACLE_SPAN:
+            # Liveness line (2026-08-24): the first oracle run came back
+            # IDENTICAL to the headline — never interpret that without
+            # positive evidence the mask was actually built and non-empty.
+            logger.info(
+                "oracle_span_liveness",
+                dataset=dataset,
+                had_spans=bool(gold_spans),
+                n_forced=int(must_keep.sum().item()) if must_keep is not None else 0,
+                n_content=int(tokens_flat.shape[0]),
+            )
+
         embed_tokens = self.encoder.l0.backbone.get_input_embeddings()
         input_embeddings = embed_tokens(tokens_flat)  # (N_content, D)
 
@@ -2894,14 +3386,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         else:
             _prompt_src = None
         if _prompt_src is not None:
-            _L = int(_prompt_src.shape[0])
+            prompt_length = int(_prompt_src.shape[0])
             _n_art = len(lengths)
             l0_prompt_emb = (
                 _prompt_src.unsqueeze(0).expand(_n_art, -1, -1)
-                .reshape(_n_art * _L, -1).to(input_embeddings.dtype)
+                .reshape(_n_art * prompt_length, -1).to(input_embeddings.dtype)
             )
             l0_prompt_cu = torch.arange(
-                0, (_n_art + 1) * _L, _L,
+                0, (_n_art + 1) * prompt_length, prompt_length,
                 dtype=torch.int32, device=self.device,
             )
             l0_prompt_pos = position_ids_from_cu(
@@ -2923,6 +3415,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             prompt_position_ids=l0_prompt_pos,
             target_ratio=ratio,
             selection_mode=selection_mode,
+            must_keep_mask=must_keep,
             utility_grad_active=util_active,
             utility_grad_capture=grad_capture,
         )
@@ -2934,8 +3427,15 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self, dataset: str, article_ids: list[str],
         query_emb: torch.Tensor | None = None,
         selection_mode: str = "threshold",
+        ratio: float | None = None,
+        gold_spans: dict[str, tuple[int, int]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return packed L0 survivors for each article.
+
+        ``ratio`` pins the LIVE encode's L0 retention (the retrieve-leaf
+        drill's ``drill_leaf_retention.l0`` override); ``None`` = the
+        per-dataset ``l0_retention`` map (legacy). The cached path ignores it
+        (cache rows are pre-baked at precompute retention).
 
         Packed form:
 
@@ -2958,10 +3458,32 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         if self._live_l0:
             out, content_cu, ratio = self._live_l0_encode(
                 dataset, article_ids, query_emb=query_emb,
-                selection_mode=selection_mode,
+                ratio=ratio, selection_mode=selection_mode,
+                gold_spans=gold_spans,
             )
             survivors = out.survivor_embeddings  # (N_survivors, D)
             cu_seqlens = out.survivor_cu_seqlens  # (B+1,)
+            # v5 span-level relevance: flat (N_content,) bool marking the gold
+            # answer span's token positions (per article, from gold_spans).
+            span_mask = None
+            if gold_spans:
+                span_mask = torch.zeros(
+                    int(content_cu[-1].item()), dtype=torch.bool, device=content_cu.device,
+                )
+                for i, aid in enumerate(article_ids):
+                    sp = gold_spans.get(aid)
+                    if sp is None:
+                        continue
+                    a0 = int(content_cu[i].item())
+                    a1 = int(content_cu[i + 1].item())
+                    s = min(max(a0 + int(sp[0]), a0), a1)
+                    e = min(max(a0 + int(sp[1]), a0), a1)
+                    if e > s:
+                        span_mask[s:e] = True
+            # Stash for _prepare_l1_turn (span -> L1 position mapping).
+            self._last_l0_survivor_mask = getattr(out, "survivor_mask", None)
+            self._last_l0_content_cu = content_cu
+            self._last_l0_span_mask = span_mask
             if self.encoder.training:
                 if getattr(self, "_survivorship_aux", True):
                     if hasattr(self, "_pending_l0_outputs"):
@@ -2972,12 +3494,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                             # Packed pre-compression content cu_seqlens so aux
                             # losses can do segment-aware reductions.
                             "cu_seqlens": content_cu,
+                            "span_mask": span_mask,
                         })
                 else:
                     # Aux OFF: accumulate ONLY the θ control scalars (no graph
                     # retention) so the head freezes but θ still tracks the ramp.
                     self._accumulate_theta_state("l0", out, ratio)
             return survivors, cu_seqlens
+        if self._ablation_mode == self.ABLATION_ORACLE_SPAN:
+            raise RuntimeError(
+                "ablation 'oracle_span' requires live_l0=True — the cached L0 "
+                "path cannot force span survival (rows are pre-baked)."
+            )
         if self._l0_cache is None:
             raise RuntimeError("L0 cache is None but live_l0 is False")
         # Cached path: pull each article's variable-length rows from the
@@ -3133,36 +3661,48 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         return total
 
     def _filter_train_by_token_budget(self) -> None:
-        """Drop training samples whose live-L0 token load exceeds
+        """Apply the same live-L0 eligibility rule to train and evaluation.
+
+        Drop samples whose live-L0 token load exceeds
         ``max_sample_l0_tokens`` — the genuine outliers (narrativeqa / pubmedqa
         tails) that would OOM the live-L0 forward. Memory's large-but-typical
-        samples (median ~42K tokens) pass. No-op when the budget is 0/unset or
-        L0 is cached (Stage B). Profiled 2026-06-28."""
+        samples (median ~42K tokens) pass. Applying a different eligibility
+        rule to evaluation creates a distribution that cannot be interpreted.
+        No-op when the budget is 0/unset or L0 is cached (Stage B)."""
         budget = int(self.step_cfg.get("max_sample_l0_tokens", 0) or 0)
         if budget <= 0 or not self._live_l0 or self._token_store is None:
             return
         from torch.utils.data import Subset
-        valid: list[int] = []
-        valid_loads: list[int] = []
-        dropped: dict[str, int] = {}
-        for idx in range(len(self.train_dataset)):
-            sample = self.train_dataset[idx]
-            load = self._sample_l0_token_load(sample)
-            if load <= budget:
-                valid.append(idx)
-                valid_loads.append(load)
-            else:
-                key = getattr(sample, "dataset_name", "?")
-                dropped[key] = dropped.get(key, 0) + 1
-        n_before = len(self.train_dataset)
-        self.train_dataset = Subset(self.train_dataset, valid)
+        def _filter(dataset):
+            valid: list[int] = []
+            loads: list[int] = []
+            dropped: dict[str, int] = {}
+            for idx in range(len(dataset)):
+                sample = dataset[idx]
+                load = self._sample_l0_token_load(sample)
+                if load <= budget:
+                    valid.append(idx)
+                    loads.append(load)
+                else:
+                    key = getattr(sample, "dataset_name", "?")
+                    dropped[key] = dropped.get(key, 0) + 1
+            return Subset(dataset, valid), loads, dropped
+
+        train_before = len(self.train_dataset)
+        eval_before = len(self.eval_dataset)
+        self.train_dataset, valid_loads, train_dropped = _filter(self.train_dataset)
+        self.eval_dataset, _eval_loads, eval_dropped = _filter(self.eval_dataset)
         # Cache per-sample loads (aligned with the post-filter Subset) so the
         # token-budget microbatch sampler can reuse them without a second walk.
         self._train_token_loads = valid_loads
         logger.info(
             "phase2_kb_token_budget_filter", budget=budget,
-            kept=len(valid), dropped=n_before - len(valid),
-            dropped_by_dataset=dropped,
+            train_kept=len(self.train_dataset),
+            train_dropped=train_before - len(self.train_dataset),
+            eval_kept=len(self.eval_dataset),
+            eval_dropped=eval_before - len(self.eval_dataset),
+            train_dropped_by_dataset=train_dropped,
+            eval_dropped_by_dataset=eval_dropped,
         )
 
     def _validate_trajectory_article_coverage(self) -> None:
@@ -3185,9 +3725,21 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
         logger.info("phase2_kb_coverage_scan_start")
         missing_by_dataset: dict[str, list[str]] = {}
+        # Retrieval ids that resolve to NO article via the browse tree (not a
+        # node, no leaf tag). `_resolve_article_ids` drops them silently → the
+        # turn becomes None → a ZERO splice — the sample trains on nothing.
+        # 2026-08-22: the flat tree builder's `--leaf-cap` silently truncated
+        # swerecall to 3,200/8,088 spans; 60% of its trajectories were zero
+        # splices while this scan reported `coverage_scan_ok` (it only checked
+        # the token store). Unresolvable ids are now fatal here.
+        unresolved_by_dataset: dict[str, list[str]] = {}
         checked_articles: dict[str, set[str]] = {}
 
         def _check_sample(sample: KBSample) -> None:
+            if sample.dataset_name in getattr(
+                self, "_artifact_coverage_validated", set(),
+            ):
+                return
             for turn in sample.trajectory:
                 if turn.kind != "bgkit":
                     continue
@@ -3202,6 +3754,10 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                         parent = tree.leaf_tag_for_article(raw)
                         if parent is not None:
                             browse_ids.append(raw)
+                        else:
+                            unresolved_by_dataset.setdefault(
+                                sample.dataset_name, [],
+                            ).append(raw)
                         continue
                     node = tree.get(raw)
                     if node.is_article:
@@ -3265,6 +3821,19 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 total=n,
             )
 
+        if unresolved_by_dataset:
+            details = {
+                ds: {"count": len(ids), "sample": ids[:5]}
+                for ds, ids in unresolved_by_dataset.items()
+            }
+            raise RuntimeError(
+                "phase2_kb: trajectory retrieval ids that resolve to NO browse-tree "
+                "article (not a tree node, no leaf tag) — every such bgkit turn "
+                "would splice a ZERO survivor and the sample would train on "
+                "nothing. Rebuild the browse tree so it contains every article "
+                "the trajectories reference (flat trees: raise "
+                f"`build_browse_tree.py --leaf-cap`). Unresolved: {details}"
+            )
         if missing_by_dataset:
             details = {
                 ds: {"count": len(ids), "sample": ids[:5]}
@@ -3362,6 +3931,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     def _prepare_l1_turn(
         self, dataset: str, tag_or_article_ids: list[str], query: str,
         distractor_ids: list[str] | None = None,
+        l0_selection_mode: str = "threshold",
+        l0_ratio: float | None = None,
+        gold_span: tuple[int, int] | None = None,
     ) -> dict | None:
         """Build per-turn packed content + query tensors without running the encoder.
 
@@ -3417,8 +3989,37 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
         # Packed L0 survivors for all articles in this turn — QUERY-CONDITIONED
         # in the live path (the question is fed to L0 as its compression prompt).
-        l0_flat, l0_cu = self._l0_for_articles(dataset, all_ids, query_emb=q_emb)
+        # ``l0_selection_mode`` lets the recursive full-backprop leaf drill force
+        # ``exact_topk`` (deterministic ceil>=1 retention) instead of the frozen-
+        # policy threshold θ, which stalls near the tanh ceiling and starves the
+        # retrieve leaf's L0 to ~0.9% (2026-07-30 recon fix). Default threshold
+        # keeps every other dataset/run unchanged. ``l0_ratio`` pins the leaf's
+        # L0 retention (drill_leaf_retention.l0); it is threaded CONDITIONALLY
+        # so monkeypatched test doubles with the legacy _l0_for_articles
+        # signature keep working when the knob is unset.
+        l0_kwargs: dict = {"query_emb": q_emb, "selection_mode": l0_selection_mode}
+        if l0_ratio is not None:
+            l0_kwargs["ratio"] = float(l0_ratio)
+        # v5: the gold answer span lives in the FIRST gold article (flat
+        # single-gold datasets). Threaded conditionally (legacy test doubles).
+        self._last_l0_survivor_mask = None
+        self._last_l0_content_cu = None
+        if gold_span is not None and article_ids:
+            l0_kwargs["gold_spans"] = {article_ids[0]: gold_span}
+        l0_flat, l0_cu = self._l0_for_articles(dataset, all_ids, **l0_kwargs)
         l0_lengths = lengths_from_cu(l0_cu).tolist()
+        # Per-article L1 span flags: for article 0 (gold w/ span), which of its
+        # L0 SURVIVORS originate inside the span (survivor order == content
+        # order, so the k-th survivor row maps to the k-th True in the mask).
+        l1_span_flags: dict[int, list[bool]] = {}
+        _sm = getattr(self, "_last_l0_survivor_mask", None)
+        _ccu = getattr(self, "_last_l0_content_cu", None)
+        if gold_span is not None and _sm is not None and _ccu is not None:
+            a0, a1 = int(_ccu[0].item()), int(_ccu[1].item())
+            art_mask = _sm[a0:a1].to("cpu")
+            surv_pos = art_mask.nonzero().flatten().tolist()  # article-local
+            s, e = int(gold_span[0]), int(gold_span[1])
+            l1_span_flags[0] = [s <= pos < e for pos in surv_pos]
 
         rev_maps = getattr(self, "_doc_id_to_title", None) or {}
         doc_to_title = rev_maps.get(dataset, {}) if rev_maps else {}
@@ -3440,6 +4041,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # _run_l1_batch bridges ONLY the survivors (the IDs are already
         # input-space and must not pass through auto_reproduce).
         survivor_list: list[bool] = []
+        span_list: list[bool] = []
         for i, aid_tokens in enumerate(id_token_lists):
             is_relevant = is_relevant_per_article[i]
             # Pin ID tokens for GOLD articles only. Distractor ID tokens are
@@ -3451,6 +4053,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             pinned_list.extend([pin_these] * len(aid_tokens))
             relevance_list.extend([is_relevant] * len(aid_tokens))
             survivor_list.extend([False] * len(aid_tokens))
+            span_list.extend([False] * len(aid_tokens))
 
             k_i = int(l0_lengths[i]) if i < len(l0_lengths) else 0
             if k_i > 0:
@@ -3459,6 +4062,11 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 pinned_list.extend([False] * k_i)
                 relevance_list.extend([is_relevant] * k_i)
                 survivor_list.extend([True] * k_i)
+                flags = l1_span_flags.get(i)
+                if flags is not None and len(flags) == k_i:
+                    span_list.extend(flags)
+                else:
+                    span_list.extend([False] * k_i)
 
         content = torch.cat(pieces, dim=0)  # (L_content, D)
         pinned = torch.tensor(pinned_list, dtype=torch.bool, device=self.device)
@@ -3468,11 +4076,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         survivor_mask = torch.tensor(
             survivor_list, dtype=torch.bool, device=self.device,
         )
+        span_mask_l1 = torch.tensor(span_list, dtype=torch.bool, device=self.device)
 
         return {
             "content": content,
             "pinned": pinned,
             "relevance_mask": relevance_mask,
+            "span_mask": span_mask_l1,
             "survivor_mask": survivor_mask,
             "query_emb": q_emb.to(content.dtype),
         }
@@ -3524,6 +4134,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         relevance_pieces: list[torch.Tensor] = [
             t["relevance_mask"].to(self.device) for t in non_null
         ]
+        span_pieces: list[torch.Tensor] = [
+            (
+                t["span_mask"].to(self.device)
+                if t.get("span_mask") is not None
+                else torch.zeros(int(t["content"].size(0)), dtype=torch.bool, device=self.device)
+            )
+            for t in non_null
+        ]
 
         content_lengths = [int(c.size(0)) for c in content_pieces]
         query_lengths = [int(q.size(0)) for q in query_pieces]
@@ -3532,6 +4150,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         query_flat = torch.cat(query_pieces, dim=0).to(target_dtype)
         pinned_flat = torch.cat(pinned_pieces, dim=0).to(self.device)
         relevance_flat = torch.cat(relevance_pieces, dim=0)
+        span_flat = torch.cat(span_pieces, dim=0)
 
         content_cu = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
         content_cu[1:] = torch.tensor(
@@ -3542,7 +4161,6 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             query_lengths, dtype=torch.int32, device=self.device,
         ).cumsum(0)
 
-        content_pos_ids = position_ids_from_cu(content_cu, int(content_flat.shape[0]))
         query_pos_ids = position_ids_from_cu(query_cu, int(query_flat.shape[0]))
 
         from bgkit.training.survivorship_helpers import LevelLossCfg
@@ -3551,7 +4169,23 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         ).utility_grad_loss_weight > 0.0
         l1_grad_capture: dict | None = {} if util_active_l1 else None
         if target_ratio is None:
+            # Retrieve-leaf drill L1 override (drill_leaf_retention.l1): applies
+            # when the caller didn't pin a ratio — notably the SINGLE-SAMPLE /
+            # EVAL path (_build_decoder_segments_core) — so eval measures the
+            # SAME leaf regime as training instead of the sampled base
+            # l1_retention (the pre-2026-07-31 eval/train divergence). Unset →
+            # sampled L1 retention, exactly legacy.
+            target_ratio = self._drill_leaf_l1_retention_override()
+        if target_ratio is None:
             target_ratio = self._sample_l1_retention()
+
+        # Oracle-span ablation: the L1 span mask (True at L0-survivor rows
+        # originating inside the gold answer span) becomes a must-keep so the
+        # span survives L1 at the same budget too. Eval-only (the training
+        # drill-checkpoint branch never sees an explicit ablation mode).
+        must_keep_l1 = None
+        if self._ablation_mode == self.ABLATION_ORACLE_SPAN and bool(span_flat.any()):
+            must_keep_l1 = span_flat
 
         # Bridge ONLY the L0-survivor positions (hidden→input space) through
         # auto_repro_head. The interleaved pinned article-ID embeddings are
@@ -3618,6 +4252,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     utility_grad_active_l1=util_active_l1,
                     utility_grad_capture_l1=l1_grad_capture,
                     selection_mode_l1=getattr(self, "_selection_mode_l1", "threshold"),
+                    must_keep_mask_l1=must_keep_l1,
                 )
             if l1_grad_capture is not None:
                 out._l1_grad_capture = l1_grad_capture  # type: ignore[attr-defined]
@@ -3633,6 +4268,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                             "cu_seqlens": content_cu,
                             "pinned": pinned_flat,
                             "relevance_mask": relevance_flat,
+                            "span_mask": span_flat,
                             "ratio": target_ratio,
                         })
                 else:
@@ -4023,10 +4659,23 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         children_ids: list[str],
         children_survivors_l1in: list[torch.Tensor],
         q_emb: torch.Tensor,
+        ratio: float | None = None,
+        force_checkpoint: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode one node via the shared primitive with the trainer's ratio
         sampling, θ dual-ascent, and (optional) encode-chunking checkpoint.
         Returns ``(projected_decoder_embeddings, l1_output_survivors)``.
+
+        ``ratio``: L1 retention for this node forward; ``None`` (all legacy
+        callers) → the recursive L1 ramp. The query-conditioned drill path
+        passes ``drill_node_retention``.
+        ``force_checkpoint``: wrap the node forward in ``torch.utils.checkpoint``
+        REGARDLESS of the per-tree size gates. Required for the per-sample
+        query-conditioned drill re-encodes, which run O(path-length x samples)
+        per repo — forcing the checkpoint frees each node's activations after
+        its forward so peak memory does NOT scale with path length (still
+        skipped outside training / when no input carries grad, where there is
+        nothing to retain).
 
         FIX 2 (encode-chunking): when ``checkpoint_tree_encode`` is on AND we're
         building the live tree under grad, the per-node forward is wrapped in
@@ -4039,14 +4688,21 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         exact (checkpoint recompute) and still reaches every node + every child
         ID embedding.
         """
-        ratio = self._recursive_l1_retention_now()
+        ratio = (
+            self._recursive_l1_retention_now() if ratio is None else float(ratio)
+        )
         requires_grad = any(
             torch.is_tensor(s) and s.requires_grad
             for s in children_survivors_l1in
         )
         use_ckpt = (
-            getattr(self, "_checkpoint_tree_encode", False)
-            and getattr(self, "_tree_encode_ckpt_active", True)
+            (
+                (
+                    getattr(self, "_checkpoint_tree_encode", False)
+                    and getattr(self, "_tree_encode_ckpt_active", True)
+                )
+                or force_checkpoint
+            )
             and self.encoder.training
             and requires_grad
         )
@@ -4112,19 +4768,43 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         """Resolve a mode-tagged prepared turn (``node`` / ``head``) to its
         projected survivor tensor for the bgkit sentinel splice.
 
-        - ``node`` — present the window subtree node's GENERIC shared-tree rep
-          (memo / detached-splice lookup, NO live encode). Mirrors
-          :meth:`_recursive_browse_node_reps`' per-repo lookup exactly.
+        - ``node`` — legacy: present the window subtree node's GENERIC
+          shared-tree rep (memo / detached-splice lookup, NO live encode).
+          With ``query_conditioned_drill_nodes`` ON and a task query tagged on
+          the turn, the node (on-path AND distractor alike) is instead
+          re-encoded LIVE under the task query via the generalized
+          :meth:`_shared_tree_head_survivor` at ``drill_node_retention`` with
+          a FORCED per-node activation checkpoint.
         - ``head`` — LIVE task-query recursive-L1 over the window node's
           children (detach-and-reaccumulate; see :meth:`_shared_tree_head_survivor`).
+          Under query-conditioned-drill-nodes it additionally takes the drill
+          ratio + forced checkpoint (uniform with the other node turns).
         """
         mode = entry.get("mode")
+        qc_drill = bool(getattr(self, "_query_conditioned_drill_nodes", False))
         if mode == "node":
+            query = str(entry.get("query", ""))
+            if qc_drill and query:
+                return self._shared_tree_head_survivor(
+                    str(entry.get("node_id", "")),
+                    query,
+                    str(entry.get("dataset", "")),
+                    ratio=self._drill_node_retention_now(),
+                    force_checkpoint=True,
+                )
             return self._shared_tree_node_survivor(
                 str(entry.get("node_id", "")),
                 str(entry.get("dataset", "")),
             )
         if mode == "head":
+            if qc_drill:
+                return self._shared_tree_head_survivor(
+                    str(entry.get("node_id", "")),
+                    str(entry.get("query", "")),
+                    str(entry.get("dataset", "")),
+                    ratio=self._drill_node_retention_now(),
+                    force_checkpoint=True,
+                )
             return self._shared_tree_head_survivor(
                 str(entry.get("node_id", "")),
                 str(entry.get("query", "")),
@@ -4224,9 +4904,16 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
     def _shared_tree_head_survivor(
         self, node_id: str, query: str, dataset: str,
+        ratio: float | None = None,
+        force_checkpoint: bool = False,
     ) -> torch.Tensor:
-        """HEAD drill (window node): LIVE task-query recursive-L1 over the
-        window node's children.
+        """QUERY-CONDITIONED node drill: LIVE task-query recursive-L1 over a
+        tree node's children. Originally the HEAD (window node) drill; the
+        query-conditioned-drill-nodes mode routes EVERY trajectory node turn
+        (on-path interior + distractor node drills alike) through this same
+        proven machinery — ``node_id`` is any tree node, ``ratio`` /
+        ``force_checkpoint`` are threaded to :meth:`_encode_tree_node_live`
+        (drill ratio + per-sample activation checkpoint).
 
         The children's L1-outputs live in the shared-tree ``memo`` (built once
         per repo by :meth:`_compute_shared_repo_tree`; ``memo[c] = (proj, l1out)``).
@@ -4293,9 +4980,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         if not children_survivors_l1in:
             return self._drilldown_zero_survivor()
         q_emb = self._head_query_emb(query)
-        proj, _l1out = self._encode_tree_node_live(
-            children_ids, children_survivors_l1in, q_emb,
-        )
+        # Thread the drill kwargs only when non-default so the legacy (flag-
+        # off) call is byte-identical to the pre-2026-07-31 path — including
+        # for monkeypatched legacy-signature test doubles.
+        if ratio is not None or force_checkpoint:
+            proj, _l1out = self._encode_tree_node_live(
+                children_ids, children_survivors_l1in, q_emb,
+                ratio=ratio, force_checkpoint=force_checkpoint,
+            )
+        else:
+            proj, _l1out = self._encode_tree_node_live(
+                children_ids, children_survivors_l1in, q_emb,
+            )
         return proj
 
     # ------------------------------------------------------------------
@@ -4325,15 +5021,48 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             return out
         return None
 
+    def _dataset_optional_column(self, ds, method_name: str) -> list[str] | None:
+        """Bulk-read an optional trajectory column through dataset wrappers."""
+        from torch.utils.data import ConcatDataset, Subset
+
+        method = getattr(ds, method_name, None)
+        if callable(method):
+            values = list(method())
+            return values or None
+        if isinstance(ds, Subset):
+            parent = self._dataset_optional_column(ds.dataset, method_name)
+            return None if parent is None else [parent[i] for i in ds.indices]
+        if isinstance(ds, ConcatDataset):
+            parts = [
+                self._dataset_optional_column(part, method_name)
+                for part in ds.datasets
+            ]
+            if any(part is None for part in parts):
+                return None
+            values: list[str] = []
+            for part in parts:
+                values.extend(part or [])
+            return values
+        return None
+
+    def _dataset_split_labels(self, ds) -> list[str] | None:
+        return self._dataset_optional_column(ds, "split_labels")
+
+    def _dataset_repo_ids(self, ds) -> list[str] | None:
+        return self._dataset_optional_column(ds, "repo_ids")
+
     def _repo_group_key(self, sample: KBSample) -> str:
         """Return the shared-subtree root node id for a git_commit_repro
         file-sample — the ``is_head`` bgkit-turn's window node id, which for the
         ``root → repo → repo/wK → c16 → c4 → commit`` layout is the window node
         ``repo/wK`` (the drill-down head).  Every file-sample of one
         ``(repo, window)`` shares this key, so grouping by it batches a repo's
-        file-samples together and identifies the root of the window-0 subtree to
+        file-samples together and identifies the root of that window subtree to
         encode once.  Returns ``""`` when the sample has no ``is_head`` drill (no
         shared tree — falls back to per-sample handling)."""
+        explicit = str(getattr(sample, "group_id", "") or "")
+        if explicit:
+            return explicit
         for turn in sample.trajectory:
             if turn.kind == "bgkit" and bool(turn.args.get("is_head")):
                 ids = turn.args.get("ids", [])
@@ -4414,12 +5143,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         )
 
     def _handle_per_repo_option_a(self, val) -> None:
-        """Live toggle for Option A (crash-free amortized per-repo mode). Takes
-        effect on the next repo (whole-repo batches are already what the
-        non-inner-loop sampler emits, so no dataloader rebuild is needed). S / K
-        come from per_repo_inner_subset_size / per_repo_max_inner_steps."""
-        self._per_repo_option_a = bool(val)
-        logger.info("live_per_repo_option_a", new=self._per_repo_option_a)
+        """Reject the incoherent split-cadence optimizer path."""
+        if bool(val):
+            raise ValueError(
+                "per_repo_option_a is removed; decoder and encoder must be "
+                "updated from one coherent repository objective"
+            )
+        self._per_repo_option_a = False
+        logger.info("live_per_repo_option_a", new=False)
 
     def _handle_option_a_max_subsets(self, val) -> None:
         """Live cap on Option A's subset count (0 = unlimited = all files).
@@ -4540,12 +5271,157 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._survivorship_aux = bool(val)
         logger.info("live_survivorship_aux", new=self._survivorship_aux)
 
+    # --- Projection-output norm-band regularizer (collapse fix) -----------
+    def _handle_projection_norm_reg_weight(self, val) -> None:
+        """Live weight for the projection norm-band regularizer (>=0). Read
+        fresh each group in _projection_norm_reg_term → effective next step."""
+        old = getattr(self, "_proj_norm_reg_weight", 0.0)
+        if isinstance(val, (int, float)) and float(val) >= 0.0:
+            self._proj_norm_reg_weight = float(val)
+            logger.info(
+                "live_projection_norm_reg_weight", old=old, new=self._proj_norm_reg_weight,
+            )
+            return
+        logger.warning(
+            "live_projection_norm_reg_weight_invalid", value=val, expected="float >= 0",
+        )
+
+    def _proj_norm_reg_embed_ref_norm(self, family: str) -> float | None:
+        """Mean row-L2-norm of ``family``'s decoder ``embed_tokens.weight`` — the
+        scalar the readable norm-band is measured against. Computed once per
+        family and cached (the vocab-wide norm is a one-time cost)."""
+        cache = self._proj_norm_reg_embed_ref_cache
+        if family in cache:
+            return cache[family]
+        by_family = getattr(self, "_decoders_by_family", None)
+        dec = by_family.get(family) if by_family else getattr(self, "decoder", None)
+        if dec is None:
+            return None
+        try:
+            w = dec.backbone.get_input_embeddings().weight
+        except (AttributeError, TypeError):
+            return None
+        val = float(w.detach().float().norm(dim=-1).mean())
+        cache[family] = val
+        return val
+
+    def _projection_norm_reg_term(self, reps: list[torch.Tensor]) -> torch.Tensor:
+        """Hinge-band penalty keeping every projected/spliced survivor-rep's L2
+        norm inside the ACTIVE decoder family's readable band. THE novel piece of
+        the 2026-07-31 collapse fix: the 9164 git-repro reps drifted from ~4x
+        embed-norm to 12-320x under-constrained full-backprop, losing content.
+
+        Per family, ``target = target_ratio[family] * mean(embed_tokens row-L2-
+        norm)`` (the reps are a co-trained code, NOT the embed_tokens manifold, so
+        we anchor the NORM band only — never the direction). Permissive inside
+        ``[target/tolerance, target*tolerance]``, quadratic on the runaway::
+
+            loss = weight * mean( relu( |log(rep_norm / target)| - log(tol) )^2 )
+
+        ``tol`` is per-family (``_proj_norm_reg_tolerances[family]``) with the
+        scalar ``_proj_norm_reg_tolerance`` as fallback — so one family's band
+        can be tightened without penalizing another that is in-band.
+
+        Gradient flows from ``rep_norm`` back through ``projection_blocks[family]``
+        into the L1/L0 backbones — that is the point (it constrains what the
+        encoder PRODUCES). Only grad-carrying reps count (skips the zero-fallback
+        splices). Returns a WEIGHTED float32 scalar (0 when disabled / eval / no
+        grad-carrying reps). Also records the per-family mean rep/embed norm-ratio
+        for the ``proj_norm_ratio_{family}`` step metric.
+        """
+        zero = torch.zeros((), device=self.device, dtype=torch.float32)
+        if not getattr(self, "_proj_norm_reg_enabled", False):
+            return zero
+        # Training-only: eval reps do not require grad and must not be penalized.
+        if not self.encoder.training:
+            return zero
+        weight = float(getattr(self, "_proj_norm_reg_weight", 0.0))
+        if weight <= 0.0:
+            return zero
+        family = self._decoder_family
+        embed_ref = self._proj_norm_reg_embed_ref_norm(family)
+        target_ratio = self._proj_norm_reg_target_ratios.get(family)
+        if embed_ref is None or not embed_ref > 0 or target_ratio is None:
+            return zero
+        target = float(target_ratio) * float(embed_ref)
+        grad_reps = [
+            r for r in reps
+            if torch.is_tensor(r) and r.requires_grad and r.numel() > 0
+        ]
+        if not grad_reps:
+            return zero
+        flat = torch.cat([r.reshape(-1, r.shape[-1]) for r in grad_reps], dim=0)
+        # clamp_min so a degenerate 0-norm rep can't produce a -inf log.
+        per_rep_norm = flat.float().norm(dim=-1).clamp_min(1e-6)  # (S,)
+        tol = self._proj_norm_reg_tolerances.get(
+            family, self._proj_norm_reg_tolerance,
+        )
+        band = math.log(max(float(tol), 1.0 + 1e-6))
+        log_ratio = (per_rep_norm / target).log()
+        penalty = torch.relu(log_ratio.abs() - band).pow(2).mean()
+        # Log-side: the rep/embed norm-ratio (comparable to the 4.2 / 0.9 band).
+        self._proj_norm_ratio_accum.setdefault(family, []).append(
+            float(per_rep_norm.mean().detach()) / float(embed_ref),
+        )
+        return weight * penalty
+
+    def _proj_norm_reg_step_metrics(self) -> dict[str, float]:
+        """Per-family mean rep/embed norm-ratio for the step metrics (so drift is
+        greppable as ``proj_norm_ratio_qwen35`` / ``proj_norm_ratio_falcon_h1``).
+        Reads + does not reset ``_proj_norm_ratio_accum`` (reset per step)."""
+        out: dict[str, float] = {}
+        for fam, ratios in (getattr(self, "_proj_norm_ratio_accum", None) or {}).items():
+            if ratios:
+                out[f"proj_norm_ratio_{fam}"] = float(sum(ratios) / len(ratios))
+        return out
+
+    def _aux_weight(self, level: str, name: str) -> float:
+        """Resolve an aux-loss weight for ``level`` ∈ {l0, l1}.
+
+        Precedence: a LIVE control.json override (applies to BOTH levels) >
+        the per-level ``survivorship.{level}.{name}`` (``LevelLossCfg``) >
+        the top-level ``survivorship.{name}`` global. Before 2026-08-22 the
+        inline aux path read only the global, so the Stage A config's
+        deliberate ``l0.decisiveness_loss_weight: 0.0`` was silently
+        overridden by the global 0.05 — at p≈0.58 that term pushes the bulk
+        UP and fights the ratio term's pull toward the target rate.
+        """
+        overrides = getattr(self, "_live_aux_overrides", None) or {}
+        if name in overrides:
+            return float(overrides[name])
+        # Per-level value only when it was EXPLICITLY configured (a
+        # default-constructed LevelLossCfg carries 0.0 and must not silence
+        # the global); ``_level_explicit_aux`` is recorded at config parse.
+        explicit = (getattr(self, "_level_explicit_aux", None) or {}).get(level, set())
+        lvl_cfg = getattr(self, f"_surv_{level}", None)
+        if name in explicit and lvl_cfg is not None and hasattr(lvl_cfg, name):
+            return float(getattr(lvl_cfg, name))
+        return float(getattr(self, f"_{name}", 0.0))
+
+    def _handle_span_relevance_weight(self, val) -> None:
+        """Live v5 gold-span relevance weight (>=0, both levels). Read fresh in
+        _compute_survivorship_aux_losses → effective on the next step. Under
+        exact_topk with standardized scores this is the term that drives
+        ranking quality (ratio/decisiveness are near-constant there)."""
+        old = getattr(self, "_span_relevance_weight", 0.0)
+        if isinstance(val, (int, float)) and float(val) >= 0.0:
+            self._span_relevance_weight = float(val)
+            logger.info(
+                "live_span_relevance_weight", old=old, new=self._span_relevance_weight,
+            )
+            return
+        logger.warning("live_span_relevance_weight_invalid", value=val, expected="float >= 0")
+
     def _handle_ratio_loss_weight(self, val) -> None:
         """Live aggregate-ratio loss weight (>=0). Read fresh in
         _compute_survivorship_aux_losses → effective on the next step."""
         old = getattr(self, "_ratio_loss_weight", 0.1)
         if isinstance(val, (int, float)) and float(val) >= 0.0:
             self._ratio_loss_weight = float(val)
+            self._live_aux_overrides = {
+                **(getattr(self, "_live_aux_overrides", None) or {}),
+                "ratio_loss_weight": float(val),
+            }
             logger.info("live_ratio_loss_weight", old=old, new=self._ratio_loss_weight)
             return
         logger.warning("live_ratio_loss_weight_invalid", value=val, expected="float >= 0")
@@ -4556,6 +5432,10 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         old = getattr(self, "_decisiveness_loss_weight", 0.05)
         if isinstance(val, (int, float)) and float(val) >= 0.0:
             self._decisiveness_loss_weight = float(val)
+            self._live_aux_overrides = {
+                **(getattr(self, "_live_aux_overrides", None) or {}),
+                "decisiveness_loss_weight": float(val),
+            }
             logger.info(
                 "live_decisiveness_loss_weight",
                 old=old, new=self._decisiveness_loss_weight,
@@ -4701,6 +5581,71 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             value=val, expected="None or float in (0, 1)",
         )
 
+    def _handle_query_conditioned_drill_nodes(self, val) -> None:
+        """Live toggle for the per-sample task-query drill-node re-encode.
+        Read fresh in _prepare_sample_for_decode / _resolve_special_survivor →
+        effective on the next sample. OFF restores exact legacy behavior
+        (static node splices, legacy head ratio/checkpoint)."""
+        old = bool(getattr(self, "_query_conditioned_drill_nodes", False))
+        self._query_conditioned_drill_nodes = bool(val)
+        logger.info(
+            "live_query_conditioned_drill_nodes",
+            old=old, new=self._query_conditioned_drill_nodes,
+        )
+
+    def _handle_drill_node_retention(self, val) -> None:
+        """Live retention for the query-conditioned drill-node forwards.
+        ``None`` clears (revert to the recursive L1 ramp); a float in (0, 1]
+        pins it. Read fresh in _drill_node_retention_now → next drill."""
+        if val is None:
+            self._drill_node_retention_cfg = None
+            logger.info("live_drill_node_retention_cleared", reverting="recursive ramp")
+            return
+        if isinstance(val, (int, float)) and 0.0 < float(val) <= 1.0:
+            self._drill_node_retention_cfg = float(val)
+            logger.info("live_drill_node_retention", new=float(val))
+            return
+        logger.warning(
+            "live_drill_node_retention_invalid",
+            value=val, expected="None or float in (0, 1]",
+        )
+
+    def _handle_drill_leaf_l0_retention(self, val) -> None:
+        """Live retrieve-leaf drill L0 retention override. ``None`` clears
+        (revert to the per-dataset l0_retention map); a float in (0, 1] pins
+        it. Read fresh in _prepare_sample_for_decode → next sample."""
+        if val is None:
+            self._drill_leaf_l0_retention_cfg = None
+            logger.info("live_drill_leaf_l0_retention_cleared", reverting="l0_retention map")
+            return
+        if isinstance(val, (int, float)) and 0.0 < float(val) <= 1.0:
+            self._drill_leaf_l0_retention_cfg = float(val)
+            logger.info("live_drill_leaf_l0_retention", new=float(val))
+            return
+        logger.warning(
+            "live_drill_leaf_l0_retention_invalid",
+            value=val, expected="None or float in (0, 1]",
+        )
+
+    def _handle_drill_leaf_l1_retention(self, val) -> None:
+        """Live retrieve-leaf drill L1 retention override. ``None`` clears
+        (revert to the recursive ramp / sampled L1); a float in (0, 1] pins
+        it. Read fresh in the per-repo drivers + _run_l1_batch → next encode."""
+        if val is None:
+            self._drill_leaf_l1_retention_cfg = None
+            logger.info(
+                "live_drill_leaf_l1_retention_cleared", reverting="recursive ramp/sampled",
+            )
+            return
+        if isinstance(val, (int, float)) and 0.0 < float(val) <= 1.0:
+            self._drill_leaf_l1_retention_cfg = float(val)
+            logger.info("live_drill_leaf_l1_retention", new=float(val))
+            return
+        logger.warning(
+            "live_drill_leaf_l1_retention_invalid",
+            value=val, expected="None or float in (0, 1]",
+        )
+
     def _handle_recursive_general_prompt(self, val) -> None:
         """Live general (query-agnostic) compression prompt for the shared repo
         tree. Read + re-embedded fresh each call in
@@ -4799,6 +5744,21 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             "live_max_repo_tree_nodes", old=old, new=self._max_repo_tree_nodes,
             note="applied on next dataloader rebuild/restart",
         )
+
+    def _dynamic_ckpt_allowed_modes(self) -> frozenset[str]:
+        """KRKB can only run its managed backbones in ``full`` mode.
+
+        Every encoder level forward is wrapped in an OUTER non-reentrant
+        ``torch.utils.checkpoint`` (:meth:`_checkpointed_level`; likewise the
+        drill / tree-node checkpoints). ``megatron`` installs a selective
+        per-op save/recompute policy INSIDE that wrapper, and the outer
+        recompute then fails strict recompute-match (``CheckpointError
+        58-vs-55`` on the first-ever downshift, lognav v1 step 49,
+        2026-08-21). ``off`` is likewise unvalidated under the wrapper. Until
+        those modes are made recompute-safe the scheduler must not flip into
+        them; the adaptive cache-flush tier stays fully active.
+        """
+        return frozenset({"full"})
 
     def _dynamic_ckpt_managed_models(self) -> list[tuple[str, torch.nn.Module]]:
         """Register the per-repo run's backbones with the memory-driven dynamic
@@ -4992,52 +5952,51 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         return memo, stats
 
     def _truncate_segments_to_gold_budget(
-        self, segments: list, n_gold: int,
+        self,
+        segments: list,
+        n_gold: int,
+        answer_span: tuple[int, int] | None = None,
     ) -> list:
-        """HARD-cut the decode segment list so at most ``n_gold`` gold (loss-
-        masked) tokens remain — truncating the gold OUTPUT to its first N
-        tokens (NO end-token / no suffix), KEEPING the sample.
+        """Hard-cut only the final answer span to its first ``n_gold`` tokens.
 
-        Walks segments accumulating loss-masked tokens; once the cumulative
-        gold count would exceed ``n_gold``, cuts the current TokenSegment right
-        after its ``n_gold``-th gold token and DROPS everything after (the
-        segment tail + all subsequent segments). The prefix (system + browse +
-        survivor splices + prompt) is untouched, so the decode seqlen is bounded
-        by ``prefix + n_gold``. The tree/input is NOT truncated. No-op when
-        ``n_gold <= 0`` or the sample already has ≤ N gold tokens."""
-        if n_gold <= 0:
+        Tool-call tokens are supervised too, but they are navigation prefix,
+        not the gold file output.  Counting them against the answer cap made the
+        retained answer length depend on trajectory depth. ``answer_span`` is in
+        assembled concat coordinates and the answer is the final turn.
+        """
+        if n_gold <= 0 or answer_span is None:
             return segments
-        gold_seen = 0
+        answer_start, answer_end = answer_span
+        if answer_end - answer_start <= n_gold:
+            return segments
+        cut_abs = answer_start + n_gold
         out: list = []
+        cursor = 0
         for seg in segments:
-            lm = getattr(seg, "loss_mask", None)
-            if isinstance(seg, TokenSegment) and lm is not None:
-                gold_in_seg = int(lm.sum().item())
-                if gold_seen + gold_in_seg <= n_gold:
-                    out.append(seg)
-                    gold_seen += gold_in_seg
-                    continue
-                # Cut within this segment after its (n_gold - gold_seen)-th gold
-                # token (hard cut; drop the tail + everything after).
-                remaining = n_gold - gold_seen
-                gold_idx = lm.reshape(-1).nonzero(as_tuple=True)[0]
-                cut = int(gold_idx[remaining - 1].item()) + 1
+            if isinstance(seg, TokenSegment):
+                length = int(seg.token_ids.shape[-1])
+            else:
+                length = int(seg.embeddings.shape[-2])
+            if cursor >= cut_abs:
+                break
+            if cursor + length <= cut_abs:
+                out.append(seg)
+                cursor += length
+                continue
+            local_cut = cut_abs - cursor
+            if isinstance(seg, TokenSegment):
                 out.append(
                     TokenSegment(
-                        # Runtime segments are (1, L) (_assemble_sample_segments
-                        # unsqueeze(0)); cut is a flat/sequence index, so slice the
-                        # LAST dim (works for both (1,L) and 1-D). The old
-                        # seg.token_ids[:cut] sliced the batch dim (size 1) → a
-                        # no-op for cut>=1, so max_decode_tokens never truncated
-                        # and long-file gold decodes ran unbounded.
-                        token_ids=seg.token_ids[..., :cut],
-                        loss_mask=lm[..., :cut],
+                        token_ids=seg.token_ids[..., :local_cut],
+                        loss_mask=(
+                            None if seg.loss_mask is None
+                            else seg.loss_mask[..., :local_cut]
+                        ),
                     )
                 )
-                return out  # drop the tail + all subsequent segments
-            # Non-gold (prefix / splice) segment: keep it only while we are
-            # still before the gold budget is exhausted.
-            out.append(seg)
+            else:
+                raise RuntimeError("answer span unexpectedly intersects an embedding splice")
+            break
         return out
 
     def _encode_decode_group(
@@ -5137,7 +6096,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         decode_cap = int(getattr(self, "_max_decode_tokens", 0) or 0)
         # Phase 3a: assemble every sample's segments (drop empties / zero-loss).
         batch_segments: list = []
-        batch_meta: list = []  # (trace, sample_tokens, n_prep_turns, decode_len)
+        batch_meta: list = []  # (s_idx, trace, sample_tokens, n_prep_turns, decode_len)
         for s_idx, prep in enumerate(preps):
             per_turn = [
                 survivors_by_address[(s_idx, t_idx)]
@@ -5156,7 +6115,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             # short-file bias). The tree/input is NOT truncated. No-op when 0.
             if decode_cap > 0:
                 segments = self._truncate_segments_to_gold_budget(
-                    segments, decode_cap,
+                    segments, decode_cap, _trace.answer_span,
                 )
             sample_tokens = 0
             decode_len = 0
@@ -5174,7 +6133,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 continue
             batch_segments.append(segments)
             batch_meta.append(
-                (_trace, sample_tokens, len(prep["prepared_turns"]), decode_len),
+                (s_idx, _trace, sample_tokens, len(prep["prepared_turns"]), decode_len),
             )
 
         # Phase 3b: decode the group.
@@ -5208,7 +6167,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     outs = self.decoder.forward_interleaved_packed(
                         batch_segments, return_hidden_states=want_hidden,
                     )
-            for (_trace, sample_tokens, n_prep, decode_len), out in zip(
+            for (_s_idx, _trace, sample_tokens, n_prep, decode_len), out in zip(
                 batch_meta, outs, strict=True,
             ):
                 if want_hidden:
@@ -5229,6 +6188,30 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 total_tokens += sample_tokens
                 n_done += 1
                 n_turns += n_prep
+
+        # Projection-output NORM-BAND regularizer (2026-07-31 collapse fix).
+        # FOLDED into the group loss so it backwards WITH the reconstruction
+        # gradient through projection_blocks into the backbone (the callers do a
+        # single per-group backward, freeing the drill graph — a deferred aux
+        # backward would hit freed graphs). Computed over the group's spliced,
+        # grad-carrying survivor reps (leaf-drill + drill-node + head; the
+        # zero-fallback splices carry no grad and are skipped). No-op unless the
+        # git-repro config enabled it. Scale note: with the run's default
+        # per_repo_sample_group_size=1 each group is ONE sample, so summing
+        # weight*penalty_group over the n_contrib groups and /n_contrib in the
+        # Option-A backward yields exactly weight*mean_penalty (calibrated for
+        # G=1; G>1 mildly under-weights — documented).
+        # NB: check the (default-False) enable flag FIRST so a stub trainer
+        # without a real ``self.encoder`` (unit tests) never touches it — and the
+        # _projection_norm_reg_term re-checks self.encoder.training itself.
+        if (
+            getattr(self, "_proj_norm_reg_enabled", False)
+            and n_done > 0
+            and getattr(getattr(self, "encoder", None), "training", False)
+        ):
+            group_loss = group_loss + self._projection_norm_reg_term(
+                list(survivors_by_address.values()),
+            )
         return group_loss, total_tokens, n_done, n_turns, len(buckets)
 
     # ------------------------------------------------------------------
@@ -5301,6 +6284,59 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             prep = self._prepare_sample_for_decode(sample)
             all_survivors = self._run_l1_batch(prep["prepared_turns"])
             return self._assemble_sample_segments(prep, all_survivors)
+
+    @torch.no_grad()
+    def generate_kb_turn(
+        self,
+        sample: KBSample,
+        history: list,
+        *,
+        max_new_tokens: int = 512,
+    ) -> str:
+        """Generate the next assistant turn from observed calls only.
+
+        ``history`` contains canonical tool calls that were actually accepted
+        and executed by the free-running evaluator. No future teacher call or
+        gold answer is rendered into the context.
+        """
+        self._ensure_eval_shared_tree(sample)
+        probe = replace(sample, trajectory=list(history))
+        segments, _trace = self._build_decoder_segments_core(probe)
+        topic_tags = (
+            self._sample_tags_for(probe)
+            if self.topic_embeddings is not None
+            else None
+        )
+        prompt_ids = assistant_generation_prompt_ids(
+            self.tokenizer,
+            self._system_prompt_for(probe),
+            probe.question,
+            list(history),
+            topic_knowledge_tags=topic_tags,
+        ).to(self.device)
+        if prompt_ids.numel() == 0:
+            raise RuntimeError("chat template produced an empty generation prompt")
+        segments.append(TokenSegment(token_ids=prompt_ids, loss=False))
+        generated = self.decoder.generate_with_segments(
+            segments,
+            tokenizer=self.tokenizer,
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+        )
+        text = generated.content_text[0] if generated.content_text else ""
+        # The decoder is trained to emit the template's end-of-turn glue
+        # before the stop token (Falcon-H1: a newline); return content only.
+        glue = assistant_turn_end_glue(
+            self.tokenizer,
+            [
+                {"role": "system", "content": self._system_prompt_for(probe)},
+                {"role": "user", "content": probe.question},
+            ],
+            [BGKIT_TOOL, BGKIT_TOPIC_KNOWLEDGE_TOOL],
+        )
+        if glue and text.endswith(glue):
+            text = text[: -len(glue)]
+        return text
 
     @contextlib.contextmanager
     def _training_ablation_override(self):
@@ -5444,10 +6480,71 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         trees = getattr(self, "_trees", None) or {}
         dataset_tree = trees.get(sample.dataset_name)
         prepared_turns: list[dict | None] = []
+        # Per-sample task query (carried by the head turn). Recursive full-backprop
+        # leaf drills are compressed UNDER this query instead of query-agnostically
+        # (the leaf's own ``query`` field is "" in the git-repro trajectories) so
+        # the retrieved diff keeps the positions relevant to THIS reconstruction
+        # (2026-07-30 recon fix). Non-git-repro datasets have no is_head turn, so
+        # task_query stays "" and their leaves are unaffected.
+        task_query = ""
+        for turn in rendered.bgkit_turns:
+            if bool(turn.args.get("is_head", False)):
+                task_query = str(turn.args.get("query", ""))
+                break
+        # Flat retrieval leaves follow the configured L0 selection mode
+        # (``training.selection_mode.l0``); the recursive full-backprop run
+        # forces exact_topk for its tree leaves as before.
+        leaf_l0_mode = (
+            "exact_topk"
+            if (
+                getattr(self, "_recursive_l1_full_backprop", False)
+                or getattr(self, "_selection_mode_l0", "threshold") == "exact_topk"
+            )
+            else "threshold"
+        )
+        # QUERY-CONDITIONED drill nodes (2026-07-31): tag EVERY node-mode turn
+        # (on-path interiors AND wrong-sibling distractors — content-driven
+        # rejection needs the distractor encoded under the same query) with the
+        # per-sample task query so _resolve_special_survivor re-encodes it LIVE
+        # via the generalized head machinery. Flag OFF (or no task query — non
+        # git-repro datasets have no is_head turn) → the dict is EXACTLY the
+        # legacy static-splice form.
+        qc_drill = (
+            bool(getattr(self, "_query_conditioned_drill_nodes", False))
+            and task_query != ""
+        )
+        # Leaf L0 retention override (drill_leaf_retention.l0) — threaded
+        # CONDITIONALLY so legacy-signature test doubles keep working when the
+        # knob is unset.
+        leaf_kwargs: dict = {"l0_selection_mode": leaf_l0_mode}
+        _leaf_l0 = self._drill_leaf_l0_retention_now()
+        if _leaf_l0 is not None:
+            leaf_kwargs["l0_ratio"] = float(_leaf_l0)
+        # CONTRACT: a ``head`` drill resolves its survivors from head-drill
+        # infrastructure ONLY — the per-repo shared tree (git_commit_repro
+        # full-backprop) or the offline L1-tree cache. Without either, every
+        # head turn falls through to ``_drilldown_zero_survivor`` and the
+        # decoder silently trains on ZERO reps while the encoder never runs
+        # (this is exactly what happened to the 2026-08 widenet v1→v4 runs:
+        # the flat writers tagged their single retrieval turn ``is_head``).
+        # Fail loudly at sample-prep time instead of producing a fake run.
+        head_infra = bool(getattr(self, "_per_repo_full_backprop", False)) or (
+            getattr(self, "_l1_tree_cache", None) is not None
+        )
         for turn in rendered.bgkit_turns:
             ids = list(turn.args.get("ids", []))
             query = str(turn.args.get("query", ""))
             is_head = bool(turn.args.get("is_head", False))
+            if is_head and not head_infra:
+                raise ValueError(
+                    "bgkit turn tagged is_head=True for dataset "
+                    f"{sample.dataset_name!r} (ids={ids[:2]}) but this trainer has "
+                    "no head-drill infrastructure (no per-repo shared tree, no "
+                    "L1-tree cache): the head drill would resolve to a ZERO "
+                    "survivor on every sample. Flat single-retrieval datasets must "
+                    "emit plain leaf drills {ids, query} (see "
+                    "bgkit.data.flat_phase2_writer.flat_trajectory_row)."
+                )
             if is_head:
                 prepared_turns.append({
                     "mode": "head",
@@ -5461,14 +6558,26 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 and dataset_tree is not None
                 and str(ids[0]) in dataset_tree
             ):
-                prepared_turns.append({
+                node_entry = {
                     "mode": "node",
                     "node_id": str(ids[0]),
                     "dataset": sample.dataset_name,
-                })
+                }
+                if qc_drill:
+                    node_entry["query"] = task_query
+                prepared_turns.append(node_entry)
             else:
+                # Leaf (retrieve) drill: fall back to the per-sample task query
+                # when the turn carries none (git-repro leaves), and force
+                # exact_topk L0 in the recursive full-backprop run.
+                leaf_query = query or task_query
+                # v5 gold span threaded CONDITIONALLY (legacy test doubles).
+                _gs = getattr(sample, "gold_span", None)
+                _gs_kwargs = {"gold_span": _gs} if _gs is not None else {}
                 prepared_turns.append(
-                    self._prepare_l1_turn(sample.dataset_name, ids, query),
+                    self._prepare_l1_turn(
+                        sample.dataset_name, ids, leaf_query, **leaf_kwargs, **_gs_kwargs,
+                    ),
                 )
 
         return {
@@ -5809,6 +6918,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # ----------------------------------------------------------------
         l0_ratio_losses: list[torch.Tensor] = []
         l0_decisive_losses: list[torch.Tensor] = []
+        l0_span_losses: list[torch.Tensor] = []
+        l0_span_survival: list[float] = []
         for entry in self._pending_l0_outputs:
             enc_out = entry["enc_out"]
             logits_for_op = enc_out.logits_for_op
@@ -5829,6 +6940,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 logits_for_op.float() - theta_t.to(logits_for_op.device).float()
             )
             target_ratio = entry["ratio"]
+            # v5 span-level relevance at L0: answer-span positions -> survive.
+            _span = entry.get("span_mask")
+            if (
+                getattr(self, "_span_relevance_weight", 0.0) > 0.0
+                and _span is not None
+                and _span.numel() == probs_f.numel()
+                and bool(_span.any())
+            ):
+                l0_span_losses.append(((1.0 - probs_f[_span]) ** 2).mean())
+                _sm = getattr(enc_out, "survivor_mask", None)
+                if _sm is not None and _sm.numel() == _span.numel():
+                    l0_span_survival.append(_sm[_span].float().mean().item())
             if cu_seqlens is not None:
                 # Segment-aware mean: (B_articles,)
                 n_articles = int(cu_seqlens.shape[0]) - 1
@@ -5852,11 +6975,17 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             l0_decisive_loss = torch.stack(l0_decisive_losses).mean()
             total = (
                 total
-                + self._ratio_loss_weight * l0_ratio_loss
-                + self._decisiveness_loss_weight * l0_decisive_loss
+                + self._aux_weight("l0", "ratio_loss_weight") * l0_ratio_loss
+                + self._aux_weight("l0", "decisiveness_loss_weight") * l0_decisive_loss
             )
             metrics["l0_ratio_loss"] = l0_ratio_loss.item()
             metrics["l0_decisiveness_loss"] = l0_decisive_loss.item()
+        if l0_span_losses:
+            l0_span_loss = torch.stack(l0_span_losses).mean()
+            total = total + getattr(self, "_span_relevance_weight", 0.0) * l0_span_loss
+            metrics["l0_span_loss"] = l0_span_loss.item()
+            if l0_span_survival:
+                metrics["l0_span_survival"] = sum(l0_span_survival) / len(l0_span_survival)
 
         # ----------------------------------------------------------------
         # L0 min-survivors loss
@@ -5917,6 +7046,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         l1_ratio_losses: list[torch.Tensor] = []
         l1_decisive_losses: list[torch.Tensor] = []
         l1_relevance_losses: list[torch.Tensor] = []
+        l1_span_losses: list[torch.Tensor] = []
+        l1_span_survival: list[float] = []
         for entry in self._pending_l1_outputs:
             enc_out = entry["enc_out"]
             logits_for_op = enc_out.logits_for_op
@@ -5938,61 +7069,95 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             )
             target_ratio = entry["ratio"]
             relevance = entry["relevance_mask"]  # (N_l1,) bool, flat
+            pinned = entry.get("pinned")
+            controllable = (
+                ~pinned.reshape(-1)
+                if pinned is not None
+                else torch.ones_like(probs_f, dtype=torch.bool)
+            )
 
             # Packed: all positions are valid.  Segment-aware per-article
-            # reductions for ratio and decisiveness.
+            # reductions for ratio and decisiveness. Pinned ID positions are
+            # forced survivors, not decisions made by the head, and therefore
+            # stay outside every selector auxiliary.
             cu_seqlens = entry.get("cu_seqlens")
             if cu_seqlens is not None:
                 n_arts = int(cu_seqlens.shape[0]) - 1
                 seg_ids = segment_ids_from_cu(cu_seqlens, int(probs_f.shape[0]))
-                mean_probs = segment_mean(probs_f, seg_ids, n_arts)  # (B,)
-                if mean_probs.numel() == 0:
+                ctrl_f = controllable.to(probs_f.dtype)
+                ctrl_counts = segment_sum(ctrl_f, seg_ids, n_arts)
+                valid_segments = ctrl_counts > 0
+                if not valid_segments.any():
                     continue
-                l1_ratio_losses.append(((mean_probs - target_ratio) ** 2).mean())
-                decisive = segment_mean(
-                    4.0 * probs_f * (1.0 - probs_f), seg_ids, n_arts,
+                mean_probs = segment_sum(
+                    probs_f * ctrl_f, seg_ids, n_arts,
+                ) / ctrl_counts.clamp(min=1)
+                l1_ratio_losses.append(
+                    ((mean_probs[valid_segments] - target_ratio) ** 2).mean()
                 )
-                l1_decisive_losses.append(decisive.mean())
+                decisive = segment_sum(
+                    4.0 * probs_f * (1.0 - probs_f) * ctrl_f,
+                    seg_ids,
+                    n_arts,
+                ) / ctrl_counts.clamp(min=1)
+                l1_decisive_losses.append(decisive[valid_segments].mean())
             else:
                 # Single-segment fallback.
-                if probs_f.numel() == 0:
+                selected_probs = probs_f[controllable]
+                if selected_probs.numel() == 0:
                     continue
-                l1_ratio_losses.append((probs_f.mean() - target_ratio) ** 2)
+                l1_ratio_losses.append((selected_probs.mean() - target_ratio) ** 2)
                 l1_decisive_losses.append(
-                    (4.0 * probs_f * (1.0 - probs_f)).mean()
+                    (4.0 * selected_probs * (1.0 - selected_probs)).mean()
                 )
 
             # Relevance loss: two per-group aggregate-ratio targets.
-            # - Gold positions (including pinned ID tokens) should survive
-            #   at ~gold_boost * target_ratio (upsample the whole block,
-            #   IDs + content).
-            # - Distractor positions (content only — their ID tokens are
-            #   not pinned) should survive at ~distractor_damp * target_ratio
+            # - Gold controllable content should survive at approximately
+            #   gold_boost * target_ratio.
+            # - Distractor controllable content should survive at
+            #   distractor_damp * target_ratio
             #   (downsample but don't suppress to zero — distractor IDs may
             #   still be referenced in later bgkit calls).
             # relevance is flat (N_l1,) bool — unchanged if already flat.
+            _span_l1 = entry.get("span_mask")
+            if (
+                getattr(self, "_span_relevance_weight", 0.0) > 0.0
+                and _span_l1 is not None
+                and _span_l1.numel() == probs_f.numel()
+                and bool(_span_l1.any())
+            ):
+                l1_span_losses.append(((1.0 - probs_f[_span_l1.reshape(-1)]) ** 2).mean())
+                _sm1 = getattr(enc_out, "survivor_mask", None)
+                if _sm1 is not None and _sm1.numel() == _span_l1.numel():
+                    l1_span_survival.append(_sm1[_span_l1.reshape(-1)].float().mean().item())
             if relevance is not None:
-                relevance_flat = relevance.reshape(-1)
+                relevance_flat = relevance.reshape(-1) & controllable
                 gold_target = min(1.0, target_ratio * self._relevance_gold_boost)
                 distractor_target = max(0.0, target_ratio * self._relevance_distractor_damp)
                 per_group_losses: list[torch.Tensor] = []
                 if relevance_flat.any():
                     gold_mean = probs_f[relevance_flat].mean()
                     per_group_losses.append((gold_mean - gold_target) ** 2)
-                distractor_mask = ~relevance_flat
+                distractor_mask = ~relevance.reshape(-1) & controllable
                 if distractor_mask.any():
                     distractor_mean = probs_f[distractor_mask].mean()
                     per_group_losses.append((distractor_mean - distractor_target) ** 2)
                 if per_group_losses:
                     l1_relevance_losses.append(torch.stack(per_group_losses).mean())
 
+        if l1_span_losses:
+            l1_span_loss = torch.stack(l1_span_losses).mean()
+            total = total + getattr(self, "_span_relevance_weight", 0.0) * l1_span_loss
+            metrics["l1_span_loss"] = l1_span_loss.item()
+            if l1_span_survival:
+                metrics["l1_span_survival"] = sum(l1_span_survival) / len(l1_span_survival)
         if l1_ratio_losses:
             l1_ratio_loss = torch.stack(l1_ratio_losses).mean()
             l1_decisive_loss = torch.stack(l1_decisive_losses).mean()
             total = (
                 total
-                + self._ratio_loss_weight * l1_ratio_loss
-                + self._decisiveness_loss_weight * l1_decisive_loss
+                + self._aux_weight("l1", "ratio_loss_weight") * l1_ratio_loss
+                + self._aux_weight("l1", "decisiveness_loss_weight") * l1_decisive_loss
             )
             metrics["l1_ratio_loss"] = l1_ratio_loss.item()
             metrics["l1_decisiveness_loss"] = l1_decisive_loss.item()
@@ -6021,20 +7186,27 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     (logits_for_op.float() - theta_t.to(logits_for_op.device).float())
                     / tau,
                 )
+                pinned = entry.get("pinned")
+                controllable = (
+                    ~pinned.reshape(-1)
+                    if pinned is not None
+                    else torch.ones_like(soft_gates, dtype=torch.bool)
+                )
+                ctrl_f = controllable.to(soft_gates.dtype)
                 cu_seqlens = entry.get("cu_seqlens")
                 if cu_seqlens is not None:
                     n_arts = int(cu_seqlens.shape[0]) - 1
                     seg_ids = segment_ids_from_cu(cu_seqlens, int(soft_gates.shape[0]))
-                    soft_count = segment_sum(soft_gates, seg_ids, n_arts)  # (B,)
-                    content_len = lengths_from_cu(cu_seqlens).to(
-                        dtype=soft_count.dtype, device=soft_count.device,
+                    soft_count = segment_sum(
+                        soft_gates * ctrl_f, seg_ids, n_arts,
                     )
+                    content_len = segment_sum(ctrl_f, seg_ids, n_arts)
                     if content_len.sum() == 0:
                         continue
                 else:
-                    soft_count = soft_gates.sum().unsqueeze(0)
+                    soft_count = (soft_gates * ctrl_f).sum().unsqueeze(0)
                     content_len = torch.tensor(
-                        [float(logits_for_op.shape[0])],
+                        [float(controllable.sum().item())],
                         dtype=soft_count.dtype, device=soft_count.device,
                     )
                     if content_len[0] == 0:
@@ -6044,7 +7216,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     min=float(self._surv_l1.min_survivors_absolute_min),
                 )
                 deficit = (1.0 - soft_count / target_min.clamp(min=1.0)).clamp(min=0.0)
-                l1_min_surv_losses.append((deficit ** 2).mean())
+                l1_min_surv_losses.append(
+                    (deficit[content_len > 0] ** 2).mean()
+                )
             if l1_min_surv_losses:
                 l1_min_surv_loss = torch.stack(l1_min_surv_losses).mean()
                 total = total + self._surv_l1.min_survivors_loss_weight * l1_min_surv_loss
@@ -6201,7 +7375,22 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             phase_peak_delta_gb=round(peak - resident, 3),
             **extra,
         )
+        # The reset below isolates the NEXT phase's peak but would also make
+        # the step-level ``mem/cuda_max_allocated_gb`` (read from the same
+        # counter at log time) report only the last phase. Keep the true
+        # max since the previous log for ``_step_peak_allocated_gb_hook``.
+        self._mem_breakdown_peak_gb = max(
+            float(getattr(self, "_mem_breakdown_peak_gb", 0.0)), float(peak),
+        )
         torch.cuda.reset_peak_memory_stats()
+
+    def _step_peak_allocated_gb_hook(self) -> float | None:
+        """True per-step peak under the breakdown probe (see BaseTrainer)."""
+        tracked = getattr(self, "_mem_breakdown_peak_gb", None)
+        if tracked is None:
+            return None
+        self._mem_breakdown_peak_gb = 0.0
+        return float(tracked)
 
     @contextlib.contextmanager
     def _timed(self, store: dict, key: str, *, gpu: bool = False):
@@ -6290,6 +7479,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._pending_l1_outputs = []
         self._step_sampled_l0_ratios = []
         self._step_sampled_l1_ratios = []
+        self._proj_norm_ratio_accum = {}
         if self.topic_embeddings is not None:
             self.topic_embeddings.record_batch_usage(
                 [self._sample_tags_for(s) for s in batch],
@@ -6361,7 +7551,12 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             #     drill_encode / assemble / decode_fwd) accumulate inside the
             #     group encode; sample_backward times the per-group backward.
             group_size = max(1, int(getattr(self, "_per_repo_sample_group_size", 1) or 1))
-            l1_ramp = self._recursive_l1_retention_now()
+            # Retrieve-leaf drill L1: the drill_leaf_retention.l1 override when
+            # set (query-conditioned-drill-nodes mode), else the recursive L1
+            # ramp (legacy drill↔tree coupling). Threaded as l1_target_ratio to
+            # _run_l1_batch — affects ONLY the bucketed leaf drills (head/node
+            # turns resolve separately at drill_node_retention / tree ratios).
+            l1_ramp = self._drill_leaf_l1_retention_now()
             n_groups = 0
             for start in range(0, len(batch), group_size):
                 group = batch[start:start + group_size]
@@ -6488,6 +7683,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             "recursive_l1_retention": self._recursive_l1_retention_now(),
         }
         metrics_out.update(aux_metrics)
+        metrics_out.update(self._proj_norm_reg_step_metrics())
         return metrics_out
 
     # ------------------------------------------------------------------
@@ -6606,6 +7802,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._pending_l1_outputs = []
         self._step_sampled_l0_ratios = []
         self._step_sampled_l1_ratios = []
+        self._proj_norm_ratio_accum = {}
 
         repo_changed = root_key != self._inner_loop_repo_key
         if repo_changed:
@@ -6634,7 +7831,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         else:
             self._inner_loop_repo_steps += 1
 
-        l1_ramp = self._recursive_l1_retention_now()
+        # Retrieve-leaf drill L1: drill_leaf_retention.l1 override when set,
+        # else the recursive L1 ramp (legacy) — see the Option A driver note.
+        l1_ramp = self._drill_leaf_l1_retention_now()
         # subset_loss / S (S = this subset's sample count; last subset may be
         # short). One inner step == one optimizer step.
         normalizer = max(1, len(batch))
@@ -6774,7 +7973,12 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # nav_gap toward 0. Only depth>=1 drills (child ids after the parent's
         # rep) can be rep-dependent, so measure those. (Measurement only — does
         # not change the training loss.)
-        nav_spans = list(trace.bgkit_call_spans)[1:]
+        nav_spans = [
+            span for turn, span in zip(
+                trace.bgkit_turns, trace.bgkit_call_spans, strict=True,
+            )
+            if getattr(turn, "loss", True) and not turn.args.get("is_head")
+        ]
         recon_spans = (
             [trace.answer_span] if trace.answer_span is not None else []
         )
@@ -6784,13 +7988,22 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         accum["nav_count"] += nav_count
         accum["recon_sum"] += recon_sum
         accum["recon_count"] += recon_count
-        # DIAGNOSTIC: bucket recon/nav CE by DRILL DEPTH (number of bgkit drill
-        # turns). recon_loss should DROP with depth — deeper drills retrieve more
+        # DIAGNOSTIC: bucket by the artifact's structural tree depth, not by the
+        # number of tool calls (multiple evidence branches and distractors make
+        # call count unrelated to hierarchy depth). Reconstruction loss should
+        # drop with depth because deeper drills retrieve more
         # of the real diff content, so reconstruction gets easier; a full-depth
         # drill that STILL has high recon_loss would be the concerning case (the
         # model has the diffs but can't use them). depth 1 == no_drill (recon from
         # the compressed head rep alone → hardest). Measurement only.
-        depth = len(trace.bgkit_call_spans)
+        depth = max(
+            (
+                int(turn.args.get("structural_depth", 0))
+                for turn in trace.bgkit_turns
+                if getattr(turn, "loss", True)
+            ),
+            default=0,
+        )
         bd = accum.setdefault("by_depth", {}).setdefault(
             depth, {"recon_sum": 0.0, "recon_count": 0,
                     "nav_sum": 0.0, "nav_count": 0, "n": 0},
@@ -6989,6 +8202,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._pending_l1_outputs = []
         self._step_sampled_l0_ratios = []
         self._step_sampled_l1_ratios = []
+        self._proj_norm_ratio_accum = {}
         if self.topic_embeddings is not None:
             self.topic_embeddings.record_batch_usage(
                 [self._sample_tags_for(s) for s in batch],
@@ -7049,7 +8263,12 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             # --- 2. Partition into K=ceil(n/S) subsets (size S, UNCAPPED —
             #        process all files; encoder steps once so no staleness).
             subsets = self._partition_option_a_subsets(contributing)
-            l1_ramp = self._recursive_l1_retention_now()
+            # Retrieve-leaf drill L1: the drill_leaf_retention.l1 override when
+            # set (query-conditioned-drill-nodes mode), else the recursive L1
+            # ramp (legacy drill↔tree coupling). Threaded as l1_target_ratio to
+            # _run_l1_batch — affects ONLY the bucketed leaf drills (head/node
+            # turns resolve separately at drill_node_retention / tree ratios).
+            l1_ramp = self._drill_leaf_l1_retention_now()
             group_size = max(
                 1, int(getattr(self, "_per_repo_sample_group_size", 1) or 1),
             )
@@ -7216,6 +8435,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             "l1_turns_per_sample": float(n_turns_total / max(1, n_samples)),
             "recursive_l0_retention": self._recursive_l0_retention_now(),
             "recursive_l1_retention": self._recursive_l1_retention_now(),
+            # Drill-side retention visibility (== the recursive values when the
+            # query-conditioned-drill overrides are unset).
+            "drill_node_retention": self._drill_node_retention_now(),
+            "drill_leaf_l1_retention": float(l1_ramp),
+            # proj_norm_ratio_{family}: mean spliced-rep / embed norm-ratio (drift
+            # canary — should track the 4.2 (qwen) / 0.9 (falcon) readable band).
+            **self._proj_norm_reg_step_metrics(),
         }
 
     def _forward_backward(self, batch) -> dict[str, float]:
@@ -7262,6 +8488,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._pending_l1_outputs: list[dict] = []
         self._step_sampled_l0_ratios = []
         self._step_sampled_l1_ratios = []
+        self._proj_norm_ratio_accum = {}
 
         # Stamp per-batch tag usage so the topic embeddings can divide
         # each tag parameter's gradient by the number of batch members
@@ -7277,8 +8504,16 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # summed into one loss) are shared with the per-repo PASS 2 via
         # _encode_decode_group. The regular path encodes the WHOLE batch as one
         # group (l1_target_ratio=None → sampled L1 retention).
+        # Per-phase wall-clock splits (prep / drill_encode / assemble /
+        # decode_fwd from _encode_decode_group, + aux / backward / util here)
+        # emitted as ``time/<phase>`` step metrics — the in-process profile
+        # that decides where a slow step's time goes (perf playbook: measure
+        # before hypothesising). GPU-synced splits; negligible vs a step.
+        import time as _time
+
+        step_timing: dict[str, float] = {}
         total_loss, total_tokens, n_samples, n_turns_total, n_buckets = (
-            self._encode_decode_group(batch, l1_target_ratio=None)
+            self._encode_decode_group(batch, timing=step_timing, l1_target_ratio=None)
         )
 
         if n_samples == 0:
@@ -7288,18 +8523,28 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         total_weighted = decoder_loss
 
         # Survivorship auxiliary losses over accumulated L0 + L1 outputs
+        _t0 = _time.perf_counter()
         aux_loss, aux_metrics = self._compute_survivorship_aux_losses()
         if aux_loss.requires_grad or aux_loss.item() != 0.0:
             total_weighted = total_weighted + aux_loss
+        step_timing["aux"] = step_timing.get("aux", 0.0) + (_time.perf_counter() - _t0)
 
+        _t0 = _time.perf_counter()
         (total_weighted / self._accum_steps).backward()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        step_timing["backward"] = step_timing.get("backward", 0.0) + (
+            _time.perf_counter() - _t0
+        )
 
         # --- Utility-gradient BCE distillation (post-backward) ---
         # The main backward populated each LevelOutput's captured
         # ``post_head_content_grad`` via the level's backward hook.
         # Rebuild the top-k teacher from ``-(grad · value)`` and run a
         # small head-local backward per level.
+        _t0 = _time.perf_counter()
         util_metrics = self._apply_utility_grad_bce_phase2()
+        step_timing["util"] = step_timing.get("util", 0.0) + (_time.perf_counter() - _t0)
 
         # Average shared-tag gradients across the batch (see
         # TopicEmbeddingModule.apply_gradient_averaging). Only touches
@@ -7309,6 +8554,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
         metrics_out = {
             "loss": decoder_loss.detach(),
+            # Per decoder-family train loss (round-robin: one family per
+            # microbatch; _average_metrics averages each key over the
+            # microbatches it appears in). Without it a family-specific
+            # divergence is invisible in the pooled `loss`.
+            f"loss/{getattr(self, '_decoder_family', 'single') or 'single'}": (
+                decoder_loss.detach()
+            ),
             "tokens": float(total_tokens / n_samples),
             "l1_retention": self._l1_retention,
             "live_l0": 1.0 if self._live_l0 else 0.0,
@@ -7325,6 +8577,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             )
         metrics_out.update(aux_metrics)
         metrics_out.update(util_metrics)
+        metrics_out.update(self._proj_norm_reg_step_metrics())
+        for _k, _v in step_timing.items():
+            metrics_out[f"time/{_k}"] = float(_v)
 
         # Head-health diagnostics (organic-rate std, undecided fraction,
         # floor/pinned/θ) per level. Sampled from the last accumulated
@@ -7456,7 +8711,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
           the keep-rate/mean-rate metrics keep logging.
         """
         skip: list[str] = []
-        if not self._live_l0:
+        if not self._live_l0 or getattr(self, "_selection_mode_l0", "threshold") == "exact_topk":
             skip.append("l0")
         if getattr(self, "_selection_mode_l1", "threshold") == "exact_topk":
             skip.append("l1")
@@ -7527,9 +8782,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         elif isinstance(self._l0_retention, (int, float)):
             target_l0 = float(self._l0_retention)
         else:
-            # No per-dataset weighting available; fall back to the mean
-            # across configured datasets.
-            vals = [float(v) for v in self._l0_retention.values()] if self._l0_retention else []
+            # No pending controllable counts (for example, an all-cached L0
+            # batch). Resolve curriculum dictionaries at the current step
+            # instead of calling float() on the raw config value.
+            vals = [
+                self._l0_retention_for(dataset)
+                for dataset in self._l0_retention
+            ]
             target_l0 = sum(vals) / len(vals) if vals else 0.10
         if l1_target_den > 0:
             target_l1 = l1_target_num / l1_target_den
@@ -7587,19 +8846,48 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         roughly doubles eval wall-clock; sized by ``max_eval_samples``.
         """
         self.model.eval()
-        # Per-evaluate() cache of encoded repo trees, reused across every
-        # ablation-mode pass (see _ensure_eval_shared_tree). Cleared in finally.
+        # Per-evaluate() bounded LRU of encoded repo trees. Keeping this small is
+        # essential: each value contains GPU survivor tensors for a whole
+        # history window. Cleared in finally.
         self._eval_tree_cache = {}
         try:
-            metrics = self._eval_pass()
+            with self._teacher_forced_decoders():
+                metrics = self._eval_pass()
+                # Generalization-gap probe: the SAME teacher-forced pass over a
+                # fixed, evenly spaced slice of TRAIN samples, keyed
+                # ``eval_train/...`` (per dataset + per decoder family). A
+                # family whose eval loss sits far above its train-subset loss
+                # is generalizing badly; one whose train-subset loss also sits
+                # far above its logged training loss has an eval-PATH defect
+                # (2026-08-22: Falcon-H1 eval 6.3 vs train ~2.6 — which?).
+                n_train_probe = int(self.step_cfg.get("eval_train_subset_samples", 0) or 0)
+                if n_train_probe > 0:
+                    metrics.update({
+                        k.replace("eval/", "eval/train_subset/", 1): v
+                        for k, v in self._eval_pass(
+                            loader=self._train_subset_batches(n_train_probe),
+                        ).items()
+                    })
+            free_running_samples = int(
+                self.step_cfg.get("eval_free_running_samples", 0) or 0
+            )
+            if free_running_samples > 0:
+                # Generation needs the cached (eval-mode) decoder path.
+                metrics.update(self._free_running_metrics_guarded(free_running_samples))
             extra_modes = list(self.step_cfg.get("eval_ablation_modes", []) or [])
+            # Restore the mode evaluate() was ENTERED with, not None — the
+            # standalone eval script may run the whole evaluation under an
+            # explicit mode (e.g. oracle_span); restoring None here would
+            # silently strip it from every pass after the sweep (2026-08-24).
+            entering_mode = self._ablation_mode
             for mode in extra_modes:
                 mode_str = str(mode)
                 self.set_ablation_mode(mode_str)
                 try:
-                    sub = self._eval_pass()
+                    with self._teacher_forced_decoders():
+                        sub = self._eval_pass()
                 finally:
-                    self.set_ablation_mode(None)
+                    self.set_ablation_mode(entering_mode)
                 for k, v in sub.items():
                     if k.startswith("eval/"):
                         metrics[f"eval/ablation/{mode_str}/{k[len('eval/'):]}"] = v
@@ -7620,10 +8908,213 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             self.model.train()
         return metrics
 
+    def _grad_norm_param_groups(self) -> dict[str, list]:
+        """Pre-clip gradient-norm groups: backbones, the small survivorship
+        heads/controllers, the L0→L1 bridge, projection blocks, decoders."""
+        groups: dict[str, list] = {}
+        enc = getattr(self, "encoder", None)
+        for lvl in ("l0", "l1"):
+            lc = getattr(enc, lvl, None) if enc is not None else None
+            if lc is None:
+                continue
+            bb = getattr(lc, "backbone", None)
+            if bb is not None:
+                groups[f"{lvl}_backbone"] = [p for p in bb.parameters() if p.requires_grad]
+            head_params: list = []
+            for sub in ("head", "threshold"):
+                m = getattr(lc, sub, None)
+                if m is not None:
+                    head_params += [p for p in m.parameters() if p.requires_grad]
+            groups[f"{lvl}_head"] = head_params
+            # The survive flag vector is added at EVERY survivor position, so
+            # its gradient is a sum over thousands of positions — reported on
+            # its own so it can't masquerade as the head's gradient.
+            se = getattr(lc, "survive_embedding", None)
+            if se is not None and getattr(se, "requires_grad", False):
+                groups[f"{lvl}_survive_embedding"] = [se]
+            br = getattr(lc, "auto_repro_head", None)
+            if br is not None:
+                groups[f"{lvl}_bridge"] = [p for p in br.parameters() if p.requires_grad]
+        pb = getattr(enc, "projection_blocks", None) if enc is not None else None
+        if pb is not None:
+            groups["projection"] = [p for p in pb.parameters() if p.requires_grad]
+        for fam, dec in (getattr(self, "_decoders_by_family", None) or {}).items():
+            groups[f"decoder_{fam}"] = [p for p in dec.parameters() if p.requires_grad]
+        return groups
+
+    def _eval_family_for_index(self, index: int) -> str:
+        """Decoder family for the ``index``-th eval sample under round-robin.
+
+        Follows the TRAINING mix: ``qwen_decoder_prob >= 1`` → Qwen only,
+        ``<= 0`` → Falcon only, otherwise deterministic 50/50 alternation.
+        (2026-08-23: v6 trains Qwen-only, yet the eval alternated families,
+        so half the pooled eval scored an untrained Falcon — eval/loss 10.0
+        with Qwen at 1.88 — and half the eval wall-clock was wasted.)
+        """
+        prob = float(getattr(self, "_qwen_decoder_prob", 0.5))
+        if prob >= 1.0 - 1e-9:
+            return "qwen35"
+        if prob <= 1e-9:
+            return "falcon_h1"
+        return "qwen35" if index % 2 == 0 else "falcon_h1"
+
+    def _train_subset_batches(self, n: int) -> list[list]:
+        """Fixed, evenly spaced ``n`` training samples as single-sample
+        batches (the shape ``_eval_pass`` iterates) for the train-subset
+        generalization-gap probe. Deterministic across evals so the numbers
+        are comparable over the run."""
+        ds = self.train_dataset
+        total = len(ds)
+        if total == 0 or n <= 0:
+            return []
+        n = min(n, total)
+        stride = max(1, total // n)
+        return [[ds[i]] for i in range(0, stride * n, stride)][:n]
+
+    @contextlib.contextmanager
+    def _teacher_forced_decoders(self):
+        """Run the DECODER backbones in ``train()`` mode for teacher-forced
+        eval (the encoder stays in eval mode; callers hold ``torch.no_grad``).
+
+        HF "eval mode" assumes autoregressive inference with a cache.
+        Falcon-H1's Mixer gates on ``self.training``: eval mode takes the
+        unfused conv/scan path and additionally applies padding masking to
+        the projected states — numerically DIFFERENT from the fused training
+        path, which produced a 5-nat eval/train gap in the summarization
+        trainer (2026-05-15) and, here, eval/loss 9.8 vs train ~1 with a zero
+        reps-ablation gap at v5b step 250 (2026-08-22). Teacher-forced
+        full-sequence eval must use the same forward as training; generation
+        passes (which need the cache) keep eval mode. Neither decoder family
+        has active dropout, so train mode changes nothing else.
+        """
+        decs = list(self._all_decoders())
+        prev = [bool(d.training) for d in decs]
+        for d in decs:
+            d.train()
+        try:
+            yield
+        finally:
+            for d, was_training in zip(decs, prev, strict=True):
+                d.train(was_training)
+
+    def _free_running_metrics_guarded(self, max_samples: int) -> dict[str, float]:
+        """The free-running probe is a DIAGNOSTIC: a defect in it must not
+        take the training run down (2026-08-23: an exception inside it killed
+        v6 between saves, 227 steps lost). Failures are logged with the
+        traceback (`free_running_eval_failed`, visible to monitors) and
+        reported as ``eval/kb/free_running/failed = 1``.
+        """
+        try:
+            metrics = self._eval_free_running_pass(max_samples)
+        except Exception:
+            logger.exception("free_running_eval_failed", max_samples=max_samples)
+            return {"eval/kb/free_running/failed": 1.0}
+        metrics["eval/kb/free_running/failed"] = 0.0
+        return metrics
+
+    def _eval_free_running_pass(self, max_samples: int) -> dict[str, float]:
+        """Generate autonomous tool calls and answers for a bounded eval slice.
+
+        Unlike :meth:`_eval_pass`, this never renders future teacher calls or
+        the gold answer. It is deliberately run once, without representation
+        ablations, because generation is substantially more expensive than a
+        teacher-forced forward.
+        """
+        from bgkit.eval.kb_trajectory_eval import evaluate_free_running_sample
+
+        max_tool_calls = int(self.step_cfg.get("eval_free_running_max_tool_calls", 16))
+        max_new_tokens = int(self.step_cfg.get("eval_free_running_max_new_tokens", 8192))
+        fields = (
+            "route_exact",
+            "valid_navigation",
+            "evidence_recall",
+            "answer_token_f1",
+            "answer_exact_match",
+        )
+        sums = dict.fromkeys(fields, 0.0)
+        # Per decoder family AND per dataset (the generative needle gate is a
+        # per-task question: fileneedle/grepset copy a line, lognav a log
+        # line, swerecall a path — a pooled EM hides which one moves).
+        group_sums: dict[str, dict[str, float]] = {}
+        group_counts: dict[str, int] = {}
+        invalid_reasons: dict[str, int] = {}
+        invalid = 0
+        seen = 0
+        examples_logged = 0
+        self._eval_shared_tree_key = None
+        # Evenly spaced over the eval set: it is index-sorted (datasets
+        # concatenated), so the first ``max_samples`` would all come from one
+        # dataset (2026-08-23: 64/64 lognav).
+        n_eval = len(self.eval_dataloader)
+        stride = max(1, n_eval // max_samples) if max_samples > 0 else 1
+        for batch_index, batch in enumerate(self.eval_dataloader):
+            if batch_index % stride:
+                continue
+            for sample in batch:
+                if seen >= max_samples:
+                    break
+                if self._round_robin:
+                    # Class-qualified so partial test doubles (a ``_Stub`` that
+                    # borrows this method) resolve the policy too.
+                    self._set_active_decoder(KRKBTrainer._eval_family_for_index(self, seen))
+                result = evaluate_free_running_sample(
+                    self,
+                    sample,
+                    max_tool_calls=max_tool_calls,
+                    max_new_tokens=max_new_tokens,
+                )
+                family = str(getattr(self, "_decoder_family", "single"))
+                dataset = str(getattr(sample, "dataset_name", "") or "unknown")
+                for group in (family, dataset):
+                    group_sums.setdefault(group, dict.fromkeys(fields, 0.0))
+                    group_counts[group] = group_counts.get(group, 0) + 1
+                for field in fields:
+                    value = float(result.get(field, 0.0))
+                    sums[field] += value
+                    group_sums[family][field] += value
+                    group_sums[dataset][field] += value
+                reason = str(result.get("invalid_reason") or "")
+                if reason:
+                    invalid += 1
+                    key = reason.split(":", 1)[0]
+                    invalid_reasons[key] = invalid_reasons.get(key, 0) + 1
+                # A few raw generations per eval so a verdict (invalid OR a
+                # zero-EM answer) can be read against what the model wrote.
+                if examples_logged < 6 and (reason or seen % 8 == 0):
+                    examples_logged += 1
+                    logger.info(
+                        "free_running_example",
+                        dataset=dataset,
+                        family=family,
+                        invalid_reason=reason,
+                        gold=str(result.get("gold_answer", ""))[:160],
+                        pred=str(result.get("pred_answer", ""))[:160],
+                        raw=str(result.get("raw_text", ""))[:200],
+                    )
+                seen += 1
+            if seen >= max_samples:
+                break
+
+        prefix = "eval/kb/free_running"
+        metrics = {
+            f"{prefix}/{field}": sums[field] / seen if seen else 0.0
+            for field in fields
+        }
+        metrics[f"{prefix}/invalid_rate"] = invalid / seen if seen else 0.0
+        metrics[f"{prefix}/n_samples"] = float(seen)
+        for key, count in invalid_reasons.items():
+            metrics[f"{prefix}/invalid/{key}"] = count / seen if seen else 0.0
+        for group, values in group_sums.items():
+            count = group_counts[group]
+            for field in fields:
+                metrics[f"{prefix}/{group}/{field}"] = values[field] / count
+            metrics[f"{prefix}/{group}/n_samples"] = float(count)
+        return metrics
+
     def _ensure_eval_shared_tree(self, sample: KBSample) -> None:
         """EVAL: install the shared repo tree so recursive drill reps resolve.
 
-        The training Option-A step encodes the window-0 subtree once per repo
+        The coherent per-repo step encodes the window subtree once per group
         (:meth:`_compute_shared_repo_tree`) and installs ``_shared_tree_memo`` /
         ``_shared_tree_splice_reps``, so every ``bgkit`` drill splices a REAL
         survivor rep. Eval's single-sample decode path never did this, so every
@@ -7657,14 +9148,15 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         key = (root, family)
         if getattr(self, "_eval_shared_tree_key", None) == key:
             return
-        # Cross-ABLATION-MODE cache: evaluate() runs _eval_pass once per mode
-        # (neither/zeroed/noise/headline), but the encoded tree is IDENTICAL
-        # across modes (ablation is applied at splice, not encode). Encode each
-        # (repo, family) tree ONCE per evaluate() and reuse — else it's ~4x
-        # redundant tree encodes (the 44-min-eval regression).
+        # Cross-ablation bounded LRU. The encoded tree is identical across
+        # modes, but an unbounded cache retained every eval repository's GPU
+        # tensors until evaluate() returned and could OOM before the first pass
+        # finished. A small cache still helps repeated adjacent groups without
+        # making memory scale with eval-set cardinality.
         cache = getattr(self, "_eval_tree_cache", None)
         if cache is not None and key in cache:
-            memo, splice = cache[key]
+            memo, splice = cache.pop(key)
+            cache[key] = (memo, splice)
         else:
             saved_count = getattr(self, "_shared_tree_forward_count", 0)
             with torch.no_grad():
@@ -7679,8 +9171,15 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 for nid, (proj, _l1out) in memo.items()
                 if proj is not None
             }
-            if cache is not None:
+            step_cfg = getattr(self, "step_cfg", {})
+            max_cached = max(
+                0, int(step_cfg.get("eval_tree_cache_max_groups", 1) or 0),
+            )
+            if cache is not None and max_cached > 0:
                 cache[key] = (memo, splice)
+                while len(cache) > max_cached:
+                    oldest = next(iter(cache))
+                    cache.pop(oldest)
         self._shared_tree_memo = memo
         self._shared_tree_splice_reps = splice
         self._shared_tree_used_nodes = set()
@@ -7702,16 +9201,22 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._eval_shared_tree_key = None
         self._eval_tree_cache = None
 
-    def _eval_pass(self) -> dict[str, float]:
+    def _eval_pass(self, loader=None) -> dict[str, float]:
         """Single pass over the eval dataloader. Assumes the model is
         already in eval mode and any ablation_mode is set. Returns the
         standard ``eval/...`` metrics dict for whatever ablation_mode is
         currently active.
+
+        ``loader`` overrides the sample source (an iterable of sample lists)
+        — used by the train-subset generalization-gap pass in
+        :meth:`evaluate`, whose keys are re-prefixed ``eval_train/``.
         """
         total_loss_weighted = 0.0
         total_tokens = 0
         n_samples = 0
         total_correct = 0
+        answer_correct = 0
+        answer_tokens = 0
 
         per_dataset_correct: dict[str, int] = {}
         per_dataset_total: dict[str, int] = {}
@@ -7729,6 +9234,12 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         kb_f1_sum = 0.0
         kb_f1_n = 0
         self._eval_family_counter = 0
+        # Per decoder-family breakdown (round-robin runs): a family-specific
+        # eval-path defect is invisible in the pooled numbers.
+        fam_loss_w: dict[str, float] = {}
+        fam_tokens: dict[str, int] = {}
+        fam_f1: dict[str, list[float]] = {}
+        fam_em: dict[str, list[float]] = {}
 
         # Optional recon/nav CE split accumulator (eval/recon_loss + eval/nav_loss).
         # evaluate() diffs these across ablation modes to get eval/recon_gap + eval/nav_gap.
@@ -7743,14 +9254,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # modes — the ablation is applied at splice, not encode). Torn down in
         # evaluate()'s finally via _clear_eval_shared_tree.
         self._eval_shared_tree_key = None
-        for batch in self.eval_dataloader:
+        for batch in (loader if loader is not None else self.eval_dataloader):
             for sample in batch:
                 if self._round_robin:
-                    # Deterministic alternation so eval/loss reflects both
-                    # decoders ~50/50 and is reproducible across runs.
+                    # Deterministic family choice that FOLLOWS the training
+                    # mix (see _eval_family_for_index); reproducible across runs.
                     self._set_active_decoder(
-                        "qwen35" if self._eval_family_counter % 2 == 0
-                        else "falcon_h1"
+                        self._eval_family_for_index(self._eval_family_counter)
                     )
                     self._eval_family_counter += 1
                 # Install the sample's shared repo tree so recursive drill reps
@@ -7765,6 +9275,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 total_loss_weighted += float(sample_loss) * sample_tokens
                 total_tokens += sample_tokens
                 total_correct += result["correct"]
+                answer_correct += result["answer_correct"]
+                answer_tokens += result["answer_tokens"]
                 n_samples += 1
                 all_em.append(result["em"])
                 all_f1.append(result["f1"])
@@ -7773,6 +9285,11 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 per_dataset_f1.setdefault(ds, []).append(result["f1"])
                 per_dataset_correct[ds] = per_dataset_correct.get(ds, 0) + result["correct"]
                 per_dataset_total[ds] = per_dataset_total.get(ds, 0) + sample_tokens
+                fam = str(getattr(self, "_decoder_family", "single") or "single")
+                fam_loss_w[fam] = fam_loss_w.get(fam, 0.0) + float(sample_loss) * sample_tokens
+                fam_tokens[fam] = fam_tokens.get(fam, 0) + sample_tokens
+                fam_f1.setdefault(fam, []).append(result["f1"])
+                fam_em.setdefault(fam, []).append(result["em"])
 
                 # KB harness metric accumulation (tool-call ID
                 # accuracy + answer F1). Already computed as part of
@@ -7791,6 +9308,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             return {
                 "eval/loss": 0.0,
                 "eval/answer_token_accuracy": 0.0,
+                "eval/loss_token_accuracy": 0.0,
                 "eval/exact_match": 0.0,
                 "eval/token_f1": 0.0,
                 "eval/n_samples": 0.0,
@@ -7806,7 +9324,10 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
         metrics: dict[str, float] = {
             "eval/loss": total_loss_weighted / total_tokens,
-            "eval/answer_token_accuracy": total_correct / total_tokens,
+            "eval/loss_token_accuracy": total_correct / total_tokens,
+            "eval/answer_token_accuracy": (
+                answer_correct / answer_tokens if answer_tokens else 0.0
+            ),
             "eval/exact_match": sum(all_em) / len(all_em),
             "eval/token_f1": sum(all_f1) / len(all_f1),
             "eval/n_samples": float(n_samples),
@@ -7822,13 +9343,19 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         for ds, c in per_dataset_correct.items():
             t = per_dataset_total.get(ds, 0)
             if t:
-                metrics[f"eval/{ds}/token_accuracy"] = c / t
+                metrics[f"eval/{ds}/loss_token_accuracy"] = c / t
         for ds, scores in per_dataset_em.items():
             if scores:
                 metrics[f"eval/{ds}/exact_match"] = sum(scores) / len(scores)
         for ds, scores in per_dataset_f1.items():
             if scores:
                 metrics[f"eval/{ds}/token_f1"] = sum(scores) / len(scores)
+        for fam, t in fam_tokens.items():
+            if t:
+                metrics[f"eval/family/{fam}/loss"] = fam_loss_w[fam] / t
+                metrics[f"eval/family/{fam}/token_f1"] = sum(fam_f1[fam]) / len(fam_f1[fam])
+                metrics[f"eval/family/{fam}/exact_match"] = sum(fam_em[fam]) / len(fam_em[fam])
+                metrics[f"eval/family/{fam}/n_samples"] = float(len(fam_f1[fam]))
         # recon/nav CE split (present when eval_gap_probe). evaluate() diffs
         # these across ablation modes to form eval/recon_gap + eval/nav_gap.
         if span_accum is not None:
@@ -7871,6 +9398,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         Returns ``None`` if the sample has no loss-bearing tokens.
         """
         from bgkit.eval.kb_trajectory_eval import (
+            _is_scored_bgkit_turn,
             _score_call_span,
             _tool_call_gold_ids,
         )
@@ -7907,6 +9435,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             f1 = 0.0
             pred_text = ""
             gold_text = str(sample.gold_answer)
+            answer_correct = 0
+            answer_tokens = 0
         else:
             a_start, a_end = answer_span
             shift_a_start = max(0, a_start - 1)
@@ -7920,6 +9450,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 if answer_mask.any():
                     pred_ids = pred_ids[answer_mask]
                     gold_ids = gold_ids[answer_mask]
+                answer_correct = int((pred_ids == gold_ids).sum().item())
+                answer_tokens = int(gold_ids.numel())
                 pred_text = self.tokenizer.decode(
                     pred_ids, skip_special_tokens=True,
                 )
@@ -7929,6 +9461,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             else:
                 pred_text = ""
                 gold_text = str(sample.gold_answer)
+                answer_correct = 0
+                answer_tokens = 0
             em = exact_match(pred_text, [gold_text])
             f1 = token_f1(pred_text, [gold_text])
 
@@ -7938,6 +9472,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         for turn, span in zip(
             trace.bgkit_turns, trace.bgkit_call_spans, strict=True,
         ):
+            if not _is_scored_bgkit_turn(turn):
+                continue
             bgkit_scores.append(
                 _score_call_span(
                     preds, shift_m, span,
@@ -7956,6 +9492,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             "loss": float(output.loss.item()),
             "tokens": tokens,
             "correct": correct,
+            "answer_correct": answer_correct,
+            "answer_tokens": answer_tokens,
             "em": em,
             "f1": f1,
             "pred_text": pred_text,
