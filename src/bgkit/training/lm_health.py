@@ -107,3 +107,32 @@ def lm_health_metrics(
         return {}
     ce = total_nll / total_tok
     return {f"{prefix}/ce": ce, f"{prefix}/ppl": math.exp(min(ce, 20.0))}
+
+
+def load_decoder_tensors(root: str | Path, family: str = "qwen35") -> dict:
+    """Decoder state dict from any on-disk checkpoint layout bgkit ships.
+
+    Three have accumulated: the Phase-2 trainers' joint ``model.pt`` keyed
+    ``decoders.<family>.backbone.*``, BlobSFTTrainer's ``decoder.backbone.*``,
+    and the summarization base's per-model ``decoder_qwen.pt``. A probe that
+    knows only one of them silently loads NOTHING and reports a fake result,
+    so the prefix search is explicit and failure is loud.
+    """
+    import torch
+
+    root = Path(root)
+    joint, solo = root / "model.pt", root / "decoder_qwen.pt"
+    src = joint if joint.exists() else solo
+    if not src.exists():
+        raise FileNotFoundError(f"no model.pt or decoder_qwen.pt under {root}")
+    sd = torch.load(str(src), map_location="cpu", mmap=True, weights_only=True)
+    if isinstance(sd, dict) and isinstance(sd.get("model"), dict):
+        sd = sd["model"]
+    for prefix in (f"decoders.{family}.backbone.", "decoder.backbone.", "backbone.", ""):
+        cand = (
+            {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+            if prefix else dict(sd)
+        )
+        if "model.embed_tokens.weight" in cand:
+            return cand
+    raise ValueError(f"cannot locate decoder tensors in {src}")

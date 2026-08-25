@@ -95,34 +95,9 @@ def main() -> None:
             args.model, dtype=torch.bfloat16, trust_remote_code=True
         )
         if arm != "stock":
-            # Two on-disk layouts: the joint `model.pt` of the Phase-2 trainers
-            # and the per-model `decoder_qwen.pt` of the summarization base.
-            root = Path(arm)
-            joint = root / "model.pt"
-            solo = root / "decoder_qwen.pt"
-            if joint.exists():
-                sd = torch.load(
-                    str(joint), map_location="cpu", mmap=True, weights_only=True)
-                prefix = f"decoders.{args.family}.backbone."
-                trimmed = {
-                    k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)
-                }
-            elif solo.exists():
-                sd = torch.load(
-                    str(solo), map_location="cpu", mmap=True, weights_only=True)
-                if isinstance(sd, dict) and "model" in sd and isinstance(sd["model"], dict):
-                    sd = sd["model"]
-                for pre in ("backbone.", "decoder.backbone.", ""):
-                    cand = {
-                        k[len(pre):]: v for k, v in sd.items() if k.startswith(pre)
-                    } if pre else dict(sd)
-                    if "model.embed_tokens.weight" in cand:
-                        trimmed = cand
-                        break
-                else:
-                    raise SystemExit(f"cannot locate decoder tensors in {solo}")
-            else:
-                raise SystemExit(f"no model.pt or decoder_qwen.pt under {root}")
+            from bgkit.training.lm_health import load_decoder_tensors
+
+            trimmed = load_decoder_tensors(arm, args.family)
             missing, unexpected = model.load_state_dict(trimmed, strict=False)
             print(
                 f"loaded {len(trimmed)} tensors "
