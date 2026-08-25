@@ -50,6 +50,12 @@ def main(cfg: DictConfig) -> None:
             content_rows = int(turn["content"].shape[0])
             pinned = int(turn["pinned"].sum().item())
             l0_surv = int(turn["survivor_mask"].sum().item())
+            # L0 ENCODES gold + distractors, so the survivor count is over ALL
+            # of them; dividing by the gold article's length alone reads as a
+            # 4x-too-high keep rate (2026-08-25: a configured 0.10 looked like
+            # 0.40 in a config that had inherited n_distractors=3).
+            n_l0_articles = 1
+            n_l0_tokens = n_tok
             # L0 head score health: raw score stats + tanh-rail saturation
             # (the 2026-08-22 collapse: every token at tanh(raw/T) == -1).
             l0_out = None
@@ -69,6 +75,10 @@ def main(cfg: DictConfig) -> None:
                     flush=True,
                 )
                 trainer._pending_l0_outputs = []
+            content_cu = getattr(trainer, "_last_l0_content_cu", None)
+            if content_cu is not None and int(content_cu.numel()) > 1:
+                n_l0_articles = int(content_cu.numel()) - 1
+                n_l0_tokens = int(content_cu[-1].item())
             ratio_l1 = trainer._drill_leaf_l1_retention_override()
             survs = trainer._run_l1_batch([turn], target_ratio=ratio_l1)
             reps = int(survs[0].shape[0])
@@ -88,7 +98,9 @@ def main(cfg: DictConfig) -> None:
             theta_s = f"{float(theta):.4f}" if theta is not None else "?"
             print(
                 f"DIAG {sample.dataset_name}: N={n_tok} l1_content_rows={content_rows} "
-                f"(pinned={pinned}, l0_survivors={l0_surv}, l0_keep={l0_surv / max(n_tok, 1):.3f}) "
+                f"(pinned={pinned}, l0_survivors={l0_surv}, "
+                f"l0_keep={l0_surv / max(n_l0_tokens, 1):.3f} over "
+                f"{n_l0_articles} article(s)/{n_l0_tokens} tok) "
                 f"reps={reps} (rep/N={reps / max(n_tok, 1):.3f}) decode_len={dec_len} "
                 f"l0_cfg_ratio={trainer._l0_retention_for(sample.dataset_name):.3f} "
                 f"l0_mode={getattr(trainer, '_selection_mode_l0', '?')} "

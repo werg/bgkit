@@ -50,6 +50,16 @@ training:
     l0: exact_topk
     l1: exact_topk
 
+  survivorship:
+    # NO DISTRACTORS. Stage A's default of 3 is a training-time relevance
+    # signal; in a benchmark arm it would splice reps from three unrelated
+    # BABILong documents into the decoder alongside the real one, spending
+    # 4x the rep budget and changing what is being measured. (The first
+    # preflight showed l0_keep ~0.40 against a configured 0.10 — that was
+    # 4 articles' survivors over the gold article's length, not a
+    # mis-applied ratio.)
+    n_distractors: 0
+
   qwen_decoder_prob: 1.0
   training_time_ablation:
     p_skip_bgkit: 0.0
