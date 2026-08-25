@@ -402,9 +402,21 @@ class BlobSFTTrainer(BaseTrainer):
             token_ids, loss_mask, sample["sentinel_spans"], survivors,
             zero_reps=zero_reps,
         )
-        result = self.decoder.forward_interleaved_with_loss(
-            segments, return_hidden_states=return_output,
-        )
+        # The decoder's spliced-rep norm guard escalates to RuntimeError after
+        # a streak of degenerate splices. Under ``zero_reps`` the degenerate
+        # reps ARE the experiment, so the guard must stand down for exactly
+        # that forward — set here, the single choke point through which every
+        # ablation forward passes, so the flag cannot drift out of sync.
+        # (2026-08-25: the standalone 256-sample eval crashed here; the
+        # in-training pass only ever ran short enough streaks to survive.)
+        prev = getattr(self.decoder, "_rep_norm_guard_expect_degenerate", False)
+        self.decoder._rep_norm_guard_expect_degenerate = bool(zero_reps)
+        try:
+            result = self.decoder.forward_interleaved_with_loss(
+                segments, return_hidden_states=return_output,
+            )
+        finally:
+            self.decoder._rep_norm_guard_expect_degenerate = prev
         n_reps = sum(int(s.shape[0]) for s in survivors)
         return result, n_reps
 

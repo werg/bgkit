@@ -101,3 +101,35 @@ def test_resolve_shards_dedupes_and_excludes(tmp_path):
     assert _resolve_shards([pat]) == [str(a), str(b)]
     assert _resolve_shards([pat], exclude={str(b)}) == [str(a)]
     assert _resolve_shards([pat, str(a)]) == [str(a), str(b)]
+
+
+def test_zeroed_ablation_stands_down_the_rep_norm_guard():
+    """The decoder's spliced-rep norm guard raises after a streak of
+    degenerate splices. Under the zeroed-rep ablation those splices are the
+    experiment — the 2026-08-25 standalone 256-sample eval crashed because
+    the flag was never armed (the in-training pass ran short enough streaks
+    to survive)."""
+
+    class _Dec:
+        def __init__(self):
+            self.seen = []
+
+        def forward_interleaved_with_loss(self, segments, return_hidden_states=False):
+            self.seen.append(getattr(self, "_rep_norm_guard_expect_degenerate", False))
+            return "out"
+
+    t = BlobSFTTrainer.__new__(BlobSFTTrainer)
+    t.device = torch.device("cpu")
+    t.decoder = _Dec()
+    t._encode_blobs = lambda contents: [torch.zeros(2, 4)]
+    sample = {
+        "token_ids": torch.arange(10, dtype=torch.long),
+        "loss_mask": torch.ones(10, dtype=torch.bool),
+        "sentinel_spans": [(4, 6)],
+        "blob_content_ids": [torch.zeros(3, dtype=torch.long)],
+    }
+    t._sample_loss(sample, zero_reps=True)
+    t._sample_loss(sample, zero_reps=False)
+    assert t.decoder.seen == [True, False]
+    # Restored afterwards, so a live forward is never left unguarded.
+    assert t.decoder._rep_norm_guard_expect_degenerate is False
