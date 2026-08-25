@@ -294,3 +294,17 @@ decoder_qwen:
 decoder_falcon:
   family: falcon_h1
   backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+
+# Held-out plain-text language health (2026-08-25). Mean next-token CE over a
+# fixed slice of ordinary text, no template and no task involved. This is the
+# ONLY eval metric that can see the decoder's general language ability
+# collapsing: the wide-net runs took it from PPL 33 to 2585 while eval loss,
+# token accuracy, exact match and the zeroed-rep ablation all looked merely
+# mediocre, because every one of those is measured on the distribution being
+# overfit. Watch DRIFT from the first eval's value, not an absolute number —
+# the healthy starting point is lineage-specific (stock 15, summ. base 33).
+# 0 disables. 16 x 1024 tokens is a rounding error against an eval pass.
+lm_health_samples: 16
+lm_health_seq_len: 1024
+# Defaults to training.data.file_tokens_path when unset.
+lm_health_tokens_path: null

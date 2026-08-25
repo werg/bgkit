@@ -59,7 +59,10 @@ def mean_ce(model, chunks: list[torch.Tensor]) -> float:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument(
+        "--checkpoint", required=True, action="append",
+        help="repeat to compare several checkpoints in one pass (lineage sweep)",
+    )
     ap.add_argument("--family", default="qwen35")
     ap.add_argument("--model", default="Qwen/Qwen3.5-0.8B")
     ap.add_argument("--tokens-dir", required=True, help="token shard dir (held-out text)")
@@ -87,17 +90,39 @@ def main() -> None:
     print(f"{len(chunks)} chunks x {args.seq_len} tokens", flush=True)
 
     results: dict[str, float] = {}
-    for arm in ("stock", "finetuned"):
+    for arm in ["stock", *args.checkpoint]:
         model = AutoModelForCausalLM.from_pretrained(
             args.model, dtype=torch.bfloat16, trust_remote_code=True
         )
-        if arm == "finetuned":
-            sd = torch.load(
-                str(Path(args.checkpoint) / "model.pt"),
-                map_location="cpu", mmap=True, weights_only=True,
-            )
-            prefix = f"decoders.{args.family}.backbone."
-            trimmed = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
+        if arm != "stock":
+            # Two on-disk layouts: the joint `model.pt` of the Phase-2 trainers
+            # and the per-model `decoder_qwen.pt` of the summarization base.
+            root = Path(arm)
+            joint = root / "model.pt"
+            solo = root / "decoder_qwen.pt"
+            if joint.exists():
+                sd = torch.load(
+                    str(joint), map_location="cpu", mmap=True, weights_only=True)
+                prefix = f"decoders.{args.family}.backbone."
+                trimmed = {
+                    k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)
+                }
+            elif solo.exists():
+                sd = torch.load(
+                    str(solo), map_location="cpu", mmap=True, weights_only=True)
+                if isinstance(sd, dict) and "model" in sd and isinstance(sd["model"], dict):
+                    sd = sd["model"]
+                for pre in ("backbone.", "decoder.backbone.", ""):
+                    cand = {
+                        k[len(pre):]: v for k, v in sd.items() if k.startswith(pre)
+                    } if pre else dict(sd)
+                    if "model.embed_tokens.weight" in cand:
+                        trimmed = cand
+                        break
+                else:
+                    raise SystemExit(f"cannot locate decoder tensors in {solo}")
+            else:
+                raise SystemExit(f"no model.pt or decoder_qwen.pt under {root}")
             missing, unexpected = model.load_state_dict(trimmed, strict=False)
             print(
                 f"loaded {len(trimmed)} tensors "
@@ -108,13 +133,13 @@ def main() -> None:
                 raise SystemExit("checkpoint/model key mismatch — probe would be invalid")
         model = model.cuda().eval()
         ce = mean_ce(model, chunks)
-        results[f"{arm}/ce"] = ce
-        results[f"{arm}/ppl"] = math.exp(min(ce, 20.0))
-        print(f"{arm}: CE {ce:.4f}  PPL {results[f'{arm}/ppl']:.2f}", flush=True)
+        label = arm if arm == "stock" else Path(arm).name
+        results[f"{label}/ce"] = ce
+        results[f"{label}/ppl"] = math.exp(min(ce, 20.0))
+        print(f"{label}: CE {ce:.4f}  PPL {results[f'{label}/ppl']:.2f}", flush=True)
         del model
         torch.cuda.empty_cache()
 
-    results["ce_delta"] = results["finetuned/ce"] - results["stock/ce"]
     print("SUMMARY", json.dumps(results, indent=2))
     if args.out_json:
         Path(args.out_json).write_text(json.dumps(results, indent=2))

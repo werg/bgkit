@@ -123,6 +123,9 @@ class BlobSFTTrainer(BaseTrainer):
         self.encoder: nn.Module | None = None
         self.decoder = None
         self.tokenizer = None
+        # Fixed held-out text slice for the plain-LM health metric (loaded
+        # once on first eval); see bgkit.training.lm_health.
+        self._lm_health_chunks: list | None = None
 
     # ------------------------------------------------------------------
     # Setup
@@ -324,6 +327,25 @@ class BlobSFTTrainer(BaseTrainer):
         )
 
         # --- optimizer ---
+        # Freeze the decoder's tied embedding / LM head BEFORE collecting
+        # trainable params. Qwen3.5 ties lm_head to embed_tokens, so every
+        # softmax step otherwise rewrites the input embedding of all 248,320
+        # tokens to fit this task's narrow target distribution — the mechanism
+        # that took the wide-net decoder from PPL 33 to 2585 on plain text
+        # (2026-08-25). Family A inherits that decoder and would compound it.
+        if bool(self.step_cfg.get("freeze_decoder_embeddings", True)):
+            frozen = 0
+            bb = getattr(self.decoder, "backbone", self.decoder)
+            for mod in filter(None, (
+                bb.get_input_embeddings(), bb.get_output_embeddings(),
+            )):
+                for prm in mod.parameters():
+                    if prm.requires_grad:
+                        prm.requires_grad_(False)
+                        frozen += prm.numel()
+            logger.info("decoder_embeddings_frozen", params=frozen)
+        else:
+            logger.warning("decoder_embeddings_trainable_opt_out")
         lr = float(self.step_cfg.lr)
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = self._create_optimizer(
@@ -568,4 +590,24 @@ class BlobSFTTrainer(BaseTrainer):
                 # Equal EM counts can still hide churn (different probes right
                 # each way). 1.0 = the reps flipped no probe at all.
                 metrics["eval/probe_zeroed_agreement"] = probe_agree / zero_probe_n
+        # Plain held-out-text CE: the only metric here that can see the
+        # decoder's general language ability collapsing. Every other number
+        # above is measured on the distribution being fitted.
+        n_health = int(self.step_cfg.get("lm_health_samples", 0) or 0)
+        if n_health > 0:
+            from bgkit.training.lm_health import lm_health_metrics, load_health_chunks
+
+            try:
+                if getattr(self, "_lm_health_chunks", None) is None:
+                    self._lm_health_chunks = load_health_chunks(
+                        self.step_cfg.get("lm_health_tokens_path", None)
+                        or self.cfg.training.data.file_tokens_path,
+                        n_docs=n_health,
+                        seq_len=int(self.step_cfg.get("lm_health_seq_len", 1024)),
+                    )
+                metrics.update(
+                    lm_health_metrics(self.decoder, self._lm_health_chunks, self.device)
+                )
+            except Exception as exc:  # diagnostics must never kill a run
+                logger.warning("lm_health_failed", error=str(exc))
         return metrics

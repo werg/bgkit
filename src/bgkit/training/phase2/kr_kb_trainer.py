@@ -370,6 +370,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # ``recursive_l1_tree.selection_mode_l1``.
         self._selection_mode_l1: str = "threshold"
         self._selection_mode_l0: str = "threshold"
+        # Fixed held-out text slice for the plain-LM health metric; loaded
+        # once on first eval (see _lm_health_metrics).
+        self._lm_health_chunks: list | None = None
         # QUERY-CONDITIONED drill nodes (2026-07-31 redesign). When True, EVERY
         # trajectory drill turn — head, on-path interior nodes, wrong-sibling
         # distractor node drills, and the retrieve leaf — is encoded LIVE per
@@ -1389,6 +1392,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             # keep it aimed at the primary family until the first per-batch swap.
             self._decoders_by_family = dict(self.model.decoders)
             self.decoder = self._decoders_by_family[self._decoder_family]
+        self._freeze_decoder_embeddings()
         self.optimizer = self._create_optimizer(
             self._build_optimizer_groups(),
             default_lr=float(self.step_cfg.get("lr", 1e-4)),
@@ -7329,6 +7333,58 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
         return metrics
 
+    def _freeze_decoder_embeddings(self) -> None:
+        """Freeze each decoder's token embedding (and, when tied, its LM head).
+
+        THE 2026-08-25 REGRESSION. Wide-net Phase-2 training took the decoder
+        from PPL 33 (summarization base) to 671 (v6) to 2585 (v7) on held-out
+        plain text — catastrophic, monotonic, and invisible to every
+        in-distribution metric. The mechanism is the tied embedding:
+
+        - Qwen3.5 has ``tie_word_embeddings=True``, so ``lm_head`` IS
+          ``embed_tokens`` — one matrix of 248,320 rows.
+        - Every optimizer step, the softmax denominator puts gradient on
+          EVERY row of that matrix; because it is tied, each step rewrites the
+          INPUT embedding of every token in the vocabulary.
+        - Phase-2 targets are ~107 loss-bearing tokens per sample of tool-call
+          scaffolding and short code answers — an extremely narrow output
+          distribution to reshape a whole vocabulary around.
+        - At lr 1e-4 for 2629 steps, AdamW's per-element update budget
+          (~0.26) is ~65x the per-element scale of an embedding row
+          (norm 0.63 over 1024 dims). Measured drift: row-wise cosine 0.56 to
+          pristine, norm 0.80x.
+        - The backbone then co-adapts to the deformed embedding, which is why
+          swapping the pristine embedding back in makes perplexity WORSE
+          (1125 vs 611): the halves only function as a degenerate pair.
+        - Each run resumes from the last, so the damage compounds across runs.
+
+        Phase 1 never had this problem because it keeps the decoder's
+        embedding as a fixed ANCHOR and repairs the projection against it
+        (Step 2.5, "projection embed-anchor repair"). Phase 2 dropped that
+        discipline and let the anchor itself move. Freezing restores it: the
+        backbone still adapts to the splice, but the token geometry the whole
+        model is built on stops moving.
+
+        ``training.freeze_decoder_embeddings: false`` opts out.
+        """
+        if not bool(self.step_cfg.get("freeze_decoder_embeddings", True)):
+            logger.warning("decoder_embeddings_trainable_opt_out")
+            return
+        frozen = 0
+        for dec in self._all_decoders():
+            backbone = getattr(dec, "backbone", dec)
+            for mod in filter(None, (
+                backbone.get_input_embeddings() if hasattr(backbone, "get_input_embeddings")
+                else None,
+                backbone.get_output_embeddings() if hasattr(backbone, "get_output_embeddings")
+                else None,
+            )):
+                for p in mod.parameters():
+                    if p.requires_grad:
+                        p.requires_grad_(False)
+                        frozen += p.numel()
+        logger.info("decoder_embeddings_frozen", params=frozen)
+
     def _all_decoders(self) -> list:
         """Decoders to optimize/save: both families in round-robin, else one."""
         if getattr(self, "_decoders_by_family", None):
@@ -8906,7 +8962,50 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         finally:
             self._clear_eval_shared_tree()
             self.model.train()
+        metrics.update(self._lm_health_metrics())
         return metrics
+
+    def _lm_health_metrics(self) -> dict[str, float]:
+        """Held-out plain-text CE for the active decoder(s).
+
+        The wide-net runs took this decoder from PPL 33 to 2585 while eval
+        loss, token accuracy, exact match AND a zeroed-rep ablation all
+        looked merely mediocre — nothing in-distribution can see catastrophic
+        forgetting, because every in-distribution metric is measured on the
+        distribution being overfit. Watch DRIFT from the first eval's value,
+        not an absolute threshold: the healthy starting point is
+        lineage-specific (stock 15, summarization base 33).
+        """
+        n = int(self.step_cfg.get("lm_health_samples", 0) or 0)
+        if n <= 0:
+            return {}
+        from bgkit.training.lm_health import lm_health_metrics, load_health_chunks
+
+        try:
+            if getattr(self, "_lm_health_chunks", None) is None:
+                tokens_dir = self.step_cfg.get("lm_health_tokens_path", None) or (
+                    self.cfg.training.data.file_tokens_path
+                )
+                self._lm_health_chunks = load_health_chunks(
+                    tokens_dir,
+                    n_docs=n,
+                    seq_len=int(self.step_cfg.get("lm_health_seq_len", 1024)),
+                )
+            out: dict[str, float] = {}
+            families = getattr(self, "_decoders_by_family", None) or {
+                getattr(self, "_decoder_family", "decoder"): self.decoder
+            }
+            for family, dec in families.items():
+                out.update(
+                    lm_health_metrics(
+                        dec, self._lm_health_chunks, self.device,
+                        prefix=f"eval/lm_health/{family}",
+                    )
+                )
+            return out
+        except Exception as exc:  # diagnostics must never kill a run
+            logger.warning("lm_health_failed", error=str(exc))
+            return {}
 
     def _grad_norm_param_groups(self) -> dict[str, list]:
         """Pre-clip gradient-norm groups: backbones, the small survivorship

@@ -1,0 +1,109 @@
+"""Held-out plain-text language health for the decoder (2026-08-25).
+
+WHY THIS EXISTS. The Phase-2 wide-net runs destroyed the decoder's language
+model without a single in-distribution metric noticing. Measured after the
+fact by plain next-token cross-entropy on held-out FineWeb-Edu:
+
+    stock Qwen3.5-0.8B                    PPL   15.1
+    summarization base (step 51945)       PPL   33.2   <- healthy start
+    wide-net v6   (2629 steps)            PPL  670.7
+    wide-net v7   (+999 steps at 6x)      PPL 2585.2   <- still descending
+
+Throughout, the runs' own eval loss, token accuracy and exact match looked
+merely mediocre, and a zeroed-rep ablation still showed the reps to be
+load-bearing (fileneedle EM 0.385 -> 0.026), so nothing flagged a problem.
+The damage is diffuse — swapping the pristine embedding back in makes
+perplexity WORSE (1125 vs 611), because the backbone co-adapted to the
+rotated token geometry — so no weight-norm guard on a single tensor would
+have caught it either.
+
+The cheap, format-free instrument that WOULD have caught it in the first
+hundred steps is this one: mean CE over a fixed slice of ordinary text.
+It needs no chat template, no instruction-following and no task ability, so
+it isolates "is this still a language model" from "is it good at our task".
+
+Wire-up: trainers call :func:`lm_health_metrics` from ``evaluate()`` and get
+``eval/lm_health/{ce,ppl}`` back. Gate with ``training.lm_health_samples``
+(0 disables). Watch for drift from the FIRST eval's value, not an absolute
+threshold — the healthy starting point differs per lineage.
+"""
+
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import numpy as np
+import structlog
+import torch
+
+logger = structlog.get_logger()
+
+
+def load_health_chunks(
+    tokens_dir: str | Path,
+    *,
+    n_docs: int = 32,
+    seq_len: int = 1024,
+) -> list[torch.Tensor]:
+    """Fixed slice of held-out text as ``(seq_len,)`` token tensors.
+
+    Drawn from the LAST shard so it stays clearly disjoint from anything the
+    training corpora sample, and deterministic so the metric is comparable
+    across steps and across runs.
+    """
+    import pyarrow.parquet as pq
+
+    shards = sorted(Path(tokens_dir).glob("shard_*.parquet"))
+    if not shards:
+        raise FileNotFoundError(f"no shard_*.parquet under {tokens_dir}")
+    rows = pq.read_table(shards[-1], columns=["token_ids"]).to_pylist()
+    chunks: list[torch.Tensor] = []
+    for row in rows:
+        arr = np.asarray(row["token_ids"], dtype=np.int64)
+        if arr.size >= seq_len:
+            chunks.append(torch.from_numpy(arr[:seq_len]))
+        if len(chunks) >= n_docs:
+            break
+    return chunks
+
+
+@torch.no_grad()
+def lm_health_metrics(
+    decoder,
+    chunks: list[torch.Tensor],
+    device: torch.device,
+    *,
+    prefix: str = "eval/lm_health",
+) -> dict[str, float]:
+    """Mean next-token CE (and perplexity) of ``decoder`` on ``chunks``.
+
+    ``decoder`` may be a bgkit ``ReconstructionDecoder`` (``.backbone``) or a
+    bare HF causal LM. No splice, no reps, no prompt — just the tokens.
+    """
+    if not chunks:
+        return {}
+    model = getattr(decoder, "backbone", decoder)
+    was_training = model.training
+    model.eval()
+    total_nll = 0.0
+    total_tok = 0
+    try:
+        for ids in chunks:
+            ids = ids.unsqueeze(0).to(device)
+            logits = model(input_ids=ids).logits[:, :-1].float()
+            targets = ids[:, 1:]
+            nll = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                targets.reshape(-1),
+                reduction="sum",
+            )
+            total_nll += float(nll.item())
+            total_tok += int(targets.numel())
+    finally:
+        if was_training:
+            model.train()
+    if total_tok == 0:
+        return {}
+    ce = total_nll / total_tok
+    return {f"{prefix}/ce": ce, f"{prefix}/ppl": math.exp(min(ce, 20.0))}
