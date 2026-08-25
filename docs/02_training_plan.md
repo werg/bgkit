@@ -3,6 +3,12 @@
 This is the executable training map. Exact hyperparameters live in Hydra
 configs; research alternatives live in `plans/`.
 
+> **Direction change (2026-08-20):** the Phase-2 browse/navigation training
+> direction and the Phase-2 → Phase-3 promotion path below are superseded by
+> `plans/capability_packaging_2026_08_20.md` (compaction, wide-net tool-result
+> compression, compressed memory, ambient repo background). This file remains
+> the accurate map of implemented machinery.
+
 ## Phase 1: compression and reconstruction
 
 Phase 1 develops the encoder/decoder representation contract through several
@@ -66,14 +72,18 @@ Stage-B batching is budgeted by cached survivor rows
 (`max_microbatch_l0_survivors`) rather than raw document tokens. Oversized
 samples become singleton microbatches.
 
-### Evaluation limitation
+### Evaluation contract
 
-`scripts/eval_phase2_kb.py` currently uses the gold trajectory as a
-teacher-forced prefix and predicts next tokens. It is useful for regression and
-conditional likelihood, but tool ID/F1 values are not free-running agent
-performance. A valid quality gate still needs an autonomous loop that executes
-generated tool calls, paired present/zero/noise ablations, held-out repositories
-or documents, and matched-decoder BM25/dense/reranker baselines.
+`scripts/eval_phase2_kb.py` runs an autonomous loop that executes generated tool
+calls, rejects IDs that were not exposed by an executed node, and reports route
+completion, evidence recall, literal full-state exact match, and answer F1.
+Teacher-forced token/tool metrics remain in the same report as diagnostics. The
+git-reproduction preset also runs a small autonomous slice during periodic
+checkpoint evaluation.
+
+A production quality gate still needs acceptance thresholds and matched-decoder
+BM25/dense/reranker baselines. Use repository-disjoint held-out data and retain
+the present/zero/noise representation ablations when comparing checkpoints.
 
 ## Phase 3: SWE trajectory imitation prototype
 

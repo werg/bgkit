@@ -72,10 +72,11 @@ independent experiments.
 
 ## Evaluation interpretation
 
-- Phase-2 `eval_phase2_kb.py`: teacher-forced regression only.
+- Phase-2 `eval_phase2_kb.py`: free-running tool execution is the capability
+  result; teacher-forced token/tool scores are diagnostics.
 - Phase-3 trainer eval: paired token loss with and without context.
-- Neither result is an autonomous SWE-bench or free-running browse score.
+- Neither result is an autonomous SWE-bench score.
 
 Record the checkpoint name, run name, config snapshot, dataset split, cache
-fingerprints, ablation arm, and whether generation was teacher-forced with every
-reported metric.
+fingerprints, ablation arm, and whether each reported metric was free-running or
+teacher-forced.

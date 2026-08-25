@@ -1,6 +1,6 @@
 # Current Project Status
 
-Last reconciled with the implementation: 2026-07-11.
+Last reconciled with the implementation: 2026-08-02.
 
 ## Implemented
 
@@ -10,6 +10,14 @@ Last reconciled with the implementation: 2026-07-11.
 - Phase-2 browse-tree datasets, cached/live L0 paths, live query-conditioned L1,
   interleaved dense decoder splices, recursive git-history experiments, and
   complete Stage-A/prompt-fit → Stage-B model handoff.
+- Git-history schema-v2 extraction with real commit/parent SHAs, rename-aware
+  file lineages, exact hunk replay, reconstruction anchors, repository-level
+  held-out splits, opaque model-facing IDs, and fingerprinted tree/mmap/
+  trajectory generations.
+- Free-running Phase-2 evaluation that executes generated `bgkit` calls,
+  rejects unsurfaced IDs, and reports route completion, evidence recall, and
+  literal full-state exact match plus answer F1. Teacher-forced metrics remain
+  separate diagnostics.
 - Content-fingerprinted L0 cache manifests for checkpoint files or directories.
 - Run-scoped checkpoint save names, resume, registry selection, pruning, NVMe
   recovery, and HDD retention.
@@ -18,9 +26,9 @@ Last reconciled with the implementation: 2026-07-11.
 
 ## Experimental or incomplete
 
-- Phase-2 survivorship heads are frozen in current presets because auxiliary
-  losses are disabled; task loss cannot directly optimize the hard mask.
-- Phase-2 evaluation is teacher-forced, not an autonomous tool loop.
+- Hard selection masks still need explicit survivorship auxiliary objectives;
+  the git-reproduction production preset enables them, while other presets may
+  intentionally retain a frozen inherited selector.
 - Phase-3 git-history and prior-session consumers have leakage-safe contracts,
   but their cache producers are not shipped and the sources are disabled.
 - Phase-3 trains on external trajectory tokens; frozen-teacher KL/hint designs
@@ -38,6 +46,14 @@ Last reconciled with the implementation: 2026-07-11.
 
 ## Recommended product direction
 
+**Decision 2026-08-20:** the navigation-based knowledge-retrieval formulation
+is judged a dead end (reconstruction trained well; navigation ID-accuracy
+never left zero across two ID redesigns). Active direction is now
+`plans/capability_packaging_2026_08_20.md`: package soft-prompt injection +
+memory — trajectory compaction, targeted compression of wide tool results,
+compressed cross-session memory, and staged whole-repo ambient background.
+The paragraphs below predate this decision.
+
 The strongest near-term use case is repository state and change-impact
 reasoning: reconstructing file state from histories, API migrations,
 dependency changes, and cross-file invariants. It naturally exercises the
@@ -52,8 +68,8 @@ cheaper and exact.
 ## Immediate engineering priorities
 
 1. Add a golden end-to-end handoff/cache test using small real model fixtures.
-2. Build a free-running Phase-2 tool executor and paired matched-decoder RAG
-   baseline.
+2. Add matched-decoder BM25/dense/reranker baselines and acceptance thresholds
+   around the free-running Phase-2 evaluator.
 3. Measure the context contribution on unseen repositories before expanding
    Phase 3.
 4. Split the Phase-2 trainer monolith along cache, tree encode, decoder assembly,

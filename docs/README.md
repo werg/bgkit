@@ -9,6 +9,8 @@ mistaken for a runtime contract.
 - `01_overview.md` — model and checkpoint contracts reflected by current code.
 - `02_training_plan.md` — runnable phase workflows and known evaluation limits.
 - `runbook.md` — setup, validation, cache, checkpoint, and launch operations.
+- `git_commit_repro_pipeline.md` — versioned git-history extraction and artifact
+  rebuild contract.
 - `survivorship_design.md` — selector mechanics and loss menu; Phase-2 config
   switches still determine which losses are active.
 - `taxonomies.md` — browse-tree/taxonomy data formats.

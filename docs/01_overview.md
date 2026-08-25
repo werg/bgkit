@@ -51,10 +51,14 @@ fraction of non-empty eligible samples on which an enabled floor actually
 activated; it is zero when the floor is disabled.
 
 The selection mask is discrete and detached from the main task loss. Therefore
-the head learns only when survivorship auxiliary losses are enabled. Current
-Phase-2 production presets deliberately set `survivorship_aux: false`, freezing
-the inherited policy while representations train around it. Treat this as an
-experimental baseline, not as evidence that the selector is task-optimal.
+the head learns only when survivorship auxiliary losses are enabled. The
+git-reproduction production preset enables relevance and utility supervision;
+presets that disable those losses intentionally freeze the inherited policy and
+must be treated as ablations, not evidence that the selector is task-optimal.
+
+Pinned ID rows are forced protocol carriers, not controllable content choices.
+Exact-ratio quotas and selector auxiliary ratios therefore exclude them from
+the eligible population.
 
 ## Phase-2 handoff contract
 
