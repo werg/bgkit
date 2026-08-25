@@ -58,13 +58,13 @@ def main(cfg: DictConfig) -> None:
                 l0_out = pend[-1].get("enc_out")
             if l0_out is not None and getattr(l0_out, "base_raw", None) is not None:
                 br = l0_out.base_raw.detach().float()
-                T = float(trainer.encoder.l0.head_tanh_temperature)
-                sq = torch.tanh(br / T)
+                temp = float(trainer.encoder.l0.head_tanh_temperature)
+                sq = torch.tanh(br / temp)
                 floor_frac = (sq <= -0.999).float().mean()
                 ceil_frac = (sq >= 0.999).float().mean()
                 print(
                     f"  L0 head: base_raw mean={br.mean():.2f} std={br.std():.2f} "
-                    f"min={br.min():.1f} max={br.max():.1f} T={T:.2f} "
+                    f"min={br.min():.1f} max={br.max():.1f} T={temp:.2f} "
                     f"tanh rail frac: floor={floor_frac:.3f} ceil={ceil_frac:.3f}",
                     flush=True,
                 )
@@ -90,6 +90,8 @@ def main(cfg: DictConfig) -> None:
                 f"DIAG {sample.dataset_name}: N={n_tok} l1_content_rows={content_rows} "
                 f"(pinned={pinned}, l0_survivors={l0_surv}, l0_keep={l0_surv / max(n_tok, 1):.3f}) "
                 f"reps={reps} (rep/N={reps / max(n_tok, 1):.3f}) decode_len={dec_len} "
+                f"l0_cfg_ratio={trainer._l0_retention_for(sample.dataset_name):.3f} "
+                f"l0_mode={getattr(trainer, '_selection_mode_l0', '?')} "
                 f"l1_ratio={ratio_l1} theta_l0={theta_s}",
                 flush=True,
             )

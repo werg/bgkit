@@ -19,6 +19,10 @@ NVME=/home/werg/bgkit-data-nvme/capability_packaging
 BL=$NVME/benchmarks/babilong
 COMPOSE="docker compose --env-file .env -f docker/docker-compose.yaml"
 OUT=$FAST/babilong_bgkit
+# Same directory as the container sees it: $FAST is bind-mounted there, and
+# hydra writes the report from INSIDE the container (a host path under
+# /home/werg is not writable there — PermissionError, 2026-08-25).
+COUT=/workspace/checkpoints_fast/babilong_bgkit
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*"; }
 
 CKPT_67X=${1:-}
@@ -55,7 +59,7 @@ run_arm() {  # $1 = experiment, $2 = checkpoint, $3 = tag
     python scripts/eval_phase2_kb.py "+experiment=$exp" \
       "+eval.checkpoint=$ckpt" +eval.per_sample=true +eval.max_samples=400 \
       +eval.free_running=true +eval.max_tool_calls=2 +eval.max_new_tokens=128 \
-      "+eval.output_dir=$OUT/$tag" 2>&1 | tail -40
+      "+eval.output_dir=$COUT/$tag" 2>&1 | tail -40
   local report
   report=$(ls -t "$OUT/$tag"/eval_phase2_kb_stage_*.json 2>/dev/null | head -1)
   if [ -z "$report" ]; then log "arm $tag: NO REPORT WRITTEN"; return 1; fi
