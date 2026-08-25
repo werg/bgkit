@@ -39,9 +39,11 @@ training:
     flush_when_free_below_gb: 30
   # Dense language-health sampling is the whole point of the run.
   eval_every: 50
-  save_every: 200
+  save_every: 50
   warmup_steps: 200
-  lm_health_samples: 32
+  # In-run lm_health is OFF (it kills the run — see stage_a). The timeline
+  # is read OFFLINE from the step-50 checkpoints instead.
+  lm_health_samples: 0
   # Keep the eval cheap so a 50-step cadence is affordable; the headline
   # metric here is lm_health, not task quality.
   max_eval_samples: 32
