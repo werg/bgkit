@@ -81,4 +81,9 @@ training:
     ratio_loss_weight: 0.5
     n_distractors: 0
 
-  max_steps: 400
+  # 800, not 400: the historical wide-net was at PPL 2425 by step 655, so
+  # the run has to cross that point to be conclusive. NOTE a live-config
+  # max_steps bump does NOT work for this — the poll happens inside the
+  # training loop, and at global_step == max_steps the loop never runs
+  # (the first extension attempt exited with training_complete at 400).
+  max_steps: 800
