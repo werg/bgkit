@@ -907,6 +907,22 @@ class BaseTrainer(ABC):
         self._optimizer_type = optimizer_type
         self._muon_exclude_set = exclude_from_muon or frozenset()
 
+        # Every group MUST carry base_lr: the per-step schedule reads
+        # ``pg.get("base_lr", <global base_lr>)``, so a group that sets only
+        # "lr" has its rate silently replaced by training.lr on the very first
+        # step. KRKBTrainer built all of its groups that way, which meant
+        # decoder_lr / l0_lr / l1_lr / projection_lr NEVER took effect — the
+        # wide-net decoder trained at 1e-4 instead of the configured 5e-5
+        # (2x) while the encoder levels ran at half their configured 2e-4.
+        # git-repro sets every rate to the same 5e-5, so the flattening was a
+        # no-op there; that is exactly why the two lineages diverged
+        # (2026-08-25). Defaulting here fixes every trainer at one choke
+        # point and keeps the checkpoint's per_group_base_lrs honest, since
+        # save_checkpoint records the same key.
+        for group in param_groups:
+            if "base_lr" not in group:
+                group["base_lr"] = float(group.get("lr", default_lr))
+
         if optimizer_type == "muon":
             from bgkit.training.muon import Muon
 
