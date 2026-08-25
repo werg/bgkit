@@ -28,6 +28,8 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -38,6 +40,14 @@ import pyarrow.parquet as pq
 # bounded region on random access; large enough to keep per-batch metadata
 # overhead negligible (~1.87M rows / 16384 ≈ 114 batches).
 DEFAULT_MAX_CHUNKSIZE = 16384
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def ipc_path_for(parquet_path: Path) -> Path:
@@ -64,9 +74,23 @@ def convert_one(
             return None
         print(f"[stale] {out.name} older than parquet — rewriting")
 
+    source_sha = _sha256(parquet_path)
+    manifest_path = parquet_path.with_suffix(".manifest.json")
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        expected_sha = str(manifest.get("trajectory_sha256", ""))
+        if expected_sha and expected_sha != source_sha:
+            raise ValueError(
+                f"{manifest_path} does not describe {parquet_path}; rebuild the "
+                "trajectory artifact before converting it"
+            )
     print(f"[read] {parquet_path}  ({parquet_path.stat().st_size / 1e9:.2f} GB)")
-    table = pq.read_table(parquet_path)
-    print(f"[write] {out}  rows={table.num_rows:,}  uncompressed Arrow IPC "
+    parquet = pq.ParquetFile(parquet_path, memory_map=True)
+    schema = parquet.schema_arrow
+    metadata = dict(schema.metadata or {})
+    metadata[b"bgkit_source_parquet_sha256"] = source_sha.encode()
+    schema = schema.with_metadata(metadata)
+    print(f"[write] {out}  rows={parquet.metadata.num_rows:,}  uncompressed Arrow IPC "
           f"(max_chunksize={max_chunksize})")
     # Write to a temp file then atomically rename so a crash never leaves a
     # half-written .arrow the dataset would try to mmap.
@@ -75,8 +99,9 @@ def convert_one(
         # compression=None / IpcWriteOptions default => UNCOMPRESSED body, the
         # whole point (so memory_map pages raw column bytes on demand).
         opts = pa.ipc.IpcWriteOptions(compression=None)
-        with pa.ipc.new_file(sink, table.schema, options=opts) as writer:
-            writer.write_table(table, max_chunksize=max_chunksize)
+        with pa.ipc.new_file(sink, schema, options=opts) as writer:
+            for batch in parquet.iter_batches(batch_size=max_chunksize):
+                writer.write_batch(batch)
     tmp.replace(out)
     print(f"[done] {out}  ({out.stat().st_size / 1e9:.2f} GB on disk, uncompressed)")
     return out

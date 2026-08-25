@@ -574,6 +574,41 @@ def test_aux_off_post_step_runs_dual_ascent_without_pending():
     assert skip_levels == ()      # live_l0 -> L0 controller also updates
 
 
+def test_aux_on_post_step_resolves_nested_l0_curriculum_without_pending():
+    """An empty/cached L0 batch must not float() a curriculum dictionary."""
+    t = _aux_trainer()
+    t._survivorship_aux = True
+    t._live_l0 = True
+    t._selection_mode_l1 = "threshold"
+    t._pending_l0_outputs = []
+    t._pending_l1_outputs = []
+    t._l0_retention = {
+        "git_commit_repro": {
+            "start": 0.30,
+            "end": 0.10,
+            "ramp_steps": 100,
+        },
+    }
+    t._l1_retention = 0.20
+    t._recursive_l0_override = None
+    t.global_step = 50
+    t.step_cfg = {}
+    t._ice_teacher = None
+    t._max_warmup_step = 0
+
+    calls = []
+    t._run_dual_ascent = types.MethodType(
+        lambda self, step, *, target_ratios=None, skip_levels=(): calls.append(
+            (step, target_ratios, skip_levels),
+        ),
+        t,
+    )
+
+    t._post_optimizer_step(50)
+
+    assert calls == [(50, {"l0": pytest.approx(0.20), "l1": 0.20}, ())]
+
+
 # ---------------------------------------------------------------------------
 # 7. B1: l1l1_bridge MUST train (unfrozen + in an optimizer group + gets grad)
 # ---------------------------------------------------------------------------
@@ -1613,7 +1648,7 @@ def test_max_decode_tokens_truncates_long_gold_keeps_all():
         lambda self, prep, per_turn: (
             [TokenSegment(token_ids=torch.ones(prep["_g"], dtype=torch.long),
                           loss_mask=torch.ones(prep["_g"]))],
-            None,
+            SimpleNamespace(answer_span=(0, prep["_g"])),
         ),
         t,
     )
@@ -2202,24 +2237,24 @@ def test_truncate_segments_to_gold_budget():
             loss_mask=(torch.ones(n) if gold else torch.zeros(n)),
         )
 
-    # prefix (10 non-gold) + gold(20) + trailing (5 non-gold "suffix/end").
-    segs = [tok_seg(10, False), tok_seg(20, True), tok_seg(5, False)]
+    # Prefix tool call is also loss-bearing, but must not consume answer budget.
+    segs = [tok_seg(10, True), tok_seg(20, True), tok_seg(5, False)]
 
     # N=8 < 20 → cut inside the gold segment after the 8th gold token; drop the
     # gold tail + the trailing segment.
-    out = t._truncate_segments_to_gold_budget(segs, 8)
+    out = t._truncate_segments_to_gold_budget(segs, 8, (10, 30))
     assert len(out) == 2  # prefix + truncated gold (trailing dropped)
-    assert int(out[0].loss_mask.sum()) == 0
+    assert int(out[0].loss_mask.sum()) == 10
     assert int(out[1].loss_mask.sum()) == 8       # first-8 gold only
     assert out[1].token_ids.shape[0] == 8
 
     # N >= total gold → unchanged (no truncation, sample kept whole).
-    out2 = t._truncate_segments_to_gold_budget(segs, 50)
+    out2 = t._truncate_segments_to_gold_budget(segs, 50, (10, 30))
     assert out2 is segs or len(out2) == 3
-    assert sum(int(s.loss_mask.sum()) for s in out2) == 20
+    assert sum(int(s.loss_mask.sum()) for s in out2) == 30
 
     # N=0 → no-op.
-    assert t._truncate_segments_to_gold_budget(segs, 0) is segs
+    assert t._truncate_segments_to_gold_budget(segs, 0, (10, 30)) is segs
 
 
 def test_drill_checkpoint_gradient_parity_and_theta_once():

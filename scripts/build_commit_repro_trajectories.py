@@ -1,27 +1,10 @@
 #!/usr/bin/env python
 """Build ``git_commit_repro`` FILE-STATE-RECONSTRUCTION trajectories.
 
-One trajectory per (file, target_commit) where the commit touches the file and
-the file's blob at that commit is a valid gold target (``is_target``). The
-decoder is asked, via a filename + the target commit's FULL message, to emit the
-file's whole content after that commit — reconstructed from the file's diff
-history.
-
-Walk (within the target's repo+window, over commits touching the file,
-oldest→target, up to ``--K`` preceding commits):
-
-    for each commit in walk (oldest→target):
-        browse-navigate to the commit (dedup shared ancestors)
-        PRECEDING: with prob --drill-prob bgkit-drill the file's diff at it
-                   (else stop at the commit — random drill-down depth)
-        TARGET:    always bgkit-drill the file's diff at it
-    answer(the file's blob at the target commit)
-
-Distractors come for free from the trainer's existing sibling mechanism: a
-``bgkit([file_change_id])`` resolves to that one file via
-``BrowseTree.leaf_tag_for_article`` (its parent leaf-tag is the commit), and the
-trainer samples the commit's OTHER file-changes as distractors. No new
-mechanism.
+One trajectory is emitted per exactly validated file-state target. Production
+full-mode retrieves every transition from the nearest periodic base anchor to
+the target. A user cap rejects an overlong sample instead of silently omitting
+required history. No-drill and truncated modes remain explicit ablations.
 
 Output ``{output_dir}/git_commit_repro.parquet`` matches the schema consumed by
 :class:`bgkit.data.datasets.phase2_kb_dataset.KBTrajectoryDataset`.
@@ -33,7 +16,7 @@ import argparse
 import json
 import random
 import sys
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -48,7 +31,9 @@ from bgkit.data.bgkit_tool_template import trajectory_to_json
 from bgkit.data.browse_tree import BrowseTree
 from bgkit.data.commit_repro import (
     DATASET_NAME,
+    GIT_REPRO_SCHEMA_VERSION,
     HEAD_QUERY_TEMPLATES,
+    ID_SCHEME_VERSION,
     MAX_DISTRACTORS,
     QUERY_TEMPLATES,
     FileChange,
@@ -57,7 +42,12 @@ from bgkit.data.commit_repro import (
     build_per_file_index,
     build_query,
     commit_key,
+    file_sha256,
+    load_commit_node_sidecar,
+    reconstruction_chain,
+    require_record_schema,
     sha_for_record,
+    stable_repo_split,
 )
 from bgkit.data.drilldown import (
     DEFAULT_MODE_WEIGHTS,
@@ -72,19 +62,29 @@ FLUSH_ROWS = 2000
 
 def _parse_commit(rec: dict) -> ReproCommit:
     """Deserialize one JSONL record into a :class:`ReproCommit`."""
+    require_record_schema(rec)
     return ReproCommit(
         repo=str(rec["repo"]), sha=sha_for_record(rec),
+        parent_sha=str(rec.get("parent_sha", "")),
         ordinal=int(rec["ordinal"]), message=str(rec.get("message", "")),
         timestamp=int(rec.get("timestamp", 0)),
         window_idx=int(rec.get("window_idx", 0)),
         file_changes=[
             FileChange(
                 file_idx=int(fc["file_idx"]), path=str(fc["path"]),
+                old_path=str(fc.get("old_path", fc["path"])),
+                change_type=str(fc.get("change_type", "modified")),
+                lineage_id=str(fc.get("lineage_id", fc["path"])),
                 diff_text=str(fc.get("diff_text", "")),
                 n_tokens=int(fc.get("n_tokens", 0)),
                 blob_text=str(fc.get("blob_text", "")),
                 n_blob_tokens=int(fc.get("n_blob_tokens", 0)),
                 is_target=bool(fc.get("is_target", False)),
+                hunks=list(fc.get("hunks", [])),
+                base_blob_text=str(fc.get("base_blob_text", "")),
+                base_blob_available=bool(fc.get("base_blob_available", False)),
+                is_anchor=bool(fc.get("is_anchor", False)),
+                reconstruction_valid=bool(fc.get("reconstruction_valid", False)),
             )
             for fc in rec["file_changes"]
         ],
@@ -158,11 +158,6 @@ def main() -> None:
                         help="cap on touching-diff drill targets per sample; 0 = NO "
                              "cap (keep the file's FULL history so historical targets "
                              "are drilled, not just recent ones)")
-    parser.add_argument("--touching-sample", choices=("recent", "uniform"),
-                        default="uniform",
-                        help="when --max-touching>0, which touching commits to keep: "
-                             "'uniform' spreads across the whole history (target always "
-                             "included); 'recent' keeps the most-recent K (legacy).")
     parser.add_argument("--n-distractors", type=int, default=MAX_DISTRACTORS,
                         help="0..this distractor branches (loss=False) per sample")
     parser.add_argument(
@@ -191,11 +186,20 @@ def main() -> None:
     args = parser.parse_args()
     mode_weights = tuple(args.drill_mode_weights)
 
+    source_sha = file_sha256(args.input)
     tree = BrowseTree.load(args.browse_tree, dataset=DATASET_NAME)
-    commit_node_ids = json.loads(args.commit_node_ids.read_text())
+    commit_node_ids, id_salt, sidecar = load_commit_node_sidecar(
+        args.commit_node_ids, expected_source_sha256=source_sha,
+    )
+    if file_sha256(args.browse_tree) != str(sidecar.get("tree_sha256", "")):
+        raise ValueError(
+            "browse tree and commit-node sidecar fingerprints differ; rebuild "
+            "the artifact set together"
+        )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     out = args.output_dir / f"{DATASET_NAME}.parquet"
+    out_tmp = out.with_suffix(out.suffix + ".tmp")
     schema = pa.schema([
         ("dataset_name", pa.string()),
         ("scope_template", pa.string()),
@@ -204,16 +208,28 @@ def main() -> None:
         ("question", pa.string()),
         ("gold_answer", pa.string()),
         ("trajectory_json", pa.string()),
+        ("group_id", pa.string()),
+        ("repo_id", pa.string()),
+        ("split", pa.string()),
+        ("target_sha", pa.string()),
+        ("target_path", pa.string()),
+        ("drill_mode", pa.string()),
+        ("structural_depth", pa.int32()),
+        ("artifact_schema_version", pa.int32()),
+        ("id_scheme_version", pa.int32()),
+        ("source_sha256", pa.string()),
     ])
 
     # Incremental write: buffer trajectory rows and flush a RecordBatch once the
     # buffer reaches FLUSH_ROWS, so peak memory is bounded by the buffer + the
     # current repo's commits, never the whole corpus.
-    writer = pq.ParquetWriter(out, schema)
+    writer = pq.ParquetWriter(out_tmp, schema)
     rows: list[dict] = []
     n_rows = 0
     n_dropped = 0
     n_targets = 0
+    split_counts: Counter[str] = Counter()
+    mode_counts: Counter[str] = Counter()
 
     def _flush() -> None:
         if not rows:
@@ -226,10 +242,10 @@ def main() -> None:
             ord_to_message = {c.ordinal: c.message for c in commits}
             ord_to_commit = {c.ordinal: c for c in commits}
             file_index = build_per_file_index(commits)
-            for file_path, history in file_index.items():
+            for _lineage, history in file_index.items():
                 # history: oldest→ list of (ordinal, FileChange) touching file
                 for tpos, (target_ord, target_fc) in enumerate(history):
-                    if not target_fc.is_target:
+                    if not target_fc.is_target or not target_fc.reconstruction_valid:
                         continue
                     n_targets += 1
                     # Per-sample deterministic RNG (distractors, template, and the
@@ -240,31 +256,30 @@ def main() -> None:
                     )
                     rng = random.Random(f"{args.seed}:{key}")
 
-                    # All commits touching the file up to + including the target
-                    # (chronological), one drill target each. Default: keep the
-                    # FULL history so HISTORICAL diffs are drilled — the earlier
-                    # "most-recent K" cap biased every trajectory toward recent
-                    # commits and starved historical-target navigation. If a cap
-                    # is set, sample across the whole history (target always kept
-                    # as the last element) rather than truncating to the tail.
-                    touching = history[:tpos + 1]
+                    # Exact anchor→target chain. Omitting any intermediate patch
+                    # would make the gold underdetermined, so a user cap rejects
+                    # the sample instead of sampling an incomplete history.
+                    try:
+                        touching = reconstruction_chain(history, tpos)
+                    except ValueError as exc:
+                        raise ValueError(
+                            "corrupt reconstruction chain for "
+                            f"{repo} window={window} ordinal={target_ord} "
+                            f"file_idx={target_fc.file_idx}: {exc}"
+                        ) from exc
                     if args.max_touching and len(touching) > args.max_touching:
-                        if args.touching_sample == "recent":
-                            touching = touching[-args.max_touching:]
-                        else:  # uniform across history, target always included
-                            k = args.max_touching
-                            head = touching[:-1]
-                            idx = sorted(
-                                rng.sample(range(len(head)), k - 1)
-                            ) if len(head) >= k - 1 else list(range(len(head)))
-                            touching = [head[i] for i in idx] + [touching[-1]]
+                        n_dropped += 1
+                        continue
                     head_template_idx = rng.randrange(len(HEAD_QUERY_TEMPLATES))
 
                     gold_blob = target_fc.blob_text
+                    file_path = target_fc.path
+                    target_commit = ord_to_commit[target_ord]
                     trajectory = build_file_drilldown_trajectory(
                         tree, commit_node_ids, repo, window, file_path, touching,
                         ord_to_message.get(target_ord, ""), gold_blob,
                         ord_to_commit=ord_to_commit,
+                        id_salt=id_salt,
                         head_template_idx=head_template_idx,
                         n_distractors=args.n_distractors,
                         mode_weights=mode_weights,
@@ -281,31 +296,76 @@ def main() -> None:
                     template_idx = rng.randrange(len(QUERY_TEMPLATES))
                     query = build_query(
                         file_path, ord_to_message.get(target_ord, ""),
-                        template_idx,
+                        target_commit.sha, template_idx,
+                    )
+                    bgkit_turns = [t for t in trajectory if t.kind == "bgkit"]
+                    drill_mode = str(bgkit_turns[0].args.get("drill_mode", "full"))
+                    structural_depth = max(
+                        (int(t.args.get("structural_depth", 0)) for t in bgkit_turns),
+                        default=0,
                     )
                     rows.append({
                         "dataset_name": DATASET_NAME,
                         "scope_template": "pre_scoped",
                         "scope_description": (
                             f"git repository {repo} (history window {window}) — "
-                            "reconstruct the full state of a file from its diff "
-                            "history"
+                            "reconstruct the full state of a file from its exact "
+                            f"history; entrypoint id: {bgkit_turns[0].args['ids'][0]}"
                         ),
                         "topic_list_json": json.dumps([]),
                         "question": query,
                         "gold_answer": gold_blob,
                         "trajectory_json": trajectory_to_json(trajectory),
+                        "group_id": str(bgkit_turns[0].args["ids"][0]),
+                        "repo_id": repo,
+                        "split": stable_repo_split(repo),
+                        "target_sha": target_commit.sha,
+                        "target_path": file_path,
+                        "drill_mode": drill_mode,
+                        "structural_depth": structural_depth,
+                        "artifact_schema_version": GIT_REPRO_SCHEMA_VERSION,
+                        "id_scheme_version": ID_SCHEME_VERSION,
+                        "source_sha256": source_sha,
                     })
+                    split_counts[stable_repo_split(repo)] += 1
+                    mode_counts[drill_mode] += 1
                     n_rows += 1
                     if len(rows) >= FLUSH_ROWS:
                         _flush()
 
     _flush()
     writer.close()
+    out_tmp.replace(out)
+    manifest_path = out.with_suffix(".manifest.json")
+    manifest_tmp = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    manifest_tmp.write_text(json.dumps({
+        "dataset_name": DATASET_NAME,
+        "schema_version": GIT_REPRO_SCHEMA_VERSION,
+        "id_scheme_version": ID_SCHEME_VERSION,
+        "id_salt": id_salt,
+        "source_sha256": source_sha,
+        "tree_sha256": sidecar.get("tree_sha256", ""),
+        "trajectory_sha256": file_sha256(out),
+        "row_count": n_rows,
+        "target_count": n_targets,
+        "dropped_count": n_dropped,
+        "split_counts": dict(split_counts),
+        "drill_mode_counts": dict(mode_counts),
+        "build_config": {
+            "max_touching": args.max_touching,
+            "n_distractors": args.n_distractors,
+            "drill_mode_weights": list(mode_weights),
+            "truncation_min_depth": args.truncation_min_depth,
+            "truncation_max_depth": args.truncation_max_depth,
+            "seed": args.seed,
+        },
+    }, indent=2, sort_keys=True))
+    manifest_tmp.replace(manifest_path)
     print(
         f"wrote {out} — {n_rows} reconstruction trajectories "
         f"({n_targets} targets, {n_dropped} dropped)",
     )
+    print(f"wrote {manifest_path}")
 
 
 if __name__ == "__main__":

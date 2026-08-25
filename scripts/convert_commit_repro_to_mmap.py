@@ -1,15 +1,10 @@
 #!/usr/bin/env python
 """Convert the ``git_commit_repro`` commit JSONL into the Phase 2 mmap schema.
 
-Each *file-change* (one changed file in one commit) becomes one mmap document —
-the L0-encodable leaf. The ``document_id`` is the positional-path file-change id
-(``{repo}/w000/c16.00/c4.01/cm.03/{path}`` — the file path scoped by the commit's
-chunk PATH id). Because the path depth depends on the window's commit count, the
-commit path ids are assigned by the tree builder and read here from the
-``--commit-node-ids`` sidecar (``commit_key -> path id``); the doc id is then
-``file_change_leaf_id(path_id, file_name, ...)`` — identical to the ``articles``
-lists in the browse tree, the trajectory ``retrieve_ids``, and the ids
-enumerated by ``scripts/build_trajectory_set.py``.
+Each file change becomes one L0 document containing query-addressable commit
+metadata, a periodic base snapshot when required, and the complete unified
+patch. Opaque document IDs and provenance are read from the versioned tree
+sidecar; a mismatched raw or tree generation is rejected.
 
 Writes the canonical layout consumed by
 :class:`bgkit.data.article_token_store.ArticleTokenStore`::
@@ -39,11 +34,18 @@ import pyarrow as pa
 
 from bgkit.data.commit_repro import (
     DATASET_NAME,
+    GIT_REPRO_SCHEMA_VERSION,
+    ID_SCHEME_VERSION,
     FileChange,
     ReproCommit,
     commit_key,
     file_change_leaf_id,
+    file_sha256,
+    load_commit_node_sidecar,
+    render_file_change_evidence,
+    require_record_schema,
     sha_for_record,
+    stable_repo_split,
 )
 from bgkit.data.mmap_writer import build_csr_offsets, write_mmap_artifacts
 
@@ -60,7 +62,10 @@ def main() -> None:
     parser.add_argument("--tokenizer", default="Qwen/Qwen3.5-0.8B")
     args = parser.parse_args()
 
-    commit_node_ids: dict[str, str] = json.loads(args.commit_node_ids.read_text())
+    source_sha = file_sha256(args.input)
+    commit_node_ids, id_salt, sidecar = load_commit_node_sidecar(
+        args.commit_node_ids, expected_source_sha256=source_sha,
+    )
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
@@ -76,41 +81,67 @@ def main() -> None:
     ordinals: list[int] = []
     file_idxs: list[int] = []
     paths: list[str] = []
+    old_paths: list[str] = []
+    change_types: list[str] = []
+    messages: list[str] = []
+    splits: list[str] = []
+    anchors: list[bool] = []
+    reconstructable: list[bool] = []
 
     with args.input.open() as f:
         for line in f:
             if not line.strip():
                 continue
             rec = json.loads(line)
+            require_record_schema(rec)
             repo = rec["repo"]
             window = int(rec.get("window_idx", 0))
             ordinal = int(rec["ordinal"])
-            # Commit PATH id from the tree-builder sidecar; skip commits the tree
-            # dropped (fail-closed — a missing path id means the join would break).
+            # A missing path means the independently built artifacts disagree;
+            # never turn that into a silent document drop.
             commit_path_id = commit_node_ids.get(commit_key(repo, window, ordinal))
             if commit_path_id is None:
-                continue
+                raise ValueError(
+                    f"commit-node sidecar is missing {commit_key(repo, window, ordinal)}"
+                )
             # Reconstruct the ReproCommit only for same-path disambiguation so the
             # document_id is bit-identical to the tree / trajectory builders.
             commit = ReproCommit(
                 repo=repo, sha=sha_for_record(rec), ordinal=ordinal,
+                parent_sha=str(rec.get("parent_sha", "")),
                 message=str(rec.get("message", "")),
                 timestamp=int(rec.get("timestamp", 0)), window_idx=window,
                 file_changes=[
-                    FileChange(file_idx=int(fc["file_idx"]), path=str(fc["path"]),
-                               diff_text=str(fc.get("diff_text", "")))
+                    FileChange(
+                        file_idx=int(fc["file_idx"]), path=str(fc["path"]),
+                        old_path=str(fc.get("old_path", fc["path"])),
+                        change_type=str(fc.get("change_type", "modified")),
+                        lineage_id=str(fc.get("lineage_id", fc["path"])),
+                        diff_text=str(fc.get("diff_text", "")),
+                        base_blob_text=str(fc.get("base_blob_text", "")),
+                        is_anchor=bool(fc.get("is_anchor", False)),
+                        reconstruction_valid=bool(
+                            fc.get("reconstruction_valid", False)
+                        ),
+                    )
                     for fc in rec["file_changes"]
                 ],
             )
             dup = commit._duplicated_paths()
-            for fc in rec["file_changes"]:
-                ids = tokenizer.encode(fc["diff_text"], add_special_tokens=False)
+            for fc in commit.file_changes:
+                ids = tokenizer.encode(
+                    render_file_change_evidence(commit, fc),
+                    add_special_tokens=False,
+                )
                 if not ids:
-                    continue
-                fi = int(fc["file_idx"])
+                    raise ValueError(
+                        f"tokenizer produced empty evidence for {commit.commit_key} "
+                        f"file index {fc.file_idx}"
+                    )
+                fi = int(fc.file_idx)
                 doc_id = file_change_leaf_id(
-                    commit_path_id, str(fc["path"]), fi,
-                    duplicated=str(fc["path"]) in dup,
+                    commit_path_id, fc.path, fi,
+                    duplicated=fc.path in dup, id_salt=id_salt,
                 )
                 chunks.append(np.array(ids, dtype=np.int32))
                 lengths.append(len(ids))
@@ -120,7 +151,13 @@ def main() -> None:
                 windows.append(window)
                 ordinals.append(ordinal)
                 file_idxs.append(fi)
-                paths.append(str(fc["path"]))
+                paths.append(fc.path)
+                old_paths.append(fc.old_path)
+                change_types.append(fc.change_type)
+                messages.append(commit.message)
+                splits.append(stable_repo_split(repo))
+                anchors.append(fc.is_anchor)
+                reconstructable.append(fc.reconstruction_valid)
 
     if not chunks:
         raise ValueError("no file-change documents produced from input JSONL")
@@ -134,6 +171,12 @@ def main() -> None:
         "commit_ordinal": pa.array(ordinals, type=pa.int64()),
         "file_idx": pa.array(file_idxs, type=pa.int64()),
         "file_path": pa.array(paths, type=pa.string()),
+        "old_file_path": pa.array(old_paths, type=pa.string()),
+        "change_type": pa.array(change_types, type=pa.string()),
+        "commit_message": pa.array(messages, type=pa.string()),
+        "split": pa.array(splits, type=pa.string()),
+        "is_anchor": pa.array(anchors, type=pa.bool_()),
+        "reconstruction_valid": pa.array(reconstructable, type=pa.bool_()),
         "tag_list_json": pa.array(["[]"] * len(document_ids), type=pa.string()),
     })
 
@@ -143,8 +186,13 @@ def main() -> None:
         offsets=build_csr_offsets(np.array(lengths, dtype=np.int64)),
         manifest_extra={
             "dataset_name": DATASET_NAME,
+            "dataset_schema_version": GIT_REPRO_SCHEMA_VERSION,
+            "id_scheme_version": ID_SCHEME_VERSION,
+            "id_salt": id_salt,
+            "source_sha256": source_sha,
+            "tree_sha256": sidecar.get("tree_sha256", ""),
             "tokenizer": args.tokenizer,
-            "leaf": "per-file commit diff patch",
+            "leaf": "query-addressable commit metadata + base anchor + unified patch",
         },
         metadata_table=metadata_table,
     )

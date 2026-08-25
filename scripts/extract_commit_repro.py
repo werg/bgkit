@@ -1,11 +1,9 @@
 #!/usr/bin/env python
 """Extract oldest-first commits per repo for the ``git_commit_repro`` dataset.
 
-Per repo (``$DATA_DIR/repos/<owner>/<repo>``) we walk commits OLDEST-first
-(chronological ascending from the root commit) and keep commits until the
-cumulative diff-token count reaches a global per-repo token budget ``B``. ``B``
-is chosen so the AVERAGE commit count across repos ≈ 64; the realized count
-``N`` varies per repo because commit diffs vary in size.
+Per repo this walks the HEAD first-parent chain oldest-first, preserves real
+commit identity and lossless textual deltas, then tiles it into independently
+reconstructable evidence-budget windows.
 
 Budget mechanism (see ``bgkit.data.commit_repro``):
 
@@ -13,8 +11,8 @@ Budget mechanism (see ``bgkit.data.commit_repro``):
    diff. Record per-commit diff-token counts.
 2. ``M`` = global median per-commit diff tokens across the calibration sample.
 3. ``B = 64 * M`` (override with ``--budget``).
-4. Per repo, take oldest commits until the cumulative diff-token count ≥ ``B``
-   (always keep ≥ 1; cap at ``--max-commits``).
+4. Validate targets by exact hunk replay and install periodic base anchors.
+5. Close windows on the actual encoded-evidence budget ``B``.
 
 For FILE-STATE RECONSTRUCTION, per (commit, file) we ALSO capture the file's
 full blob content at that commit (the gold) and mark it a valid TARGET when the
@@ -25,10 +23,12 @@ Output: a JSONL of commit records consumed by
 ``scripts/build_commit_repro_tree.py``, and
 ``scripts/build_commit_repro_trajectories.py``::
 
-    {"repo", "sha", "ordinal", "window_idx", "message", "timestamp",
+    {"schema_version", "repo", "sha", "parent_sha", "ordinal", "window_idx",
+     "message", "timestamp",
      "n_diff_tokens",
-     "file_changes": [{"file_idx", "path", "diff_text", "n_tokens",
-                       "blob_text", "n_blob_tokens", "is_target"}, ...]}
+     "file_changes": [{"file_idx", "path", "old_path", "lineage_id",
+                       "diff_text", "hunks", "is_anchor",
+                       "reconstruction_valid", ...}, ...]}
 """
 
 from __future__ import annotations
@@ -46,9 +46,13 @@ if _src not in sys.path:
 
 from bgkit.data.commit_repro import (
     DATASET_NAME,
+    DEFAULT_RECONSTRUCTION_ANCHOR_INTERVAL,
+    GIT_REPRO_SCHEMA_VERSION,
     FileChange,
     ReproCommit,
     diff_token_budget_from_median,
+    prepare_reconstruction_chains,
+    render_file_change_evidence,
     summarize_distribution,
     walk_repo_commits_oldest_first,
 )
@@ -81,20 +85,18 @@ def _collect_repo(
     file), the file's full blob (the reconstruction gold). No budgeting yet."""
     commits: list[ReproCommit] = []
     ordinal = 0
-    for sha, message, ts, files in walk_repo_commits_oldest_first(
+    for sha, parent_sha, message, ts, files in walk_repo_commits_oldest_first(
         str(repo_path), repo_id, max_walked=max_walked,
     ):
         file_changes: list[FileChange] = []
         total = 0
-        skip = False
-        for fi, (path, diff_text, blob_text) in enumerate(files):
-            ids = tokenizer.encode(diff_text, add_special_tokens=False)
+        for fi, walked in enumerate(files):
+            ids = tokenizer.encode(walked.diff_text, add_special_tokens=False)
             if len(ids) > max_file_tokens:
-                # A single file beyond the (lenient) per-file cap is a
-                # generated/vendored blob, not a meaningful change — drop the
-                # whole commit (keeps the diff leaves complete, never truncated).
-                skip = True
-                break
+                # Drop only this oversized leaf.  The next eligible state in its
+                # lineage receives a base anchor, so filtering cannot create a
+                # silently incomplete reconstruction chain.
+                continue
             # Gold blob: a (file, commit) is a valid reconstruction TARGET only
             # when the blob is decodable (not None — i.e. not deleted/binary)
             # AND within the gold-token cap. Larger/absent blobs still leave a
@@ -102,22 +104,37 @@ def _collect_repo(
             n_blob = 0
             is_target = False
             stored_blob = ""
-            if blob_text is not None:
-                n_blob = len(tokenizer.encode(blob_text, add_special_tokens=False))
+            if walked.blob_text is not None:
+                n_blob = len(tokenizer.encode(walked.blob_text, add_special_tokens=False))
                 is_target = n_blob <= max_gold_tokens
                 if is_target:
-                    stored_blob = blob_text  # only persist gold for real targets
+                    stored_blob = walked.blob_text
+            base_blob = walked.base_blob_text
+            if base_blob is not None:
+                n_base = len(tokenizer.encode(base_blob, add_special_tokens=False))
+                if n_base > max_gold_tokens:
+                    base_blob = None
             file_changes.append(FileChange(
-                file_idx=fi, path=path, diff_text=diff_text, n_tokens=len(ids),
+                file_idx=fi,
+                path=walked.path,
+                old_path=walked.old_path,
+                change_type=walked.change_type,
+                lineage_id=walked.lineage_id,
+                diff_text=walked.diff_text,
+                hunks=walked.hunks,
+                n_tokens=len(ids),
                 blob_text=stored_blob, n_blob_tokens=n_blob, is_target=is_target,
+                base_blob_text=(base_blob or ""),
+                base_blob_available=base_blob is not None,
             ))
             total += len(ids)
         # Per-commit TOTAL diff cap is the primary gate. The per-file cap stays
         # lenient — one large-but-legitimate file shouldn't drop a whole commit.
-        if skip or not file_changes or total > max_commit_tokens:
+        if not file_changes or total > max_commit_tokens:
             continue
         commits.append(ReproCommit(
-            repo=repo_id, sha=sha, ordinal=ordinal, message=message,
+            repo=repo_id, sha=sha, parent_sha=parent_sha,
+            ordinal=ordinal, message=message,
             timestamp=ts, file_changes=file_changes, n_diff_tokens=total,
         ))
         ordinal += 1
@@ -135,20 +152,18 @@ def main() -> None:
         help="Explicit owner/repo to include (repeatable). Overrides discovery.",
     )
     parser.add_argument("--max-walked", type=int, default=4000,
-                        help="Max commits to inspect per repo (full-history walk "
-                             "for windowing; also the calibration sample).")
-    parser.add_argument("--max-windows-per-repo", type=int, default=1,
+                        help="Max recent first-parent commits to inspect per repo "
+                             "(also the calibration sample).")
+    parser.add_argument("--max-windows-per-repo", type=int, default=0,
                         help="Cap on contiguous B-budget windows tiled per repo. "
-                             "Default 1 (WINDOW-0-ONLY: the oldest B-budget window). "
-                             "Raise to tile more of each repo's history; IMPORTANT "
-                             "for balance — uncapped, a 10K-commit repo yields ~150 "
-                             "windows and over-weights big repos.")
-    parser.add_argument("--max-commits", type=int, default=2048,
+                             "0 (default) keeps every window within --max-walked; "
+                             "set a positive cap only for an explicit ablation.")
+    parser.add_argument("--max-commits", type=int, default=0,
                         help="Overall safety cap on commits kept per repo across "
-                             "all windows.")
+                             "all windows; 0 (default) means no additional cap.")
     parser.add_argument("--max-file-tokens", type=int, default=8192,
                         help="Lenient per-file cap: a single file beyond this is "
-                             "treated as a generated/vendored blob → drop the commit.")
+                             "treated as generated/vendored and omitted.")
     parser.add_argument("--max-commit-tokens", type=int, default=16384,
                         help="Primary gate: skip a commit whose TOTAL diff "
                              "exceeds this.")
@@ -158,6 +173,12 @@ def main() -> None:
     parser.add_argument("--budget", type=int, default=None,
                         help="Override B (per-window token budget). "
                              "Default = 64 * median.")
+    parser.add_argument(
+        "--anchor-interval", type=int,
+        default=DEFAULT_RECONSTRUCTION_ANCHOR_INTERVAL,
+        help="Retain an exact base snapshot at least every N textual changes. "
+             "This bounds the longest reconstruction chain.",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -212,59 +233,112 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     n_rows = 0
     n_targets = 0
-    with args.output.open("w") as f:
+    reconstruction_stats = {
+        "targets_checked": 0,
+        "targets_valid": 0,
+        "targets_rejected": 0,
+        "anchors": 0,
+    }
+    output_tmp = args.output.with_suffix(args.output.suffix + ".tmp")
+    with output_tmp.open("w") as f:
         for _repo_id, commits in collected.items():
             window_idx = 0
             ord_in_window = 0
-            cum = 0
+            evidence_tokens = 0
             kept_total = 0
-            per_window = [0]
+            windows: list[list[ReproCommit]] = []
+            current_window: list[ReproCommit] = []
+            chain_state: dict[str, tuple[str, int]] = {}
             repo_targets = 0
             for c in commits:
-                if kept_total >= args.max_commits:
+                if args.max_commits > 0 and kept_total >= args.max_commits:
                     break
                 c.window_idx = window_idx
                 c.ordinal = ord_in_window
-                f.write(json.dumps(c.to_dict()) + "\n")
-                n_rows += 1
+                checked = prepare_reconstruction_chains(
+                    [c],
+                    anchor_interval=args.anchor_interval,
+                    state=chain_state,
+                )
+                for key, value in checked.items():
+                    reconstruction_stats[key] += value
                 for fc in c.file_changes:
-                    if fc.is_target:
-                        repo_targets += 1
-                        n_targets += 1
-                        gold_token_sizes.append(fc.n_blob_tokens)
+                    fc.n_tokens = len(tokenizer.encode(
+                        render_file_change_evidence(c, fc),
+                        add_special_tokens=False,
+                    ))
+                c.n_diff_tokens = sum(fc.n_tokens for fc in c.file_changes)
+                current_window.append(c)
                 kept_total += 1  # noqa: SIM113 - also a break guard, not just an index
                 ord_in_window += 1
-                per_window[-1] += 1
-                cum += c.n_diff_tokens
-                if cum >= budget:
+                evidence_tokens += c.n_diff_tokens
+                if evidence_tokens >= budget:
+                    windows.append(current_window)
                     window_idx += 1
-                    if window_idx >= args.max_windows_per_repo:
+                    if (
+                        args.max_windows_per_repo > 0
+                        and len(windows) >= args.max_windows_per_repo
+                    ):
                         break
                     ord_in_window = 0
-                    cum = 0
-                    per_window.append(0)
-            per_window = [w for w in per_window if w > 0]
+                    evidence_tokens = 0
+                    current_window = []
+                    chain_state = {}
+
+            if current_window and (
+                args.max_windows_per_repo <= 0
+                or len(windows) < args.max_windows_per_repo
+            ):
+                windows.append(current_window)
+            for window in windows:
+                for c in window:
+                    for fc in c.file_changes:
+                        if fc.is_target:
+                            repo_targets += 1
+                            n_targets += 1
+                            gold_token_sizes.append(fc.n_blob_tokens)
+                        # Only anchors need their parent snapshot downstream.
+                        # Clear redundant copies after exact validation and
+                        # token accounting to keep the raw artifact bounded.
+                        if not fc.is_anchor:
+                            fc.base_blob_text = ""
+                    f.write(json.dumps(c.to_dict()) + "\n")
+                    n_rows += 1
+
+            per_window = [len(window) for window in windows]
             window_counts.append(len(per_window))
             window_commit_counts.extend(per_window)
             targets_per_repo.append(repo_targets)
+    output_tmp.replace(args.output)
 
     summary = {
         "dataset": DATASET_NAME,
+        "schema_version": GIT_REPRO_SCHEMA_VERSION,
         "task": "file_state_reconstruction",
         "budget_B_tokens": budget,
         "median_per_commit_diff_tokens": round(median_tokens, 1),
+        "tokenizer": args.tokenizer,
+        "max_repos": args.max_repos,
+        "selected_repos": list(args.repo or []),
+        "max_walked": args.max_walked,
         "max_windows_per_repo": args.max_windows_per_repo,
+        "max_commits": args.max_commits,
+        "max_file_tokens": args.max_file_tokens,
+        "max_commit_tokens": args.max_commit_tokens,
         "max_gold_tokens": args.max_gold_tokens,
+        "anchor_interval": args.anchor_interval,
         "n_commit_rows": n_rows,
         "n_targets": n_targets,
         "windows_per_repo": summarize_distribution(window_counts),
         "commits_per_window": summarize_distribution(window_commit_counts),
         "targets_per_repo": summarize_distribution(targets_per_repo),
         "gold_token_sizes": summarize_distribution(gold_token_sizes),
+        "reconstruction_validation": reconstruction_stats,
     }
-    args.output.with_suffix(".calibration.json").write_text(
-        json.dumps(summary, indent=2),
-    )
+    calibration = args.output.with_suffix(".calibration.json")
+    calibration_tmp = calibration.with_suffix(calibration.suffix + ".tmp")
+    calibration_tmp.write_text(json.dumps(summary, indent=2))
+    calibration_tmp.replace(calibration)
     print(json.dumps(summary, indent=2))
 
 
