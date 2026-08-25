@@ -703,6 +703,13 @@ services:
     restart: "no"
     command: ["scripts/train.py", "+experiment=phase2_kb_widenet_lrprobe"]
 
+  # Isolation arm: lrprobe with the embedding freeze OFF, to separate the
+  # per-group-LR fix from the freeze.
+  train-phase2-kb-widenet-lrprobe-nofreeze:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_lrprobe_nofreeze"]
+
   # Long-prose semantic fact recall (babilong_style) alongside the code
   # wide-net datasets; the zero-shot BABILong arm scored 0.00 on every cell
   # (2026-08-25), teacher-forced and free-running alike.
