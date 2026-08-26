@@ -327,14 +327,12 @@ class BlobSFTTrainer(BaseTrainer):
         )
 
         # --- optimizer ---
-        # Freeze the decoder's tied embedding / LM head BEFORE collecting
-        # trainable params. HYGIENE, NOT A FIX for the Phase-2 language
-        # collapse — see KRKBTrainer._freeze_decoder_embeddings for the
-        # measurements that refuted that diagnosis (the embedding is
-        # essentially identical in the healthy base and the destroyed
-        # checkpoints). Pinning a 248,320-row tied matrix against ~107
-        # loss-bearing tokens per sample is still the right default.
-        if bool(self.step_cfg.get("freeze_decoder_embeddings", True)):
+        # Optional freeze of the decoder's tied embedding / LM head, applied
+        # BEFORE collecting trainable params. DEFAULT OFF: matched runs put
+        # freeze-off at PPL 31.2 and freeze-on at 41.1, and the per-group-LR
+        # fix alone is what actually prevents the language collapse. See
+        # KRKBTrainer._freeze_decoder_embeddings for the measurements.
+        if bool(self.step_cfg.get("freeze_decoder_embeddings", False)):
             frozen = 0
             bb = getattr(self.decoder, "backbone", self.decoder)
             for mod in filter(None, (

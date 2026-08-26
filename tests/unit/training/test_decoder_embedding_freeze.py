@@ -37,6 +37,7 @@ class _Dec:
 
 
 def _trainer(dec, **cfg):
+    cfg.setdefault("freeze_decoder_embeddings", True)
     t = KRKBTrainer.__new__(KRKBTrainer)
     t._decoders_by_family = {"qwen35": dec} if not isinstance(dec, list) else {
         f"d{i}": d for i, d in enumerate(dec)
@@ -69,7 +70,13 @@ def test_every_round_robin_family_is_covered():
     assert all(not d.backbone.embed.weight.requires_grad for d in decs)
 
 
-def test_opt_out_leaves_everything_trainable():
+def test_default_is_off_because_freezing_measured_worse():
+    """Matched 700-step runs: freeze OFF holds PPL 31.2 (base 30.4), freeze ON
+    sits at 41.1. The per-group-LR fix alone prevents the collapse, so the
+    freeze costs ~10 perplexity for no protection."""
     dec = _Dec()
-    _trainer(dec, freeze_decoder_embeddings=False)._freeze_decoder_embeddings()
+    t = KRKBTrainer.__new__(KRKBTrainer)
+    t._decoders_by_family = {"qwen35": dec}
+    t.step_cfg = {}  # no key set -> default
+    t._freeze_decoder_embeddings()
     assert dec.backbone.embed.weight.requires_grad

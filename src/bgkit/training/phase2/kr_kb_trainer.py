@@ -7336,8 +7336,19 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     def _freeze_decoder_embeddings(self) -> None:
         """Freeze each decoder's token embedding (and, when tied, its LM head).
 
-        HYGIENE, NOT A FIX — read this before citing it. It was added on
-        2026-08-25 as the supposed cure for the Phase-2 language collapse
+        DEFAULT OFF — measured mildly HARMFUL. Two matched 700-step runs from
+        the same base with the per-group-LR fix (26fc012) in place:
+
+            freeze OFF   PPL 31.2 at steps 500/600/650/699 (base 30.4)
+            freeze ON    PPL 41.8 / 41.2 / 41.1 at the same steps
+
+        Freezing costs ~10 perplexity for no protection: the LR fix ALONE
+        holds the decoder at the base's level through the window where the
+        historical run reached 2425. Pinning the embedding evidently denies
+        the decoder small beneficial adaptations. Enable it only with a
+        specific reason and measure the cost.
+
+        It was added on 2026-08-25 as the supposed cure for the collapse
         (decoder plain-text PPL 31 at the summarization base -> 671 at
         wide-net v6 -> 2585 at v7). That diagnosis was WRONG and the measured
         refutation is worth keeping:
@@ -7361,9 +7372,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         FURTHER over 8700 steps and stayed at PPL 64), which
         ``eval/lm_health/*`` now measures every eval.
 
-        ``training.freeze_decoder_embeddings: false`` opts out.
+        ``training.freeze_decoder_embeddings: true`` opts IN.
         """
-        if not bool(self.step_cfg.get("freeze_decoder_embeddings", True)):
+        if not bool(self.step_cfg.get("freeze_decoder_embeddings", False)):
             logger.warning("decoder_embeddings_trainable_opt_out")
             return
         frozen = 0
