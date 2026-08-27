@@ -974,6 +974,35 @@ def resolve_level_loss_cfg(cfg_block: dict | None) -> LevelLossCfg:
     )
 
 
+def _segment_zscore_flat(raw: Tensor, cu_seqlens: Tensor | None) -> Tensor:
+    """Per-document ``(raw - mean) / sqrt(var + 1e-6)`` over a packed buffer.
+
+    Mirrors ``bgkit.models.level_compressor._segment_zscore`` but is
+    implemented locally to keep this helper free of a models import. With
+    ``cu_seqlens=None`` the whole flat buffer is treated as one segment.
+    """
+    raw32 = raw.float()
+    if cu_seqlens is None or int(cu_seqlens.shape[0]) < 2:
+        return (raw32 - raw32.mean()) / torch.sqrt(raw32.var(unbiased=False) + 1e-6)
+    n = int(raw32.shape[0])
+    num_segs = int(cu_seqlens.shape[0]) - 1
+    seg = torch.zeros(n, dtype=torch.long, device=raw32.device)
+    bounds = cu_seqlens.to(torch.long)
+    for i in range(num_segs):
+        seg[int(bounds[i].item()) : int(bounds[i + 1].item())] = i
+    counts = torch.zeros(num_segs, device=raw32.device, dtype=torch.float32)
+    counts.index_add_(0, seg, torch.ones_like(raw32))
+    counts = counts.clamp(min=1.0)
+    sums = torch.zeros(num_segs, device=raw32.device, dtype=torch.float32)
+    sums.index_add_(0, seg, raw32)
+    mean = sums / counts
+    centered = raw32 - mean[seg]
+    var_sums = torch.zeros(num_segs, device=raw32.device, dtype=torch.float32)
+    var_sums.index_add_(0, seg, centered * centered)
+    std = torch.sqrt(var_sums / counts + 1e-6)
+    return centered / std[seg]
+
+
 def utility_grad_bce_loss(
     base_raw_for_util: Tensor | None,
     content_grad: Tensor | None,
@@ -983,8 +1012,32 @@ def utility_grad_bce_loss(
     target_ratio: float,
     content_cu_seqlens: Tensor | None = None,
     sync_metrics: bool = True,
+    standardize: bool = False,
 ) -> tuple[Tensor, dict[str, float | Tensor]]:
     """Utility-gradient BCE distillation loss on the survivorship head.
+
+    ``standardize=True`` runs the BCE on the PER-DOCUMENT Z-SCORE of
+    ``base_raw_for_util`` rather than the raw score. Pass it whenever the
+    level's operator is ``exact_topk``, whose score is that same z-score.
+
+    Why it matters (2026-08-27). ``binary_cross_entropy_with_logits`` is
+    minimised by inflating |logit| with the correct sign, so on a RAW score it
+    rewards unbounded scale growth — the documented v5b head pathology (raw std
+    2.96 -> 120 -> 1030). ``_segment_zscore`` was introduced to make every loss
+    scale-free, but its contract enumerates "ratio, span, decisiveness,
+    relevance" and this term was never brought under it. The consequence is not
+    merely cosmetic: every OTHER loss reaches the head through the z-score,
+    whose gradient w.r.t. raw scales as 1/std, while this one is undamped. Once
+    the scale runs away the ratio between them IS the damping factor, so the
+    span signal is attenuated by exactly the amount this term inflated.
+
+    Measured on the wide-net run: L1 raw std 119 (gain 1/119 = 0.0087) against
+    L0's 2.17. L0 escapes only because it carries moment_match_weight 0.05,
+    which anchors its raw moments; L1 sets it to 0.0. Span discrimination
+    followed: +0.517 sd at L0 vs +0.138 sd at L1.
+
+    Top-k is unaffected — the z-score is monotone in the raw score, so the
+    teacher and the ranking are identical either way.
 
     Packed inputs (FA4 varlen). ``base_raw_for_util`` is flat ``(N,)``,
     ``content_grad`` and ``content_values`` are flat ``(N, D)``,
@@ -1093,8 +1146,11 @@ def utility_grad_bce_loss(
     if controllable is not None:
         teacher = teacher & controllable
 
+    logits_for_bce = base_raw_for_util.float()
+    if standardize:
+        logits_for_bce = _segment_zscore_flat(logits_for_bce, content_cu_seqlens)
     bce_per_pos = F.binary_cross_entropy_with_logits(
-        base_raw_for_util.float(),
+        logits_for_bce,
         teacher.to(base_raw_for_util.dtype).float(),
         reduction="none",
     )

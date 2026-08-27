@@ -7405,6 +7405,12 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     pinned_mask=None,
                     target_ratio=float(entry.get("ratio", self._l1_retention)),
                     content_cu_seqlens=entry.get("cu_seqlens"),
+                    # exact_topk's operator score IS the per-document z-score,
+                    # so the BCE must run on it too or this term alone keeps a
+                    # scale degree of freedom and inflates the head (2026-08-27).
+                    standardize=(
+                        getattr(self, "_selection_mode_l0", "threshold") == "exact_topk"
+                    ),
                 )
                 if util_loss.requires_grad:
                     (util_loss * w_l0 / self._accum_steps).backward()
@@ -7438,6 +7444,12 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     pinned_mask=entry.get("pinned"),
                     target_ratio=float(entry.get("ratio", self._l1_retention)),
                     content_cu_seqlens=entry.get("cu_seqlens"),
+                    # See the L0 site. L1 is where this actually bit: raw std
+                    # 119 vs L0's 2.17, because L0 is anchored by
+                    # moment_match_weight 0.05 and L1 sets it to 0.0.
+                    standardize=(
+                        getattr(self, "_selection_mode_l1", "threshold") == "exact_topk"
+                    ),
                 )
                 if util_loss.requires_grad:
                     (util_loss * w_l1 / self._accum_steps).backward()
