@@ -1220,6 +1220,12 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # v5: span-level relevance — push the gold answer span's positions to
         # survive at L0 AND L1 (target prob 1.0). 0.0 = off (default).
         self._span_relevance_weight = float(surv_cfg.get("span_relevance_weight", 0.0))
+        # Per-term gradient attribution at the L1 selector head, every N steps
+        # (0 = off). Answers "which aux loss owns this head's gradient?", which
+        # no existing metric could: grad_norm/l1_head reports the SUM.
+        self._aux_grad_attribution_every = int(
+            surv_cfg.get("grad_attribution_every", 0) or 0
+        )
 
         # Which per-level aux weights were EXPLICITLY configured (see _aux_weight).
         self._level_explicit_aux = {
@@ -6925,6 +6931,16 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
         metrics: dict[str, float] = {}
         total = torch.zeros((), device=self.device, dtype=torch.float32)
+        # Per-term gradient attribution at the selector heads. Armed by
+        # survivorship.grad_attribution_every (0 = off). See _attribute_terms.
+        attrib: list[tuple[str, torch.Tensor]] = []
+        # getattr: tests construct the trainer bypassing __init__.
+        _attrib_every = int(getattr(self, "_aux_grad_attribution_every", 0) or 0)
+
+        def _keep(name: str, term: torch.Tensor) -> torch.Tensor:
+            if _attrib_every > 0 and term.requires_grad:
+                attrib.append((name, term))
+            return term
 
         def _record_head_spread(level: str, entry: dict) -> None:
             """Log the per-document std of the RAW head score.
@@ -7199,7 +7215,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
         if l1_span_losses:
             l1_span_loss = torch.stack(l1_span_losses).mean()
-            total = total + getattr(self, "_span_relevance_weight", 0.0) * l1_span_loss
+            total = total + _keep(
+                "l1_span", getattr(self, "_span_relevance_weight", 0.0) * l1_span_loss,
+            )
             metrics["l1_span_loss"] = l1_span_loss.item()
             if l1_span_survival:
                 metrics["l1_span_survival"] = sum(l1_span_survival) / len(l1_span_survival)
@@ -7208,8 +7226,11 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             l1_decisive_loss = torch.stack(l1_decisive_losses).mean()
             total = (
                 total
-                + self._aux_weight("l1", "ratio_loss_weight") * l1_ratio_loss
-                + self._aux_weight("l1", "decisiveness_loss_weight") * l1_decisive_loss
+                + _keep("l1_ratio", self._aux_weight("l1", "ratio_loss_weight") * l1_ratio_loss)
+                + _keep(
+                    "l1_decisiveness",
+                    self._aux_weight("l1", "decisiveness_loss_weight") * l1_decisive_loss,
+                )
             )
             metrics["l1_ratio_loss"] = l1_ratio_loss.item()
             metrics["l1_decisiveness_loss"] = l1_decisive_loss.item()
@@ -7273,15 +7294,61 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 )
             if l1_min_surv_losses:
                 l1_min_surv_loss = torch.stack(l1_min_surv_losses).mean()
-                total = total + self._surv_l1.min_survivors_loss_weight * l1_min_surv_loss
+                total = total + _keep(
+                    "l1_min_survivors",
+                    self._surv_l1.min_survivors_loss_weight * l1_min_surv_loss,
+                )
                 metrics["l1_min_survivors_loss"] = l1_min_surv_loss.item()
 
         if l1_relevance_losses:
             l1_relevance_loss = torch.stack(l1_relevance_losses).mean()
-            total = total + self._relevance_loss_weight * l1_relevance_loss
+            total = total + _keep(
+                "l1_relevance", self._relevance_loss_weight * l1_relevance_loss,
+            )
             metrics["l1_relevance_loss"] = l1_relevance_loss.item()
 
+        if attrib and _attrib_every > 0:
+            step = int(getattr(self, "global_step", 0) or 0)
+            if step % _attrib_every == 0:
+                metrics.update(self._attribute_head_gradient(attrib))
+
         return total, metrics
+
+    def _attribute_head_gradient(
+        self, terms: list[tuple[str, torch.Tensor]],
+    ) -> dict[str, float]:
+        """Per-term gradient norm at the L1 selector head.
+
+        ``grad_norm/l1_head`` reports the SUM over every auxiliary, so a head
+        running at a median 6672 while l1_backbone sits at 0.40 tells you the
+        head is being shouted at without telling you BY WHAT. This splits it:
+        one ``gattr/<term>`` per weighted loss, so a term that dominates the
+        span signal by orders of magnitude is visible directly.
+
+        LIMITATION: the utility-grad BCE runs its own backward in
+        ``_apply_utility_grad_bce_phase2`` and is NOT one of these terms, so
+        the reported norms need not sum to grad_norm/l1_head. A large residual
+        between the two is itself informative — it points at utility-grad.
+        """
+        params = [p for p in self.encoder.l1.head.parameters() if p.requires_grad]
+        out: dict[str, float] = {}
+        if not params:
+            return out
+        for name, term in terms:
+            try:
+                grads = torch.autograd.grad(
+                    term, params, retain_graph=True, allow_unused=True,
+                )
+            except RuntimeError:
+                # A term detached from the head contributes nothing; skip it
+                # rather than aborting the whole attribution pass.
+                continue
+            sq = torch.zeros((), device=self.device, dtype=torch.float32)
+            for g in grads:
+                if g is not None:
+                    sq = sq + (g.float() ** 2).sum()
+            out[f"gattr/{name}"] = float(torch.sqrt(sq).item())
+        return out
 
     def _apply_utility_grad_bce_phase2(self) -> dict[str, float]:
         """Run post-backward utility-gradient BCE distillation for Phase 2.
