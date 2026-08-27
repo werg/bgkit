@@ -2875,12 +2875,65 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     T=calibrated_t,
                     phase="phase2_kb",
                 )
+                self._reset_head_output_scale(level, calibrated_t)
             else:
                 logger.info(
                     "phase2_kb_tanh_calibration_skipped",
                     enc_level=level,
                     reason="no_extractable_content",
                 )
+
+    def _reset_head_output_scale(self, level: str, measured_std: float) -> None:
+        """One-time rescale of a selector head's output to the anchor target.
+
+        Only acts when that level runs the scale anchor (i.e. exact_topk, where
+        every loss is defined on the scale-invariant z-score).
+
+        PROVABLY SELECTION-PRESERVING: the head ends in a Linear, so scaling its
+        weight AND bias by k scales ``base_raw`` by exactly k, and the
+        per-document z-score ``(raw - mean)/std`` is invariant to any positive
+        affine transform. Ranking, top-k, and every z-scored loss are bit-for-bit
+        unaffected; only the gradient's scale-sensitivity changes.
+
+        Why it is needed on top of the anchor (2026-08-27): the anchor supplies a
+        gradient in the scale direction, but Adam has to build momentum against a
+        noise-driven walk whose v is tiny. On the first resume the scale still ran
+        129 -> 4612 over ~40 steps before the anchor won and crushed it to ~13.
+        Those were ~40 steps of every head weight moving ~lr in an essentially
+        RANDOM direction, which scrambles the head's learned ORDERING, not just
+        its magnitude — eval exact_match fell 0.254 -> 0.164 and free-running
+        answer EM 0.266 -> 0.078 across that excursion. Starting at the target
+        removes the excursion instead of recovering from it.
+        """
+        cfg = getattr(self, f"_surv_{level}", None)
+        w = float(getattr(cfg, "head_scale_anchor_weight", 0.0) or 0.0)
+        if w <= 0.0 or not measured_std or measured_std <= 0.0:
+            return
+        target = float(getattr(cfg, "head_scale_anchor_target_std", 2.0) or 2.0)
+        k = target / float(measured_std)
+        # Leave it alone when already within 1.5x — rescaling is exact but a
+        # no-op rescale just adds noise to the logs.
+        if abs(math.log(max(k, 1e-12))) < math.log(1.5):
+            return
+        lc = getattr(self.encoder, level, None)
+        head = getattr(lc, "head", None)
+        final = getattr(head, "head", None)
+        if lc is None or final is None:
+            return
+        final = final[-1]
+        with torch.no_grad():
+            final.weight.mul_(k)
+            if final.bias is not None:
+                final.bias.mul_(k)
+            if hasattr(lc, "head_tanh_temperature"):
+                lc.head_tanh_temperature.fill_(target)
+        logger.info(
+            "head_output_scale_reset",
+            enc_level=level,
+            measured_std=float(measured_std),
+            target_std=target,
+            factor=float(k),
+        )
 
     def _pre_train_loop(self) -> None:
         """After setup AND checkpoint restore: under ``exact_topk`` the head
