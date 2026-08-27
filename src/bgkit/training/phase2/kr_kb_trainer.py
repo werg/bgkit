@@ -4261,6 +4261,17 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             if l1_grad_capture is not None:
                 out._l1_grad_capture = l1_grad_capture  # type: ignore[attr-defined]
 
+            # L1 selection stash, mirroring the L0 one in _l0_for_articles and
+            # set UNCONDITIONALLY (the aux-loss stash below is training-only).
+            # Without it an eval-mode probe cannot see which L1 rows survived
+            # and has to ASSUME the span survives at the uniform L1 keep rate —
+            # which is what diag_span_survival did, making its end-to-end
+            # number a restatement of the L0 number rather than a measurement
+            # (2026-08-27).
+            self._last_l1_survivor_mask = getattr(out, "survivor_mask", None)
+            self._last_l1_span_mask = span_flat
+            self._last_l1_content_cu = content_cu
+
             # Stash encoder output for aux loss computation (when training).
             # Everything is flat: relevance_mask and pinned are flat (N_content,)
             # bool, cu_seqlens is the per-turn segmentation of the flat buffer.
@@ -6915,6 +6926,41 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         metrics: dict[str, float] = {}
         total = torch.zeros((), device=self.device, dtype=torch.float32)
 
+        def _record_head_spread(level: str, entry: dict) -> None:
+            """Log the per-document std of the RAW head score.
+
+            Under ``exact_topk`` the operator score is ``_segment_zscore`` =
+            ``(raw - mean_doc) / sqrt(var_doc + 1e-6)``, so this std is the
+            divisor — and d(score)/d(raw) scales as 1/std. A head whose output
+            goes near-constant within a document therefore does not merely stop
+            discriminating, it AMPLIFIES its own gradient without bound (the
+            epsilon floors std at 1e-3, i.e. up to 1000x). That is the
+            suspected mechanism behind grad_norm/l1_head running at ~6.7e3
+            while every other group sits at O(1) (2026-08-27). Nothing logged
+            this quantity, so the pathology was only visible as a grad-norm
+            anomaly with no cause attached.
+            """
+            enc_out = entry.get("enc_out")
+            raw = getattr(enc_out, "base_raw", None)
+            if raw is None:
+                raw = getattr(enc_out, "base_raw_for_util", None)
+            cu = entry.get("cu_seqlens")
+            if raw is None or cu is None:
+                return
+            raw = raw.detach().reshape(-1).float()
+            n = int(raw.shape[0])
+            n_seg = int(cu.shape[0]) - 1
+            if n <= 0 or n_seg <= 0:
+                return
+            seg = segment_ids_from_cu(cu, n)
+            mean = segment_mean(raw, seg, n_seg)
+            centered = raw - mean[seg]
+            var = segment_mean(centered * centered, seg, n_seg)
+            std = torch.sqrt(var + 1e-6)
+            metrics[f"{level}_base_raw_std"] = float(std.mean().item())
+            metrics[f"{level}_base_raw_std_min"] = float(std.min().item())
+            metrics[f"{level}_zscore_grad_gain"] = float((1.0 / std).mean().item())
+
         # ----------------------------------------------------------------
         # L0: ratio + decisiveness
         # Each entry is one _l0_for_articles call.  Packed: logits_for_op
@@ -6926,6 +6972,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         l0_span_survival: list[float] = []
         for entry in self._pending_l0_outputs:
             enc_out = entry["enc_out"]
+            _record_head_spread("l0", entry)
             logits_for_op = enc_out.logits_for_op
             if logits_for_op is None:
                 continue
@@ -7054,6 +7101,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         l1_span_survival: list[float] = []
         for entry in self._pending_l1_outputs:
             enc_out = entry["enc_out"]
+            _record_head_spread("l1", entry)
             logits_for_op = enc_out.logits_for_op
             if logits_for_op is None:
                 continue

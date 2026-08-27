@@ -1,0 +1,730 @@
+ Container docker-train-phase2-kb-git-repro-fullbackprop-run-95e477e89621 Creating 
+ Container docker-train-phase2-kb-git-repro-fullbackprop-run-95e477e89621 Created 
+capability:12.1
+backend_kind:flash_attn
+FlashAttention SM12x extension detected; preferring extension backend.
+flash_attention_native_backend:extension
+bgkit source hash: 5849b8e01c51
+flashqla source hash: 09d398f86e70
+luce_megakernel source hash: 029e484b74b2
+bgkit 0.1.0
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.5-0.8B/2fc06364715b967f1860aea9cf38778875588b17/config.json "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/adapter_config.json "HTTP/1.1 404 Not Found"
+Could not cache non-existence of file. Will ignore error and continue. Error: [Errno 13] Permission denied: '/workspace/hf_cache/hub/models--Qwen--Qwen3.5-0.8B/.no_exist/2fc06364715b967f1860aea9cf38778875588b17/adapter_config.json'
+Could not cache non-existence of file. Will ignore error and continue. Error: [Errno 13] Permission denied: '/workspace/hf_cache/hub/models--Qwen--Qwen3.5-0.8B/.no_exist/2fc06364715b967f1860aea9cf38778875588b17/adapter_config.json'
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.5-0.8B/2fc06364715b967f1860aea9cf38778875588b17/config.json "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/adapter_config.json "HTTP/1.1 404 Not Found"
+Could not cache non-existence of file. Will ignore error and continue. Error: [Errno 13] Permission denied: '/workspace/hf_cache/hub/models--Qwen--Qwen3.5-0.8B/.no_exist/2fc06364715b967f1860aea9cf38778875588b17/adapter_config.json'
+Could not cache non-existence of file. Will ignore error and continue. Error: [Errno 13] Permission denied: '/workspace/hf_cache/hub/models--Qwen--Qwen3.5-0.8B/.no_exist/2fc06364715b967f1860aea9cf38778875588b17/adapter_config.json'
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/model.safetensors "HTTP/1.1 404 Not Found"
+Could not cache non-existence of file. Will ignore error and continue. Error: [Errno 13] Permission denied: '/workspace/hf_cache/hub/models--Qwen--Qwen3.5-0.8B/.no_exist/2fc06364715b967f1860aea9cf38778875588b17/model.safetensors'
+Could not cache non-existence of file. Will ignore error and continue. Error: [Errno 13] Permission denied: '/workspace/hf_cache/hub/models--Qwen--Qwen3.5-0.8B/.no_exist/2fc06364715b967f1860aea9cf38778875588b17/model.safetensors'
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/model.safetensors.index.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.5-0.8B/2fc06364715b967f1860aea9cf38778875588b17/model.safetensors.index.json "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/model.safetensors-00001-of-00001.safetensors "HTTP/1.1 302 Found"
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 8848.92it/s]
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/generation_config.json "HTTP/1.1 404 Not Found"
+Could not cache non-existence of file. Will ignore error and continue. Error: [Errno 13] Permission denied: '/workspace/hf_cache/hub/models--Qwen--Qwen3.5-0.8B/.no_exist/2fc06364715b967f1860aea9cf38778875588b17/generation_config.json'
+Could not cache non-existence of file. Will ignore error and continue. Error: [Errno 13] Permission denied: '/workspace/hf_cache/hub/models--Qwen--Qwen3.5-0.8B/.no_exist/2fc06364715b967f1860aea9cf38778875588b17/generation_config.json'
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.5-0.8B/2fc06364715b967f1860aea9cf38778875588b17/config.json "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/custom_generate/generate.py "HTTP/1.1 404 Not Found"
+Could not cache non-existence of file. Will ignore error and continue. Error: [Errno 13] Permission denied: '/workspace/hf_cache/hub/models--Qwen--Qwen3.5-0.8B/.no_exist/2fc06364715b967f1860aea9cf38778875588b17/custom_generate'
+Could not cache non-existence of file. Will ignore error and continue. Error: [Errno 13] Permission denied: '/workspace/hf_cache/hub/models--Qwen--Qwen3.5-0.8B/.no_exist/2fc06364715b967f1860aea9cf38778875588b17/custom_generate'
+[2m2026-08-01T22:27:46.952917Z[0m [[32m[1minfo     [0m] [1mphase2_kb_decoder_ce_impl_selected[0m [36mimpl[0m=[35mcce[0m [36mstrict[0m=[35mTrue[0m
+[2m2026-08-01T22:27:46.954331Z[0m [[32m[1minfo     [0m] [1mgradient_checkpointing_enabled[0m [36mmegatron_layers[0m=[35m0[0m [36mmode[0m=[35mTrue[0m [36mmodel[0m=[35mQwen3_5ForCausalLM[0m [36mnodeterm_layers[0m=[35m0[0m [36mreentrant_layers[0m=[35m0[0m
+[2m2026-08-01T22:27:46.954434Z[0m [[32m[1minfo     [0m] [1mphase2_kb_encoder_activation_checkpointing_resolved[0m [36menabled[0m=[35mFalse[0m
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.5-0.8B/2fc06364715b967f1860aea9cf38778875588b17/config.json "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.5-0.8B/2fc06364715b967f1860aea9cf38778875588b17/tokenizer_config.json "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.5-0.8B/2fc06364715b967f1860aea9cf38778875588b17/tokenizer_config.json "HTTP/1.1 200 OK"
+HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3.5-0.8B/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3.5-0.8B/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3.5-0.8B "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/tiiuae/Falcon-H1-Tiny-90M-Instruct/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/tiiuae/Falcon-H1-Tiny-90M-Instruct/e6389502a0b12cd8da894b395ba5bf7436873b16/config.json "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/tiiuae/Falcon-H1-Tiny-90M-Instruct/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/tiiuae/Falcon-H1-Tiny-90M-Instruct/e6389502a0b12cd8da894b395ba5bf7436873b16/config.json "HTTP/1.1 200 OK"
+[transformers] The fast path for FalconH1 will be used when running the model on a GPU
+Loading weights:   0%|          | 0/386 [00:00<?, ?it/s]Loading weights: 100%|██████████| 386/386 [00:00<00:00, 13077.77it/s]
+HTTP Request: HEAD https://huggingface.co/tiiuae/Falcon-H1-Tiny-90M-Instruct/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/tiiuae/Falcon-H1-Tiny-90M-Instruct/e6389502a0b12cd8da894b395ba5bf7436873b16/generation_config.json "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/tiiuae/Falcon-H1-Tiny-90M-Instruct/resolve/main/custom_generate/generate.py "HTTP/1.1 404 Not Found"
+falcon_h1_patch_applied: {'attention': 24, 'attention_packed_qkv': 24, 'attention_cat_qkv': 0, 'attention_direct_fa4': 0, 'attention_direct_flash': 0, 'attention_direct_hf_flash': 0, 'attention_direct_sdpa': 0, 'mlp': 24, 'mlp_packed_gate_up': 24, 'mlp_cat_gate_up': 0, 'mlp_liger': 24, 'mlp_trainable_autograd': 24, 'rmsnorm_liger': 49, 'packed_seqidx_loop': 1, 'fused_layer_loop': 0, 'layer_fused_input_proj': 0, 'mixer': 24, 'mixer_specialized_mamba': 24, 'mixer_save_scan': 24, 'mixer_inproj_autograd': 24, 'mixer_chunk_size': 0, 'layer': 24}
+[2m2026-08-01T22:27:50.359991Z[0m [[32m[1minfo     [0m] [1mfalcon_h1_patch_applied       [0m [36mcounts[0m=[35m{'attention': 24, 'attention_packed_qkv': 24, 'attention_cat_qkv': 0, 'attention_direct_fa4': 0, 'attention_direct_flash': 0, 'attention_direct_hf_flash': 0, 'attention_direct_sdpa': 0, 'mlp': 24, 'mlp_packed_gate_up': 24, 'mlp_cat_gate_up': 0, 'mlp_liger': 24, 'mlp_trainable_autograd': 24, 'rmsnorm_liger': 49, 'packed_seqidx_loop': 1, 'fused_layer_loop': 0, 'layer_fused_input_proj': 0, 'mixer': 24, 'mixer_specialized_mamba': 24, 'mixer_save_scan': 24, 'mixer_inproj_autograd': 24, 'mixer_chunk_size': 0, 'layer': 24}[0m
+[2m2026-08-01T22:27:50.361496Z[0m [[32m[1minfo     [0m] [1mgradient_checkpointing_enabled[0m [36mmegatron_layers[0m=[35m0[0m [36mmode[0m=[35mTrue[0m [36mmodel[0m=[35mFalconH1ForCausalLM[0m [36mnodeterm_layers[0m=[35m0[0m [36mreentrant_layers[0m=[35m0[0m
+HTTP Request: HEAD https://huggingface.co/tiiuae/Falcon-H1-Tiny-90M-Instruct/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/tiiuae/Falcon-H1-Tiny-90M-Instruct/e6389502a0b12cd8da894b395ba5bf7436873b16/config.json "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/tiiuae/Falcon-H1-Tiny-90M-Instruct/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/tiiuae/Falcon-H1-Tiny-90M-Instruct/e6389502a0b12cd8da894b395ba5bf7436873b16/tokenizer_config.json "HTTP/1.1 200 OK"
+HTTP Request: GET https://huggingface.co/api/models/tiiuae/Falcon-H1-Tiny-90M-Instruct/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+HTTP Request: GET https://huggingface.co/api/models/tiiuae/Falcon-H1-Tiny-90M-Instruct/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+[2m2026-08-01T22:27:50.965190Z[0m [[32m[1minfo     [0m] [1mfalcon_chat_template_patched  [0m [36mdecoder_tokenizer[0m=[35mtiiuae/Falcon-H1-Tiny-90M-Instruct[0m
+[2m2026-08-01T22:27:50.965274Z[0m [[32m[1minfo     [0m] [1mphase2_kb_decoder_built       [0m [36mce_impl[0m=[35mcce[0m [36mce_strict[0m=[35mTrue[0m [36mfamily[0m=[35mfalcon_h1[0m [36mmodel[0m=[35mtiiuae/Falcon-H1-Tiny-90M-Instruct[0m
+[2m2026-08-01T22:27:50.965302Z[0m [[32m[1minfo     [0m] [1mphase2_kb_round_robin_decoders[0m [36mfamilies[0m=[35m['falcon_h1', 'qwen35'][0m [36mprimary[0m=[35mqwen35[0m [36mqwen_decoder_prob[0m=[35m0.08[0m
+[2m2026-08-01T22:27:51.612834Z[0m [[32m[1minfo     [0m] [1mcheckpoint_loaded             [0m [36mkeys[0m=[35m['decoder_falcon', 'decoder_qwen', 'encoder', 'optimizer_state_by_name'][0m [36mpath[0m=[35m/workspace/checkpoints/phase1_summarization_round_robin_step51945_20260624_060459[0m [36mstep[0m=[35m51945[0m
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.5-0.8B-Base/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68/config.json "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.5-0.8B-Base/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68/config.json "HTTP/1.1 200 OK"
+Loading weights:   0%|          | 0/473 [00:00<?, ?it/s]Loading weights: 100%|██████████| 473/473 [00:00<00:00, 8671.37it/s]
+l1l1_bridge_clone_init: l1l1_bridge.* absent from checkpoint; cloned weights from l0.auto_repro_head (L0->L1 projection).
+Missing keys when loading encoder state dict: ['l1l1_bridge.weight', 'l1l1_bridge.bias']
+[2m2026-08-01T22:27:53.201876Z[0m [[32m[1minfo     [0m] [1mphase2_kb_decoder_loaded_from_phase1[0m [36mckpt_key[0m=[35mdecoder_qwen[0m [36mfamily[0m=[35mqwen35[0m [36mmissing[0m=[35m0[0m [36munexpected[0m=[35m0[0m
+[2m2026-08-01T22:27:53.210507Z[0m [[32m[1minfo     [0m] [1mphase2_kb_decoder_loaded_from_phase1[0m [36mckpt_key[0m=[35mdecoder_falcon[0m [36mfamily[0m=[35mfalcon_h1[0m [36mmissing[0m=[35m0[0m [36munexpected[0m=[35m0[0m
+[2m2026-08-01T22:27:53.210633Z[0m [[32m[1minfo     [0m] [1mgradient_checkpointing_enabled[0m [36mmegatron_layers[0m=[35m0[0m [36mmode[0m=[35mTrue[0m [36mmodel[0m=[35mPrunedBidirectionalQwen35[0m [36mnodeterm_layers[0m=[35m0[0m [36mreentrant_layers[0m=[35m0[0m
+[2m2026-08-01T22:27:53.210676Z[0m [[32m[1minfo     [0m] [1mgradient_checkpointing_enabled[0m [36mmegatron_layers[0m=[35m0[0m [36mmode[0m=[35mTrue[0m [36mmodel[0m=[35mPrunedBidirectionalQwen35[0m [36mnodeterm_layers[0m=[35m0[0m [36mreentrant_layers[0m=[35m0[0m
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B-Base/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.5-0.8B-Base/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68/config.json "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B-Base/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.5-0.8B-Base/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68/tokenizer_config.json "HTTP/1.1 200 OK"
+HTTP Request: HEAD https://huggingface.co/Qwen/Qwen3.5-0.8B-Base/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
+HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.5-0.8B-Base/dc7cdfe2ee4154fa7e30f5b51ca41bfa40174e68/tokenizer_config.json "HTTP/1.1 200 OK"
+HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3.5-0.8B-Base/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
+HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3.5-0.8B-Base/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
+HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen3.5-0.8B-Base "HTTP/1.1 200 OK"
+[2m2026-08-01T22:27:54.379713Z[0m [[32m[1minfo     [0m] [1mphase2_kb_vocab_alignment_ok  [0m [36mdec_vocab[0m=[35m248320[0m [36menc_vocab[0m=[35m248320[0m
+[2m2026-08-01T22:27:54.380850Z[0m [[32m[1minfo     [0m] [1mphase2_kb_encoder_lora_disabled[0m [36mlive_l0[0m=[35mTrue[0m [36mtrain_l1_direct[0m=[35mTrue[0m
+[2m2026-08-01T22:27:54.381486Z[0m [[32m[1minfo     [0m] [1mphase2_kb_query_conditioned_drill_nodes_enabled[0m [36mdrill_leaf_l0[0m=[35m0.63[0m [36mdrill_leaf_l1[0m=[35m0.63[0m [36mdrill_node_retention[0m=[35m0.4[0m [36mnote[0m=[35m'every trajectory drill node (head + on-path + distractors) re-encoded LIVE per sample under the task query; leaf at drill_leaf_retention; shared tree unchanged at the recursive ramps'[0m
+[2m2026-08-01T22:27:54.381606Z[0m [[33m[1mwarning  [0m] [1mphase2_kb_recursive_l1_per_repo_full_backprop_enabled[0m [36mgeneral_prompt[0m=[35m"compress this repository's commit history"[0m [36ml0_retention[0m=[35m{'start': 0.3, 'end': 0.3, 'ramp_steps': 4000}[0m [36ml1_retention[0m=[35m{'start': 0.3, 'end': 0.3, 'ramp_steps': 4000}[0m [36mnote[0m=[35m"window-0 subtree encoded ONCE per repo (shared, grad-accumulated via retain_graph across the repo's file-samples); browse turns splice shared node reps, drill-down bgkit re-encodes the file-diff with the specific commit/filename query; SMALL trees ONLY"[0m
+[2m2026-08-01T22:28:01.739767Z[0m [[32m[1minfo     [0m] [1mphase2_kb_title_sidecar_absent[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mmsg[0m=[35m'browse-tree ids treated as canonical mmap document_ids'[0m
+[2m2026-08-01T22:28:01.740737Z[0m [[32m[1minfo     [0m] [1mphase2_kb_projection_norm_reg_enabled[0m [36mtarget_ratio[0m=[35m{'qwen35': 4.2, 'falcon_h1': 0.9}[0m [36mtolerance[0m=[35m2.0[0m [36mtolerance_by_family[0m=[35m{'qwen35': 1.4, 'falcon_h1': 2.0}[0m [36mweight[0m=[35m0.3[0m
+[2m2026-08-01T22:28:01.749067Z[0m [[32m[1minfo     [0m] [1mphase2_kb_dataset_loaded      [0m [36mcap[0m=[35mNone[0m [36mdataset[0m=[35mgit_commit_repro[0m [36msize[0m=[35m1868302[0m [36mwhitelist_size[0m=[35mNone[0m
+[2m2026-08-01T22:28:28.704395Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_size_filter[0m [36mmax_repo_file_samples[0m=[35m500[0m [36mmax_repo_leaf_tokens[0m=[35mNone[0m [36mmax_repo_tree_nodes[0m=[35m130[0m [36mn_repos_after[0m=[35m11003[0m [36mn_repos_before[0m=[35m13342[0m [36mn_repos_dropped[0m=[35m2339[0m [36mn_samples_after[0m=[35m1333381[0m [36mn_samples_before[0m=[35m1868046[0m [36mn_samples_dropped[0m=[35m534665[0m
+[2m2026-08-01T22:28:28.704484Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_grouping   [0m [36minner_loop_active[0m=[35mFalse[0m [36minner_subset_size[0m=[35m16[0m [36mmax_inner_steps[0m=[35m12[0m [36mn_repos[0m=[35m11003[0m [36mn_samples[0m=[35m1333381[0m [36mn_train_batches[0m=[35m11003[0m
+[2m2026-08-01T22:28:29.380243Z[0m [[32m[1minfo     [0m] [1mhead_tanh_temperature_calibrated[0m [36mT[0m=[35m2.1324256658554077[0m [36mphase[0m=[35mphase2_kb[0m
+[2m2026-08-01T22:28:29.439930Z[0m [[32m[1minfo     [0m] [1mhead_tanh_temperature_calibrated[0m [36mT[0m=[35m6.724229514598846[0m [36mphase[0m=[35mphase2_kb[0m
+[2m2026-08-01T22:28:29.440287Z[0m [[32m[1minfo     [0m] [1mphase2_kb_coverage_scan_start [0m
+[2m2026-08-01T22:28:32.057635Z[0m [[32m[1minfo     [0m] [1mphase2_kb_coverage_scan_split [0m [36msampled[0m=[35mTrue[0m [36msamples[0m=[35m2000[0m [36msplit[0m=[35mtrain[0m [36mtotal[0m=[35m1868046[0m
+[2m2026-08-01T22:28:32.110307Z[0m [[32m[1minfo     [0m] [1mphase2_kb_coverage_scan_split [0m [36msampled[0m=[35mFalse[0m [36msamples[0m=[35m256[0m [36msplit[0m=[35meval[0m [36mtotal[0m=[35m256[0m
+[2m2026-08-01T22:28:32.110376Z[0m [[32m[1minfo     [0m] [1mphase2_kb_coverage_scan_ok    [0m [36mdatasets[0m=[35m1[0m [36munique_articles[0m=[35m404424[0m
+[2m2026-08-01T22:28:32.119412Z[0m [[32m[1minfo     [0m] [1mphase2_kb_liger_applied       [0m [36mdecoder_ce_impl[0m=[35mcce[0m [36mdecoder_modules[0m=[35m25[0m [36mdecoder_qwen_liger[0m=[35mTrue[0m [36mencoder_modules[0m=[35m37[0m [36muse_liger_ce[0m=[35mFalse[0m
+[2m2026-08-01T22:28:32.125213Z[0m [[32m[1minfo     [0m] [1moptimizer_created             [0m [36mparams[0m=[35m1587241986[0m [36mtype[0m=[35madamw[0m
+[2m2026-08-01T22:28:32.125880Z[0m [[32m[1minfo     [0m] [1mloading_checkpoint            [0m [36mpath[0m=[35m/workspace/checkpoints_fast/phase2_kb_step286_20260801_214749_232269_run-phase2_kb_git_repro_reanchor51945[0m
+[2m2026-08-01T22:28:33.443384Z[0m [[32m[1minfo     [0m] [1mcheckpoint_loaded             [0m [36mkeys[0m=[35m['model', 'optimizer_state_by_name'][0m [36mpath[0m=[35m/workspace/checkpoints_fast/phase2_kb_step286_20260801_214749_232269_run-phase2_kb_git_repro_reanchor51945[0m [36mstep[0m=[35m286[0m
+[2m2026-08-01T22:28:33.929988Z[0m [[32m[1minfo     [0m] [1moptimizer_state_restored_by_name[0m [36mmatched_frozen[0m=[35m0[0m [36mmatched_in_optimizer[0m=[35m903[0m [36mnew_frozen[0m=[35m1[0m [36mnew_in_optimizer[0m=[35m8[0m [36mskipped_from_save[0m=[35m0[0m
+[2m2026-08-01T22:28:33.930115Z[0m [[32m[1minfo     [0m] [1mrestored_from_checkpoint      [0m [36mstep[0m=[35m286[0m
+[2m2026-08-01T22:28:33.932862Z[0m [[32m[1minfo     [0m] [1mcheckpoint_loaded             [0m [36mstep[0m=[35m286[0m
+[2m2026-08-01T22:28:33.936485Z[0m [[32m[1minfo     [0m] [1msamples_picked                [0m [36mn[0m=[35m6[0m [36mscanned[0m=[35m21[0m
+[2m2026-08-01T22:28:39.195518Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_shared_tree_encoded[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mencode_checkpointed[0m=[35mTrue[0m [36ml0_retention[0m=[35m0.3[0m [36ml1_retention[0m=[35m0.3[0m [36mn_nodes[0m=[35m316[0m [36mroot[0m=[35mgetumbrel/umbrel/w000[0m [36mtree_checkpoint_min_nodes[0m=[35m64[0m [36mtree_checkpoint_min_tokens[0m=[35m16384[0m [36mtree_leaf_tokens[0m=[35m75311[0m [36mtree_node_count[0m=[35m316[0m
+[2m2026-08-01T22:28:39.384834Z[0m [[33m[1mwarning  [0m] [1mphase2_kb_drilldown_zero_survivor[0m [36mcount[0m=[35m1[0m [36mn_spliced[0m=[35m316[0m [36mreason[0m=[35munknown[0m
+[2m2026-08-01T22:28:39.387310Z[0m [[32m[1minfo     [0m] [1minterleaved_gc_toggled        [0m [36mactive[0m=[35mTrue[0m [36mdecoder_family[0m=[35mqwen35[0m [36mlayers[0m=[35m25[0m [36mmax_seqlen[0m=[35m4796[0m [36mmin_seqlen[0m=[35m4096[0m [36mmode[0m=[35mreentrant[0m
+
+====================================================================================================
+{
+  "family": "qwen35",
+  "question": "give me the state of invoicer/invoicer.conf after applying the commit with this message: Add the invoicer config with an",
+  "turn_kinds": [
+    "head",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "node",
+    "node",
+    "retrieve"
+  ],
+  "splice_rows_per_turn": [
+    2064,
+    387,
+    164,
+    378,
+    123,
+    162,
+    1,
+    55
+  ],
+  "n_retrieve_diffs": 2,
+  "diff_target_tokens": 282,
+  "file_target_tokens": 198,
+  "A_reps_to_diff": {
+    "ce_present": 2.5042,
+    "ce_zeroed": 3.1871,
+    "recon_gap": 0.6829,
+    "text_oracle_ce": 0.3356,
+    "target_tokens": 282
+  },
+  "B_reps_to_file": {
+    "ce_present": 2.6756,
+    "ce_zeroed": 3.6869,
+    "recon_gap": 1.0113,
+    "text_oracle_ce": 0.544,
+    "target_tokens": 198
+  }
+}
+[2m2026-08-01T22:28:45.106857Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_shared_tree_encoded[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mencode_checkpointed[0m=[35mTrue[0m [36ml0_retention[0m=[35m0.3[0m [36ml1_retention[0m=[35m0.3[0m [36mn_nodes[0m=[35m272[0m [36mroot[0m=[35mMichaelAquilina/zsh-autoswitch-virtualenv/w000[0m [36mtree_checkpoint_min_nodes[0m=[35m64[0m [36mtree_checkpoint_min_tokens[0m=[35m16384[0m [36mtree_leaf_tokens[0m=[35m73768[0m [36mtree_node_count[0m=[35m272[0m
+[2m2026-08-01T22:28:45.296930Z[0m [[33m[1mwarning  [0m] [1mphase2_kb_drilldown_zero_survivor[0m [36mcount[0m=[35m2[0m [36mn_spliced[0m=[35m272[0m [36mreason[0m=[35munknown[0m
+
+====================================================================================================
+{
+  "family": "qwen35",
+  "question": "reconstruct autoswitch_virtualenv.plugin.zsh as it stands after the change with commit message: Linter fixes",
+  "turn_kinds": [
+    "head",
+    "node",
+    "node",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "retrieve"
+  ],
+  "splice_rows_per_turn": [
+    2266,
+    532,
+    414,
+    248,
+    206,
+    1,
+    123,
+    109
+  ],
+  "n_retrieve_diffs": 2,
+  "diff_target_tokens": 384,
+  "file_target_tokens": 185,
+  "A_reps_to_diff": {
+    "ce_present": 2.1255,
+    "ce_zeroed": 2.7543,
+    "recon_gap": 0.6288,
+    "text_oracle_ce": 0.5848,
+    "target_tokens": 384
+  },
+  "B_reps_to_file": {
+    "ce_present": 2.4988,
+    "ce_zeroed": 3.6134,
+    "recon_gap": 1.1146,
+    "text_oracle_ce": 0.6329,
+    "target_tokens": 185
+  }
+}
+[2m2026-08-01T22:28:49.602819Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_shared_tree_encoded[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mencode_checkpointed[0m=[35mTrue[0m [36ml0_retention[0m=[35m0.3[0m [36ml1_retention[0m=[35m0.3[0m [36mn_nodes[0m=[35m67[0m [36mroot[0m=[35mjavascript-obfuscator/javascript-obfuscator/w000[0m [36mtree_checkpoint_min_nodes[0m=[35m64[0m [36mtree_checkpoint_min_tokens[0m=[35m16384[0m [36mtree_leaf_tokens[0m=[35m77147[0m [36mtree_node_count[0m=[35m67[0m
+[2m2026-08-01T22:28:49.844663Z[0m [[33m[1mwarning  [0m] [1mphase2_kb_drilldown_zero_survivor[0m [36mcount[0m=[35m3[0m [36mn_spliced[0m=[35m67[0m [36mreason[0m=[35munknown[0m
+
+====================================================================================================
+{
+  "family": "qwen35",
+  "question": "what does src/nodes/UnicodeArrayRotateFunctionCallNode.ts look like after the commit whose message is: Added node interf",
+  "turn_kinds": [
+    "head",
+    "node",
+    "node",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "retrieve"
+  ],
+  "splice_rows_per_turn": [
+    1086,
+    251,
+    1107,
+    227,
+    2045,
+    1,
+    67,
+    179
+  ],
+  "n_retrieve_diffs": 2,
+  "diff_target_tokens": 425,
+  "file_target_tokens": 609,
+  "A_reps_to_diff": {
+    "ce_present": 3.0411,
+    "ce_zeroed": 3.5545,
+    "recon_gap": 0.5134,
+    "text_oracle_ce": 0.9232,
+    "target_tokens": 425
+  },
+  "B_reps_to_file": {
+    "ce_present": 2.0788,
+    "ce_zeroed": 2.187,
+    "recon_gap": 0.1082,
+    "text_oracle_ce": 1.3407,
+    "target_tokens": 609
+  }
+}
+[2m2026-08-01T22:28:55.014130Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_shared_tree_encoded[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mencode_checkpointed[0m=[35mTrue[0m [36ml0_retention[0m=[35m0.3[0m [36ml1_retention[0m=[35m0.3[0m [36mn_nodes[0m=[35m169[0m [36mroot[0m=[35mappsignal/appsignal-elixir/w000[0m [36mtree_checkpoint_min_nodes[0m=[35m64[0m [36mtree_checkpoint_min_tokens[0m=[35m16384[0m [36mtree_leaf_tokens[0m=[35m74884[0m [36mtree_node_count[0m=[35m169[0m
+
+====================================================================================================
+{
+  "family": "qwen35",
+  "question": "reconstruct lib/appsignal/transaction.ex as it stands after the change with commit message: Work on tighter Phoenix inte",
+  "turn_kinds": [
+    "head",
+    "node",
+    "node",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "retrieve",
+    "node",
+    "node",
+    "retrieve"
+  ],
+  "splice_rows_per_turn": [
+    1352,
+    498,
+    483,
+    187,
+    350,
+    1,
+    68,
+    467,
+    386,
+    1,
+    109
+  ],
+  "n_retrieve_diffs": 3,
+  "diff_target_tokens": 1372,
+  "file_target_tokens": 1770,
+  "A_reps_to_diff": {
+    "ce_present": 2.4324,
+    "ce_zeroed": 3.2441,
+    "recon_gap": 0.8118,
+    "text_oracle_ce": 0.56,
+    "target_tokens": 1372
+  },
+  "B_reps_to_file": {
+    "ce_present": 2.4416,
+    "ce_zeroed": 2.8055,
+    "recon_gap": 0.3639,
+    "text_oracle_ce": 1.3011,
+    "target_tokens": 1770
+  }
+}
+[2m2026-08-01T22:29:00.720537Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_shared_tree_encoded[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mencode_checkpointed[0m=[35mTrue[0m [36ml0_retention[0m=[35m0.3[0m [36ml1_retention[0m=[35m0.3[0m [36mn_nodes[0m=[35m146[0m [36mroot[0m=[35mantchfx/xmlquery/w000[0m [36mtree_checkpoint_min_nodes[0m=[35m64[0m [36mtree_checkpoint_min_tokens[0m=[35m16384[0m [36mtree_leaf_tokens[0m=[35m76910[0m [36mtree_node_count[0m=[35m146[0m
+
+====================================================================================================
+{
+  "family": "qwen35",
+  "question": "give me the state of xml/node_test.go after applying the commit with this message: #7 add missing XML declaration checki",
+  "turn_kinds": [
+    "head",
+    "node",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "node",
+    "retrieve",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "node",
+    "retrieve",
+    "retrieve"
+  ],
+  "splice_rows_per_turn": [
+    1103,
+    392,
+    523,
+    218,
+    388,
+    558,
+    405,
+    260,
+    233,
+    78,
+    225,
+    180,
+    435,
+    366,
+    1,
+    287,
+    218,
+    306,
+    74
+  ],
+  "n_retrieve_diffs": 6,
+  "diff_target_tokens": 3072,
+  "file_target_tokens": 2198,
+  "A_reps_to_diff": {
+    "ce_present": 2.1623,
+    "ce_zeroed": 2.4697,
+    "recon_gap": 0.3073,
+    "text_oracle_ce": 0.7431,
+    "target_tokens": 3072
+  },
+  "B_reps_to_file": {
+    "ce_present": 2.2411,
+    "ce_zeroed": 2.6923,
+    "recon_gap": 0.4512,
+    "text_oracle_ce": 0.8633,
+    "target_tokens": 2198
+  }
+}
+[2m2026-08-01T22:29:07.412447Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_shared_tree_encoded[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mencode_checkpointed[0m=[35mTrue[0m [36ml0_retention[0m=[35m0.3[0m [36ml1_retention[0m=[35m0.3[0m [36mn_nodes[0m=[35m62[0m [36mroot[0m=[35mmicrosoft/JARVIS/w000[0m [36mtree_checkpoint_min_nodes[0m=[35m64[0m [36mtree_checkpoint_min_tokens[0m=[35m16384[0m [36mtree_leaf_tokens[0m=[35m73971[0m [36mtree_node_count[0m=[35m62[0m
+
+====================================================================================================
+{
+  "family": "qwen35",
+  "question": "show the full contents of CONTRIBUTING.md as of the commit described by: update .cff",
+  "turn_kinds": [
+    "head",
+    "node",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "node",
+    "retrieve"
+  ],
+  "splice_rows_per_turn": [
+    632,
+    670,
+    555,
+    781,
+    1,
+    217,
+    660,
+    629,
+    353,
+    60,
+    522,
+    271
+  ],
+  "n_retrieve_diffs": 3,
+  "diff_target_tokens": 1154,
+  "file_target_tokens": 409,
+  "A_reps_to_diff": {
+    "ce_present": 1.3654,
+    "ce_zeroed": 1.8077,
+    "recon_gap": 0.4423,
+    "text_oracle_ce": 0.376,
+    "target_tokens": 1154
+  },
+  "B_reps_to_file": {
+    "ce_present": 1.9052,
+    "ce_zeroed": 2.7413,
+    "recon_gap": 0.8361,
+    "text_oracle_ce": 0.3113,
+    "target_tokens": 409
+  }
+}
+[2m2026-08-01T22:29:14.809222Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_shared_tree_encoded[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mencode_checkpointed[0m=[35mTrue[0m [36ml0_retention[0m=[35m0.3[0m [36ml1_retention[0m=[35m0.3[0m [36mn_nodes[0m=[35m316[0m [36mroot[0m=[35mgetumbrel/umbrel/w000[0m [36mtree_checkpoint_min_nodes[0m=[35m64[0m [36mtree_checkpoint_min_tokens[0m=[35m16384[0m [36mtree_leaf_tokens[0m=[35m75311[0m [36mtree_node_count[0m=[35m316[0m
+[2m2026-08-01T22:29:14.989560Z[0m [[32m[1minfo     [0m] [1minterleaved_gc_toggled        [0m [36mactive[0m=[35mTrue[0m [36mdecoder_family[0m=[35mfalcon_h1[0m [36mlayers[0m=[35m25[0m [36mmax_seqlen[0m=[35m8107[0m [36mmin_seqlen[0m=[35m4096[0m [36mmode[0m=[35mreentrant[0m
+
+====================================================================================================
+{
+  "family": "falcon_h1",
+  "question": "give me the state of invoicer/invoicer.conf after applying the commit with this message: Add the invoicer config with an",
+  "turn_kinds": [
+    "head",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "node",
+    "node",
+    "retrieve"
+  ],
+  "splice_rows_per_turn": [
+    4128,
+    774,
+    328,
+    756,
+    246,
+    324,
+    1,
+    110
+  ],
+  "n_retrieve_diffs": 2,
+  "diff_target_tokens": 349,
+  "file_target_tokens": 242,
+  "A_reps_to_diff": {
+    "ce_present": 2.6525,
+    "ce_zeroed": 3.8282,
+    "recon_gap": 1.1757,
+    "text_oracle_ce": 0.5328,
+    "target_tokens": 349
+  },
+  "B_reps_to_file": {
+    "ce_present": 2.2309,
+    "ce_zeroed": 3.7073,
+    "recon_gap": 1.4764,
+    "text_oracle_ce": 1.1685,
+    "target_tokens": 242
+  }
+}
+[2m2026-08-01T22:29:19.907068Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_shared_tree_encoded[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mencode_checkpointed[0m=[35mTrue[0m [36ml0_retention[0m=[35m0.3[0m [36ml1_retention[0m=[35m0.3[0m [36mn_nodes[0m=[35m272[0m [36mroot[0m=[35mMichaelAquilina/zsh-autoswitch-virtualenv/w000[0m [36mtree_checkpoint_min_nodes[0m=[35m64[0m [36mtree_checkpoint_min_tokens[0m=[35m16384[0m [36mtree_leaf_tokens[0m=[35m73768[0m [36mtree_node_count[0m=[35m272[0m
+
+====================================================================================================
+{
+  "family": "falcon_h1",
+  "question": "reconstruct autoswitch_virtualenv.plugin.zsh as it stands after the change with commit message: Linter fixes",
+  "turn_kinds": [
+    "head",
+    "node",
+    "node",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "retrieve"
+  ],
+  "splice_rows_per_turn": [
+    4532,
+    1064,
+    828,
+    496,
+    412,
+    1,
+    246,
+    218
+  ],
+  "n_retrieve_diffs": 2,
+  "diff_target_tokens": 467,
+  "file_target_tokens": 221,
+  "A_reps_to_diff": {
+    "ce_present": 2.7801,
+    "ce_zeroed": 3.7353,
+    "recon_gap": 0.9552,
+    "text_oracle_ce": 0.8461,
+    "target_tokens": 467
+  },
+  "B_reps_to_file": {
+    "ce_present": 2.9957,
+    "ce_zeroed": 4.4989,
+    "recon_gap": 1.5032,
+    "text_oracle_ce": 1.0062,
+    "target_tokens": 221
+  }
+}
+[2m2026-08-01T22:29:23.521302Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_shared_tree_encoded[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mencode_checkpointed[0m=[35mTrue[0m [36ml0_retention[0m=[35m0.3[0m [36ml1_retention[0m=[35m0.3[0m [36mn_nodes[0m=[35m67[0m [36mroot[0m=[35mjavascript-obfuscator/javascript-obfuscator/w000[0m [36mtree_checkpoint_min_nodes[0m=[35m64[0m [36mtree_checkpoint_min_tokens[0m=[35m16384[0m [36mtree_leaf_tokens[0m=[35m77147[0m [36mtree_node_count[0m=[35m67[0m
+
+====================================================================================================
+{
+  "family": "falcon_h1",
+  "question": "what does src/nodes/UnicodeArrayRotateFunctionCallNode.ts look like after the commit whose message is: Added node interf",
+  "turn_kinds": [
+    "head",
+    "node",
+    "node",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "retrieve"
+  ],
+  "splice_rows_per_turn": [
+    2172,
+    502,
+    2214,
+    454,
+    4090,
+    1,
+    134,
+    358
+  ],
+  "n_retrieve_diffs": 2,
+  "diff_target_tokens": 497,
+  "file_target_tokens": 691,
+  "A_reps_to_diff": {
+    "ce_present": 2.8872,
+    "ce_zeroed": 3.5286,
+    "recon_gap": 0.6414,
+    "text_oracle_ce": 0.742,
+    "target_tokens": 497
+  },
+  "B_reps_to_file": {
+    "ce_present": 1.7473,
+    "ce_zeroed": 2.1248,
+    "recon_gap": 0.3775,
+    "text_oracle_ce": 1.2258,
+    "target_tokens": 691
+  }
+}
+[2m2026-08-01T22:29:27.829806Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_shared_tree_encoded[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mencode_checkpointed[0m=[35mTrue[0m [36ml0_retention[0m=[35m0.3[0m [36ml1_retention[0m=[35m0.3[0m [36mn_nodes[0m=[35m169[0m [36mroot[0m=[35mappsignal/appsignal-elixir/w000[0m [36mtree_checkpoint_min_nodes[0m=[35m64[0m [36mtree_checkpoint_min_tokens[0m=[35m16384[0m [36mtree_leaf_tokens[0m=[35m74884[0m [36mtree_node_count[0m=[35m169[0m
+
+====================================================================================================
+{
+  "family": "falcon_h1",
+  "question": "reconstruct lib/appsignal/transaction.ex as it stands after the change with commit message: Work on tighter Phoenix inte",
+  "turn_kinds": [
+    "head",
+    "node",
+    "node",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "retrieve",
+    "node",
+    "node",
+    "retrieve"
+  ],
+  "splice_rows_per_turn": [
+    2704,
+    996,
+    966,
+    374,
+    700,
+    1,
+    136,
+    934,
+    772,
+    1,
+    218
+  ],
+  "n_retrieve_diffs": 3,
+  "diff_target_tokens": 1680,
+  "file_target_tokens": 2083,
+  "A_reps_to_diff": {
+    "ce_present": 2.0215,
+    "ce_zeroed": 2.9893,
+    "recon_gap": 0.9678,
+    "text_oracle_ce": 0.3473,
+    "target_tokens": 1680
+  },
+  "B_reps_to_file": {
+    "ce_present": 2.2496,
+    "ce_zeroed": 2.8514,
+    "recon_gap": 0.6018,
+    "text_oracle_ce": 1.4226,
+    "target_tokens": 2083
+  }
+}
+[2m2026-08-01T22:29:31.902703Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_shared_tree_encoded[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mencode_checkpointed[0m=[35mTrue[0m [36ml0_retention[0m=[35m0.3[0m [36ml1_retention[0m=[35m0.3[0m [36mn_nodes[0m=[35m146[0m [36mroot[0m=[35mantchfx/xmlquery/w000[0m [36mtree_checkpoint_min_nodes[0m=[35m64[0m [36mtree_checkpoint_min_tokens[0m=[35m16384[0m [36mtree_leaf_tokens[0m=[35m76910[0m [36mtree_node_count[0m=[35m146[0m
+
+====================================================================================================
+{
+  "family": "falcon_h1",
+  "question": "give me the state of xml/node_test.go after applying the commit with this message: #7 add missing XML declaration checki",
+  "turn_kinds": [
+    "head",
+    "node",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "node",
+    "retrieve",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "node",
+    "retrieve",
+    "retrieve"
+  ],
+  "splice_rows_per_turn": [
+    2206,
+    784,
+    1046,
+    436,
+    776,
+    1116,
+    810,
+    520,
+    466,
+    156,
+    450,
+    360,
+    870,
+    732,
+    1,
+    574,
+    436,
+    612,
+    148
+  ],
+  "n_retrieve_diffs": 6,
+  "diff_target_tokens": 3072,
+  "file_target_tokens": 2660,
+  "A_reps_to_diff": {
+    "ce_present": 2.3269,
+    "ce_zeroed": 3.0258,
+    "recon_gap": 0.6989,
+    "text_oracle_ce": 2.0212,
+    "target_tokens": 3072
+  },
+  "B_reps_to_file": {
+    "ce_present": 1.9132,
+    "ce_zeroed": 2.4984,
+    "recon_gap": 0.5851,
+    "text_oracle_ce": 1.8973,
+    "target_tokens": 2660
+  }
+}
+[2m2026-08-01T22:29:36.036323Z[0m [[32m[1minfo     [0m] [1mphase2_kb_per_repo_shared_tree_encoded[0m [36mdataset[0m=[35mgit_commit_repro[0m [36mencode_checkpointed[0m=[35mTrue[0m [36ml0_retention[0m=[35m0.3[0m [36ml1_retention[0m=[35m0.3[0m [36mn_nodes[0m=[35m62[0m [36mroot[0m=[35mmicrosoft/JARVIS/w000[0m [36mtree_checkpoint_min_nodes[0m=[35m64[0m [36mtree_checkpoint_min_tokens[0m=[35m16384[0m [36mtree_leaf_tokens[0m=[35m73971[0m [36mtree_node_count[0m=[35m62[0m
+
+====================================================================================================
+{
+  "family": "falcon_h1",
+  "question": "show the full contents of CONTRIBUTING.md as of the commit described by: update .cff",
+  "turn_kinds": [
+    "head",
+    "node",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "node",
+    "node",
+    "node",
+    "retrieve",
+    "node",
+    "retrieve"
+  ],
+  "splice_rows_per_turn": [
+    1264,
+    1340,
+    1110,
+    1562,
+    1,
+    434,
+    1320,
+    1258,
+    706,
+    120,
+    1044,
+    542
+  ],
+  "n_retrieve_diffs": 3,
+  "diff_target_tokens": 1240,
+  "file_target_tokens": 434,
+  "A_reps_to_diff": {
+    "ce_present": 1.6005,
+    "ce_zeroed": 2.3646,
+    "recon_gap": 0.7641,
+    "text_oracle_ce": 0.4389,
+    "target_tokens": 1240
+  },
+  "B_reps_to_file": {
+    "ce_present": 2.0845,
+    "ce_zeroed": 3.4024,
+    "recon_gap": 1.3179,
+    "text_oracle_ce": 0.6195,
+    "target_tokens": 434
+  }
+}
+
+####################################################################################################
+AGGREGATE  (token-weighted CE; recon_gap = ce_zeroed - ce_present)
+family     test              CE_present  CE_zeroed  recon_gap  text_oracle   n
+------------------------------------------------------------------------------
+falcon_h1  A_reps_to_diff        2.2160     3.0231     0.8071       1.1344   6
+falcon_h1  B_reps_to_file        2.0674     2.7518     0.6843       1.5213   6
+qwen35     A_reps_to_diff        2.1484     2.6298     0.4815       0.6274   6
+qwen35     B_reps_to_file        2.2881     2.7445     0.4563       1.0000   6
+[2m2026-08-01T22:29:37.341186Z[0m [[32m[1minfo     [0m] [1mreport_written                [0m [36mpath[0m=[35m/workspace/checkpoints/diag_git_repro_A_vs_B.json[0m
