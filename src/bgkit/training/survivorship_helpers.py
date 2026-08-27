@@ -234,6 +234,25 @@ class LevelLossCfg:
     decisiveness_warmup_steps: int = 0
     moment_match_weight: float = 0.0
     moment_match_start_step: int = 0
+    # Head output-scale anchor. Penalises log-deviation of the per-document
+    # std of ``base_raw`` from ``head_scale_anchor_target_std``.
+    #
+    # REQUIRED whenever every loss reaching the head is defined on the
+    # per-document z-score (i.e. selection_mode exact_topk). The z-score is
+    # INVARIANT to the head's output scale, so under exact_topk the scale is a
+    # gradient-free direction — and Adam divides by sqrt(v) + eps, so on a
+    # direction whose true gradient is ~0 it amplifies numerical noise into
+    # lr-sized steps. Measured 2026-08-27: after standardizing the last
+    # unstandardized term (utility-grad BCE), l1_base_raw_std ran
+    # 129 -> 8431 in 30 steps, far faster than the pre-fix drift, because the
+    # raw BCE had been acting as an ACCIDENTAL anchor (mis-ranked positions
+    # push back hard against growth).
+    #
+    # Scale and ordering are separate concerns: the z-scored losses own the
+    # ordering, this term owns the scale. L0 got this for free via
+    # moment_match_weight, which is why only L1 ran away.
+    head_scale_anchor_weight: float = 0.0
+    head_scale_anchor_target_std: float = 2.0
     # Utility-gradient BCE distillation weight. Gates the compressor's
     # head-fork + backward-hook capture path (compressor skips both when
     # this is zero) and the trainer-level post-backward loss. Replaces the
@@ -948,30 +967,40 @@ def maybe_unload_ice(
 
 
 def resolve_level_loss_cfg(cfg_block: dict | None) -> LevelLossCfg:
-    """Build a ``LevelLossCfg`` from a config block (or empty dict)."""
+    """Build a ``LevelLossCfg`` from a config block (or empty dict).
+
+    Fields are derived from the dataclass itself rather than enumerated by
+    hand. The hand-written version silently DROPPED any field added to
+    ``LevelLossCfg`` but not also added here — a knob that is documented, set
+    in configs, and does nothing. That is the same defect class as the
+    per-group-LR bug (2026-08-25) and it bit again on 2026-08-27 with
+    ``head_scale_anchor_weight``.
+
+    Unknown keys RAISE rather than being ignored, so a typo or a renamed knob
+    fails loudly at configuration time instead of silently taking a default.
+    """
+    import dataclasses
+
     cfg = dict(cfg_block) if cfg_block is not None else {}
-    return LevelLossCfg(
-        ratio_loss_weight=float(cfg.get("ratio_loss_weight", 0.0)),
-        decisiveness_loss_weight=float(cfg.get("decisiveness_loss_weight", 0.0)),
-        decisiveness_warmup_weight=float(cfg.get("decisiveness_warmup_weight", 0.0)),
-        decisiveness_warmup_steps=int(cfg.get("decisiveness_warmup_steps", 0)),
-        moment_match_weight=float(cfg.get("moment_match_weight", 0.0)),
-        moment_match_start_step=int(cfg.get("moment_match_start_step", 0)),
-        utility_grad_loss_weight=float(cfg.get("utility_grad_loss_weight", 0.0)),
-        min_survivors_loss_weight=float(cfg.get("min_survivors_loss_weight", 0.0)),
-        min_survivors_floor_ratio=float(cfg.get("min_survivors_floor_ratio", 0.02)),
-        min_survivors_absolute_min=int(cfg.get("min_survivors_absolute_min", 1)),
-        min_survivors_tau=float(cfg.get("min_survivors_tau", 0.3)),
-        qa_position_loss_weight=float(cfg.get("qa_position_loss_weight", 0.0)),
-        qa_non_answer_target=float(cfg.get("qa_non_answer_target", 0.10)),
-        forced_survivor_bce_weight=float(cfg.get("forced_survivor_bce_weight", 0.0)),
-        forced_survivor_bce_anchor_ratio=float(
-            cfg.get("forced_survivor_bce_anchor_ratio", 0.6),
-        ),
-        forced_survivor_bce_symmetric=bool(
-            cfg.get("forced_survivor_bce_symmetric", False),
-        ),
-    )
+    fields = {f.name: f for f in dataclasses.fields(LevelLossCfg)}
+    unknown = set(cfg) - set(fields)
+    if unknown:
+        raise ValueError(
+            f"unknown survivorship level-config keys: {sorted(unknown)}; "
+            f"valid keys are {sorted(fields)}"
+        )
+    kwargs = {}
+    for name, field in fields.items():
+        if name not in cfg:
+            continue
+        raw = cfg[name]
+        if field.type in ("int", int):
+            kwargs[name] = int(raw)
+        elif field.type in ("bool", bool):
+            kwargs[name] = bool(raw)
+        else:
+            kwargs[name] = float(raw)
+    return LevelLossCfg(**kwargs)
 
 
 def _segment_zscore_flat(raw: Tensor, cu_seqlens: Tensor | None) -> Tensor:

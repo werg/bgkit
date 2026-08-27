@@ -95,6 +95,20 @@ training:
     span_relevance_weight: 2.0
     ratio_loss_weight: 0.5
     n_distractors: 0
+    # MANDATORY under exact_topk (2026-08-27). Every loss reaching the head is
+    # defined on the per-document z-score, which is invariant to the head's
+    # output scale — so the scale is a gradient-free direction, and Adam
+    # amplifies numerical noise on such a direction into lr-sized steps. The
+    # raw utility-grad BCE used to anchor the scale by accident; once that was
+    # standardized (33d15f1), l1_base_raw_std ran 129 -> 8431 in 30 steps.
+    # Ordering is owned by the z-scored losses, scale by this term. L0 already
+    # had an anchor via moment_match_weight, which is why only L1 ran away.
+    l0:
+      head_scale_anchor_weight: 0.05
+      head_scale_anchor_target_std: 2.0
+    l1:
+      head_scale_anchor_weight: 0.05
+      head_scale_anchor_target_std: 2.0
 
   # 800, not 400: the historical wide-net was at PPL 2425 by step 655, so
   # the run has to cross that point to be conclusive. NOTE a live-config

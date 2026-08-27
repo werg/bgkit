@@ -6942,6 +6942,40 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 attrib.append((name, term))
             return term
 
+        def _head_scale_anchor(level: str, entry: dict):
+            """Differentiable log-std anchor on ``base_raw`` for one entry.
+
+            Returns None when the level does not use it. See
+            LevelLossCfg.head_scale_anchor_weight for why this is mandatory
+            under exact_topk: the z-score is scale-invariant, so without it the
+            head's output scale is a gradient-free direction and Adam random-
+            walks along it (l1_base_raw_std 129 -> 8431 in 30 steps).
+            """
+            cfg = getattr(self, f"_surv_{level}", None)
+            w = float(getattr(cfg, "head_scale_anchor_weight", 0.0) or 0.0)
+            if w <= 0.0:
+                return None
+            enc_out = entry.get("enc_out")
+            raw = getattr(enc_out, "base_raw", None)
+            if raw is None:
+                raw = getattr(enc_out, "base_raw_for_util", None)
+            cu = entry.get("cu_seqlens")
+            if raw is None or cu is None or not raw.requires_grad:
+                return None
+            raw = raw.reshape(-1).float()
+            n, n_seg = int(raw.shape[0]), int(cu.shape[0]) - 1
+            if n <= 1 or n_seg <= 0:
+                return None
+            seg = segment_ids_from_cu(cu, n)
+            mean = segment_mean(raw, seg, n_seg)
+            centered = raw - mean[seg]
+            var = segment_mean(centered * centered, seg, n_seg)
+            std = torch.sqrt(var + 1e-6)
+            target = float(getattr(cfg, "head_scale_anchor_target_std", 2.0) or 2.0)
+            # log-space so the penalty is symmetric in over/under-shoot and
+            # cannot explode when std is already far from target.
+            return w * ((torch.log(std) - math.log(max(target, 1e-6))) ** 2).mean()
+
         def _record_head_spread(level: str, entry: dict) -> None:
             """Log the per-document std of the RAW head score.
 
@@ -6985,10 +7019,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         l0_ratio_losses: list[torch.Tensor] = []
         l0_decisive_losses: list[torch.Tensor] = []
         l0_span_losses: list[torch.Tensor] = []
+        l0_scale_anchors: list[torch.Tensor] = []
         l0_span_survival: list[float] = []
         for entry in self._pending_l0_outputs:
             enc_out = entry["enc_out"]
             _record_head_spread("l0", entry)
+            _anch = _head_scale_anchor("l0", entry)
+            if _anch is not None:
+                l0_scale_anchors.append(_anch)
             logits_for_op = enc_out.logits_for_op
             if logits_for_op is None:
                 continue
@@ -7114,10 +7152,14 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         l1_decisive_losses: list[torch.Tensor] = []
         l1_relevance_losses: list[torch.Tensor] = []
         l1_span_losses: list[torch.Tensor] = []
+        l1_scale_anchors: list[torch.Tensor] = []
         l1_span_survival: list[float] = []
         for entry in self._pending_l1_outputs:
             enc_out = entry["enc_out"]
             _record_head_spread("l1", entry)
+            _anch = _head_scale_anchor("l1", entry)
+            if _anch is not None:
+                l1_scale_anchors.append(_anch)
             logits_for_op = enc_out.logits_for_op
             if logits_for_op is None:
                 continue
@@ -7306,6 +7348,12 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 "l1_relevance", self._relevance_loss_weight * l1_relevance_loss,
             )
             metrics["l1_relevance_loss"] = l1_relevance_loss.item()
+
+        for _lvl, _terms in (("l0", l0_scale_anchors), ("l1", l1_scale_anchors)):
+            if _terms:
+                _t = torch.stack(_terms).mean()
+                total = total + _t
+                metrics[f"{_lvl}_head_scale_anchor_loss"] = float(_t.item())
 
         if attrib and _attrib_every > 0:
             step = int(getattr(self, "global_step", 0) or 0)
