@@ -713,8 +713,10 @@ services:
   train-phase2-kb-widenet-control-armb:
     <<: *gpu-common
     restart: "no"
-    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_control_armb",
-      "+resume_checkpoint=/workspace/checkpoints/phase2_kb_step1022_20260827_105419_306307_run-phase2_kb_widenet_lrprobe_nofreeze"]
+    # The explicit step1022 resume is REMOVED now that this arm is the primary
+    # run: it has its own checkpoints (step1258+) and must auto-resume from
+    # them, not restart the A/B from the shared origin.
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_control_armb"]
 
   # Long-prose semantic fact recall (babilong_style) alongside the code
   # wide-net datasets; the zero-shot BABILong arm scored 0.00 on every cell

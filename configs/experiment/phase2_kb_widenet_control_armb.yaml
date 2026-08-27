@@ -125,5 +125,6 @@ training:
   # 700 steps it already beat v6@2629 on the generative path
   # (route_exact .984 vs .531, invalid 1.6% vs 46.9%, answer EM .266 vs
   # .125). 2600 steps makes it a like-for-like replacement for v6.
-  # Only needs to cross the step-1250 eval to be decisive.
-  max_steps: 1260
+  # PROMOTED to the primary wide-net run (2026-08-27): the A/B showed this
+  # configuration holds routing (route_exact 0.938 vs the treatment's 0.438).
+  max_steps: 2600

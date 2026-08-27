@@ -95,7 +95,20 @@ training:
     span_relevance_weight: 2.0
     ratio_loss_weight: 0.5
     n_distractors: 0
-    # MANDATORY under exact_topk (2026-08-27). Every loss reaching the head is
+    # DISABLED 2026-08-27 after a controlled A/B from the same step1022
+    # checkpoint. The two head changes fixed the gradient imbalance
+    # (grad_norm/l1_head 6672 -> 0.4) but COST ROUTING:
+    #   arm            EM     F1    loss  freerun  route_exact
+    #   A treatment  0.172  0.437  1.062    0.078       0.438
+    #   B control    0.141  0.451  0.896    0.141       0.938
+    # The control held route_exact at the step-699 level (0.984); the
+    # treatment halved free-running answer EM. Both arms fell on
+    # teacher-forced EM (0.254 -> 0.14-0.17), so THAT decline is a separate,
+    # objective-level problem and not caused by these knobs.
+    # Keep the code (it is correct about the pathology) but default it off
+    # until the routing cost is understood.
+    standardize_utility_grad: false
+    # (was) MANDATORY under exact_topk. Every loss reaching the head is
     # defined on the per-document z-score, which is invariant to the head's
     # output scale — so the scale is a gradient-free direction, and Adam
     # amplifies numerical noise on such a direction into lr-sized steps. The
@@ -104,11 +117,9 @@ training:
     # Ordering is owned by the z-scored losses, scale by this term. L0 already
     # had an anchor via moment_match_weight, which is why only L1 ran away.
     l0:
-      head_scale_anchor_weight: 0.05
-      head_scale_anchor_target_std: 2.0
+      head_scale_anchor_weight: 0.0
     l1:
-      head_scale_anchor_weight: 0.05
-      head_scale_anchor_target_std: 2.0
+      head_scale_anchor_weight: 0.0
 
   # 800, not 400: the historical wide-net was at PPL 2425 by step 655, so
   # the run has to cross that point to be conclusive. NOTE a live-config
