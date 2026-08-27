@@ -144,8 +144,16 @@ def main(cfg: DictConfig) -> None:
         # Phase-2 runs are AdamW).
         from bgkit.training.checkpointing import load_checkpoint as _load
 
-        _meta, state = _load(Path(str(ck)))
-        trainer._restore_model_state(state)
+        try:
+            _meta, state = _load(Path(str(ck)))
+            trainer._restore_model_state(state)
+        except Exception as exc:
+            # One unreadable checkpoint must not abort the sweep — the
+            # summarization base uses the split encoder.pt/decoder_*.pt
+            # layout rather than a joint "model" key.
+            print(f"{label}: SKIPPED ({type(exc).__name__}: {exc})", flush=True)
+            results[label] = {"samples": 0, "error": f"{type(exc).__name__}"}
+            continue
         trainer.model.eval()
         with torch.no_grad():
             results[label] = measure(trainer, n)

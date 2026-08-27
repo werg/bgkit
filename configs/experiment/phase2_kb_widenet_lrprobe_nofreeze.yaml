@@ -50,16 +50,16 @@ training:
     enabled: true
     flush_when_free_below_gb: 30
   # Dense language-health sampling is the whole point of the run.
-  eval_every: 50
-  save_every: 50
+  eval_every: 250
+  save_every: 250
   warmup_steps: 200
   # In-run lm_health is OFF (it kills the run — see stage_a). The timeline
   # is read OFFLINE from the step-50 checkpoints instead.
   lm_health_samples: 0
   # Keep the eval cheap so a 50-step cadence is affordable; the headline
   # metric here is lm_health, not task quality.
-  max_eval_samples: 32
-  eval_free_running_samples: 0
+  max_eval_samples: 128
+  eval_free_running_samples: 64
   eval_ablation_modes: []
   eval_train_subset_samples: 0
   profile_timing: true
@@ -101,4 +101,9 @@ training:
   # max_steps bump does NOT work for this — the poll happens inside the
   # training loop, and at global_step == max_steps the loop never runs
   # (the first extension attempt exited with training_complete at 400).
-  max_steps: 700
+  # PROMOTED to the reference run (2026-08-27). This is now the healthy
+  # wide-net lineage: LR fix in place, decoder at PPL 31.2, and at only
+  # 700 steps it already beat v6@2629 on the generative path
+  # (route_exact .984 vs .531, invalid 1.6% vs 46.9%, answer EM .266 vs
+  # .125). 2600 steps makes it a like-for-like replacement for v6.
+  max_steps: 2600
