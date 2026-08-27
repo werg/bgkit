@@ -1,0 +1,129 @@
+# @package _global_
+# LR-FIX PROBE (2026-08-25) — the controlled test of the one confirmed bug.
+#
+# The wide-net decoder's held-out plain-text perplexity goes 30 (summarization
+# base) -> 2425 (v5b step 655) -> ~585 (v6, healed) -> 5450 (v7 step 500) ->
+# 2353 (v7 step 999). It spikes at each run start and partially recovers;
+# steps 9/15/31 of v5 are still at ~30, so the blow-up develops over hundreds
+# of steps rather than at init. Ruled out by measurement: the token embedding
+# (identical in healthy and damaged checkpoints), raw weight drift (git-repro
+# moved further and stayed at PPL 64), and input mis-scaling (every checkpoint
+# peaks at scale 1.0).
+#
+# What IS confirmed is a code defect: KRKBTrainer's param groups set only
+# "lr" while the schedule reads pg.get("base_lr", <global>), so decoder_lr /
+# l0_lr / l1_lr never took effect and every group ran at training.lr. The
+# wide-net decoder therefore trained at 1e-4 against a configured 5e-5 — and
+# git-repro, whose config sets every rate to the same 5e-5, was immune. Fixed
+# in commit 26fc012.
+#
+# This run is v6's configuration from the same base with that fix in place,
+# short, with lm_health on every eval. Read eval/lm_health/qwen35/ppl:
+#   holds ~30-60  -> the LR flattening was the cause (or most of it)
+#   climbs to 1e3 -> it was not; the objective/replay hypothesis is next
+#     (blob_sft healed 585 -> 123 on natural-language targets, so the damage
+#      is recoverable and the objective plainly matters)
+#
+# Deliberately NOT a capability run — 400 steps buys the diagnosis, nothing
+# more. Everything else is v6 verbatim so the comparison is clean.
+# ISOLATION ARM (2026-08-26). phase2_kb_widenet_lrprobe held the decoder at
+# PPL ~41 across 800 steps where the historical run was at 2425 by step 655 —
+# but it changed TWO things: the per-group-LR fix (26fc012) and the tied
+# embedding freeze. The weight measurements say the freeze should be near a
+# no-op (the embedding moves 0.5003 -> 0.4999 across a whole Phase-2 run),
+# but three mechanisms were already overturned by measurement today, so the
+# prior does not get to stand in for the experiment.
+#
+# Identical to lrprobe with freeze_decoder_embeddings: false. Runs to 700 to
+# cross the historical failure point.
+#   holds ~41  -> the LR fix alone is sufficient; the freeze is hygiene only
+#   collapses  -> the freeze is load-bearing after all and both are required
+defaults:
+  - /config
+  - /training/phase2_kb_stage_a
+  - _self_
+
+run_name: phase2_kb_widenet_control_armb
+
+training:
+  dynamic_ckpt:
+    enabled: true
+    flush_when_free_below_gb: 30
+  # Dense language-health sampling is the whole point of the run.
+  eval_every: 250
+  save_every: 250
+  warmup_steps: 200
+  # In-run lm_health is OFF (it kills the run — see stage_a). The timeline
+  # is read OFFLINE from the step-50 checkpoints instead.
+  lm_health_samples: 0
+  # Keep the eval cheap so a 50-step cadence is affordable; the headline
+  # metric here is lm_health, not task quality.
+  max_eval_samples: 128
+  eval_free_running_samples: 64
+  eval_ablation_modes: []
+  eval_train_subset_samples: 0
+  profile_timing: true
+
+  datasets:
+    - lognav
+    - fileneedle
+    - grepset
+    - swerecall
+  max_samples_per_dataset_default: 100000
+
+  l0_retention:
+    lognav: 0.10
+    fileneedle: 0.10
+    grepset: 0.10
+    swerecall: 0.10
+  l1_retention: 0.15
+  selection_mode:
+    l0: exact_topk
+    l1: exact_topk
+
+  qwen_decoder_prob: 1.0
+  training_time_ablation:
+    p_skip_bgkit: 0.0
+    p_skip_topic: 0.0
+    p_noise_bgkit: 0.0
+
+  # THE isolated variable.
+  freeze_decoder_embeddings: false
+
+  survivorship:
+    survivorship_aux: true
+    span_relevance_weight: 2.0
+    ratio_loss_weight: 0.5
+    n_distractors: 0
+    # MANDATORY under exact_topk (2026-08-27). Every loss reaching the head is
+    # defined on the per-document z-score, which is invariant to the head's
+    # output scale — so the scale is a gradient-free direction, and Adam
+    # amplifies numerical noise on such a direction into lr-sized steps. The
+    # raw utility-grad BCE used to anchor the scale by accident; once that was
+    # standardized (33d15f1), l1_base_raw_std ran 129 -> 8431 in 30 steps.
+    # Ordering is owned by the z-scored losses, scale by this term. L0 already
+    # had an anchor via moment_match_weight, which is why only L1 ran away.
+    # CONTROL ARM (2026-08-27): both 2026-08-27 head changes DISABLED, so
+    # this is the historical behaviour resumed from the same step1022
+    # checkpoint as the treatment arm. Capability fell EM 0.250 -> 0.17 and
+    # route_exact 0.938 -> 0.44 between step 1005 and 1250, and BOTH runs
+    # across that window carried the changes — so they are the leading
+    # suspect and this isolates them.
+    standardize_utility_grad: false
+    l0:
+      head_scale_anchor_weight: 0.0
+    l1:
+      head_scale_anchor_weight: 0.0
+
+  # 800, not 400: the historical wide-net was at PPL 2425 by step 655, so
+  # the run has to cross that point to be conclusive. NOTE a live-config
+  # max_steps bump does NOT work for this — the poll happens inside the
+  # training loop, and at global_step == max_steps the loop never runs
+  # (the first extension attempt exited with training_complete at 400).
+  # PROMOTED to the reference run (2026-08-27). This is now the healthy
+  # wide-net lineage: LR fix in place, decoder at PPL 31.2, and at only
+  # 700 steps it already beat v6@2629 on the generative path
+  # (route_exact .984 vs .531, invalid 1.6% vs 46.9%, answer EM .266 vs
+  # .125). 2600 steps makes it a like-for-like replacement for v6.
+  # Only needs to cross the step-1250 eval to be decisive.
+  max_steps: 1260

@@ -1226,6 +1226,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._aux_grad_attribution_every = int(
             surv_cfg.get("grad_attribution_every", 0) or 0
         )
+        # A/B switch for the 2026-08-27 utility-grad standardization. Default
+        # True = run the BCE on the z-score for exact_topk levels (33d15f1).
+        # Set False to restore the historical raw-score BCE, which is the
+        # control arm for "did that change cost capability?".
+        self._standardize_utility_grad = bool(
+            surv_cfg.get("standardize_utility_grad", True)
+        )
 
         # Which per-level aux weights were EXPLICITLY configured (see _aux_weight).
         self._level_explicit_aux = {
@@ -7510,7 +7517,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     # so the BCE must run on it too or this term alone keeps a
                     # scale degree of freedom and inflates the head (2026-08-27).
                     standardize=(
-                        getattr(self, "_selection_mode_l0", "threshold") == "exact_topk"
+                        getattr(self, "_standardize_utility_grad", True)
+                        and getattr(self, "_selection_mode_l0", "threshold") == "exact_topk"
                     ),
                 )
                 if util_loss.requires_grad:
@@ -7549,7 +7557,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     # 119 vs L0's 2.17, because L0 is anchored by
                     # moment_match_weight 0.05 and L1 sets it to 0.0.
                     standardize=(
-                        getattr(self, "_selection_mode_l1", "threshold") == "exact_topk"
+                        getattr(self, "_standardize_utility_grad", True)
+                        and getattr(self, "_selection_mode_l1", "threshold") == "exact_topk"
                     ),
                 )
                 if util_loss.requires_grad:
