@@ -137,7 +137,15 @@ def main(cfg: DictConfig) -> None:
     results: dict[str, dict] = {}
     for ck in ckpts:
         label = Path(str(ck)).name[:52]
-        trainer.load_checkpoint(Path(str(ck)))
+        # WEIGHTS ONLY. trainer.load_checkpoint() refuses on an optimizer-type
+        # mismatch, which is right for resuming a run and wrong here: this
+        # probe never steps an optimizer, and the checkpoints being compared
+        # deliberately span optimizers (the summarization base is Muon, the
+        # Phase-2 runs are AdamW).
+        from bgkit.training.checkpointing import load_checkpoint as _load
+
+        _meta, state = _load(Path(str(ck)))
+        trainer._restore_model_state(state)
         trainer.model.eval()
         with torch.no_grad():
             results[label] = measure(trainer, n)
