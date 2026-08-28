@@ -208,6 +208,23 @@ def collect(trainer: KRKBTrainer, per_dataset: int) -> dict:
         l0_vecs = l0_src[:k].detach().to("cpu").float()
 
         y = span_flags[:k]
+        # H3: membership != content. Keep the projected reps and the gold answer
+        # ids so content_recoverability can ask whether the ANSWER'S IDENTITY is
+        # readable, not merely which rows sat in the answer region.
+        try:
+            gold_txt = str(getattr(sample, "gold_answer", "") or "")
+            if gold_txt:
+                gid = trainer.tokenizer.encode(gold_txt, add_special_tokens=False)
+                projected = trainer._run_l1_batch(
+                    [turn], target_ratio=trainer._drill_leaf_l1_retention_override(),
+                )[0].detach()
+                store = getattr(trainer, "_probe_content_items", None)
+                if store is None:
+                    store = {}
+                    trainer._probe_content_items = store
+                store.setdefault(name, []).append((projected, gid))
+        except Exception:
+            pass
         per_ds_rows[name]["l0"].append(l0_vecs)
         per_ds_rows[name]["l1"].append(l1_vecs)
         per_ds_rows[name]["y"].append(y)
@@ -283,6 +300,29 @@ def main(cfg: DictConfig) -> None:
     print("  l0 high, l1 ~0.5 -> THE BRIDGE destroys it; head-side fixes are futile")
     print("  both high        -> signal survives; L1's head/loss is the problem")
     print("  both ~0.5        -> the span target is not linearly present anywhere")
+    # H3 readout: where do the gold answer's tokens rank when the reps are
+    # projected onto the decoder's embedding matrix? 0.5 = chance.
+    dec = getattr(trainer, "decoder", None)
+    if dec is None:
+        dec = next(iter(trainer.decoders.values()))
+    emb_w = dec.backbone.get_input_embeddings().weight.detach()
+    print("\nH3 CONTENT RECOVERABILITY (is the ANSWER readable, not just located?)")
+    print(f"{'dataset':<16}{'gold_pctile':>13}{'chance':>9}{'n':>6}")
+    for name, items in sorted(
+        (getattr(trainer, "_probe_content_items", None) or {}).items()
+    ):
+        if not items:
+            continue
+        vals = []
+        for reps, gid in items[:24]:
+            v, _ = content_recoverability(reps, emb_w, gid)
+            if v == v:
+                vals.append(v)
+        if vals:
+            print(f"{name:<16}{sum(vals) / len(vals):13.3f}{0.5:9.2f}{len(vals):6d}")
+    print("  ~0.5 = the answer's tokens are NO closer to the reps than random")
+    print("  tokens: the reps locate the span but do NOT encode its content, and")
+    print("  the projection/manifold story is not the whole explanation.")
     print("\nPROBE JSON", json.dumps(res, indent=2, default=str))
 
 

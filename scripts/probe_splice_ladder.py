@@ -149,6 +149,17 @@ def main(cfg: DictConfig) -> None:
             return survivors
         if mode["rung"] == "zeros":
             return [torch.zeros_like(s) for s in survivors]
+        if mode["rung"] == "real_fp32":
+            # H9: at ~139x the embedding norm, bf16 has ~8 mantissa bits, so the
+            # spliced values may be quantised coarsely relative to what the
+            # decoder needs. Casting to fp32 costs nothing and rules it in/out.
+            return [s_.float().to(survivors[0].dtype) for s_ in survivors]
+        if mode["rung"] == "real_highret":
+            # H4: maybe nothing is wrong with the projection and 1.5% retention
+            # simply destroys the content. Recompute at a MUCH looser budget;
+            # if the reps become useful, the ratio is the binding constraint,
+            # not the manifold.
+            return real_run_l1(prepared, target_ratio=0.60)
         if mode["rung"] == "real_trainmode":
             # H7: recompute the reps with the ENCODER in train() mode. All
             # probes call model.eval(); if the encoder has a train/eval
@@ -209,7 +220,8 @@ def main(cfg: DictConfig) -> None:
                 continue
             ok = True
             for rung in ("zeros", "real", "random_sel", "real_rescaled",
-                         "real_trainmode", "gold_tokens"):
+                         "real_fp32", "real_highret", "real_trainmode",
+                         "gold_tokens"):
                 mode["rung"] = "real" if rung == "random_sel" else rung
                 mode["gold_ids"] = gold_ids
                 _randomize_heads(rung == "random_sel")
@@ -230,7 +242,9 @@ def main(cfg: DictConfig) -> None:
              ("random_sel", "1a RANDOM selection"),
              ("real", "1b trained selection"),
              ("real_rescaled", "1c real reps @ embed norm"),
-             ("real_trainmode", "1d real reps, encoder.train()"),
+             ("real_fp32", "1d real reps in fp32"),
+             ("real_highret", "1e real reps @ ret 0.60"),
+             ("real_trainmode", "1f real reps, encoder.train()"),
              ("gold_tokens", "2 gold-span token embeds")]
     base_acc = None
     for key, label in order:
