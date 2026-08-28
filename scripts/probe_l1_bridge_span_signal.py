@@ -63,6 +63,42 @@ def _auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
     return (rank_sum - pos * (pos + 1) / 2) / (pos * neg)
 
 
+def content_recoverability(reps: torch.Tensor, emb: torch.Tensor,
+                           gold_ids: list[int]) -> tuple[float, float]:
+    """Can the ANSWER'S IDENTITY be read out of the reps, not just its location?
+
+    H3, and a correction to how the span-membership AUC was reported. A probe
+    that separates "came from the answer region" from "did not" can succeed on
+    positional or stylistic cues alone — it does NOT show the reps encode WHICH
+    tokens the answer contains. Membership is not content.
+
+    This asks the stronger question directly: project each rep onto the
+    decoder's token-embedding matrix and see whether the gold answer's tokens
+    rank near the top. Reported against a random-token floor, since in high
+    dimension a raw similarity is meaningless on its own.
+
+    Returns (mean_gold_percentile, chance_percentile=0.5).
+    """
+    if reps.numel() == 0 or not gold_ids:
+        return float("nan"), 0.5
+    r = reps.float()
+    r = r / r.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    e = emb.float()
+    e = e / e.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    # Best similarity any rep gives each vocabulary item.
+    best = torch.full((e.shape[0],), -1.0)
+    for s_ in range(0, e.shape[0], 32768):
+        blk = e[s_ : s_ + 32768].to(r.device)
+        sim = (r @ blk.T).max(dim=0).values.cpu()
+        best[s_ : s_ + 32768] = sim
+    order = torch.argsort(best, descending=True)
+    rank_of = torch.empty_like(order)
+    rank_of[order] = torch.arange(order.numel())
+    v = float(e.shape[0])
+    pct = [1.0 - (float(rank_of[t].item()) / v) for t in gold_ids if 0 <= t < e.shape[0]]
+    return (sum(pct) / len(pct) if pct else float("nan")), 0.5
+
+
 def _fit_linear_probe(feats: torch.Tensor, y: torch.Tensor, steps: int = 300):
     """Class-balanced logistic regression, returns (auc, acc, pos_rate).
 

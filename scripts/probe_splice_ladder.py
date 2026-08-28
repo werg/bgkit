@@ -149,6 +149,22 @@ def main(cfg: DictConfig) -> None:
             return survivors
         if mode["rung"] == "zeros":
             return [torch.zeros_like(s) for s in survivors]
+        if mode["rung"] == "real_trainmode":
+            # H7: recompute the reps with the ENCODER in train() mode. All
+            # probes call model.eval(); if the encoder has a train/eval
+            # asymmetry like Falcon-H1's Mamba path (eval/loss 9.8 vs train ~1,
+            # see _teacher_forced_decoders), then every measurement so far has
+            # scored a degenerate representation and the ladder, bridge probe
+            # and rep-dependence results are all void.
+            was = trainer.encoder.training
+            trainer.encoder.train()
+            try:
+                out = real_run_l1(prepared, target_ratio=target_ratio)
+                out = [o.detach().clone() for o in out]
+            finally:
+                if not was:
+                    trainer.encoder.eval()
+            return out
         if mode["rung"] == "real_rescaled":
             # THE MANIFOLD TEST. Gold token embeddings work (acc 0.626); the
             # same splice with real reps does not (0.271 vs 0.266 for zeros).
@@ -192,7 +208,8 @@ def main(cfg: DictConfig) -> None:
             if not gold_ids:
                 continue
             ok = True
-            for rung in ("zeros", "real", "random_sel", "real_rescaled", "gold_tokens"):
+            for rung in ("zeros", "real", "random_sel", "real_rescaled",
+                         "real_trainmode", "gold_tokens"):
                 mode["rung"] = "real" if rung == "random_sel" else rung
                 mode["gold_ids"] = gold_ids
                 _randomize_heads(rung == "random_sel")
@@ -213,6 +230,7 @@ def main(cfg: DictConfig) -> None:
              ("random_sel", "1a RANDOM selection"),
              ("real", "1b trained selection"),
              ("real_rescaled", "1c real reps @ embed norm"),
+             ("real_trainmode", "1d real reps, encoder.train()"),
              ("gold_tokens", "2 gold-span token embeds")]
     base_acc = None
     for key, label in order:
