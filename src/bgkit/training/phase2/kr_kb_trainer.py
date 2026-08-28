@@ -1163,7 +1163,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 self._l0_retention[str(k)] = float(v)
             else:
                 self._l0_retention[str(k)] = dict(v)
-        self._l1_retention = float(self.step_cfg.get("l1_retention", 0.15))
+        # ``l1_retention`` accepts the SAME two shapes as l0_retention: a
+        # scalar, or a {start, end, ramp_steps} curriculum. L0 has supported
+        # the ramp since the KB-scale work; L1 was scalar-only, so a wide-net
+        # run had to cold-start at its final (hardest) budget. At 0.10 x 0.15
+        # only ~1.5% of tokens survive, and a 12-token verbatim answer then
+        # needs ~40% of the entire budget — plausibly below the level at which
+        # the span loss carries usable signal, which is one explanation for L1
+        # sitting at +0.138 sd (chance) for thousands of steps (2026-08-28).
+        self._l1_retention_cfg = self.step_cfg.get("l1_retention", 0.15)
+        self._l1_retention = float(
+            self._interp_ratio_ramp(self._l1_retention_cfg, 0, default=0.15)
+        )
         anchor_grid = resolve_anchor_grid(
             self.cfg.model,
             float(self._l1_retention),
@@ -3303,12 +3314,28 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         )
         return dataclasses.replace(cfg, anchor_sampling_prob=0.0)
 
+    def _l1_retention_now(self) -> float:
+        """Current L1 retention, curriculum-aware.
+
+        Mirrors :meth:`_l0_retention_for`: a scalar config stays fixed, a
+        ``{start, end, ramp_steps}`` config interpolates by ``global_step`` and
+        holds at ``end`` thereafter. Live-config writes to ``l1_retention``
+        set the scalar and win, so manual overrides still work.
+        """
+        cfg = getattr(self, "_l1_retention_cfg", None)
+        if isinstance(cfg, dict):
+            return float(self._interp_ratio_ramp(
+                cfg, int(getattr(self, "global_step", 0) or 0),
+                default=float(self._l1_retention),
+            ))
+        return float(self._l1_retention)
+
     def _sample_l1_retention(self) -> float:
         """Sample an L1 retention ratio around the configured base rate."""
         ratio = sample_ratio(
             rng=self._l1_ratio_rng,
             config=self._l1_ratio_sampler_cfg,
-            base_ratio=self._l1_retention,
+            base_ratio=self._l1_retention_now(),
             is_evaluating=not self.encoder.training,
             override_active=False,
         )

@@ -721,6 +721,14 @@ services:
     command: ["scripts/train.py", "+experiment=phase2_kb_widenet_control_armb",
       "+resume_checkpoint=/workspace/checkpoints/phase2_kb_step1258_20260827_193854_503259_run-phase2_kb_widenet_control_armb"]
 
+  # v8: swerecall dropped (40% of rows, answers named in the question) plus a
+  # retention curriculum on both levels. Fresh run from the Phase-1 base — no
+  # resume pin, so it must NOT inherit control_armb's state.
+  train-phase2-kb-widenet-v8:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v8"]
+
   # Long-prose semantic fact recall (babilong_style) alongside the code
   # wide-net datasets; the zero-shot BABILong arm scored 0.00 on every cell
   # (2026-08-25), teacher-forced and free-running alike.
