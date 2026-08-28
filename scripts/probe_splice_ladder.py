@@ -108,6 +108,38 @@ def main(cfg: DictConfig) -> None:
         dec = next(iter(trainer.decoders.values()))
     embed = dec.backbone.get_input_embeddings()
 
+    # RANDOM-SELECTION CONTROL. bgkit's survivors are taken from the post-norm
+    # LAST-block output, and the head fires mid-backbone so the remaining blocks
+    # consolidate under the survival signal — i.e. every survivor has attended
+    # over the whole document. The representation is DISTRIBUTED, so WHICH
+    # positions are kept should be an information-density knob, not the
+    # load-bearing mechanism, and random selection at the same budget should do
+    # nearly as well.
+    #
+    # If that holds, gold-span survival (and the span_relevance_weight
+    # supervision built on it) is measuring the wrong thing, and the whole
+    # L0-vs-L1 span-discrimination thread is a red herring.
+    #
+    # Implemented by making the selector heads emit random scores: exact_topk
+    # then picks uniformly at random at the SAME budget, with everything else —
+    # backbone, bridge, projection, splice — untouched.
+    def _randomize_heads(enable: bool) -> None:
+        for level in ("l0", "l1"):
+            lc = getattr(trainer.encoder, level, None)
+            head = getattr(lc, "head", None)
+            if head is None:
+                continue
+            if enable:
+                if not hasattr(head, "_orig_forward"):
+                    head._orig_forward = head.forward
+                head.forward = (  # type: ignore[method-assign]
+                    lambda hs, _h=head: torch.randn(
+                        hs.shape[:-1], device=hs.device, dtype=torch.float32
+                    ).squeeze(0)
+                )
+            elif hasattr(head, "_orig_forward"):
+                head.forward = head._orig_forward  # type: ignore[method-assign]
+
     real_run_l1 = trainer._run_l1_batch
     mode = {"rung": "real"}
 
@@ -144,10 +176,12 @@ def main(cfg: DictConfig) -> None:
             if not gold_ids:
                 continue
             ok = True
-            for rung in ("zeros", "real", "gold_tokens"):
-                mode["rung"] = rung
+            for rung in ("zeros", "real", "random_sel", "gold_tokens"):
+                mode["rung"] = "real" if rung == "random_sel" else rung
                 mode["gold_ids"] = gold_ids
+                _randomize_heads(rung == "random_sel")
                 m = _answer_metrics(trainer, sample)
+                _randomize_heads(False)
                 if m is None:
                     ok = False
                     break
@@ -160,7 +194,8 @@ def main(cfg: DictConfig) -> None:
     print(f"\nSPLICE LADDER — n={used} samples, answer span only")
     print(f"{'rung':<26}{'CE':>9}{'tok_acc':>10}")
     order = [("zeros", "0 zeros (floor)"),
-             ("real", "1 real reps"),
+             ("random_sel", "1a RANDOM selection"),
+             ("real", "1b trained selection"),
              ("gold_tokens", "2 gold-span token embeds")]
     base_acc = None
     for key, label in order:
@@ -174,6 +209,18 @@ def main(cfg: DictConfig) -> None:
         if key == "zeros":
             base_acc = macc
     print()
+    # Does selection matter at all? The distributed-representation claim.
+    if res["random_sel"]["acc"] and res["real"]["acc"]:
+        rnd = sum(res["random_sel"]["acc"]) / len(res["random_sel"]["acc"])
+        tr = sum(res["real"]["acc"]) / len(res["real"]["acc"])
+        print(f"SELECTION: trained {tr:.4f} vs random {rnd:.4f}  (delta {tr - rnd:+.4f})")
+        if abs(tr - rnd) < 0.02:
+            print("  -> selection is NOT load-bearing: random does as well. The reps")
+            print("     are distributed, so gold-span survival and the")
+            print("     span_relevance_weight supervision measure the wrong thing.")
+        else:
+            print("  -> selection DOES matter at this budget.")
+        print()
     if res["gold_tokens"]["acc"] and base_acc is not None:
         g = sum(res["gold_tokens"]["acc"]) / len(res["gold_tokens"]["acc"])
         r = (sum(res["real"]["acc"]) / len(res["real"]["acc"])) if res["real"]["acc"] else 0.0
