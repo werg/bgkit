@@ -64,7 +64,13 @@ def _auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
 
 
 def _fit_linear_probe(feats: torch.Tensor, y: torch.Tensor, steps: int = 300):
-    """Class-balanced logistic regression, returns (auc, acc, pos_rate)."""
+    """Class-balanced logistic regression, returns (auc, acc, pos_rate).
+
+    ``torch.enable_grad()`` is REQUIRED: the caller collects features under
+    ``torch.no_grad()`` (correctly — the encoder forward needs no graph), and
+    that context also disables grad for THIS probe's own parameters, so the
+    first fit died with "element 0 of tensors does not require grad".
+    """
     x = feats.float()
     x = (x - x.mean(0, keepdim=True)) / (x.std(0, keepdim=True) + 1e-6)
     n_pos = float(y.sum().item())
@@ -77,17 +83,18 @@ def _fit_linear_probe(feats: torch.Tensor, y: torch.Tensor, steps: int = 300):
     w_neg = (n_pos + n_neg) / (2.0 * n_neg)
     weights = torch.where(y.bool(), torch.full_like(y, w_pos, dtype=torch.float32),
                           torch.full_like(y, w_neg, dtype=torch.float32))
-    lin = torch.nn.Linear(x.shape[1], 1)
-    opt = torch.optim.Adam(lin.parameters(), lr=1e-2)
-    yf = y.float().unsqueeze(1)
-    for _ in range(steps):
-        opt.zero_grad()
-        logits = lin(x)
-        loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            logits, yf, weight=weights.unsqueeze(1),
-        )
-        loss.backward()
-        opt.step()
+    with torch.enable_grad():
+        lin = torch.nn.Linear(x.shape[1], 1)
+        opt = torch.optim.Adam(lin.parameters(), lr=1e-2)
+        yf = y.float().unsqueeze(1)
+        for _ in range(steps):
+            opt.zero_grad()
+            logits = lin(x)
+            loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                logits, yf, weight=weights.unsqueeze(1),
+            )
+            loss.backward()
+            opt.step()
     with torch.no_grad():
         s = lin(x).squeeze(1)
     auc = _auc(s.double(), y)
