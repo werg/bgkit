@@ -139,7 +139,23 @@ training:
     # embedding norm does NOT help (0.256), so the binding defect is DIRECTION.
     # Until this is fixed no selection or query-conditioning work can matter,
     # because the decoder cannot read the representation at all.
-    proj_anchor_weight: 0.5
+    # DISABLED 2026-08-28 — the term is INERT and was dominating the objective.
+    # Evidence: proj_embed_anchor_loss sat at 25.1-25.3 without decreasing over
+    # 20 steps while contributing 0.5*25.3 = 12.7 against a main loss of 0.69
+    # (18.3x), and grad_norm/projection stayed at 0.6209 — identical to the
+    # pre-anchor measurement. A loss that swamps the objective while making no
+    # progress on its own metric is not training anything.
+    #
+    # Cause: _run_l1_batch runs its level forwards under an OUTER non-reentrant
+    # torch.utils.checkpoint, so the `projected` tensor captured into
+    # _pending_proj_anchor OUTSIDE that region carries no usable graph. Same
+    # class as the documented CheckpointError 58-vs-55 note.
+    #
+    # Re-implement at the SPLICE site instead, where gradient demonstrably
+    # flows (decoder gradient reaches the encoder: l0/l1_content_grad_norm
+    # 0.062/0.0149). Until then this must not run: an 18x-dominant inert loss
+    # can only starve the real objective.
+    proj_anchor_weight: 0.0
     ratio_loss_weight: 0.5
     n_distractors: 0
     # MANDATORY under exact_topk (2026-08-27). Every loss reaching the head is
