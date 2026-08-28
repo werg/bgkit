@@ -149,6 +149,22 @@ def main(cfg: DictConfig) -> None:
             return survivors
         if mode["rung"] == "zeros":
             return [torch.zeros_like(s) for s in survivors]
+        if mode["rung"] == "real_rescaled":
+            # THE MANIFOLD TEST. Gold token embeddings work (acc 0.626); the
+            # same splice with real reps does not (0.271 vs 0.266 for zeros).
+            # The reps sit at ~139x the token-embedding norm in a projected
+            # space, and CLAUDE.md documents Phase-1 Step 2.5 as an entire
+            # repair stage for exactly this "large-norm / orthogonal-direction
+            # drift between the projection output and the decoder's
+            # token-embedding manifold". If simply matching the norm recovers
+            # accuracy, the drift is the bug and projection_block is what needs
+            # repair — not selection, not the bridge, not the data.
+            tgt = embed.weight.detach().norm(dim=-1).mean()
+            out = []
+            for sv in survivors:
+                cur = sv.detach().norm(dim=-1).mean().clamp(min=1e-6)
+                out.append((sv * (tgt / cur)).to(sv.dtype))
+            return out
         if mode["rung"] == "gold_tokens":
             ids = mode.get("gold_ids")
             if not ids:
@@ -176,7 +192,7 @@ def main(cfg: DictConfig) -> None:
             if not gold_ids:
                 continue
             ok = True
-            for rung in ("zeros", "real", "random_sel", "gold_tokens"):
+            for rung in ("zeros", "real", "random_sel", "real_rescaled", "gold_tokens"):
                 mode["rung"] = "real" if rung == "random_sel" else rung
                 mode["gold_ids"] = gold_ids
                 _randomize_heads(rung == "random_sel")
@@ -196,6 +212,7 @@ def main(cfg: DictConfig) -> None:
     order = [("zeros", "0 zeros (floor)"),
              ("random_sel", "1a RANDOM selection"),
              ("real", "1b trained selection"),
+             ("real_rescaled", "1c real reps @ embed norm"),
              ("gold_tokens", "2 gold-span token embeds")]
     base_acc = None
     for key, label in order:
