@@ -1253,6 +1253,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._span_contrastive_weight = float(
             surv_cfg.get("span_contrastive_weight", 0.0)
         )
+        # Projection embed-anchor weight (Step-2.5 repair as a Phase-2 aux).
+        self._proj_anchor_weight = float(surv_cfg.get("proj_anchor_weight", 0.0))
+        self._pending_proj_anchor: list[torch.Tensor] = []
         # Per-term gradient attribution at the L1 selector head, every N steps
         # (0 = off). Answers "which aux loss owns this head's gradient?", which
         # no existing metric could: grad_norm/l1_head reports the SUM.
@@ -4436,6 +4439,25 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
 
             projected = proj_out.projected_embeddings
             projected_cu_t = effective_projection_cu(proj_out, proj_cu)
+            # PROJECTION EMBED-ANCHOR (2026-08-28). Measured on the Phase-2
+            # checkpoint: reps sit at 188x the token-embedding norm with
+            # cos-to-nearest-embedding 0.156 against a random floor of -0.029 —
+            # i.e. huge and very nearly ORTHOGONAL to the manifold the decoder
+            # reads. That is the exact pathology Phase-1 Step 2.5 exists to
+            # repair, and this lineage never had it applied.
+            #
+            # It is decisive rather than incidental: handing the decoder the
+            # answer's own token embeddings through the SAME splice scores 0.63
+            # while the real reps score 0.258 against a 0.253 floor. Rescaling
+            # to the embedding norm does NOT help (0.256), so it is direction,
+            # not scale — and no amount of selection or query-conditioning work
+            # can matter while the decoder cannot read the representation.
+            #
+            # Anchors the projection output toward embed_tokens in DIRECTION
+            # (cosine) and magnitude (log-norm), the Step-2.5 loss applied as a
+            # Phase-2 auxiliary. Weight 0 = off, so existing runs are unchanged.
+            if self.encoder.training and getattr(self, "_proj_anchor_weight", 0.0) > 0.0:
+                self._pending_proj_anchor.append(projected)
 
         # Extract per-turn projected survivors via per-turn boundaries.
         surv_cu = projected_cu_t.to(torch.int64).tolist()
@@ -7530,6 +7552,47 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 "l1_relevance", self._relevance_loss_weight * l1_relevance_loss,
             )
             metrics["l1_relevance_loss"] = l1_relevance_loss.item()
+
+        # PROJECTION EMBED-ANCHOR loss. Pulls the projection output toward the
+        # decoder's token-embedding manifold in DIRECTION and MAGNITUDE. Both
+        # halves are needed: measured drift was norm_ratio 188x AND
+        # cos-to-nearest-embedding 0.156 vs a -0.029 random floor, and
+        # rescaling alone did not recover any accuracy (0.256 vs 0.258), so
+        # direction is the binding half.
+        if getattr(self, "_proj_anchor_weight", 0.0) > 0.0 and self._pending_proj_anchor:
+            dec = getattr(self, "decoder", None)
+            if dec is None and getattr(self, "decoders", None):
+                dec = next(iter(self.decoders.values()))
+            if dec is not None:
+                emb_w = dec.backbone.get_input_embeddings().weight
+                tgt_norm = emb_w.detach().float().norm(dim=-1).mean()
+                terms = []
+                for proj in self._pending_proj_anchor:
+                    if proj is None or proj.numel() == 0:
+                        continue
+                    pf = proj.float()
+                    # Magnitude: log-space so over- and under-shoot cost alike.
+                    cur = pf.norm(dim=-1).clamp(min=1e-6)
+                    mag = ((torch.log(cur) - torch.log(tgt_norm)) ** 2).mean()
+                    # Direction: reward alignment with the NEAREST token
+                    # embedding, computed on a random vocab slice so the vocab
+                    # matmul stays cheap. Detached target — this moves the
+                    # projection onto the manifold, never the embedding table
+                    # toward the reps.
+                    with torch.no_grad():
+                        idx = torch.randint(
+                            0, emb_w.shape[0], (4096,), device=emb_w.device,
+                        )
+                        sub = emb_w[idx].detach().float()
+                        sub = sub / sub.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                    pu = pf / pf.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                    nearest = (pu @ sub.T).max(dim=-1).values
+                    terms.append(mag + (1.0 - nearest).mean())
+                if terms:
+                    anchor = torch.stack(terms).mean()
+                    total = total + self._proj_anchor_weight * anchor
+                    metrics["proj_embed_anchor_loss"] = float(anchor.item())
+            self._pending_proj_anchor = []
 
         for _lvl, _terms in (("l0", l0_scale_anchors), ("l1", l1_scale_anchors)):
             if _terms:

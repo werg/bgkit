@@ -130,6 +130,16 @@ training:
     # question is asked. Data supports it: 77-92% of rows have 2.9-4.3
     # non-overlapping negatives.
     span_contrastive_weight: 1.0
+    # PROJECTION EMBED-ANCHOR — the Step-2.5 repair, as a Phase-2 auxiliary.
+    # Measured on the Phase-2 checkpoint: reps at 188x the token-embedding norm
+    # with cos-to-nearest-embedding 0.156 against a -0.029 random floor, i.e.
+    # huge and nearly ORTHOGONAL to the manifold the decoder reads. Handing the
+    # decoder the answer's own token embeddings through the SAME splice scores
+    # 0.63 while real reps score 0.258 against a 0.253 floor; rescaling to the
+    # embedding norm does NOT help (0.256), so the binding defect is DIRECTION.
+    # Until this is fixed no selection or query-conditioning work can matter,
+    # because the decoder cannot read the representation at all.
+    proj_anchor_weight: 0.5
     ratio_loss_weight: 0.5
     n_distractors: 0
     # MANDATORY under exact_topk (2026-08-27). Every loss reaching the head is
