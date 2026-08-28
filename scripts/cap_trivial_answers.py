@@ -70,7 +70,7 @@ def main() -> None:
             by_answer[str(rows[i].get("gold_answer") or "").strip()].append(i)
         dropped = 0
         capped_answers = 0
-        for ans, group in by_answer.items():
+        for _ans, group in by_answer.items():
             if len(group) <= cap:
                 keep.update(group)
                 continue
@@ -92,10 +92,10 @@ def main() -> None:
     # Post-condition: no answer may exceed the cap in any split.
     kept_rows = [rows[i] for i in sorted(keep)]
     worst = 0.0
-    for split, idxs in defaultdict(
-        list, {s: [i for i, r in enumerate(kept_rows)
-                   if str(r.get("split") or "") == s] for s in by_split}
-    ).items():
+    for _split, idxs in {
+        s: [i for i, r in enumerate(kept_rows) if str(r.get("split") or "") == s]
+        for s in by_split
+    }.items():
         if not idxs:
             continue
         c = Counter(str(kept_rows[i].get("gold_answer") or "").strip() for i in idxs)

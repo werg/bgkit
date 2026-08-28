@@ -221,3 +221,67 @@ def materialize_window(sample: dict) -> str:
     """Resolve a sample's span back to the raw window text."""
     lines = Path(sample["path"]).read_text(errors="replace").splitlines()
     return "\n".join(lines[sample["line_start"] : sample["line_end"]])
+
+# --------------------------------------------------------------------------
+# Low-entropy field extraction (2026-08-28).
+#
+# The original qtypes ask for a whole log line quoted VERBATIM. Measured on the
+# shipped data: 60.7 answer tokens averaging 29.7% DIGITS (epoch stamps,
+# microsecond timestamps, core numbers). Asking a ~66x lossy compressor to
+# reproduce exactly the least compressible substring in the document is a
+# contradictory objective, and the failure mode confirms it is not a metric
+# artifact: only 1.7% of lognav errors are near-misses, 72.5% are unrelated.
+#
+# These helpers pull SHORT, low-entropy fields out of a line so a question can
+# require LOCATING content without requiring lossless reproduction of it.
+# Formats seen in the corpus:
+#   BGL: - <epoch> <date> <node> <ts> <node> RAS KERNEL INFO <message>
+#   ZK : <date> <time> - INFO  [<component>@<line>] - <message>
+SEVERITIES = (
+    "FATAL", "ERROR", "SEVERE", "CRITICAL", "WARN", "WARNING",
+    "INFO", "DEBUG", "TRACE",
+)
+
+
+def log_line_fields(line: str) -> dict[str, str]:
+    """Best-effort {severity, component, node} for one log line.
+
+    Returns only the keys it is confident about — a caller must treat a missing
+    key as "cannot build a question from this line" rather than substituting a
+    default, or the answer distribution silently collapses onto that default
+    (exactly the failure that made "No error-severity lines are present." 17.8%
+    of lognav).
+    """
+    out: dict[str, str] = {}
+    toks = line.split()
+    sev_i = None
+    for i, t in enumerate(toks):
+        bare = t.strip("[]()<>:,")
+        if bare.upper() in SEVERITIES and bare.isupper():
+            out["severity"] = bare.upper()
+            sev_i = i
+            break
+    # Component: the token before the severity (BGL "KERNEL"), or the bracketed
+    # class name after it (ZK "[...QuorumCnxManager$Listener@493]").
+    if sev_i is not None:
+        if sev_i > 0:
+            prev = toks[sev_i - 1].strip("[]()<>:,")
+            if prev.isalpha() and prev.isupper() and len(prev) >= 3:
+                out["component"] = prev
+        if "component" not in out:
+            for t in toks[sev_i + 1 :]:
+                if t.startswith("[") or "@" in t:
+                    cand = t.strip("[]").split("@")[0].split(":")[-1]
+                    if cand and any(c.isalpha() for c in cand):
+                        out["component"] = cand
+                        break
+    # Node id: BGL-style RXX-MX-NX-C:JXX-UXX.
+    for t in toks:
+        if t.count("-") >= 3 and ":" in t and any(c.isdigit() for c in t):
+            out["node"] = t
+            break
+    return out
+
+
+def severity_is_error(sev: str) -> bool:
+    return sev.upper() in ("FATAL", "ERROR", "SEVERE", "CRITICAL")
