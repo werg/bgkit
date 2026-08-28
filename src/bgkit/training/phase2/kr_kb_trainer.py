@@ -1253,6 +1253,11 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._span_contrastive_weight = float(
             surv_cfg.get("span_contrastive_weight", 0.0)
         )
+        # Top-k margin form of the contrastive term — acts on the quantity that
+        # decides survival rather than on sigmoid probabilities. See the loss
+        # site for why the sigmoid form provably could not change selection.
+        self._span_margin_weight = float(surv_cfg.get("span_margin_weight", 0.0))
+        self._span_margin = float(surv_cfg.get("span_margin", 0.5))
         # Projection embed-anchor weight (Step-2.5 repair as a Phase-2 aux).
         self._proj_anchor_weight = float(surv_cfg.get("proj_anchor_weight", 0.0))
         self._pending_proj_anchor: list[torch.Tensor] = []
@@ -7249,7 +7254,51 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             # answers. Without this the positive term alone is satisfied by a
             # query-INDEPENDENT policy, because the union of all spans
             # (0.4-3.1%) fits inside the retention budget (10%).
+            # TOP-K MARGIN contrastive (2026-08-28). The sigmoid form below
+            # supervises probs_f = sigmoid(z - theta), a SOFT probability, but
+            # survival is decided by HARD exact_topk on the z-score. Measured:
+            # the soft loss fell 0.76 -> 0.43 while survivor-set Jaccard between
+            # a sample's own and a FOREIGN query went 0.967 -> 0.991. The model
+            # lowers soft probabilities by margins far below the top-k gap, so
+            # the loss is satisfied without moving a single survivor.
+            #
+            # This form acts on the quantity that actually decides survival: the
+            # k-th largest score in the document IS the cutoff, so pushing a
+            # negative span below it (by a margin) removes it from the
+            # selection, and nothing else counts as progress.
             _neg = entry.get("neg_span_mask")
+            _mw = float(getattr(self, "_span_margin_weight", 0.0) or 0.0)
+            if (
+                _mw > 0.0
+                and _neg is not None
+                and _neg.numel() == logits_for_op.numel()
+                and bool(_neg.any())
+                and cu_seqlens is not None
+            ):
+                z = logits_for_op.float()
+                margin = float(getattr(self, "_span_margin", 0.5) or 0.5)
+                terms = []
+                for _i in range(int(cu_seqlens.shape[0]) - 1):
+                    a0 = int(cu_seqlens[_i].item())
+                    a1 = int(cu_seqlens[_i + 1].item())
+                    n_seg = a1 - a0
+                    if n_seg < 2:
+                        continue
+                    seg_z = z[a0:a1]
+                    seg_neg = _neg[a0:a1]
+                    if not bool(seg_neg.any()):
+                        continue
+                    k = max(1, min(n_seg, math.ceil(n_seg * float(target_ratio))))
+                    # The k-th largest score is the survival cutoff. Detached:
+                    # the cutoff is a reference point, not something to drag
+                    # down to meet the negatives.
+                    cutoff = torch.topk(seg_z, k).values[-1].detach()
+                    viol = torch.relu(seg_z[seg_neg] - cutoff + margin)
+                    terms.append(viol.mean())
+                if terms:
+                    _m = torch.stack(terms).mean()
+                    total = total + _mw * _m
+                    metrics["l0_span_margin_loss"] = float(_m.item())
             if (
                 getattr(self, "_span_contrastive_weight", 0.0) > 0.0
                 and _neg is not None
