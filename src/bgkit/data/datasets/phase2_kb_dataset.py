@@ -48,8 +48,27 @@ class KBSample:
     id_scheme_version: int = 0
     source_sha256: str = ""
     gold_span: tuple[int, int] | None = None
+    negative_spans: tuple[tuple[int, int], ...] = ()
+    """Spans of the SAME document's OTHER questions (contrastive supervision).
+
+    The span loss is positive-only and therefore satisfiable without reading the
+    question: the union of all questions' spans per document is 0.4-3.1% while
+    the retention budget is 10%, so keeping every answer-looking position
+    satisfies every question at once. These let the trainer push the other
+    questions' answers DOWN so budget allocation depends on WHICH question is
+    asked (2026-08-28)."""
     """[tok_start, tok_end) of the answer inside the gold article's tokens
     (v5 span-level relevance supervision; from ``gold_span_json``)."""
+
+
+def _parse_negative_spans(raw) -> tuple[tuple[int, int], ...]:
+    """Parse ``negative_spans_json`` (a list of [start, end)) — empty if absent."""
+    if not raw:
+        return ()
+    try:
+        return tuple((int(a), int(b)) for a, b in json.loads(raw))
+    except Exception:
+        return ()
 
 
 def _parse_gold_span(raw) -> tuple[int, int] | None:
@@ -251,6 +270,7 @@ class KBTrajectoryDataset(Dataset):
             id_scheme_version=int(row.get("id_scheme_version") or 0),
             source_sha256=str(row.get("source_sha256") or ""),
             gold_span=_parse_gold_span(row.get("gold_span_json")),
+            negative_spans=_parse_negative_spans(row.get("negative_spans_json")),
         )
 
     def _column_unique_values(self, name: str) -> set:

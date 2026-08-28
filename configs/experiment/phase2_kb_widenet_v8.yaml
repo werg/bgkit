@@ -119,6 +119,17 @@ training:
   survivorship:
     survivorship_aux: true
     span_relevance_weight: 2.0
+    # CONTRASTIVE span supervision (2026-08-28). The positive-only span loss is
+    # satisfiable WITHOUT reading the question: the union of all questions'
+    # answer spans per document is 0.4-3.1% while the L0 budget is 10%, so
+    # "keep every answer-looking position" satisfies every question at once and
+    # query-blind generic saliency is OPTIMAL. Measured: survivor-set Jaccard
+    # own-vs-foreign query 0.967, answer accuracy unchanged under the wrong
+    # question, random selection == trained selection. This term pushes DOWN
+    # the same document's OTHER answers so budget allocation depends on WHICH
+    # question is asked. Data supports it: 77-92% of rows have 2.9-4.3
+    # non-overlapping negatives.
+    span_contrastive_weight: 1.0
     ratio_loss_weight: 0.5
     n_distractors: 0
     # MANDATORY under exact_topk (2026-08-27). Every loss reaching the head is

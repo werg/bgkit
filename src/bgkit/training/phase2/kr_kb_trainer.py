@@ -1234,6 +1234,25 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # v5: span-level relevance — push the gold answer span's positions to
         # survive at L0 AND L1 (target prob 1.0). 0.0 = off (default).
         self._span_relevance_weight = float(surv_cfg.get("span_relevance_weight", 0.0))
+        # CONTRASTIVE span supervision (2026-08-28). The span loss is
+        # POSITIVE-ONLY: push THIS question's answer span up. That is
+        # satisfiable without ever looking at the question, because the union of
+        # ALL questions' spans for a document occupies 0.4-3.1% of it while the
+        # retention budget is 10% — so "keep every answer-looking position"
+        # satisfies every question at once and query-blind generic saliency is
+        # the OPTIMAL solution. Measured consequence: survivor-set Jaccard
+        # between a sample's own query and a FOREIGN query 0.967, answer
+        # accuracy unchanged under the wrong query, random selection equal to
+        # trained selection.
+        #
+        # This term pushes DOWN the spans belonging to the document's OTHER
+        # questions, making budget allocation depend on WHICH question is
+        # asked. The data already supports it: 4.5-6.8 questions per document,
+        # 79-100% of documents have several, so the contrastive pairs existed
+        # all along and were simply never used.
+        self._span_contrastive_weight = float(
+            surv_cfg.get("span_contrastive_weight", 0.0)
+        )
         # Per-term gradient attribution at the L1 selector head, every N steps
         # (0 = off). Answers "which aux loss owns this head's gradient?", which
         # no existing metric could: grad_norm/l1_head reports the SUM.
@@ -3354,6 +3373,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         ratio: float | None = None,
         selection_mode: str = "threshold",
         gold_spans: dict[str, tuple[int, int]] | None = None,
+        negative_spans: dict[str, tuple[tuple[int, int], ...]] | None = None,
     ):
         """Run the encoder live on each article's tokens to produce L0 survivors.
 
@@ -3529,6 +3549,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         selection_mode: str = "threshold",
         ratio: float | None = None,
         gold_spans: dict[str, tuple[int, int]] | None = None,
+        negative_spans: dict[str, tuple[tuple[int, int], ...]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return packed L0 survivors for each article.
 
@@ -3560,6 +3581,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 dataset, article_ids, query_emb=query_emb,
                 ratio=ratio, selection_mode=selection_mode,
                 gold_spans=gold_spans,
+                negative_spans=negative_spans,
             )
             survivors = out.survivor_embeddings  # (N_survivors, D)
             cu_seqlens = out.survivor_cu_seqlens  # (B+1,)
@@ -3580,6 +3602,28 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     e = min(max(a0 + int(sp[1]), a0), a1)
                     if e > s:
                         span_mask[s:e] = True
+            # CONTRASTIVE: the same document's OTHER questions' spans. Pushing
+            # these DOWN is what makes budget allocation depend on WHICH
+            # question is asked; without it a query-independent policy satisfies
+            # every question at once (union of spans 0.4-3.1% vs 10% budget).
+            neg_mask = None
+            if negative_spans:
+                neg_mask = torch.zeros(
+                    int(content_cu[-1].item()), dtype=torch.bool,
+                    device=content_cu.device,
+                )
+                for i, aid in enumerate(article_ids):
+                    for sp in negative_spans.get(aid, ()) or ():
+                        a0 = int(content_cu[i].item())
+                        a1 = int(content_cu[i + 1].item())
+                        s_ = min(max(a0 + int(sp[0]), a0), a1)
+                        e_ = min(max(a0 + int(sp[1]), a0), a1)
+                        if e_ > s_:
+                            neg_mask[s_:e_] = True
+                # Never penalise a position the positive term is pushing up.
+                if span_mask is not None:
+                    neg_mask = neg_mask & ~span_mask
+
             # Stash for _prepare_l1_turn (span -> L1 position mapping).
             self._last_l0_survivor_mask = getattr(out, "survivor_mask", None)
             self._last_l0_content_cu = content_cu
@@ -3595,6 +3639,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                             # losses can do segment-aware reductions.
                             "cu_seqlens": content_cu,
                             "span_mask": span_mask,
+                            "neg_span_mask": neg_mask,
                         })
                 else:
                     # Aux OFF: accumulate ONLY the θ control scalars (no graph
@@ -4034,6 +4079,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         l0_selection_mode: str = "threshold",
         l0_ratio: float | None = None,
         gold_span: tuple[int, int] | None = None,
+        negative_spans: tuple[tuple[int, int], ...] = (),
     ) -> dict | None:
         """Build per-turn packed content + query tensors without running the encoder.
 
@@ -4106,6 +4152,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._last_l0_content_cu = None
         if gold_span is not None and article_ids:
             l0_kwargs["gold_spans"] = {article_ids[0]: gold_span}
+        if negative_spans and article_ids:
+            l0_kwargs["negative_spans"] = {article_ids[0]: tuple(negative_spans)}
         l0_flat, l0_cu = self._l0_for_articles(dataset, all_ids, **l0_kwargs)
         l0_lengths = lengths_from_cu(l0_cu).tolist()
         # Per-article L1 span flags: for article 0 (gold w/ span), which of its
@@ -6709,6 +6757,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 # v5 gold span threaded CONDITIONALLY (legacy test doubles).
                 _gs = getattr(sample, "gold_span", None)
                 _gs_kwargs = {"gold_span": _gs} if _gs is not None else {}
+                _ns = tuple(getattr(sample, "negative_spans", ()) or ())
+                if _ns:
+                    _gs_kwargs["negative_spans"] = _ns
                 prepared_turns.append(
                     self._prepare_l1_turn(
                         sample.dataset_name, ids, leaf_query, **leaf_kwargs, **_gs_kwargs,
@@ -7134,6 +7185,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         l0_decisive_losses: list[torch.Tensor] = []
         l0_span_losses: list[torch.Tensor] = []
         l0_scale_anchors: list[torch.Tensor] = []
+        l0_contrastive_losses: list[torch.Tensor] = []
         l0_span_survival: list[float] = []
         for entry in self._pending_l0_outputs:
             enc_out = entry["enc_out"]
@@ -7171,6 +7223,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 _sm = getattr(enc_out, "survivor_mask", None)
                 if _sm is not None and _sm.numel() == _span.numel():
                     l0_span_survival.append(_sm[_span].float().mean().item())
+            # CONTRASTIVE: push DOWN the same document's OTHER questions'
+            # answers. Without this the positive term alone is satisfied by a
+            # query-INDEPENDENT policy, because the union of all spans
+            # (0.4-3.1%) fits inside the retention budget (10%).
+            _neg = entry.get("neg_span_mask")
+            if (
+                getattr(self, "_span_contrastive_weight", 0.0) > 0.0
+                and _neg is not None
+                and _neg.numel() == probs_f.numel()
+                and bool(_neg.any())
+            ):
+                l0_contrastive_losses.append((probs_f[_neg] ** 2).mean())
             if cu_seqlens is not None:
                 # Segment-aware mean: (B_articles,)
                 n_articles = int(cu_seqlens.shape[0]) - 1
@@ -7199,6 +7263,10 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             )
             metrics["l0_ratio_loss"] = l0_ratio_loss.item()
             metrics["l0_decisiveness_loss"] = l0_decisive_loss.item()
+        if l0_contrastive_losses:
+            _c = torch.stack(l0_contrastive_losses).mean()
+            total = total + self._span_contrastive_weight * _c
+            metrics["l0_span_contrastive_loss"] = float(_c.item())
         if l0_span_losses:
             l0_span_loss = torch.stack(l0_span_losses).mean()
             total = total + getattr(self, "_span_relevance_weight", 0.0) * l0_span_loss
