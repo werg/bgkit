@@ -1171,6 +1171,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         # needs ~40% of the entire budget — plausibly below the level at which
         # the span loss carries usable signal, which is one explanation for L1
         # sitting at +0.138 sd (chance) for thousands of steps (2026-08-28).
+        self._tool_call_loss_weight = float(
+            self.step_cfg.get("tool_call_loss_weight", 1.0)
+        )
         self._l1_retention_cfg = self.step_cfg.get("l1_retention", 0.15)
         self._l1_retention = float(
             self._interp_ratio_ramp(self._l1_retention_cfg, 0, default=0.15)
@@ -6229,7 +6232,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             decode_len = 0
             for seg in segments:
                 if isinstance(seg, TokenSegment) and seg.loss_mask is not None:
-                    sample_tokens += int(seg.loss_mask.sum().item())
+                    # Count positions, not summed weights — the mask may be a
+                    # float weight vector (tool_call_loss_weight).
+                    sample_tokens += int((seg.loss_mask > 0).sum().item())
                 tk = getattr(seg, "token_ids", None)
                 if tk is not None:
                     decode_len += int(tk.reshape(-1).shape[0])
@@ -6566,6 +6571,28 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         rendered, topic_block, _topic_tags = self._render_sample(sample)
         token_ids = rendered.token_ids.to(self.device)
         loss_mask = rendered.loss_mask.to(self.device)
+        # TOOL-CALL LOSS WEIGHT (2026-08-28). 57% of loss-bearing tokens are the
+        # bgkit tool call, and that call is a COPY task: flat_trajectory_row
+        # writes the doc id into the scope description and the query is the
+        # question verbatim, so those tokens need no reps at all. Measured
+        # answer share of loss tokens: lognav 55.5%, grepset 33.2%, fileneedle
+        # 23.3% (pooled 42.9%). The model duly learns the copy (route_exact
+        # 0.92-0.98) while answer EM sits at 0.17 — the gradient is mostly
+        # teaching the rep-INDEPENDENT half.
+        #
+        # Down-weight rather than mask: routing is a real requirement and is
+        # already near-saturated, so a small weight retains it while
+        # concentrating gradient on the answer. The CE path already multiplies
+        # the mask as a float (decoder.py: shift_mask * loss_mask[...].float()),
+        # so a weighted mask needs no plumbing at the loss site.
+        w = float(getattr(self, "_tool_call_loss_weight", 1.0) or 1.0)
+        if w != 1.0 and getattr(rendered, "bgkit_call_spans", None):
+            loss_mask = loss_mask.to(torch.float32)
+            for c0, c1 in rendered.bgkit_call_spans:
+                c0 = max(0, int(c0))
+                c1 = min(int(loss_mask.shape[0]), int(c1))
+                if c1 > c0:
+                    loss_mask[c0:c1] = loss_mask[c0:c1] * w
 
         sentinel_ids = self.tokenizer.encode(BGKIT_SENTINEL, add_special_tokens=False)
         sentinel_len = len(sentinel_ids)
@@ -6975,7 +7002,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         n_tokens = 0
         for seg in segments:
             if isinstance(seg, TokenSegment) and seg.loss_mask is not None:
-                n_tokens += int(seg.loss_mask.sum().item())
+                n_tokens += int((seg.loss_mask > 0).sum().item())
         return loss, n_tokens
 
     # ------------------------------------------------------------------

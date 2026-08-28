@@ -80,6 +80,17 @@ training:
     - grepset
   max_samples_per_dataset_default: 100000
 
+  # TOOL-CALL LOSS WEIGHT (2026-08-28). Measured: 57% of loss-bearing tokens
+  # are the bgkit tool call, and that call is a COPY task — flat_trajectory_row
+  # writes the doc id into the scope description and the query is the question
+  # verbatim, so those tokens need no reps. Answer share of loss tokens:
+  # lognav 55.5%, grepset 33.2%, fileneedle 23.3% (pooled 42.9%). The model
+  # duly learns the copy (route_exact 0.92-0.98) while answer EM sits at 0.17:
+  # the gradient was mostly teaching the rep-INDEPENDENT half. Down-weight
+  # rather than mask, because routing is a real requirement and is already
+  # near-saturated — 0.2 keeps it while concentrating gradient on the answer.
+  tool_call_loss_weight: 0.2
+
   # RETENTION CURRICULUM (2026-08-28). Previously 0.10 x 0.15 fixed from step
   # 0, i.e. ~1.5% of tokens survive to the decoder. For a 12-token verbatim
   # answer in a 2k-token document a PERFECT selector must spend ~40% of its
