@@ -84,8 +84,9 @@ def main(cfg: DictConfig) -> None:
     trainer.model.eval()
 
     prompt_tokens = int(getattr(trainer, "_l0_prompt_tokens", 0) or 0)
-    print(f"l0_prompt_tokens = {prompt_tokens} "
-          f"({'QUESTION is the prompt' if prompt_tokens == 0 else 'LEARNABLE prompt OVERRIDES the question'})")
+    _src = "QUESTION is the prompt" if prompt_tokens == 0 else (
+        "LEARNABLE prompt OVERRIDES the question")
+    print(f"l0_prompt_tokens = {prompt_tokens}  ({_src})")
 
     # Substitute the compression prompt without touching anything else.
     real_prepare = trainer._prepare_l1_turn
@@ -125,14 +126,14 @@ def main(cfg: DictConfig) -> None:
 
             captured: dict[str, torch.Tensor] = {}
 
-            def run(qtext: str | None, tag: str) -> float | None:
+            def run(qtext: str | None, tag: str, _s=sample, _cap=captured) -> float | None:
                 override["query"] = qtext
-                a = _answer_acc(trainer, sample)
+                a = _answer_acc(trainer, _s)
                 sm = getattr(trainer, "_last_l0_survivor_mask", None)
                 ccu = getattr(trainer, "_last_l0_content_cu", None)
                 if sm is not None and ccu is not None:
                     a0, a1 = int(ccu[0].item()), int(ccu[1].item())
-                    captured[tag] = sm[a0:a1].detach().to("cpu").clone()
+                    _cap[tag] = sm[a0:a1].detach().to("cpu").clone()
                 return a
 
             a_own = run(None, "own")            # None => the sample's own query
@@ -158,7 +159,7 @@ def main(cfg: DictConfig) -> None:
     if jac:
         j = sum(jac) / len(jac)
         print(f"  SELECTION   survivor-set Jaccard (own vs foreign query): {j:.4f}")
-        print(f"              1.000 = selection completely ignores the prompt")
+        print("              1.000 = selection completely ignores the prompt")
     if cos:
         print(f"  REPRESENT.  mean rep cosine: {sum(cos) / len(cos):.4f}")
     if acc_own:
