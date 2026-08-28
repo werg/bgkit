@@ -60,7 +60,11 @@ training:
   # metric here is lm_health, not task quality.
   max_eval_samples: 128
   eval_free_running_samples: 64
-  eval_ablation_modes: []
+  # rep_gain REQUIRES the zeroed arm. eval/rep_gain/* is the headline "is the
+  # model actually USING the encoded information" metric, and with this list
+  # empty it silently never computes — which is how the capability decayed
+  # unnoticed for months (base 2.03-2.95 nats -> 0.004 with nothing reporting).
+  eval_ablation_modes: [zeroed]
   eval_train_subset_samples: 0
   profile_timing: true
 

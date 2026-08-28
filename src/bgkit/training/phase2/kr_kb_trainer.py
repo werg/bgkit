@@ -9388,6 +9388,41 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 metrics["eval/recon_gap"] = z_r - base_r
             if base_n is not None and z_n is not None:
                 metrics["eval/nav_gap"] = z_n - base_n
+
+            # REP_GAIN — the headline "is the model actually USING the encoded
+            # information" metric, first-class rather than an occasional probe.
+            #
+            # This is the number whose decay went unnoticed for months. On the
+            # base checkpoint it was 2.03-2.95 nats on the task the model was
+            # trained on; after 2600 steps of wide-net Phase-2 it was ~0.004,
+            # and nothing in the training loop reported it. A capability you do
+            # not measure is one you will lose.
+            #
+            # Computed on the ANSWER span, not pooled loss: 57% of loss-bearing
+            # tokens are the bgkit tool call, which is a copy task the prompt
+            # already determines, so a pooled gap is diluted by construction and
+            # would hide exactly the effect being watched.
+            b_acc = metrics.get("eval/answer_token_accuracy")
+            z_acc = metrics.get("eval/ablation/zeroed/answer_token_accuracy")
+            if b_acc is not None and z_acc is not None:
+                metrics["eval/rep_gain/answer_accuracy"] = b_acc - z_acc
+            b_em = metrics.get("eval/exact_match")
+            z_em = metrics.get("eval/ablation/zeroed/exact_match")
+            if b_em is not None and z_em is not None:
+                metrics["eval/rep_gain/exact_match"] = b_em - z_em
+            b_l = metrics.get("eval/loss")
+            z_l = metrics.get("eval/ablation/zeroed/loss")
+            if b_l is not None and z_l is not None:
+                # nats the reps are worth; the sign convention matches the base
+                # control (ce_zeroed - ce_reps), so POSITIVE = reps help.
+                metrics["eval/rep_gain/nats"] = z_l - b_l
+            # Per dataset, because a pooled gain can be carried by one task
+            # while the others are at zero.
+            for ds in list(self.step_cfg.get("datasets", []) or []):
+                bd = metrics.get(f"eval/{ds}/exact_match")
+                zd = metrics.get(f"eval/ablation/zeroed/{ds}/exact_match")
+                if bd is not None and zd is not None:
+                    metrics[f"eval/rep_gain/{ds}/exact_match"] = bd - zd
         finally:
             self._clear_eval_shared_tree()
             self.model.train()
