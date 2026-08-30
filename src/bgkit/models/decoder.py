@@ -6897,8 +6897,21 @@ class ReconstructionDecoder(nn.Module):
             ref = getattr(self, "_rep_norm_guard_ref_ratio", None)
             if ref is None and ratio >= lo:
                 ref = self._rep_norm_guard_ref_ratio = ratio
+            # An ablation may deliberately move reps to a DIFFERENT but valid
+            # scale — the rescale-to-embed-norm arm targets ratio 1.0 by
+            # construction. Suppressing the guard there (the cheap fix) would
+            # cost the one check that matters most during that arm: whether the
+            # rescale ACTUALLY APPLIED. Measuring drift against the declared
+            # expectation instead keeps the guard live and inverts it usefully —
+            # a rescaled arm still sitting at the raw reference is now the
+            # anomaly. On 2026-08-30 that check was run BY HAND on v8
+            # (ratio 0.9999 vs reference 237.45) to prove the arm worked; the
+            # next person should not have to.
+            expected = getattr(self, "_rep_norm_guard_expected_ratio", None)
+            band_ref = expected if expected is not None else ref
             degenerate = ratio < lo or (
-                ref is not None and hi > 0 and (ratio > ref * hi or ratio < ref / hi)
+                band_ref is not None and hi > 0
+                and (ratio > band_ref * hi or ratio < band_ref / hi)
             )
             streak = int(getattr(self, "_rep_norm_guard_oob_streak", 0))
             streak = streak + 1 if degenerate else 0
@@ -6911,6 +6924,7 @@ class ReconstructionDecoder(nn.Module):
                 ratio=round(ratio, 4),
                 rep_norm_mean=round(rep_norm_mean, 4),
                 reference_ratio=None if ref is None else round(ref, 4),
+                expected_ratio=expected,
                 decoder_family=getattr(self, "decoder_family", None),
                 n_rep_vectors=int(all_norms.numel()),
                 guard_call=n,
@@ -6927,6 +6941,7 @@ class ReconstructionDecoder(nn.Module):
                     band_low=round(lo, 4),
                     band_high=hi,
                     reference_ratio=None if ref is None else round(ref, 4),
+                    expected_ratio=expected,
                     degenerate=degenerate,
                     decoder_family=getattr(self, "decoder_family", None),
                     n_rep_vectors=int(all_norms.numel()),

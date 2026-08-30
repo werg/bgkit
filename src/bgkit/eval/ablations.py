@@ -80,6 +80,44 @@ class AblationCondition(Enum):
     SURVIVORS_PRESENT = "present"
     SURVIVORS_ZEROED = "zeroed"
     SURVIVORS_NOISE = "noise"
+    # RESCALED (2026-08-30): survivor MAGNITUDE normalised to the decoder's
+    # mean token-embedding norm, directions untouched. Not an ablation in the
+    # "remove information" sense — it removes a suspected mechanical BARRIER to
+    # information the reps already hold, so a gain here is attributable to
+    # scale alone. See rescale_to_embed_norm for the measurements.
+    SURVIVORS_RESCALED = "rescaled"
+
+
+def rescale_to_embed_norm(
+    survivors: torch.Tensor, embed_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Normalise rep magnitude to the decoder's mean token-embedding norm.
+
+    THE ONE IMPLEMENTATION. Per-vector, so DIRECTIONS are preserved exactly:
+    this changes how loud the reps are, not what they say. Any loss change is
+    therefore attributable to scale and nothing else — which is the entire
+    basis of the inference below, so it must not be reimplemented per caller.
+
+    MEASURED (summarization base, source->summary, per-token gap
+    ce_zeroed - ce_reps, n=6318 each):
+
+        l0      raw gap    rescaled gap    swing
+        0.63    -0.0640      +0.0455      +0.110
+        0.32    -0.0618      +0.0496      +0.111
+        0.10    -0.0068      +0.0945      +0.101
+
+    Reps sit at ~500x embed norm. Raw, they are mildly HARMFUL and the harm is
+    dose-dependent (CE rises monotonically with how many are spliced while the
+    zeroed arm stays flat). Rescaled, they help — most at the harshest budget,
+    where each rep must carry the most. That is the signature of information
+    being mechanically suppressed rather than absent.
+    """
+    if survivors.numel() == 0:
+        return survivors
+    with torch.no_grad():
+        target = embed_weight.detach().float().norm(dim=-1).mean()
+    current = survivors.float().norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    return (survivors.float() / current * target).to(survivors.dtype)
 
 
 @dataclass
@@ -93,6 +131,7 @@ class AblationResult:
 def _modify_survivors(
     survivors: torch.Tensor,
     condition: AblationCondition,
+    embed_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply ablation modification to survivor embeddings."""
     if condition == AblationCondition.SURVIVORS_PRESENT:
@@ -101,6 +140,13 @@ def _modify_survivors(
         return torch.zeros_like(survivors)
     elif condition == AblationCondition.SURVIVORS_NOISE:
         return torch.randn_like(survivors) * survivors.std()
+    elif condition == AblationCondition.SURVIVORS_RESCALED:
+        if embed_weight is None:
+            raise ValueError(
+                "SURVIVORS_RESCALED needs embed_weight (the decoder's token "
+                "embedding matrix) to know what norm to rescale TO"
+            )
+        return rescale_to_embed_norm(survivors, embed_weight)
     else:
         raise ValueError(f"Unknown ablation condition: {condition}")
 
@@ -259,11 +305,27 @@ def run_ablation_suite(
 
 
 def compute_ablation_gap(results: list[AblationResult]) -> dict[str, float]:
-    """Compute present-vs-zeroed and present-vs-noise gaps.
+    """Compute present-vs-zeroed / -noise / -rescaled gaps.
 
     A positive gap means the 'present' condition is better (lower loss),
     i.e., zeroed/noise hurt performance -- the expected outcome if BgKIT
     survivors carry signal.
+
+    READ THESE POOLED GAPS WITH CARE — and prefer the per-token distribution
+    from :mod:`bgkit.eval.rep_dependence` when the question is "are the reps
+    load-bearing". A pooled mean CANNOT distinguish:
+
+        (a) reps useless everywhere                    gap ~ 0
+        (b) reps load-bearing for 6% of tokens         gap ~ 0
+
+    Those demand opposite conclusions and produce the same number. Measured
+    2026-08-29 on the summarization base, case (b) was the truth: pooled gap
+    -0.02 while p99 was +1.2 and 6% of tokens gained >0.5 nats. The pooled
+    reading alone said "reps do nothing" for a full day.
+
+    ``present_vs_rescaled`` is NOT an ablation gap in the same sense: rescaled
+    keeps all the information and only fixes magnitude, so a positive value
+    means the reps' SCALE is costing you, not that information is missing.
 
     Returns:
         Dict with gap values. Both should be positive if survivors are useful.
@@ -281,5 +343,15 @@ def compute_ablation_gap(results: list[AblationResult]) -> dict[str, float]:
             gaps["present_vs_zeroed_loss_gap"] = zeroed_loss - present_loss
         if noise_loss is not None:
             gaps["present_vs_noise_loss_gap"] = noise_loss - present_loss
+        rescaled_loss = by_condition.get(
+            AblationCondition.SURVIVORS_RESCALED, {},
+        ).get("loss")
+        if rescaled_loss is not None:
+            # POSITIVE => rescaling the reps to embed norm HELPS, i.e. their
+            # ~500x magnitude is mechanically suppressing information they hold.
+            gaps["present_vs_rescaled_loss_gap"] = present_loss - rescaled_loss
+            if zeroed_loss is not None:
+                # What the value-of-reps signal WOULD be with scale fixed.
+                gaps["rescaled_vs_zeroed_loss_gap"] = zeroed_loss - rescaled_loss
 
     return gaps
