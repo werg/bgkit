@@ -34,8 +34,8 @@ from bgkit.models.encoder import BgKITEncoder, EncoderOutput
 from bgkit.models.projection_block import effective_projection_counts, effective_projection_cu
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
-from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
-from bgkit.training.compression_curriculum import CompressionCurriculumMixin
+from bgkit.training.checkpointing import load_checkpoint
+from bgkit.training.compression_curriculum import CompressionCurriculumMixin, linear_ratio
 from bgkit.training.gradient_utils import (
     configure_decoder_layerwise_split,
     maybe_enable_decoder_gradient_checkpointing,
@@ -1292,11 +1292,14 @@ class CompressionTrainer(CompressionCurriculumMixin, BaseTrainer):
             return 1.0
         if self._target_ratio_override is not None:
             return self._target_ratio_override
-        step = self.global_step
-        if step >= self._target_ratio_ramp_steps:
-            return self._target_ratio_end
-        t = step / max(self._target_ratio_ramp_steps, 1)
-        return self._target_ratio_start + t * (self._target_ratio_end - self._target_ratio_start)
+        # See decoder_init: same arithmetic as ``linear_ratio``, hand-rolled
+        # without its monotone-descent clamp. Ramp origin is step 0 here.
+        return linear_ratio(
+            self.global_step,
+            self._target_ratio_start,
+            self._target_ratio_end,
+            self._target_ratio_ramp_steps,
+        )
 
     def _sample_target_ratio(self) -> float:
         """Sample a requested ratio for the current microbatch."""
@@ -3205,44 +3208,28 @@ class CompressionTrainer(CompressionCurriculumMixin, BaseTrainer):
     # Checkpointing
     # ------------------------------------------------------------------
 
-    def save_checkpoint(
-        self, checkpoint_dir: Path, metrics: dict[str, float] | None = None,
-    ) -> Path:
-        """Save encoder, decoder, optimizer, and curriculum state."""
-        if self._training_state is None:
-            self._training_state = {}
+    def checkpoint_models(self) -> dict[str, torch.nn.Module]:
+        """Encoder + decoder (compression curriculum trains both).
 
-        # Inject curriculum state
-        self._training_state.update({
-            "l1_enabled": self._l1_enabled,
-            "l1_transitioned": self._l1_transitioned,
-            "l1_rebuild_pending": self._l1_rebuild_pending,
-            "target_ratio_override": self._target_ratio_override,
-        })
+        Was a hand-rolled save_checkpoint override that re-declared all eight
+        metadata fields AND called the module-level save_checkpoint() directly,
+        bypassing _write_checkpoint — so it wrote to the spinning HDD and
+        skipped async archival (the 2026-06-10 NVMe routing bug, fixed in
+        summarization_round_robin and never propagated here, because each
+        trainer owned its own copy of the write path).
+        """
+        return {"encoder": self.encoder, "decoder": self.decoder}
 
-        metadata = CheckpointMetadata(
-            phase=self.cfg.training.phase,
-            step=self.global_step,
-            epoch=self.epoch,
-            parent_checkpoint=self._last_checkpoint_path,
-            metrics=metrics,
-            schedule_params=self._schedule_params,
-            training_state=self._training_state,
-            optimizer_type=self._optimizer_type,
-            run_name=self.cfg.get("run_name", None),
-        )
-        save_kwargs = dict(
-            encoder=self.encoder.state_dict(),
-            decoder=self.decoder.state_dict(),
-            optimizer_state_by_name=self._build_optimizer_state_by_name(),
-        )
+    def checkpoint_extra_state(self) -> dict[str, dict]:
+        """LoRA-merged decoder, when LoRA is installed.
+
+        Restored after the checkpoint_models conversion initially dropped it —
+        caught by diffing the new hook against what HEAD's override actually
+        wrote. decoder_merged.pt is a real downstream artifact.
+        """
         if getattr(self, "_decoder_lora", False):
-            save_kwargs["decoder_merged"] = self.decoder.merge_lora()
-
-        ckpt_path = save_checkpoint(checkpoint_dir, metadata, **save_kwargs)
-        self._last_checkpoint_path = str(ckpt_path)
-        return ckpt_path
-
+            return {"decoder_merged": self.decoder.merge_lora()}
+        return {}
     def _named_parameters_for_optimizer(self):
         """Yield (name, param) pairs across encoder + decoder."""
         for name, param in self.encoder.named_parameters():

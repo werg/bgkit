@@ -34,8 +34,8 @@ from bgkit.models.decoder import ReconstructionDecoder, normalize_decoder_family
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
-from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
-from bgkit.training.compression_curriculum import CompressionCurriculumMixin
+from bgkit.training.checkpointing import load_checkpoint
+from bgkit.training.compression_curriculum import CompressionCurriculumMixin, linear_ratio
 from bgkit.training.gradient_utils import (
     configure_decoder_layerwise_split,
     maybe_enable_decoder_gradient_checkpointing,
@@ -133,6 +133,9 @@ class _InterleavingIterator:
 
 class DecoderInitTrainer(CompressionCurriculumMixin, BaseTrainer):
     """Step 1: Decoder init with encoder unfreeze + compression curriculum."""
+    # Hands compressed reps to a decoder: eval MUST report a
+    # rep-dependence number (BaseTrainer warns loudly otherwise).
+    SPLICES_REPS: ClassVar[bool] = True
 
     LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {
         "target_ratio_ramp_steps": "_target_ratio_ramp_steps",
@@ -1289,12 +1292,20 @@ class DecoderInitTrainer(CompressionCurriculumMixin, BaseTrainer):
         if not self._compression_active or self._compression_introduction_step is None:
             return 1.0  # no compression
 
-        # Ramp relative to compression introduction step
-        steps_since_intro = self.global_step - self._compression_introduction_step
-        if steps_since_intro >= self._target_ratio_ramp_steps:
-            return self._target_ratio_end
-        t = max(steps_since_intro, 0) / max(self._target_ratio_ramp_steps, 1)
-        return self._target_ratio_start + t * (self._target_ratio_end - self._target_ratio_start)
+        # Arithmetic is ``linear_ratio``'s, with the ramp measured from the
+        # introduction step. Hand-rolling it here duplicated the helper AND
+        # dropped its ``max(end, ...)`` clamp, which is what enforces the
+        # monotone-descent rule (compression may only ever decrease). No
+        # shipped config ascends, so this is a no-op today; the point is that a
+        # future start < end now clamps instead of silently inverting the
+        # curriculum.
+        return linear_ratio(
+            self.global_step,
+            self._target_ratio_start,
+            self._target_ratio_end,
+            self._target_ratio_ramp_steps,
+            introduction_step=self._compression_introduction_step,
+        )
 
     def _sample_target_ratio(self) -> float:
         """Sample a requested ratio using the configured window or jitter policy."""
@@ -1932,50 +1943,35 @@ class DecoderInitTrainer(CompressionCurriculumMixin, BaseTrainer):
     # Checkpointing
     # ------------------------------------------------------------------
 
-    def save_checkpoint(
-        self, checkpoint_dir: Path, metrics: dict[str, float] | None = None
-    ) -> Path:
-        """Save both BgKIT encoder and decoder models."""
-        if self._training_state is None:
-            self._training_state = {}
-        self._training_state["decoder_frozen"] = getattr(self, "_decoder_frozen", False)
-        self._training_state["encoder_frozen"] = getattr(self, "_encoder_frozen", True)
-        self._training_state["compression_active"] = getattr(
-            self,
-            "_compression_active",
-            False,
-        )
-        self._training_state["target_ratio_override"] = getattr(
-            self,
-            "_target_ratio_override",
-            None,
-        )
+    # Encoder absence was a hard error here; the shared loader raises the
+    # same way via CHECKPOINT_REQUIRED. Non-strict: new survivorship-head
+    # components are expected to be missing on older checkpoints.
+    CHECKPOINT_REQUIRED: ClassVar[tuple[str, ...]] = ("encoder",)
+    # Encoder loose (new survivorship-head components expected on older
+    # checkpoints); decoder EXACT, as at HEAD. Caught by diffing the converted
+    # loader against what HEAD actually did — the class default would have
+    # silently loosened the decoder load.
+    CHECKPOINT_STRICT: ClassVar[dict[str, bool]] = {
+        "encoder": False, "decoder": True,
+    }
 
-        metadata = CheckpointMetadata(
-            phase=self.cfg.training.phase,
-            step=self.global_step,
-            epoch=self.epoch,
-            parent_checkpoint=self._last_checkpoint_path,
-            metrics=metrics,
-            schedule_params=self._schedule_params,
-            training_state=self._training_state,
-            optimizer_type=self._optimizer_type,
-            run_name=self.cfg.get("run_name", None),
-        )
+    def checkpoint_models(self) -> dict[str, torch.nn.Module]:
+        """Encoder + decoder (decoder-init trains both).
 
-        save_kwargs = dict(
-            encoder=self.encoder.state_dict(),
-            decoder=self.decoder.state_dict(),
-            optimizer_state_by_name=self._build_optimizer_state_by_name(),
-        )
-        # For LoRA: also save a merged decoder state dict so downstream steps
-        # can load it as a plain decoder without the PeftModel wrapper.
+        Was a hand-rolled save_checkpoint override that re-declared all eight
+        metadata fields and called module-level save_checkpoint() directly,
+        bypassing _write_checkpoint — writing to the spinning HDD and skipping
+        async archival (the 2026-06-10 NVMe routing bug, fixed once in
+        summarization_round_robin and never propagated here).
+        """
+        return {"encoder": self.encoder, "decoder": self.decoder}
+
+    def checkpoint_extra_state(self) -> dict[str, dict]:
+        """LoRA-merged decoder, so downstream steps can load a plain decoder
+        without the PeftModel wrapper."""
         if getattr(self, "_decoder_lora", False):
-            save_kwargs["decoder_merged"] = self.decoder.merge_lora()
-
-        ckpt_path = save_checkpoint(checkpoint_dir, metadata, **save_kwargs)
-        self._last_checkpoint_path = str(ckpt_path)
-        return ckpt_path
+            return {"decoder_merged": self.decoder.merge_lora()}
+        return {}
 
     def _named_parameters_for_optimizer(self):
         """Yield (name, param) pairs across encoder, decoder, projection_block.
@@ -1995,21 +1991,6 @@ class DecoderInitTrainer(CompressionCurriculumMixin, BaseTrainer):
         # projection_block lives under encoder; already covered above.
         # Listed here only for trainers where it becomes a separate module.
 
-    def _restore_model_state(self, state_dicts: dict) -> None:
-        """Restore encoder (with legacy-key tolerance) + decoder."""
-        if "encoder" not in state_dicts:
-            raise ValueError(
-                f"Resume checkpoint missing 'encoder' key. Found: {list(state_dicts.keys())}"
-            )
-        enc_state = state_dicts["encoder"]
-        result = self.encoder.load_state_dict(enc_state, strict=False)
-        if result.missing_keys:
-            logger.info(
-                "encoder_missing_keys",
-                keys=result.missing_keys,
-                hint="Expected for new survivorship head components",
-            )
-        self.decoder.load_state_dict(state_dicts["decoder"])
 
     def _restore_training_state(self, training_state: dict) -> None:
         self._target_ratio_override = training_state.get("target_ratio_override")
