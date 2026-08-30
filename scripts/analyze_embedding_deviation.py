@@ -38,8 +38,13 @@ Metrics, per checkpoint:
   norm_ratio     mean ||projection|| / mean ||embed_tokens||   (1.0 = matched)
   cos_to_embed   mean cosine between each rep and its NEAREST token embedding
                  (direction: is it pointing anywhere the decoder recognises?)
-  cos_random     the same against random token embeddings — the chance floor,
-                 without which a "high" cosine means nothing in high dimension
+  cos_random     mean cosine against random token embeddings
+  cos_nearest_for_random_vector
+                 THE CORRECT FLOOR: the nearest-embedding cosine achieved by a
+                 RANDOM direction. cos_near is a MAX over ~150k tokens, so its
+                 null must be a max too — a mean-against-random-tokens floor
+                 (cos_random) makes any max look impressive. Read
+                 nearest_vs_random_ratio: <= 1.0 means no directional alignment
 
 Usage (GPU container, no trainer running):
     python scripts/analyze_embedding_deviation.py +experiment=phase2_kb_widenet_v6 \\
@@ -56,7 +61,7 @@ import hydra
 import torch
 from omegaconf import DictConfig
 
-from bgkit.training.checkpointing import normalize_model_state
+from bgkit.training.checkpointing import restore_model_state_lenient
 from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
 from bgkit.utils.logging import setup_logging
 
@@ -74,6 +79,7 @@ def measure(trainer: KRKBTrainer, n_samples: int) -> dict:
     norms: list[float] = []
     cos_near: list[float] = []
     cos_rand: list[float] = []
+    cos_near_rand: list[float] = []
     used = 0
     g = torch.Generator(device="cpu").manual_seed(0)
 
@@ -107,6 +113,23 @@ def measure(trainer: KRKBTrainer, n_samples: int) -> dict:
             idx = torch.randint(0, emb_unit.shape[0], (reps.shape[0],), generator=g)
             rnd = emb_unit[idx].to(reps.device)
             cos_rand.extend((r_unit * rnd).sum(dim=-1).tolist())
+
+            # THE FLOOR FOR A *NEAREST* STATISTIC MUST ALSO BE A NEAREST
+            # STATISTIC. ``cos_to_random_embed`` is a MEAN against random
+            # tokens; ``cos_to_nearest_embed`` is a MAX over ~150k of them.
+            # Comparing them is comparing a max to a mean, and the max cosine
+            # of even a RANDOM direction over a vocabulary that large is well
+            # above zero in high dimension. Read against the wrong floor, v8's
+            # 0.159 looked like "weak but real alignment" when it may be pure
+            # extreme-value noise. So: draw random unit vectors of the same
+            # dimension and take THEIR nearest-embedding cosine.
+            rv = torch.randn(reps.shape[0], reps.shape[-1], generator=g)
+            rv = (rv / rv.norm(dim=-1, keepdim=True).clamp(min=1e-6)).to(reps.device)
+            rbest = torch.full((reps.shape[0],), -1.0, device=reps.device)
+            for s in range(0, emb_unit.shape[0], 32768):
+                blk = emb_unit[s : s + 32768].to(reps.device)
+                rbest = torch.maximum(rbest, (rv @ blk.T).max(dim=-1).values)
+            cos_near_rand.extend(rbest.tolist())
             used += 1
 
     if not norms:
@@ -120,6 +143,17 @@ def measure(trainer: KRKBTrainer, n_samples: int) -> dict:
         "norm_ratio": mean_rep_norm / max(mean_emb_norm, 1e-6),
         "cos_to_nearest_embed": sum(cos_near) / len(cos_near),
         "cos_to_random_embed": sum(cos_rand) / len(cos_rand),
+        # The correct floor: nearest-embedding cosine for a RANDOM direction.
+        "cos_nearest_for_random_vector": (
+            sum(cos_near_rand) / len(cos_near_rand) if cos_near_rand else None
+        ),
+        # What the number actually means. <= 1.0 means the reps point no closer
+        # to any token than chance does: no directional alignment at all.
+        "nearest_vs_random_ratio": (
+            (sum(cos_near) / len(cos_near))
+            / max(sum(cos_near_rand) / len(cos_near_rand), 1e-6)
+            if cos_near_rand else None
+        ),
     }
 
 
@@ -142,7 +176,9 @@ def main(cfg: DictConfig) -> None:
         label = Path(str(ck)).name[:44]
         try:
             _meta, state = _load(Path(str(ck)))
-            trainer._restore_model_state(normalize_model_state(state))
+            # Lenient + disclosed: the Phase-1 base predates l1l1_bridge,
+            # which is provably off this path (recursive_l1_tree is None).
+            restore_model_state_lenient(trainer, state)
         except Exception as exc:
             print(f"{label:<46}  SKIPPED ({type(exc).__name__}: {str(exc)[:120]})")
             results[label] = {"error": type(exc).__name__}

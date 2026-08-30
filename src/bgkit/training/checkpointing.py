@@ -243,3 +243,47 @@ def save_checkpoint(*_args, **_kwargs):
         "Declare layout via checkpoint_models()/checkpoint_extra_state(); "
         "BaseTrainer._write_checkpoint performs the write."
     )
+
+
+def restore_model_state_lenient(trainer, state_dicts: dict) -> list[str]:
+    """Restore for DIAGNOSTICS, tolerating keys a checkpoint cannot contain.
+
+    Cross-lineage probes compare a Phase-1 base against a Phase-2 descendant,
+    and the descendant's architecture has grown parameters the base predates --
+    ``encoder.l1l1_bridge.*`` is the standing example (the recursive L1->L1
+    bridge postdates the summarization lineage entirely). A strict load makes
+    the base unloadable, so on 2026-08-30 the one comparison that answers
+    "did this drift predate Phase 2?" returned SKIPPED(RuntimeError) and the
+    question stayed open -- the same shape of failure that
+    ``normalize_model_state`` was written to fix.
+
+    Leniency is confined to diagnostics and is always DISCLOSED: the missing
+    keys are returned and logged at WARNING with the reminder that they sit at
+    INIT, not trained. A caller must show they are off the measured path before
+    trusting the numbers (for the wide-net evals, ``recursive_l1_tree`` resolves
+    to None, so ``l1l1_bridge`` is provably unreachable).
+
+    Never use this to load a checkpoint for TRAINING or for a headline metric:
+    there, a missing parameter is a real error and ``CHECKPOINT_STRICT`` should
+    keep it one.
+    """
+    normalized = normalize_model_state(state_dicts)
+    try:
+        trainer._restore_model_state(normalized)
+        return []
+    except RuntimeError as exc:
+        missing = re.findall(r'"([A-Za-z0-9_.]+)"', str(exc))
+        model = getattr(trainer, "model", None)
+        if model is None:
+            raise
+        result = model.load_state_dict(normalized["model"], strict=False)
+        still = [k for k in getattr(result, "unexpected_keys", [])]
+        logger.warning(
+            "checkpoint_restored_lenient",
+            missing=sorted(set(missing))[:20],
+            n_missing=len(set(missing)),
+            unexpected=still[:10],
+            hint="listed params are at INIT, not trained — show they are off "
+                 "the measured path before trusting these numbers",
+        )
+        return sorted(set(missing))

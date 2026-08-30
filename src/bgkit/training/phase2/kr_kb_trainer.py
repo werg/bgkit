@@ -282,6 +282,16 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     # suppressing information the reps already contain, HERE on Phase-2's own
     # path rather than on summarization.
     ABLATION_RESCALED = "rescaled"
+    # THE UPPER BOUND. Splice the document's own tokens (embedded) in place of
+    # the compressed reps, at the same position, through the same segment
+    # machinery. Every other arm DEGRADES the reps; none of them establishes
+    # what the ceiling is, so a low rep_gain has been uninterpretable: it could
+    # mean compression destroys the information, or that the decoder cannot use
+    # document context for this task, or that the task is unanswerable as
+    # posed. Those need opposite fixes. This arm separates the first from the
+    # other two -- if full text does not beat reps, compression is not the
+    # bottleneck.
+    ABLATION_FULL_TEXT = "full_text"
     ABLATION_NO_TOPICS = "no_topics"  # drop topic embedding segment
     ABLATION_TOPICS_ONLY = "topics_only"  # drop bgkit survivor segments
     ABLATION_NEITHER = "neither"     # drop both topics and bgkit survivors
@@ -303,6 +313,8 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     # stays live during the arm and flags a rescale that did not apply.
     _REP_ABLATION_EXPECTED_RATIO: ClassVar[dict[str, float]] = {
         ABLATION_RESCALED: 1.0,
+        # embed_tokens output IS the embedding distribution, so ratio 1.0.
+        ABLATION_FULL_TEXT: 1.0,
     }
 
     @property
@@ -7146,6 +7158,63 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             "replay_tail": replay_tail,
         }
 
+    def _full_text_payload(
+        self, dataset: str, ids, decoder_hidden: int,
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        """Embedded RAW document tokens for the ABLATION_FULL_TEXT upper bound.
+
+        Returned as embeddings, not a TokenSegment, so the arm reuses the
+        existing splice machinery unchanged -- ``running_delta += n_emb -
+        sentinel_tok_len`` already generalises over arbitrary payload length,
+        and the answer/tool-call span remapping therefore stays correct without
+        a second code path to keep in sync.
+
+        TOKENIZER ROUND-TRIP IS MANDATORY. ``_token_store`` holds ids in the
+        ENCODER's vocabulary; feeding them to the decoder's embed_tokens would
+        index a different vocabulary and silently produce plausible-looking
+        garbage -- a shape-correct, meaning-wrong tensor, the exact failure
+        class this codebase keeps hitting. Decode to text with the encoder
+        tokenizer, re-encode with the decoder's.
+        """
+        store = getattr(self, "_token_store", None)
+        if store is None:
+            raise RuntimeError(
+                "ABLATION_FULL_TEXT needs the raw token store; it is unset. "
+                "The cached-L0 path never reads tokens -- run with live_l0."
+            )
+        cap = int(self.step_cfg.get("eval_full_text_max_tokens", 4096))
+        article_ids = self._resolve_article_ids(dataset, ids)
+        chunks: list[str] = []
+        for aid in article_ids:
+            if not store.has(dataset, aid):
+                continue
+            chunks.append(
+                self.encoder_tokenizer.decode(store.get(dataset, aid).tolist()),
+            )
+        if not chunks:
+            raise RuntimeError(
+                f"ABLATION_FULL_TEXT: no stored text for {dataset}:{article_ids} "
+                "-- the arm would silently degrade to an empty context and be "
+                "reported as a valid upper bound"
+            )
+        tok = self.tokenizer.encode("\n\n".join(chunks), add_special_tokens=False)
+        if len(tok) > cap:
+            tok = tok[:cap]
+        # ReconstructionDecoder has no embed_tokens; the embedding table is
+        # reached through the backbone, the same accessor the splice guard and
+        # the rescale arm use.
+        embed_fn = self.decoder.backbone.get_input_embeddings()
+        emb = embed_fn(
+            torch.tensor(tok, dtype=torch.long, device=embed_fn.weight.device),
+        )
+        if emb.size(-1) != decoder_hidden:
+            raise RuntimeError(
+                f"full-text embedding dim {emb.size(-1)} != decoder hidden "
+                f"{decoder_hidden}"
+            )
+        return emb.to(dtype=ref.dtype)
+
     def _assemble_sample_segments(
         self, prep: dict, survivors_per_turn: list[torch.Tensor],
     ) -> tuple[list[Segment], _KBDecodeTrace]:
@@ -7197,15 +7266,27 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             splice_events.append(
                 (rendered.topic_sentinel_position, "topic", topic_block.embeddings[0]),
             )
-        for survivors, start in zip(
-            survivors_per_turn, rendered.bgkit_sentinel_positions, strict=True,
+        for turn, survivors, start in zip(
+            rendered.bgkit_turns, survivors_per_turn,
+            rendered.bgkit_sentinel_positions, strict=True,
         ):
             if survivors.size(-1) != decoder_hidden:
                 raise RuntimeError(
                     f"survivor hidden dim {survivors.size(-1)} != decoder hidden "
                     f"dim {decoder_hidden}; add a cache_projection."
                 )
-            survivors = self._apply_context_ablation(survivors, skip=skip_survivors)
+            if self._ablation_mode == self.ABLATION_FULL_TEXT:
+                # Replace the compressed reps with the document itself, in the
+                # same slot. Raises rather than falling back, so a broken upper
+                # bound can never be reported as a real one.
+                survivors = self._full_text_payload(
+                    prep["sample"].dataset_name, turn.args.get("ids"),
+                    decoder_hidden, survivors,
+                )
+            else:
+                survivors = self._apply_context_ablation(
+                    survivors, skip=skip_survivors,
+                )
             splice_events.append((start, "bgkit", survivors))
         splice_events.sort(key=lambda e: e[0])
 
