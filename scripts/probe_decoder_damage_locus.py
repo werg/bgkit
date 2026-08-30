@@ -47,6 +47,8 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
+from bgkit.training.checkpointing import normalize_model_state
+
 EMBED_KEYS = ("model.embed_tokens.weight", "lm_head.weight")
 
 
@@ -59,7 +61,7 @@ def load_decoder_tensors(root: Path, family: str) -> dict[str, torch.Tensor]:
         raise SystemExit(f"no model.pt or decoder_qwen.pt under {root}")
     sd = torch.load(str(src), map_location="cpu", mmap=True, weights_only=True)
     if isinstance(sd, dict) and "model" in sd and isinstance(sd.get("model"), dict):
-        sd = sd["model"]
+        sd = normalize_model_state(sd)["model"]
     for prefix in (f"decoders.{family}.backbone.", "decoder.backbone.", "backbone.", ""):
         cand = (
             {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}

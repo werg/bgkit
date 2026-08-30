@@ -34,7 +34,7 @@ from bgkit.eval.metrics.embedding_health import embedding_drift_metrics
 from bgkit.eval.metrics.reconstruction import parse_success_rate
 from bgkit.models.decoder import ReconstructionDecoder
 from bgkit.models.encoder import BgKITEncoder
-from bgkit.training.checkpointing import load_checkpoint
+from bgkit.training.checkpointing import load_checkpoint, normalize_model_state
 from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.logging import setup_logging
 
@@ -65,7 +65,12 @@ def _load_models(cfg: DictConfig, device: torch.device):
             revision=bgkit_cfg.get("backbone_revision"),
             attn_implementation=attention_impl,
         )
-    elif "model" in state_dicts:
+    else:
+        # normalize_model_state accepts BOTH on-disk layouts: Phase-2's flat
+        # ``model`` sub-state and Phase-1's {encoder, decoder_qwen, ...} split.
+        # This branch used to require "model" in state_dicts, so every Phase-1
+        # checkpoint fell through to the "missing encoder state" ValueError.
+        state_dicts = normalize_model_state(state_dicts)
         model_state = state_dicts["model"]
         encoder_state = {
             k.replace("encoder.", "", 1): v
@@ -90,11 +95,6 @@ def _load_models(cfg: DictConfig, device: torch.device):
                 revision=bgkit_cfg.get("backbone_revision"),
                 attn_implementation=attention_impl,
             )
-    else:
-        raise ValueError(
-            f"Checkpoint missing encoder state: {checkpoint_path}. "
-            f"Found keys: {list(state_dicts.keys())}"
-        )
     encoder.to(device).eval()
     encoder.requires_grad_(False)
 

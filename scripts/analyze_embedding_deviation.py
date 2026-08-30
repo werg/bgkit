@@ -56,6 +56,7 @@ import hydra
 import torch
 from omegaconf import DictConfig
 
+from bgkit.training.checkpointing import normalize_model_state
 from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
 from bgkit.utils.logging import setup_logging
 
@@ -141,9 +142,9 @@ def main(cfg: DictConfig) -> None:
         label = Path(str(ck)).name[:44]
         try:
             _meta, state = _load(Path(str(ck)))
-            trainer._restore_model_state(state)
+            trainer._restore_model_state(normalize_model_state(state))
         except Exception as exc:
-            print(f"{label:<46}  SKIPPED ({type(exc).__name__})")
+            print(f"{label:<46}  SKIPPED ({type(exc).__name__}: {str(exc)[:120]})")
             results[label] = {"error": type(exc).__name__}
             continue
         trainer.model.eval()
