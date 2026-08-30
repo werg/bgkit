@@ -21,8 +21,10 @@ always survivor embeddings), supports query prompts, and has no ``auto_repro_hea
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 
+import structlog
 import torch
 import torch.nn as nn
 
@@ -34,8 +36,95 @@ from bgkit.models.projection_block import (
     effective_projection_cu,
 )
 from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
+from bgkit.models.ratios import is_skip
 from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.packing import lengths_from_cu, position_ids_from_cu
+
+logger = structlog.get_logger(__name__)
+
+_BRIDGE_GUARD_ENABLED = os.environ.get("BGKIT_BRIDGE_SCALE_GUARD", "1") not in ("0", "false")
+_bridge_guard_calls: dict[str, int] = {}
+_bridge_guard_reference: dict[str, float] = {}
+
+
+def guard_bridge_output_scale(
+    bridged: torch.Tensor,
+    embed_weight: torch.Tensor,
+    *,
+    site: str,
+    every: int = 200,
+    reference: float | None = None,
+    drift_lo: float = 0.5,
+    drift_hi: float = 2.0,
+    degenerate_below: float = 1e-3,
+) -> None:
+    """Watch the L0->L1 bridge output scale for DRIFT, not for a target value.
+
+    THE CONTRACT. L1's backbone is a deepcopy of L0's, so it expects
+    INPUT-EMBEDDING-distributed inputs; ``l0.auto_reproduce`` converts L0's
+    last-block hidden states into that space. In the Phase-2 path L1 also
+    receives pinned article-ID embeddings taken straight from ``embed_tokens``,
+    correctly left un-bridged because they are already in the bridge's
+    codomain. Two streams share one sequence, so a bridge that stops landing
+    where L1 expects makes L1 read one sequence in two scales.
+
+    WHY DRIFT AND NOT AN ABSOLUTE BAND. The first version of this guard
+    asserted the ratio should sit near 1.0, reading CLAUDE.md's "maps back to
+    input-embedding space" literally. Measured 2026-08-29 it is ~502x on the
+    summarization base and ~636x in the live Phase-2 run. The base was TRAINED
+    with the bridge at that scale, so L1's weights are adapted to it: a large
+    ratio is this model's normal operating point, not a defect, and the band
+    was flagging the design rather than a fault. The decoder's own
+    ``_maybe_guard_spliced_rep_norm`` already had this right — it bands around
+    a REFERENCE ratio.
+
+    So: the first sampled call per site establishes the reference (or pass one
+    in), and a warning means the bridge has MOVED relative to where this
+    lineage operates. A near-zero ratio is still flagged absolutely, because a
+    collapsed bridge is broken at any operating point.
+
+    Sampled and warn-only; a diagnostic must never take a run down.
+    """
+    if not _BRIDGE_GUARD_ENABLED or bridged.numel() == 0:
+        return
+    n = _bridge_guard_calls.get(site, 0) + 1
+    _bridge_guard_calls[site] = n
+    # (n - 1) % every, NOT n % every == 1: the latter is never true for
+    # every == 1 (n % 1 is always 0), so the guard would be silently dead at
+    # its most verbose setting — precisely the sampling bug it exists to avoid.
+    if (n - 1) % every != 0:
+        return
+    with torch.no_grad():
+        bridged_norm = float(bridged.detach().float().norm(dim=-1).mean())
+        embed_norm = float(embed_weight.detach().float().norm(dim=-1).mean())
+    ratio = bridged_norm / max(embed_norm, 1e-9)
+
+    ref = reference if reference is not None else _bridge_guard_reference.get(site)
+    if ref is None:
+        _bridge_guard_reference[site] = ratio
+        ref = ratio
+    payload = dict(
+        site=site, call=n,
+        bridged_norm_mean=round(bridged_norm, 4),
+        embed_norm_mean=round(embed_norm, 4),
+        ratio=round(ratio, 4),
+        reference_ratio=round(ref, 4),
+    )
+    drift = ratio / max(ref, 1e-9)
+    degenerate = ratio < degenerate_below
+    if degenerate or not (drift_lo <= drift <= drift_hi):
+        logger.warning(
+            "bridge_output_scale_out_of_band",
+            drift=round(drift, 4), degenerate=degenerate,
+            hint=(
+                "bridge output moved relative to this lineage's operating "
+                "point; L1 reads survivors alongside un-bridged ID embeddings"
+            ),
+            **payload,
+        )
+    else:
+        # Every sampled check logs, in band or not, so the trend is greppable.
+        logger.info("bridge_output_scale", drift=round(drift, 4), **payload)
 
 
 def _resolve_layers(backbone: nn.Module) -> nn.ModuleList:
@@ -560,8 +649,14 @@ class BgKITEncoder(nn.Module):
             capture_decoder_only_prefix=capture_decoder_only_prefix_l0,
         )
 
-        if target_ratio_l1 is None:
+        if target_ratio_l1 is None or is_skip(target_ratio_l1):
             # L1 skipped: project the L0 survivors directly.
+            #
+            # SKIP_LEVEL is the unambiguous spelling. `None` also means skip
+            # HERE for backward compatibility, but it means "unset, resolve
+            # from config" in KRKBTrainer._run_l1_batch — a disagreement that
+            # made this branch unreachable from Phase 2 for its whole
+            # existence. Prefer SKIP_LEVEL in new code.
             l1_out: LevelOutput | None = None
             proj_cu = l0_out.survivor_cu_seqlens
             proj_max = _max_from_cu(proj_cu)
@@ -580,6 +675,11 @@ class BgKITEncoder(nn.Module):
             # stage (cross-section merge → L1 → projection). KRKBTrainer calls
             # the SAME run_l1_and_project, so the two paths cannot diverge.
             l1_input = self.l0.auto_reproduce(l0_out.survivor_embeddings)
+            guard_bridge_output_scale(
+                l1_input,
+                self.l0.backbone.get_input_embeddings().weight,
+                site="encoder_forward",
+            )
             l1_out, proj_out, proj_cu = self.run_l1_and_project(
                 l1_input_embeddings=l1_input,
                 l1_input_cu_seqlens=l0_out.survivor_cu_seqlens,

@@ -25,7 +25,9 @@ from __future__ import annotations
 import contextlib
 import math
 import os
+import random
 import time
+import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import ClassVar
@@ -58,6 +60,7 @@ from bgkit.models.decoder import (
     TokenSegment,
     normalize_decoder_family,
 )
+from bgkit.models.encoder import guard_bridge_output_scale
 from bgkit.models.lora_encoder import (
     DEFAULT_LORA_TARGETS,
     LoRALinearWrapper,
@@ -65,6 +68,7 @@ from bgkit.models.lora_encoder import (
     remap_base_keys_to_lora,
 )
 from bgkit.models.projection_block import effective_projection_cu
+from bgkit.models.ratios import is_skip
 from bgkit.models.recursive_l1 import encode_tree_node
 from bgkit.models.topic_embeddings import TopicEmbeddingModule
 from bgkit.training.base_trainer import BaseTrainer
@@ -198,6 +202,9 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
           l1_rank: 32
           alpha: 64
     """
+    # Hands compressed reps to a decoder: eval MUST report a
+    # rep-dependence number (BaseTrainer warns loudly otherwise).
+    SPLICES_REPS: ClassVar[bool] = True
 
     _log_every = 5
     _use_device_prefetcher = False  # samples carry variable-shaped state
@@ -264,6 +271,17 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     ABLATION_NONE = None
     ABLATION_ZEROED = "zeroed"       # survivors → zeros (no context info)
     ABLATION_NOISE = "noise"         # survivors → gaussian noise
+    # RESCALED (2026-08-30): survivor MAGNITUDE normalised to the decoder's
+    # mean token-embedding norm; DIRECTIONS, and therefore all the information,
+    # are untouched. Measured on the summarization base the same day, this
+    # flips the per-token rep gap from -0.064 to +0.046 at l0=0.63 and from
+    # -0.007 to +0.095 at l0=0.10 (the harsher budget, where Phase 2 runs) —
+    # i.e. reps go from mildly HARMFUL to helpful, with the benefit largest
+    # where each rep must carry the most. Reps sit at ~500x embed norm, so the
+    # question this arm answers is whether that scale is mechanically
+    # suppressing information the reps already contain, HERE on Phase-2's own
+    # path rather than on summarization.
+    ABLATION_RESCALED = "rescaled"
     ABLATION_NO_TOPICS = "no_topics"  # drop topic embedding segment
     ABLATION_TOPICS_ONLY = "topics_only"  # drop bgkit survivor segments
     ABLATION_NEITHER = "neither"     # drop both topics and bgkit survivors
@@ -280,6 +298,13 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
     # reps are the experiment, not a collapse.
     _DEGENERATE_REP_ABLATIONS = frozenset({"zeroed", "noise", "topics_only", "neither"})
 
+    # Ablations that put reps at a DELIBERATE, VALID scale (not degenerate).
+    # The guard bands drift around this instead of the learned reference, so it
+    # stays live during the arm and flags a rescale that did not apply.
+    _REP_ABLATION_EXPECTED_RATIO: ClassVar[dict[str, float]] = {
+        ABLATION_RESCALED: 1.0,
+    }
+
     @property
     def _ablation_mode(self) -> str | None:
         return self.__dict__.get("_ablation_mode_value")
@@ -291,8 +316,10 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         can never drift out of sync with the trainer's ablation state."""
         self.__dict__["_ablation_mode_value"] = mode
         expect_degenerate = mode in self._DEGENERATE_REP_ABLATIONS
+        expected_ratio = self._REP_ABLATION_EXPECTED_RATIO.get(mode)
         for dec in self._guarded_decoders():
             dec._rep_norm_guard_expect_degenerate = expect_degenerate
+            dec._rep_norm_guard_expected_ratio = expected_ratio
 
     def _guarded_decoders(self) -> list:
         """Decoders whose splice guard tracks the ablation state (both
@@ -1174,6 +1201,72 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         self._tool_call_loss_weight = float(
             self.step_cfg.get("tool_call_loss_weight", 1.0)
         )
+        # REPLAY AUX (2026-08-29). The measured cause of rep_gain ~0.01: the
+        # wide-net objective is satisfiable WITHOUT the reps, so the decoder's
+        # ability to read them decayed. Weight-delta across the lineage says
+        # the representation itself did NOT change — l1.backbone 0.0000,
+        # l0.backbone 0.0001, projection_blocks.qwen35 0.0039 (its output_norm
+        # is bit-identical) — while the DECODER moved 0.0120 uniformly across
+        # every layer. The same reps that earned the base 2.03-2.95 nats are
+        # still being produced; only the reader changed. So the fix is not an
+        # anchor on the projection (nothing drifted) and not selection (random
+        # == trained, and the top-k margin loss drove its own metric to 0.0008
+        # with zero rep_gain effect) — it is an objective the decoder CANNOT
+        # satisfy without reading the reps.
+        #
+        # The tail asks the decoder to CONTINUE the gold document from a short
+        # verbatim cue, with the document present only as spliced reps. The LM
+        # prior can produce plausible continuations, which is exactly what the
+        # zeroed arm controls for; CE still falls only if the reps are read.
+        # This is the base's own training task, and the base sits 1.2% away in
+        # weight space, so this is a recovery rather than learning from scratch.
+        self._replay_loss_weight = float(
+            self.step_cfg.get("replay_loss_weight", 0.0)
+        )
+        self._replay_window_tokens = int(
+            self.step_cfg.get("replay_window_tokens", 48)
+        )
+        self._replay_cue_tokens = int(self.step_cfg.get("replay_cue_tokens", 8))
+        # Where the replay target comes from, and therefore how much of it the
+        # LM prior can supply without the reps. See _replay_tail for the
+        # measured failure of each earlier mode.
+        #   cue    verbatim cue, continue from it     (gap 0.0229 / CE 1.077)
+        #   start  no cue, reproduce from position 0  (gap 0.0293 / CE 0.588)
+        #   chunk  reproduce chunk <i>; the locator is an INDEX and carries no
+        #          content, so neither leak applies
+        self._replay_mode = str(self.step_cfg.get("replay_mode", "cue"))
+        if self._replay_mode not in ("cue", "start", "chunk"):
+            raise ValueError(
+                f"training.replay_mode must be cue|start|chunk, got "
+                f"{self._replay_mode!r}"
+            )
+        self._replay_marker_ids: list[int] | None = None
+        self._replay_stats = {"applied": 0, "skipped": 0, "target_tokens": 0}
+        # Driven ONLY by _eval_replay_gap: force the tail on inside no_grad,
+        # and make it the only supervised region so the loss IS the replay CE.
+        self._replay_force = False
+        self._replay_only_loss = False
+        # L0-ONLY MODE (2026-08-30). Skips the L0->L1 bridge and the entire L1
+        # stage, projecting L0 survivors straight to the decoder splice.
+        #
+        # WHY IT EXISTS. Every positive rep result measured on the base was
+        # L0-ONLY (the probe runs through encoder.forward, whose
+        # target_ratio_l1=None branch skips L1): rescaled L0 survivors are
+        # worth +0.0455 / +0.0496 / +0.0945 nats at l0 = 0.63 / 0.32 / 0.10.
+        # With L1 in the path on wide-net, the same rescale is worth +0.0012
+        # and rep_gain sits at 0.007. L1's own diagnostics agree it is not
+        # contributing: backbone gradient ~35,000x below its head's, selection
+        # at chance (span survival 0.471 vs 0.499 retention), and its weights
+        # move 0.0228 across a whole phase.
+        #
+        # NOTE this could NOT previously be expressed in Phase 2 at all:
+        # _run_l1_batch treats target_ratio=None as "sample one", not "skip",
+        # so L1 was hard-wired into every Phase-2 run. encoder.forward has the
+        # real branch; this makes the trainer able to reach it.
+        #
+        # Budget note: two-stage r0 x r1 becomes single-stage r0, so set
+        # l0_retention to the EFFECTIVE budget you want (0.10 x 0.50 -> 0.05).
+        self._use_l1 = bool(self.step_cfg.get("use_l1", True))
         self._l1_retention_cfg = self.step_cfg.get("l1_retention", 0.15)
         self._l1_retention = float(
             self._interp_ratio_ramp(self._l1_retention_cfg, 0, default=0.15)
@@ -4335,10 +4428,39 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         if target_ratio is None:
             target_ratio = self._sample_l1_retention()
 
-        # Oracle-span ablation: the L1 span mask (True at L0-survivor rows
-        # originating inside the gold answer span) becomes a must-keep so the
-        # span survives L1 at the same budget too. Eval-only (the training
-        # drill-checkpoint branch never sees an explicit ablation mode).
+        # L0-ONLY: skip the bridge AND L1, projecting L0 survivors straight to
+        # the splice. Mirrors encoder.forward's ``target_ratio_l1 is None``
+        # branch (same projection block, same call shape) so the two paths
+        # cannot diverge — the reason run_l1_and_project is shared at all.
+        #
+        # Returns via the SAME _per_turn_from_projected the L1 path uses, so
+        # re-interleaving of None fallbacks and mode-tagged drill survivors
+        # lives in exactly one place.
+        if is_skip(target_ratio) or not getattr(self, "_use_l1", True):
+            proj_cu = content_cu
+            proj_max = (
+                int(lengths_from_cu(proj_cu).max().item())
+                if int(proj_cu.numel()) > 1 else 0
+            )
+            proj_out = self.encoder.get_active_projection_block()(
+                content_flat,
+                cu_seqlens=proj_cu,
+                max_seqlen=proj_max,
+                position_ids=position_ids_from_cu(
+                    proj_cu, int(content_flat.shape[0]),
+                ),
+                survivor_mask=None,
+            )
+            self._last_l1_survivor_mask = None
+            self._last_l1_span_mask = span_flat
+            self._last_l1_content_cu = content_cu
+            return self._per_turn_from_projected(
+                proj_out.projected_embeddings,
+                effective_projection_cu(proj_out, proj_cu),
+                prepared, batch_size, zero_fallback, _is_special,
+            )
+
+
         must_keep_l1 = None
         if self._ablation_mode == self.ABLATION_ORACLE_SPAN and bool(span_flat.any()):
             must_keep_l1 = span_flat
@@ -4358,6 +4480,17 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             bridged_content[survivor_flat] = self.encoder.l0.auto_reproduce(
                 content_flat[survivor_flat],
             ).to(content_flat.dtype)
+            # The contract this path DEPENDS on: bridged survivors must land in
+            # embed_tokens' distribution, because the un-bridged ID positions
+            # sitting beside them in this very buffer are natively there. If the
+            # bridge is off-scale, L1 reads one sequence in two scales. Guarded
+            # here as well as in encoder.forward so neither bridge site can
+            # drift unobserved (the adapter moved 0.0170 across Phase 2).
+            guard_bridge_output_scale(
+                bridged_content[survivor_flat],
+                self.encoder.l0.backbone.get_input_embeddings().weight,
+                site="kr_kb_run_l1_batch",
+            )
 
         # Run the SHARED L1 stage (cross-section merge → L1 → projection) — the
         # very encoder.run_l1_and_project that encoder.forward uses, so the
@@ -4464,24 +4597,41 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             if self.encoder.training and getattr(self, "_proj_anchor_weight", 0.0) > 0.0:
                 self._pending_proj_anchor.append(projected)
 
-        # Extract per-turn projected survivors via per-turn boundaries.
+        return self._per_turn_from_projected(
+            projected, projected_cu_t, prepared, batch_size, zero_fallback,
+            _is_special,
+        )
+
+    def _per_turn_from_projected(
+        self,
+        projected: torch.Tensor,
+        projected_cu_t: torch.Tensor,
+        prepared: list,
+        batch_size: int,
+        zero_fallback: torch.Tensor,
+        is_special,
+    ) -> list[torch.Tensor]:
+        """Split a flat projected buffer back into per-turn survivor tensors.
+
+        Extracted so the L1 path and the L0-only path share it verbatim. The
+        alternative was re-indenting ~130 lines of the L1 block under a
+        conditional, which is the same span-edit operation that silently
+        deleted nine helper functions from encoder.py earlier today.
+        """
         surv_cu = projected_cu_t.to(torch.int64).tolist()
         per_turn: list[torch.Tensor] = []
         for i in range(batch_size):
             start = int(surv_cu[i])
             end = int(surv_cu[i + 1])
-            if end <= start:
-                per_turn.append(zero_fallback)
-            else:
-                per_turn.append(projected[start:end])
-
-        # Re-interleave with None fallbacks + mode-tagged drill-down survivors.
+            per_turn.append(
+                zero_fallback if end <= start else projected[start:end],
+            )
         results: list[torch.Tensor] = []
         it = iter(per_turn)
         for t in prepared:
             if t is None:
                 results.append(zero_fallback)
-            elif _is_special(t):
+            elif is_special(t):
                 results.append(self._resolve_special_survivor(t))
             else:
                 results.append(next(it))
@@ -6303,6 +6453,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 segments = self._truncate_segments_to_gold_budget(
                     segments, decode_cap, _trace.answer_span,
                 )
+            # REPLAY TAIL — appended AFTER truncation so the gold cap can never
+            # delete it. Sits past the answer, so every span in ``_trace`` keeps
+            # its coordinates and no eval metric moves. ``sample_tokens`` below
+            # counts its supervised positions, so the per-sample normaliser
+            # accounts for it rather than inflating its effective weight.
+            replay_tail = prep.get("replay_tail")
+            if replay_tail is not None and segments:
+                r_ids, r_w = replay_tail
+                segments.append(TokenSegment(
+                    token_ids=r_ids.unsqueeze(0),
+                    loss_mask=r_w.unsqueeze(0),
+                ))
             sample_tokens = 0
             decode_len = 0
             for seg in segments:
@@ -6626,6 +6788,173 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         rendered, _tb, _tt = self._render_sample(sample)
         return int(rendered.loss_mask.sum().item())
 
+    def _replay_gold_article(self, sample: KBSample, rendered) -> str | None:
+        """First resolvable gold article whose reps this sample actually splices.
+
+        Skips ``is_head`` turns (they carry the task query, not a document) and
+        node-mode turns (generic shared-tree reps, no article tokens).
+        """
+        for turn in getattr(rendered, "bgkit_turns", []) or []:
+            if bool(turn.args.get("is_head", False)):
+                continue
+            ids = [str(i) for i in (turn.args.get("ids") or [])]
+            if not ids:
+                continue
+            resolved = self._resolve_article_ids(sample.dataset_name, ids)
+            if resolved:
+                return str(resolved[0])
+        return None
+
+    def _note_replay_skip(self) -> None:
+        """Count a skip and shout if the tail is never actually being built.
+
+        An all-skip run is indistinguishable from a healthy one in every other
+        metric, so it gets its own WARNING rather than waiting to be inferred
+        from a flat rep_gain 1000 steps later.
+        """
+        st = self._replay_stats
+        st["skipped"] += 1
+        if st["applied"] == 0 and st["skipped"] in (200, 1000, 5000):
+            logger.warning(
+                "replay_tail_never_applied",
+                skipped=st["skipped"],
+                hint="every sample skipped — check token store, is_head routing, doc length",
+            )
+
+    def _replay_tail(
+        self, sample: KBSample, rendered,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Build the replay cue+target tail, or None when not applicable.
+
+        Returns ``(token_ids, loss_weights)``, both 1-D and on ``self.device``.
+        The marker and the cue carry weight 0; only the continuation is
+        supervised, at ``replay_loss_weight``.
+
+        Gated on ``torch.is_grad_enabled()`` so no eval, ablation, or
+        free-running generation path can pick it up and shift a metric.
+        """
+        w = float(getattr(self, "_replay_loss_weight", 0.0) or 0.0)
+        if w <= 0.0:
+            return None
+        if not (torch.is_grad_enabled() or getattr(self, "_replay_force", False)):
+            return None
+        store = getattr(self, "_token_store", None)
+        if store is None:
+            return None
+
+        aid = self._replay_gold_article(sample, rendered)
+        if aid is None:
+            self._note_replay_skip()
+            return None
+        try:
+            doc = store.get(sample.dataset_name, aid)
+        except Exception:
+            self._note_replay_skip()
+            return None
+        doc = doc.reshape(-1)
+        cue_n = max(0, int(self._replay_cue_tokens))
+        win_n = max(1, int(self._replay_window_tokens))
+        span = cue_n + win_n
+        if int(doc.numel()) < span + 1:
+            self._note_replay_skip()
+            return None
+
+        # THE LOCATOR MUST NOT CARRY CONTENT. Both earlier forms failed on this,
+        # each measured on its own eval:
+        #
+        #   mode=cue    an 8-token verbatim cue, continue from there.
+        #               step 1500: gap 0.0229 against a replay CE of 1.077, i.e.
+        #               98% of the continuation came from the LM prior. In
+        #               templated log lines and grep output a short cue very
+        #               nearly determines the next 48 tokens.
+        #   mode=start  no cue, reproduce from position 0.
+        #               step 1750: replay CE HALVED to 0.588 while the gap
+        #               barely moved (0.0293). That drop is a property of the
+        #               target, not of learning — document openings are
+        #               boilerplate (licence headers, imports, log preambles),
+        #               so position 0 is the most predictable place to ask about.
+        #
+        # mode=chunk removes both leaks: the locator is an INDEX. The marker
+        # says which chunk to reproduce and nothing about what is in it, so the
+        # prior can supply only "text of this kind at roughly this depth", and
+        # the actual content exists solely in the spliced reps. The index->offset
+        # convention is the one thing the model has to learn, and it is the same
+        # convention on every sample.
+        mode = str(getattr(self, "_replay_mode", "cue"))
+        chunk_index: int | None = None
+        # Stable per (step, article) draw so targets vary across steps but are
+        # reproducible on resume. crc32, not hash() — PYTHONHASHSEED varies
+        # between processes and would break that reproducibility.
+        seed = (int(self.global_step) * 1000003 + zlib.crc32(aid.encode())) % (2**31)
+        rng = random.Random(seed)
+        if mode == "start":
+            start = 0
+        elif mode == "chunk":
+            n_chunks = int(doc.numel()) // span
+            if n_chunks < 1:
+                self._note_replay_skip()
+                return None
+            chunk_index = rng.randrange(0, n_chunks)
+            start = chunk_index * span
+        else:
+            start = rng.randrange(0, int(doc.numel()) - span)
+        window_text = self.encoder_tokenizer.decode(
+            doc[start : start + span].tolist()
+        )
+
+        # Encode the window ONCE and split by token count. Encoding cue and
+        # target separately would be wrong — BPE is not concat-distributive —
+        # and no exact character boundary is needed here, only some split.
+        ids = self.tokenizer.encode(window_text, add_special_tokens=False)
+        if len(ids) < 8:
+            self._note_replay_skip()
+            return None
+        if mode in ("start", "chunk"):
+            n_cue = 0          # every token supervised; nothing is handed over
+        else:
+            n_cue = max(2, round(len(ids) * cue_n / span))
+            n_cue = min(n_cue, len(ids) - 4)
+
+        if chunk_index is None:
+            if self._replay_marker_ids is None:
+                self._replay_marker_ids = self.tokenizer.encode(
+                    "\n\n[replay]\n", add_special_tokens=False,
+                )
+            marker = self._replay_marker_ids
+        else:
+            # The index IS the locator. Not cached — it varies per sample — but
+            # it is a handful of tokens, negligible against the encode above.
+            marker = self.tokenizer.encode(
+                f"\n\n[replay {chunk_index}]\n", add_special_tokens=False,
+            )
+
+        tail_ids = torch.tensor(
+            list(marker) + list(ids), dtype=torch.long, device=self.device,
+        )
+        weights = torch.zeros(
+            tail_ids.shape[0], dtype=torch.float32, device=self.device,
+        )
+        weights[len(marker) + n_cue :] = w
+        self._replay_stats["applied"] += 1
+        self._replay_stats["target_tokens"] += int(len(ids) - n_cue)
+        # Log the FIRST application immediately, then periodically. A silently
+        # wrong gate (prep running under no_grad, an empty token store, every
+        # turn is_head) would otherwise look identical to a working run for
+        # hundreds of steps — the failure shape that has cost this work eight
+        # instruments already.
+        st = self._replay_stats
+        if st["applied"] == 1 or st["applied"] % 200 == 0:
+            logger.info(
+                "replay_tail_stats",
+                applied=st["applied"],
+                skipped=st["skipped"],
+                mean_target_tokens=round(
+                    st["target_tokens"] / max(st["applied"], 1), 1,
+                ),
+                weight=w,
+            )
+        return tail_ids, weights
+
     def _prepare_sample_for_decode(self, sample: KBSample) -> dict:
         """Render the sample and prepare all per-turn L1 inputs.
 
@@ -6668,6 +6997,18 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 c1 = min(int(loss_mask.shape[0]), int(c1))
                 if c1 > c0:
                     loss_mask[c0:c1] = loss_mask[c0:c1] * w
+
+        # Built here (needs ``rendered``) but APPENDED as its own segment in
+        # _encode_decode_group, AFTER _truncate_segments_to_gold_budget. That
+        # truncation drops every segment past the answer cut, so a tail folded
+        # into ``token_ids`` here would be silently deleted whenever the answer
+        # exceeded the cap — intermittently, which is worse than never.
+        replay_tail = self._replay_tail(sample, rendered)
+        if replay_tail is not None and getattr(self, "_replay_only_loss", False):
+            # _eval_replay_gap only: silence answer + tool supervision so the
+            # returned loss is the replay CE alone and not a pooled quantity
+            # whose movement could come from either half.
+            loss_mask = torch.zeros_like(loss_mask, dtype=torch.float32)
 
         sentinel_ids = self.tokenizer.encode(BGKIT_SENTINEL, add_special_tokens=False)
         sentinel_len = len(sentinel_ids)
@@ -6802,6 +7143,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             "topic_sentinel_len": topic_sentinel_len,
             "prepared_turns": prepared_turns,
             "topic_block": topic_block,
+            "replay_tail": replay_tail,
         }
 
     def _assemble_sample_segments(
@@ -8674,6 +9016,123 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             if saved_state_l1 is not None:
                 self._surv_state_l1 = saved_state_l1
 
+    def _eval_samples_for_replay(self, n: int) -> list:
+        """A fixed head slice of the eval set — same samples every eval, so the
+        gap is comparable across steps rather than re-sampling its own noise."""
+        ds = self.eval_dataset
+        return [ds[i] for i in range(min(int(n), len(ds)))]
+
+    def _eval_replay_gap(self, samples: list) -> dict[str, float]:
+        """Is the REPLAY task being solved from the reps, or bluffed?
+
+        The replay tail is the only objective in this run that cannot be
+        satisfied without reading the reps, so its own rep-dependence is the
+        metric that decides whether the intervention works. Pooled train loss
+        cannot answer it — the replay CE is mixed with answer + tool CE there —
+        and ``eval/rep_gain`` measures the ANSWER task, which is exactly the
+        task the model already solves rep-blind.
+
+        Decodes ``samples`` twice with ONLY the replay continuation supervised:
+        once normally, once with survivors zeroed. Reports both CEs in nats and
+        their gap.
+
+            gap ~ 0        the model is bluffing the continuation from the LM
+                           prior — the cue leaks enough that the reps are still
+                           optional, and the design needs a harder target.
+            gap climbing   the reps are being read. This is the intervention
+                           working, and it should lead eval/rep_gain.
+
+        Read-only: no backward, no optimizer step, and every mutable container
+        the encode/decode touches is snapshotted and restored, same discipline
+        as :meth:`_run_ablation_gap_probe`.
+        """
+        from bgkit.training.survivorship_helpers import init_state
+
+        # getattr, not attribute access: these accumulators are created by the
+        # TRAINING path, and this probe is reachable from scripts/eval_phase2_kb.py
+        # which calls setup() and evaluates without ever entering the training
+        # loop. Direct access raised AttributeError there (2026-08-30), which
+        # the eval guard swallowed — so the probe silently produced no number
+        # while everything else looked healthy.
+        saved = {
+            "ablation": self._ablation_mode,
+            "pending_l0": getattr(self, "_pending_l0_outputs", None),
+            "pending_l1": getattr(self, "_pending_l1_outputs", None),
+            "ratios_l0": getattr(self, "_step_sampled_l0_ratios", None),
+            "ratios_l1": getattr(self, "_step_sampled_l1_ratios", None),
+            "used_nodes": getattr(self, "_shared_tree_used_nodes", None),
+            "child_used": getattr(self, "_shared_tree_child_l1_used", None),
+            "state_l0": getattr(self, "_surv_state_l0", None),
+            "state_l1": getattr(self, "_surv_state_l1", None),
+            "force": getattr(self, "_replay_force", False),
+            "only": getattr(self, "_replay_only_loss", False),
+            "weight": self._replay_loss_weight,
+        }
+        try:
+            self._pending_l0_outputs = []
+            self._pending_l1_outputs = []
+            self._step_sampled_l0_ratios = []
+            self._step_sampled_l1_ratios = []
+            self._shared_tree_used_nodes = (
+                set(saved["used_nodes"]) if saved["used_nodes"] is not None else set()
+            )
+            self._shared_tree_child_l1_used = (
+                set(saved["child_used"]) if saved["child_used"] is not None else set()
+            )
+            if saved["state_l0"] is not None:
+                self._surv_state_l0 = init_state()
+            if saved["state_l1"] is not None:
+                self._surv_state_l1 = init_state()
+
+            # Force the tail on (it is gated to grad-enabled paths) and make it
+            # the ONLY supervised region, so the returned loss IS the replay CE.
+            # Weight 1.0 so the number is in nats rather than 0.5 x nats — the
+            # normaliser counts positions, not weights, so a 0.5 mask would
+            # halve both arms and silently halve the reported gap too.
+            self._replay_force = True
+            self._replay_only_loss = True
+            self._replay_loss_weight = 1.0
+
+            with torch.no_grad():
+                self._ablation_mode = self.ABLATION_NONE
+                loss_reps, _tok_n, done_n, _, _ = self._encode_decode_group(
+                    samples, None, l1_target_ratio=None,
+                )
+                self._ablation_mode = self.ABLATION_ZEROED
+                loss_zero, _tok_z, done_z, _, _ = self._encode_decode_group(
+                    samples, None, l1_target_ratio=None,
+                )
+            if done_n == 0 or done_z == 0:
+                return {}
+            # _encode_decode_group returns a SUM over samples — _forward_backward
+            # divides by n_samples right after calling it. Reporting the raw sum
+            # gave ce_reps 25.86 at step 1500, which is worse than uniform over
+            # the vocab (ln 150k ~ 11.9) and irreconcilable with a pooled train
+            # loss of 1.3. Caught by that contradiction, not by the probe.
+            ce_reps = float(loss_reps.detach()) / done_n
+            ce_zero = float(loss_zero.detach()) / done_z
+            return {
+                "eval/replay/ce_reps": ce_reps,
+                "eval/replay/ce_zeroed": ce_zero,
+                "eval/replay/gap": ce_zero - ce_reps,
+                "eval/replay/n_samples": float(done_n),
+            }
+        finally:
+            self._ablation_mode = saved["ablation"]
+            self._pending_l0_outputs = saved["pending_l0"]
+            self._pending_l1_outputs = saved["pending_l1"]
+            self._step_sampled_l0_ratios = saved["ratios_l0"]
+            self._step_sampled_l1_ratios = saved["ratios_l1"]
+            self._shared_tree_used_nodes = saved["used_nodes"]
+            self._shared_tree_child_l1_used = saved["child_used"]
+            if saved["state_l0"] is not None:
+                self._surv_state_l0 = saved["state_l0"]
+            if saved["state_l1"] is not None:
+                self._surv_state_l1 = saved["state_l1"]
+            self._replay_force = saved["force"]
+            self._replay_only_loss = saved["only"]
+            self._replay_loss_weight = saved["weight"]
+
     def _forward_backward_option_a(self, batch) -> dict[str, float]:
         """OPTION A — crash-free amortized per-repo training.
 
@@ -9063,13 +9522,23 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             total_weighted = total_weighted + aux_loss
         step_timing["aux"] = step_timing.get("aux", 0.0) + (_time.perf_counter() - _t0)
 
-        _t0 = _time.perf_counter()
-        (total_weighted / self._accum_steps).backward()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        step_timing["backward"] = step_timing.get("backward", 0.0) + (
-            _time.perf_counter() - _t0
-        )
+        # Timed via _timed so the device sync is GATED on profile_timing, like
+        # every other phase. It used to sync unconditionally: backward is the
+        # longest phase (73% of a microbatch), so a forced drain here stopped
+        # the CPU from running ahead into the NEXT microbatch's prep — ~1.1s of
+        # CPU work per microbatch that should overlap with GPU backward but
+        # instead showed up as GPU idle (util dipped 96% -> 0-39%, matching the
+        # prep share almost exactly). _timed's own docstring already promised
+        # "this sync is ONLY taken under the flag, so the real run keeps full
+        # CPU/GPU overlap" — this line was the exception that broke it.
+        #
+        # Removing the sync costs nothing in correctness (autograd is async;
+        # the next op queues behind it regardless) and only makes time/backward
+        # meaningless when unprofiled — which is why it is now recorded only
+        # when profiling, rather than reported as a launch-time number that
+        # looks like device time.
+        with self._timed(step_timing, "backward", gpu=True):
+            (total_weighted / self._accum_steps).backward()
 
         # --- Utility-gradient BCE distillation (post-backward) ---
         # The main backward populated each LevelOutput's captured
@@ -9188,7 +9657,31 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             return torch.zeros_like(survivors)
         if self._ablation_mode == self.ABLATION_NOISE:
             return torch.randn_like(survivors) * 0.02
+        if self._ablation_mode == self.ABLATION_RESCALED:
+            return self._rescale_to_embed_norm(survivors)
         return survivors
+
+    def _rescale_to_embed_norm(self, survivors: torch.Tensor) -> torch.Tensor:
+        """Normalise rep magnitude to the active decoder's mean embedding norm.
+
+        Per-vector, so DIRECTIONS are preserved exactly: this changes how loud
+        the reps are, not what they say. Any change in loss is therefore
+        attributable to scale alone.
+        """
+        dec = getattr(self, "decoder", None)
+        if dec is None:
+            decs = getattr(self, "decoders", {}) or {}
+            fam = getattr(self, "_decoder_family", None)
+            dec = decs.get(fam) or (next(iter(decs.values())) if decs else None)
+        if dec is None:
+            return survivors
+        # Delegates to the ONE implementation in bgkit.eval.ablations. A
+        # per-trainer copy is precisely the duplication that makes a
+        # representation-interface contract drift apart between call sites.
+        from bgkit.eval.ablations import rescale_to_embed_norm
+        return rescale_to_embed_norm(
+            survivors, dec.backbone.get_input_embeddings().weight,
+        )
 
     # ------------------------------------------------------------------
     # Post-optimizer-step hooks
@@ -9408,6 +9901,52 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             if free_running_samples > 0:
                 # Generation needs the cached (eval-mode) decoder path.
                 metrics.update(self._free_running_metrics_guarded(free_running_samples))
+            # REPLAY GAP — rep-dependence of the ONE objective that requires the
+            # reps. eval/rep_gain measures the ANSWER task, which the model
+            # already solves rep-blind, so it cannot tell a working replay term
+            # from an inert one. Guarded like the free-running probe: a
+            # diagnostic must never take the run down.
+            n_replay = int(self.step_cfg.get("replay_eval_samples", 0) or 0)
+            if n_replay > 0 and float(getattr(self, "_replay_loss_weight", 0.0)) > 0:
+                # WALL-CLOCK BUDGET. A diagnostic must not be able to hang the
+                # thing it is diagnosing. On 2026-08-30 this probe wedged an
+                # eval for THREE HOURS on a cross-lineage checkpoint — one core
+                # pinned at 100%, GPU resident but drawing 35W, no log line
+                # after the first replay tail. The surrounding try/except caught
+                # exceptions but a hang is not an exception, so nothing fired.
+                #
+                # SIGALRM rather than a thread: the probe is a single
+                # long-running call into torch, so there is no safe point for
+                # cooperative cancellation, and the goal is to abandon it and
+                # keep the rest of the eval, not to interrupt training.
+                import signal as _signal
+
+                budget_s = int(self.step_cfg.get("replay_eval_timeout_s", 600))
+
+                def _timed_out(_sig, _frm):
+                    raise TimeoutError(
+                        f"replay-gap probe exceeded {budget_s}s; abandoned so "
+                        "the rest of the eval can complete"
+                    )
+
+                _prev = _signal.signal(_signal.SIGALRM, _timed_out)
+                _signal.alarm(budget_s)
+                try:
+                    with self._teacher_forced_decoders():
+                        metrics.update(self._eval_replay_gap(
+                            self._eval_samples_for_replay(n_replay),
+                        ))
+                except TimeoutError:
+                    logger.warning(
+                        "replay_gap_eval_timeout",
+                        n_samples=n_replay, budget_s=budget_s,
+                        hint="eval continued without replay-gap metrics",
+                    )
+                except Exception:
+                    logger.exception("replay_gap_eval_failed", n_samples=n_replay)
+                finally:
+                    _signal.alarm(0)
+                    _signal.signal(_signal.SIGALRM, _prev)
             extra_modes = list(self.step_cfg.get("eval_ablation_modes", []) or [])
             # Restore the mode evaluate() was ENTERED with, not None — the
             # standalone eval script may run the whole evaluation under an
@@ -9472,6 +10011,30 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 zd = metrics.get(f"eval/ablation/zeroed/{ds}/exact_match")
                 if bd is not None and zd is not None:
                     metrics[f"eval/rep_gain/{ds}/exact_match"] = bd - zd
+
+            # RESCALE GAIN (2026-08-30): what the SAME reps are worth once
+            # their magnitude matches the decoder's embedding norm. Directions
+            # are untouched, so this isolates scale from content.
+            #
+            #   rescale_gain/nats  > 0   the ~500x rep norm is mechanically
+            #                            suppressing information the reps hold
+            #   rescale_gain/nats ~= 0   scale is not the barrier on this path
+            #
+            # rep_gain_rescaled is the headline it implies: what rep_gain WOULD
+            # be if the scale mismatch were fixed. Derived here rather than
+            # eyeballed across two log lines, because a two-number comparison
+            # done by hand is how the summ_summary autoencoding row got read as
+            # a summarization result for a whole day.
+            r_l = metrics.get("eval/ablation/rescaled/loss")
+            if b_l is not None and r_l is not None:
+                metrics["eval/rescale_gain/nats"] = b_l - r_l
+                if z_l is not None:
+                    metrics["eval/rep_gain_rescaled/nats"] = z_l - r_l
+            r_em = metrics.get("eval/ablation/rescaled/exact_match")
+            if b_em is not None and r_em is not None:
+                metrics["eval/rescale_gain/exact_match"] = r_em - b_em
+                if z_em is not None:
+                    metrics["eval/rep_gain_rescaled/exact_match"] = r_em - z_em
         finally:
             self._clear_eval_shared_tree()
             self.model.train()
