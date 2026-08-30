@@ -39,6 +39,7 @@ import os
 import queue
 import shutil
 import threading
+import time
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -124,6 +125,37 @@ def _matches_run(path: Path, phase: str, run_name: str | None) -> bool:
     return run_name is None or meta.get("run_name") == run_name
 
 
+def _archive_is_complete(fast: Path, arch: Path) -> bool:
+    """Whether ``arch`` holds every file of ``fast`` at the same size.
+
+    EXISTENCE IS NOT COMPLETENESS. The archive directory is created before the
+    copy finishes, so an interrupted archival leaves a real directory holding a
+    subset of the files. Observed 2026-08-30:
+
+        fast: 9082 MB / 2 *.pt      archive: 3028 MB / 1 *.pt
+
+    Pruning the NVMe copy on ``.exists()`` alone would have destroyed the only
+    complete copy of that checkpoint. Size-and-name comparison is cheap
+    (a stat per file) and catches truncation, which is the failure that
+    actually happens here; content hashing 8.5 GB per checkpoint is not
+    affordable on every save.
+    """
+    if not arch.is_dir():
+        return False
+    try:
+        want = {
+            (str(f.relative_to(fast)), f.stat().st_size)
+            for f in fast.rglob("*") if f.is_file()
+        }
+        have = {
+            (str(f.relative_to(arch)), f.stat().st_size)
+            for f in arch.rglob("*") if f.is_file()
+        }
+    except OSError:
+        return False
+    return bool(want) and want <= have
+
+
 def _prune_fast_dir(
     fast_dir: Path,
     archive_dir: Path,
@@ -148,9 +180,15 @@ def _prune_fast_dir(
         reverse=True,
     )
     for stale in live[keep_last_n:]:
-        if (archive_dir / stale.name).exists():
+        if _archive_is_complete(stale, archive_dir / stale.name):
             shutil.rmtree(stale, ignore_errors=True)
             logger.info("checkpoint_fast_pruned", name=stale.name)
+        else:
+            logger.warning(
+                "checkpoint_fast_prune_skipped_incomplete_archive",
+                name=stale.name,
+                hint="NVMe copy kept — the HDD archive is missing or truncated",
+            )
 
 
 def _prune_archive_dir(
@@ -326,3 +364,80 @@ def archive_pending_into(
     if copied:
         logger.info("checkpoint_archive_recovered", names=copied)
     return copied
+
+
+def sweep_finished_run_residue(
+    fast_dir: Path,
+    archive_dir: Path,
+    phase: str,
+    run_name: str | None,
+    *,
+    stale_tmp_hours: float = 24.0,
+) -> tuple[int, int]:
+    """Reclaim NVMe residue left behind by runs that have FINISHED.
+
+    ``_prune_fast_dir`` is scoped to the CURRENT phase+run_name, so when a run
+    ends its last ``keep_last_n`` NVMe checkpoints become permanent: no future
+    run with a different ``run_name`` will ever consider them. Measured
+    2026-08-30 on this box — seven finished runs (v3a, v6, v8, lrprobe,
+    lrprobe_nofreeze, control_armb, blob_sft, git_repro) had left 17 fully
+    archived checkpoints stranded on the NVMe, ~140 GB, on a filesystem at 94%
+    full. The retention policy was working exactly as written and the disk
+    filled anyway.
+
+    The NVMe dir is STAGING; the HDD holds the history. So a checkpoint that is
+    completely archived and does not belong to the active run has no reason to
+    occupy it. Runs on startup, before training allocates.
+
+    Also ages out orphan ``._tmp_*`` directories (interrupted writes, already
+    ignored by auto-resolve and backfill) older than ``stale_tmp_hours`` — three
+    of those held another 19 GB.
+
+    Returns ``(checkpoints_removed, tmp_dirs_removed)``. Never removes anything
+    belonging to the active run, and never removes a checkpoint whose archive is
+    missing or truncated.
+    """
+    fast_dir, archive_dir = Path(fast_dir), Path(archive_dir)
+    if not fast_dir.is_dir() or not archive_dir.is_dir():
+        return (0, 0)
+
+    removed = 0
+    for d in sorted(fast_dir.iterdir()):
+        if not d.is_dir() or d.name.startswith("._"):
+            continue
+        if not (d / "metadata.json").exists():
+            continue
+        # Never touch the active run — _prune_fast_dir owns its retention.
+        if _matches_run(d, phase, run_name):
+            continue
+        if not _archive_is_complete(d, archive_dir / d.name):
+            logger.info(
+                "checkpoint_residue_kept_unarchived",
+                name=d.name,
+                hint="NVMe-only or truncated archive; left in place",
+            )
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        removed += 1
+        logger.info("checkpoint_residue_pruned", name=d.name)
+
+    tmp_removed = 0
+    cutoff = time.time() - stale_tmp_hours * 3600.0
+    for d in sorted(fast_dir.glob("._tmp_*")):
+        if not d.is_dir():
+            continue
+        try:
+            if d.stat().st_mtime > cutoff:
+                continue  # possibly an in-flight write
+        except OSError:
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        tmp_removed += 1
+        logger.info("checkpoint_orphan_tmp_pruned", name=d.name)
+
+    if removed or tmp_removed:
+        logger.info(
+            "checkpoint_residue_sweep",
+            checkpoints_removed=removed, tmp_removed=tmp_removed,
+        )
+    return (removed, tmp_removed)

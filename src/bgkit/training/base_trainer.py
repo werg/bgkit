@@ -2898,6 +2898,7 @@ class BaseTrainer(ABC):
             from bgkit.training.checkpoint_archiver import (
                 CheckpointArchiver,
                 archive_pending_into,
+                sweep_finished_run_residue,
             )
 
             self._fast_checkpoint_dir = Path(fast_ckpt)
@@ -2908,6 +2909,17 @@ class BaseTrainer(ABC):
                 self._fast_checkpoint_dir,
                 phase_for_ckpt,
                 run_name=self.cfg.get("run_name", None),
+            )
+            # Reclaim NVMe residue from runs that have FINISHED. Per-run
+            # retention cannot: it only ever considers the CURRENT run_name, so
+            # every completed run leaves its last keep_last_n checkpoints
+            # stranded forever. Runs AFTER archive_pending_into, so anything
+            # NVMe-only has just been archived and is eligible.
+            sweep_finished_run_residue(
+                self._fast_checkpoint_dir,
+                checkpoint_dir,
+                phase_for_ckpt,
+                self.cfg.get("run_name", None),
             )
             self._archiver = CheckpointArchiver(
                 archive_dir=checkpoint_dir,
