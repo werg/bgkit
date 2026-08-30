@@ -13,7 +13,7 @@ torch = pytest.importorskip("torch")
 from omegaconf import OmegaConf
 
 from bgkit.training.base_trainer import BaseTrainer
-from bgkit.training.checkpointing import CheckpointMetadata, save_checkpoint
+from bgkit.training.checkpointing import CheckpointMetadata, write_checkpoint_files
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -307,7 +307,7 @@ class TestCheckpointRestore:
             parent_checkpoint=None,
             optimizer_type="muon",
         )
-        ckpt = save_checkpoint(tmp_path, metadata, model=model.state_dict())
+        ckpt = write_checkpoint_files(tmp_path, metadata, model=model.state_dict())
 
         with pytest.raises(RuntimeError, match="Optimizer type mismatch"):
             t.load_checkpoint(Path(ckpt))
@@ -322,7 +322,7 @@ class TestCheckpointRestore:
         metadata = CheckpointMetadata(
             phase="test", step=10, epoch=0, parent_checkpoint=None
         )
-        ckpt = save_checkpoint(
+        ckpt = write_checkpoint_files(
             tmp_path, metadata, model=model.state_dict(),
             optimizer=t.optimizer.state_dict(),
         )
@@ -340,7 +340,7 @@ class TestCheckpointRestore:
         metadata = CheckpointMetadata(
             phase="test", step=10, epoch=0, parent_checkpoint=None
         )
-        ckpt = save_checkpoint(
+        ckpt = write_checkpoint_files(
             tmp_path, metadata, model=model.state_dict(),
             optimizer=adamw_opt.state_dict(),
         )
@@ -365,7 +365,7 @@ class TestCheckpointRestore:
             phase="test", step=10, epoch=0, parent_checkpoint=None,
             optimizer_type="adamw",
         )
-        ckpt = save_checkpoint(
+        ckpt = write_checkpoint_files(
             tmp_path, metadata, model=model.state_dict(),
             optimizer=t.optimizer.state_dict(),
         )

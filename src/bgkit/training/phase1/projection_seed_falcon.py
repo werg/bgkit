@@ -18,7 +18,7 @@ from bgkit.models.decoder import ReconstructionDecoder, normalize_decoder_family
 from bgkit.models.encoder import BgKITEncoder, EncoderOutput
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
-from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
+from bgkit.training.checkpointing import load_checkpoint
 from bgkit.utils.attention_backend import (
     resolve_attention_implementation,
     resolve_decoder_attention_implementation,
@@ -682,31 +682,14 @@ class FalconProjectionSeedTrainer(BaseTrainer):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    def save_checkpoint(
-        self,
-        checkpoint_dir: Path,
-        metrics: dict[str, float] | None = None,
-    ) -> Path:
-        metadata = CheckpointMetadata(
-            phase=self.cfg.training.phase,
-            step=self.global_step,
-            epoch=self.epoch,
-            parent_checkpoint=self._last_checkpoint_path,
-            metrics=metrics,
-            schedule_params=self._schedule_params,
-            training_state=self._training_state,
-            optimizer_type=self._optimizer_type,
-            run_name=self.cfg.get("run_name", None),
-        )
-        ckpt_path = save_checkpoint(
-            checkpoint_dir,
-            metadata,
-            encoder=self.encoder.state_dict(),
-            optimizer_state_by_name=self._build_optimizer_state_by_name(),
-        )
-        self._last_checkpoint_path = str(ckpt_path)
-        return ckpt_path
+    def checkpoint_models(self) -> dict[str, torch.nn.Module]:
+        """Modules this trainer owns.
 
-    def _restore_model_state(self, state_dicts: dict) -> None:
-        if "encoder" in state_dicts:
-            self.encoder.load_state_dict(state_dicts["encoder"], strict=False)
+        Was a hand-rolled save_checkpoint override calling module-level
+        save_checkpoint() directly, bypassing _write_checkpoint — writing to
+        the spinning HDD and skipping async archival (the 2026-06-10 NVMe
+        routing bug, fixed once in summarization_round_robin and never
+        propagated). Eleven trainers carried it.
+        """
+        return {"encoder": self.encoder}
+

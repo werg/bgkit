@@ -27,7 +27,11 @@ from bgkit.training.checkpoint_registry import (
     normalize_checkpoint_name,
     resolve_latest_checkpoint,
 )
-from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
+from bgkit.training.checkpointing import (
+    CheckpointMetadata,
+    load_checkpoint,
+    write_checkpoint_files,
+)
 from bgkit.training.gradient_utils import clip_grad_norm
 from bgkit.training.interruption import GracefulInterruptor
 from bgkit.training.live_config import LiveConfig
@@ -1600,9 +1604,124 @@ class BaseTrainer(ABC):
         return self._write_checkpoint(
             checkpoint_dir,
             metadata,
-            model=self.model.state_dict(),
+            **{k: m.state_dict() for k, m in self.checkpoint_models().items()},
+            **self.checkpoint_extra_state(),
             optimizer_state_by_name=self._build_optimizer_state_by_name(),
         )
+
+    # ------------------------------------------------------------------
+    # Evaluation template
+    # ------------------------------------------------------------------
+
+    def _eval_models(self) -> list[torch.nn.Module]:
+        """Modules to switch to eval mode (and restore afterwards).
+
+        Defaults to everything checkpoint_models() names, so a trainer that has
+        already declared what it owns gets correct mode handling for free.
+        """
+        return list(self.checkpoint_models().values())
+
+    def _eval_batch(self, batch) -> tuple[dict[str, float], float] | None:
+        """Score ONE eval batch: ``({metric: value_sum}, weight)`` or None.
+
+        Returns SUMS plus the weight they were summed over, never means. The
+        template divides once at the end, so batches of different size reduce
+        correctly. Trainers that genuinely want a per-batch mean return
+        ``weight=1.0`` — which is what most hand-rolled overrides did, and
+        making that an explicit argument rather than an accident of the loop is
+        the point.
+        """
+        raise NotImplementedError
+
+    def _eval_extra_metrics(self) -> dict[str, float]:
+        """Extra metrics merged in after the loss loop (ablations, probes)."""
+        return {}
+
+    def evaluate_templated(self) -> dict[str, float]:
+        """Mode-toggle -> iterate -> token-weighted reduce -> restore.
+
+        WHY THIS EXISTS. Fifteen trainers overrode ``evaluate`` and every one
+        re-implemented this same skeleton, averaging 78 lines. The variation was
+        only ever (a) which modules to toggle and (b) the per-batch forward —
+        both now hooks. Meanwhile the base class defined ``evaluate`` in 2
+        lines, so forking was strictly cheaper than extending, which is the
+        mechanism that produced the divergence in the first place.
+
+        The reduction is weighted: ``_eval_batch`` returns sums and the weight
+        they cover, so token-weighted and per-batch-mean reductions are BOTH
+        expressible and the choice is explicit at the hook rather than implied
+        by how someone happened to write the loop.
+
+        Mode restore is in a ``finally``: several hand-rolled overrides left
+        models in eval mode when a batch raised, and Falcon-H1 in particular
+        takes a numerically different path in eval vs train, so a leaked mode
+        silently changes later training.
+        """
+        models = self._eval_models()
+        prev = [bool(m.training) for m in models]
+        for m in models:
+            m.eval()
+        try:
+            sums: dict[str, float] = {}
+            weight = 0.0
+            with torch.no_grad():
+                for batch in self.eval_dataloader:
+                    scored = self._eval_batch(batch)
+                    if scored is None:
+                        continue
+                    values, w = scored
+                    for key, val in values.items():
+                        sums[key] = sums.get(key, 0.0) + float(val)
+                    weight += float(w)
+            metrics = (
+                {k: v / weight for k, v in sums.items()} if weight > 0 else {}
+            )
+            metrics.update(self._eval_extra_metrics())
+            return metrics
+        finally:
+            for m, was_training in zip(models, prev, strict=True):
+                m.train(was_training)
+
+    def checkpoint_models(self) -> dict[str, torch.nn.Module]:
+        """Named modules this trainer owns, as they are written to disk.
+
+        THE CONTRACT THAT WAS MISSING. ``self.model`` means a different thing in
+        every trainer — ``self.encoder`` in summarization and projection_repair,
+        ``self.decoder`` in decoder_init / commit_encoding / compression, and a
+        wrapper over encoder + both decoders in KRKBTrainer. Since the default
+        save writes ``model=self.model.state_dict()``, every trainer whose
+        ``self.model`` is only PART of what it trains had to hand-roll a
+        ``save_checkpoint`` override — five of them do, each repeating the same
+        eight metadata fields and differing only in which modules they name.
+
+        The cost was not the duplication itself but the three incompatible
+        on-disk layouts it produced ({encoder, decoder_qwen, decoder_falcon},
+        {encoder, decoder}, {model}), which then required every CONSUMER to
+        know which phase wrote a checkpoint. Consumers did not, so they assumed
+        ``state["model"]`` and raised KeyError on Phase-1 checkpoints —
+        silently reported as ``SKIPPED`` by lineage tooling, which is how a
+        measurement that mattered went unmade for a day, and why eval_phase1.py
+        could not load Phase-1 checkpoints at all.
+
+        Override this instead of ``save_checkpoint``: the metadata, the NVMe
+        fast-dir routing and the async archival then stay in ONE place.
+        """
+        return {"model": self.model}
+
+    def checkpoint_extra_state(self) -> dict[str, dict]:
+        """Extra RAW state dicts to save alongside ``checkpoint_models()``.
+
+        Some trainers persist derived state that is not a live module — e.g.
+        ``decoder_merged``, the LoRA-merged decoder produced by
+        ``decoder.merge_lora()``, saved only when LoRA is installed. Modules and
+        derived state need separate hooks: the former are state_dict()-ed here,
+        the latter are already dicts and may be conditional.
+
+        Kept as its own hook rather than letting ``checkpoint_models`` return
+        either kind, so "what modules does this trainer own" stays a question
+        with one honest answer.
+        """
+        return {}
 
     def _write_checkpoint(
         self, checkpoint_dir: Path, metadata: CheckpointMetadata, **state_dicts
@@ -1619,7 +1738,7 @@ class BaseTrainer(ABC):
         """
         fast_dir = getattr(self, "_fast_checkpoint_dir", None)
         write_dir = fast_dir if fast_dir is not None else checkpoint_dir
-        ckpt_path = save_checkpoint(write_dir, metadata, **state_dicts)
+        ckpt_path = write_checkpoint_files(write_dir, metadata, **state_dicts)
         self._last_checkpoint_path = str(ckpt_path)
         archiver = getattr(self, "_archiver", None)
         if fast_dir is not None and archiver is not None:
@@ -1702,7 +1821,68 @@ class BaseTrainer(ABC):
         set of modules (encoder-only, encoder + decoder, student /
         teacher pair, ...).
         """
-        self.model.load_state_dict(state_dicts["model"])
+        for name, module in self.checkpoint_models().items():
+            if name not in state_dicts:
+                if name in self.CHECKPOINT_REQUIRED:
+                    raise ValueError(
+                        f"Resume checkpoint missing required '{name}'. "
+                        f"Found: {sorted(state_dicts)}"
+                    )
+                continue
+            state = self._migrate_state_dict(name, state_dicts[name])
+            result = module.load_state_dict(
+                state, strict=self._strict_for(name),
+            )
+            missing = list(getattr(result, "missing_keys", []) or [])
+            unexpected = list(getattr(result, "unexpected_keys", []) or [])
+            if missing or unexpected:
+                # ALWAYS disclosed. Several trainers logged this and several
+                # silently discarded it; a param left at initialisation because
+                # its key did not match is indistinguishable from a trained one
+                # at every later point.
+                logger.info(
+                    "checkpoint_partial_load",
+                    module=name,
+                    n_missing=len(missing), missing=missing[:10],
+                    n_unexpected=len(unexpected), unexpected=unexpected[:10],
+                )
+        self._restore_extra_state(state_dicts)
+
+    # Strict by default would break every cross-version resume (new heads, new
+    # survivorship components); trainers that want exactness opt in. May be a
+    # bool, or a per-module mapping — several trainers legitimately load the
+    # encoder loosely (new components expected) while requiring the decoder to
+    # match exactly. A single flag would have SILENTLY loosened those decoder
+    # loads during this refactor, hiding a mismatched decoder rather than
+    # failing on it.
+    CHECKPOINT_STRICT: ClassVar[bool | dict[str, bool]] = False
+
+    def _strict_for(self, name: str) -> bool:
+        """Resolve strictness for one sub-state."""
+        cfg = self.CHECKPOINT_STRICT
+        if isinstance(cfg, dict):
+            return bool(cfg.get(name, False))
+        return bool(cfg)
+    # Names whose absence is a hard error rather than a skip.
+    CHECKPOINT_REQUIRED: ClassVar[tuple[str, ...]] = ()
+
+    def _migrate_state_dict(self, name: str, state: dict) -> dict:
+        """Hook: rewrite a sub-state before it is loaded.
+
+        The legitimately trainer-specific part of restoring — projection key
+        remapping (commit_encoding), threshold-controller ratio remapping
+        (compression). Expressed as a hook so the LOAD is shared: five trainers
+        previously reimplemented the whole load in order to add one migration.
+        """
+        return state
+
+    def _restore_extra_state(self, state_dicts: dict) -> None:
+        """Hook: consume sub-states that are not live modules.
+
+        Mirror of ``checkpoint_extra_state`` — e.g. a frozen decoder stashed as
+        a raw dict for a later phase to pick up.
+        """
+        return None
 
     def _restore_training_state(self, training_state: dict) -> None:
         """Restore subclass-specific fields from ``training_state``.
@@ -2553,14 +2733,52 @@ class BaseTrainer(ABC):
             run_name=self.cfg.get("run_name", None),
         )
 
+    # Set True by any trainer that hands compressed representations to a
+    # decoder. It is a CLAIM about the pipeline, and _normalize_eval_metrics
+    # checks that the claim is backed by a measurement.
+    SPLICES_REPS: ClassVar[bool] = False
+
     @staticmethod
     def _normalize_eval_metrics(metrics: dict[str, float]) -> dict[str, float]:
-        """Return eval metrics with exactly one ``eval/`` prefix."""
+        """Return eval metrics with exactly one ``eval/`` prefix.
 
+        Deliberately still a pure staticmethod: it is a key transform, nothing
+        more, and callers rely on invoking it unbound.
+        """
         return {
             key if str(key).startswith("eval/") else f"eval/{key}": value
             for key, value in metrics.items()
         }
+
+    def _check_rep_dependence_reported(self, metrics: dict[str, float]) -> None:
+        """Warn if a rep-splicing trainer's eval measured no rep dependence.
+
+        THE FAILURE THIS CATCHES. ``summarization_round_robin`` ran 52,000
+        steps splicing compressed reps into a decoder while containing ZERO
+        occurrences of ablation/zeroed/rep_gain, and its checkpoint records
+        ``metrics: null``. Nobody knew whether the reps contributed anything.
+        When a downstream Phase-2 regression appeared it was diagnosed against
+        that baseline for a day — and the eventual measurement showed the
+        baseline was ~0 too, so there had been no regression to explain.
+
+        A silent gap is indistinguishable from a healthy pipeline, so the
+        absence has to be NOISY. Called from the eval path rather than from
+        ``_normalize_eval_metrics`` so that transform stays pure.
+        """
+        if not getattr(self, "SPLICES_REPS", False):
+            return
+        if any(("rep_gain" in k) or ("ablation" in k) for k in metrics):
+            return
+        logger.warning(
+            "rep_dependence_unmeasured",
+            trainer=type(self).__name__,
+            hint=(
+                "this trainer splices reps into a decoder but its eval reports "
+                "no rep_gain / ablation metric — set eval_ablation_modes, or "
+                "override evaluate() to report one (bgkit.eval.ablations / "
+                "bgkit.eval.rep_dependence)"
+            ),
+        )
 
     def _audit_optimizer_coverage(self) -> None:
         """Warn about parameters that require grad but reach no param group.
@@ -3323,6 +3541,7 @@ class BaseTrainer(ABC):
                             finally:
                                 _wd_resume()
                         eval_metrics = self._normalize_eval_metrics(eval_metrics)
+                        self._check_rep_dependence_reported(eval_metrics)
                         logger.info("eval", step=step, **eval_metrics)
                         if wandb_run is not None:
                             wandb_run.log(eval_metrics, step=step)
@@ -3522,6 +3741,7 @@ class BaseTrainer(ABC):
                     finally:
                         _wd_resume()
                 eval_metrics = self._normalize_eval_metrics(eval_metrics)
+                self._check_rep_dependence_reported(eval_metrics)
                 logger.info("final_eval", **eval_metrics)
                 self._training_state = self._build_training_state(
                     es_best, es_evals_without_improvement, wandb_run,

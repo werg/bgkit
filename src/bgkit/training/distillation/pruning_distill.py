@@ -27,7 +27,7 @@ from bgkit.data.samplers import PackedTokenBudgetSampler
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.models.pruned_qwen35 import PrunedBidirectionalQwen35
 from bgkit.training.base_trainer import BaseTrainer
-from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
+from bgkit.training.checkpointing import load_checkpoint
 from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
 from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.packing import position_ids_from_cu
@@ -727,37 +727,25 @@ class PruningDistillTrainer(BaseTrainer):
     # Checkpointing
     # ------------------------------------------------------------------
 
-    def save_checkpoint(
-        self, checkpoint_dir: Path, metrics: dict[str, float] | None = None,
-    ) -> Path:
-        if self._training_state is None:
-            self._training_state = {}
-        self._training_state["stage"] = self._current_stage
-        self._training_state["stage_thresholds"] = self._stage_thresholds
+    # student encoder only: exact match expected.
+    CHECKPOINT_STRICT: ClassVar[bool] = True
 
-        metadata = CheckpointMetadata(
-            phase=self.cfg.training.phase,
-            step=self.global_step,
-            epoch=self.epoch,
-            parent_checkpoint=self._last_checkpoint_path,
-            metrics=metrics,
-            schedule_params=self._schedule_params,
-            training_state=self._training_state,
-            optimizer_type=self._optimizer_type,
-            run_name=self.cfg.get("run_name", None),
-        )
+    def checkpoint_models(self) -> dict[str, torch.nn.Module]:
+        """Modules this trainer owns.
 
-        save_kwargs = dict(
-            encoder=self.student_encoder.state_dict(),
-            optimizer_state_by_name=self._build_optimizer_state_by_name(),
-        )
-        # Pass through decoder from original step1 checkpoint (unchanged)
-        if self._decoder_state_dict is not None:
-            save_kwargs["decoder"] = self._decoder_state_dict
+        Was a hand-rolled save_checkpoint override calling module-level
+        save_checkpoint() directly, bypassing _write_checkpoint — writing to
+        the spinning HDD and skipping async archival (the 2026-06-10 NVMe
+        routing bug, fixed once in summarization_round_robin and never
+        propagated). Eleven trainers carried it.
+        """
+        return {"encoder": self.student_encoder}
 
-        ckpt_path = save_checkpoint(checkpoint_dir, metadata, **save_kwargs)
-        self._last_checkpoint_path = str(ckpt_path)
-        return ckpt_path
+    def checkpoint_extra_state(self) -> dict[str, dict]:
+        """Frozen decoder state, carried forward when one was supplied."""
+        if getattr(self, "_decoder_state_dict", None) is not None:
+            return {"decoder": self._decoder_state_dict}
+        return {}
 
     def _named_parameters_for_optimizer(self):
         """Yield (name, param) pairs across the student encoder only.
@@ -768,9 +756,6 @@ class PruningDistillTrainer(BaseTrainer):
         for name, param in self.student_encoder.named_parameters():
             yield f"encoder.{name}", param
 
-    def _restore_model_state(self, state_dicts: dict) -> None:
-        if "encoder" in state_dicts:
-            self.student_encoder.load_state_dict(state_dicts["encoder"])
 
     def _restore_training_state(self, training_state: dict) -> None:
         self._current_stage = training_state.get("stage", -1)

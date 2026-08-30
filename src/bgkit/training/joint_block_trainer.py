@@ -34,7 +34,6 @@ from bgkit.data.samplers import PackedTokenBudgetSampler
 from bgkit.models.decoder import normalize_decoder_family
 from bgkit.models.encoder import BgKITEncoder, _resolve_layers
 from bgkit.training.base_trainer import BaseTrainer
-from bgkit.training.checkpointing import CheckpointMetadata, save_checkpoint
 from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
 from bgkit.utils.attention_backend import (
     resolve_attention_implementation,
@@ -539,41 +538,23 @@ class JointBlockTrainer(BaseTrainer):
             "cosine_sim_proj": total_cosine_proj / max(n, 1),
         }
 
-    def save_checkpoint(
-        self, checkpoint_dir: Path, metrics: dict[str, float] | None = None
-    ) -> Path:
-        """Save encoder state dict with phase metadata."""
-        metadata = CheckpointMetadata(
-            phase=self.cfg.training.phase,
-            step=self.global_step,
-            epoch=self.epoch,
-            parent_checkpoint=self._last_checkpoint_path,
-            metrics=metrics,
-            schedule_params=self._schedule_params,
-            training_state=self._training_state,
-            optimizer_type=self._optimizer_type,
-            run_name=self.cfg.get("run_name", None),
-        )
-        ckpt_path = save_checkpoint(
-            checkpoint_dir,
-            metadata,
-            encoder=self.encoder.state_dict(),
-            optimizer_state_by_name=self._build_optimizer_state_by_name(),
-        )
-        self._last_checkpoint_path = str(ckpt_path)
-        return ckpt_path
+    # encoder only, strict: exact match expected.
+    CHECKPOINT_STRICT: ClassVar[bool] = True
+    CHECKPOINT_REQUIRED: ClassVar[tuple[str, ...]] = ('encoder',)
+
+    def checkpoint_models(self) -> dict[str, torch.nn.Module]:
+        """Modules this trainer owns.
+
+        Was a hand-rolled save_checkpoint override calling module-level
+        save_checkpoint() directly, bypassing _write_checkpoint — writing to
+        the spinning HDD and skipping async archival (the 2026-06-10 NVMe
+        routing bug, fixed once in summarization_round_robin and never
+        propagated). Eleven trainers carried it.
+        """
+        return {"encoder": self.encoder}
 
     def _named_parameters_for_optimizer(self):
         """Yield (name, param) pairs across the encoder only."""
         for name, param in self.encoder.named_parameters():
             yield f"encoder.{name}", param
 
-    def _restore_model_state(self, state_dicts: dict) -> None:
-        """Load encoder state dict.
-
-        Topology mismatches within the same optimizer type (e.g.
-        switching heads_only mode) preserve per-param moments where
-        names match via the name-keyed optimizer state path — this
-        load uses strict matching for the encoder weights themselves.
-        """
-        self.encoder.load_state_dict(state_dicts["encoder"])

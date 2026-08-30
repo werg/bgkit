@@ -24,6 +24,7 @@ import random
 from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import structlog
@@ -157,6 +158,10 @@ class DistillationTrainer(BaseTrainer):
     external models (SWE-bench OpenHands, Llama-70B, etc.) but we never
     train a larger target in-house.
     """
+
+    # Hands compressed reps to a decoder: eval MUST report a
+    # rep-dependence number (BaseTrainer warns loudly otherwise).
+    SPLICES_REPS: ClassVar[bool] = True
 
     _log_every = 5
 

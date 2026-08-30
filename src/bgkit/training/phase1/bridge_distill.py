@@ -25,7 +25,7 @@ from bgkit.data.samplers import PackedTokenBudgetSampler
 from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
-from bgkit.training.checkpointing import CheckpointMetadata, load_checkpoint, save_checkpoint
+from bgkit.training.checkpointing import load_checkpoint
 from bgkit.training.gradient_utils import maybe_enable_gradient_checkpointing
 from bgkit.utils.attention_backend import resolve_attention_implementation
 from bgkit.utils.packing import position_ids_from_cu
@@ -779,41 +779,42 @@ class BridgeDistillTrainer(BaseTrainer):
     # Checkpointing
     # ------------------------------------------------------------------
 
-    def save_checkpoint(
-        self, checkpoint_dir: Path, metrics: dict[str, float] | None = None,
-    ) -> Path:
-        metadata = CheckpointMetadata(
-            phase=self.cfg.training.phase,
-            step=self.global_step,
-            epoch=self.epoch,
-            parent_checkpoint=self._last_checkpoint_path,
-            metrics=metrics,
-            schedule_params=self._schedule_params,
-            training_state=self._training_state,
-            optimizer_type=self._optimizer_type,
-            run_name=self.cfg.get("run_name", None),
-        )
-        save_kwargs = dict(
-            encoder=self.encoder_student.state_dict(),
-            optimizer_state_by_name=self._build_optimizer_state_by_name(),
-        )
-        if self._decoder_state_dict is not None:
-            save_kwargs["decoder"] = self._decoder_state_dict
-        if self._decoder_merged_state_dict is not None:
-            save_kwargs["decoder_merged"] = self._decoder_merged_state_dict
-        ckpt_path = save_checkpoint(checkpoint_dir, metadata, **save_kwargs)
-        self._last_checkpoint_path = str(ckpt_path)
-        return ckpt_path
+    def checkpoint_models(self) -> dict[str, torch.nn.Module]:
+        """Modules this trainer owns.
+
+        Was a hand-rolled save_checkpoint override calling module-level
+        save_checkpoint() directly, bypassing _write_checkpoint — writing to
+        the spinning HDD and skipping async archival (the 2026-06-10 NVMe
+        routing bug, fixed once in summarization_round_robin and never
+        propagated). Eleven trainers carried it.
+        """
+        return {"encoder": self.encoder_student}
+
+    def checkpoint_extra_state(self) -> dict[str, dict]:
+        """Frozen decoder + its LoRA-merged form, when supplied.
+
+        These are RAW state dicts held on the trainer, not live modules — the
+        auto-conversion first emitted decoder.merge_lora() here, which this
+        trainer does not have. Caught by diffing against what HEAD wrote.
+        """
+        out: dict[str, dict] = {}
+        if getattr(self, "_decoder_state_dict", None) is not None:
+            out["decoder"] = self._decoder_state_dict
+        if getattr(self, "_decoder_merged_state_dict", None) is not None:
+            out["decoder_merged"] = self._decoder_merged_state_dict
+        return out
+
 
     def _named_parameters_for_optimizer(self):
         for name, param in self.encoder_student.named_parameters():
             yield f"encoder_student.{name}", param
 
-    def _restore_model_state(self, state_dicts: dict) -> None:
-        # Teacher stays pinned to the Step 4 source checkpoint loaded in setup;
-        # only the student moves on resume.
-        if "encoder" in state_dicts:
-            self.encoder_student.load_state_dict(state_dicts["encoder"], strict=False)
+    def _restore_extra_state(self, state_dicts: dict) -> None:
+        """Stash the frozen decoder for a later phase to pick up.
+
+        Not a live module here, so it belongs in the extra-state hook rather
+        than in the module load — the mirror of checkpoint_extra_state.
+        """
         if "decoder" in state_dicts:
             self._decoder_state_dict = state_dicts["decoder"]
 

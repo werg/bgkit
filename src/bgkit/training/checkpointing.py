@@ -40,7 +40,7 @@ class CheckpointMetadata:
     run_name: str | None = None
 
 
-def save_checkpoint(
+def write_checkpoint_files(
     checkpoint_dir: Path,
     metadata: CheckpointMetadata,
     **state_dicts,
@@ -166,3 +166,80 @@ def load_checkpoint(checkpoint_path: Path) -> tuple[CheckpointMetadata, dict]:
         keys=list(state_dicts.keys()),
     )
     return metadata, state_dicts
+
+
+# Sub-state name -> the prefix it carries in the flat, single-``model`` layout.
+# Phase-1 trainers save each managed model as its own ``<name>.pt`` with
+# unprefixed keys; Phase-2 saves one flat ``model.pt``. Anything that reads
+# ``state["model"]`` therefore raises KeyError on every Phase-1 checkpoint.
+_PHASE1_SUBSTATE_PREFIXES = {
+    "encoder": "encoder.",
+    "decoder_qwen": "decoders.qwen35.",
+    "decoder_falcon": "decoders.falcon_h1.",
+    "decoder": "decoder.",
+}
+
+
+def normalize_model_state(state_dicts: dict) -> dict:
+    """Return ``state_dicts`` with a single flat ``["model"]`` sub-state.
+
+    TWO ON-DISK LAYOUTS EXIST and consumers kept assuming the newer one:
+
+    * Phase-2 / KRKBTrainer     ``{"model": {...}, "optimizer_state_by_name": ...}``
+    * Phase-1 (summarization,
+      commit-encoding, ...)     ``{"encoder": {...}, "decoder_qwen": {...},
+                                   "decoder_falcon": {...}, ...}`` with
+                                  UNPREFIXED keys inside each sub-state.
+
+    ``state_dicts["model"]`` on a Phase-1 checkpoint raises ``KeyError``. On
+    2026-08-28 that turned every lineage comparison against the Phase-1 base
+    into a silent ``SKIPPED (KeyError)`` row, so the one measurement that could
+    distinguish "Phase-2 training broke the projection" from "it was never
+    aligned" was never actually made — the question stayed open for a day on a
+    missing three-line adapter.
+
+    This is deliberately shared rather than fixed per-script: the same
+    assumption is in ``analyze_embedding_deviation``, ``eval_phase1`` and
+    ``probe_decoder_damage_locus``, and any future tool comparing across the
+    Phase-1 -> Phase-2 boundary will hit it too.
+
+    Idempotent: a checkpoint already in the flat layout is returned unchanged.
+    """
+    if "model" in state_dicts:
+        return state_dicts
+    merged: dict = {}
+    for name, prefix in _PHASE1_SUBSTATE_PREFIXES.items():
+        sub = state_dicts.get(name)
+        if not isinstance(sub, dict):
+            continue
+        for k, v in sub.items():
+            merged[f"{prefix}{k}"] = v
+    if not merged:
+        raise KeyError(
+            "unrecognised checkpoint layout: expected a flat 'model' sub-state "
+            f"or one of {sorted(_PHASE1_SUBSTATE_PREFIXES)}; got {sorted(state_dicts)}"
+        )
+    out = dict(state_dicts)
+    out["model"] = merged
+    return out
+
+
+def save_checkpoint(*_args, **_kwargs):
+    """REMOVED — use ``BaseTrainer._write_checkpoint`` instead.
+
+    This was the copy-paste path. Because a module-level ``save_checkpoint``
+    was importable, the cheapest way to give a trainer a different on-disk
+    layout was to copy BaseTrainer.save_checkpoint and call this directly —
+    which skips NVMe fast-dir routing and async HDD archival. Twelve trainers
+    copied it; ELEVEN carried the resulting bug, and the fix made in one of
+    them in June 2026 could not propagate to the others.
+
+    Declare the layout with ``checkpoint_models()`` / ``checkpoint_extra_state()``
+    and let BaseTrainer do the write. The low-level writer is still available as
+    ``write_checkpoint_files`` for infrastructure that genuinely needs it.
+    """
+    raise RuntimeError(
+        "save_checkpoint() was removed: it bypasses NVMe routing and archival. "
+        "Declare layout via checkpoint_models()/checkpoint_extra_state(); "
+        "BaseTrainer._write_checkpoint performs the write."
+    )

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import glob as _glob
 from pathlib import Path
+from typing import ClassVar
 
 import torch
 from torch import nn
@@ -115,6 +116,9 @@ def _resolve_shards(patterns: list[str], exclude: set[str] | None = None) -> lis
 
 class BlobSFTTrainer(BaseTrainer):
     """See module docstring."""
+    # Hands compressed reps to a decoder: eval MUST report a
+    # rep-dependence number (BaseTrainer warns loudly otherwise).
+    SPLICES_REPS: ClassVar[bool] = True
 
     def __init__(self, cfg) -> None:
         super().__init__(cfg)

@@ -58,7 +58,6 @@ from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import (
-    CheckpointMetadata,
     load_checkpoint,
 )
 from bgkit.training.compression_curriculum import (
@@ -181,6 +180,9 @@ class SummarizationRoundRobinTrainer(CompressionCurriculumMixin, BaseTrainer):
     keep-rate drifts off the curriculum target with nothing to correct it
     (the 2026-06-08 over-compression regression).
     """
+    # Hands compressed reps to a decoder: eval MUST report a
+    # rep-dependence number (BaseTrainer warns loudly otherwise).
+    SPLICES_REPS: ClassVar[bool] = True
 
     LIVE_CONFIG_FIELDS: ClassVar[dict[str, str]] = {
         **CURRICULUM_LIVE_CONFIG_FIELDS,
@@ -1009,31 +1011,27 @@ class SummarizationRoundRobinTrainer(CompressionCurriculumMixin, BaseTrainer):
     # Checkpoint
     # ------------------------------------------------------------------
 
-    def save_checkpoint(
-        self, checkpoint_dir: Path, metrics: dict[str, float] | None = None,
-    ) -> Path:
-        metadata = CheckpointMetadata(
-            phase=self.cfg.training.phase,
-            step=self.global_step,
-            epoch=self.epoch,
-            parent_checkpoint=self._last_checkpoint_path,
-            metrics=metrics,
-            schedule_params=self._schedule_params,
-            training_state=self._training_state,
-            optimizer_type=self._optimizer_type,
-            run_name=self.cfg.get("run_name", None),
-        )
-        # Route through the base helper so the NVMe fast-dir + async HDD archive
-        # apply here too (this override used to call save_checkpoint() directly,
-        # writing to the slow HDD and bypassing NVMe — the 2026-06-10 bug).
-        return self._write_checkpoint(
-            checkpoint_dir,
-            metadata,
-            encoder=self.encoder.state_dict(),
-            decoder_qwen=self.decoder_qwen.state_dict(),
-            decoder_falcon=self.decoder_falcon.state_dict(),
-            optimizer_state_by_name=self._build_optimizer_state_by_name(),
-        )
+    # Encoder loose (new survivorship components expected on older
+    # checkpoints); BOTH decoders exact. Preserved verbatim from the override —
+    # a single class-level flag would have loosened the decoder loads.
+    CHECKPOINT_STRICT: ClassVar[dict[str, bool]] = {
+        "encoder": False, "decoder_qwen": True, "decoder_falcon": True,
+    }
+
+    def checkpoint_models(self) -> dict[str, torch.nn.Module]:
+        """Encoder + BOTH decoder families (round-robin trains both).
+
+        Was a full save_checkpoint override that re-declared all eight metadata
+        fields; the only real content was these three names. The override also
+        once called save_checkpoint() directly and so bypassed the NVMe fast-dir
+        and async archival (the 2026-06-10 routing bug) — a failure only
+        possible because the write path was duplicated instead of shared.
+        """
+        return {
+            "encoder": self.encoder,
+            "decoder_qwen": self.decoder_qwen,
+            "decoder_falcon": self.decoder_falcon,
+        }
 
     def _named_parameters_for_optimizer(self):
         for name, param in self.encoder.named_parameters():
@@ -1043,13 +1041,6 @@ class SummarizationRoundRobinTrainer(CompressionCurriculumMixin, BaseTrainer):
         for name, param in self.decoder_falcon.named_parameters():
             yield f"decoder_falcon.{name}", param
 
-    def _restore_model_state(self, state_dicts: dict) -> None:
-        if "encoder" in state_dicts:
-            self.encoder.load_state_dict(state_dicts["encoder"], strict=False)
-        if "decoder_qwen" in state_dicts:
-            self.decoder_qwen.load_state_dict(state_dicts["decoder_qwen"])
-        if "decoder_falcon" in state_dicts:
-            self.decoder_falcon.load_state_dict(state_dicts["decoder_falcon"])
 
     def trainable_parameters(self) -> list:
         params = [p for p in self.encoder.parameters() if p.requires_grad]

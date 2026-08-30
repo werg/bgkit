@@ -32,9 +32,7 @@ from bgkit.models.encoder import BgKITEncoder
 from bgkit.training.base_trainer import BaseTrainer
 from bgkit.training.checkpoint_registry import resolve_checkpoint
 from bgkit.training.checkpointing import (
-    CheckpointMetadata,
     load_checkpoint,
-    save_checkpoint,
 )
 from bgkit.utils.attention_backend import (
     resolve_attention_implementation,
@@ -347,55 +345,33 @@ class FalconProjectionCachedTrainer(BaseTrainer):
         return {k: float(v.item()) for k, v in metrics.items()}
 
     @torch.no_grad()
-    def evaluate(self) -> dict[str, float]:
-        proj_block = self.encoder.projection_blocks["falcon_h1"]
-        proj_block.eval()
-        totals: dict[str, float] = {}
-        count = 0
-        try:
-            for batch in self.eval_dataloader:
-                _total, stats = self._forward_one(batch)
-                totals["loss"] = totals.get("loss", 0.0) + float(_total.item())
-                for name, value in stats.items():
-                    totals[name] = totals.get(name, 0.0) + float(value.item())
-                count += 1
-            if count:
-                totals = {k: v / count for k, v in totals.items()}
-            return totals
-        finally:
-            proj_block.train()
+    def _eval_models(self) -> list[torch.nn.Module]:
+        """Only the Falcon projection block trains here."""
+        return [self.encoder.projection_blocks["falcon_h1"]]
+
+    def _eval_batch(self, batch) -> tuple[dict[str, float], float] | None:
+        """Per-batch mean over the loss plus every stat _forward_one reports.
+
+        weight=1.0 reproduces the previous per-batch-mean reduction EXACTLY;
+        it is now explicit rather than an artefact of dividing by a batch
+        counter at the end of a hand-rolled loop.
+        """
+        total, stats = self._forward_one(batch)
+        values = {"loss": float(total.item())}
+        values.update({k: float(v.item()) for k, v in stats.items()})
+        return values, 1.0
+
+    evaluate = BaseTrainer.evaluate_templated
 
     # ------------------------------------------------------------------ checkpoints
-    def save_checkpoint(
-        self,
-        checkpoint_dir: Path,
-        metrics: dict[str, float] | None = None,
-    ) -> Path:
-        # Save only the projection_blocks.falcon_h1 sub-state — small (~38 MB),
-        # and the encoder.l0/l1 are untouched so we don't need to save them.
-        # But for compatibility with downstream phases that resolve from a
-        # phase1_falcon_dense_seed checkpoint and expect a full encoder, we
-        # save the FULL encoder state dict (the rest is unchanged from src).
-        metadata = CheckpointMetadata(
-            phase=self.cfg.training.phase,
-            step=self.global_step,
-            epoch=self.epoch,
-            parent_checkpoint=self._last_checkpoint_path,
-            metrics=metrics,
-            schedule_params=self._schedule_params,
-            training_state=self._training_state,
-            optimizer_type=self._optimizer_type,
-            run_name=self.cfg.get("run_name", None),
-        )
-        ckpt_path = save_checkpoint(
-            checkpoint_dir,
-            metadata,
-            encoder=self.encoder.state_dict(),
-            optimizer_state_by_name=self._build_optimizer_state_by_name(),
-        )
-        self._last_checkpoint_path = str(ckpt_path)
-        return ckpt_path
+    def checkpoint_models(self) -> dict[str, torch.nn.Module]:
+        """Modules this trainer owns.
 
-    def _restore_model_state(self, state_dicts: dict) -> None:
-        if "encoder" in state_dicts:
-            self.encoder.load_state_dict(state_dicts["encoder"], strict=False)
+        Was a hand-rolled save_checkpoint override calling module-level
+        save_checkpoint() directly, bypassing _write_checkpoint — writing to
+        the spinning HDD and skipping async archival (the 2026-06-10 NVMe
+        routing bug, fixed once in summarization_round_robin and never
+        propagated). Eleven trainers carried it.
+        """
+        return {"encoder": self.encoder}
+
