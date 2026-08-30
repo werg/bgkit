@@ -28,6 +28,7 @@ Usage::
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import hydra
@@ -166,12 +167,97 @@ def main(cfg: DictConfig) -> None:
     checkpoint_path = eval_cfg.get("checkpoint")
     if checkpoint_path:
         logger.info("loading_checkpoint", path=str(checkpoint_path))
-        trainer.load_checkpoint(Path(str(checkpoint_path)))
-        logger.info("checkpoint_loaded", step=trainer.global_step)
+        # WEIGHTS ONLY. trainer.load_checkpoint is the RESUME path: it restores
+        # optimizer state and therefore refuses on an optimizer-type mismatch
+        # ("saved with 'muon' but current config uses 'adamw'"). That guard is
+        # correct for resuming training and wrong for evaluation — an eval
+        # needs no optimizer, and refusing here makes whole lineages
+        # unevaluable under a config that merely chose a different optimizer.
+        # Hit 2026-08-30 evaluating the Muon-trained summarization base under
+        # the AdamW wide-net config, which is exactly the cross-lineage
+        # comparison an eval script exists to make.
+        from bgkit.training.checkpointing import (
+            load_checkpoint as _load_ckpt,
+        )
+        from bgkit.training.checkpointing import (
+            normalize_model_state as _norm_state,
+        )
+        _meta, _state = _load_ckpt(Path(str(checkpoint_path)))
+        _state = _norm_state(_state)
+        try:
+            trainer._restore_model_state(_state)
+        except RuntimeError as exc:
+            # CROSS-LINEAGE EVAL. A Phase-1 checkpoint predates Phase-2-only
+            # modules (e.g. encoder.l1l1_bridge, added for the recursive-L1
+            # tree), so a STRICT load fails on keys that simply did not exist
+            # when it was saved. The trainer's guard is right to stay strict
+            # for RESUMING training; for evaluation, refusing makes every
+            # earlier lineage unevaluable under the current config.
+            #
+            # Non-strict, but NOT silent: every missing/unexpected key is
+            # logged at WARNING. A module left at initialisation is only
+            # harmless if it is off the eval path — say which ones they are
+            # rather than letting an untrained module run unnoticed.
+            missing, unexpected = trainer.model.load_state_dict(
+                _state["model"], strict=False,
+            )
+            logger.warning(
+                "checkpoint_loaded_non_strict",
+                reason=str(exc)[:200],
+                missing=list(missing)[:20],
+                n_missing=len(missing),
+                unexpected=list(unexpected)[:20],
+                n_unexpected=len(unexpected),
+                hint="listed params are at INIT, not trained — verify they are "
+                     "off the eval path before trusting the numbers",
+            )
+        trainer.global_step = int(getattr(_meta, "step", 0) or 0)
+        logger.info(
+            "checkpoint_loaded", step=trainer.global_step, weights_only=True,
+        )
 
     max_samples = int(eval_cfg.get("max_samples", 256))
     collect_per_sample = bool(eval_cfg.get("per_sample", False))
-    free_running = bool(eval_cfg.get("free_running", True))
+    # HOW MANY samples get free-running generation, not whether.
+    #
+    # Free-running is by far the most expensive thing this script does:
+    # autoregressive greedy decode, one tiny GPU kernel per token, so it is
+    # CPU-launch-bound and shows up as ~88% GPU "utilization" at ~35W with one
+    # core pinned — indistinguishable from a hang until you read a stack.
+    #
+    # It used to be an all-or-nothing bool read from ``eval.free_running``
+    # (default True), while the in-training knob for the same behaviour is
+    # ``training.eval_free_running_samples``. Two names for one thing, and the
+    # script silently ignored the documented one: on 2026-08-30 three eval runs
+    # were launched with ``training.eval_free_running_samples=0`` and every one
+    # of them free-ran anyway, costing hours and two wrong hang diagnoses.
+    #
+    # Resolution order, most specific first, with the result LOGGED because a
+    # silently-ignored config key is what caused the incident:
+    #   1. eval.free_running_samples: N   (explicit cap for this script)
+    #   2. training.eval_free_running_samples: N  (the shared, documented key)
+    #   3. eval.free_running: bool        (legacy; True -> all, False -> none)
+    step_cfg = getattr(trainer, "step_cfg", {}) or {}
+    _explicit = eval_cfg.get("free_running_samples", None)
+    _shared = step_cfg.get("eval_free_running_samples", None)
+    if _explicit is not None:
+        free_running_limit, _src = int(_explicit), "eval.free_running_samples"
+    elif _shared is not None:
+        free_running_limit = int(_shared)
+        _src = "training.eval_free_running_samples"
+    else:
+        free_running_limit = max_samples if bool(
+            eval_cfg.get("free_running", True)
+        ) else 0
+        _src = "eval.free_running"
+    free_running_limit = max(0, min(free_running_limit, max_samples))
+    logger.info(
+        "eval_free_running_resolved",
+        free_running_samples=free_running_limit,
+        source=_src,
+        max_samples=max_samples,
+        note="0 disables generation; teacher-forced scoring is unaffected",
+    )
     max_tool_calls = int(eval_cfg.get("max_tool_calls", 16))
     max_new_tokens = int(eval_cfg.get("max_new_tokens", 8192))
     # Seed the gold retrieval turn instead of making the model emit it:
@@ -198,6 +284,7 @@ def main(cfg: DictConfig) -> None:
     trainer.model.eval()
     per_sample_rows: list[dict] = []
     samples_seen = 0
+    free_run_done = 0
     with torch.no_grad():
         for batch in trainer.eval_dataloader:
             if samples_seen >= max_samples:
@@ -214,16 +301,16 @@ def main(cfg: DictConfig) -> None:
                 # different); generation below keeps eval mode for the cache.
                 with trainer._teacher_forced_decoders():
                     result = evaluate_sample(trainer, sample)
-                free_result = (
-                    evaluate_free_running_sample(
+                free_result = None
+                if free_run_done < free_running_limit:
+                    free_result = evaluate_free_running_sample(
                         trainer,
                         sample,
                         max_tool_calls=max_tool_calls,
                         max_new_tokens=max_new_tokens,
                         force_first_call=force_first_call,
                     )
-                    if free_running else None
-                )
+                    free_run_done += 1
                 row = {
                     "dataset": getattr(sample, "dataset_name", ""),
                     "decoder_family": getattr(trainer, "_decoder_family", ""),
@@ -298,7 +385,18 @@ def main(cfg: DictConfig) -> None:
             trimmed.append(r)
         report["per_sample"] = trimmed
 
-    output_dir = Path(eval_cfg.get("output_dir", "eval_reports"))
+    # Default the report under CHECKPOINT_DIR, which is bind-mounted, NOT a
+    # container-relative path. ``docker compose run --rm`` deletes the
+    # container filesystem on exit, so the previous default ("eval_reports")
+    # wrote the report into a directory that ceased to exist moments later —
+    # on 2026-08-30 a completed 128-sample eval's report was destroyed this
+    # way and survived only because the container log happened to be teed to
+    # a file. A result you cannot read is a result you did not produce.
+    _default_out = os.environ.get("CHECKPOINT_DIR", "")
+    output_dir = Path(
+        eval_cfg.get("output_dir", None)
+        or (Path(_default_out) / "eval_reports" if _default_out else "eval_reports")
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     stage = str(cfg.training.get("stage", "?")).upper()
     suffix = f"_{ablation}" if ablation else ""
