@@ -65,7 +65,14 @@ training:
   # empty it silently never computes — which is how the capability decayed
   # unnoticed for months (base 2.03-2.95 nats -> 0.004 with nothing reporting).
   eval_ablation_modes: [zeroed]
-  eval_train_subset_samples: 0
+  # GENERALIZATION GAP. This is THE instrument for "is it overfitting" — the
+  # same teacher-forced pass over a fixed slice of TRAINING samples, so
+  # eval/train_subset/loss vs eval/loss is a like-for-like comparison. It was 0,
+  # i.e. off, for this entire run, which is why the question could only be
+  # answered indirectly. Note the pooled train_step loss is NOT a substitute:
+  # it now includes the replay tail, which the eval passes exclude, so the two
+  # are no longer measuring the same thing.
+  eval_train_subset_samples: 128
   profile_timing: true
 
   # swerecall REMOVED (2026-08-28). It was 7808 of 19691 train rows — 40% of
@@ -94,6 +101,64 @@ training:
   # rather than mask, because routing is a real requirement and is already
   # near-saturated — 0.2 keeps it while concentrating gradient on the answer.
   tool_call_loss_weight: 0.2
+
+  # REPLAY AUX (2026-08-29) — the one lever left standing.
+  #
+  # Weight-delta across the lineage settled what actually changed between the
+  # base (rep_gain 2.03-2.95 nats) and Phase 2 (rep_gain ~0.01):
+  #     l1.backbone              0.0000
+  #     l0.backbone              0.0001
+  #     projection_blocks.qwen35 0.0039   (output_norm.weight BIT-IDENTICAL)
+  #     DECODER qwen35           0.0120   (uniform across every layer)
+  # The reps being produced today are, to four decimals, the reps that earned
+  # 2-3 nats. Nothing about the representation drifted. Only the reader did.
+  #
+  # That kills the two candidate fixes at once: a projection anchor repairs a
+  # drift that did not happen (norm_ratio 188 and cos_near 0.156 are the BASE's
+  # operating point, inherited), and selection is dead for a third independent
+  # reason — the heads are the ONLY encoder part Phase 2 moves at all
+  # (l0.head 17%) and moving them that far changed rep_gain not at all, matching
+  # random-selection == trained-selection and the top-k margin loss reaching
+  # 0.0008 with no rep_gain effect.
+  #
+  # What is left is the objective. Continue the gold document from a short
+  # verbatim cue, with the document present ONLY as spliced reps. The LM prior
+  # can produce plausible continuations — which is exactly what the zeroed arm
+  # controls for — but CE falls only if the reps are read. This is the base's
+  # own training task and the base is 1.2% away in weight space, so it is a
+  # recovery, not learning from scratch.
+  #
+  # Cost, stated plainly: ~40 supervised replay positions join ~90 answer/tool
+  # positions in the per-sample normaliser, so answer gradient per step drops
+  # roughly 45%. That is the intended trade — the answer task is currently
+  # being solved WITHOUT the reps, so diluting it to restore rep-reading is the
+  # point. Read eval/rep_gain/nats and eval/rep_gain/exact_match.
+  replay_loss_weight: 0.5
+  replay_window_tokens: 48
+  # LOCATOR = INDEX (2026-08-29, third form). Both earlier locators carried
+  # content and leaked to the LM prior, each measured on its own eval:
+  #   mode=cue    step 1500: gap 0.0229 against replay CE 1.077 — 98% of the
+  #               continuation came from the prior, because a short cue out of
+  #               templated log/grep text nearly determines the next 48 tokens.
+  #   mode=start  step 1750: replay CE HALVED to 0.588 while the gap barely
+  #               moved (0.0293). The halving is a property of the TARGET, not
+  #               of learning: document openings are boilerplate (licence
+  #               headers, imports, log preambles), so position 0 is the most
+  #               guessable place in the document to ask about.
+  # mode=chunk asks for chunk <i>: the marker names WHICH chunk and nothing
+  # about what is in it, so the prior can supply only "text of this kind at
+  # roughly this depth" and the content exists solely in the spliced reps.
+  # cue_tokens is unused in this mode; every target token is supervised.
+  #
+  # Read eval/replay/gap against BOTH priors above. If it stays ~0.03 while
+  # replay CE falls again, the leak is not in the locator and the objective
+  # itself is not the lever.
+  replay_mode: chunk
+  replay_cue_tokens: 0
+  # 24 was too few to separate 0.0229 from 0.0293 — those differ by less than
+  # the noise at that n. Doubled; the probe is two decodes per sample and runs
+  # once per eval.
+  replay_eval_samples: 48
 
   # RETENTION CURRICULUM (2026-08-28). Previously 0.10 x 0.15 fixed from step
   # 0, i.e. ~1.5% of tokens survive to the decoder. For a 12-token verbatim
@@ -133,7 +198,18 @@ training:
     # the same document's OTHER answers so budget allocation depends on WHICH
     # question is asked. Data supports it: 77-92% of rows have 2.9-4.3
     # non-overlapping negatives.
-    span_contrastive_weight: 1.0
+    # SOFT form DISABLED — measured ineffective, not merely weak. It
+    # supervises sigmoid(z - theta) while survival is decided by hard
+    # exact_topk on the z-score, so at v8 step 700 the loss had fallen
+    # 0.76 -> 0.43 while survivor Jaccard (own vs FOREIGN query) went
+    # 0.967 -> 0.991. It trained honestly against the wrong quantity.
+    span_contrastive_weight: 0.0
+    # TOP-K MARGIN form: hinge pushing the other questions' spans below the
+    # k-th largest score, which IS the survival cutoff, so progress on the
+    # loss is progress on selection by construction. Cutoff detached, or the
+    # model could drag it down to meet the negatives instead of demoting them.
+    span_margin_weight: 1.0
+    span_margin: 0.5
     # PROJECTION EMBED-ANCHOR — the Step-2.5 repair, as a Phase-2 auxiliary.
     # Measured on the Phase-2 checkpoint: reps at 188x the token-embedding norm
     # with cos-to-nearest-embedding 0.156 against a -0.029 random floor, i.e.

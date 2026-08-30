@@ -731,7 +731,7 @@ services:
     # match on run_name (it cold-started control_armb from the Phase-1 base and
     # discarded 1258 steps). UPDATE THIS PATH when resuming from a later step.
     command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v8",
-      "+resume_checkpoint=/workspace/checkpoints/phase2_kb_step701_20260828_221918_650700_run-phase2_kb_widenet_v8"]
+      "+resume_checkpoint=/workspace/checkpoints/phase2_kb_step2827_20260829_203241_421138_run-phase2_kb_widenet_v8"]
 
   # Long-prose semantic fact recall (babilong_style) alongside the code
   # wide-net datasets; the zero-shot BABILong arm scored 0.00 on every cell
