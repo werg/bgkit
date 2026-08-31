@@ -41,14 +41,22 @@ def test_spread_payload_reports_a_high_rank():
     st = _rep_rank_stats([torch.randn(40, 64)])
     assert st["eff_rank"] > 20.0
     assert st["shared_frac"] < 0.1
+    assert st["n_rows"] == 40
 
 
-def test_single_row_payloads_are_skipped():
-    """A lone vector is trivially rank 1; counting it would drag the average
-    toward an alarm on every short document."""
+def test_short_payloads_are_skipped():
+    """A participation ratio over k centred rows is bounded by k - 1, so a
+    short payload reports a low rank by CONSTRUCTION rather than by
+    collapsing. The first live run warned on exactly such a payload
+    (n_payloads=1, eff_rank 1.84) with 9-10.6 either side of it."""
+    from bgkit.models.decoder import _REP_RANK_GUARD_MIN_ROWS
+
+    short = _REP_RANK_GUARD_MIN_ROWS - 1
     assert _rep_rank_stats([torch.randn(1, 64)]) is None
-    st = _rep_rank_stats([torch.randn(1, 64), torch.randn(40, 64)])
+    assert _rep_rank_stats([torch.randn(short, 64)]) is None
+    st = _rep_rank_stats([torch.randn(short, 64), torch.randn(40, 64)])
     assert st["n_payloads"] == 1
+    assert st["n_rows"] == 40
 
 
 def test_empty_and_non_tensor_inputs_are_ignored():
@@ -83,3 +91,138 @@ def test_rank_is_scale_invariant():
     lo = _rep_rank_stats([x])["eff_rank"]
     hi = _rep_rank_stats([x * 1000.0])["eff_rank"]
     assert lo == pytest.approx(hi, rel=1e-3)
+
+
+def test_the_row_count_reported_is_what_actually_entered_the_statistic():
+    """The warning is only readable if it says how much evidence it had."""
+    from bgkit.models.decoder import _REP_RANK_GUARD_MAX_ROWS
+
+    st = _rep_rank_stats([torch.randn(_REP_RANK_GUARD_MAX_ROWS * 4, 64)])
+    assert st["n_rows"] <= _REP_RANK_GUARD_MAX_ROWS + 1
+    assert st["n_rows"] > 1
+
+
+# ---------------------------------------------------------------------------
+# The alarm itself: a run-level property, not one sampled call
+# ---------------------------------------------------------------------------
+
+import torch.nn.functional as F
+from torch import nn
+
+import bgkit.models.decoder as decoder_mod
+from bgkit.models.decoder import (
+    EmbeddingSegment,
+    ReconstructionDecoder,
+    TokenSegment,
+)
+
+RANK_EVENT = "spliced_rep_rank_collapsed"
+_VOCAB, _DIM = 64, 16
+
+
+class _Inner(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(_VOCAB, _DIM)
+        with torch.no_grad():
+            self.embed_tokens.weight.copy_(
+                F.normalize(torch.randn(_VOCAB, _DIM), dim=-1),
+            )
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+
+class _Backbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = _Inner()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+
+class _Rec:
+    def __init__(self):
+        self.warnings: list[tuple[str, dict]] = []
+
+    def warning(self, event, **kw):
+        self.warnings.append((event, kw))
+
+    def info(self, *a, **k):
+        pass
+
+
+@pytest.fixture
+def guard_env(monkeypatch):
+    monkeypatch.setattr(decoder_mod, "_REP_NORM_GUARD_ENABLED", True)
+    monkeypatch.setattr(decoder_mod, "_REP_NORM_GUARD_EVERY", 1)
+    monkeypatch.setattr(decoder_mod, "_REP_NORM_GUARD_HI", 1e9)
+    rec = _Rec()
+    monkeypatch.setattr(decoder_mod, "logger", rec)
+    return rec
+
+
+def _decoder():
+    torch.manual_seed(11)
+    return ReconstructionDecoder(_Backbone(), hidden_dim=_DIM)
+
+
+def _segments(reps: torch.Tensor) -> list:
+    return [
+        TokenSegment(token_ids=torch.arange(4, dtype=torch.long), loss=False),
+        EmbeddingSegment(embeddings=reps),
+    ]
+
+
+def _rank_one(k=32):
+    v = F.normalize(torch.randn(_DIM), dim=-1)
+    return torch.arange(1.0, k + 1.0).unsqueeze(-1) * v
+
+
+def _spread(k=32):
+    return F.normalize(torch.randn(k, _DIM), dim=-1)
+
+
+def _rank_warnings(rec):
+    return [(e, kw) for e, kw in rec.warnings if e == RANK_EVENT]
+
+
+def test_one_low_call_does_not_raise_the_alarm(guard_env):
+    """The first live run warned on a single short document (n_payloads=1,
+    eff_rank 1.84) with 9-10.6 either side of it. One call is not a run."""
+    dec = _decoder()
+    dec._maybe_guard_spliced_rep_norm([_rank_one()], dec.backbone.get_input_embeddings())
+    assert _rank_warnings(guard_env) == []
+
+
+def test_a_sustained_collapse_does_raise_it(guard_env):
+    dec = _decoder()
+    emb = dec.backbone.get_input_embeddings()
+    for _ in range(decoder_mod._REP_RANK_GUARD_WINDOW):
+        dec._maybe_guard_spliced_rep_norm([_rank_one()], emb)
+    warns = _rank_warnings(guard_env)
+    assert warns, "a full window of rank-1 payloads must warn"
+    assert warns[-1][1]["median_eff_rank"] < 2.0
+    assert warns[-1][1]["n_rows"] > 0
+
+
+def test_a_healthy_run_with_one_short_document_stays_quiet(guard_env):
+    """The realistic mix: mostly spread payloads, occasionally a short one."""
+    dec = _decoder()
+    emb = dec.backbone.get_input_embeddings()
+    for i in range(12):
+        payload = _rank_one() if i == 5 else _spread()
+        dec._maybe_guard_spliced_rep_norm([payload], emb)
+    assert _rank_warnings(guard_env) == []
+
+
+def test_recovery_resets_the_consecutive_counter(guard_env):
+    dec = _decoder()
+    emb = dec.backbone.get_input_embeddings()
+    for _ in range(decoder_mod._REP_RANK_GUARD_WINDOW + 2):
+        dec._maybe_guard_spliced_rep_norm([_rank_one()], emb)
+    assert _rank_warnings(guard_env)[-1][1]["consecutive"] >= 2
+    for _ in range(decoder_mod._REP_RANK_GUARD_WINDOW):
+        dec._maybe_guard_spliced_rep_norm([_spread()], emb)
+    assert int(dec._rep_rank_guard_low_streak) == 0

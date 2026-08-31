@@ -128,6 +128,18 @@ except ValueError:
 # spread, not of how many vectors were sampled from it.
 _REP_RANK_GUARD_MAX_ROWS = 512
 
+# Floor on rows for the statistic to MEAN anything. A participation ratio over
+# k centred rows is bounded by k - 1, so a 3-row payload reports at most 2 and
+# trips any threshold at or above that by construction, not by collapsing. The
+# first live run warned on exactly such a payload (n_payloads=1, eff_rank 1.84)
+# while its neighbours read 9-10.6.
+_REP_RANK_GUARD_MIN_ROWS = 8
+
+# Sampled calls whose eff_rank the warning is judged on. One call can be a
+# single short document; a collapse is a property of the run, so the alarm is
+# the MEDIAN of a full window rather than any one reading.
+_REP_RANK_GUARD_WINDOW = 5
+
 _FROZEN_DELTANET_CORE_TIMER_EVENTS: dict[
     str,
     list[tuple[torch.cuda.Event, torch.cuda.Event]],
@@ -4724,20 +4736,23 @@ def _rep_rank_stats(segments: list[torch.Tensor]) -> dict | None:
     ``shared_frac`` is ``||mean(rows)||^2 / mean(||row||^2)``: how much of the
     payload's energy every vector carries identically.
 
-    Single-row payloads are skipped -- a lone vector is trivially rank 1 and
-    all-shared, and would drag both statistics without saying anything.
+    Payloads shorter than ``_REP_RANK_GUARD_MIN_ROWS`` are skipped: a
+    participation ratio over k centred rows is bounded by k - 1, so a short
+    payload reports a low rank by construction rather than by collapsing.
     """
     ranks: list[float] = []
     fracs: list[float] = []
+    rows_used = 0
     for t in segments:
         if not torch.is_tensor(t) or t.numel() == 0:
             continue
         x = t.detach().reshape(-1, t.shape[-1]).float()
-        if x.shape[0] < 2:
+        if x.shape[0] < _REP_RANK_GUARD_MIN_ROWS:
             continue
         if x.shape[0] > _REP_RANK_GUARD_MAX_ROWS:
             step = x.shape[0] // _REP_RANK_GUARD_MAX_ROWS + 1
             x = x[::step]
+        rows_used += int(x.shape[0])
         energy = x.pow(2).sum(dim=-1).mean().clamp_min(1e-30)
         fracs.append(float((x.mean(dim=0).pow(2).sum() / energy).item()))
         lam = torch.linalg.svdvals(x - x.mean(dim=0, keepdim=True)).pow(2)
@@ -4750,6 +4765,7 @@ def _rep_rank_stats(segments: list[torch.Tensor]) -> dict | None:
         "eff_rank": sum(ranks) / len(ranks),
         "shared_frac": sum(fracs) / len(fracs),
         "n_payloads": len(ranks),
+        "n_rows": rows_used,
     }
 
 
@@ -7014,27 +7030,43 @@ class ReconstructionDecoder(nn.Module):
                 shared_frac=(
                     None if rank_stats is None else round(rank_stats["shared_frac"], 5)
                 ),
+                n_rank_payloads=(
+                    None if rank_stats is None else rank_stats["n_payloads"]
+                ),
             )
-            if rank_stats is not None and rank_stats["eff_rank"] < _REP_EFF_RANK_LO:
-                rstreak = int(getattr(self, "_rep_rank_guard_low_streak", 0)) + 1
-                self._rep_rank_guard_low_streak = rstreak
-                logger.warning(
-                    "spliced_rep_rank_collapsed",
-                    eff_rank=round(rank_stats["eff_rank"], 3),
-                    shared_frac=round(rank_stats["shared_frac"], 5),
-                    threshold=_REP_EFF_RANK_LO,
-                    n_payloads=rank_stats["n_payloads"],
-                    decoder_family=getattr(self, "decoder_family", None),
-                    guard_call=n,
-                    consecutive=rstreak,
-                    hint=(
-                        "the spliced survivors span <1 direction between them: "
-                        "extra retention budget cannot add information and a "
-                        "rescale cannot fix it"
-                    ),
-                )
-            else:
-                self._rep_rank_guard_low_streak = 0
+            # A collapse is a property of the RUN, and one sampled call can be
+            # a single short document. The first live run warned on exactly
+            # that (n_payloads=1, eff_rank 1.84) with 9-10.6 either side of it.
+            # So the alarm is the median of a full window of sampled calls.
+            if rank_stats is not None:
+                window = list(getattr(self, "_rep_rank_guard_window", ()))
+                window.append(float(rank_stats["eff_rank"]))
+                window = window[-_REP_RANK_GUARD_WINDOW:]
+                self._rep_rank_guard_window = window
+                median = sorted(window)[len(window) // 2]
+                if len(window) >= _REP_RANK_GUARD_WINDOW and median < _REP_EFF_RANK_LO:
+                    rstreak = int(getattr(self, "_rep_rank_guard_low_streak", 0)) + 1
+                    self._rep_rank_guard_low_streak = rstreak
+                    logger.warning(
+                        "spliced_rep_rank_collapsed",
+                        eff_rank=round(rank_stats["eff_rank"], 3),
+                        median_eff_rank=round(median, 3),
+                        window=len(window),
+                        shared_frac=round(rank_stats["shared_frac"], 5),
+                        threshold=_REP_EFF_RANK_LO,
+                        n_payloads=rank_stats["n_payloads"],
+                        n_rows=rank_stats["n_rows"],
+                        decoder_family=getattr(self, "decoder_family", None),
+                        guard_call=n,
+                        consecutive=rstreak,
+                        hint=(
+                            "the spliced survivors span <1 direction between "
+                            "them: extra retention budget cannot add "
+                            "information and a rescale cannot fix it"
+                        ),
+                    )
+                else:
+                    self._rep_rank_guard_low_streak = 0
             abs_warned = bool(getattr(self, "_rep_norm_guard_abs_warned", False))
             if degenerate or (out_of_band and not abs_warned):
                 if out_of_band:
