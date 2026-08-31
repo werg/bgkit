@@ -141,7 +141,12 @@ def test_interface_norm_removes_a_corpus_constant_from_the_output(monkeypatch):
     """The measured v8 pathology: 99% of every survivor's energy is one shared
     vector. What leaves the projection must be the part that differs."""
     torch.manual_seed(0)
-    hidden = torch.randn(64, 8) + torch.tensor([300.0] + [0.0] * 7)
+    # A DENSE shared vector, not a single spiked channel: measured on the real
+    # checkpoints the top 8 channels hold only ~6% of the corpus mean's energy,
+    # so this is not the "massive activation" shape and a fix that only
+    # rebalanced a few big channels would not have touched it. Subtracting a
+    # mean removes a spread constant just as well as a spiked one.
+    hidden = torch.randn(64, 8) + torch.randn(8) * 300.0
     block = _make_interface_block(8, interface_target_row_norm=0.64)
     block.train()
     out = _run(block, hidden, monkeypatch).projected_embeddings.detach()
