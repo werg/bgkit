@@ -6,7 +6,7 @@ import contextlib
 import json
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -38,6 +38,73 @@ class CheckpointMetadata:
     # (e.g. all Phase 2 KB runs share phase="phase2_kb"). None for checkpoints
     # saved before this field was added — never cross-matched to a named run.
     run_name: str | None = None
+    # Fingerprint of the config keys that change what the WEIGHTS MEAN. Run
+    # name is not enough on its own: a graceful-shutdown save writes a
+    # checkpoint under the run's name, and if the run is then relaunched with a
+    # changed model config, run-scoped auto-resume silently continues from
+    # weights trained under the OLD one. That is how an isolated-variable arm
+    # stops being isolated, and it nearly happened on 2026-08-31 -- a step-74
+    # emergency save from an interface_affine=true launch was sitting in the
+    # fast dir when the same run was relaunched with the affine pinned.
+    # None for checkpoints saved before this field was added.
+    model_fingerprint: dict | None = None
+
+
+# Config keys whose value changes what a saved weight MEANS, rather than
+# merely how training proceeds. Deliberately short: a fingerprint that
+# includes schedule or logging knobs would refuse to resume its own run after
+# any edit, which trains people to bypass it.
+_FINGERPRINT_KEYS: tuple[tuple[str, ...], ...] = (
+    ("model", "encoder", "interface_norm"),
+    ("model", "encoder", "interface_affine"),
+    ("model", "encoder", "hidden_dim"),
+    ("model", "encoder", "backbone_name"),
+    ("training", "selection_mode", "l0"),
+    ("training", "selection_mode", "l1"),
+)
+
+
+def model_fingerprint(cfg) -> dict:
+    """The config values that determine what a saved weight means.
+
+    Absent keys are recorded as ``None`` so that ADDING one later reads as a
+    change rather than as a match -- the failure mode being guarded against is
+    silently continuing under a different meaning, and "the key did not exist
+    before" is exactly that.
+    """
+    out: dict = {}
+    for path in _FINGERPRINT_KEYS:
+        node = cfg
+        for part in path:
+            if node is None:
+                break
+            getter = getattr(node, "get", None)
+            node = getter(part, None) if callable(getter) else getattr(node, part, None)
+        out[".".join(path)] = None if node is None else _plain(node)
+    return out
+
+
+def _plain(value):
+    """Config values as comparable primitives (OmegaConf nodes are not)."""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def fingerprint_mismatch(saved: dict | None, current: dict) -> dict[str, tuple]:
+    """Keys where a checkpoint disagrees with the config about to use it.
+
+    A checkpoint with NO fingerprint (saved before the field existed) cannot
+    disagree -- returning a mismatch there would refuse every legitimate
+    resume of an older run.
+    """
+    if not saved:
+        return {}
+    return {
+        k: (saved.get(k), current.get(k))
+        for k in set(saved) | set(current)
+        if saved.get(k) != current.get(k)
+    }
 
 
 def write_checkpoint_files(
@@ -136,6 +203,19 @@ def write_checkpoint_files(
         keys=list(state_dicts.keys()),
     )
     return final_path
+
+
+def load_checkpoint_metadata(checkpoint_path: Path) -> CheckpointMetadata:
+    """Read a checkpoint's metadata WITHOUT loading its tensors.
+
+    The auto-resume compatibility check runs before deciding to load at all,
+    and these state dicts are ~15 GB on spinning storage.
+    """
+    meta_dict = json.loads((checkpoint_path / "metadata.json").read_text())
+    known_fields = {f.name for f in fields(CheckpointMetadata)}
+    return CheckpointMetadata(
+        **{k: v for k, v in meta_dict.items() if k in known_fields}
+    )
 
 
 def load_checkpoint(checkpoint_path: Path) -> tuple[CheckpointMetadata, dict]:

@@ -29,7 +29,10 @@ from bgkit.training.checkpoint_registry import (
 )
 from bgkit.training.checkpointing import (
     CheckpointMetadata,
+    fingerprint_mismatch,
     load_checkpoint,
+    load_checkpoint_metadata,
+    model_fingerprint,
     write_checkpoint_files,
 )
 from bgkit.training.gradient_utils import clip_grad_norm
@@ -1600,6 +1603,7 @@ class BaseTrainer(ABC):
             training_state=self._training_state,
             optimizer_type=self._optimizer_type,
             run_name=self.cfg.get("run_name", None),
+            model_fingerprint=model_fingerprint(self.cfg),
         )
         return self._write_checkpoint(
             checkpoint_dir,
@@ -2975,14 +2979,38 @@ class BaseTrainer(ABC):
                     run_name=self.cfg.get("run_name", None),
                 )
                 if auto_resolved is not None:
-                    resume_path = str(auto_resolved)
-                    auto_resolved_resume = True
-                    logger.info(
-                        "auto_resume_resolved",
-                        checkpoint=resume_path,
-                        phase=phase,
-                        run_name=self.cfg.get("run_name", None),
+                    # A matching run_name is not enough. A graceful-shutdown
+                    # save writes a checkpoint under the run's name, so
+                    # relaunching that run with a changed MODEL config silently
+                    # continues from weights trained under the old one -- which
+                    # is how an isolated-variable arm stops being isolated.
+                    # Refuse rather than warn: this codebase's log-only
+                    # warnings have been missed before, and cold-starting is
+                    # the recoverable direction. An explicit resume_checkpoint
+                    # still overrides, because there the user named the file.
+                    saved_meta = load_checkpoint_metadata(Path(str(auto_resolved)))
+                    drift = fingerprint_mismatch(
+                        getattr(saved_meta, "model_fingerprint", None),
+                        model_fingerprint(self.cfg),
                     )
+                    if drift:
+                        logger.error(
+                            "auto_resume_refused_config_changed",
+                            checkpoint=str(auto_resolved),
+                            changed={k: {"checkpoint": a, "now": b}
+                                     for k, (a, b) in sorted(drift.items())},
+                            hint="cold-starting. Pass resume_checkpoint=<path> "
+                                 "to resume anyway, or delete the checkpoint.",
+                        )
+                    else:
+                        resume_path = str(auto_resolved)
+                        auto_resolved_resume = True
+                        logger.info(
+                            "auto_resume_resolved",
+                            checkpoint=resume_path,
+                            phase=phase,
+                            run_name=self.cfg.get("run_name", None),
+                        )
         is_resuming = False
         resume_step: int | None = None
         if resume_path is not None and auto_resolved_resume:
