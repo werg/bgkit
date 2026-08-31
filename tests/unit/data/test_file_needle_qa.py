@@ -89,6 +89,41 @@ def test_presence_question_form_is_identical_across_classes():
     assert forms["presence_absent"] == forms["presence_present"]
 
 
+def test_presence_classes_are_balanced_across_the_corpus():
+    """A 2.6:1 negative skew -- what emitting whichever class a file could
+    furnish produced on the real corpus -- is still a 72% prior for a model
+    that never reads the file."""
+    counts = {"presence_absent": 0, "presence_present": 0}
+    for seed in range(400):
+        for s in generate_file_samples(
+            CODE,
+            source_label="repo:pkg/fetch.py",
+            rng=random.Random(seed),
+            absent_symbols=["totally_absent_fn", "another_missing_fn"],
+        ):
+            if s.qtype in counts:
+                counts[s.qtype] += 1
+    total = sum(counts.values())
+    assert total > 300
+    assert 0.4 < counts["presence_absent"] / total < 0.6, counts
+
+
+def test_no_presence_question_when_one_class_is_impossible():
+    """A file with nothing to say No about, or nothing left to say Yes about,
+    gets no presence question rather than a guaranteed-class one."""
+    only_present = generate_file_samples(
+        CODE, source_label="r:f.py", rng=random.Random(0), absent_symbols=None,
+    )
+    assert not [s for s in only_present if s.qtype.startswith("presence_")]
+
+    tiny = "def only_one_fn():\n    return 1\n" + "x = 1\n" * 20
+    only_absent = generate_file_samples(
+        tiny, source_label="r:t.py", rng=random.Random(0),
+        absent_symbols=["missing_fn_a", "missing_fn_b"],
+    )
+    assert not [s for s in only_absent if s.qtype.startswith("presence_")]
+
+
 def test_presence_classes_are_both_drawn():
     """Both classes must actually appear; a pool that is empty in practice
     would silently restore the negatives-only dataset."""

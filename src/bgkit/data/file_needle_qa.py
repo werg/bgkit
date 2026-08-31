@@ -169,11 +169,15 @@ def generate_file_samples(
     # PRESENCE, BALANCED. Identical question form for both classes, so the
     # answer cannot be produced from the question alone — see the module
     # docstring for what the negatives-only version was measuring instead.
+    # Both pools must be available, or the question is not a coin flip. A
+    # first cut emitted whichever class the file could furnish, which left the
+    # corpus at 2.6 negatives per positive -- still a prior worth 72% to a
+    # model that never reads. A file that cannot furnish a positive simply
+    # gets no presence question.
     absent_pool = [s for s in (absent_symbols or []) if s not in text]
     present_pool = [s for s in sorted(defs) if s not in signature_syms]
-    classes = [c for c, pool in (("absent", absent_pool), ("present", present_pool)) if pool]
-    if classes:
-        cls = rng.choice(classes)
+    if absent_pool and present_pool:
+        cls = rng.choice(("absent", "present"))
         sym = rng.choice(absent_pool if cls == "absent" else present_pool)
         question = f"Is `{sym}` defined in this file? If so, quote its definition line."
         if cls == "absent":
