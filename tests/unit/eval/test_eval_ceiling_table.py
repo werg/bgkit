@@ -266,3 +266,23 @@ def test_the_shared_eval_tree_is_cleared_after_each_arm(monkeypatch):
     ev._score_samples(t, samples, free_running_limit=0, max_tool_calls=1,
                       max_new_tokens=8, force_first_call=False)
     assert t.cleared == 2
+
+
+def test_generation_runs_on_the_reps_arm_whatever_the_sweep_order():
+    """Free-running numbers for a zeroed or full-text arm answer no question
+    anyone asked, and generation costs orders of magnitude more than teacher
+    forcing -- so the arm is chosen by MEANING, not by list position."""
+    assert ev._generation_arm(["zeroed", "", "full_text"]) == ""
+    assert ev._generation_arm(["", "zeroed"]) == ""
+    assert ev._generation_arm(["zeroed", "full_text"]) == "zeroed"
+    assert ev._generation_arm([]) == ""
+
+
+def test_sweep_maps_none_to_the_unablated_arm():
+    """`none` is spelled out because an empty element inside a Hydra list
+    literal is fragile to quote; a sweep that silently dropped its reps arm
+    would build the ceiling table against the wrong baseline."""
+    assert ev._parse_sweep(["none", "zeroed", "full_text"]) == ["", "zeroed", "full_text"]
+    assert ev._parse_sweep(["NONE", None, ""]) == ["", "", ""]
+    assert ev._parse_sweep(None) == []
+    assert ev._parse_sweep([]) == []

@@ -142,6 +142,34 @@ def _score_samples(
 _CEILING_METRICS = ("kb/answer_token_f1", "kb/answer_exact_match")
 
 
+def _parse_sweep(raw) -> list[str]:
+    """Normalise an ``eval.ablation_sweep`` list to internal mode strings.
+
+    ``none`` is spelled out rather than left empty: an empty element inside a
+    Hydra list literal is fragile to quote and easy to lose silently, and a
+    sweep that quietly dropped its reps arm would build the ceiling table
+    against the wrong baseline.
+    """
+    return [
+        "" if str(m or "").lower() in ("", "none") else str(m)
+        for m in (raw or [])
+    ]
+
+
+def _generation_arm(modes: list[str]) -> str:
+    """Which arm free-running generation should run on.
+
+    The REPS arm when the sweep contains one, not whichever mode happens to be
+    listed first: generation costs orders of magnitude more than teacher
+    forcing, the ceiling table is built from the teacher-forced metrics, and
+    free-running numbers for a zeroed or full-text arm answer no question
+    anyone asked.
+    """
+    if not modes:
+        return ""
+    return "" if "" in modes else modes[0]
+
+
 def _ceiling_table(
     arms: dict[str, list[dict]],
     floor: str = "zeroed",
@@ -430,10 +458,7 @@ def main(cfg: DictConfig) -> None:
     # Hydra list literal is fragile to quote and easy to lose silently, and a
     # sweep that quietly dropped its reps arm would report a ceiling table
     # against the wrong baseline.
-    sweep = [
-        "" if str(m or "").lower() in ("", "none") else str(m)
-        for m in (eval_cfg.get("ablation_sweep") or [])
-    ]
+    sweep = _parse_sweep(eval_cfg.get("ablation_sweep"))
     modes = sweep or [ablation]
     if ablation:
         # e.g. +eval.ablation=oracle_span — applies to BOTH the trainer metric
@@ -455,6 +480,7 @@ def main(cfg: DictConfig) -> None:
     # partly a difference in the sample draw.
     eval_samples = _collect_eval_samples(trainer, max_samples)
     primary = modes[0]
+    gen_arm = _generation_arm(modes)
     arms: dict[str, list[dict]] = {}
     for arm_index, mode in enumerate(modes):
         trainer.set_ablation_mode(mode or None)
@@ -466,10 +492,7 @@ def main(cfg: DictConfig) -> None:
         arms[mode or "none"] = _score_samples(
             trainer,
             eval_samples,
-            # Generation runs on the primary arm only: it costs orders of
-            # magnitude more than teacher forcing and the ceiling table is
-            # built from the teacher-forced metrics.
-            free_running_limit=free_running_limit if arm_index == 0 else 0,
+            free_running_limit=free_running_limit if mode == gen_arm else 0,
             max_tool_calls=max_tool_calls,
             max_new_tokens=max_new_tokens,
             force_first_call=force_first_call,
