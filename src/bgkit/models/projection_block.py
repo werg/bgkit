@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from bgkit.models.bidirectional_qwen35 import _packed_full_attention
+from bgkit.models.interface_norm import DecoderInterfaceNorm
 from bgkit.utils.packing import lengths_from_cu, segment_ids_from_cu
 
 
@@ -91,6 +92,9 @@ class ProjectionBlock(nn.Module):
         output_split_factor: int = 1,
         enforce_output_norm: bool = True,
         output_dim: int | None = None,
+        interface_norm: bool = False,
+        interface_target_row_norm: float = 1.0,
+        interface_momentum: float = 0.01,
     ):
         super().__init__()
         if output_split_factor < 1:
@@ -133,6 +137,22 @@ class ProjectionBlock(nn.Module):
         self.output_dim = int(output_dim)
         self.projection_head = nn.Linear(hidden_dim, hidden_dim)
         self.enforce_output_norm = bool(enforce_output_norm)
+        # Opt-in decoder-interface contract. ``enforce_output_norm`` bounds the
+        # SCALE of what leaves here, against the encoder-space norm of its own
+        # input -- a quantity with no relationship to the decoder's embedding
+        # distribution, and blind to a payload at the right scale whose vectors
+        # are all the same vector. widenet v8 sat inside that bound while 99%
+        # of every survivor's energy was one corpus-constant direction. When
+        # this is on it replaces the rescale entirely; the two would fight.
+        self.interface_norm = (
+            DecoderInterfaceNorm(
+                self.output_dim,
+                target_row_norm=interface_target_row_norm,
+                momentum=interface_momentum,
+            )
+            if interface_norm
+            else None
+        )
 
         object.__setattr__(self, "_rotary_emb", rotary_emb)
 
@@ -150,7 +170,16 @@ class ProjectionBlock(nn.Module):
         """
         reference = self.output_norm(hidden)
         projected = self.projection_head(reference)
-        if not self.enforce_output_norm or projected.numel() == 0:
+        # When the interface contract is on it sets the output scale, and the
+        # rescale below would immediately be overwritten by it -- worse, the
+        # rescale's per-row target is the encoder-space norm, so leaving both
+        # on would feed the contract a signal that varies with a quantity the
+        # decoder has no stake in.
+        if (
+            self.interface_norm is not None
+            or not self.enforce_output_norm
+            or projected.numel() == 0
+        ):
             return projected
         target = reference.float().norm(dim=-1, keepdim=True).detach()
         actual = projected.float().norm(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -221,14 +250,21 @@ class ProjectionBlock(nn.Module):
         all_out = h  # (N, D)
 
         def _split_projected(projected: torch.Tensor) -> torch.Tensor:
-            if self.output_split_factor == 1:
-                return projected
-            n = projected.shape[0]
-            return (
-                projected.reshape(n, self.output_split_factor, self.output_dim)
-                .reshape(n * self.output_split_factor, self.output_dim)
-                .contiguous()
-            )
+            if self.output_split_factor != 1:
+                n = projected.shape[0]
+                projected = (
+                    projected.reshape(n, self.output_split_factor, self.output_dim)
+                    .reshape(n * self.output_split_factor, self.output_dim)
+                    .contiguous()
+                )
+            # The contract applies to the rows the DECODER receives, which for
+            # a split projection are the post-reshape ones -- a split slices a
+            # hidden-width vector into several decoder-width positions, and
+            # normalising before the slice would standardise a width the
+            # decoder never sees.
+            if self.interface_norm is not None:
+                projected = self.interface_norm(projected)
+            return projected
 
         def _split_cu(cu: torch.Tensor) -> torch.Tensor:
             if self.output_split_factor == 1:

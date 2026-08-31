@@ -207,8 +207,18 @@ def _make_projection_blocks(
     rotary_emb: nn.Module,
     hidden_dim: int,
     num_layers: int = 1,
+    interface_norm: bool = False,
+    interface_target_row_norm: float = 1.0,
+    interface_momentum: float = 0.01,
 ) -> nn.ModuleDict:
     """Build one ProjectionBlock per decoder family.
+
+    ``interface_norm`` turns on the decoder-interface contract
+    (:class:`bgkit.models.interface_norm.DecoderInterfaceNorm`): the emitted
+    rows are standardised against slowly-moving statistics and rescaled to
+    ``interface_target_row_norm``, which should be the target decoder's mean
+    ``embed_tokens`` row norm. Off by default -- turning it on changes what
+    every existing checkpoint's decoder receives.
 
     ``num_layers`` controls how deep each projection block is. Extra layers
     beyond the head are deepcopies of the popped backbone layer, so they
@@ -251,6 +261,9 @@ def _make_projection_blocks(
             hidden_dim=hidden_dim,
             output_split_factor=split,
             output_dim=decoder_hidden,
+            interface_norm=interface_norm,
+            interface_target_row_norm=interface_target_row_norm,
+            interface_momentum=interface_momentum,
         )
     return nn.ModuleDict(blocks)
 
@@ -727,6 +740,9 @@ class BgKITEncoder(nn.Module):
         threshold_controller_cfg: dict | None = None,
         active_decoder_family: str = "qwen35",
         projection_num_layers: int = 1,
+        interface_norm: bool = False,
+        interface_target_row_norm: float = 1.0,
+        interface_momentum: float = 0.01,
     ) -> BgKITEncoder:
         if isinstance(backbone_name_or_module, str):
             from transformers import AutoModelForCausalLM
@@ -770,6 +786,9 @@ class BgKITEncoder(nn.Module):
                 threshold_controller_cfg,
                 active_decoder_family,
                 projection_num_layers=projection_num_layers,
+                interface_norm=interface_norm,
+                interface_target_row_norm=interface_target_row_norm,
+                interface_momentum=interface_momentum,
             )
 
         if not isinstance(raw_model, BidirectionalQwen35) and _is_qwen35_model(raw_model):
@@ -810,6 +829,9 @@ class BgKITEncoder(nn.Module):
             rotary_emb,
             hidden_dim=hidden_dim,
             num_layers=projection_num_layers,
+            interface_norm=interface_norm,
+            interface_target_row_norm=interface_target_row_norm,
+            interface_momentum=interface_momentum,
         )
 
         encoder = cls(l0, l1, projection_blocks, active_decoder_family=active_decoder_family)
@@ -828,6 +850,9 @@ class BgKITEncoder(nn.Module):
         threshold_controller_cfg: dict | None = None,
         active_decoder_family: str = "qwen35",
         projection_num_layers: int = 1,
+        interface_norm: bool = False,
+        interface_target_row_norm: float = 1.0,
+        interface_momentum: float = 0.01,
     ) -> BgKITEncoder:
         layers = _resolve_layers(text_model)
         projection_layer = layers[-1]
@@ -868,6 +893,9 @@ class BgKITEncoder(nn.Module):
             rotary_emb,
             hidden_dim=hidden_dim,
             num_layers=projection_num_layers,
+            interface_norm=interface_norm,
+            interface_target_row_norm=interface_target_row_norm,
+            interface_momentum=interface_momentum,
         )
 
         encoder = cls(l0, l1, projection_blocks, active_decoder_family=active_decoder_family)
@@ -890,6 +918,9 @@ class BgKITEncoder(nn.Module):
         threshold_controller_cfg: dict | None = None,
         active_decoder_family: str = "qwen35",
         projection_num_layers: int = 1,
+        interface_norm: bool = False,
+        interface_target_row_norm: float = 1.0,
+        interface_momentum: float = 0.01,
     ) -> BgKITEncoder:
         """Construct an encoder and load a state dict in the new split-L0/L1 layout.
 
@@ -919,6 +950,9 @@ class BgKITEncoder(nn.Module):
             threshold_controller_cfg=threshold_controller_cfg,
             active_decoder_family=active_decoder_family,
             projection_num_layers=projection_num_layers,
+            interface_norm=interface_norm,
+            interface_target_row_norm=interface_target_row_norm,
+            interface_momentum=interface_momentum,
         )
 
         # One-shot migration: if a checkpoint was saved with the broken

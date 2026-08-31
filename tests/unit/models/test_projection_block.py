@@ -99,3 +99,84 @@ def test_projection_head_cannot_inflate_decoder_interface_norm():
         hidden.norm(dim=-1),
         rtol=1e-5,
     )
+
+
+# ---------------------------------------------------------------------------
+# Decoder-interface contract
+# ---------------------------------------------------------------------------
+
+
+def _make_interface_block(hidden_dim: int = 8, split: int = 1, **kw) -> ProjectionBlock:
+    block = ProjectionBlock(
+        _ZeroAttentionLayer(hidden_dim),
+        nn.Identity(),
+        _Rotary(),
+        hidden_dim=hidden_dim,
+        output_split_factor=split,
+        interface_norm=True,
+        **kw,
+    )
+    with torch.no_grad():
+        block.projection_head.weight.copy_(torch.eye(hidden_dim))
+        block.projection_head.bias.zero_()
+    return block
+
+
+def _run(block, hidden, monkeypatch):
+    from bgkit.models import projection_block as pb
+
+    monkeypatch.setattr(
+        pb, "_packed_full_attention", lambda *_a, **_k: torch.zeros_like(hidden),
+    )
+    n = hidden.shape[0]
+    return block(
+        hidden,
+        cu_seqlens=torch.tensor([0, n], dtype=torch.int32),
+        max_seqlen=n,
+        position_ids=torch.arange(n, dtype=torch.int64),
+    )
+
+
+def test_interface_norm_removes_a_corpus_constant_from_the_output(monkeypatch):
+    """The measured v8 pathology: 99% of every survivor's energy is one shared
+    vector. What leaves the projection must be the part that differs."""
+    torch.manual_seed(0)
+    hidden = torch.randn(64, 8) + torch.tensor([300.0] + [0.0] * 7)
+    block = _make_interface_block(8, interface_target_row_norm=0.64)
+    block.train()
+    out = _run(block, hidden, monkeypatch).projected_embeddings.detach()
+    energy = out.pow(2).sum(dim=-1).mean()
+    assert float(out.mean(dim=0).pow(2).sum() / energy) < 0.05
+    assert float(out.norm(dim=-1).mean()) == pytest.approx(0.64, rel=0.3)
+
+
+def test_interface_norm_replaces_the_output_rescale(monkeypatch):
+    """Both on would fight: the rescale targets the ENCODER-space norm of the
+    projection's own input, which the decoder has no stake in."""
+    block = _make_interface_block(8)
+    assert block.enforce_output_norm is True  # default, deliberately untouched
+    torch.manual_seed(1)
+    hidden = torch.randn(32, 8) * 50.0
+    block.train()
+    out = _run(block, hidden, monkeypatch).projected_embeddings.detach()
+    # The rescale would have produced rows at the input's norm (~50 * sqrt(8));
+    # the contract produces rows at target_row_norm.
+    assert float(out.norm(dim=-1).mean()) < 5.0
+
+
+def test_interface_norm_applies_after_the_split(monkeypatch):
+    """A split slices a hidden-width vector into several decoder-width rows;
+    standardising before the slice would normalise a width the decoder never
+    sees, leaving each emitted row un-normalised."""
+    torch.manual_seed(2)
+    hidden = torch.randn(64, 8) + 200.0
+    block = _make_interface_block(8, split=2, interface_target_row_norm=0.5)
+    block.train()
+    out = _run(block, hidden, monkeypatch).projected_embeddings.detach()
+    assert out.shape == (128, 4)
+    assert float(out.norm(dim=-1).mean()) == pytest.approx(0.5, rel=0.3)
+
+
+def test_interface_norm_is_off_by_default(monkeypatch):
+    block = _make_block(hidden_dim=4, split=2)
+    assert block.interface_norm is None
