@@ -4734,7 +4734,13 @@ def _rep_rank_stats(segments: list[torch.Tensor]) -> dict | None:
     more information.
 
     ``shared_frac`` is ``||mean(rows)||^2 / mean(||row||^2)``: how much of the
-    payload's energy every vector carries identically.
+    payload's energy every vector carries identically. On its own it does NOT
+    separate healthy from collapsed -- the Phase-1 base sits at 0.927 with
+    reps that identify their document at top-1 0.898, against v8's 0.990. What
+    separated them was whether that shared component is the same vector for
+    EVERY document (base 0.961 cosine to the corpus mean, v8 1.00000), which
+    needs state across payloads and so is computed by the caller from
+    ``mean_vec``.
 
     Payloads shorter than ``_REP_RANK_GUARD_MIN_ROWS`` are skipped: a
     participation ratio over k centred rows is bounded by k - 1, so a short
@@ -4742,6 +4748,7 @@ def _rep_rank_stats(segments: list[torch.Tensor]) -> dict | None:
     """
     ranks: list[float] = []
     fracs: list[float] = []
+    means: list[torch.Tensor] = []
     rows_used = 0
     for t in segments:
         if not torch.is_tensor(t) or t.numel() == 0:
@@ -4753,8 +4760,10 @@ def _rep_rank_stats(segments: list[torch.Tensor]) -> dict | None:
             step = x.shape[0] // _REP_RANK_GUARD_MAX_ROWS + 1
             x = x[::step]
         rows_used += int(x.shape[0])
+        mu = x.mean(dim=0)
+        means.append(mu)
         energy = x.pow(2).sum(dim=-1).mean().clamp_min(1e-30)
-        fracs.append(float((x.mean(dim=0).pow(2).sum() / energy).item()))
+        fracs.append(float((mu.pow(2).sum() / energy).item()))
         lam = torch.linalg.svdvals(x - x.mean(dim=0, keepdim=True)).pow(2)
         ranks.append(
             float((lam.sum().pow(2) / lam.pow(2).sum().clamp_min(1e-30)).item()),
@@ -4766,6 +4775,9 @@ def _rep_rank_stats(segments: list[torch.Tensor]) -> dict | None:
         "shared_frac": sum(fracs) / len(fracs),
         "n_payloads": len(ranks),
         "n_rows": rows_used,
+        # For the caller's running corpus mean: is this payload's shared
+        # component the SAME vector every other document emits?
+        "mean_vec": torch.stack(means).mean(dim=0),
     }
 
 
@@ -7015,6 +7027,23 @@ class ReconstructionDecoder(nn.Module):
             # (effective rank 1.01 against the Phase-1 base's 12.97) and no
             # norm-based check could see it.
             rank_stats = _rep_rank_stats(rep_segments)
+            # IS THE SHARED COMPONENT THE SAME VECTOR FOR EVERY DOCUMENT?
+            # This, not shared_frac, is what separated healthy from collapsed:
+            # the Phase-1 base's payload means sit at cosine 0.961 to the
+            # corpus mean with reps that identify their document at top-1
+            # 0.898, while v8 reached 1.00000 at top-1 0.031. shared_frac
+            # alone cannot tell them apart (0.927 vs 0.990). Needs state
+            # across payloads, so it lives here rather than in the helper.
+            mean_cos = None
+            if rank_stats is not None:
+                mu = rank_stats.pop("mean_vec")
+                prev = getattr(self, "_rep_rank_guard_corpus_mean", None)
+                if prev is not None and prev.shape == mu.shape:
+                    a = prev / prev.norm().clamp_min(1e-12)
+                    b = mu / mu.norm().clamp_min(1e-12)
+                    mean_cos = float((a @ b).item())
+                    mu = 0.98 * prev + 0.02 * mu
+                self._rep_rank_guard_corpus_mean = mu.detach()
             logger.info(
                 "spliced_rep_norm_sample",
                 ratio=round(ratio, 4),
@@ -7032,6 +7061,9 @@ class ReconstructionDecoder(nn.Module):
                 ),
                 n_rank_payloads=(
                     None if rank_stats is None else rank_stats["n_payloads"]
+                ),
+                mean_cos_to_corpus=(
+                    None if mean_cos is None else round(mean_cos, 5)
                 ),
             )
             # A collapse is a property of the RUN, and one sampled call can be
@@ -7056,6 +7088,9 @@ class ReconstructionDecoder(nn.Module):
                         threshold=_REP_EFF_RANK_LO,
                         n_payloads=rank_stats["n_payloads"],
                         n_rows=rank_stats["n_rows"],
+                        mean_cos_to_corpus=(
+                            None if mean_cos is None else round(mean_cos, 5)
+                        ),
                         decoder_family=getattr(self, "decoder_family", None),
                         guard_call=n,
                         consecutive=rstreak,

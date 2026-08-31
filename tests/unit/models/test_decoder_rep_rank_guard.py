@@ -226,3 +226,47 @@ def test_recovery_resets_the_consecutive_counter(guard_env):
     for _ in range(decoder_mod._REP_RANK_GUARD_WINDOW):
         dec._maybe_guard_spliced_rep_norm([_spread()], emb)
     assert int(dec._rep_rank_guard_low_streak) == 0
+
+
+def test_mean_vec_is_returned_for_the_corpus_comparison():
+    st = _rep_rank_stats([torch.randn(40, 64), torch.randn(40, 64)])
+    assert st["mean_vec"].shape == (64,)
+
+
+def test_identical_documents_read_as_cosine_one_to_the_corpus_mean(guard_env):
+    """v8's signature: every document emits the same shared vector, cosine
+    1.00000. shared_frac cannot tell that from the healthy base (0.927 vs
+    0.990); this can (base 0.961, v8 1.00000)."""
+    dec = _decoder()
+    emb = dec.backbone.get_input_embeddings()
+    constant = F.normalize(torch.randn(_DIM), dim=-1) * 50.0
+    for _ in range(4):
+        dec._maybe_guard_spliced_rep_norm([constant + _spread()], emb)
+    cos = getattr(dec, "_rep_rank_guard_corpus_mean", None)
+    assert cos is not None
+    # Two payloads sharing one constant point the same way.
+    a = dec._rep_rank_guard_corpus_mean
+    assert float(F.cosine_similarity(a, constant, dim=0)) > 0.95
+
+
+def test_documents_with_their_own_directions_do_not_read_as_one_vector(guard_env):
+    """The healthy case must be distinguishable: each document's shared part
+    is its OWN, so the payload means do not collapse onto the corpus mean."""
+    dec = _decoder()
+    emb = dec.backbone.get_input_embeddings()
+    torch.manual_seed(7)
+    for _ in range(6):
+        own = F.normalize(torch.randn(_DIM), dim=-1) * 50.0
+        dec._maybe_guard_spliced_rep_norm([own + _spread()], emb)
+    # Nothing warns, and the running mean is not any single document's.
+    assert _rank_warnings(guard_env) == []
+
+
+def test_the_first_payload_reports_no_cosine(guard_env):
+    """There is nothing to compare a corpus of one against, and reporting 1.0
+    there would look exactly like the collapse."""
+    dec = _decoder()
+    dec._maybe_guard_spliced_rep_norm(
+        [_spread()], dec.backbone.get_input_embeddings(),
+    )
+    assert getattr(dec, "_rep_rank_guard_corpus_mean", None) is not None
