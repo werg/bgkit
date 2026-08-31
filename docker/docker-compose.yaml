@@ -742,6 +742,14 @@ services:
     restart: "no"
     command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v9_interface"]
 
+  # Wide-net v10: the information-forcing arm. v9 + the `reconstruct` family,
+  # cold start from the Phase-1 base. Auto-resume is run-scoped and this run
+  # has no checkpoints; do NOT add a resume pin.
+  train-phase2-kb-widenet-v10-reconstruct:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v10_reconstruct"]
+
   # Long-prose semantic fact recall (babilong_style) alongside the code
   # wide-net datasets; the zero-shot BABILong arm scored 0.00 on every cell
   # (2026-08-25), teacher-forced and free-running alike.
