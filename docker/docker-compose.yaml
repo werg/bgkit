@@ -733,6 +733,15 @@ services:
     command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v8",
       "+resume_checkpoint=/workspace/checkpoints/phase2_kb_step2827_20260829_203241_421138_run-phase2_kb_widenet_v8"]
 
+  # Wide-net v9: the decoder-interface contract arm. COLD START from the
+  # Phase-1 base -- auto-resume is run-scoped by run_name, and this run has no
+  # checkpoints, so it starts where the encoder's reps still identify their own
+  # document (per-document effective rank 12.97). Do NOT add a resume pin.
+  train-phase2-kb-widenet-v9-interface:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v9_interface"]
+
   # Long-prose semantic fact recall (babilong_style) alongside the code
   # wide-net datasets; the zero-shot BABILong arm scored 0.00 on every cell
   # (2026-08-25), teacher-forced and free-running alike.
