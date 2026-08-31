@@ -185,3 +185,47 @@ def test_interface_norm_applies_after_the_split(monkeypatch):
 def test_interface_norm_is_off_by_default(monkeypatch):
     block = _make_block(hidden_dim=4, split=2)
     assert block.interface_norm is None
+
+
+def test_interface_norm_statistics_ride_in_the_state_dict(monkeypatch):
+    """The EMA reference IS the contract. If it did not survive a save/load,
+    every resume would hand the decoder a payload normalised against numbers
+    from a different distribution until the reference caught up again."""
+    torch.manual_seed(3)
+    hidden = torch.randn(64, 8) + torch.randn(8) * 300.0
+    src = _make_interface_block(8, interface_target_row_norm=0.64)
+    src.train()
+    _run(src, hidden, monkeypatch)
+
+    dst = _make_interface_block(8, interface_target_row_norm=0.64)
+    dst.load_state_dict(src.state_dict())
+    torch.testing.assert_close(
+        dst.interface_norm.running_mean, src.interface_norm.running_mean,
+    )
+    assert int(dst.interface_norm.num_updates.item()) == 1
+    dst.eval()
+    src.eval()
+    torch.testing.assert_close(
+        _run(dst, hidden, monkeypatch).projected_embeddings,
+        _run(src, hidden, monkeypatch).projected_embeddings,
+    )
+
+
+def test_a_checkpoint_predating_the_contract_loads_and_calibrates(monkeypatch):
+    """Turning the contract on for a run resuming an older checkpoint must not
+    require a migration -- the buffers are simply absent and get set by the
+    first forward."""
+    plain = _make_block(hidden_dim=8, split=1)
+    with_norm = _make_interface_block(8, interface_target_row_norm=0.64)
+    missing, unexpected = with_norm.load_state_dict(plain.state_dict(), strict=False)
+    assert not unexpected
+    assert all("interface_norm" in k for k in missing), missing
+    assert int(with_norm.interface_norm.num_updates.item()) == 0
+
+    torch.manual_seed(4)
+    hidden = torch.randn(64, 8) + torch.randn(8) * 300.0
+    with_norm.eval()
+    out = _run(with_norm, hidden, monkeypatch).projected_embeddings.detach()
+    assert int(with_norm.interface_norm.num_updates.item()) == 1
+    energy = out.pow(2).sum(dim=-1).mean()
+    assert float(out.mean(dim=0).pow(2).sum() / energy) < 0.05
