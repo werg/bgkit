@@ -270,3 +270,40 @@ def test_the_first_payload_reports_no_cosine(guard_env):
         [_spread()], dec.backbone.get_input_embeddings(),
     )
     assert getattr(dec, "_rep_rank_guard_corpus_mean", None) is not None
+
+
+def test_the_corpus_cosine_is_withheld_until_the_ema_means_something(guard_env):
+    """For its first samples the EMA IS approximately the last payload, so the
+    cosine reads near 1.0 by construction -- indistinguishable from the
+    collapse it exists to detect. It also restarts with the process, so a
+    resumed run would report that artefact all over again. Observed twice on
+    live runs before it was withheld."""
+    dec = _decoder()
+    emb = dec.backbone.get_input_embeddings()
+    for _ in range(decoder_mod._REP_CORPUS_MEAN_WARMUP - 1):
+        dec._maybe_guard_spliced_rep_norm([_spread()], emb)
+    assert all(
+        kw.get("mean_cos_to_corpus") is None
+        for e, kw in guard_env.warnings if e == RANK_EVENT
+    )
+    assert int(dec._rep_rank_guard_corpus_n) == decoder_mod._REP_CORPUS_MEAN_WARMUP - 1
+
+
+def test_the_corpus_cosine_appears_once_the_ema_is_warm(guard_env):
+    dec = _decoder()
+    emb = dec.backbone.get_input_embeddings()
+    seen = []
+
+    class _Cap(_Rec):
+        def info(self, event, **kw):
+            if "mean_cos_to_corpus" in kw:
+                seen.append(kw["mean_cos_to_corpus"])
+
+    cap = _Cap()
+    decoder_mod.logger = cap
+    for _ in range(decoder_mod._REP_CORPUS_MEAN_WARMUP + 5):
+        dec._maybe_guard_spliced_rep_norm([_spread()], emb)
+    assert seen[:decoder_mod._REP_CORPUS_MEAN_WARMUP - 1] == [None] * (
+        decoder_mod._REP_CORPUS_MEAN_WARMUP - 1
+    )
+    assert any(v is not None for v in seen)

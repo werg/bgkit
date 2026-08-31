@@ -135,6 +135,11 @@ _REP_RANK_GUARD_MAX_ROWS = 512
 # while its neighbours read 9-10.6.
 _REP_RANK_GUARD_MIN_ROWS = 8
 
+# Sampled payloads the corpus-mean EMA must see before its cosine means
+# anything. Below this it is approximately the last payload, so the cosine
+# reads near 1.0 -- indistinguishable from the collapse it exists to detect.
+_REP_CORPUS_MEAN_WARMUP = 30
+
 # Sampled calls whose eff_rank the warning is judged on. One call can be a
 # single short document; a collapse is a property of the run, so the alarm is
 # the MEDIAN of a full window rather than any one reading.
@@ -7034,16 +7039,26 @@ class ReconstructionDecoder(nn.Module):
             # 0.898, while v8 reached 1.00000 at top-1 0.031. shared_frac
             # alone cannot tell them apart (0.927 vs 0.990). Needs state
             # across payloads, so it lives here rather than in the helper.
+            # WARM-UP MATTERS. The reference is an EMA over payload means, so
+            # for its first samples it IS approximately the last payload and
+            # the cosine reads near 1.0 by construction -- which is exactly the
+            # collapsed signature. It also restarts with the process, so a
+            # resumed run reports that artefact all over again. Report None
+            # until the EMA has seen enough payloads to be a corpus rather
+            # than a memory of the last few.
             mean_cos = None
             if rank_stats is not None:
                 mu = rank_stats.pop("mean_vec")
                 prev = getattr(self, "_rep_rank_guard_corpus_mean", None)
+                seen = int(getattr(self, "_rep_rank_guard_corpus_n", 0))
                 if prev is not None and prev.shape == mu.shape:
-                    a = prev / prev.norm().clamp_min(1e-12)
-                    b = mu / mu.norm().clamp_min(1e-12)
-                    mean_cos = float((a @ b).item())
+                    if seen >= _REP_CORPUS_MEAN_WARMUP:
+                        a = prev / prev.norm().clamp_min(1e-12)
+                        b = mu / mu.norm().clamp_min(1e-12)
+                        mean_cos = float((a @ b).item())
                     mu = 0.98 * prev + 0.02 * mu
                 self._rep_rank_guard_corpus_mean = mu.detach()
+                self._rep_rank_guard_corpus_n = seen + 1
             logger.info(
                 "spliced_rep_norm_sample",
                 ratio=round(ratio, 4),
