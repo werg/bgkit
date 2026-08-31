@@ -13,8 +13,11 @@
 #     pin that is correct only until the next checkpoint is written. A restart
 #     on a stale pin rewinds training to it: a verification chain restarted a
 #     run pinned at step286 that had reached step 701, losing ~400 steps.
-#     Dropping the pin is worse — auto-resume does not match on run_name, so it
-#     cold-started from the Phase-1 base and discarded 1258 steps.
+#     Dropping the pin USED to be worse: auto-resume did not match on run_name,
+#     so it cold-started from the Phase-1 base and discarded 1258 steps. That
+#     is no longer true — auto-resume is run-scoped and now also refuses a
+#     checkpoint whose model-config fingerprint differs — so a service with no
+#     pin is left alone here rather than having one invented for it.
 #
 #  2. THE RESCUE SAVE WAS BEING THROWN AWAY. BaseTrainer._graceful_shutdown_save
 #     writes a checkpoint on SIGTERM and compose honours stop_grace_period, so
@@ -175,22 +178,17 @@ fi
 # run (they carry step, timestamp and run_name), so swapping the exact old
 # string cannot touch another service's pin — unlike a pattern rewrite, which
 # would repoint all of them.
-python3 - "$PIN" "$NAME" "$COMPOSE_FILE" <<'PY'
-import sys
-from pathlib import Path
-old, new, compose_file = sys.argv[1], sys.argv[2], sys.argv[3]
-p = Path(compose_file)
-s = p.read_text()
-if old == new:
-    print(f"pin already at {new}")
-    raise SystemExit(0)
-if old not in s:
-    raise SystemExit(f"REFUSING: current pin '{old}' not found verbatim in {compose_file}")
-n = s.count(old)
-p.write_text(s.replace(old, new))
-print(f"pin -> {new}" + (f"  ({n} occurrences)" if n > 1 else ""))
-PY
-if [ $? -ne 0 ]; then echo "pin rewrite failed; not starting"; exit 1; fi
+# A service with NO pin needs none: auto-resume is run-scoped and, since the
+# config-fingerprint check, refuses to continue under a changed model config.
+# Inventing a pin for it is what destroyed this file once -- see
+# scripts/repin_compose.py.
+if [ -z "${PIN// /}" ]; then
+  echo "==> no +resume_checkpoint pin on $SVC; leaving the compose file alone"
+  echo "    and letting run-scoped auto-resume resolve $NAME"
+else
+  .venv/bin/python scripts/repin_compose.py "$PIN" "$NAME" "$COMPOSE_FILE"
+  if [ $? -ne 0 ]; then echo "pin rewrite failed; not starting"; exit 1; fi
+fi
 
 echo "==> starting $SVC"
 scripts/run-train.sh --no-follow "$SVC"
