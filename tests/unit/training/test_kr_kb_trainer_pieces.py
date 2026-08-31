@@ -844,6 +844,11 @@ def test_query_conditioning_produces_different_survivors_for_different_queries()
         def active_projection_output_dim(self):
             return hidden_dim
 
+        def observe_bridge_scale(self, *_args, **_kwargs):
+            """The trainer guards the bridge scale against the encoder's
+            persisted reference, so a stub encoder has to answer for it."""
+            return None
+
         @property
         def calls(self):
             return self.l0.calls + self.l1.calls

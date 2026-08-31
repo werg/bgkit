@@ -129,11 +129,38 @@ def test_env_disable_is_honoured() -> None:
 def test_both_bridge_sites_are_guarded() -> None:
     """There are TWO bridge call sites — encoder.forward and KRKBTrainer's
     _run_l1_batch — and they must not be able to drift apart, which is the
-    stated reason run_l1_and_project is shared between them."""
+    stated reason run_l1_and_project is shared between them.
+
+    Checked through the entry point each site actually calls, not by matching
+    the guard function's name in the source: the sites go through
+    ``observe_bridge_scale`` so the band is anchored to the checkpoint's
+    persisted reference, and a test that pinned the old name would have failed
+    on that improvement while a site that quietly stopped guarding would still
+    pass. So: each site must call an entry point, and the entry point must
+    reach the guard.
+    """
     import inspect
 
     from bgkit.models.encoder import BgKITEncoder
     from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
 
-    assert "guard_bridge_output_scale" in inspect.getsource(BgKITEncoder.forward)
-    assert "guard_bridge_output_scale" in inspect.getsource(KRKBTrainer._run_l1_batch)
+    entry_points = ("observe_bridge_scale", "guard_bridge_output_scale")
+    for fn in (BgKITEncoder.forward, KRKBTrainer._run_l1_batch):
+        src = inspect.getsource(fn)
+        assert any(name in src for name in entry_points), fn.__qualname__
+    assert "guard_bridge_output_scale" in inspect.getsource(
+        BgKITEncoder.observe_bridge_scale
+    )
+
+
+def test_the_wrapper_anchors_on_the_checkpointed_reference() -> None:
+    """``observe_bridge_scale`` exists to pass the LINEAGE's reference in. If
+    it stopped doing that, the guard would silently return to re-anchoring on
+    every process start -- the reason a 484 -> 70985 runaway never fired."""
+    import inspect
+
+    from bgkit.models.encoder import BgKITEncoder
+
+    src = inspect.getsource(BgKITEncoder.observe_bridge_scale)
+    assert "reference=" in src
+    assert "bridge_reference" in src

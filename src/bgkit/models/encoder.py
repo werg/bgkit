@@ -57,7 +57,7 @@ def guard_bridge_output_scale(
     drift_lo: float = 0.5,
     drift_hi: float = 2.0,
     degenerate_below: float = 1e-3,
-) -> None:
+) -> float | None:
     """Watch the L0->L1 bridge output scale for DRIFT, not for a target value.
 
     THE CONTRACT. L1's backbone is a deepcopy of L0's, so it expects
@@ -83,17 +83,30 @@ def guard_bridge_output_scale(
     lineage operates. A near-zero ratio is still flagged absolutely, because a
     collapsed bridge is broken at any operating point.
 
+    THE REFERENCE MUST OUTLIVE THE PROCESS. Held only in the module-global
+    below, it is re-anchored to whatever the current process happens to see
+    first, so a runaway spread over many runs is invisible: each restart
+    declares the inflated value normal. That is not hypothetical -- the ratio
+    went 484 (Phase-1 base) -> 845 (v5b) -> ... and the L1-input corpus mean
+    reached 70985 at v8, and this guard never once fired, because no single
+    run moved it by 2x. Pass ``reference`` from a persisted value (the
+    encoder's ``bridge_scale_reference`` buffer, which rides in the
+    checkpoint) so the band is anchored to the LINEAGE.
+
+    Returns the measured ratio on sampled calls, so a caller can seed that
+    buffer the first time; ``None`` on skipped calls.
+
     Sampled and warn-only; a diagnostic must never take a run down.
     """
     if not _BRIDGE_GUARD_ENABLED or bridged.numel() == 0:
-        return
+        return None
     n = _bridge_guard_calls.get(site, 0) + 1
     _bridge_guard_calls[site] = n
     # (n - 1) % every, NOT n % every == 1: the latter is never true for
     # every == 1 (n % 1 is always 0), so the guard would be silently dead at
     # its most verbose setting — precisely the sampling bug it exists to avoid.
     if (n - 1) % every != 0:
-        return
+        return None
     with torch.no_grad():
         bridged_norm = float(bridged.detach().float().norm(dim=-1).mean())
         embed_norm = float(embed_weight.detach().float().norm(dim=-1).mean())
@@ -125,6 +138,7 @@ def guard_bridge_output_scale(
     else:
         # Every sampled check logs, in band or not, so the trend is greppable.
         logger.info("bridge_output_scale", drift=round(drift, 4), **payload)
+    return ratio
 
 
 def _resolve_layers(backbone: nn.Module) -> nn.ModuleList:
@@ -380,6 +394,15 @@ class BgKITEncoder(nn.Module):
         # has explicit section boundaries. Context-only — never a survivor
         # candidate (excluded via ``content_selectable_mask``).
         self.section_separator_embedding = nn.Parameter(torch.zeros(l1.hidden_dim))
+        # LINEAGE-PERSISTENT reference for the L0->L1 bridge scale guard. Held
+        # only in a module global, the reference re-anchors on every process
+        # start, so a runaway spread over many runs is invisible: each restart
+        # declares the inflated value normal. Measured: the ratio went 484 at
+        # the Phase-1 base to 845 by widenet v5b, and the L1-input corpus mean
+        # reached 70985 by v8, without this guard ever firing -- no single run
+        # moved it 2x. As a buffer it rides in the checkpoint, so the band is
+        # anchored where the LINEAGE operates. 0 means "not yet observed".
+        self.register_buffer("bridge_scale_reference", torch.zeros(()))
         if isinstance(projection_block, ProjectionBlock):
             self.projection_blocks = nn.ModuleDict({"qwen35": projection_block})
         elif isinstance(projection_block, nn.ModuleDict):
@@ -413,6 +436,31 @@ class BgKITEncoder(nn.Module):
         _src_bridge = getattr(self.l0, "auto_repro_head", None)
         if isinstance(_src_bridge, nn.Linear):
             self.l1l1_bridge.load_state_dict(_src_bridge.state_dict())
+
+    def bridge_reference(self) -> float | None:
+        """The lineage's bridge-scale operating point, or None if unobserved."""
+        value = float(self.bridge_scale_reference.item())
+        return value if value > 0 else None
+
+    def observe_bridge_scale(
+        self, bridged: torch.Tensor, embed_weight: torch.Tensor, *, site: str,
+    ) -> None:
+        """Guard the bridge scale against the LINEAGE's reference, and seed it.
+
+        The first observation on a checkpoint that predates the buffer sets it
+        -- that run therefore re-anchors, which cannot be helped, but every run
+        after it is measured against a value that travelled in the checkpoint.
+        """
+        ratio = guard_bridge_output_scale(
+            bridged, embed_weight, site=site, reference=self.bridge_reference(),
+        )
+        if ratio is not None and self.bridge_reference() is None and ratio > 0:
+            self.bridge_scale_reference.fill_(ratio)
+            logger.info(
+                "bridge_scale_reference_seeded",
+                site=site, reference_ratio=round(ratio, 4),
+                hint="checkpoint predates the persisted reference; anchoring here",
+            )
 
     @property
     def projection_block(self) -> ProjectionBlock:
@@ -694,7 +742,7 @@ class BgKITEncoder(nn.Module):
             # stage (cross-section merge → L1 → projection). KRKBTrainer calls
             # the SAME run_l1_and_project, so the two paths cannot diverge.
             l1_input = self.l0.auto_reproduce(l0_out.survivor_embeddings)
-            guard_bridge_output_scale(
+            self.observe_bridge_scale(
                 l1_input,
                 self.l0.backbone.get_input_embeddings().weight,
                 site="encoder_forward",

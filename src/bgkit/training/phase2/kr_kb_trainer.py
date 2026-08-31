@@ -60,7 +60,6 @@ from bgkit.models.decoder import (
     TokenSegment,
     normalize_decoder_family,
 )
-from bgkit.models.encoder import guard_bridge_output_scale
 from bgkit.models.lora_encoder import (
     DEFAULT_LORA_TARGETS,
     LoRALinearWrapper,
@@ -4519,7 +4518,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             # bridge is off-scale, L1 reads one sequence in two scales. Guarded
             # here as well as in encoder.forward so neither bridge site can
             # drift unobserved (the adapter moved 0.0170 across Phase 2).
-            guard_bridge_output_scale(
+            self.encoder.observe_bridge_scale(
                 bridged_content[survivor_flat],
                 self.encoder.l0.backbone.get_input_embeddings().weight,
                 site="kr_kb_run_l1_batch",
