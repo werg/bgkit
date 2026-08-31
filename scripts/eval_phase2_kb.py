@@ -156,18 +156,27 @@ def _parse_sweep(raw) -> list[str]:
     ]
 
 
-def _generation_arm(modes: list[str]) -> str:
-    """Which arm free-running generation should run on.
+def _generation_arms(modes: list[str], extra) -> set[str]:
+    """Which arms free-running generation runs on.
 
-    The REPS arm when the sweep contains one, not whichever mode happens to be
-    listed first: generation costs orders of magnitude more than teacher
-    forcing, the ceiling table is built from the teacher-forced metrics, and
-    free-running numbers for a zeroed or full-text arm answer no question
-    anyone asked.
+    The REPS arm always, when the sweep contains one -- not whichever mode
+    happens to be listed first, since generation costs orders of magnitude
+    more than teacher forcing.
+
+    ``extra`` adds arms, and there is one case where it is not optional. A
+    family whose answer is a long verbatim span CANNOT be measured teacher
+    forced: the gold prefix is handed to both arms and determines most of the
+    continuation. Measured on `reconstruct` at v10 step 500, same checkpoint,
+    same samples -- teacher-forced token_f1 0.404, free-running 0.012, against
+    a cross-document floor of 0.021. The teacher-forced number was the prefix.
+    So for such a family the only real rep_gain is a generative one, which
+    needs the zeroed arm generated too.
     """
-    if not modes:
-        return ""
-    return "" if "" in modes else modes[0]
+    arms = {"" if "" in modes else (modes[0] if modes else "")}
+    for m in _parse_sweep(extra):
+        if m in modes:
+            arms.add(m)
+    return arms
 
 
 def _ceiling_table(
@@ -224,6 +233,46 @@ def _ceiling_table(
             }
         key = "overall" if group == "__all__" else group
         table[key] = entry
+    return table
+
+
+def _generative_rep_gain(
+    arms: dict[str, list[dict]], reps: str = "none", floor: str = "zeroed",
+) -> dict:
+    """Free-running answer quality with the reps versus with them zeroed.
+
+    The only honest rep_gain for a family whose answer is a long verbatim
+    span. Returns ``{}`` unless BOTH arms actually generated -- a silent zero
+    here would read as "the reps do not help" when it means "the floor arm was
+    never generated".
+    """
+    if reps not in arms or floor not in arms:
+        return {}
+
+    def _by_group(rows: list[dict]) -> dict[str, list[dict]]:
+        out: dict[str, list[dict]] = {"overall": []}
+        for row in rows:
+            free = row.get("free_running")
+            if not isinstance(free, dict):
+                continue
+            out["overall"].append(free)
+            out.setdefault(str(row.get("dataset", "unknown")), []).append(free)
+        return out
+
+    a, b = _by_group(arms[reps]), _by_group(arms[floor])
+    table: dict[str, dict] = {}
+    for group, rows in a.items():
+        other = b.get(group) or []
+        if not rows or not other:
+            continue
+        entry: dict[str, float] = {"n_reps": len(rows), "n_zeroed": len(other)}
+        for field in ("answer_token_f1", "answer_exact_match"):
+            hi = sum(float(r.get(field, 0.0)) for r in rows) / len(rows)
+            lo = sum(float(r.get(field, 0.0)) for r in other) / len(other)
+            entry[f"{field}/reps"] = hi
+            entry[f"{field}/zeroed"] = lo
+            entry[f"{field}/gain"] = hi - lo
+        table[group] = entry
     return table
 
 
@@ -480,7 +529,7 @@ def main(cfg: DictConfig) -> None:
     # partly a difference in the sample draw.
     eval_samples = _collect_eval_samples(trainer, max_samples)
     primary = modes[0]
-    gen_arm = _generation_arm(modes)
+    gen_arms = _generation_arms(modes, eval_cfg.get("free_running_arms"))
     arms: dict[str, list[dict]] = {}
     for arm_index, mode in enumerate(modes):
         trainer.set_ablation_mode(mode or None)
@@ -492,7 +541,7 @@ def main(cfg: DictConfig) -> None:
         arms[mode or "none"] = _score_samples(
             trainer,
             eval_samples,
-            free_running_limit=free_running_limit if mode == gen_arm else 0,
+            free_running_limit=free_running_limit if mode in gen_arms else 0,
             max_tool_calls=max_tool_calls,
             max_new_tokens=max_new_tokens,
             force_first_call=force_first_call,
@@ -540,6 +589,13 @@ def main(cfg: DictConfig) -> None:
             }
             for name, rows in arms.items()
         }
+        gen = _generative_rep_gain(arms)
+        if gen:
+            report["generative_rep_gain"] = gen
+            for group, cells in sorted(gen.items()):
+                logger.info("kb_eval_generative_rep_gain", group=group,
+                            **{k: round(v, 4) for k, v in cells.items()
+                               if isinstance(v, float)})
         ceiling = _ceiling_table(arms)
         if ceiling:
             report["ceiling"] = ceiling

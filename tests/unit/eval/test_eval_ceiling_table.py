@@ -269,13 +269,55 @@ def test_the_shared_eval_tree_is_cleared_after_each_arm(monkeypatch):
 
 
 def test_generation_runs_on_the_reps_arm_whatever_the_sweep_order():
-    """Free-running numbers for a zeroed or full-text arm answer no question
-    anyone asked, and generation costs orders of magnitude more than teacher
-    forcing -- so the arm is chosen by MEANING, not by list position."""
-    assert ev._generation_arm(["zeroed", "", "full_text"]) == ""
-    assert ev._generation_arm(["", "zeroed"]) == ""
-    assert ev._generation_arm(["zeroed", "full_text"]) == "zeroed"
-    assert ev._generation_arm([]) == ""
+    """Generation costs orders of magnitude more than teacher forcing, so the
+    arm is chosen by MEANING, not by list position."""
+    assert ev._generation_arms(["zeroed", "", "full_text"], None) == {""}
+    assert ev._generation_arms(["", "zeroed"], None) == {""}
+    assert ev._generation_arms(["zeroed", "full_text"], None) == {"zeroed"}
+
+
+def test_extra_generation_arms_are_opt_in_and_must_be_in_the_sweep():
+    assert ev._generation_arms(["", "zeroed"], ["zeroed"]) == {"", "zeroed"}
+    # Asking to generate an arm the sweep never runs cannot conjure it.
+    assert ev._generation_arms(["", "full_text"], ["zeroed"]) == {""}
+
+
+def test_generative_rep_gain_needs_both_arms_generated():
+    """A silent zero would read as 'the reps do not help' when it means 'the
+    floor arm was never generated'."""
+    rows = [{"dataset": "reconstruct", "free_running": {"answer_token_f1": 0.3}}]
+    assert ev._generative_rep_gain({"none": rows}) == {}
+    assert ev._generative_rep_gain({"none": rows, "zeroed": []}) == {}
+
+
+def test_generative_rep_gain_is_reported_per_dataset_and_overall():
+    """The measurement teacher forcing cannot make. Reconstruct at v10 step
+    500: teacher-forced token_f1 0.404 both arms, free-running 0.012 -- the
+    gold prefix was doing the work, and it is handed to both arms equally."""
+    def _rows(ds, f1):
+        return [{"dataset": ds, "free_running": {"answer_token_f1": f1,
+                                                 "answer_exact_match": 0.0}}] * 4
+    arms = {
+        "none": _rows("reconstruct", 0.30) + _rows("lognav", 0.20),
+        "zeroed": _rows("reconstruct", 0.02) + _rows("lognav", 0.19),
+    }
+    g = ev._generative_rep_gain(arms)
+    assert set(g) == {"overall", "reconstruct", "lognav"}
+    assert g["reconstruct"]["answer_token_f1/gain"] == pytest.approx(0.28)
+    assert g["lognav"]["answer_token_f1/gain"] == pytest.approx(0.01)
+    assert g["reconstruct"]["n_reps"] == 4 and g["reconstruct"]["n_zeroed"] == 4
+
+
+def test_rows_without_a_generation_are_skipped_not_counted_as_zero():
+    arms = {
+        "none": [{"dataset": "a", "free_running": {"answer_token_f1": 0.5}},
+                 {"dataset": "a"}],
+        "zeroed": [{"dataset": "a", "free_running": {"answer_token_f1": 0.1}},
+                   {"dataset": "a"}],
+    }
+    g = ev._generative_rep_gain(arms)
+    assert g["a"]["n_reps"] == 1
+    assert g["a"]["answer_token_f1/gain"] == pytest.approx(0.4)
 
 
 def test_sweep_maps_none_to_the_unablated_arm():

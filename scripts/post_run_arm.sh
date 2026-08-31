@@ -4,6 +4,14 @@
 #   setsid nohup bash scripts/post_run_arm.sh <experiment> <run_name> <service> \
 #     > /home/werg/bgkit-ckpt-fast/post_run_<run_name>.log 2>&1 &
 #
+# GENERATION RUNS ON THE ZEROED ARM TOO, which doubles its cost and is not
+# optional. A family whose answer is a long verbatim span cannot be measured
+# teacher forced: the gold prefix is handed to both arms and determines most
+# of the continuation. Measured on `reconstruct` at v10 step 500, same
+# checkpoint and samples -- teacher-forced token_f1 0.404, free-running 0.012,
+# against a cross-document floor of 0.021. The teacher-forced number WAS the
+# prefix, so the only real rep_gain for that family is a generative one.
+#
 # Generic because this is the third arm to need it. Order is the point: the
 # probe is the arm's verdict and costs minutes, the floor/reps/ceiling sweep
 # costs an hour and is only interpretable if the probe passed. A container that
@@ -70,6 +78,7 @@ $COMPOSE run --rm "$SVC" scripts/eval_phase2_kb.py \
   "+experiment=$EXP" \
   "+eval.checkpoint=$MOUNT/$NAME" \
   "+eval.ablation_sweep=[none,zeroed,full_text]" \
+  "+eval.free_running_arms=[zeroed]" \
   +eval.per_sample=true +eval.max_samples=192 \
   +eval.max_new_tokens=512 +eval.max_tool_calls=4 \
   "+eval.output_dir=/workspace/checkpoints/eval_reports_${RUN}" \
