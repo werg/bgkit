@@ -95,6 +95,7 @@ class ProjectionBlock(nn.Module):
         interface_norm: bool = False,
         interface_target_row_norm: float = 1.0,
         interface_momentum: float = 0.01,
+        interface_affine: bool = False,
     ):
         super().__init__()
         if output_split_factor < 1:
@@ -149,6 +150,7 @@ class ProjectionBlock(nn.Module):
                 self.output_dim,
                 target_row_norm=interface_target_row_norm,
                 momentum=interface_momentum,
+                affine=interface_affine,
             )
             if interface_norm
             else None

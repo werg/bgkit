@@ -224,6 +224,7 @@ def _make_projection_blocks(
     interface_norm: bool = False,
     interface_target_row_norm: float | dict[str, float] = 1.0,
     interface_momentum: float = 0.01,
+    interface_affine: bool = False,
 ) -> nn.ModuleDict:
     """Build one ProjectionBlock per decoder family.
 
@@ -284,6 +285,7 @@ def _make_projection_blocks(
                 else float(interface_target_row_norm)
             ),
             interface_momentum=interface_momentum,
+            interface_affine=interface_affine,
         )
     return nn.ModuleDict(blocks)
 
@@ -797,6 +799,7 @@ class BgKITEncoder(nn.Module):
         interface_norm: bool = False,
         interface_target_row_norm: float | dict[str, float] = 1.0,
         interface_momentum: float = 0.01,
+        interface_affine: bool = False,
     ) -> BgKITEncoder:
         if isinstance(backbone_name_or_module, str):
             from transformers import AutoModelForCausalLM
@@ -843,6 +846,7 @@ class BgKITEncoder(nn.Module):
                 interface_norm=interface_norm,
                 interface_target_row_norm=interface_target_row_norm,
                 interface_momentum=interface_momentum,
+                interface_affine=interface_affine,
             )
 
         if not isinstance(raw_model, BidirectionalQwen35) and _is_qwen35_model(raw_model):
@@ -886,6 +890,7 @@ class BgKITEncoder(nn.Module):
             interface_norm=interface_norm,
             interface_target_row_norm=interface_target_row_norm,
             interface_momentum=interface_momentum,
+            interface_affine=interface_affine,
         )
 
         encoder = cls(l0, l1, projection_blocks, active_decoder_family=active_decoder_family)
@@ -907,6 +912,7 @@ class BgKITEncoder(nn.Module):
         interface_norm: bool = False,
         interface_target_row_norm: float | dict[str, float] = 1.0,
         interface_momentum: float = 0.01,
+        interface_affine: bool = False,
     ) -> BgKITEncoder:
         layers = _resolve_layers(text_model)
         projection_layer = layers[-1]
@@ -950,6 +956,7 @@ class BgKITEncoder(nn.Module):
             interface_norm=interface_norm,
             interface_target_row_norm=interface_target_row_norm,
             interface_momentum=interface_momentum,
+            interface_affine=interface_affine,
         )
 
         encoder = cls(l0, l1, projection_blocks, active_decoder_family=active_decoder_family)
@@ -975,6 +982,7 @@ class BgKITEncoder(nn.Module):
         interface_norm: bool = False,
         interface_target_row_norm: float | dict[str, float] = 1.0,
         interface_momentum: float = 0.01,
+        interface_affine: bool = False,
     ) -> BgKITEncoder:
         """Construct an encoder and load a state dict in the new split-L0/L1 layout.
 
@@ -1007,6 +1015,7 @@ class BgKITEncoder(nn.Module):
             interface_norm=interface_norm,
             interface_target_row_norm=interface_target_row_norm,
             interface_momentum=interface_momentum,
+            interface_affine=interface_affine,
         )
 
         # One-shot migration: if a checkpoint was saved with the broken

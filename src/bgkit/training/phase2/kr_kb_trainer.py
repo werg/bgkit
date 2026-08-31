@@ -1857,7 +1857,10 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             threshold_controller_cfg=threshold_cfg or None,
             interface_norm=interface_norm,
             interface_target_row_norm=target_row_norms or 1.0,
-            interface_momentum=float(encoder_cfg.get("interface_momentum", 0.01)),
+            interface_momentum=float(encoder_cfg.get("interface_momentum", 0.1)),
+            # Opening the affine reopens both muting routes -- see
+            # bgkit/models/interface_norm.py. Off unless a run asks.
+            interface_affine=bool(encoder_cfg.get("interface_affine", False)),
         ).to(self.device)
 
         # Load the co-trained decoder(s) from the SAME Phase-1 checkpoint (the

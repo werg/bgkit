@@ -51,18 +51,20 @@
 # re-expanded to the decoder's scale no matter how large the constant grows.
 # It also replaces the rescale where enabled; the two would fight.
 #
-# WHAT COULD STILL GO WRONG, and how it would show. The contract's gain/shift
-# are trainable (they sit in the projection param group, which round_robin
-# puts in the optimizer at projection_lr), so the model could mute by driving
-# the gain toward zero instead of by growing a constant. That is a DIFFERENT
-# signature and a different guard: gain -> 0 shows up as the splice norm
-# guard's absolute floor, not as rank, because effective rank is
-# scale-invariant. Both routes are instrumented; watch both events, not just
-# the rank one. The gain is left trainable on purpose -- the lineage's reps
-# operate at ~27x the embedding norm and the right target is not obviously 1x,
-# so a learnable scale starting at 1x is the honest way to carry that
-# uncertainty. `affine: false` in DecoderInterfaceNorm makes it a fixed
-# contract if the trainable version turns out to mute.
+# WHAT THE FIRST LAUNCH SHOWED, and what it changed. Run once with a
+# LEARNABLE gain and shift and killed at step 65. The emitted norm ratio
+# climbed 1.30 -> 6.52 monotonically and shared_frac went 0.26 -> 0.94: the
+# model was renegotiating the contract, not living inside it. A trainable
+# shift IS a corpus-constant re-added after the standardisation that removed
+# one, and a trainable gain restores the free scale direction -- both muting
+# routes reopen through the affine, and both did. The affine is now pinned.
+#
+# Two failure signatures remain, and they are different events. A collapse to
+# a constant shows on eff_rank and, from now on, on mean_cos_to_corpus (the
+# statistic that actually separated healthy from collapsed: base 0.961, v8
+# 1.00000 -- shared_frac alone cannot, at 0.927 vs 0.990). A runaway in scale
+# shows on the splice norm guard's ratio, which is what caught the first
+# launch. Watch both; neither alone is sufficient.
 #
 # COLD START FROM THE PHASE-1 BASE, not from v8: the base's encoder is the one
 # whose reps still identify their document, and the question is whether the
@@ -91,7 +93,21 @@ model:
   encoder:
     # THE isolated variable. See bgkit/models/interface_norm.py.
     interface_norm: true
-    interface_momentum: 0.01
+    # FIXED, not learnable. The first launch of this arm ran with a learnable
+    # gain and shift and was killed at step 65: the emitted norm ratio climbed
+    # 1.30 -> 6.52 monotonically while shared_frac went 0.26 -> 0.94. A
+    # trainable shift IS a corpus-constant, re-added after the very
+    # standardisation that removed one, and a trainable gain restores the free
+    # scale direction the contract exists to close -- so the affine reopens
+    # both muting routes, which is exactly what the run showed. The decoder's
+    # own input projection can absorb a fixed per-channel scaling, so nothing
+    # expressive is lost by pinning it.
+    interface_affine: false
+    # 0.1, not 0.01. The same 65 steps saw l0_base_raw_std go 0.32 -> 1.96, so
+    # a reference with a ~100-update half-life is stale by the time it is used
+    # and the standardiser divides by a number that is too small, inflating the
+    # output on its own. Match the momentum to how fast the upstream moves.
+    interface_momentum: 0.1
 
 training:
   dynamic_ckpt:

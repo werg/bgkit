@@ -156,9 +156,20 @@ def test_wrong_width_is_refused_rather_than_broadcast():
         norm(torch.randn(8, 32))
 
 
-def test_non_affine_mode_is_a_contract_the_model_cannot_renegotiate():
-    norm = DecoderInterfaceNorm(64, affine=False)
-    assert not any(p.requires_grad for p in norm.parameters())
+def test_the_contract_is_fixed_by_default():
+    """Measured, not stylistic. The first arm ran with a learnable gain and
+    shift; over 65 steps the emitted norm ratio climbed 1.30 -> 6.52 and
+    shared_frac 0.26 -> 0.94. A trainable shift IS a corpus-constant re-added
+    after the standardisation that removed one, and a trainable gain restores
+    the free scale direction the contract exists to close."""
+    assert not any(p.requires_grad for p in DecoderInterfaceNorm(64).parameters())
+    assert list(DecoderInterfaceNorm(64).parameters()) == []
+
+
+def test_the_affine_can_be_opened_deliberately():
+    norm = DecoderInterfaceNorm(64, affine=True)
+    names = {n for n, p in norm.named_parameters() if p.requires_grad}
+    assert names == {"weight", "bias"}
 
 
 @pytest.mark.parametrize("bad", [{"dim": 0}, {"momentum": 0.0}, {"momentum": 2.0},

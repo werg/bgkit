@@ -36,6 +36,23 @@ batch whose composition happens to be skewed cannot move what the decoder
 reads. See ``feedback_representation_interface_contracts``: this class of
 defect -- shape-correct, distribution-wrong, silent -- has recurred often
 enough to be worth a named boundary rather than a per-site fix.
+
+THE AFFINE IS OFF BY DEFAULT, AND THAT IS MEASURED, NOT STYLISTIC. The first
+arm ran with a learnable gain and shift, on the reasoning that the lineage's
+reps operate at ~27x the embedding norm so 1x is not obviously the right
+target. Watching it for 65 steps settled the question: the emitted
+norm ratio climbed 1.30 -> 6.52 monotonically while shared_frac went 0.26 ->
+0.94. A trainable shift IS a corpus-constant, re-added after the very
+standardisation that removed one, and a trainable gain restores the free
+scale direction the contract exists to close. Both muting routes reopen
+through the affine. The decoder's own input projection can absorb any fixed
+per-channel scaling, so nothing expressive is lost by pinning it.
+
+THE MOMENTUM HAS TO TRACK THE ENCODER. The same 65 steps saw
+``l0_base_raw_std`` go 0.32 -> 1.96, so a reference with a ~100-update
+half-life is stale by the time it is used and the standardiser divides by a
+number that is too small -- which inflates the output on its own, affine or
+not. Match the momentum to how fast the upstream is actually moving.
 """
 
 from __future__ import annotations
@@ -55,8 +72,8 @@ class DecoderInterfaceNorm(nn.Module):
             starts at ``target_row_norm / sqrt(dim)``.
         momentum: EMA rate for the running statistics.
         eps: variance floor.
-        affine: whether the gain/shift are learnable. Off makes the boundary
-            a fixed contract the model cannot renegotiate.
+        affine: whether the gain/shift are learnable. DEFAULT OFF, and that
+            is the whole point -- see below.
     """
 
     def __init__(
@@ -65,7 +82,7 @@ class DecoderInterfaceNorm(nn.Module):
         target_row_norm: float = 1.0,
         momentum: float = 0.01,
         eps: float = 1e-5,
-        affine: bool = True,
+        affine: bool = False,
     ) -> None:
         super().__init__()
         if dim < 1:
