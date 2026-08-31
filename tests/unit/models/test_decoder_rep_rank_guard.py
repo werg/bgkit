@@ -14,7 +14,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from bgkit.models.decoder import _rep_rank_stats  # noqa: E402
+from bgkit.models.decoder import _rep_rank_stats
 
 
 def test_rank_one_payload_is_reported_as_rank_one():

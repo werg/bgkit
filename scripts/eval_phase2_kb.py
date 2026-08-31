@@ -12,7 +12,14 @@ Metrics (see :mod:`bgkit.eval.kb_trajectory_eval` for full semantics):
 - ``free_running/*``: autonomous route completion, surfaced-ID validity,
   evidence recall, and answer F1 without future teacher context.
 - ``trajectory_step_accuracy`` / ``tool_call_id_accuracy`` /
-  ``answer_token_f1``: exact teacher-forced diagnostics.
+  ``answer_token_f1`` / ``answer_exact_match``: exact teacher-forced
+  diagnostics.
+- ``ceiling``: with ``+eval.ablation_sweep`` covering the reps arm, a floor
+  (``zeroed``) and a ceiling (``full_text``), the report carries
+  ``fraction_captured`` per dataset -- how much of the information the model
+  could read it actually got from the reps. A reps score alone does not say
+  that, which is how a pooled token-F1 of 0.386 passed for a working model
+  against a 0.752 ceiling and a 0.386 floor.
 - ``eval/loss``, ``eval/n_samples``, ``eval/tokens_per_sample``: kept
   for backward compatibility with the existing trainer eval report.
 
@@ -23,6 +30,12 @@ Usage::
         +eval.checkpoint=checkpoints/phase2_kb_best \\
         +eval.max_samples=256 \\
         +eval.per_sample=true
+
+    # floor / reps / ceiling in one pass over the same samples:
+    python scripts/eval_phase2_kb.py \\
+        +experiment=phase2_kb_widenet_v8 \\
+        +eval.checkpoint=... \\
+        "+eval.ablation_sweep=[none,zeroed,full_text]"
 """
 
 from __future__ import annotations
@@ -51,6 +64,141 @@ logger = structlog.get_logger()
 # ---------------------------------------------------------------------------
 
 
+def _collect_eval_samples(trainer: KRKBTrainer, max_samples: int) -> list:
+    """Materialise the eval samples once, so every ablation arm sees them."""
+    samples: list = []
+    for batch in trainer.eval_dataloader:
+        for sample in batch:
+            if len(samples) >= max_samples:
+                return samples
+            samples.append(sample)
+    return samples
+
+
+def _score_samples(
+    trainer: KRKBTrainer,
+    samples: list,
+    *,
+    free_running_limit: int,
+    max_tool_calls: int,
+    max_new_tokens: int,
+    force_first_call: bool,
+) -> list[dict]:
+    """Teacher-forced (and optionally free-running) scoring of ``samples``.
+
+    The decoder family per sample follows the TRAINING mix, and is keyed off
+    the sample's index in the list rather than a running counter, so an arm
+    that scores fewer samples cannot silently shift the family assignment
+    relative to another arm.
+    """
+    trainer.model.eval()
+    rows: list[dict] = []
+    free_run_done = 0
+    with torch.no_grad():
+        for index, sample in enumerate(samples):
+            if getattr(trainer, "_round_robin", False):
+                # Same family policy as the trainer's eval pass (follows
+                # the training mix: Qwen-only runs evaluate Qwen only).
+                trainer._set_active_decoder(trainer._eval_family_for_index(index))
+            # Teacher-forced scoring must use the training-mode decoder
+            # forward (Falcon-H1's eval-mode Mixer path is numerically
+            # different); generation below keeps eval mode for the cache.
+            with trainer._teacher_forced_decoders():
+                result = evaluate_sample(trainer, sample)
+            free_result = None
+            if free_run_done < free_running_limit:
+                free_result = evaluate_free_running_sample(
+                    trainer,
+                    sample,
+                    max_tool_calls=max_tool_calls,
+                    max_new_tokens=max_new_tokens,
+                    force_first_call=force_first_call,
+                )
+                free_run_done += 1
+            row = {
+                "dataset": getattr(sample, "dataset_name", ""),
+                "decoder_family": getattr(trainer, "_decoder_family", ""),
+                # Keep the prompt question with the prediction: the report
+                # is then self-contained for spot checks, and external
+                # scorers that need it (BABILong's ``compare_answers``
+                # excludes labels already named in the question) don't have
+                # to re-join against the trajectory parquet.
+                "question": getattr(sample, "question", ""),
+                **result,
+            }
+            if free_result is not None:
+                row["free_running"] = free_result
+            rows.append(row)
+    clear_tree = getattr(trainer, "_clear_eval_shared_tree", None)
+    if callable(clear_tree):
+        clear_tree()
+    trainer.model.train()
+    return rows
+
+
+# Metrics the ceiling table is computed for. Both are per-sample averages, so
+# a floor/ceiling ratio over them is meaningful; micro-averaged counters
+# (tool-call accuracy) are not comparable this way and are left out.
+_CEILING_METRICS = ("kb/answer_token_f1", "kb/answer_exact_match")
+
+
+def _ceiling_table(
+    arms: dict[str, list[dict]],
+    floor: str = "zeroed",
+    ceiling: str = "full_text",
+    reps: str = "none",
+) -> dict:
+    """How much of the readable information do the reps actually deliver?
+
+    ``fraction_captured = (reps - floor) / (ceiling - floor)`` per metric,
+    overall and per dataset. The floor arm is the model answering with no
+    information in the splice; the ceiling arm is the same model handed the
+    raw document. Without both, a rep score is uninterpretable: v8's pooled
+    token-F1 of 0.386 reads as a mediocre model until the floor (0.386) and
+    ceiling (0.752) put the fraction captured at ~0.
+
+    Returns ``{}`` unless all three arms ran. A non-positive ceiling-minus-
+    floor gap yields ``None`` for that metric rather than a ratio -- there is
+    no headroom to capture a fraction of, and dividing by it manufactures
+    numbers of either sign.
+    """
+    if not {floor, ceiling, reps} <= set(arms):
+        return {}
+
+    def _split(rows: list[dict]) -> dict[str, list[dict]]:
+        out: dict[str, list[dict]] = {"__all__": rows}
+        for row in rows:
+            out.setdefault(str(row.get("dataset", "unknown")), []).append(row)
+        return out
+
+    parts = {name: _split(rows) for name, rows in arms.items()}
+    table: dict[str, dict] = {}
+    for group in parts[reps]:
+        agg = {
+            name: _aggregate(parts[name].get(group, [])) for name in (floor, ceiling, reps)
+        }
+        entry: dict[str, dict] = {"n_samples": len(parts[reps].get(group, []))}
+        for metric in _CEILING_METRICS:
+            lo = agg[floor].get(metric)
+            hi = agg[ceiling].get(metric)
+            mid = agg[reps].get(metric)
+            if lo is None or hi is None or mid is None:
+                continue
+            headroom = hi - lo
+            entry[metric] = {
+                floor: lo,
+                reps: mid,
+                ceiling: hi,
+                "headroom": headroom,
+                "fraction_captured": (
+                    (mid - lo) / headroom if headroom > 1e-9 else None
+                ),
+            }
+        key = "overall" if group == "__all__" else group
+        table[key] = entry
+    return table
+
+
 def _aggregate(
     per_sample: list[dict],
 ) -> dict[str, float]:
@@ -70,6 +218,7 @@ def _aggregate(
             "kb/tool_call_id_accuracy/bgkit": 0.0,
             "kb/tool_call_id_accuracy/overall": 0.0,
             "kb/answer_token_f1": 0.0,
+            "kb/answer_exact_match": 0.0,
             "kb/n_samples": 0.0,
             "kb/n_samples_with_answer": 0.0,
             "kb/n_bgkit_calls": 0.0,
@@ -92,6 +241,7 @@ def _aggregate(
     free_evidence = 0.0
     free_answer_f1 = 0.0
     free_answer_exact = 0.0
+    em_sum = 0.0
 
     for row in per_sample:
         correct_tokens += int(row.get("trajectory_correct_tokens", 0))
@@ -106,6 +256,7 @@ def _aggregate(
         # bundle — if the gold is empty we shouldn't penalize the run).
         if row.get("gold_answer"):
             f1_sum += float(row.get("answer_token_f1", 0.0))
+            em_sum += float(row.get("answer_exact_match", 0.0))
             f1_n += 1
         free = row.get("free_running")
         if isinstance(free, dict):
@@ -119,12 +270,14 @@ def _aggregate(
     step_acc = correct_tokens / total_tokens if total_tokens else 0.0
     bgkit_acc = bgkit_sum / bgkit_n if bgkit_n else 0.0
     f1 = f1_sum / f1_n if f1_n else 0.0
+    em = em_sum / f1_n if f1_n else 0.0
 
     return {
         "kb/trajectory_step_accuracy": step_acc,
         "kb/tool_call_id_accuracy/bgkit": bgkit_acc,
         "kb/tool_call_id_accuracy/overall": bgkit_acc,
         "kb/answer_token_f1": f1,
+        "kb/answer_exact_match": em,
         "kb/n_samples": float(len(per_sample)),
         "kb/n_samples_with_answer": float(f1_n),
         "kb/n_bgkit_calls": float(bgkit_n),
@@ -266,6 +419,22 @@ def main(cfg: DictConfig) -> None:
     # out-of-distribution id format masks the capability entirely).
     force_first_call = bool(eval_cfg.get("force_first_call", False))
     ablation = str(eval_cfg.get("ablation", "") or "")
+    # An ablation SWEEP scores the same samples under several modes in one
+    # process. Reporting a rep-dependence number needs at least a floor and a
+    # ceiling beside it -- the widenet runs spent weeks on a "reps" number
+    # with neither, and a pooled 0.386 looked like a bad-but-working model
+    # until the full-text arm put its ceiling at 0.752 (2026-08-30). Running
+    # the arms here rather than as separate invocations is what guarantees
+    # they saw the same documents.
+    # "none" is spelled out rather than left empty: an empty element inside a
+    # Hydra list literal is fragile to quote and easy to lose silently, and a
+    # sweep that quietly dropped its reps arm would report a ceiling table
+    # against the wrong baseline.
+    sweep = [
+        "" if str(m or "").lower() in ("", "none") else str(m)
+        for m in (eval_cfg.get("ablation_sweep") or [])
+    ]
+    modes = sweep or [ablation]
     if ablation:
         # e.g. +eval.ablation=oracle_span — applies to BOTH the trainer metric
         # pass and the per-sample teacher-forced + free-running loop below.
@@ -274,62 +443,39 @@ def main(cfg: DictConfig) -> None:
 
     # Trainer-side loss metric (backward-compatible baseline). Done
     # before the KB metrics so a failure in the KB path doesn't hide
-    # the loss number entirely.
+    # the loss number entirely. Primary arm only: pooled loss is owned by the
+    # biggest-target samples and has repeatedly failed to track rep
+    # dependence, so paying for it once per arm buys a misleading number.
     logger.info("kb_trainer_evaluate")
     trainer_metrics = trainer.evaluate()
 
-    # KB trajectory metrics. We iterate the eval dataloader directly so
-    # we can cap samples and optionally record per-sample rows without
-    # reimplementing trainer internals.
-    trainer.model.eval()
-    per_sample_rows: list[dict] = []
-    samples_seen = 0
-    free_run_done = 0
-    with torch.no_grad():
-        for batch in trainer.eval_dataloader:
-            if samples_seen >= max_samples:
-                break
-            for sample in batch:
-                if samples_seen >= max_samples:
-                    break
-                if getattr(trainer, "_round_robin", False):
-                    # Same family policy as the trainer's eval pass (follows
-                    # the training mix: Qwen-only runs evaluate Qwen only).
-                    trainer._set_active_decoder(trainer._eval_family_for_index(samples_seen))
-                # Teacher-forced scoring must use the training-mode decoder
-                # forward (Falcon-H1's eval-mode Mixer path is numerically
-                # different); generation below keeps eval mode for the cache.
-                with trainer._teacher_forced_decoders():
-                    result = evaluate_sample(trainer, sample)
-                free_result = None
-                if free_run_done < free_running_limit:
-                    free_result = evaluate_free_running_sample(
-                        trainer,
-                        sample,
-                        max_tool_calls=max_tool_calls,
-                        max_new_tokens=max_new_tokens,
-                        force_first_call=force_first_call,
-                    )
-                    free_run_done += 1
-                row = {
-                    "dataset": getattr(sample, "dataset_name", ""),
-                    "decoder_family": getattr(trainer, "_decoder_family", ""),
-                    # Keep the prompt question with the prediction: the report
-                    # is then self-contained for spot checks, and external
-                    # scorers that need it (BABILong's ``compare_answers``
-                    # excludes labels already named in the question) don't have
-                    # to re-join against the trajectory parquet.
-                    "question": getattr(sample, "question", ""),
-                    **result,
-                }
-                if free_result is not None:
-                    row["free_running"] = free_result
-                per_sample_rows.append(row)
-                samples_seen += 1
-    clear_tree = getattr(trainer, "_clear_eval_shared_tree", None)
-    if callable(clear_tree):
-        clear_tree()
-    trainer.model.train()
+    # KB trajectory metrics, scored over a FIXED sample list. Pulling the
+    # samples out of the dataloader once is what makes a sweep a controlled
+    # comparison: every arm must see the same documents, or its ceiling is
+    # partly a difference in the sample draw.
+    eval_samples = _collect_eval_samples(trainer, max_samples)
+    primary = modes[0]
+    arms: dict[str, list[dict]] = {}
+    for arm_index, mode in enumerate(modes):
+        trainer.set_ablation_mode(mode or None)
+        if len(modes) > 1:
+            logger.info(
+                "kb_eval_ablation_arm",
+                mode=mode or "none", arm=arm_index + 1, of=len(modes),
+            )
+        arms[mode or "none"] = _score_samples(
+            trainer,
+            eval_samples,
+            # Generation runs on the primary arm only: it costs orders of
+            # magnitude more than teacher forcing and the ceiling table is
+            # built from the teacher-forced metrics.
+            free_running_limit=free_running_limit if arm_index == 0 else 0,
+            max_tool_calls=max_tool_calls,
+            max_new_tokens=max_new_tokens,
+            force_first_call=force_first_call,
+        )
+    trainer.set_ablation_mode(primary or None)
+    per_sample_rows = arms[primary or "none"]
 
     aggregate = _aggregate(per_sample_rows)
 
@@ -358,6 +504,34 @@ def main(cfg: DictConfig) -> None:
         "num_samples_evaluated": len(per_sample_rows),
         "ablation": ablation or None,
     }
+    if len(modes) > 1:
+        report["ablation_sweep"] = {
+            name: {
+                "kb_metrics": _aggregate(rows),
+                "per_dataset": {
+                    ds: _aggregate(
+                        [r for r in rows if str(r.get("dataset", "unknown")) == ds]
+                    )
+                    for ds in {str(r.get("dataset", "unknown")) for r in rows}
+                },
+            }
+            for name, rows in arms.items()
+        }
+        ceiling = _ceiling_table(arms)
+        if ceiling:
+            report["ceiling"] = ceiling
+            for group, entry in sorted(ceiling.items()):
+                for metric, cells in entry.items():
+                    if metric == "n_samples":
+                        continue
+                    logger.info(
+                        "kb_eval_ceiling",
+                        group=group,
+                        metric=metric,
+                        n=entry["n_samples"],
+                        **{k: (round(v, 4) if isinstance(v, float) else v)
+                           for k, v in cells.items()},
+                    )
     # Ensure the required backward-compat keys show up at the top-level
     # aggregate view too.
     for key in ("eval/loss", "eval/n_samples", "eval/tokens_per_sample"):
@@ -399,7 +573,7 @@ def main(cfg: DictConfig) -> None:
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     stage = str(cfg.training.get("stage", "?")).upper()
-    suffix = f"_{ablation}" if ablation else ""
+    suffix = "_sweep" if len(modes) > 1 else (f"_{ablation}" if ablation else "")
     report_path = output_dir / f"eval_phase2_kb_stage_{stage}{suffix}.json"
     report_path.write_text(json.dumps(report, indent=2, default=str))
     logger.info(

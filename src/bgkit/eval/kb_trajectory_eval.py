@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from bgkit.data.bgkit_tool_template import TrajectoryTurn
-from bgkit.eval.metrics.qa_metrics import token_f1
+from bgkit.eval.metrics.qa_metrics import exact_match, token_f1
 
 if TYPE_CHECKING:
     from bgkit.data.datasets.phase2_kb_dataset import KBSample
@@ -69,6 +69,7 @@ EMPTY_RESULT: dict = {
         "n_bgkit": 0,
     },
     "answer_token_f1": 0.0,
+    "answer_exact_match": 0.0,
     "pred_answer": "",
     "gold_answer": "",
 }
@@ -720,7 +721,15 @@ def evaluate_sample(
         output, trace, tokenizer,
     )
     gold_answer = str(getattr(sample, "gold_answer", "") or "")
-    f1 = token_f1(pred_text, [gold_answer]) if pred_text and gold_answer else 0.0
+    scorable = bool(pred_text and gold_answer)
+    f1 = token_f1(pred_text, [gold_answer]) if scorable else 0.0
+    # Exact match beside F1. F1 is generous to a prediction that overlaps the
+    # gold without being it, and set-valued answers (grepset's path lists)
+    # score partial credit for naming one member -- so a family can look like
+    # it is reading while getting the answer wrong. The free-running path has
+    # reported both since it was written; teacher forcing reported only F1,
+    # which is why every rep-dependence comparison had to be assembled by hand.
+    em = exact_match(pred_text, [gold_answer]) if scorable else 0.0
 
     return {
         "trajectory_step_accuracy": step_acc,
@@ -728,6 +737,7 @@ def evaluate_sample(
         "trajectory_correct_tokens": correct_tokens,
         "tool_call_id_accuracy": tool_call_metrics,
         "answer_token_f1": f1,
+        "answer_exact_match": em,
         "pred_answer": pred_text,
         "gold_answer": gold_answer,
     }
