@@ -48,6 +48,19 @@ scale direction the contract exists to close. Both muting routes reopen
 through the affine. The decoder's own input projection can absorb any fixed
 per-channel scaling, so nothing expressive is lost by pinning it.
 
+CORRECTION (same day, from the relaunch's own data): pinning the affine did
+NOT change the trajectory. With the affine off and momentum 0.1 the emitted
+norm ratio followed the same path (1.55 1.19 1.13 ... 2.41 4.11 1.77 2.21
+3.72) and shared_frac rose to ~0.93 just as it had with the affine on. So
+neither hypothesis below was the cause. The pinning stands as hygiene -- it
+does close a route in principle -- but it did not fix what was observed, and
+the run killed on that diagnosis was killed on a reading the data refutes.
+
+What this class of normalisation CAN do is remove a corpus-constant, and it
+does: mean_cos_to_corpus stayed at 0.01-0.26 where v8 reached 1.00000. What
+it CANNOT do is raise rank. A per-channel affine cannot turn k identical rows
+into k different ones, so a within-document collapse passes straight through.
+
 THE MOMENTUM HAS TO TRACK THE ENCODER. The same 65 steps saw
 ``l0_base_raw_std`` go 0.32 -> 1.96, so a reference with a ~100-update
 half-life is stale by the time it is used and the standardiser divides by a

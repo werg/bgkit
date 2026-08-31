@@ -66,6 +66,29 @@
 # shows on the splice norm guard's ratio, which is what caught the first
 # launch. Watch both; neither alone is sufficient.
 #
+#
+# CORRECTION, from the relaunch's own data. Pinning the affine did NOT change
+# the trajectory. Emitted norm ratio at the same guard calls:
+#
+#   affine ON, momentum 0.01: 1.30 1.22 1.04 1.48 1.47 1.52 1.37 1.41 1.64
+#                             2.02 1.79 2.13 2.14 2.87 4.28 3.03 6.52
+#   affine OFF, momentum 0.1: 1.55 1.19 1.13 1.28 1.11 1.69 0.96 1.01 1.08
+#                             1.28 0.92 1.35 1.32 2.41 4.11 1.77 2.21 3.72
+#
+# Near-identical, and shared_frac rises to ~0.93 in both. So neither the
+# trainable affine nor the stale EMA reference was the cause -- both
+# hypotheses are refuted by the controlled comparison, and the first run was
+# killed on a diagnosis the data does not support. The pinning stands as
+# hygiene (it does close a route in principle) but it fixed nothing here.
+#
+# What the contract IS doing, and it is not nothing: mean_cos_to_corpus stays
+# at 0.01-0.26 where v8 reached 1.00000. The corpus-constant is gone. What it
+# cannot do is raise RANK -- a per-channel affine cannot make k identical rows
+# into k different ones -- and within-document eff_rank still falls toward 1.
+# Whether the POOLED rep still identifies its document is a different question
+# from within-document diversity, and it is the one the probe answers. v8 had
+# eff_rank 1.01 and whitened retrieval 1.000 simultaneously, so the two are
+# not the same measurement. Do not read either as the verdict.
 # COLD START FROM THE PHASE-1 BASE, not from v8: the base's encoder is the one
 # whose reps still identify their document, and the question is whether the
 # contract keeps it that way through the window where v5b lost it (~step 650
