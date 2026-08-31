@@ -330,6 +330,25 @@ def collect(trainer: KRKBTrainer, n_samples: int) -> dict:
                 (gm.norm() / dm.norm(dim=-1).mean().clamp_min(1e-6)).item(),
             )
             corpus_means[k] = gm
+            # WHICH CHANNELS carry the shared vector. Qwen-family residual
+            # streams are known for "massive activations": a handful of
+            # channels an order of magnitude above the rest. RMSNorm scales by
+            # the whole vector's RMS, so if those channels own the norm then
+            # normalising crushes every other channel -- a concrete, testable
+            # mechanism for a rank-1 output that no amount of rescaling fixes.
+            share = gm.pow(2) / gm.pow(2).sum().clamp_min(1e-30)
+            top = share.sort(descending=True)
+            r["corpus_mean_top1_channel_share"] = float(top.values[0].item())
+            r["corpus_mean_top8_channel_share"] = float(top.values[:8].sum().item())
+            r["corpus_mean_top8_channels"] = [int(i) for i in top.indices[:8]]
+            # Same question for the per-document VARIANCE: if the signal also
+            # lives in those channels it is not being crushed, it is absent.
+            dv = dm.var(dim=0)
+            dtop = dv.sort(descending=True)
+            r["doc_var_top8_channel_share"] = float(
+                (dtop.values[:8].sum() / dv.sum().clamp_min(1e-30)).item(),
+            )
+            r["doc_var_top8_channels"] = [int(i) for i in dtop.indices[:8]]
         out[k] = r
     # WHICH vector is the shared one? ``survive_embedding`` is a single
     # learned parameter scattered at every surviving position, and its

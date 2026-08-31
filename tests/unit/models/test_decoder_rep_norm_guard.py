@@ -50,6 +50,17 @@ class _Backbone(nn.Module):
         return self.model.embed_tokens
 
 
+NORM_EVENT = "spliced_rep_norm_out_of_band"
+
+
+def norm_warnings(rec):
+    """Only this guard's warnings. The same sampled block also emits
+    ``spliced_rep_rank_collapsed``, which carries its own ``consecutive``
+    counter -- collecting both would make these assertions about the norm
+    band silently depend on the rank band's threshold."""
+    return [(e, kw) for e, kw in rec.warnings if e == NORM_EVENT]
+
+
 class _RecordingLogger:
     def __init__(self) -> None:
         self.warnings: list[tuple[str, dict]] = []
@@ -130,10 +141,10 @@ def test_guard_respects_sampling_cadence(monkeypatch):
     # 49 calls: below the sampling cadence -> silent even though inflated.
     for _ in range(49):
         dec._concat_segments(_segments(20.0), embed_fn)
-    assert not rec.warnings
+    assert not norm_warnings(rec)
     # 50th call trips the sample and warns.
     dec._concat_segments(_segments(20.0), embed_fn)
-    assert any(e == "spliced_rep_norm_out_of_band" for e, _ in rec.warnings)
+    assert any(e == NORM_EVENT for e, _ in rec.warnings)
 
 
 def test_guard_disabled_never_warns(monkeypatch):
@@ -141,7 +152,7 @@ def test_guard_disabled_never_warns(monkeypatch):
     monkeypatch.setattr(decoder_mod, "_REP_NORM_GUARD_EVERY", 1)
     dec = _decoder()
     rec = _run(dec, rep_norm=100.0, monkeypatch=monkeypatch)
-    assert not rec.warnings
+    assert not norm_warnings(rec)
 
 
 def test_guard_raises_after_consecutive_out_of_band(guard_every_1, monkeypatch):
@@ -156,11 +167,11 @@ def test_guard_raises_after_consecutive_out_of_band(guard_every_1, monkeypatch):
     # Two zero-norm splices: warned, not raised.
     dec._concat_segments(_segments(0.0), embed_fn)
     dec._concat_segments(_segments(0.0), embed_fn)
-    assert [kw["consecutive"] for _, kw in rec.warnings] == [1, 2]
+    assert [kw["consecutive"] for _, kw in norm_warnings(rec)] == [1, 2]
     # An in-band splice resets the streak.
     dec._concat_segments(_segments(1.0), embed_fn)
     dec._concat_segments(_segments(0.0), embed_fn)
-    assert rec.warnings[-1][1]["consecutive"] == 1
+    assert norm_warnings(rec)[-1][1]["consecutive"] == 1
     dec._concat_segments(_segments(0.0), embed_fn)
     # Third consecutive hit raises with a diagnostic message.
     with pytest.raises(RuntimeError, match="consecutive sampled checks"):
@@ -180,7 +191,7 @@ def test_guard_stands_down_under_expected_degenerate_reps(guard_every_1, monkeyp
     dec._rep_norm_guard_expect_degenerate = True
     for _ in range(10):
         dec._concat_segments(_segments(0.0), embed_fn)  # ablation pass: ignored
-    assert len(rec.warnings) == 1
+    assert len(norm_warnings(rec)) == 1
     dec._rep_norm_guard_expect_degenerate = False
     with pytest.raises(RuntimeError):
         dec._concat_segments(_segments(0.0), embed_fn)  # streak 2 -> raise
@@ -200,11 +211,11 @@ def test_guard_reference_ratio_steady_high_is_not_degenerate(guard_every_1, monk
     for _ in range(6):
         dec._concat_segments(_segments(37.0), embed_fn)  # steady 37x: fine
     assert dec._rep_norm_guard_ref_ratio == pytest.approx(37.0, rel=1e-3)
-    assert len(rec.warnings) == 1  # informational, once
-    assert rec.warnings[0][1]["degenerate"] is False
+    assert len(norm_warnings(rec)) == 1  # informational, once
+    assert norm_warnings(rec)[0][1]["degenerate"] is False
     assert dec._rep_norm_guard_oob_streak == 0
     dec._concat_segments(_segments(37.0 * 9), embed_fn)  # 9x drift: degenerate
-    assert rec.warnings[-1][1]["degenerate"] is True
+    assert norm_warnings(rec)[-1][1]["degenerate"] is True
     with pytest.raises(RuntimeError, match="degenerate"):
         dec._concat_segments(_segments(37.0 * 9), embed_fn)
 

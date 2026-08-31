@@ -98,6 +98,36 @@ try:
 except ValueError:
     _REP_NORM_GUARD_RAISE_AFTER = 10
 
+# RANK BAND. The norm guard above catches a payload at the wrong SCALE; it is
+# blind to a payload at the right scale whose vectors are all the SAME vector.
+# Measured 2026-08-31 on the same eval documents:
+#
+#   Phase-1 base   effective rank per document 12.97, shared_frac 0.927
+#   widenet v8      effective rank per document  1.01, shared_frac 0.992
+#
+# v8's k survivors therefore carried at most ONE direction between them, which
+# is why 33x the retention budget changed nothing and why rescaling the reps
+# bought +0.001 -- rescale fixes magnitude, and the defect was rank. Phase-2
+# training collapsed a representation the base had.
+#
+# Effective rank (participation ratio of the centred payload's singular values)
+# is the statistic that separates those two: shared_frac alone reads 0.93 vs
+# 0.99, which is not an alarm you would act on. shared_frac is logged beside it
+# because it says how much of the energy the shared component owns.
+#
+# Warn below the threshold; never raise. Unlike the norm band the healthy
+# operating point is not established across lineages, and a diagnostic that
+# halts training on an unvalidated threshold is worse than the blindness it
+# replaces.
+try:
+    _REP_EFF_RANK_LO = float(os.environ.get("BGKIT_REP_EFF_RANK_LO", "2.0") or 2.0)
+except ValueError:
+    _REP_EFF_RANK_LO = 2.0
+
+# Cap on rows entering the SVD; the statistic is a property of the payload's
+# spread, not of how many vectors were sampled from it.
+_REP_RANK_GUARD_MAX_ROWS = 512
+
 _FROZEN_DELTANET_CORE_TIMER_EVENTS: dict[
     str,
     list[tuple[torch.cuda.Event, torch.cuda.Event]],
@@ -4678,6 +4708,51 @@ class DecoderLoRALinear(nn.Module):
         return self.base_layer.weight + delta.to(dtype=self.base_layer.weight.dtype)
 
 
+def _rep_rank_stats(segments: list[torch.Tensor]) -> dict | None:
+    """Effective rank and shared-energy fraction of spliced rep payloads.
+
+    One value per payload (a payload is one document's survivors), averaged.
+
+    ``eff_rank`` is the participation ratio of the CENTRED payload's covariance
+    eigenvalues, ``(sum L)^2 / sum L^2``: the number of directions the payload
+    actually spans, equal to the row count for an isotropic spread and 1.0 when
+    every row lies on a single direction. Centring is the point -- an uncentred
+    "one shared vector plus small content" matrix reports rank ~1 for the mean
+    alone, and it is the CONTENT's rank that says whether more survivors carry
+    more information.
+
+    ``shared_frac`` is ``||mean(rows)||^2 / mean(||row||^2)``: how much of the
+    payload's energy every vector carries identically.
+
+    Single-row payloads are skipped -- a lone vector is trivially rank 1 and
+    all-shared, and would drag both statistics without saying anything.
+    """
+    ranks: list[float] = []
+    fracs: list[float] = []
+    for t in segments:
+        if not torch.is_tensor(t) or t.numel() == 0:
+            continue
+        x = t.detach().reshape(-1, t.shape[-1]).float()
+        if x.shape[0] < 2:
+            continue
+        if x.shape[0] > _REP_RANK_GUARD_MAX_ROWS:
+            step = x.shape[0] // _REP_RANK_GUARD_MAX_ROWS + 1
+            x = x[::step]
+        energy = x.pow(2).sum(dim=-1).mean().clamp_min(1e-30)
+        fracs.append(float((x.mean(dim=0).pow(2).sum() / energy).item()))
+        lam = torch.linalg.svdvals(x - x.mean(dim=0, keepdim=True)).pow(2)
+        ranks.append(
+            float((lam.sum().pow(2) / lam.pow(2).sum().clamp_min(1e-30)).item()),
+        )
+    if not ranks:
+        return None
+    return {
+        "eff_rank": sum(ranks) / len(ranks),
+        "shared_frac": sum(fracs) / len(fracs),
+        "n_payloads": len(ranks),
+    }
+
+
 class ReconstructionDecoder(nn.Module):
     """Causal LM decoder for reconstructing content from BgKIT survivors.
 
@@ -6919,6 +6994,11 @@ class ReconstructionDecoder(nn.Module):
             # Trend visibility: every sampled check (in band or not) is an INFO
             # event, so rep-norm drift is greppable per family without a
             # trainer metric plumb (the guard's warnings only fire on change).
+            # RANK, alongside scale. A payload can sit in a perfect norm band
+            # and still be k copies of one vector; that is what widenet v8 was
+            # (effective rank 1.01 against the Phase-1 base's 12.97) and no
+            # norm-based check could see it.
+            rank_stats = _rep_rank_stats(rep_segments)
             logger.info(
                 "spliced_rep_norm_sample",
                 ratio=round(ratio, 4),
@@ -6928,7 +7008,33 @@ class ReconstructionDecoder(nn.Module):
                 decoder_family=getattr(self, "decoder_family", None),
                 n_rep_vectors=int(all_norms.numel()),
                 guard_call=n,
+                eff_rank=(
+                    None if rank_stats is None else round(rank_stats["eff_rank"], 3)
+                ),
+                shared_frac=(
+                    None if rank_stats is None else round(rank_stats["shared_frac"], 5)
+                ),
             )
+            if rank_stats is not None and rank_stats["eff_rank"] < _REP_EFF_RANK_LO:
+                rstreak = int(getattr(self, "_rep_rank_guard_low_streak", 0)) + 1
+                self._rep_rank_guard_low_streak = rstreak
+                logger.warning(
+                    "spliced_rep_rank_collapsed",
+                    eff_rank=round(rank_stats["eff_rank"], 3),
+                    shared_frac=round(rank_stats["shared_frac"], 5),
+                    threshold=_REP_EFF_RANK_LO,
+                    n_payloads=rank_stats["n_payloads"],
+                    decoder_family=getattr(self, "decoder_family", None),
+                    guard_call=n,
+                    consecutive=rstreak,
+                    hint=(
+                        "the spliced survivors span <1 direction between them: "
+                        "extra retention budget cannot add information and a "
+                        "rescale cannot fix it"
+                    ),
+                )
+            else:
+                self._rep_rank_guard_low_streak = 0
             abs_warned = bool(getattr(self, "_rep_norm_guard_abs_warned", False))
             if degenerate or (out_of_band and not abs_warned):
                 if out_of_band:
