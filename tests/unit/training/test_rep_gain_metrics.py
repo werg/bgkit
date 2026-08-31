@@ -17,7 +17,7 @@ def _gains(metrics: dict, datasets: list[str]) -> dict:
     """The computation under test, extracted from KRKBTrainer.evaluate."""
     out = {}
     for ds in datasets:
-        for metric in ("exact_match", "token_f1"):
+        for metric in ("exact_match", "token_f1", "loss_token_accuracy"):
             base = metrics.get(f"eval/{ds}/{metric}")
             zeroed = metrics.get(f"eval/ablation/zeroed/{ds}/{metric}")
             if base is not None and zeroed is not None:
@@ -76,12 +76,29 @@ def test_a_dataset_absent_from_the_eval_split_is_skipped():
     assert _gains({"eval/lognav/exact_match": 0.3}, ["reconstruct"]) == {}
 
 
-def test_the_trainer_computes_both_metrics():
-    """Pins the loop to the source, so dropping token_f1 fails here."""
+def test_a_high_floor_metric_is_not_the_only_one_reported():
+    """token_f1 has a HIGH FLOOR on code: measured on `reconstruct` at v10
+    step 500 the ZEROED arm scored 0.400 reproducing a 266-character span
+    from no document, because code shares whitespace, braces and keywords. A
+    metric that scores 0.40 on nothing cannot resolve a small gain, so
+    loss_token_accuracy -- whose floor is chance -- is reported beside it."""
+    m = {
+        "eval/reconstruct/token_f1": 0.404,
+        "eval/ablation/zeroed/reconstruct/token_f1": 0.400,
+        "eval/reconstruct/loss_token_accuracy": 0.52,
+        "eval/ablation/zeroed/reconstruct/loss_token_accuracy": 0.31,
+    }
+    g = _gains(m, ["reconstruct"])
+    assert g["eval/rep_gain/reconstruct/token_f1"] == pytest.approx(0.004, abs=1e-6)
+    assert g["eval/rep_gain/reconstruct/loss_token_accuracy"] == pytest.approx(0.21)
+
+
+def test_the_trainer_computes_all_three_metrics():
+    """Pins the loop to the source, so dropping one fails here."""
     import inspect
 
     from bgkit.training.phase2.kr_kb_trainer import KRKBTrainer
 
     src = inspect.getsource(KRKBTrainer.evaluate)
-    assert 'for metric in ("exact_match", "token_f1")' in src
+    assert 'for metric in ("exact_match", "token_f1", "loss_token_accuracy")' in src
     assert '"eval/rep_gain/token_f1"' in src

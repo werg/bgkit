@@ -10124,7 +10124,16 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             # 0.382. A metric that reads zero for a reason unrelated to the
             # phenomenon is how this project has repeatedly lost months.
             for ds in list(self.step_cfg.get("datasets", []) or []):
-                for metric in ("exact_match", "token_f1"):
+                # THREE metrics, because each has a blind spot the others do
+                # not. exact_match saturates at 0.000 for long verbatim
+                # answers. token_f1 has a HIGH FLOOR on code -- measured on
+                # `reconstruct` at v10 step 500, the ZEROED arm scored 0.400
+                # reproducing a 266-character span from no document at all,
+                # because code shares whitespace, braces, keywords -- so it
+                # cannot resolve a small gain. loss_token_accuracy has neither
+                # problem: its floor is chance and it is sensitive to the
+                # tokens a prior cannot supply.
+                for metric in ("exact_match", "token_f1", "loss_token_accuracy"):
                     bd = metrics.get(f"eval/{ds}/{metric}")
                     zd = metrics.get(f"eval/ablation/zeroed/{ds}/{metric}")
                     if bd is not None and zd is not None:
