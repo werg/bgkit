@@ -115,3 +115,154 @@ def test_samples_without_a_gold_answer_do_not_dilute_the_average():
     cell = ev._ceiling_table(arms)["a"]["kb/answer_token_f1"]
     assert cell["none"] == pytest.approx(0.5)
     assert cell["fraction_captured"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# The scoring loop the sweep runs once per arm
+# ---------------------------------------------------------------------------
+
+
+class _StubDecoders:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+class _StubModel:
+    def __init__(self):
+        self.modes = []
+
+    def eval(self):
+        self.modes.append("eval")
+
+    def train(self):
+        self.modes.append("train")
+
+
+class _StubSample:
+    def __init__(self, name, question):
+        self.dataset_name = name
+        self.question = question
+
+
+class _StubTrainer:
+    _round_robin = False
+
+    def __init__(self, samples):
+        self.model = _StubModel()
+        self.eval_dataloader = [samples[:2], samples[2:]]
+        self._decoder_family = "qwen35"
+        self.ablations = []
+        self.cleared = 0
+
+    def _teacher_forced_decoders(self):
+        return _StubDecoders()
+
+    def set_ablation_mode(self, mode):
+        self.ablations.append(mode)
+
+    def _clear_eval_shared_tree(self):
+        self.cleared += 1
+
+
+def _stub_scoring(monkeypatch, marker="x"):
+    monkeypatch.setattr(
+        ev, "evaluate_sample",
+        lambda _t, s: {"gold_answer": "g", "answer_token_f1": 0.5,
+                       "answer_exact_match": 0.0, "pred_answer": marker},
+    )
+    monkeypatch.setattr(
+        ev, "evaluate_free_running_sample",
+        lambda _t, s, **_kw: {"answer_token_f1": 0.1, "answer_exact_match": 0.0},
+    )
+
+
+def test_score_samples_scores_every_sample_it_is_given(monkeypatch):
+    _stub_scoring(monkeypatch)
+    samples = [_StubSample("a", f"q{i}") for i in range(4)]
+    rows = ev._score_samples(
+        _StubTrainer(samples), samples, free_running_limit=0,
+        max_tool_calls=1, max_new_tokens=8, force_first_call=False,
+    )
+    assert len(rows) == 4
+    assert [r["question"] for r in rows] == ["q0", "q1", "q2", "q3"]
+    assert all("free_running" not in r for r in rows)
+
+
+def test_generation_is_capped_at_the_limit(monkeypatch):
+    _stub_scoring(monkeypatch)
+    samples = [_StubSample("a", f"q{i}") for i in range(5)]
+    rows = ev._score_samples(
+        _StubTrainer(samples), samples, free_running_limit=2,
+        max_tool_calls=1, max_new_tokens=8, force_first_call=False,
+    )
+    assert sum("free_running" in r for r in rows) == 2
+
+
+def test_collect_eval_samples_caps_and_flattens_batches():
+    samples = [_StubSample("a", f"q{i}") for i in range(4)]
+    t = _StubTrainer(samples)
+    assert len(ev._collect_eval_samples(t, 3)) == 3
+    assert len(ev._collect_eval_samples(t, 99)) == 4
+
+
+def test_every_arm_scores_the_same_sample_list(monkeypatch):
+    """The point of materialising the samples once. If each arm re-drew from
+    the dataloader, a ceiling would be partly a difference in the draw."""
+    _stub_scoring(monkeypatch)
+    samples = [_StubSample("a", f"q{i}") for i in range(4)]
+    trainer = _StubTrainer(samples)
+    arms = {}
+    for mode in ("", "zeroed", "full_text"):
+        trainer.set_ablation_mode(mode or None)
+        arms[mode or "none"] = ev._score_samples(
+            trainer, samples, free_running_limit=0,
+            max_tool_calls=1, max_new_tokens=8, force_first_call=False,
+        )
+    assert trainer.ablations == [None, "zeroed", "full_text"]
+    questions = {tuple(r["question"] for r in rows) for rows in arms.values()}
+    assert len(questions) == 1
+    assert ev._ceiling_table(arms)["a"]["kb/answer_token_f1"][
+        "fraction_captured"
+    ] is None  # identical arms => no headroom, and no invented ratio
+
+
+def test_decoder_family_follows_the_sample_index_not_a_running_counter(monkeypatch):
+    """An arm that scores fewer samples must not shift which family each
+    sample gets, or the arms stop being comparable."""
+    _stub_scoring(monkeypatch)
+    seen = []
+
+    class _RR(_StubTrainer):
+        _round_robin = True
+
+        def _set_active_decoder(self, family):
+            seen.append(family)
+            self._decoder_family = family
+
+        def _eval_family_for_index(self, i):
+            return "qwen35" if i % 2 == 0 else "falcon_h1"
+
+    samples = [_StubSample("a", f"q{i}") for i in range(4)]
+    ev._score_samples(
+        _RR(samples), samples[:2], free_running_limit=0,
+        max_tool_calls=1, max_new_tokens=8, force_first_call=False,
+    )
+    ev._score_samples(
+        _RR(samples), samples, free_running_limit=0,
+        max_tool_calls=1, max_new_tokens=8, force_first_call=False,
+    )
+    assert seen == ["qwen35", "falcon_h1"] + ["qwen35", "falcon_h1"] * 2
+
+
+def test_the_shared_eval_tree_is_cleared_after_each_arm(monkeypatch):
+    _stub_scoring(monkeypatch)
+    samples = [_StubSample("a", "q")]
+    t = _StubTrainer(samples)
+    ev._score_samples(t, samples, free_running_limit=0, max_tool_calls=1,
+                      max_new_tokens=8, force_first_call=False)
+    ev._score_samples(t, samples, free_running_limit=0, max_tool_calls=1,
+                      max_new_tokens=8, force_first_call=False)
+    assert t.cleared == 2

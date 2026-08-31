@@ -189,6 +189,8 @@ See `configs/model/survivorship_head.yaml` and the per-level `survivorship.l{0,1
 - `BgKITEncoder.bridge_scale_reference` — a buffer that rides in the checkpoint, seeded once and never re-seeded, so the bridge guard is anchored to the LINEAGE. Both bridge sites call `encoder.observe_bridge_scale(...)`.
 - `scripts/eval_phase2_kb.py +eval.ablation_sweep=[none,zeroed,full_text]` — scores one fixed sample list under every arm and emits `ceiling`: per dataset and overall, `fraction_captured = (reps − floor) / (ceiling − floor)`. A reps score alone says nothing; v8's pooled token-F1 of 0.386 sat between a 0.386 floor and a 0.752 ceiling. Teacher forcing now also reports `answer_exact_match`.
 
+**Reading `eff_rank` when the contract is ON.** The guard measures the payload as the decoder receives it, i.e. AFTER `DecoderInterfaceNorm`, and a per-channel affine changes a participation ratio. So a contract-on `eff_rank` is not comparable to the probe's contract-off numbers (base 12.97, v8 1.01), and there is no contract-on baseline yet. `shared_frac` is the interpretable one in the meantime — raw token embeddings sit at 0.225, v8 at 0.990. The apples-to-apples check is `scripts/probe_rep_distinguishability.py` on a checkpoint: reps top-1 against base 0.898 and v8 0.031.
+
 **Two muting routes, two different signatures.** Growing a constant shows up as rank collapse; driving the interface gain to zero does not (effective rank is scale-invariant) and shows up on the norm guard's absolute floor. Read both events.
 
 **Known limitations**:
