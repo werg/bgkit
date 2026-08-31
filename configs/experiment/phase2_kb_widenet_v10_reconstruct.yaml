@@ -33,6 +33,15 @@
 # satisfies them all -- which is precisely what the query-blind policy cannot
 # survive. See bgkit/data/reconstruct_qa.py.
 #
+# SECOND DIFFERENCE FROM v9, and it is a measurement fix rather than a
+# hypothesis: fileneedle's negative class is rebuilt as a balanced coin flip.
+# It used to answer "Is `X` defined in this file?" with "No" every time, which
+# is derivable from the question -- 19.9% of the family, and roughly two thirds
+# of its rep-blind EM of 0.3065. The primary metric here (eff_rank, and the
+# probe's retrieval) does not touch fileneedle at all, so the single-variable
+# claim holds for the thing being tested; what improves is the honesty of the
+# ceiling table's fileneedle column.
+#
 # CO-PRIMARY, NOT A REPLACEMENT. QA, compaction and tool calls are all the
 # goal, so the QA families stay in the mix at full weight. reconstruct is there
 # to make the encoder carry content that the other families can then use.
