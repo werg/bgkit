@@ -62,6 +62,16 @@ log "probe exit=$?"
 sed -E 's/\x1b\[[0-9;]*m//g' "$FAST/repdist_v9.container.log" \
   | grep -E "^checkpoint:|^documents:|^stage|^raw |^l1_input|^l1_in@k|^reps " || true
 
+# The verdict is a threshold committed BEFORE the numbers arrived, not a
+# reading made after them. See scripts/verdict_repdist.py.
+JSON="${CHECKPOINT_DIR:-/mnt/external/bgkit-checkpoints}/repdist_v9_vs_base_v8.json"
+if [ -f "$JSON" ]; then
+  .venv/bin/python scripts/verdict_repdist.py "$JSON" --treatment v9_interface \
+    | tee "$FAST/verdict_v9.txt"
+else
+  log "no probe JSON at $JSON — cannot state a verdict"
+fi
+
 log "STEP 2/2 floor / reps / ceiling on the same samples"
 $COMPOSE run --rm "$SVC" scripts/eval_phase2_kb.py \
   +experiment=phase2_kb_widenet_v9_interface \
