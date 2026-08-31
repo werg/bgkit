@@ -10102,6 +10102,10 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
             z_em = metrics.get("eval/ablation/zeroed/exact_match")
             if b_em is not None and z_em is not None:
                 metrics["eval/rep_gain/exact_match"] = b_em - z_em
+            b_f1 = metrics.get("eval/token_f1")
+            z_f1 = metrics.get("eval/ablation/zeroed/token_f1")
+            if b_f1 is not None and z_f1 is not None:
+                metrics["eval/rep_gain/token_f1"] = b_f1 - z_f1
             b_l = metrics.get("eval/loss")
             z_l = metrics.get("eval/ablation/zeroed/loss")
             if b_l is not None and z_l is not None:
@@ -10110,11 +10114,21 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                 metrics["eval/rep_gain/nats"] = z_l - b_l
             # Per dataset, because a pooled gain can be carried by one task
             # while the others are at zero.
+            #
+            # ON BOTH METRICS, and token_f1 is not decoration. A family whose
+            # answer is a long verbatim span scores exact_match 0.000 in BOTH
+            # arms for a long time -- reproducing 266 characters exactly is
+            # brutal -- so its EM gain is 0.000 by construction and says
+            # nothing about whether the reps helped. Measured on the
+            # `reconstruct` family at v10 step 250: EM 0.000 with token_f1
+            # 0.382. A metric that reads zero for a reason unrelated to the
+            # phenomenon is how this project has repeatedly lost months.
             for ds in list(self.step_cfg.get("datasets", []) or []):
-                bd = metrics.get(f"eval/{ds}/exact_match")
-                zd = metrics.get(f"eval/ablation/zeroed/{ds}/exact_match")
-                if bd is not None and zd is not None:
-                    metrics[f"eval/rep_gain/{ds}/exact_match"] = bd - zd
+                for metric in ("exact_match", "token_f1"):
+                    bd = metrics.get(f"eval/{ds}/{metric}")
+                    zd = metrics.get(f"eval/ablation/zeroed/{ds}/{metric}")
+                    if bd is not None and zd is not None:
+                        metrics[f"eval/rep_gain/{ds}/{metric}"] = bd - zd
 
             # RESCALE GAIN (2026-08-30): what the SAME reps are worth once
             # their magnitude matches the decoder's embedding norm. Directions
