@@ -27,10 +27,13 @@ THE DESIGN, and every piece of it is load-bearing:
 - The span is RANDOM per row and DIFFERENT across a document's rows, so the
   union over questions approaches the whole file. No fixed subset of positions
   satisfies them all, which is exactly what defeats the query-blind policy.
-- Spans are anchored so the task does not become line-counting. ``head`` and
-  ``tail`` need no anchor at all; ``after_anchor`` names one line that occurs
-  exactly once and asks for what FOLLOWS it, so the anchor is revealed and the
-  target is not.
+- Spans are anchored so the task does not become line-counting. ``tail``
+  needs no anchor at all; ``after_anchor`` names one line that occurs exactly
+  once and asks for what FOLLOWS it, so the anchor is revealed and the target
+  is not. There is no ``head``: the first lines of a source file are its most
+  predictable region and a correct answer there is weak evidence of reading.
+- Licence headers and comment blocks are rejected wherever they land. A model
+  reproduces an Apache header from its prior, not from the document.
 - Capacity is not the constraint: 10% of a 2k-token document is ~200 survivor
   vectors of width 1024, far above the entropy of any span asked for here. The
   constraint is whether the encoder CHOOSES to carry it.
@@ -38,8 +41,8 @@ THE DESIGN, and every piece of it is load-bearing:
 A previous reconstruction attempt (``git_commit_repro``) sat at recon_gap ~0
 for thousands of steps because a browse plaintext-copy path let the decoder
 copy the answer instead of reading the reps. Hence the rule that decides this
-family's validity: THE PROMPT MUST NEVER CONTAIN THE TARGET. The head/tail
-questions name no content at all; the anchor question names exactly one line
+family's validity: THE PROMPT MUST NEVER CONTAIN THE TARGET. The tail
+question names no content at all; the anchor question names exactly one line
 and asks for the following ones.
 """
 
@@ -54,6 +57,19 @@ from bgkit.data.blob_format import render_header
 # A span made mostly of blank or punctuation-only lines is reproducible
 # without having read anything.
 _SUBSTANTIVE = re.compile(r"[A-Za-z0-9]")
+
+# Neither is a licence header. Spot-checking the first build on real repo
+# files turned up spans like "/****...\n * Copyright 2011, " -- an Apache
+# header a language model reproduces from its prior, with no reading
+# involved. That is the same "answerable without the document" defect this
+# family exists to remove, so it is filtered wherever it lands.
+_COMMENT_START = re.compile(r"^\s*(#|//|/\*|\*|<!--|--\s|;|%)")
+_BOILERPLATE = re.compile(
+    r"copyright|licen[sc]ed under|all rights reserved|"
+    r"permission is hereby granted|apache licen[sc]e|mit licen[sc]e|"
+    r"gnu general public|spdx-licen[sc]e-identifier|redistribution and use",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -75,9 +91,21 @@ def _substantive(lines: list[str], min_ratio: float = 0.6) -> bool:
     return hits >= max(1, int(len(lines) * min_ratio))
 
 
+def _boilerplate(lines: list[str]) -> bool:
+    """Reproducible from a language prior rather than from the document."""
+    text = "\n".join(lines)
+    if _BOILERPLATE.search(text):
+        return True
+    real = [ln for ln in lines if ln.strip()]
+    if not real:
+        return True
+    comments = sum(1 for ln in real if _COMMENT_START.match(ln))
+    return comments > len(real) * 0.5
+
+
 def _span_text(lines: list[str], start: int, count: int) -> str | None:
     chunk = lines[start : start + count]
-    if len(chunk) < count or not _substantive(chunk):
+    if len(chunk) < count or not _substantive(chunk) or _boilerplate(chunk):
         return None
     return "\n".join(chunk)
 
@@ -123,21 +151,21 @@ def generate_reconstruct_samples(
     samples: list[ReconstructSample] = []
     used: set[int] = set()
 
-    # HEAD and TAIL leak nothing at all: the position is named, not the
-    # content. One of each at most, so the family is not dominated by the two
-    # spans every document shares a shape for.
-    for qtype, start_of in (("head", lambda k: 0), ("tail", lambda k: n_lines - k)):
-        k = rng.randint(min_lines, max_lines)
-        start = start_of(k)
-        span = _span_text(lines, start, k) if start >= 0 else None
-        if ok(span):
-            where = "first" if qtype == "head" else "last"
-            samples.append(make(
-                qtype,
-                f"Reproduce the {where} {k} lines of this file, exactly as written.",
-                span,
-            ))
-            used.update(range(start, start + k))
+    # TAIL leaks nothing at all: the position is named, not the content. There
+    # is deliberately no HEAD counterpart -- the first lines of a source file
+    # are its single most predictable region (shebang, licence, imports), so a
+    # correct answer there is weak evidence of having read anything. Spot
+    # checks on real repos produced Apache headers and bundler preambles.
+    k = rng.randint(min_lines, max_lines)
+    start = n_lines - k
+    span = _span_text(lines, start, k) if start >= 0 else None
+    if ok(span):
+        samples.append(make(
+            "tail",
+            f"Reproduce the last {k} lines of this file, exactly as written.",
+            span,
+        ))
+        used.update(range(start, start + k))
 
     # ANCHORED spans: name one line that occurs exactly once, ask for what
     # follows it. The anchor is revealed; the target is not.

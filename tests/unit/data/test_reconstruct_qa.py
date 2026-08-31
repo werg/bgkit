@@ -67,11 +67,52 @@ def test_the_prompt_never_contains_the_answer():
             assert s.answer not in s.question, (seed, s.qtype)
 
 
-def test_head_and_tail_questions_name_no_content_at_all():
+def test_the_tail_question_names_no_content_at_all():
     for seed in range(40):
         for s in _samples(seed):
-            if s.qtype in ("head", "tail"):
+            if s.qtype == "tail":
                 assert "`" not in s.question
+
+
+def test_there_is_no_head_variant():
+    """The first lines of a source file are its most predictable region --
+    shebang, licence, imports -- so a correct answer there is weak evidence of
+    having read anything. Spot checks on real repos produced Apache headers
+    and bundler preambles, which a model reproduces from its prior."""
+    for seed in range(40):
+        assert all(s.qtype != "head" for s in _samples(seed))
+
+
+def test_licence_headers_are_rejected_wherever_they_land():
+    licensed = "\n".join(
+        ["/*"]
+        + [" * Copyright 2011 Example Inc."]
+        + [" * Licensed under the Apache License, Version 2.0"]
+        + [f" * line {i} of the notice text here" for i in range(20)]
+        + [" */", ""]
+        + [f"def real_function_{i}(argument):" for i in range(20)]
+    )
+    for seed in range(30):
+        for s in generate_reconstruct_samples(
+            licensed, source_label="r:l.py", rng=random.Random(seed),
+        ):
+            assert "Copyright" not in s.answer
+            assert "Licensed under" not in s.answer
+
+
+def test_comment_blocks_are_rejected():
+    """A span that is mostly prose commentary is closer to a language prior
+    than to the document's content."""
+    commented = "\n".join(
+        [f"# explanatory note number {i} about the module" for i in range(30)]
+        + [f"value_{i} = compute_something(i, {i})" for i in range(30)]
+    )
+    for seed in range(30):
+        for s in generate_reconstruct_samples(
+            commented, source_label="r:c.py", rng=random.Random(seed),
+        ):
+            lines = [ln for ln in s.answer.split("\n") if ln.strip()]
+            assert sum(1 for ln in lines if ln.lstrip().startswith("#")) <= len(lines) * 0.5
 
 
 def test_the_anchor_is_revealed_but_the_target_is_not():
