@@ -4,7 +4,7 @@
 Family B "large file read + needle" (`plans/capability_packaging_2026_08_20.md`
 §5.1): each article is one real source file (a simulated big `read_file` tool
 result); questions ask for definition lines, constant values, unique-identifier
-lines, and explicit not-defined-here negatives. Split = held-out REPOS.
+lines, and a balanced present/absent presence check. Split = held-out REPOS.
 
 Usage:
     .venv/bin/python scripts/build_fileneedle_phase2.py \
@@ -101,10 +101,14 @@ def main() -> None:
             doc_tokens.append(np.asarray(ids, dtype=np.int32))
             offsets = article_offsets(tokenizer, text)
             for s in samples:
+                # Key off span_text, not the qtype string: the answer of a
+                # negative presence question is a statement ABOUT the file,
+                # not a quotation FROM it, and asking for its span would
+                # search the text for a string that is not there.
                 span = (
                     None
-                    if s.qtype == "absent"
-                    else answer_span_from_offsets(offsets, text, s.answer)
+                    if s.span_text is None
+                    else answer_span_from_offsets(offsets, text, s.span_text)
                 )
                 traj_rows.append(
                     flat_trajectory_row(

@@ -14,8 +14,18 @@ Question types:
 - ``needle_token``— quote the unique line mentioning a rare identifier
   (generic fallback, shares :func:`bgkit.data.lognav_qa.rare_id_tokens`'s
   spirit but code-tokenized).
-- ``absent``      — a plausible symbol NOT present in this file (drawn from
-  a sibling file by the caller): the answer states it is not defined here.
+- ``presence_absent`` / ``presence_present`` — a BALANCED presence check.
+  One question form, "Is `X` defined in this file? If so, quote its
+  definition line."; the symbol is drawn either from a sibling file (answer:
+  it is not defined here) or from this file's own definitions (answer: the
+  real definition line).
+
+  This branch used to emit negatives only, and its answer, "No — `X` is not
+  defined in this file.", is fully derivable from the question. It was 19.9%
+  of the family, and measured rep-blind EM on fileneedle was 0.3065 —
+  roughly two thirds of that came from here, so the family's rep-dependence
+  number was mostly reporting a template. A negative class only tests
+  reading when the same question can come back positive.
 """
 
 from __future__ import annotations
@@ -36,13 +46,29 @@ _DEF_PATTERNS = [
 _CONST_RE = re.compile(r"^\s*([A-Z][A-Z0-9_]{3,})\s*[:=]\s*(.+?)\s*$", re.M)
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{5,}")
 
+# Sentinel distinguishing "span_text not given, default to the answer"
+# from an explicit ``None`` meaning "this answer is not in the text".
+_SELF = object()
+
 
 @dataclass(frozen=True)
 class FileNeedleSample:
+    """One needle question.
+
+    ``span_text`` is the substring of the file the answer quotes, used to
+    locate the gold span. It equals ``answer`` for every question whose
+    answer IS a line lifted from the file, and is ``None`` for the negative
+    presence case, whose answer is a statement about the file rather than a
+    quotation from it. Callers key span extraction off this field rather
+    than off a ``qtype`` string, so adding a question type cannot silently
+    ask for the span of an answer that is not in the text.
+    """
+
     qtype: str
     question: str
     answer: str
     blob_header: str
+    span_text: str | None = None
 
 
 def defined_symbols(text: str) -> dict[str, str]:
@@ -102,18 +128,22 @@ def generate_file_samples(
     def short(table: dict[str, str]) -> dict[str, str]:
         return {k: v for k, v in table.items() if len(v) <= max_answer_chars}
 
-    def make(qtype: str, question: str, answer: str) -> FileNeedleSample:
+    def make(
+        qtype: str, question: str, answer: str, span_text: str | None = _SELF,
+    ) -> FileNeedleSample:
         return FileNeedleSample(
             qtype=qtype,
             question=question,
             answer=answer,
+            span_text=answer if span_text is _SELF else span_text,
             blob_header=render_header(
                 "tool", source=source_label, stats=f"{n_lines} lines", query=question
             ),
         )
 
     defs = short(defined_symbols(text))
-    for sym in rng.sample(sorted(defs), min(max_per_type, len(defs))):
+    signature_syms = rng.sample(sorted(defs), min(max_per_type, len(defs)))
+    for sym in signature_syms:
         samples.append(
             make(
                 "signature",
@@ -136,15 +166,25 @@ def generate_file_samples(
             make("needle_token", f"Quote the line in this file that mentions `{w}`.", uniq[w])
         )
 
-    if absent_symbols:
-        candidates = [s for s in absent_symbols if s not in text]
-        if candidates:
-            sym = rng.choice(candidates)
+    # PRESENCE, BALANCED. Identical question form for both classes, so the
+    # answer cannot be produced from the question alone — see the module
+    # docstring for what the negatives-only version was measuring instead.
+    absent_pool = [s for s in (absent_symbols or []) if s not in text]
+    present_pool = [s for s in sorted(defs) if s not in signature_syms]
+    classes = [c for c, pool in (("absent", absent_pool), ("present", present_pool)) if pool]
+    if classes:
+        cls = rng.choice(classes)
+        sym = rng.choice(absent_pool if cls == "absent" else present_pool)
+        question = f"Is `{sym}` defined in this file? If so, quote its definition line."
+        if cls == "absent":
             samples.append(
                 make(
-                    "absent",
-                    f"Is `{sym}` defined in this file? If so, quote its definition line.",
+                    "presence_absent",
+                    question,
                     f"No — `{sym}` is not defined in this file.",
+                    span_text=None,
                 )
             )
+        else:
+            samples.append(make("presence_present", question, defs[sym]))
     return samples
