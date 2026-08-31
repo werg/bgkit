@@ -162,6 +162,35 @@ See `configs/model/survivorship_head.yaml` and the per-level `survivorship.l{0,1
 
 **Checkpoint registry note (split-L0/L1 layout)**: `BgKITEncoder.from_pretrained_with_state_dict` loads new-layout state dicts directly (keys like `l0.backbone.*`, `l0.head.*`, `l0.threshold.*`, `l0.auto_repro_head.*`, `l1.backbone.*`, `l1.head.*`, `l1.threshold.*`, `projection_block.*`). For one-time migration of pre-2026-05 `compressor.*` checkpoints, use `from_pretrained_legacy_step4_checkpoint` — it copies the legacy backbone into both `l0.backbone` and `l1.backbone`, preserves the legacy threshold controllers + `auto_repro_head` + tanh temperatures, and DROPS the legacy block-1 heads (`compressor.head_base_l{0,1}`) since the new heads fire at the last block and need re-training.
 
+## The encoder→decoder interface contract (2026-08-31)
+
+**What happened.** Phase-2 wide-net training collapsed the encoder's output to rank 1 per document. Measured with `scripts/probe_rep_distinguishability.py` (128 eval docs, no decoder in the loop — split each document's survivors into disjoint parity halves, pool, and ask whether half A retrieves half B):
+
+| | reps top-1 (chance .008) | eff rank / doc | shared_frac | corpus-whitened top-1 |
+|---|---|---|---|---|
+| Phase-1 base step51945 | 0.898 | 12.97 | 0.927 | 0.953 |
+| widenet v5 step31 | 0.891 | 12.68 | 0.936 | — |
+| widenet v5b step655 | 0.383 | 1.48 | 0.956 | 0.719 |
+| widenet v5b step836 | 0.008 | 1.34 | 0.991 | 0.672 |
+| widenet v6 step1375 | 0.062 | 1.01 | 0.990 | 0.922 |
+| widenet v8 step2999 | 0.031 | 1.01 | 0.990 | 0.953 |
+| raw doc embeddings | 0.688 | 17.3 | 0.225 | 0.875 |
+
+**The content never left.** Whitening retrieves v8's document perfectly (noise-whitened 1.000), so this is an EXPOSURE problem, not a content problem — the two call for opposite fixes, which is why the probe measures them apart. 99% of every survivor's energy became one vector, identical across the corpus (cosine 1.00000 to the corpus mean), leaving the document-specific part at ~1% of the norm. That is why the 33× retention sweep was flat and why rescaling reps bought +0.001: rescale fixes magnitude, and the defect was rank.
+
+**Why it was reachable.** `ProjectionBlock._project`'s `enforce_output_norm` rescale holds the emitted norm fixed, so growing a shared component shrinks the content's share of the emitted direction at no cost in norm. For a decoder whose loss was dominated by a rep-independent copy task, muting the reps is a descent direction. v1–v4 spliced nothing (`is_head` misrouting) and are bit-identical to the base; v5 began splicing and the rank went within ~800 steps. Ruled out by direct state-dict measurement: `survive_embedding` (norm 3.3, cosine −0.01 to the corpus mean), the projection head (|W|/√D 0.3886→0.3887, |b| 3.0913 constant), and the L0→L1 bridge (1.2904→1.2906). L0's last-block output is already rank-1 before either linear map runs.
+
+**Why nothing caught it.** The decoder's splice guard measured SCALE only, and the rescale kept the norm in band throughout. The bridge guard's reference lived in a module global that re-anchored on every process start, so a 484→70985 runaway spread over many runs never moved any single run by its 2× band.
+
+**Now in place:**
+
+- `bgkit.models.interface_norm.DecoderInterfaceNorm` — opt-in contract at the projection output. Per-channel standardisation against an EMA reference (not the batch: gradients flow only through the numerator and train/eval read the same reference; the first calibration runs in either mode so an eval-only load cannot standardise by (0, 1)), then rescale to the decoder's own `embed_tokens` row norm. Enable with `model.encoder.interface_norm: true`; the target is read per decoder family at setup (Qwen3.5 0.627, Falcon-H1 3.297 — one shared number would start a family's gain in the wrong place). It REPLACES `enforce_output_norm` where on; the two would fight.
+- `decoder.py::_rep_rank_stats` — the sampled splice guard now logs `eff_rank` (participation ratio of the CENTRED payload) and `shared_frac` beside the norm, and warns `spliced_rep_rank_collapsed` below `BGKIT_REP_EFF_RANK_LO` (default 2.0). Log-only: unlike the norm band the healthy operating point is not established across lineages.
+- `BgKITEncoder.bridge_scale_reference` — a buffer that rides in the checkpoint, seeded once and never re-seeded, so the bridge guard is anchored to the LINEAGE. Both bridge sites call `encoder.observe_bridge_scale(...)`.
+- `scripts/eval_phase2_kb.py +eval.ablation_sweep=[none,zeroed,full_text]` — scores one fixed sample list under every arm and emits `ceiling`: per dataset and overall, `fraction_captured = (reps − floor) / (ceiling − floor)`. A reps score alone says nothing; v8's pooled token-F1 of 0.386 sat between a 0.386 floor and a 0.752 ceiling. Teacher forcing now also reports `answer_exact_match`.
+
+**Two muting routes, two different signatures.** Growing a constant shows up as rank collapse; driving the interface gain to zero does not (effective rank is scale-invariant) and shows up on the norm guard's absolute floor. Read both events.
+
 **Known limitations**:
 - **Phase 2 KB ratio-conditioning regression** (pending separate design pass): removing the ratio embedding means the encoder backbone no longer adapts representation per ratio. For Phase 2 KB with per-query ratios in the Pareto sweep at [0.5, 0.1, 0.05, 0.02, 0.01], this likely hurts ablation numbers at extreme ratios. See `docs/survivorship_design.md §Phase 2 KB regression` for the constraint and possible mitigations.
 
