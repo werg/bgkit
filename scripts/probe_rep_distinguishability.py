@@ -27,6 +27,9 @@ Run at three stages of the same forward, so a failure localises:
             full-text arm actually spends)
   l1_input  the packed L1 input: L0 survivors + pinned id-token embeddings
             (i.e. everything L0 and the bridge have already decided)
+  l1_in@k   the SAME vectors subsampled to the rep count, so an l1_input ->
+            reps drop cannot be read off a pooling-sample-size difference:
+            pooling 10x more vectors estimates a mean 10x better all on its own
   reps      the final projected L1 survivors -- what the decoder is spliced
 
   raw high, l1_input high, reps at chance -> the collapse is L1 + projection.
@@ -103,19 +106,26 @@ def _shared_energy(x: torch.Tensor) -> dict:
 
 
 def _halves(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Mean-pool disjoint parity halves, L2-normalised. None if too few rows."""
+    """Mean-pool disjoint parity halves. None if too few rows.
+
+    Returned UNNORMALISED; the retrieval path normalises, and the whitening
+    path needs the raw scale to estimate a covariance.
+    """
     if x.shape[0] < 4:
         return None
-    a = x[0::2].float().mean(dim=0)
-    b = x[1::2].float().mean(dim=0)
-    return (
-        a / a.norm().clamp_min(1e-6),
-        b / b.norm().clamp_min(1e-6),
-    )
+    return x[0::2].float().mean(dim=0), x[1::2].float().mean(dim=0)
+
+
+def _unit(x: torch.Tensor) -> torch.Tensor:
+    return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
 def _retrieval(a: torch.Tensor, b: torch.Tensor) -> dict:
-    """Top-1 / MRR for matching each row of ``a`` to its own row of ``b``."""
+    """Top-1 / MRR for matching each row of ``a`` to its own row of ``b``.
+
+    Rows must already be L2-normalised; the caller decides what transform
+    they were normalised after.
+    """
     m = a.shape[0]
     sim = a @ b.T  # (M, M)
     order = sim.argsort(dim=-1, descending=True)
@@ -134,17 +144,95 @@ def _retrieval(a: torch.Tensor, b: torch.Tensor) -> dict:
     }
 
 
+def _reweighted_retrieval(
+    a: torch.Tensor, b: torch.Tensor, shrink: float = 0.05, max_dims: int = 64,
+) -> dict:
+    """Is the document signal ABSENT from these vectors, or merely drowned?
+
+    Cosine retrieval is a FIXED metric, and a low score has two very
+    different causes that call for opposite fixes -- build the content, or
+    expose it -- so the probe must tell them apart.
+
+    Two re-weightings, both fitted on one half of the documents and scored on
+    the other half. Fitting on the documents you score lets the transform
+    memorise them and reports a high number for any input at all, which is
+    the standard way this measurement goes wrong.
+
+    ``corpus``  centre by the corpus mean and equalise the ACROSS-document
+                covariance. This is the transform a fixed centre-and-whiten
+                layer at the decoder interface could apply, so it answers
+                "could an affine fix at the interface have recovered this?"
+    ``noise``   equalise the WITHIN-document covariance, estimated from the
+                two halves of the same document (``a_i - b_i``), which is
+                pure nuisance by construction. Directions along which one
+                document's own halves disagree get down-weighted; what
+                survives is document-specific structure. This is the
+                Fisher-style answer to "is the information in there at all?"
+
+    Both run inside a PCA subspace fitted on the training documents. A
+    1024-dimensional covariance estimated from a few hundred samples is rank
+    deficient, and whitening it would divide the unfitted directions by a
+    regularisation constant rather than by anything measured -- amplifying
+    whatever noise happens to lie there and reporting it as signal.
+    """
+    m = a.shape[0]
+    if m < 16:
+        return {}
+    tr = torch.arange(0, m, 2)
+    te = torch.arange(1, m, 2)
+    k = int(min(max_dims, tr.numel() // 3, a.shape[-1]))
+    if k < 2:
+        return {}
+
+    fit = torch.cat([a[tr], b[tr]], dim=0)
+    mu = fit.mean(dim=0, keepdim=True)
+
+    def _cov(x: torch.Tensor) -> torch.Tensor:
+        xc = x - x.mean(dim=0, keepdim=True)
+        return (xc.T @ xc) / max(1, xc.shape[0] - 1)
+
+    # PCA basis from the across-document covariance of the training docs.
+    evals, evecs = torch.linalg.eigh(_cov(fit))
+    basis = evecs[:, -k:]  # (D, k), ascending eigenvalues
+    corpus_var = evals[-k:].clamp_min(1e-12)
+
+    def _proj(x: torch.Tensor) -> torch.Tensor:
+        return (x - mu) @ basis
+
+    def _whitener(cov: torch.Tensor) -> torch.Tensor:
+        # Regularise against the MEDIAN eigenvalue, not the mean. A handful
+        # of nuisance directions carry orders of magnitude more variance than
+        # the rest, so a mean-scaled floor is set by those directions alone
+        # and swamps every direction the whitening is supposed to keep.
+        ev, evec = torch.linalg.eigh(cov)
+        lam = shrink * float(ev.clamp_min(0).median().clamp_min(1e-12))
+        return evec @ torch.diag((ev.clamp_min(0) + lam).rsqrt()) @ evec.T
+
+    # Halved: var(a_i - b_i) sums the two halves' independent nuisance.
+    w_noise = _whitener(_cov(_proj(a[tr]) - _proj(b[tr])) / 2.0)
+    w_corpus = torch.diag(corpus_var.rsqrt())
+
+    pa, pb = _proj(a[te]), _proj(b[te])
+    out = {
+        "n_heldout": int(te.numel()),
+        "pca_dims": k,
+        "raw_heldout": _retrieval(_unit(a[te]), _unit(b[te])),
+    }
+    for name, w in (("corpus", w_corpus), ("noise", w_noise)):
+        out[f"{name}_whitened_heldout"] = _retrieval(_unit(pa @ w), _unit(pb @ w))
+    return out
+
+
 def collect(trainer: KRKBTrainer, n_samples: int) -> dict:
     ds = trainer.eval_dataset
     dec = getattr(trainer, "decoder", None) or next(iter(trainer.decoders.values()))
     dec_hidden = int(dec.backbone.get_input_embeddings().weight.shape[-1])
 
-    stages: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {
-        "raw": [], "l1_input": [], "reps": [],
-    }
-    within: dict[str, list[float]] = {"raw": [], "l1_input": [], "reps": []}
-    shared: dict[str, list[float]] = {"raw": [], "l1_input": [], "reps": []}
-    doc_means: dict[str, list[torch.Tensor]] = {"raw": [], "l1_input": [], "reps": []}
+    names = ("raw", "l1_input", "l1_in@k", "reps")
+    stages: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {k: [] for k in names}
+    within: dict[str, list[float]] = {k: [] for k in names}
+    shared: dict[str, list[float]] = {k: [] for k in names}
+    doc_means: dict[str, list[torch.Tensor]] = {k: [] for k in names}
     datasets: list[str] = []
     used = 0
     raw_failures = 0
@@ -185,7 +273,20 @@ def collect(trainer: KRKBTrainer, n_samples: int) -> dict:
                 except Exception:
                     raw_failures += 1
 
-            per_stage = {"reps": reps, "l1_input": content, "raw": raw}
+            # Count control: evenly spaced rows, not the first k -- L1 input
+            # is ordered id-tokens-then-survivors per article, so a prefix
+            # would be all ids and no content.
+            k = reps.shape[0]
+            if k >= content.shape[0]:
+                content_k = content
+            else:
+                pick = torch.linspace(
+                    0, content.shape[0] - 1, k, device=content.device,
+                ).round().long().unique()
+                content_k = content[pick]
+            per_stage = {
+                "reps": reps, "l1_input": content, "l1_in@k": content_k, "raw": raw,
+            }
             pooled = {k: (_halves(v) if v is not None else None)
                       for k, v in per_stage.items()}
             # Require every stage present so the three columns are measured on
@@ -210,8 +311,9 @@ def collect(trainer: KRKBTrainer, n_samples: int) -> dict:
     for k, pairs in stages.items():
         a = torch.stack([p[0] for p in pairs])
         b = torch.stack([p[1] for p in pairs])
-        r = _retrieval(a, b)
-        r["eff_rank_across"] = _participation_ratio(a)
+        r = _retrieval(_unit(a), _unit(b))
+        r["whitening"] = _reweighted_retrieval(a, b)
+        r["eff_rank_across"] = _participation_ratio(_unit(a))
         wv = [w for w in within[k] if w == w]
         r["eff_rank_within"] = (sum(wv) / len(wv)) if wv else None
         sv = shared[k]
@@ -263,8 +365,8 @@ def collect(trainer: KRKBTrainer, n_samples: int) -> dict:
             continue
         out["by_dataset"][name] = {
             k: _retrieval(
-                torch.stack([stages[k][j][0] for j in idxs]),
-                torch.stack([stages[k][j][1] for j in idxs]),
+                _unit(torch.stack([stages[k][j][0] for j in idxs])),
+                _unit(torch.stack([stages[k][j][1] for j in idxs])),
             )
             for k in stages
         }
@@ -276,25 +378,42 @@ def collect(trainer: KRKBTrainer, n_samples: int) -> dict:
 def main(cfg: DictConfig) -> None:
     setup_logging()
     diag = cfg.get("diag", {}) or {}
-    ckpt = diag.get("checkpoint")
+    ckpts = [str(c) for c in (diag.get("checkpoints") or [])]
+    if diag.get("checkpoint"):
+        ckpts.insert(0, str(diag.get("checkpoint")))
     n = int(diag.get("n_samples", 96))
-    if not ckpt:
-        raise SystemExit("pass +diag.checkpoint=/path/to/checkpoint")
+    if not ckpts:
+        raise SystemExit("pass +diag.checkpoint=PATH or +diag.checkpoints='[A,B]'")
 
     trainer = KRKBTrainer(cfg)
     trainer.setup()
-    _meta, state = load_checkpoint(Path(str(ckpt)))
-    restore_model_state_lenient(trainer, state)
-    trainer.model.eval()
 
-    res = collect(trainer, n)
+    all_res: dict[str, dict] = {}
+    for ckpt in ckpts:
+        # Lenient + disclosed: the Phase-1 base predates l1l1_bridge, which is
+        # provably off this path (recursive_l1_tree is None).
+        _meta, state = load_checkpoint(Path(ckpt))
+        restore_model_state_lenient(trainer, state)
+        trainer.model.eval()
+        res = collect(trainer, n)
+        all_res[ckpt] = res
+        report(ckpt, res)
+    blob = json.dumps(all_res, indent=2, default=str)
+    dest = diag.get("out")
+    if dest:
+        Path(str(dest)).write_text(blob)
+        print(f"wrote {dest}")
+    print("\nDISTINGUISHABILITY JSON", blob)
+
+
+def report(ckpt: str, res: dict) -> None:
     print(f"\ncheckpoint: {ckpt}")
     print(f"documents:  {res.get('samples')}")
     hdr = f"{'stage':<10}{'top1':>8}{'chance':>8}{'MRR':>8}{'med_rank':>10}" \
           f"{'rank_across':>13}{'rank_within':>13}{'offdiag_cos':>13}" \
           f"{'shared_frac':>13}{'doc~corpus':>12}"
     print(hdr)
-    for k in ("raw", "l1_input", "reps"):
+    for k in ("raw", "l1_input", "l1_in@k", "reps"):
         r = res.get(k)
         if not r:
             continue
@@ -312,12 +431,27 @@ def main(cfg: DictConfig) -> None:
     print("shared_frac = fraction of a document's rep energy carried IDENTICALLY")
     print("by every one of its survivors; doc~corpus = how much of that shared")
     print("part is the SAME vector for every document.")
-    blob = json.dumps(res, indent=2, default=str)
-    dest = diag.get("out")
-    if dest:
-        Path(str(dest)).write_text(blob)
-        print(f"wrote {dest}")
-    print("\nDISTINGUISHABILITY JSON", blob)
+    print()
+    print(f"{'stage':<10}{'raw_top1':>10}{'corpusW':>10}{'noiseW':>10}"
+          f"{'raw_MRR':>10}{'corpusW':>10}{'noiseW':>10}   (held-out docs)")
+    for k in ("raw", "l1_input", "l1_in@k", "reps"):
+        w = (res.get(k) or {}).get("whitening") or {}
+        if not w:
+            continue
+        print(f"{k:<10}{w['raw_heldout']['top1']:10.3f}"
+              f"{w['corpus_whitened_heldout']['top1']:10.3f}"
+              f"{w['noise_whitened_heldout']['top1']:10.3f}"
+              f"{w['raw_heldout']['mrr']:10.3f}"
+              f"{w['corpus_whitened_heldout']['mrr']:10.3f}"
+              f"{w['noise_whitened_heldout']['mrr']:10.3f}")
+    print()
+    print("noiseW >> raw means the document signal IS in the reps and cosine")
+    print("simply cannot see it -- an EXPOSURE problem, fixable at the interface")
+    print("or by a metric the decoder can learn. noiseW ~ raw ~ chance means the")
+    print("content is not there at all -- a CONTENT problem, fixable only by an")
+    print("objective that requires the reps to carry the document.")
+    print("corpusW says whether a FIXED centre-and-whiten at the interface would")
+    print("have been enough on its own.")
 
 
 if __name__ == "__main__":

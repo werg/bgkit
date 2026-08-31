@@ -50,17 +50,70 @@ def test_participation_ratio_ignores_a_constant_offset():
     )
 
 
-def test_halves_are_disjoint_and_unit_norm():
+def test_halves_are_disjoint_and_unnormalised():
+    """Unnormalised on purpose: the whitening path estimates a covariance
+    from these, and normalising first would discard the scale it needs."""
     x = torch.randn(9, 6)
     a, b = probe._halves(x)
-    assert a.norm() == pytest.approx(1.0, abs=1e-5)
-    assert b.norm() == pytest.approx(1.0, abs=1e-5)
-    ea = x[0::2].float().mean(dim=0)
-    torch.testing.assert_close(a, ea / ea.norm(), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(a, x[0::2].float().mean(dim=0))
+    torch.testing.assert_close(b, x[1::2].float().mean(dim=0))
 
 
-def test_halves_refuses_too_few_rows():
-    assert probe._halves(torch.randn(3, 6)) is None
+def _buried(sig: float, seed: int, m: int = 192, d: int = 128):
+    """A corpus-constant vector, a few high-variance per-half nuisance
+    directions, and a document signal of size ``sig`` -- the measured
+    pathology in miniature. ``sig=0`` is the same setup with no signal."""
+    torch.manual_seed(seed)
+    shared = torch.randn(d) * 300.0
+    nuisance = torch.linalg.qr(torch.randn(d, d))[0][:6]
+    content = torch.randn(m, d) * sig
+
+    def half():
+        return (
+            shared
+            + content
+            + (torch.randn(m, 6) * 12.0) @ nuisance
+            + 0.05 * torch.randn(m, d)
+        )
+
+    return probe._reweighted_retrieval(half(), half())
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_noise_whitening_recovers_a_signal_cosine_cannot_see(seed):
+    w = _buried(0.3, seed)
+    assert w["raw_heldout"]["top1"] < 0.1
+    assert w["noise_whitened_heldout"]["top1"] > 0.8
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_no_reweighting_invents_a_signal_that_is_absent(seed):
+    """The other half of the discrimination. Without this the probe could
+    report 'the information is in there' for any input at all."""
+    w = _buried(0.0, seed)
+    assert w["noise_whitened_heldout"]["top1"] < 0.15
+    assert w["corpus_whitened_heldout"]["top1"] < 0.15
+
+
+def test_reweighting_fits_and_scores_on_disjoint_documents():
+    w = probe._reweighted_retrieval(torch.randn(64, 32), torch.randn(64, 32))
+    assert w["n_heldout"] == 32
+    for k in ("raw_heldout", "corpus_whitened_heldout", "noise_whitened_heldout"):
+        assert w[k]["n_docs"] == 32
+
+
+def test_reweighting_stays_inside_a_fitted_subspace():
+    """A covariance estimated from a few hundred samples in 1024 dimensions is
+    rank deficient; whitening the unfitted directions divides by the
+    regulariser rather than by anything measured. The PCA cap is what keeps
+    that from being reported as signal."""
+    w = probe._reweighted_retrieval(torch.randn(64, 512), torch.randn(64, 512))
+    assert w["pca_dims"] <= 32 // 3 + 1
+    assert w["pca_dims"] >= 2
+
+
+def test_reweighting_skips_when_there_are_too_few_documents():
+    assert probe._reweighted_retrieval(torch.randn(12, 12), torch.randn(12, 12)) == {}
 
 
 def test_retrieval_is_perfect_when_halves_match():
