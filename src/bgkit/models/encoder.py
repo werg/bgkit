@@ -208,7 +208,7 @@ def _make_projection_blocks(
     hidden_dim: int,
     num_layers: int = 1,
     interface_norm: bool = False,
-    interface_target_row_norm: float = 1.0,
+    interface_target_row_norm: float | dict[str, float] = 1.0,
     interface_momentum: float = 0.01,
 ) -> nn.ModuleDict:
     """Build one ProjectionBlock per decoder family.
@@ -217,8 +217,10 @@ def _make_projection_blocks(
     (:class:`bgkit.models.interface_norm.DecoderInterfaceNorm`): the emitted
     rows are standardised against slowly-moving statistics and rescaled to
     ``interface_target_row_norm``, which should be the target decoder's mean
-    ``embed_tokens`` row norm. Off by default -- turning it on changes what
-    every existing checkpoint's decoder receives.
+    ``embed_tokens`` row norm. Pass a mapping to give each decoder family its
+    own -- Qwen3.5's and Falcon-H1's embedding scales differ, and one shared
+    number would start one family's gain in the wrong place. Off by default:
+    turning it on changes what every existing checkpoint's decoder receives.
 
     ``num_layers`` controls how deep each projection block is. Extra layers
     beyond the head are deepcopies of the popped backbone layer, so they
@@ -262,7 +264,11 @@ def _make_projection_blocks(
             output_split_factor=split,
             output_dim=decoder_hidden,
             interface_norm=interface_norm,
-            interface_target_row_norm=interface_target_row_norm,
+            interface_target_row_norm=(
+                float(interface_target_row_norm[family])
+                if isinstance(interface_target_row_norm, dict)
+                else float(interface_target_row_norm)
+            ),
             interface_momentum=interface_momentum,
         )
     return nn.ModuleDict(blocks)
@@ -741,7 +747,7 @@ class BgKITEncoder(nn.Module):
         active_decoder_family: str = "qwen35",
         projection_num_layers: int = 1,
         interface_norm: bool = False,
-        interface_target_row_norm: float = 1.0,
+        interface_target_row_norm: float | dict[str, float] = 1.0,
         interface_momentum: float = 0.01,
     ) -> BgKITEncoder:
         if isinstance(backbone_name_or_module, str):
@@ -851,7 +857,7 @@ class BgKITEncoder(nn.Module):
         active_decoder_family: str = "qwen35",
         projection_num_layers: int = 1,
         interface_norm: bool = False,
-        interface_target_row_norm: float = 1.0,
+        interface_target_row_norm: float | dict[str, float] = 1.0,
         interface_momentum: float = 0.01,
     ) -> BgKITEncoder:
         layers = _resolve_layers(text_model)
@@ -919,7 +925,7 @@ class BgKITEncoder(nn.Module):
         active_decoder_family: str = "qwen35",
         projection_num_layers: int = 1,
         interface_norm: bool = False,
-        interface_target_row_norm: float = 1.0,
+        interface_target_row_norm: float | dict[str, float] = 1.0,
         interface_momentum: float = 0.01,
     ) -> BgKITEncoder:
         """Construct an encoder and load a state dict in the new split-L0/L1 layout.

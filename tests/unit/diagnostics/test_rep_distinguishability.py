@@ -182,3 +182,43 @@ def test_shared_energy_returns_the_mean_vector_it_measured():
     torch.testing.assert_close(
         probe._shared_energy(x)["mean_vec"], x.float().mean(dim=0),
     )
+
+
+def test_diagonal_whitening_is_reported_and_is_weaker_than_a_rotation():
+    """The diag arm must be the SHIPPED transform (centre + per-channel scale),
+    not a stand-in for the full whitening. A signal that lives in a rotated
+    direction is recoverable by corpusW and not by diagW, and conflating them
+    would report the shipped fix as sufficient when it is not."""
+    torch.manual_seed(0)
+    m, d = 192, 32
+    # Signal along a direction that no single channel isolates, buried under
+    # per-channel nuisance of equal size in every channel -- so scaling
+    # channels cannot separate them and only a rotation can.
+    direction = torch.randn(d)
+    direction = direction / direction.norm()
+    coeff = torch.randn(m, 1)
+    shared = torch.randn(d) * 300.0
+
+    def half():
+        return shared + coeff * direction * 3.0 + torch.randn(m, d) * 3.0
+
+    w = probe._reweighted_retrieval(half(), half())
+    assert "diag_whitened_heldout" in w
+    assert w["corpus_whitened_heldout"]["top1"] > w["diag_whitened_heldout"]["top1"]
+
+
+def test_diagonal_whitening_recovers_a_per_channel_burial():
+    """And when the burial IS per-channel, the shipped transform must suffice
+    -- otherwise the arm would always understate it."""
+    torch.manual_seed(1)
+    m, d = 192, 32
+    shared = torch.randn(d) * 300.0
+    scale = torch.cat([torch.full((4,), 60.0), torch.full((d - 4,), 0.05)])
+    content = torch.randn(m, d)
+
+    def half():
+        return shared + content + torch.randn(m, d) * scale
+
+    w = probe._reweighted_retrieval(half(), half())
+    assert w["raw_heldout"]["top1"] < 0.3
+    assert w["diag_whitened_heldout"]["top1"] > 0.7

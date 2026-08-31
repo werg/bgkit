@@ -158,10 +158,15 @@ def _reweighted_retrieval(
     memorise them and reports a high number for any input at all, which is
     the standard way this measurement goes wrong.
 
-    ``corpus``  centre by the corpus mean and equalise the ACROSS-document
-                covariance. This is the transform a fixed centre-and-whiten
-                layer at the decoder interface could apply, so it answers
-                "could an affine fix at the interface have recovered this?"
+    ``diag``    centre by the corpus mean and divide by each channel's
+                standard deviation -- exactly what
+                :class:`bgkit.models.interface_norm.DecoderInterfaceNorm`
+                applies. This is the arm that says whether the shipped fix is
+                enough on its own, so it is measured rather than assumed.
+    ``corpus``  the same centring but with a FULL covariance whitening, which
+                also rotates. Stronger than anything a per-channel norm can
+                do; if ``corpus`` recovers the document and ``diag`` does not,
+                the interface needs a learned rotation, not just a scale.
     ``noise``   equalise the WITHIN-document covariance, estimated from the
                 two halves of the same document (``a_i - b_i``), which is
                 pure nuisance by construction. Directions along which one
@@ -186,6 +191,7 @@ def _reweighted_retrieval(
 
     fit = torch.cat([a[tr], b[tr]], dim=0)
     mu = fit.mean(dim=0, keepdim=True)
+    chan_std = fit.std(dim=0, keepdim=True).clamp_min(1e-6)
 
     def _cov(x: torch.Tensor) -> torch.Tensor:
         xc = x - x.mean(dim=0, keepdim=True)
@@ -217,6 +223,11 @@ def _reweighted_retrieval(
         "n_heldout": int(te.numel()),
         "pca_dims": k,
         "raw_heldout": _retrieval(_unit(a[te]), _unit(b[te])),
+        # Full width, no PCA: the shipped fix is per-channel and does not get
+        # to pick a subspace, so neither does its arm here.
+        "diag_whitened_heldout": _retrieval(
+            _unit((a[te] - mu) / chan_std), _unit((b[te] - mu) / chan_std),
+        ),
     }
     for name, w in (("corpus", w_corpus), ("noise", w_noise)):
         out[f"{name}_whitened_heldout"] = _retrieval(_unit(pa @ w), _unit(pb @ w))
@@ -451,26 +462,28 @@ def report(ckpt: str, res: dict) -> None:
     print("by every one of its survivors; doc~corpus = how much of that shared")
     print("part is the SAME vector for every document.")
     print()
-    print(f"{'stage':<10}{'raw_top1':>10}{'corpusW':>10}{'noiseW':>10}"
-          f"{'raw_MRR':>10}{'corpusW':>10}{'noiseW':>10}   (held-out docs)")
+    print(f"{'stage':<10}{'raw_top1':>10}{'diagW':>10}{'corpusW':>10}"
+          f"{'noiseW':>10}{'raw_MRR':>10}{'diagW':>10}{'corpusW':>10}"
+          f"{'noiseW':>10}   (held-out docs)")
     for k in ("raw", "l1_input", "l1_in@k", "reps"):
         w = (res.get(k) or {}).get("whitening") or {}
         if not w:
             continue
-        print(f"{k:<10}{w['raw_heldout']['top1']:10.3f}"
-              f"{w['corpus_whitened_heldout']['top1']:10.3f}"
-              f"{w['noise_whitened_heldout']['top1']:10.3f}"
-              f"{w['raw_heldout']['mrr']:10.3f}"
-              f"{w['corpus_whitened_heldout']['mrr']:10.3f}"
-              f"{w['noise_whitened_heldout']['mrr']:10.3f}")
+        cells = ("raw_heldout", "diag_whitened_heldout",
+                 "corpus_whitened_heldout", "noise_whitened_heldout")
+        print(f"{k:<10}"
+              + "".join(f"{w[c]['top1']:10.3f}" for c in cells)
+              + "".join(f"{w[c]['mrr']:10.3f}" for c in cells))
     print()
     print("noiseW >> raw means the document signal IS in the reps and cosine")
     print("simply cannot see it -- an EXPOSURE problem, fixable at the interface")
     print("or by a metric the decoder can learn. noiseW ~ raw ~ chance means the")
     print("content is not there at all -- a CONTENT problem, fixable only by an")
     print("objective that requires the reps to carry the document.")
-    print("corpusW says whether a FIXED centre-and-whiten at the interface would")
-    print("have been enough on its own.")
+    print("diagW is exactly what DecoderInterfaceNorm applies (centre + per-channel")
+    print("scale). corpusW additionally ROTATES. diagW ~ corpusW means the shipped")
+    print("per-channel fix is enough; corpusW >> diagW means the interface needs a")
+    print("learned rotation as well.")
 
 
 if __name__ == "__main__":

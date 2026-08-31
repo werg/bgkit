@@ -1832,12 +1832,33 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         saved_anchors = encoder_state.get("l0.threshold.anchor_ratios")
         if saved_anchors is not None:
             threshold_cfg["anchor_ratios"] = saved_anchors.tolist()
+        # Decoder-interface contract (off unless a run asks for it). Each
+        # family's target is ITS OWN mean embed_tokens row norm, read off the
+        # decoder that is already built at this point: Qwen3.5's and
+        # Falcon-H1's embedding scales differ, and one shared number would
+        # start one family's gain in the wrong place. See
+        # bgkit.models.interface_norm for what this is protecting against.
+        interface_norm = bool(encoder_cfg.get("interface_norm", False))
+        target_row_norms: dict[str, float] = {}
+        if interface_norm:
+            for family, dec in getattr(self, "_decoders_by_family", {}).items():
+                emb = dec.backbone.get_input_embeddings().weight
+                target_row_norms[family] = float(
+                    emb.detach().float().norm(dim=-1).mean().item(),
+                )
+            logger.info(
+                "phase2_kb_interface_norm_enabled",
+                target_row_norms={k: round(v, 5) for k, v in target_row_norms.items()},
+            )
         self.encoder = BgKITEncoder.from_pretrained_with_state_dict(
             encoder_cfg.get("backbone_name", "Qwen/Qwen3.5-0.8B-Base"),
             encoder_state,
             hidden_dim=int(encoder_cfg.get("hidden_dim", 1024)),
             active_decoder_family=getattr(self, "_decoder_family", "qwen35"),
             threshold_controller_cfg=threshold_cfg or None,
+            interface_norm=interface_norm,
+            interface_target_row_norm=target_row_norms or 1.0,
+            interface_momentum=float(encoder_cfg.get("interface_momentum", 0.01)),
         ).to(self.device)
 
         # Load the co-trained decoder(s) from the SAME Phase-1 checkpoint (the
