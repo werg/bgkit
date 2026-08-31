@@ -51,6 +51,19 @@
 # re-expanded to the decoder's scale no matter how large the constant grows.
 # It also replaces the rescale where enabled; the two would fight.
 #
+# WHAT COULD STILL GO WRONG, and how it would show. The contract's gain/shift
+# are trainable (they sit in the projection param group, which round_robin
+# puts in the optimizer at projection_lr), so the model could mute by driving
+# the gain toward zero instead of by growing a constant. That is a DIFFERENT
+# signature and a different guard: gain -> 0 shows up as the splice norm
+# guard's absolute floor, not as rank, because effective rank is
+# scale-invariant. Both routes are instrumented; watch both events, not just
+# the rank one. The gain is left trainable on purpose -- the lineage's reps
+# operate at ~27x the embedding norm and the right target is not obviously 1x,
+# so a learnable scale starting at 1x is the honest way to carry that
+# uncertainty. `affine: false` in DecoderInterfaceNorm makes it a fixed
+# contract if the trainable version turns out to mute.
+#
 # COLD START FROM THE PHASE-1 BASE, not from v8: the base's encoder is the one
 # whose reps still identify their document, and the question is whether the
 # contract keeps it that way through the window where v5b lost it (~step 650
