@@ -750,6 +750,14 @@ services:
     restart: "no"
     command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v10_reconstruct"]
 
+  # Wide-net v11: reconstruction made learnable (shorter spans + its own L0
+  # retention curriculum). Cold start from the Phase-1 base; no resume pin.
+  train-phase2-kb-widenet-v11-reconstruct-learnable:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py",
+      "+experiment=phase2_kb_widenet_v11_reconstruct_learnable"]
+
   # Long-prose semantic fact recall (babilong_style) alongside the code
   # wide-net datasets; the zero-shot BABILong arm scored 0.00 on every cell
   # (2026-08-25), teacher-forced and free-running alike.
