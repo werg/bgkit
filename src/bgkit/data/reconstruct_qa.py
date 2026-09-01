@@ -139,11 +139,20 @@ def generate_reconstruct_samples(
     verbatim from 1.5% of a document is not a test of whether the reps carry
     content.
 
-    60-300 characters is still far above the guessing floor -- random spans
-    from different files score 0.021 against each other -- and is a length a
+    60-300 characters is still far above the guessing floor and is a length a
     model can actually reach. An unlearnable task measures nothing: a rep_gain
     computed between two arms that are both at floor reads zero for a reason
     that has nothing to do with the reps.
+
+    TWO FLOORS, and the higher one governs. Measured on the shipped spans:
+    random spans from different files score token_f1 0.012 against each other,
+    but THE QUESTION scores 0.117 against its own answer, because the anchored
+    form names one line of the file verbatim. So a model that echoes the anchor
+    and reads nothing scores 0.117, and any claim that this family has been
+    learned has to clear that, not the cross-document number. Shortening the
+    spans LOWERED the cross-document floor (0.023 -> 0.012, fewer tokens means
+    less incidental overlap) and left the echo floor where it was, since the
+    anchor is a fixed cost.
     """
     lines = text.split("\n")
     n_lines = len(lines)

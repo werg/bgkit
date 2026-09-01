@@ -30,9 +30,15 @@
 # to both arms. An unlearnable task measures nothing, however well instrumented.
 #
 # WHAT TO WATCH, in order:
-#   1. eval/kb/free_running/reconstruct/answer_token_f1 must clear 0.021, the
-#      measured floor. Until it does, nothing else about this family means
-#      anything -- that is the lesson of v10, not a caveat on it.
+#   1. eval/kb/free_running/reconstruct/answer_token_f1 must clear 0.117.
+#      NOT 0.021. Two floors were measured on the v2 spans and the higher one
+#      governs: random spans from different files score 0.012 against each
+#      other, but THE QUESTION ITSELF scores 0.117 against its own answer,
+#      because the anchored form names one line of the file. A model that
+#      merely echoes the anchor clears 0.021 five times over while reading
+#      nothing. (v10's reconstruct sat at 0.025 -- below even the echo level,
+#      so it was not parroting the anchor either, it was producing noise.)
+#      Until this clears 0.117, nothing else about this family means anything.
 #   2. Generative rep_gain per dataset from the post-run sweep
 #      (+eval.free_running_arms=[zeroed]). The ONLY honest rep_gain for a
 #      long-answer family; teacher forcing cannot see it.
