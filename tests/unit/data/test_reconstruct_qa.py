@@ -156,15 +156,29 @@ def test_spans_vary_across_documents_of_the_same_shape():
 
 
 def test_answers_are_long_enough_not_to_be_guessable():
+    """60 chars, not 120: random spans from different files score token_f1
+    0.021 against each other, so 60 is already far above the guessing floor,
+    while 266 (the first cut's p50) proved unlearnable -- generative F1 0.025
+    after 750 steps. An unlearnable task measures nothing."""
     for seed in range(20):
         for s in _samples(seed):
-            assert len(s.answer) >= 120
+            assert len(s.answer) >= 60
 
 
 def test_answers_are_capped_so_one_family_cannot_own_the_loss():
     for seed in range(20):
         for s in _samples(seed, max_chars=400):
             assert len(s.answer) <= 400
+
+
+def test_the_default_span_is_short_enough_to_be_learnable():
+    """The v10 lesson in a test. 4-12 lines at p50 266 chars produced
+    generative F1 0.025 after 750 steps -- indistinguishable from the 0.021
+    floor -- while every other family learned."""
+    lengths = [len(s.answer) for seed in range(30) for s in _samples(seed)]
+    assert lengths
+    assert max(lengths) <= 300
+    assert sorted(lengths)[len(lengths) // 2] <= 200
 
 
 def test_blank_and_punctuation_only_spans_are_rejected():

@@ -116,10 +116,10 @@ def generate_reconstruct_samples(
     source_label: str,
     rng: random.Random,
     n_samples: int = 4,
-    min_lines: int = 4,
-    max_lines: int = 12,
-    min_chars: int = 120,
-    max_chars: int = 900,
+    min_lines: int = 2,
+    max_lines: int = 5,
+    min_chars: int = 60,
+    max_chars: int = 300,
 ) -> list[ReconstructSample]:
     """Span-reconstruction questions for ``text``.
 
@@ -128,6 +128,22 @@ def generate_reconstruct_samples(
     outside ``[min_chars, max_chars]`` is rejected: too short is guessable,
     too long dominates the decoder's loss budget and crowds out every other
     family in the mix.
+
+    THE DEFAULTS WERE HALVED after v10. The first cut asked for 4-12 lines
+    (p50 266 chars) and after 750 steps the model's GENERATIVE token_f1 on
+    this family was 0.025 against a measured cross-document floor of 0.021 --
+    it had learned nothing, while lognav's tripled to 0.589 over the same
+    steps. Two things made it near-impossible rather than merely hard:
+    the span length, and a retention curriculum composing to ~1.5% effective
+    (l0 0.10 x l1 0.15) by the end of the ramp. Reproducing 266 characters
+    verbatim from 1.5% of a document is not a test of whether the reps carry
+    content.
+
+    60-300 characters is still far above the guessing floor -- random spans
+    from different files score 0.021 against each other -- and is a length a
+    model can actually reach. An unlearnable task measures nothing: a rep_gain
+    computed between two arms that are both at floor reads zero for a reason
+    that has nothing to do with the reps.
     """
     lines = text.split("\n")
     n_lines = len(lines)
