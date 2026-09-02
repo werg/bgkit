@@ -203,11 +203,22 @@ training:
     # NOT the same ramp as the others any more. v10 used 0.35->0.10, which
     # composes with the global L1 0.50->0.15 to ~1.5% effective retention --
     # and reproducing a verbatim span from 1.5% of a document is not a test
-    # of whether the reps carry content, it is a test of nothing. 0.60->0.30
-    # composes to ~30% at the start and ~4.5% at the end: a curriculum that
-    # begins possible and tightens. L1 retention is global (no per-dataset
-    # support), so this is the only lever without a trainer change.
-    reconstruct: {start: 0.60, end: 0.30, ramp_steps: 1500}
+    # of whether the reps carry content, it is a test of nothing.
+    #
+    # The START is unchanged from v10 at 0.35, and that is a memory
+    # constraint, not a preference. Effective retention is L0 x L1 and both
+    # descend, so the PEAK is at step 0: the first v11 launch tried
+    # 0.60 -> 0.30 and died at step 5 with CUDA OOM at 73.3 GB against a
+    # 72.98 GB cap, in the decoder SwiGLU forward -- L1 attention is
+    # quadratic in survivor count, and 0.60 x 0.50 = 30% effective nearly
+    # doubled v10's 17.5% peak.
+    #
+    # Only the FLOOR moves, which is the half that mattered: 0.35 -> 0.30
+    # composes to 17.5% at the start (v10's proven-safe peak) and 4.5% at
+    # the end instead of 1.5%. The descent still happens, carried by the
+    # global L1 ramp 0.50 -> 0.15. At 4.5% a 2000-token document leaves ~90
+    # survivor vectors for a ~35-token answer; v10 left ~30 for ~75 tokens.
+    reconstruct: {start: 0.35, end: 0.30, ramp_steps: 1500}
   l1_retention: {start: 0.50, end: 0.15, ramp_steps: 1500}
   selection_mode:
     l0: exact_topk
