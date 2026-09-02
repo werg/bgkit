@@ -39,6 +39,14 @@
 #      nothing. (v10's reconstruct sat at 0.025 -- below even the echo level,
 #      so it was not parroting the anchor either, it was producing noise.)
 #      Until this clears 0.117, nothing else about this family means anything.
+#
+#      BUT READ route_exact FIRST. A generation that never emits a valid tool
+#      call never reaches the reproduction task, so its F1 is capped near zero
+#      for a reason that has nothing to do with the reps. At v11 step 250
+#      reconstruct's route_exact was 0.389 (v10 reached 0.722 by step 750),
+#      with invalid_rate 0.375 dominated by unsurfaced_id -- so its F1 of
+#      0.0088 was measuring ROUTING, not reproduction. The gate is only
+#      interpretable once routing is comparable to the other families'.
 #   2. Generative rep_gain per dataset from the post-run sweep
 #      (+eval.free_running_arms=[zeroed]). The ONLY honest rep_gain for a
 #      long-answer family; teacher forcing cannot see it.
