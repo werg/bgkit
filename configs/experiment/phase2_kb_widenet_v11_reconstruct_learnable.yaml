@@ -249,6 +249,22 @@ training:
     l0: exact_topk
     l1: exact_topk
 
+  # MICROBATCH TAIL CAP. Not a diagnosis -- a bound. v11 reached 74.5 GB by
+  # step 70 against an 80g container cap, where v10 maxed at 71.6 GB over its
+  # whole 1000 steps. Three explanations were tested and all three refuted:
+  # reconstruct's retention (v11's is LOWER), the co-resident GPU job
+  # (cuda_max_allocated is process-local), and microbatch packing (both runs
+  # pack to avg_samples_per_microbatch=3.55 on a 52000-token budget, measured
+  # identical).
+  #
+  # So the cause is unknown, and this caps the TAIL rather than explaining the
+  # mean: a microbatch of many small samples runs that many sequential decoder
+  # backwards, and bounding the count bounds the peak whatever made the
+  # microbatch heavy. Stage B has used 8 for the same reason; 4 is tighter
+  # because live L0 is heavier than Stage B's cached path. Costs a few percent
+  # in step time from the extra splits.
+  max_microbatch_samples: 4
+
   qwen_decoder_prob: 1.0
   training_time_ablation:
     p_skip_bgkit: 0.0
