@@ -218,7 +218,20 @@ training:
     # the end instead of 1.5%. The descent still happens, carried by the
     # global L1 ramp 0.50 -> 0.15. At 4.5% a 2000-token document leaves ~90
     # survivor vectors for a ~35-token answer; v10 left ~30 for ~75 tokens.
-    reconstruct: {start: 0.35, end: 0.30, ramp_steps: 1500}
+    # FLAT at 0.30, and the descent is carried entirely by the global L1 ramp
+    # (0.50 -> 0.15), giving ~15% effective at the start and ~4.5% at the end.
+    #
+    # Measured rather than assumed: at 0.35 the run peaked at 73.7 GB within
+    # 25 steps, ABOVE v10's 71.6 GB maximum over its whole 1000 steps -- so it
+    # would have OOM'd on a heavy batch hours in, which is how the first v11
+    # launch died at step 5. 0.30 puts the peak BELOW the level v10 survived
+    # 1000 steps at.
+    #
+    # Nothing is lost. The start was never what made v10 unlearnable; its END
+    # was, at 0.10 x 0.15 = 1.5% effective. 4.5% is 3x that, and the start
+    # moving 17.5% -> 15% is immaterial to a curriculum whose job is to
+    # descend.
+    reconstruct: 0.30
   l1_retention: {start: 0.50, end: 0.15, ramp_steps: 1500}
   selection_mode:
     l0: exact_topk
