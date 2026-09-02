@@ -221,11 +221,23 @@ training:
     # FLAT at 0.30, and the descent is carried entirely by the global L1 ramp
     # (0.50 -> 0.15), giving ~15% effective at the start and ~4.5% at the end.
     #
-    # Measured rather than assumed: at 0.35 the run peaked at 73.7 GB within
-    # 25 steps, ABOVE v10's 71.6 GB maximum over its whole 1000 steps -- so it
-    # would have OOM'd on a heavy batch hours in, which is how the first v11
-    # launch died at step 5. 0.30 puts the peak BELOW the level v10 survived
-    # 1000 steps at.
+    # CORRECTED, and the correction matters more than the original claim. I
+    # said 0.30 "puts the peak below the level v10 survived 1000 steps at".
+    # It does not: at 0.30 the run reached 72.1 GB by step 30, ABOVE v10's
+    # 71.6 GB lifetime maximum, having read 67.5 GB at step 0. The peak is
+    # essentially insensitive to retention across 0.30-0.35 and is driven by
+    # batch composition, so the second restart bought nothing and the causal
+    # story I attached to it was wrong.
+    #
+    # What IS supported: the first launch at 0.60 -- a 1.7x jump, not a 0.05
+    # one -- OOM'd at step 5. Large retention changes move memory; small ones
+    # are lost in per-batch variance.
+    #
+    # The real constraint is the container's own mem_limit of 80g, which is
+    # what "72.98 GiB allowed" in the OOM referred to. Raising it would trade
+    # a clean container OOM for a HOST OOM, which on this unified-memory box
+    # kills unprotected processes instead of raising an error -- so it stays.
+    # Watch the heartbeat's peakGB; past ~76 GB this run needs intervention.
     #
     # Nothing is lost. The start was never what made v10 unlearnable; its END
     # was, at 0.10 x 0.15 = 1.5% effective. 4.5% is 3x that, and the start
