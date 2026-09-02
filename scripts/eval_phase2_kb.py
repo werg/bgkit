@@ -75,6 +75,19 @@ def _collect_eval_samples(trainer: KRKBTrainer, max_samples: int) -> list:
     return samples
 
 
+def _evenly_spaced(n_total: int, k: int) -> set[int]:
+    """``k`` indices spread across ``range(n_total)``, not the first ``k``.
+
+    The eval set is index-sorted with datasets concatenated, so taking a
+    prefix samples one or two families and silently omits the rest.
+    """
+    if k <= 0 or n_total <= 0:
+        return set()
+    if k >= n_total:
+        return set(range(n_total))
+    return {round(i * (n_total - 1) / (k - 1)) if k > 1 else 0 for i in range(k)}
+
+
 def _score_samples(
     trainer: KRKBTrainer,
     samples: list,
@@ -90,10 +103,18 @@ def _score_samples(
     the sample's index in the list rather than a running counter, so an arm
     that scores fewer samples cannot silently shift the family assignment
     relative to another arm.
+
+    Generation is spread EVENLY over the list, not taken from the front. The
+    eval set is index-sorted with datasets concatenated, so generating the
+    first N samples covers only whichever families come first -- v10's sweep
+    generated 34 fileneedle + 30 lognav and ZERO reconstruct, which is the
+    family the generative measurement existed for. The trainer's own
+    free-running pass fixed this on 2026-08-23 ("64/64 lognav") and this
+    script reintroduced it.
     """
     trainer.model.eval()
     rows: list[dict] = []
-    free_run_done = 0
+    generate_at = _evenly_spaced(len(samples), free_running_limit)
     with torch.no_grad():
         for index, sample in enumerate(samples):
             if getattr(trainer, "_round_robin", False):
@@ -106,7 +127,7 @@ def _score_samples(
             with trainer._teacher_forced_decoders():
                 result = evaluate_sample(trainer, sample)
             free_result = None
-            if free_run_done < free_running_limit:
+            if index in generate_at:
                 free_result = evaluate_free_running_sample(
                     trainer,
                     sample,
@@ -114,7 +135,6 @@ def _score_samples(
                     max_new_tokens=max_new_tokens,
                     force_first_call=force_first_call,
                 )
-                free_run_done += 1
             row = {
                 "dataset": getattr(sample, "dataset_name", ""),
                 "decoder_family": getattr(trainer, "_decoder_family", ""),

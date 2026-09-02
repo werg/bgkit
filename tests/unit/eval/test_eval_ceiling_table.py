@@ -328,3 +328,37 @@ def test_sweep_maps_none_to_the_unablated_arm():
     assert ev._parse_sweep(["NONE", None, ""]) == ["", "", ""]
     assert ev._parse_sweep(None) == []
     assert ev._parse_sweep([]) == []
+
+
+def test_generation_is_spread_over_the_list_not_taken_from_the_front():
+    """The eval set is index-sorted with datasets concatenated, so a prefix
+    covers one or two families. v10's sweep generated 34 fileneedle + 30
+    lognav and ZERO reconstruct -- the family the generative measurement
+    existed for. The trainer fixed this in its own free-running pass on
+    2026-08-23 ("64/64 lognav") and this script reintroduced it."""
+    idx = ev._evenly_spaced(128, 8)
+    assert len(idx) == 8
+    assert max(idx) > 100, "must reach the end of the list, not just the front"
+    assert min(idx) == 0
+
+
+def test_evenly_spaced_covers_every_contiguous_block():
+    """Four datasets concatenated: every quarter must get samples."""
+    idx = ev._evenly_spaced(128, 16)
+    quarters = {i // 32 for i in idx}
+    assert quarters == {0, 1, 2, 3}
+
+
+def test_evenly_spaced_degenerate_cases():
+    assert ev._evenly_spaced(128, 0) == set()
+    assert ev._evenly_spaced(0, 8) == set()
+    assert ev._evenly_spaced(5, 99) == {0, 1, 2, 3, 4}
+    assert ev._evenly_spaced(10, 1) == {0}
+
+
+def test_generation_selection_is_by_index_so_arms_generate_the_same_samples():
+    """Both arms must generate the SAME samples or the gain compares
+    different documents."""
+    a = ev._evenly_spaced(192, 64)
+    b = ev._evenly_spaced(192, 64)
+    assert a == b

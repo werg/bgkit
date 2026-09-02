@@ -34,14 +34,25 @@ def test_the_shared_training_key_is_consulted() -> None:
 
 def test_generation_is_capped_by_a_count_not_a_bare_bool() -> None:
     """A bool can only mean all-or-nothing. The in-training knob is a COUNT, so
-    the script must be one too, or the two configs cannot agree."""
-    src = _source()
-    assert "free_running_limit" in src
-    assert "free_run_done" in src
-    assert re.search(r"if free_run_done < free_running_limit:", src), (
-        "generation must be gated on the running count"
-    )
-    assert "if free_running else None" not in src, "the old bool gate is back"
+    the script must be one too, or the two configs cannot agree.
+
+    Checked through behaviour rather than the source, because the original
+    version pinned a running counter (``free_run_done``) that legitimately
+    disappeared when generation moved to evenly-spaced index selection -- so
+    it failed on an improvement while a genuine regression to a bool would
+    still have passed.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("ev_cap", SCRIPT)
+    ev = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ev)
+
+    assert "free_running_limit" in _source()
+    assert "if free_running else None" not in _source(), "the old bool gate is back"
+    # A count means N of them, for any N -- not all-or-nothing.
+    for k in (0, 1, 7, 64):
+        assert len(ev._evenly_spaced(128, k)) == k
 
 
 def test_resolution_is_logged() -> None:
