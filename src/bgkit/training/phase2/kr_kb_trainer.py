@@ -10343,6 +10343,7 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
         invalid = 0
         seen = 0
         examples_logged = 0
+        examples_by_dataset: dict[str, int] = {}
         self._eval_shared_tree_key = None
         # Evenly spaced over the eval set: it is index-sorted (datasets
         # concatenated), so the first ``max_samples`` would all come from one
@@ -10382,7 +10383,21 @@ class KRKBTrainer(CompressionCurriculumMixin, BaseTrainer):
                     invalid_reasons[key] = invalid_reasons.get(key, 0) + 1
                 # A few raw generations per eval so a verdict (invalid OR a
                 # zero-EM answer) can be read against what the model wrote.
-                if examples_logged < 6 and (reason or seen % 8 == 0):
+                #
+                # PER DATASET, not a global budget. A single counter is spent
+                # in iteration order, and samples arrive grouped by dataset, so
+                # the first family consumed all six slots and no other family's
+                # generations were ever logged: at v12 step 250 every one of
+                # the six examples was fileneedle while xref sat at token_f1
+                # 0.000, the one number the run existed for, with nothing to
+                # read it against. Same shape as the eval sweep's
+                # first-N-of-a-concatenated-list defect.
+                if examples_by_dataset.get(dataset, 0) < 3 and (
+                    reason or seen % 8 == 0
+                ):
+                    examples_by_dataset[dataset] = (
+                        examples_by_dataset.get(dataset, 0) + 1
+                    )
                     examples_logged += 1
                     logger.info(
                         "free_running_example",
