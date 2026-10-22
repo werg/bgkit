@@ -1,0 +1,48 @@
+survivorship_head:
+  inner_dim: 256               # head MLP hidden dim
+  tap_layer: 7                 # layer index for head tap (pruned: block 1)
+  # ratio_inject_layer REMOVED — ratio embedding intentionally deleted in
+  # the survivorship-head pivot. target_ratio is consumed by the operator
+  # (DualThresholdController), not by a learned embedding. Phase 2 KB with
+  # per-query ratios needs separate design (see docs/survivorship_design.md
+  # §Phase 2 KB regression).
+
+threshold_controller:
+  # θ(r) operates on tanh-bounded head output (in (-1, 1)). The controller
+  # stores a monotone threshold curve over requested retention ratio rather
+  # than a single scalar θ. For a roughly symmetric head distribution,
+  # θ = 1 - 2·target_ratio is still the affine warm-start used to initialize
+  # the curve.
+  init_theta: -0.9            # default for target_ratio_start=0.95
+  # Anchor grid for the monotone threshold curve. Interpolation happens in
+  # ratio_space below; denser coverage at the low-ratio end matters most.
+  anchor_ratios: [0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 0.95]
+  # Interpolate the threshold curve in this ratio space. "log" gives extra
+  # resolution where aggressive compression is most sensitive.
+  ratio_space: log
+  # lr history:
+  #   0.02 → 0.05 (2026-04-21): under-damped for active-ramp tracking.
+  #   0.05 → 0.20 (2026-05-08): paired with kernel_bandwidth=1.0; observed
+  #     wild oscillation (ratio 0.04 ↔ 1.0 within 10 steps) — too aggressive.
+  #   0.20 → 0.05 (2026-05-08): keep the kernel spread but revert lr. The
+  #     kernel alone breaks the monotone-projection clamp; lr need not change.
+  lr: 0.05                    # dual-ascent lr in tanh-logit space
+  momentum: 0.0               # tune up if nearby anchors sawtooth
+  # Gaussian-kernel bandwidth (in ratio_space units; 0.5 in log space spans
+  # ~2-3 anchors meaningfully — narrower than 1.0 to avoid PAVA averaging
+  # collapsing the upper anchor curve under sustained gap). When set,
+  # dual-ascent updates touch all anchors weighted by distance from
+  # target_rate. Fixes the monotone-projection clamp diagnosed 2026-05-08.
+  kernel_bandwidth: 0.5
+  # Clamp applies to each anchor individually. Allowing anchors past ±1 lets
+  # the curve saturate cleanly when the requested ratio is temporarily
+  # infeasible under the current head distribution.
+  clamp: 1.5                  # ±clamp past tanh's range to allow clean saturation
+  min_per_sample_during_warmup: 1   # floor active during BCE warmup only
+  min_per_sample_post_warmup: 0     # disabled; accept zero-survivor samples as
+                                    # legitimate signal at full compression.
+
+# Adapter + μ EMA architecture was removed 2026-04-16. Soft-attn now
+# feeds gradient directly to the single head; tanh saturation at ±1
+# is the sole structural guard against inflation. See bgkit_compressor.py
+# module docstring and git log for the simplification rationale.

@@ -1,0 +1,11 @@
+{
+  "_comment": "Per-depth L1 retention for scripts/precompute_l1_tree.py (the offline bottom-up L1-tree cache build). root = depth 0. Shallow interior nodes summarize huge subtrees so they keep more; deep leaf-adjacent nodes summarize little and compress hard. 'default' applies to any unlisted depth. Used by the path-selective recursive-L1 runs (KILT / pubmedqa / narrativeqa).",
+  "default": 0.15,
+  "0": 0.50,
+  "1": 0.35,
+  "2": 0.25,
+  "3": 0.20,
+  "4": 0.15,
+  "5": 0.10,
+  "6": 0.08
+}

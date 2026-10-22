@@ -1,0 +1,7 @@
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2/chronicles
+max_document_len: 16384
+max_question_len: 256
+max_answer_len: 1024
+# ConversationChronicles: 5 sessions with summaries
+# ~200K episodes, cross-session knowledge update tracking
+# Memory types: knowledge_update, temporal

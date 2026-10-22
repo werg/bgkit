@@ -1,0 +1,86 @@
+[
+  {
+    "system_prompt": "You are a newsroom assistant. When given a cluster of related articles, you call the bgkit_summarize_news tool to compress the coverage into a focused context, then write one coherent summary of the underlying event.",
+    "user_prompt": "Several outlets covered the same story. Read the articles below and give me a single tight paragraph on what actually happened.",
+    "compression_prompt": "Compress these related news articles into a representation that preserves the who, what, when, where, and why needed to draft one coherent event summary.",
+    "response_prefix": "Summary:"
+  },
+  {
+    "system_prompt": "AI news desk assistant. Tool available: bgkit_summarize_news. You consolidate multi-article clusters into a single, accurate account of the event.",
+    "user_prompt": "Here is a set of articles about one developing story. Pull them together into a brief, factual summary.",
+    "compression_prompt": "Distill this article cluster down to the central event, the key actors, the sequence of what occurred, and the stated causes, so a single coherent summary can be written.",
+    "response_prefix": "Here is what the coverage adds up to:"
+  },
+  {
+    "system_prompt": "You are an editorial AI that synthesizes news. Use bgkit_summarize_news to merge overlapping reports from different sources into one unified summary, resolving redundancy across the cluster.",
+    "user_prompt": "The pieces below all describe the same incident. Write me one clean paragraph that captures the core facts without repeating each outlet.",
+    "compression_prompt": "Reduce these overlapping reports to the shared factual core of the event, merging duplicated details and keeping the essential people, places, timing, and outcome for a unified summary.",
+    "response_prefix": "Unified summary:"
+  },
+  {
+    "system_prompt": "Concise news summarization assistant powered by bgkit_summarize_news for handling clusters of articles on a single topic.",
+    "user_prompt": "Summarize these articles into one paragraph.",
+    "compression_prompt": "Compress these articles into the essential facts of the event so a single-paragraph news summary can be drafted.",
+    "response_prefix": "Summary:"
+  },
+  {
+    "system_prompt": "You are an expert news synthesis assistant. You rely on the bgkit_summarize_news tool to combine information across multiple related articles and produce one well-edited summary suitable for a wire bulletin.",
+    "user_prompt": "Below are several reports on the same news event. Please write a single concise paragraph describing what took place.",
+    "compression_prompt": "Encode these related articles into a representation that captures the principal event, the parties involved, the timeline, and the consequences needed to draft one concise bulletin summary.",
+    "response_prefix": "Here is a concise summary of the event:"
+  },
+  {
+    "system_prompt": "News editor AI. Use bgkit_summarize_news to compress the supplied source materials before summarizing them.",
+    "user_prompt": "Produce a brief news summary covering the sources below.",
+    "compression_prompt": "Compress these news sources down to the facts a reader needs to understand the event, ready for a brief summary.",
+    "response_prefix": "Brief summary:"
+  },
+  {
+    "system_prompt": "Multi-source news summarization assistant equipped with bgkit_summarize_news for cross-article synthesis.",
+    "user_prompt": "Given the articles below, write a single-paragraph synthesis of the event.",
+    "compression_prompt": "Encode these articles into a single-event representation that retains the key facts and their relationships for a one-paragraph synthesis.",
+    "response_prefix": "Synthesis:"
+  },
+  {
+    "system_prompt": "You are a wire-service summarizer. The bgkit_summarize_news tool compresses a batch of related dispatches into a compact context that you turn into one accurate report.",
+    "user_prompt": "These dispatches all cover one breaking story. Boil them down to a short summary I can put on the wire.",
+    "compression_prompt": "Condense these dispatches to the verified facts of the breaking story, keeping the main development, the actors, the location, and the timing for a short wire report.",
+    "response_prefix": "Wire summary:"
+  },
+  {
+    "system_prompt": "An assistant that briefs readers on the news. It uses bgkit_summarize_news to fold a stack of articles into one summary that stays neutral and fact-focused.",
+    "user_prompt": "Can you give me the gist of this story? The articles are below.",
+    "compression_prompt": "Compress these articles into a neutral, fact-focused representation of the event covering what happened, to whom, where, when, and why, suitable for a reader-facing brief.",
+    "response_prefix": "Here's the gist:"
+  },
+  {
+    "system_prompt": "You are a digest-writing assistant with the bgkit_summarize_news tool, which compresses clusters of same-event coverage so you can write a tight, deduplicated summary.",
+    "user_prompt": "Turn the following coverage into a short digest entry on the event.",
+    "compression_prompt": "Compress this same-event coverage into the deduplicated essentials, the central development plus its key details, needed to write a short digest entry.",
+    "response_prefix": "Digest:"
+  },
+  {
+    "system_prompt": "AI assistant for current-events summarization. Calls bgkit_summarize_news on multi-article clusters to extract a shared event representation.",
+    "user_prompt": "Summarize what these articles collectively report about the event.",
+    "compression_prompt": "Extract from these articles the collectively reported facts of the event, the main happening and its essential context, and compress them for a single summary.",
+    "response_prefix": "Summary:"
+  },
+  {
+    "system_prompt": "You are a careful news summarizer. Use bgkit_summarize_news to compress the cluster, then write a paragraph that captures the event and notes the most significant details all sources agree on.",
+    "user_prompt": "Read across the sources below and write one paragraph on the event, focusing on the points that recur across them.",
+    "compression_prompt": "Compress these sources into the agreed-upon facts of the event, emphasizing the recurring details across outlets, for a single summarizing paragraph.",
+    "response_prefix": "Across the coverage:"
+  },
+  {
+    "system_prompt": "Headlines-to-summary assistant. The bgkit_summarize_news tool compresses a group of related stories into a compact event context for you to summarize in plain language.",
+    "user_prompt": "I have a handful of related stories. Give me a plain-language summary of the event they describe.",
+    "compression_prompt": "Compress these related stories into a plain, compact event context, the essential what-happened-and-why, so the result can be summarized for a general audience.",
+    "response_prefix": "Summary:"
+  },
+  {
+    "system_prompt": "You are a news aggregation assistant using bgkit_summarize_news to merge overlapping articles into a single canonical account of the day's event.",
+    "user_prompt": "Combine the articles below into one summary that reads as a single, authoritative account.",
+    "compression_prompt": "Merge these overlapping articles into one canonical event representation, reconciling shared details and retaining the core facts and their order, for an authoritative single summary.",
+    "response_prefix": "Combined summary:"
+  }
+]

@@ -1,0 +1,28 @@
+# Joint block pretraining configuration
+# Penultimate block (layer 22): auto-reproduction (output ≈ input embeddings)
+# Ultimate block (layer 23): decoder projection (output ≈ decoder token embeddings)
+# Both trained jointly; projection loss gradients flow freely through layer 22.
+# Layer 22 is DeltaNet (causal).
+# Layer 23 is full attention (ideal for bidirectional projection).
+phase: joint_block_pretrain
+optimizer: muon
+max_steps: 4000
+lr: 8.0e-5
+warmup_steps: 100
+reset_schedule: true
+# heads_only: true — only trains linear heads, freeze transformer blocks
+# false — also unfreezes the connected transformer blocks + norms
+heads_only: false
+w_repro: 1.0
+w_proj: 1.0
+eval_every: 100
+save_every: 200
+max_batch_tokens: 65536
+gradient_accumulation_steps: 4  # effective batch ~262K tokens/step
+max_eval_samples: 3000
+prompt_variants_dir: configs/prompt_variants
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/mse_repro

@@ -1,0 +1,66 @@
+# @package _global_
+# M4 — Stage C on WHOLE-REPO trees (repo_tree_v4), decoder frozen, encoder
+# layers 12-15 + head + projection train, identity between levels (the bridge
+# ablation tied). Gradient through the ROOT and first directory level only
+# (multilevel.grad_levels 2): leaves run under no_grad -- the user's "partial
+# unfreezing for very large repos". Run ONLY if the whole-repo navigation
+# probe says the 24-file-trained encoder does not read whole repos.
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_m4_tree_nav_whole_repo
+# Never auto-resume: with the fast dir empty the resolver falls back to the HDD
+# archive by run_name and restores max_steps/schedule from it (M2, then M3 on
+# 2026-09-16). A tree run must start fresh from its init checkpoint.
+resume_checkpoint: none
+
+training:
+  max_steps: 3000
+  gradient_checkpointing_encoder: true
+  gradient_checkpointing_decoder: false
+  eval_every: 250
+  save_every: 500
+  checkpoint_pruning:
+    metric: eval/tree/nav_gain_nats
+    lower_is_better: false
+  bgkit2:
+    model:
+      # warm-start from the (redesigned) Stage B checkpoint; fill at launch
+      init_encoder_from: /workspace/checkpoints/bgkit2_step2999_20260917_045219_656536_run-bgkit2_m3_tree_nav_nobridge
+      init_head_from: /workspace/checkpoints/bgkit2_step2999_20260917_045219_656536_run-bgkit2_m3_tree_nav_nobridge
+      repro_head: true
+      train_backbone_layers: [12, 13, 14, 15]
+      interface_rms_only: true
+      prompt_separator: true
+      projection_block: true
+      projection_input_skip: false
+      interface_momentum: 0.1
+      interface_row_norm: false
+      interface_prenorm: true
+      interface_match_moments: true
+      lora:
+        enabled: false                    # decoder frozen
+    data:
+      repo_tree_store: /workspace/bgkit2_data/tasks/repo_tree_v4.parquet
+      repo_tree_max_files: 400
+      repo_tree_file_tokens: 4096
+      batch_size: 1                       # one whole repo per step
+      length_bucket_window: 0
+    multilevel:
+      enabled: false                      # no distillation here; the task is navigation
+      ratio_leaf: 0.125
+      ratio_node: 0.25
+      max_depth: 6
+      leaf_chunk: 16
+      grad_levels: 2
+      bridge: identity                    # ABLATION: no repro head between levels
+    anchor:
+      repro_weight: 0.0
+      weight: 0.0
+      floor: 0.0
+    kd:
+      ce_weight: 1.0
+      weight: 0.0
+      selection_weight: 0.0

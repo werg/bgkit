@@ -1,0 +1,63 @@
+# @package _global_
+# M2b — Stage B redesigned (plans/multilevel_encoder_2026_09_16.md).
+#
+# Two defects of M2 fixed:
+#  1. M2 froze the whole backbone, so the encoder never learned to READ bridged
+#     inputs -- only the projection compensated. bgkit1 Step 4.7 trained the
+#     last L0 block and first L1 blocks for exactly this reason. Here the last
+#     four backbone layers train.
+#  2. M2's Path B re-compressed ONE document twice, never showing the upper
+#     level survivors concatenated from DIFFERENT files -- the distribution the
+#     tree serves. group_size 4: the frozen teacher encodes the flat concatenation
+#     of 4 documents single-level, the student encodes them as a tree, and the
+#     final survivor sets are forced equal through the concat positions.
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_m2b_bridge_distill_grouped
+
+training:
+  max_steps: 2000
+  gradient_checkpointing_encoder: true
+  gradient_checkpointing_decoder: false
+  eval_every: 500
+  save_every: 500
+  checkpoint_pruning:
+    metric: eval/loss
+    lower_is_better: true
+  bgkit2:
+    model:
+      init_encoder_from: /workspace/checkpoints/bgkit2_step2999_20260916_151729_086214_run-bgkit2_m1_repro_prewarm
+      init_head_from: /workspace/checkpoints/bgkit2_step2999_20260916_151729_086214_run-bgkit2_m1_repro_prewarm
+      repro_head: true
+      train_backbone_layers: [12, 13, 14, 15]   # the layers that must learn to read compressed inputs
+      interface_rms_only: true
+      prompt_separator: true
+      projection_block: true
+      projection_input_skip: false
+      interface_momentum: 0.1
+      interface_row_norm: false
+      interface_prenorm: true
+      interface_match_moments: true
+    data:
+      max_batch_tokens: 6000
+      task_max_ctx_tokens: 8192
+    multilevel:
+      enabled: true
+      teacher_checkpoint: /workspace/checkpoints/eval_keep/bgkit2_step23999_20260916_100251_611179_run-bgkit2_p26_agentic_distill
+      teacher_ratio: 0.20
+      group_size: 4
+      path_a_prob: 0.5
+      frac_extras_start: 0.5
+      frac_extras_end: 0.31
+      curriculum_steps: 1500
+    anchor:
+      repro_weight: 0.2
+      weight: 0.0
+      floor: 0.0
+    kd:
+      ce_weight: 0.0
+      weight: 0.0
+      selection_weight: 0.0

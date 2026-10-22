@@ -1,0 +1,8 @@
+# @package _global_
+# Full experiment preset: joint block pretraining
+defaults:
+  - /config
+  - /training/joint_block_pretrain
+  - _self_
+
+run_name: joint_block_pretrain

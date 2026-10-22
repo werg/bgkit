@@ -1,0 +1,15 @@
+# Phase 3 Step 2: Distillation from Llama-70B teacher trajectories
+phase: phase3
+step: step2
+optimizer: adamw
+max_steps: 100000
+warmup_steps: 5000
+lr: 5.0e-5
+max_batch_tokens: 32768
+eval_every: 2000
+save_every: 10000
+# Teacher: Llama-70B filtered trajectories
+no_injection_fraction: 0.30
+# BgKIT context from Phase 2
+phase2_checkpoint: auto
+bgkit_cache_dir: ${oc.env:DATA_DIR}/swe_embeddings

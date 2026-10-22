@@ -1,0 +1,18 @@
+# @package _global_
+# Experiment preset: Phase 1 Step 2.5 projection embed-anchor repair.
+defaults:
+  - /config
+  - /training/phase1_step2p5
+  - _self_
+
+run_name: phase1_step2p5
+
+# Load encoder + decoder from the best Step 2 checkpoint. 'auto'
+# resolves via the registry (phase=phase1_step2, metric=eval/loss).
+# Ignored on resume (the checkpoint being resumed from takes over).
+bgkit_checkpoint: auto
+
+# Auto-resume to the latest in-progress step2p5 checkpoint; fall back to
+# the earlier step2000 snapshot (cos 0.19, norm essentially perfect at
+# 0.998) only when no completed checkpoint is registered.
+resume_checkpoint: null

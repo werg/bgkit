@@ -1,0 +1,365 @@
+{
+ "instances": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/swebench_lite/instances.jsonl",
+ "n_instances": 186,
+ "repos_filter": "astropy/astropy,matplotlib/matplotlib,mwaskom/seaborn,pallets/flask,psf/requests,pydata/xarray,pylint-dev/pylint,pytest-dev/pytest,scikit-learn/scikit-learn,sphinx-doc/sphinx,sympy/sympy",
+ "student_url": "http://localhost:8097",
+ "decoder_token_budget": 40000,
+ "max_turns": 12,
+ "context_budget": 6144,
+ "compaction_mode": "cons",
+ "tree_cache_dir": "/mnt/external/bgkit-checkpoints/tree_caches/swe_lite.nodes",
+ "arms": {
+  "compressed": {
+   "n": 186,
+   "errors": 0,
+   "skipped": 0,
+   "read_gold_any": 0.1183,
+   "answer_hit": 0.0269,
+   "answer_exact": 0.0269,
+   "answered": 0.2151,
+   "answer_form": {
+    "none": 141,
+    "files": 45
+   },
+   "stop": {
+    "loop": 130,
+    "max_turns": 6,
+    "final": 46,
+    "budget": 4
+   },
+   "loops": 130,
+   "turns": 7.1452,
+   "decoder_tokens": 19500.8495,
+   "tool_result_tokens": 20303.1882,
+   "tokens_saved": 19429.3226,
+   "wall_s": 8.3513,
+   "edit_calls": 0,
+   "episodes_with_edit": 0,
+   "edit_old_verbatim": null,
+   "edit_old_unique": null,
+   "edit_old_ws_match": null,
+   "by_repo": {
+    "astropy/astropy": {
+     "n": 6,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "matplotlib/matplotlib": {
+     "n": 23,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "mwaskom/seaborn": {
+     "n": 4,
+     "read_gold_any": 0.5,
+     "answer_hit": 0.25
+    },
+    "pallets/flask": {
+     "n": 3,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "psf/requests": {
+     "n": 6,
+     "read_gold_any": 0.3333,
+     "answer_hit": 0.0
+    },
+    "pydata/xarray": {
+     "n": 5,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "pylint-dev/pylint": {
+     "n": 6,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "pytest-dev/pytest": {
+     "n": 17,
+     "read_gold_any": 0.0588,
+     "answer_hit": 0.0
+    },
+    "scikit-learn/scikit-learn": {
+     "n": 23,
+     "read_gold_any": 0.1304,
+     "answer_hit": 0.0435
+    },
+    "sphinx-doc/sphinx": {
+     "n": 16,
+     "read_gold_any": 0.25,
+     "answer_hit": 0.0
+    },
+    "sympy/sympy": {
+     "n": 77,
+     "read_gold_any": 0.1299,
+     "answer_hit": 0.039
+    }
+   }
+  },
+  "full_text": {
+   "n": 186,
+   "errors": 0,
+   "skipped": 0,
+   "read_gold_any": 0.0054,
+   "answer_hit": 0.0,
+   "answer_exact": 0.0,
+   "answered": 0.0215,
+   "answer_form": {
+    "none": 181,
+    "files": 5
+   },
+   "stop": {
+    "final": 170,
+    "max_turns": 5,
+    "loop": 4,
+    "budget": 7
+   },
+   "loops": 4,
+   "turns": 2.6344,
+   "decoder_tokens": 22674.6237,
+   "tool_result_tokens": 16124.9301,
+   "tokens_saved": 15610.7258,
+   "wall_s": 6.3304,
+   "edit_calls": 0,
+   "episodes_with_edit": 0,
+   "edit_old_verbatim": null,
+   "edit_old_unique": null,
+   "edit_old_ws_match": null,
+   "by_repo": {
+    "astropy/astropy": {
+     "n": 6,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "matplotlib/matplotlib": {
+     "n": 23,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "mwaskom/seaborn": {
+     "n": 4,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "pallets/flask": {
+     "n": 3,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "psf/requests": {
+     "n": 6,
+     "read_gold_any": 0.1667,
+     "answer_hit": 0.0
+    },
+    "pydata/xarray": {
+     "n": 5,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "pylint-dev/pylint": {
+     "n": 6,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "pytest-dev/pytest": {
+     "n": 17,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "scikit-learn/scikit-learn": {
+     "n": 23,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "sphinx-doc/sphinx": {
+     "n": 16,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "sympy/sympy": {
+     "n": 77,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    }
+   }
+  },
+  "compressed_ov": {
+   "n": 186,
+   "errors": 0,
+   "skipped": 0,
+   "read_gold_any": 0.086,
+   "answer_hit": 0.0753,
+   "answer_exact": 0.0753,
+   "answered": 0.5914,
+   "answer_form": {
+    "none": 68,
+    "files": 118
+   },
+   "stop": {
+    "final": 178,
+    "budget": 5,
+    "max_turns": 3
+   },
+   "loops": 0,
+   "turns": 3.9462,
+   "decoder_tokens": 13926.629,
+   "tool_result_tokens": 14133.7742,
+   "tokens_saved": 13551.2849,
+   "wall_s": 7.6542,
+   "edit_calls": 0,
+   "episodes_with_edit": 0,
+   "edit_old_verbatim": null,
+   "edit_old_unique": null,
+   "edit_old_ws_match": null,
+   "with_overview": 1.0,
+   "browse_calls": 0,
+   "browsed_gold_dir": 0.0,
+   "by_repo": {
+    "astropy/astropy": {
+     "n": 6,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "matplotlib/matplotlib": {
+     "n": 23,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "mwaskom/seaborn": {
+     "n": 4,
+     "read_gold_any": 0.25,
+     "answer_hit": 0.25
+    },
+    "pallets/flask": {
+     "n": 3,
+     "read_gold_any": 0.3333,
+     "answer_hit": 0.3333
+    },
+    "psf/requests": {
+     "n": 6,
+     "read_gold_any": 0.1667,
+     "answer_hit": 0.1667
+    },
+    "pydata/xarray": {
+     "n": 5,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "pylint-dev/pylint": {
+     "n": 6,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "pytest-dev/pytest": {
+     "n": 17,
+     "read_gold_any": 0.1176,
+     "answer_hit": 0.1765
+    },
+    "scikit-learn/scikit-learn": {
+     "n": 23,
+     "read_gold_any": 0.087,
+     "answer_hit": 0.0
+    },
+    "sphinx-doc/sphinx": {
+     "n": 16,
+     "read_gold_any": 0.125,
+     "answer_hit": 0.125
+    },
+    "sympy/sympy": {
+     "n": 77,
+     "read_gold_any": 0.0909,
+     "answer_hit": 0.0779
+    }
+   }
+  },
+  "full_text_ov": {
+   "n": 186,
+   "errors": 0,
+   "skipped": 0,
+   "read_gold_any": 0.0108,
+   "answer_hit": 0.0054,
+   "answer_exact": 0.0,
+   "answered": 0.0376,
+   "answer_form": {
+    "none": 178,
+    "files": 8
+   },
+   "stop": {
+    "final": 181,
+    "max_turns": 2,
+    "budget": 3
+   },
+   "loops": 0,
+   "turns": 2.2688,
+   "decoder_tokens": 21643.3817,
+   "tool_result_tokens": 15852.6613,
+   "tokens_saved": 15343.543,
+   "wall_s": 6.7529,
+   "edit_calls": 0,
+   "episodes_with_edit": 0,
+   "edit_old_verbatim": null,
+   "edit_old_unique": null,
+   "edit_old_ws_match": null,
+   "with_overview": 1.0,
+   "browse_calls": 0,
+   "browsed_gold_dir": 0.0,
+   "by_repo": {
+    "astropy/astropy": {
+     "n": 6,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "matplotlib/matplotlib": {
+     "n": 23,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "mwaskom/seaborn": {
+     "n": 4,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "pallets/flask": {
+     "n": 3,
+     "read_gold_any": 0.3333,
+     "answer_hit": 0.3333
+    },
+    "psf/requests": {
+     "n": 6,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "pydata/xarray": {
+     "n": 5,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "pylint-dev/pylint": {
+     "n": 6,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "pytest-dev/pytest": {
+     "n": 17,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "scikit-learn/scikit-learn": {
+     "n": 23,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "sphinx-doc/sphinx": {
+     "n": 16,
+     "read_gold_any": 0.0,
+     "answer_hit": 0.0
+    },
+    "sympy/sympy": {
+     "n": 77,
+     "read_gold_any": 0.013,
+     "answer_hit": 0.0
+    }
+   }
+  }
+ }
+}

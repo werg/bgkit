@@ -1,0 +1,25 @@
+# @package _global_
+# P1 "prompted, rung 0" on BaseTrainer: instruct LFM2.5-350M decoder with its
+# own chat template, compression prompts on the encoder, SQuAD + HotpotQA +
+# file_overview task stores mixed 50/50 with the autoencode/continue stream.
+# Decoder and encoder backbone frozen (head + projection learn).
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_p1_prompted
+
+training:
+  bgkit2:
+    model:
+      # 2026-09-05 (resumed at step 5000): bound the interface reference by
+      # construction; the raw projection scale had run to 1386 (var 9e4).
+      interface_prenorm: true
+    data:
+      task_stores:
+        - /workspace/bgkit2_data/tasks/qa_squad.parquet
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa.parquet
+        - /workspace/bgkit2_data/tasks/file_overview.parquet
+      task_weights: [0.25, 0.25, 0.5]
+      task_mix: 0.5

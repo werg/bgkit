@@ -1,0 +1,87 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/babilong_16k.jsonl",
+ "n": 100,
+ "budgets": [
+  1024,
+  2048,
+  4096
+ ],
+ "slot_tokens": 2048,
+ "seconds": 271,
+ "summary": {
+  "bgkit@1024": {
+   "acc": 0.74,
+   "prefix": 1071.81,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.5392,
+   "dec_s": 0.0467
+  },
+  "text@1024": {
+   "acc": 0.12,
+   "prefix": 1068.16,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0834
+  },
+  "base@1024": {
+   "acc": 0.08,
+   "prefix": 1068.16,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.091
+  },
+  "bgkit@2048": {
+   "acc": 0.76,
+   "prefix": 2095.94,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.5354,
+   "dec_s": 0.0759
+  },
+  "text@2048": {
+   "acc": 0.19,
+   "prefix": 2092.2,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.112
+  },
+  "base@2048": {
+   "acc": 0.13,
+   "prefix": 2092.2,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0918
+  },
+  "bgkit@4096": {
+   "acc": 0.74,
+   "prefix": 4143.67,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.5424,
+   "dec_s": 0.1406
+  },
+  "text@4096": {
+   "acc": 0.22,
+   "prefix": 4140.11,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1748
+  },
+  "base@4096": {
+   "acc": 0.13,
+   "prefix": 4140.11,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1295
+  }
+ }
+}

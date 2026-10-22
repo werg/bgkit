@@ -1,0 +1,40 @@
+# @package _global_
+defaults:
+  - /config
+  - /training/phase1_qwen_realign
+  - _self_
+
+run_name: phase1_qwen_realign
+# CompressionTrainer reads ``step1_checkpoint`` (NOT ``bgkit_checkpoint``);
+# the latter is read by DecoderInitTrainer, used only by Step 3/4. Earlier
+# realign runs that set ``bgkit_checkpoint`` were silently running on a
+# pristine HF encoder — the entire encoder backbone, heads, thresholds,
+# and projections were random-init.
+#
+# Resume from the Qwen projection warmup output, NOT directly from
+# Falcon-l0. Warmup (2026-06-02) trained only `projection_blocks.qwen35`
+# against a Step 6 teacher's projection output, taking eval/mse from
+# 0.024 → 0.00083 and cos_sim from 0.49 → 0.918. The encoder backbone
+# is unchanged from Falcon-l0; only the projection is re-aligned.
+# 2026-06-03 update v3: reverted to warmstart_v1 (Falcon-trained head
+# matched to Falcon-trained backbone — the natural pairing). The
+# warmstart_v2 experiment copied Step 6's head onto the Falcon
+# backbone; that combination produced actual_ratio=0.003 at step 0
+# (head asked for 0.55, selected 0.3%) confirming that 75k Falcon
+# steps shifted the backbone's output distribution enough that
+# Qwen-trained heads can't operate on it. The Falcon-trained head
+# IS calibrated for this backbone and selects sane ratios.
+#
+# New strategy: keep the natural (Falcon head + Falcon backbone +
+# warmed Qwen projection + Step 6 Qwen decoder) pairing, and give
+# the decoder a much gentler runway to adapt by starting at ratio
+# 0.9 (~all positions survive, near-full context → reconstruction
+# is easy) and descending very slowly toward 0.10 over many more
+# steps. The decoder learns to interpret the encoder's survivors
+# while compression gradually tightens.
+step1_checkpoint: /workspace/checkpoints/phase1_qwen_realign_warmstart_20260603
+
+model:
+  decoder:
+    family: qwen35
+    backbone_name: Qwen/Qwen3.5-0.8B

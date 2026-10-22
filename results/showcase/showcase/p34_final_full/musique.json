@@ -1,0 +1,35 @@
+{
+ "experiment": "bgkit2_p34_browse_overview_dropout",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step5999_20260921_051813_397690_run-bgkit2_p34_browse_overview_dropout",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/musique.jsonl",
+ "n": 200,
+ "budgets": [
+  512
+ ],
+ "slot_tokens": 2048,
+ "seconds": 188,
+ "summary": {
+  "text_full@full": {
+   "em": 0.03,
+   "f1": 0.101,
+   "contains": 0.115,
+   "prefix": 2516.17,
+   "ctx_tokens": 2458.19,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.4455,
+   "judge_acc": 0.165
+  },
+  "base_full@full": {
+   "em": 0.005,
+   "f1": 0.0728,
+   "contains": 0.135,
+   "prefix": 2516.17,
+   "ctx_tokens": 2458.19,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.4797,
+   "judge_acc": 0.15
+  }
+ }
+}

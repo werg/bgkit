@@ -1,0 +1,24 @@
+bgkit-350m
+
+This release is a Derivative Work of two models by Liquid AI, Inc., distributed under the
+LFM Open License v1.0 (see LICENSE):
+
+  LiquidAI/LFM2.5-350M          https://huggingface.co/LiquidAI/LFM2.5-350M
+  LiquidAI/LFM2.5-Encoder-350M  https://huggingface.co/LiquidAI/LFM2.5-Encoder-350M
+
+Modified files (Section 4(b) of the License):
+
+  decoder/model.safetensors   LFM2.5-350M with a rank-32 low-rank adapter (layers 0-7) trained
+                              by Gabriel Pickard and merged into the weights.
+  encoder/model.safetensors   LFM2.5-Encoder-350M with a rank-16 low-rank adapter (layers 12-15)
+                              trained by Gabriel Pickard and merged into the weights.
+
+Unmodified files from LiquidAI/LFM2.5-Encoder-350M: encoder/config.json,
+encoder/modeling_lfm2_bidirectional.py. Tokenizer and chat template in decoder/ are those of
+LiquidAI/LFM2.5-350M.
+
+New files (not derived from the Liquid AI models): compressor.safetensors, bgkit_config.json,
+modeling_bgkit.py, README.md, paper.pdf.
+
+"LFM" and "Liquid" are names of Liquid AI, Inc.; they are used here only to describe the origin of
+the base models. This release is not affiliated with or endorsed by Liquid AI, Inc.

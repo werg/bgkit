@@ -1,0 +1,89 @@
+# @package _global_
+# bgkit2 reset lineage on the project's BaseTrainer (plans/reset_2026_09_03.md).
+# The bgkit2 dataclass config lives under training.bgkit2; everything else
+# (max_steps, lr, cadence, pruning, memory) is BaseTrainer's own schema.
+training:
+  phase: bgkit2
+  stage: P1
+  lr: 2.0e-4              # base LR (per-group LRs in bgkit2.optim override it)
+  max_steps: 20000
+  warmup_steps: 500
+  eval_every: 1000
+  save_every: 1000
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer: adamw
+  gradient_checkpointing: true
+  # On unified memory the caching allocator's RESERVED pool is host RAM: P2
+  # sat at 77 GB reserved with 3-14 GB allocated and the host at 36 GB free.
+  # Flush earlier (pool free < 45 GB) and every few steps regardless.
+  dynamic_ckpt:
+    enabled: true
+    flush_when_free_below_gb: 45
+    flush_min_slack_gb: 3
+  cuda_empty_cache_every_step: 4
+  checkpoint_pruning:
+    enabled: true
+    keep_best: 2
+    keep_latest: 2
+    metric: eval/x4/reconstruct/loss
+    lower_is_better: true
+  bgkit2:
+    model:
+      encoder_id: LiquidAI/LFM2.5-Encoder-350M
+      decoder_id: LiquidAI/LFM2.5-350M
+      head_layer: 6
+      train_backbone_layers: []
+      selection: learned
+      interface_momentum: 0.1
+      lora:
+        enabled: false
+    data:
+      train_stores:
+        - /workspace/bgkit2_data/corpus/fineweb_train
+        - /workspace/bgkit2_data/corpus/code_train
+      train_weights: [0.6, 0.4]
+      eval_stores:
+        - /workspace/bgkit2_data/corpus/fineweb_eval
+        - /workspace/bgkit2_data/corpus/code_eval
+      prompt_style: chat
+      compression_prompts: true
+      task_stores: []
+      task_mix: 0.5
+      task_max_ctx_tokens: 2048
+      task_max_target_tokens: 384
+      task_eval_samples: 96
+      task_gen_samples: 48
+      task_gen_max_new_tokens: 96
+      ctx_min: 64
+      ctx_max: 1024
+      cont_min: 32
+      cont_max: 256
+      p_continue: 0.5
+      batch_size: 16
+      num_workers: 2
+      eval_samples: 192
+      eval_batch_size: 8      # eval sequences at x1 reach ~2.1k tokens; keep the batch small
+      gen_samples: 48
+      gen_max_new_tokens: 320
+      probe_ratio: 0.0625
+    ratio:
+      r_max_start: 1.0
+      ceiling_steps: 2000
+      r_max: 0.25
+      r_start: 0.25
+      r_end: 0.0078125
+      descent_steps: 8000
+      p_random_selection: 0.1
+    anchor:
+      weight: 1.0
+      floor: 0.0
+      steps: 4000
+    optim:
+      lr_backbone: 2.0e-5
+      lr_head: 1.0e-4
+      lr_projection: 2.0e-4
+      lr_lora: 1.0e-4
+      weight_decay: 0.01
+    run:
+      dtype: bfloat16

@@ -1,0 +1,70 @@
+phase: phase1_qwen_projection_warmup
+optimizer: muon
+muon_ns_steps: 1
+# Qwen projection warmup: distills a pre-Falcon Qwen-aligned encoder's
+# projection output into the current encoder's `projection_blocks.qwen35`.
+# All student params frozen except the Qwen projection block.
+#
+# Use this before `phase1_qwen_realign` if the Qwen projection has fallen
+# too far out of step with the encoder backbone during a long Falcon-only
+# training stretch (symptom: realign loss plateaus above ~5.5 after the
+# warmup epochs). Output checkpoint is drop-in for `bgkit_checkpoint:` in
+# the realign run.
+
+max_steps: 1500
+lr: 5.0e-5
+projection_lr: 5.0e-5
+warmup_steps: 100
+bidi_warmup_steps: 0
+max_batch_tokens: 4096
+gradient_accumulation_steps: 8
+min_sample_length: 256
+max_sample_length: 800
+max_eval_samples: 500
+eval_every: 200
+save_every: 250
+max_grad_norm: 5.0
+gradient_checkpointing: false
+
+sampler:
+  cost_multiplier: 1.0
+  eval_cost_multiplier: 1.0
+
+# Loss weights — MSE primary, cosine for direction alignment, log-norm to
+# pin scale. Match Step 2.5's structure.
+mse_weight: 1.0
+cos_weight: 0.5
+norm_weight: 0.1
+
+# Teacher operating ratio. The earlier fixed-at-0.10 warmup
+# (2026-06-02 first cut) only validated the projection at the
+# narrow distribution of top-10% positions. The realign curriculum
+# walks ratio 0.55 → 0.10, so most realign survivors during the
+# first ~2000 steps fall OUTSIDE that warmup-validated regime —
+# observed as a realign eval/loss plateau at 4.4. Switching to a
+# log-uniform range covering the realign curriculum span fixes the
+# coverage gap: every batch, the teacher selects a fresh top-K%
+# slice from somewhere in [lo, hi], and the student's projection is
+# trained on the full distribution it will see at realign time.
+target_ratio_l0_range: [0.10, 0.55]
+
+data:
+  prompt_variants_dir: configs/prompt_variants
+  tokens:
+    max_seq_len: 8192
+
+model:
+  decoder:
+    family: qwen35
+    backbone_name: Qwen/Qwen3.5-0.8B
+  # Match Falcon-l0 student's 6-anchor threshold controller so the
+  # student state_dict loads without shape mismatches. The threshold
+  # controllers stay frozen during warmup anyway — only the qwen35
+  # projection trains.
+  threshold_controller:
+    anchor_ratios: [0.02, 0.04, 0.08, 0.16, 0.32, 0.60]
+    ratio_space: log
+    lr: 0.05
+    momentum: 0.0
+    clamp: 1.5
+    kernel_bandwidth: 0.5

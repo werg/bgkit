@@ -1,0 +1,6 @@
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2/newsqa
+max_document_len: 4096
+max_question_len: 256
+max_answer_len: 256
+# NewsQA: CNN/DailyMail article comprehension
+# Span-extraction QA over news articles

@@ -1,0 +1,26 @@
+# BgKIT Data Preprocessing Container (CPU-only)
+FROM python:3.12-slim
+
+WORKDIR /workspace/bgkit
+
+# System deps for git processing
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    libgit2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy project files needed for pip install
+COPY pyproject.toml ./
+COPY docs/01_overview.md docs/
+COPY src/ src/
+
+# Install bgkit core + data extras (no GPU deps, no torch)
+RUN pip install --no-cache-dir ".[data]"
+
+# Copy configs and scripts
+COPY configs/ configs/
+COPY scripts/ scripts/
+
+ENV PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python"]

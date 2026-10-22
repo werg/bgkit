@@ -1,0 +1,54 @@
+# @package _global_
+# Capability-packaging Family B first run: lognav (log-needle QA over LogHub
+# raw-log windows) through the PROVEN KRKBTrainer flat single-bgkit path.
+# See plans/capability_packaging_2026_08_20.md §5 + §12 and
+# scripts/build_lognav_phase2.py (data build 2026-08-21: 960 windows /
+# 23.7M tokens / 3918 train + 200 eval trajectories, eval = held-out log
+# SYSTEMS zookeeper+apache).
+#
+# Inherits the full Stage-A recipe — live L0, direct L0/L1 training, GC-on,
+# round-robin decoders, phase1_checkpoint pinned to summarization step-51945
+# — and overrides only dataset selection + retention + decoder bias.
+defaults:
+  - /config
+  - /training/phase2_kb_stage_a
+  - _self_
+
+run_name: phase2_kb_lognav_v1
+
+training:
+  # Dynamic-ckpt OFF for this run (2026-08-21 crash at step 49): with lognav's
+  # tiny memory profile (~10GB peak vs 80GB budget) the scheduler made its
+  # first-ever DOWNSHIFT full->megatron, and KRKB's live-L0 forward fails the
+  # non-reentrant strict recompute-match under the lighter mode
+  # (CheckpointError 58-vs-55 — same class as the documented 666-vs-382).
+  # The adaptive flush is also unneeded at this memory profile. REAL FIX
+  # (planned): restrict per-trainer allowed modes so the scheduler can never
+  # flip a KRKB model into a mode its forward can't recompute.
+  dynamic_ckpt:
+    enabled: false
+
+  # Cadence: was previously (accidentally) set by the stale git-repro
+  # control.json; now owned here. Dense eval early — 2599-step run.
+  eval_every: 100
+  save_every: 200
+  warmup_steps: 300
+
+  datasets:
+    - lognav
+  # Take the whole 3918-row train split (stage_a's default caps at 1500).
+  max_samples_per_dataset_default: 100000
+
+  # Needle-in-window at 10x L0 compression to start; descend later via
+  # control.json following the continuous-descent rule.
+  l0_retention:
+    lognav: 0.10
+
+  # Ship target is the Qwen decoder — bias round-robin toward it (Stage A
+  # biased 0.15 toward Falcon for speed; here Qwen is the product). Watch
+  # memory: Qwen microbatches are the heavy ones (windows up to 45K tokens).
+  qwen_decoder_prob: 0.80
+
+  # lognav windows are capped at 45K tokens at data build; keep the Stage-A
+  # 52K live-L0 trim as the safety net (inherited). Explicit split column in
+  # the trajectory parquet drives train/eval — no random split.

@@ -1,0 +1,66 @@
+# @package _global_
+# P15 (prepared 2026-09-06): P14 + TOKEN-ANCHORED RESIDUAL REPS. In every run
+# x1 ≈ x4 ≈ x16 and the within-document effective rank of the reps was ~2:
+# the survivors collapse to one document vector, so a rep cannot even name
+# its own token. rep_i = interface(proj(h_i)) + E_dec[token_i]: the decoder
+# reads each survivor as the text token it is, the encoder adds context.
+# The x1 arm now trivially tracks full text; the claim lives at x4/x16 and
+# in the ablation P15b (residual only = plain token pruning).
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_p15_token_residual
+
+training:
+  max_steps: 20000
+  bgkit2:
+    model:
+      init_encoder_from: /workspace/checkpoints/bgkit2_step3000_20260906_031649_752538_run-bgkit2_p11_fullenc_prenorm
+      train_backbone_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      encoder_lora:
+        enabled: false
+      interface_momentum: 0.1
+      interface_row_norm: false
+      interface_prenorm: true
+      interface_match_moments: true
+      rep_token_residual: true
+      lora:
+        enabled: true
+        rank: 32
+        alpha: 64
+        layers: [0, 1, 2, 3, 4, 5, 6, 7]
+    data:
+      task_stores:
+        - /workspace/bgkit2_data/tasks/qa_squad.parquet
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa.parquet
+        - /workspace/bgkit2_data/tasks/qa_triviaqa.parquet
+        - /workspace/bgkit2_data/tasks/file_overview.parquet
+        - /workspace/bgkit2_data/tasks/compaction_v2.parquet
+      task_weights: [0.2, 0.2, 0.15, 0.3, 0.15]
+      task_mix: 0.5
+      task_max_ctx_tokens: 2048
+      task_max_prefix_tokens: 1536
+      batch_size: 12
+    ratio:
+      r_max_start: 0.5
+      ceiling_steps: 1000
+    anchor:
+      weight: 0.0
+      floor: 0.0
+      steps: 1
+      decorrelation_weight: 0.0
+      within_doc_diversity_weight: 0.0
+    kd:
+      weight: 1.0
+      temperature: 1.0
+      ce_weight: 0.0   # KD ONLY: the prior cannot match a context-dependent teacher
+      # P8's decoder LoRA (lower 8, r32) trained on FULL TEXT: SQuAD full-text
+      # loss 1.11 vs the base's 2.63. Same model.lora spec as this run.
+      teacher_checkpoint: /workspace/checkpoints/bgkit2_step2000_20260905_125046_329715_run-bgkit2_p8_declora_kd
+    optim:
+      lr_backbone: 2.0e-5
+      lr_head: 5.0e-5
+      lr_projection: 1.0e-4
+      lr_lora: 2.0e-5

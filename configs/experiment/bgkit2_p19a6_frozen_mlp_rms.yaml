@@ -1,0 +1,71 @@
+# @package _global_
+# P19a6 (2026-09-08, user question): the ORIGINAL stage A — frozen encoder
+# backbone, frozen decoder, plain MLP projection, no input skip, no contextual
+# block, anchor-only at ratio 1.0 — re-run under the RMS-ONLY interface
+# contract. P19a capped at cos ~0.5 under the standardise-then-recolour
+# interface, which imposed a constant offset no projection could cancel
+# (diagnosed on P19a4 step 1000). This is the cleanest test of whether the
+# simplest architecture passes gate A once the contract is right. Cold start
+# (fresh projection); ~4.5 s/step. Matched read vs P19a2/P19a4/P19a5 at
+# 500 / 1000 on x1 reconstruct, cos and NN identity.
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_p19a6_frozen_mlp_rms
+
+training:
+  max_steps: 8000
+  eval_every: 500
+  save_every: 500
+  checkpoint_pruning:
+    metric: eval/x1/reconstruct/loss
+  bgkit2:
+    model:
+      train_backbone_layers: []
+      interface_rms_only: true
+      encoder_lora:
+        enabled: false
+      interface_momentum: 0.1
+      interface_row_norm: false
+      interface_prenorm: true
+      interface_match_moments: true
+      rep_token_residual: false
+      rep_token_residual_only: false
+      lora:
+        enabled: false
+    data:
+      task_stores:
+        - /workspace/bgkit2_data/tasks/qa_squad.parquet
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa.parquet
+        - /workspace/bgkit2_data/tasks/qa_triviaqa.parquet
+        - /workspace/bgkit2_data/tasks/file_overview.parquet
+        - /workspace/bgkit2_data/tasks/compaction_v2.parquet
+      task_weights: [0.2, 0.2, 0.15, 0.3, 0.15]
+      task_mix: 0.5
+      task_max_ctx_tokens: 2048
+      task_max_prefix_tokens: 1536
+      batch_size: 12
+    ratio:
+      r_max_start: 1.0
+      r_max: 1.0
+      r_start: 1.0
+      r_end: 1.0
+      descent_steps: 0
+      ceiling_steps: 0
+      hold_steps: 0
+      p_random_selection: 0.0
+    anchor:
+      weight: 1.0
+      floor: 1.0
+      steps: 1
+      decorrelation_weight: 0.0
+      within_doc_diversity_weight: 0.0
+    kd:
+      weight: 0.0
+      ce_weight: 0.0
+      selection_weight: 0.0
+      teacher_checkpoint: null
+    optim:
+      lr_projection: 3.0e-4

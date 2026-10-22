@@ -1,0 +1,36 @@
+# @package _global_
+# P2 "rung 1": same recipe as P1 but the decoder opens LoRA on its lower 8
+# layers and the encoder opens its top 4 layers; all five task stores
+# (SQuAD, HotpotQA, TriviaQA, file_overview, compaction) mixed 50/50 with
+# the autoencode/continue stream. Launch when P1 plateaus (plan §6 rule).
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_p2_rung1
+
+training:
+  max_steps: 20000
+  bgkit2:
+    model:
+      train_backbone_layers: [12, 13, 14, 15]
+      lora:
+        enabled: true
+        rank: 32
+        alpha: 64
+        layers: [0, 1, 2, 3, 4, 5, 6, 7]
+    data:
+      task_stores:
+        - /workspace/bgkit2_data/tasks/qa_squad.parquet
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa.parquet
+        - /workspace/bgkit2_data/tasks/qa_triviaqa.parquet
+        - /workspace/bgkit2_data/tasks/file_overview.parquet
+        - /workspace/bgkit2_data/tasks/compaction_v2.parquet
+      task_weights: [0.2, 0.2, 0.15, 0.3, 0.15]
+      task_mix: 0.5
+      task_max_ctx_tokens: 2048
+      task_max_prefix_tokens: 1536
+    optim:
+      lr_backbone: 2.0e-5
+      lr_lora: 1.0e-4

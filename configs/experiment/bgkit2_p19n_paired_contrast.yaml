@@ -1,0 +1,141 @@
+# @package _global_
+# P19n (2026-09-10): PAIRED prompt contrast. P19l (one-sided hinge) and P19m
+# (symmetric hinge, four sibling stores, weight 1.0) both opened a 0.3-nat
+# prompt gap by step 600 and closed it by step 900 while the needle train loss
+# rose ~1.5 nats: the hinge is satisfied by making the sibling-prompt reps bad
+# for EVERYTHING, which the main CE then undoes. Now the sibling is a FULL
+# sample (its own answer) and the pass scores the 2x2: CE(B|reps_B) keeps the
+# sibling reps honest for their own question, the two hinges push the crossed
+# pairs nll(A|reps_B), nll(B|reps_A) above the matched pairs by the margin.
+# Encoder-only gradient. Warm from P19k@6000 (P19l/P19m discarded).
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_p19n_paired_contrast
+
+training:
+  max_steps: 20000
+  gradient_checkpointing_encoder: false   # user 2026-09-09: cap rows instead of recomputing; ceiling raised to 0.85
+  gradient_checkpointing_decoder: false   # user 2026-09-08: peaks of 50-67 GB against the 73 GB cap are accepted
+  eval_every: 3000   # user 2026-09-09: evals shorter and less frequent
+  save_every: 500
+  checkpoint_pruning:
+    metric: eval/task/qa_multineedle/gen_x64/exact_match
+    lower_is_better: false
+  bgkit2:
+    model:
+      init_encoder_from: /workspace/checkpoints/bgkit2_step6000_20260910_000721_796301_run-bgkit2_p19k_encoder_prompt
+      init_head_from: /workspace/checkpoints/bgkit2_step6000_20260910_000721_796301_run-bgkit2_p19k_encoder_prompt
+      init_decoder_from: /workspace/checkpoints/bgkit2_step6000_20260910_000721_796301_run-bgkit2_p19k_encoder_prompt   # P19k adapter continues
+      train_backbone_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]   # the WHOLE backbone
+      interface_rms_only: true
+      prompt_separator: true
+      projection_block: true
+      projection_input_skip: false
+      encoder_lora:
+        enabled: false
+      interface_momentum: 0.1
+      interface_row_norm: false
+      interface_prenorm: true
+      interface_match_moments: true
+      rep_token_residual: false
+      rep_token_residual_only: false
+      lora:
+        enabled: true
+        rank: 32
+        alpha: 64
+        layers: [0, 1, 2, 3, 4, 5, 6, 7]
+        rep_gated: true   # delta at rep positions only: noctx / full-text / plain-text arms == the base by construction
+    data:
+      task_stores:
+        - /workspace/bgkit2_data/tasks/qa_squad.parquet
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa.parquet
+        - /workspace/bgkit2_data/tasks/qa_triviaqa.parquet
+        - /workspace/bgkit2_data/tasks/file_overview.parquet
+        - /workspace/bgkit2_data/tasks/compaction_v2.parquet
+        - /workspace/bgkit2_data/tasks/compaction_chunks_5src_100k.arrow
+        - /workspace/bgkit2_data/tasks/qa_multineedle.parquet   # prompt-conditioned needle finding (K=10 passages/doc)
+        - /workspace/bgkit2_data/tasks/qa_multineedle_long.parquet   # 30 passages/doc, ~4k tokens
+        - /workspace/bgkit2_data/tasks/compaction_chunks_long_5src.arrow   # agentic histories up to ~10k tokens   # Arrow IPC (zero-copy mmap); 100k rows balanced over SWE-Zero / nebius / Open-SWE-Traces / OpenResearcher / AgentTrove
+      task_weights: [0.09, 0.09, 0.06, 0.16, 0.06, 0.14, 0.12, 0.16, 0.12]
+      task_mix: 0.5
+      task_max_target_tokens: 640   # chunk targets (p50 677 at the 768 cap); QA targets are short anyway
+      framing_diversity: true
+      framing_p_system: 0.3
+      framing_p_no_prompt: 0.1
+      task_eval_heldout_samples: 64
+      heldout_stores: [qa_squad, qa_multineedle, compaction_chunks_5src_100k]   # held-out phrasing arms only here
+      alt_prompt_stores: [qa_multineedle, qa_multineedle_long, qa_squad, qa_triviaqa]   # every store whose context repeats under several questions
+      eval_only_stores:
+        - /workspace/bgkit2_data/tasks/babilong.parquet   # external long-context needle benchmark (eval only)
+      max_batch_tokens: 9000   # 12000 still peaked at 71 GB allocated / 111 GB reserved (host available 10 GB); an 8k row alone, ~3k rows three at a time
+      eval_batch_size: 2
+      task_eval_factors: [4, 16, 64, 128]   # no x1 arm at 8k (8k reps in the slot = the eval memory peak; host hit 3 GB available at 16:33Z)
+      task_gen_factors: [64]   # the headline; 4x/16x generation at the pause ablations
+      task_max_ctx_tokens: 8192
+      task_max_prefix_tokens: 1536
+      # Eval noise (2026-09-08): gen SQuAD EM moved 5/48 -> 0/48 between evals.
+      # The eval rows are the FIRST N of each store's eval split, so a larger
+      # N is a superset of the earlier set (comparable on the shared rows).
+      eval_samples: 96
+      task_eval_samples: 96
+      task_gen_samples: 96
+      batch_size: 12
+      length_bucket_window: 32   # user 2026-09-08: length-aware batching (sort 32-batch windows by length hint)
+    ratio:
+      r_max_start: 0.25   # band top stays at 4x
+      r_max: 0.25   # no ceiling descent
+      r_start: 0.0078125   # P19k's floor had reached r_end by step 6000
+      r_end: 0.0078125
+      ceiling_steps: 0
+      hold_steps: 0
+      # ADAPTIVE floor (user, 2026-09-08): steps per doubling grow like
+      # 1/sqrt(r) (first doubling ~670 steps, 64x->128x ~5200 if mastered on
+      # time) and the rate is eased by clamp(target_gap / gap, 0.1, 1) with
+      # gap = reconstruct loss at the CURRENT FLOOR minus full text, read at
+      # every eval. Never stops, never rises. descent_steps is unused here.
+      adaptive: true
+      rate_log2_per_step: 2.0e-3
+      rate_power: 0.5
+      mult_min: 0.25   # ≥ 2000 steps per doubling at the hard end
+      band_top_prob: 0.4   # 40% of steps at 4-8x: gen x4 EM fell to 0.03 under plain log-uniform (P19k@1000)
+      band_top_lo: 0.125
+      family_bands:
+        qa_multineedle: [0.0078125, 0.03125]   # 32-128x: the needle union exceeds the budget
+        qa_multineedle_long: [0.0078125, 0.03125]
+      mastery_family: reconstruct
+      mastery_target_gap: 0.2   # user 2026-09-08: ease earlier (was 0.3)
+      descent_steps: 8000
+      p_random_selection: 0.1
+      ratios_per_step: 1   # 2 doubled every decoder pass; multi-ratio coverage comes from sampling across steps
+    anchor:
+      weight: 0.0
+      floor: 0.0
+      phase_out_steps: 0   # P19f already phased the anchor out
+      steps: 1
+      decorrelation_weight: 0.0
+      within_doc_diversity_weight: 0.0
+    kd:
+      weight: 1.0        # stage D: KD to the frozen base every step — the guard on the adapter
+      kd_every: 1
+      temperature: 1.0
+      prompt_contrast_weight: 1.0
+      prompt_contrast_margin: 1.0
+      prompt_contrast_max_tokens: 6144   # two encoder + four decoder graphs coexist in the pass
+      prompt_contrast_paired: true
+      ce_weight: 1.0       # P19e showed KD-only is capped at the base teacher (x4 rose 1.88 -> 2.58, gen EM 0.03): CE carries the gold signal
+      selection_weight: 1.0
+      selection_temperature: 1.0
+      selection_signal: utility_grad   # the old lineage's signal: dL/dh at the hook layer over ALL positions, zero extra passes
+      selection_every: 1
+      head_scale_anchor_weight: 0.01   # old lineage: z-scored losses leave the raw scale gradient-free (129 -> 8431 in 30 steps)
+      head_scale_target: 1.0
+      teacher_checkpoint: /workspace/checkpoints/bgkit2_step4000_20260909_033056_638835_run-bgkit2_p19g_fulltext_lora   # matched full-text LoRA (rep-gated), the honest teacher
+    optim:
+      lr_backbone: 2.0e-5   # the whole backbone (old lineage rate)
+      lr_lora: 2.0e-5
+      lr_head: 5.0e-5
+      lr_projection: 1.0e-4
+      lr_projection_block: 5.0e-5

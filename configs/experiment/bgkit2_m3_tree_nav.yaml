@@ -1,0 +1,70 @@
+# @package _global_
+# M3 — Stage C: recursive tree encodings the decoder reads at the ROOT, with
+# navigation by file path (plans/multilevel_encoder_2026_09_16.md, restated by
+# the user 2026-09-16: "just train up multi-level recursive encodings, with the
+# ability for the decoder to read out the encoding of the entire tree --
+# navigation should just be via file name paths").
+#
+# Data: repo_tree_v3 -- up to 24 real source files per row as a sub-tree around
+# the evidence file, paths kept, 0 leaky questions, train/eval repo-disjoint.
+# Each repo is encoded with encode_tree (file -> directory -> root, depth 3);
+# the decoder gets the root reps and must produce the answer path.
+#
+# DECODER FROZEN (lora.enabled false): small decoder state, large encoder tree.
+# The encoder side trains: repro head, projection, head, last backbone layers.
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_m3_tree_nav
+# Never auto-resume: with the fast dir empty the resolver falls back to the HDD
+# archive by run_name and restores max_steps/schedule from it (M2, then M3 on
+# 2026-09-16). A tree run must start fresh from its init checkpoint.
+resume_checkpoint: none
+
+training:
+  max_steps: 3000
+  gradient_checkpointing_encoder: true
+  gradient_checkpointing_decoder: false
+  eval_every: 250
+  save_every: 500
+  checkpoint_pruning:
+    metric: eval/tree/nav_gain_nats
+    lower_is_better: false
+  bgkit2:
+    model:
+      # warm-start from the (redesigned) Stage B checkpoint; fill at launch
+      init_encoder_from: /workspace/checkpoints/bgkit2_step1999_20260916_230824_025665_run-bgkit2_m2b_bridge_distill_grouped
+      init_head_from: /workspace/checkpoints/bgkit2_step1999_20260916_230824_025665_run-bgkit2_m2b_bridge_distill_grouped
+      repro_head: true
+      train_backbone_layers: [12, 13, 14, 15]
+      interface_rms_only: true
+      prompt_separator: true
+      projection_block: true
+      projection_input_skip: false
+      interface_momentum: 0.1
+      interface_row_norm: false
+      interface_prenorm: true
+      interface_match_moments: true
+      lora:
+        enabled: false                    # decoder frozen
+    data:
+      repo_tree_store: /workspace/bgkit2_data/tasks/repo_tree_v3.parquet
+      repo_tree_max_files: 24
+      repo_tree_file_tokens: 512
+      batch_size: 2                       # trees per step; each is up to 24 files
+      length_bucket_window: 0
+    multilevel:
+      enabled: false                      # no distillation here; the task is navigation
+      ratio_leaf: 0.125
+      ratio_node: 0.25
+      max_depth: 3
+    anchor:
+      repro_weight: 0.0
+      weight: 0.0
+      floor: 0.0
+    kd:
+      ce_weight: 1.0
+      weight: 0.0
+      selection_weight: 0.0

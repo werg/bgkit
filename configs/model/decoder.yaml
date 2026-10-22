@@ -1,0 +1,14 @@
+# Reconstruction decoder
+# Based on Qwen3.5-0.8B (instruct, ~800M params, hybrid DeltaNet + full attention)
+# Used as standard causal LM (no bidirectionalization needed)
+decoder:
+  backbone_name: Qwen/Qwen3.5-0.8B
+  # backbone_revision: <pin after release stabilizes>
+  hidden_dim: 1024
+  # Adaptation strategy: "full" or "lora"
+  # Start with full fine-tuning, switch to LoRA if embedding drift observed
+  adaptation: full
+  lora:
+    rank: 256  # High-rank if switching to LoRA
+    alpha: 512
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]

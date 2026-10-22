@@ -1,0 +1,181 @@
+# Phase 2 KB-scale Stage B: full-corpus training (merged with the
+# old Stage C — we no longer ship a separate Stage C config).
+#
+# L0 is frozen/cached; direct-trained L1 + decoder continue from Stage A. L0
+# survivors come from a pre-computed cache built by
+# scripts/precompute_l0_subset.py with --stage-a-checkpoint pointing at
+# the trained Stage A checkpoint.
+#
+# Memory safety (2026-06-28): the global guard is .env BGKIT_CUDA_MEM_FRACTION=0.80
+# (~97GB process cap → ~24GB host margin on the 121GB unified-memory host, so a
+# host FREEZE is impossible — see the Stage A GC-off freeze post-mortem in memory).
+# ⚠ Stage B uses CACHED L0 (live_l0: false) — NO live-L0 forward — so its peak
+# profile is FUNDAMENTALLY DIFFERENT from Stage A's: the per-step cost is the L1
+# encoder + decoder forward over the (small) cached survivors, NOT a raw-token L0
+# forward. DO NOT copy Stage A's trim (max_sample_l0_tokens) / memory-retention
+# tuning — those are live-L0 knobs. Profile Stage B FRESH (profile-phase2-kb-stage-b
+# compose service) before raising batch_size.
+phase: phase2_kb
+stage: B
+optimizer: adamw
+max_steps: 60000
+warmup_steps: 1000
+lr: 1.0e-4
+decoder_lr: 5.0e-5
+l1_lr: 2.0e-4
+eval_every: 1000
+save_every: 5000
+
+# Fallback only when survivor-budget packing is disabled.
+batch_size: 4
+# Pack by the cached survivor rows that actually drive Stage-B L1/decoder cost.
+# Oversized samples become singletons; max_microbatch_samples bounds sequential
+# decoder work even when many tiny trajectories fit the row budget.
+max_microbatch_l0_survivors: 8192
+max_microbatch_samples: 8
+
+datasets:
+  - kilt_wikipedia
+  - pubmedqa
+  - narrativeqa
+  - git_history
+  - memory
+  - newsqa
+  - msmarco_passage
+  - searchqa
+
+# No top_tag_whitelist — Stage B is the full-scale stage. If you want
+# to run a smaller subset for debugging, add a whitelist here.
+
+live_l0: false
+# The L0 cache MUST be precomputed with the PROMPT-FIT checkpoint so the cached
+# survivors reflect the per-task L0 prompts (see phase2_kb_prompt_fit + the
+# precompute command in the stage_a_checkpoint note below). A cache built without
+# the prompts gives a task-UNCONDITIONED cached L0.
+l0_cache_dir: ${oc.env:DATA_DIR}/l0_cache_kb
+
+# ── Recursive-L1 path-selective browse encode (Phase 3) ──────────────────
+# OFF by default — the trainer's browse turns stay text-only. When enabled,
+# each browse turn additionally splices a DENSE node-rep: the live search
+# path is re-encoded with gradient (query-conditioned), while off-path
+# browse-tree siblings are read DETACHED from the query-agnostic L1-tree
+# cache built by scripts/precompute_l1_tree.py (the memory win). Requires
+# that cache to exist for every active dataset.
+recursive_l1_tree:
+  enabled: false
+  # cache_dir: ${oc.env:DATA_DIR}/l1_tree_cache_kb   # default when omitted
+  # l1_retention: 0.15                               # defaults to l1_retention
+  # full_backprop: false
+  #   FULL-TREE curriculum (git-repro windows ONLY). When true, the WHOLE
+  #   window subtree is re-encoded LIVE every step and gradient flows to ALL
+  #   nodes (on-path + off-path) — off-path siblings are re-encoded live from
+  #   the L0 leaf cache, NOT read detached from an L1-tree cache (so no
+  #   precompute_l1_tree.py run is needed). L0 stays frozen/cached. SMALL
+  #   trees ONLY (~16-64 commits) — MUST NOT be enabled on big trees
+  #   (pubmedqa/KILT) or it will OOM / be intractably slow.
+
+l0_retention:
+  kilt_wikipedia: 0.05
+  pubmedqa: 0.20
+  narrativeqa: 0.20
+  newsqa: 0.10
+  msmarco_passage: 0.40
+  searchqa: 0.40
+  git_history: 0.20
+  memory: 0.40
+
+# L1 retention drives how much *additional* compression L1 applies on
+# top of the per-article L0 survivors. Pinned article-ID tokens always
+# survive; this controls non-pinned positions. 0.10-0.20 keeps L1 doing
+# real compression. Tightened from 0.50 historical default.
+l1_retention: 0.15
+
+l0_retention_jitter:
+  enabled: false
+  mode: jitter
+  jitter_abs: 0.01
+  jitter_rel: 0.10
+  anchor_sampling_prob: 0.30
+
+l1_retention_jitter:
+  enabled: true
+  mode: jitter
+  jitter_abs: 0.01
+  jitter_rel: 0.10
+  anchor_sampling_prob: 0.30
+
+lora:
+  # Stage A trains L1 directly. Keep the same module topology so the complete
+  # Stage-A state loads exactly rather than inserting fresh LoRA wrappers.
+  enabled: false
+  train_l1_direct: true
+  l0_rank: 32
+  l1_rank: 32
+  alpha: 64
+  dropout: 0.0
+
+# Survivorship head auxiliary losses. Stage B: L0 is cached + frozen, so L0
+# survivorship losses are zeroed and the trainer skips L0
+# θ/μ updates in post-step. L1 continues from Stage A's cold-start.
+survivorship:
+  # Phase 2 (KRKBTrainer): selection is the least-important signal (reps are
+  # distributed; the pre-trained head already selects decent candidates), so
+  # ALL survivorship aux is OFF — head frozen, no _pending retention, only the
+  # main reconstruction loss + the (still-on) dual-ascent θ control. The
+  # per-level weights below are inert under this flag (kept for re-enable).
+  survivorship_aux: false
+  relevance_loss_weight: 0.05
+  relevance_gold_boost: 1.5
+  relevance_distractor_damp: 0.5
+  n_distractors: 3
+  ratio_loss_weight: 0.1
+  decisiveness_loss_weight: 0.05
+
+  # L0 frozen — all weights zero; trainer skips L0 θ/μ updates.
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    utility_grad_loss_weight: 0.0
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.0          # L0 frozen — no gradient to push
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+
+ice_distillation:
+  l0:
+    enabled: false            # L0 frozen (Stage-A state is baked into cache)
+  l1:
+    enabled: false
+
+moment_match_reference:
+  l0:
+    path: null
+  l1:
+    path: null
+
+# Must match the base used by Stage A and cache precompute exactly.
+phase1_checkpoint: /workspace/checkpoints/phase1_summarization_round_robin_step51945_20260624_060459
+stage_a_checkpoint: auto
+# The same resolved prompt-fit/Stage-A checkpoint MUST be passed to cache
+# precompute. Stage B now loads its complete encoder/bridge/L1/projection and
+# decoder state directly as well as verifying the cached L0 provenance:
+#   python scripts/precompute_l0_subset.py \
+#     --articles $DATA_DIR/trajectory_sets/stage_b.jsonl \
+#     --mmap-dir $DATA_DIR/mmap/phase2 \
+#     --phase1-checkpoint $CHECKPOINT_DIR/phase1_summarization_round_robin_step51945_... \
+#     --stage-a-checkpoint $CHECKPOINT_DIR/phase2_kb_prompt_fit_best \
+#     --output-dir $DATA_DIR/l0_cache_kb \
+#     --retention-json configs/phase2_kb/l0_retention.json --lora-rank 32
+# precompute auto-detects l0_task_prompts.* in the ckpt (scripts/
+# precompute_l0_subset.py:~90-116). If prompt-fit hasn't run, pass
+# phase2_kb_stage_a_best instead — the cache will be task-UNconditioned.

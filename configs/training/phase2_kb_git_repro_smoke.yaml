@@ -1,0 +1,171 @@
+# Phase 2 KB — git_commit_repro PER-REPO full-backprop SMOKE probe.
+#
+# WHAT THIS IS
+#   A few-step (max_steps: 8) wall-time / memory smoke of the per-repo
+#   full-backprop recursive-L1 trainer (the review's M1/M2 check) on a SMALL,
+#   worst-case-inclusive subset of git_commit_repro. Identical mechanism to
+#   configs/training/phase2_kb_git_repro_fullbackprop.yaml; only the dataset,
+#   horizon, and eval/save cadence differ. Run it the moment the per-repo
+#   trainer fix lands, to confirm the largest windows fit memory + measure
+#   per-step wall-clock before launching the full run.
+#
+#   Dataset: git_commit_repro_smoke ONLY — a 15-batch merge (150 repos) that
+#   deliberately includes the largest windows found across the completed
+#   extraction batches:
+#     - Chalarangelo/30-seconds-of-python  503 commits / 955 file-samples (M1/M2 worst on BOTH axes)
+#     - HackTricks-wiki/hacktricks         25  commits / 1539 file-samples (worst file-sample fan-out)
+#     - chokcoco/iCSS                       509 commits / 509 file-samples  (worst commit window)
+#   Built by merging completed *calibration*-sidecar batches into
+#   $DATA_DIR/staging/commit_repro_smoke.jsonl, then running
+#   convert_commit_repro_to_mmap -> build_commit_repro_tree ->
+#   build_commit_repro_trajectories with DATASET_NAME overridden to
+#   git_commit_repro_smoke (distinct from the full git_commit_repro outputs).
+#
+# DO NOT use for real training — 8 steps, eval/save effectively off.
+phase: phase2_kb
+stage: A                       # live-L0 semantics (live_l0 below)
+optimizer: adamw
+
+# Training horizon — SMOKE: 8 optimizer steps. With
+# gradient_accumulation_steps: 4 that consumes ~32 repo-batches (of 150),
+# enough to surface the per-step memory/wall-time profile incl. large windows.
+max_steps: 8
+warmup_steps: 2
+lr: 1.0e-4
+decoder_lr: 5.0e-5
+l1_lr: 2.0e-4
+# eval / save effectively OFF (> max_steps) — this is a wall-time/memory probe.
+eval_every: 1000
+save_every: 1000
+
+# batch_size is IGNORED in per-repo mode: RepoGroupedBatchSampler emits one
+# batch = one repo's window-0 file-samples, micro-batched internally.
+batch_size: 1
+gradient_accumulation_steps: 4
+
+# Gradient checkpointing — REQUIRED (per-layer encoder GC + reentrant decoder
+# GC). Turning GC off on this host has frozen the machine. Keep ON.
+activation_checkpointing:
+  encoder: false
+  decoder: false
+gradient_checkpointing: true
+decoder_gradient_checkpointing: "reentrant"
+
+datasets:
+  - git_commit_repro_smoke
+
+# LIVE L0 — gradient trains L0 backbone/head/auto_repro_head on the diff leaves
+# of the shared tree. No L0 precompute / cache needed.
+live_l0: true
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2
+
+# ── Recursive-L1 PER-REPO full-backprop ─────────────────────────────────────
+recursive_l1_tree:
+  enabled: true
+  full_backprop_per_repo: true   # implies full_backprop
+  general_prompt: "compress this repository's commit history"
+  # Step-interpolated retention ramps (start -> end over ramp_steps). At
+  # max_steps: 8 these stay essentially at the START (highest-retention =
+  # most survivors = WORST-CASE memory), which is what the smoke wants to probe.
+  l0_retention:
+    start: 0.15
+    end: 0.05
+    ramp_steps: 4000
+  l1_retention:
+    start: 0.30
+    end: 0.05
+    ramp_steps: 4000
+  # M1/M2 knob — null = use EVERY file-sample of a repo (full worst-case per-step
+  # cost). Leave null so the smoke hits the true large-window load; set an int K
+  # here only if the smoke OOMs and you want to bound staged-graph memory.
+  max_file_samples_per_repo: null
+
+l0_retention:
+  git_commit_repro_smoke:
+    start: 0.15
+    end: 0.05
+    ramp_steps: 4000
+
+l1_retention: 0.05
+
+l0_retention_jitter:
+  enabled: false
+l1_retention_jitter:
+  enabled: false
+
+# Direct training (no LoRA): L1's LoRA broke GC recompute (LoRARouter
+# thread-local state). L0 trains directly (live); l1l1_bridge + L1 backbone
+# train directly; round-robin projection blocks track the decoders.
+lora:
+  enabled: false
+  train_l1_direct: true
+  l0_rank: 32
+  l1_rank: 32
+  alpha: 64
+  dropout: 0.0
+
+# Survivorship aux losses DISABLED (same as the full fullbackprop run): the
+# head is frozen at its pre-trained selection; only L0/L1 backbones +
+# l1l1_bridge + projection train via the reconstruction loss. Dual-ascent θ
+# control stays ON (accumulated per-microbatch at encode time).
+survivorship:
+  survivorship_aux: false
+  relevance_loss_weight: 0.05
+  relevance_gold_boost: 1.5
+  relevance_distractor_damp: 0.5
+  n_distractors: 3
+  ratio_loss_weight: 0.1
+  decisiveness_loss_weight: 0.05
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+
+ice_distillation:
+  l0:
+    enabled: false
+  l1:
+    enabled: false
+
+moment_match_reference:
+  l0:
+    path: null
+  l1:
+    path: null
+
+# ── Encoder source: the distilled L1->L1 bridge checkpoint (same as full run) ─
+# STAGE BOTH DECODERS FIRST: copy decoder_qwen.pt + decoder_falcon.pt from the
+# summarization round-robin ckpt into this dir so the co-trained decoders load.
+phase1_checkpoint: /workspace/checkpoints/phase2_kb_l1l1_step200_20260629_054912
+
+# ── Decoder: ROUND-ROBIN both families (Qwen-0.8B + Falcon-H1-90M) ──────────
+round_robin: true
+qwen_decoder_prob: 0.3
+decoder_qwen:
+  family: qwen35
+  backbone_name: Qwen/Qwen3.5-0.8B
+decoder_falcon:
+  family: falcon_h1
+  backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+
+# Checkpoint pruning irrelevant at save_every > max_steps; kept harmless.
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+  lower_is_better: true

@@ -1,0 +1,1016 @@
+{"id": "quality:2011", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 592, "enc_s": 0.8275, "dec_s": 0.0424}
+{"id": "quality:2011", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 595, "enc_s": 0.0, "dec_s": 0.0249}
+{"id": "quality:2011", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 595, "enc_s": 0.0, "dec_s": 0.0181}
+{"id": "quality:2011", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 575, "enc_s": 0.0, "dec_s": 0.0238, "summ_in_tokens": 3363, "summ_out_tokens": 483, "summ_s": 79.43}
+{"id": "quality:2011", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1104, "enc_s": 0.1319, "dec_s": 0.0372}
+{"id": "quality:2011", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1107, "enc_s": 0.0, "dec_s": 0.0352}
+{"id": "quality:2011", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1107, "enc_s": 0.0, "dec_s": 0.0258}
+{"id": "quality:2011", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1712, "enc_s": 0.1318, "dec_s": 0.0532}
+{"id": "quality:2011", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2131, "enc_s": 0.0, "dec_s": 0.0648}
+{"id": "quality:2011", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2131, "enc_s": 0.0, "dec_s": 0.0452}
+{"id": "quality:2011", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2127, "enc_s": 0.0, "dec_s": 0.0645, "summ_in_tokens": 3364, "summ_out_tokens": 2407, "summ_s": 270.84}
+{"id": "quality:2003", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 589, "enc_s": 0.1295, "dec_s": 0.0244}
+{"id": "quality:2003", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 591, "enc_s": 0.0, "dec_s": 0.0231}
+{"id": "quality:2003", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 591, "enc_s": 0.0, "dec_s": 0.0182}
+{"id": "quality:2003", "subset": "validation", "arm": "summary@512", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 472, "enc_s": 0.0, "dec_s": 0.0232, "summ_in_tokens": 2933, "summ_out_tokens": 424, "summ_s": 68.04}
+{"id": "quality:2003", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1101, "enc_s": 0.13, "dec_s": 0.036}
+{"id": "quality:2003", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1103, "enc_s": 0.0, "dec_s": 0.0358}
+{"id": "quality:2003", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1103, "enc_s": 0.0, "dec_s": 0.026}
+{"id": "quality:2003", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1501, "enc_s": 0.1317, "dec_s": 0.0448}
+{"id": "quality:2003", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2127, "enc_s": 0.0, "dec_s": 0.0648}
+{"id": "quality:2003", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2127, "enc_s": 0.0, "dec_s": 0.0452}
+{"id": "quality:2003", "subset": "validation", "arm": "summary@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 943, "enc_s": 0.0, "dec_s": 0.0323, "summ_in_tokens": 2934, "summ_out_tokens": 892, "summ_s": 143.36}
+{"id": "quality:1839", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 597, "enc_s": 0.1296, "dec_s": 0.0241}
+{"id": "quality:1839", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 599, "enc_s": 0.0, "dec_s": 0.0244}
+{"id": "quality:1839", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 599, "enc_s": 0.0, "dec_s": 0.0184}
+{"id": "quality:1839", "subset": "validation", "arm": "summary@512", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 595, "enc_s": 0.0, "dec_s": 0.0232, "summ_in_tokens": 2936, "summ_out_tokens": 535, "summ_s": 87.67}
+{"id": "quality:1839", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1109, "enc_s": 0.131, "dec_s": 0.0351}
+{"id": "quality:1839", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1111, "enc_s": 0.0, "dec_s": 0.0358}
+{"id": "quality:1839", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1111, "enc_s": 0.0, "dec_s": 0.0259}
+{"id": "quality:1839", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1509, "enc_s": 0.1319, "dec_s": 0.0469}
+{"id": "quality:1839", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2135, "enc_s": 0.0, "dec_s": 0.0662}
+{"id": "quality:1839", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2135, "enc_s": 0.0, "dec_s": 0.0454}
+{"id": "quality:1839", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1076, "enc_s": 0.0, "dec_s": 0.035, "summ_in_tokens": 2937, "summ_out_tokens": 1005, "summ_s": 161.83}
+{"id": "quality:1492", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 620, "enc_s": 0.2742, "dec_s": 0.0249}
+{"id": "quality:1492", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 621, "enc_s": 0.0, "dec_s": 0.0246}
+{"id": "quality:1492", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 621, "enc_s": 0.0, "dec_s": 0.0181}
+{"id": "quality:1492", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 617, "enc_s": 0.0, "dec_s": 0.0234, "summ_in_tokens": 8076, "summ_out_tokens": 535, "summ_s": 87.8}
+{"id": "quality:1492", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1132, "enc_s": 0.2745, "dec_s": 0.0366}
+{"id": "quality:1492", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1133, "enc_s": 0.0, "dec_s": 0.0365}
+{"id": "quality:1492", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1133, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:1492", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2158, "enc_s": 0.2755, "dec_s": 0.0655}
+{"id": "quality:1492", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2157, "enc_s": 0.0, "dec_s": 0.0669}
+{"id": "quality:1492", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2157, "enc_s": 0.0, "dec_s": 0.0457}
+{"id": "quality:1492", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1217, "enc_s": 0.0, "dec_s": 0.0387, "summ_in_tokens": 8077, "summ_out_tokens": 1083, "summ_s": 174.98}
+{"id": "quality:483", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 618, "enc_s": 0.272, "dec_s": 0.0258}
+{"id": "quality:483", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 618, "enc_s": 0.0, "dec_s": 0.0238}
+{"id": "quality:483", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 618, "enc_s": 0.0, "dec_s": 0.0183}
+{"id": "quality:483", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 614, "enc_s": 0.0, "dec_s": 0.0239, "summ_in_tokens": 6893, "summ_out_tokens": 544, "summ_s": 87.93}
+{"id": "quality:483", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1130, "enc_s": 0.2717, "dec_s": 0.0364}
+{"id": "quality:483", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1130, "enc_s": 0.0, "dec_s": 0.0366}
+{"id": "quality:483", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1130, "enc_s": 0.0, "dec_s": 0.0263}
+{"id": "quality:483", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2153, "enc_s": 0.2739, "dec_s": 0.0653}
+{"id": "quality:483", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2154, "enc_s": 0.0, "dec_s": 0.066}
+{"id": "quality:483", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2154, "enc_s": 0.0, "dec_s": 0.0457}
+{"id": "quality:483", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1467, "enc_s": 0.0, "dec_s": 0.045, "summ_in_tokens": 6894, "summ_out_tokens": 1313, "summ_s": 164.97}
+{"id": "quality:155", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 643, "enc_s": 0.2696, "dec_s": 0.0263}
+{"id": "quality:155", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 643, "enc_s": 0.0, "dec_s": 0.0253}
+{"id": "quality:155", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 643, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:155", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 612, "enc_s": 0.0, "dec_s": 0.0243, "summ_in_tokens": 7083, "summ_out_tokens": 475, "summ_s": 75.58}
+{"id": "quality:155", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 1153, "enc_s": 0.2706, "dec_s": 0.0364}
+{"id": "quality:155", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1155, "enc_s": 0.0, "dec_s": 0.0376}
+{"id": "quality:155", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1155, "enc_s": 0.0, "dec_s": 0.0277}
+{"id": "quality:155", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2178, "enc_s": 0.2746, "dec_s": 0.0663}
+{"id": "quality:155", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 2179, "enc_s": 0.0, "dec_s": 0.0688}
+{"id": "quality:155", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2179, "enc_s": 0.0, "dec_s": 0.047}
+{"id": "quality:155", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 1237, "enc_s": 0.0, "dec_s": 0.0392, "summ_in_tokens": 7084, "summ_out_tokens": 1085, "summ_s": 148.91}
+{"id": "quality:1301", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 596, "enc_s": 0.1295, "dec_s": 0.0242}
+{"id": "quality:1301", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 598, "enc_s": 0.0, "dec_s": 0.0238}
+{"id": "quality:1301", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 598, "enc_s": 0.0, "dec_s": 0.0189}
+{"id": "quality:1301", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 594, "enc_s": 0.0, "dec_s": 0.0241, "summ_in_tokens": 2608, "summ_out_tokens": 595, "summ_s": 86.69}
+{"id": "quality:1301", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1108, "enc_s": 0.131, "dec_s": 0.0347}
+{"id": "quality:1301", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1110, "enc_s": 0.0, "dec_s": 0.0359}
+{"id": "quality:1301", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1110, "enc_s": 0.0, "dec_s": 0.0261}
+{"id": "quality:1301", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1346, "enc_s": 0.1327, "dec_s": 0.0413}
+{"id": "quality:1301", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2134, "enc_s": 0.0, "dec_s": 0.0664}
+{"id": "quality:1301", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2134, "enc_s": 0.0, "dec_s": 0.0454}
+{"id": "quality:1301", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 990, "enc_s": 0.0, "dec_s": 0.0336, "summ_in_tokens": 2609, "summ_out_tokens": 929, "summ_s": 93.78}
+{"id": "quality:1795", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 615, "enc_s": 0.2747, "dec_s": 0.0251}
+{"id": "quality:1795", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0239}
+{"id": "quality:1795", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0192}
+{"id": "quality:1795", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 521, "enc_s": 0.0, "dec_s": 0.0229, "summ_in_tokens": 8038, "summ_out_tokens": 402, "summ_s": 63.74}
+{"id": "quality:1795", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1129, "enc_s": 0.2748, "dec_s": 0.0365}
+{"id": "quality:1795", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1128, "enc_s": 0.0, "dec_s": 0.0369}
+{"id": "quality:1795", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1128, "enc_s": 0.0, "dec_s": 0.0263}
+{"id": "quality:1795", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2152, "enc_s": 0.2743, "dec_s": 0.0667}
+{"id": "quality:1795", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2152, "enc_s": 0.0, "dec_s": 0.0667}
+{"id": "quality:1795", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2152, "enc_s": 0.0, "dec_s": 0.0458}
+{"id": "quality:1795", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 888, "enc_s": 0.0, "dec_s": 0.0305, "summ_in_tokens": 8039, "summ_out_tokens": 763, "summ_s": 80.37}
+{"id": "quality:671", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 640, "enc_s": 0.2701, "dec_s": 0.0255}
+{"id": "quality:671", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 640, "enc_s": 0.0, "dec_s": 0.025}
+{"id": "quality:671", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 640, "enc_s": 0.0, "dec_s": 0.0192}
+{"id": "quality:671", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 612, "enc_s": 0.0, "dec_s": 0.0243, "summ_in_tokens": 6840, "summ_out_tokens": 455, "summ_s": 57.78}
+{"id": "quality:671", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1150, "enc_s": 0.2709, "dec_s": 0.036}
+{"id": "quality:671", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1152, "enc_s": 0.0, "dec_s": 0.037}
+{"id": "quality:671", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1152, "enc_s": 0.0, "dec_s": 0.0267}
+{"id": "quality:671", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2176, "enc_s": 0.2745, "dec_s": 0.0665}
+{"id": "quality:671", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2176, "enc_s": 0.0, "dec_s": 0.0679}
+{"id": "quality:671", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2176, "enc_s": 0.0, "dec_s": 0.0465}
+{"id": "quality:671", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1030, "enc_s": 0.0, "dec_s": 0.0341, "summ_in_tokens": 6841, "summ_out_tokens": 853, "summ_s": 39.05}
+{"id": "quality:353", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 598, "enc_s": 0.3379, "dec_s": 0.025}
+{"id": "quality:353", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 596, "enc_s": 0.0, "dec_s": 0.0246}
+{"id": "quality:353", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 596, "enc_s": 0.0, "dec_s": 0.0188}
+{"id": "quality:353", "subset": "validation", "arm": "summary@512", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 592, "enc_s": 0.0, "dec_s": 0.0235, "summ_in_tokens": 8410, "summ_out_tokens": 541, "summ_s": 25.36}
+{"id": "quality:353", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1109, "enc_s": 0.3368, "dec_s": 0.0355}
+{"id": "quality:353", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1108, "enc_s": 0.0, "dec_s": 0.0359}
+{"id": "quality:353", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1108, "enc_s": 0.0, "dec_s": 0.0262}
+{"id": "quality:353", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 2130, "enc_s": 0.3392, "dec_s": 0.0642}
+{"id": "quality:353", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2132, "enc_s": 0.0, "dec_s": 0.0664}
+{"id": "quality:353", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2132, "enc_s": 0.0, "dec_s": 0.0448}
+{"id": "quality:353", "subset": "validation", "arm": "summary@2048", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 1200, "enc_s": 0.0, "dec_s": 0.038, "summ_in_tokens": 8411, "summ_out_tokens": 1078, "summ_s": 47.48}
+{"id": "quality:576", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 648, "enc_s": 0.1977, "dec_s": 0.0255}
+{"id": "quality:576", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 649, "enc_s": 0.0, "dec_s": 0.0253}
+{"id": "quality:576", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 649, "enc_s": 0.0, "dec_s": 0.0193}
+{"id": "quality:576", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 645, "enc_s": 0.0, "dec_s": 0.0241, "summ_in_tokens": 4537, "summ_out_tokens": 529, "summ_s": 24.24}
+{"id": "quality:576", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 1159, "enc_s": 0.2011, "dec_s": 0.0365}
+{"id": "quality:576", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1161, "enc_s": 0.0, "dec_s": 0.038}
+{"id": "quality:576", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 1161, "enc_s": 0.0, "dec_s": 0.0274}
+{"id": "quality:576", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2184, "enc_s": 0.2038, "dec_s": 0.0663}
+{"id": "quality:576", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2185, "enc_s": 0.0, "dec_s": 0.0672}
+{"id": "quality:576", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 2185, "enc_s": 0.0, "dec_s": 0.0463}
+{"id": "quality:576", "subset": "validation", "arm": "summary@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2028, "enc_s": 0.0, "dec_s": 0.0613, "summ_in_tokens": 4538, "summ_out_tokens": 1816, "summ_s": 80.79}
+{"id": "quality:611", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 605, "enc_s": 0.2713, "dec_s": 0.0246}
+{"id": "quality:611", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 603, "enc_s": 0.0, "dec_s": 0.0239}
+{"id": "quality:611", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 603, "enc_s": 0.0, "dec_s": 0.0181}
+{"id": "quality:611", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 600, "enc_s": 0.0, "dec_s": 0.0237, "summ_in_tokens": 6655, "summ_out_tokens": 560, "summ_s": 24.93}
+{"id": "quality:611", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1115, "enc_s": 0.2692, "dec_s": 0.0355}
+{"id": "quality:611", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1116, "enc_s": 0.0, "dec_s": 0.0363}
+{"id": "quality:611", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1116, "enc_s": 0.0, "dec_s": 0.0261}
+{"id": "quality:611", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2139, "enc_s": 0.2736, "dec_s": 0.0646}
+{"id": "quality:611", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2140, "enc_s": 0.0, "dec_s": 0.0663}
+{"id": "quality:611", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2140, "enc_s": 0.0, "dec_s": 0.0455}
+{"id": "quality:611", "subset": "validation", "arm": "summary@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1319, "enc_s": 0.0, "dec_s": 0.0415, "summ_in_tokens": 6656, "summ_out_tokens": 1173, "summ_s": 51.78}
+{"id": "quality:1873", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 619, "enc_s": 0.1294, "dec_s": 0.0246}
+{"id": "quality:1873", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 621, "enc_s": 0.0, "dec_s": 0.0246}
+{"id": "quality:1873", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 621, "enc_s": 0.0, "dec_s": 0.0182}
+{"id": "quality:1873", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 617, "enc_s": 0.0, "dec_s": 0.0239, "summ_in_tokens": 3298, "summ_out_tokens": 507, "summ_s": 22.19}
+{"id": "quality:1873", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1131, "enc_s": 0.1294, "dec_s": 0.036}
+{"id": "quality:1873", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1133, "enc_s": 0.0, "dec_s": 0.0351}
+{"id": "quality:1873", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1133, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:1873", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1753, "enc_s": 0.1317, "dec_s": 0.0542}
+{"id": "quality:1873", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2157, "enc_s": 0.0, "dec_s": 0.0664}
+{"id": "quality:1873", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2157, "enc_s": 0.0, "dec_s": 0.046}
+{"id": "quality:1873", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2153, "enc_s": 0.0, "dec_s": 0.0661, "summ_in_tokens": 3299, "summ_out_tokens": 2035, "summ_s": 90.57}
+{"id": "quality:1195", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 630, "enc_s": 0.1286, "dec_s": 0.0244}
+{"id": "quality:1195", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 632, "enc_s": 0.0, "dec_s": 0.0247}
+{"id": "quality:1195", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 632, "enc_s": 0.0, "dec_s": 0.0181}
+{"id": "quality:1195", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 628, "enc_s": 0.0, "dec_s": 0.024, "summ_in_tokens": 2519, "summ_out_tokens": 710, "summ_s": 32.01}
+{"id": "quality:1195", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1142, "enc_s": 0.1308, "dec_s": 0.0364}
+{"id": "quality:1195", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1143, "enc_s": 0.0, "dec_s": 0.0361}
+{"id": "quality:1195", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1143, "enc_s": 0.0, "dec_s": 0.0267}
+{"id": "quality:1195", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1359, "enc_s": 0.1332, "dec_s": 0.0417}
+{"id": "quality:1195", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2168, "enc_s": 0.0, "dec_s": 0.0674}
+{"id": "quality:1195", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2168, "enc_s": 0.0, "dec_s": 0.0461}
+{"id": "quality:1195", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1838, "enc_s": 0.0, "dec_s": 0.0569, "summ_in_tokens": 2520, "summ_out_tokens": 1680, "summ_s": 75.37}
+{"id": "quality:535", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 621, "enc_s": 0.2704, "dec_s": 0.0248}
+{"id": "quality:535", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 621, "enc_s": 0.0, "dec_s": 0.0244}
+{"id": "quality:535", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 621, "enc_s": 0.0, "dec_s": 0.0182}
+{"id": "quality:535", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 617, "enc_s": 0.0, "dec_s": 0.024, "summ_in_tokens": 7328, "summ_out_tokens": 581, "summ_s": 26.37}
+{"id": "quality:535", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1132, "enc_s": 0.274, "dec_s": 0.036}
+{"id": "quality:535", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1133, "enc_s": 0.0, "dec_s": 0.0364}
+{"id": "quality:535", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1133, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:535", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2156, "enc_s": 0.2758, "dec_s": 0.0668}
+{"id": "quality:535", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2157, "enc_s": 0.0, "dec_s": 0.0675}
+{"id": "quality:535", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2157, "enc_s": 0.0, "dec_s": 0.046}
+{"id": "quality:535", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1809, "enc_s": 0.0, "dec_s": 0.0557, "summ_in_tokens": 7329, "summ_out_tokens": 1666, "summ_s": 75.51}
+{"id": "quality:350", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 619, "enc_s": 0.27, "dec_s": 0.0256}
+{"id": "quality:350", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 620, "enc_s": 0.0, "dec_s": 0.0241}
+{"id": "quality:350", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 620, "enc_s": 0.0, "dec_s": 0.0192}
+{"id": "quality:350", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0244, "summ_in_tokens": 7091, "summ_out_tokens": 520, "summ_s": 24.17}
+{"id": "quality:350", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1132, "enc_s": 0.2733, "dec_s": 0.0362}
+{"id": "quality:350", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1131, "enc_s": 0.0, "dec_s": 0.0369}
+{"id": "quality:350", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1131, "enc_s": 0.0, "dec_s": 0.0264}
+{"id": "quality:350", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2156, "enc_s": 0.2714, "dec_s": 0.0665}
+{"id": "quality:350", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2156, "enc_s": 0.0, "dec_s": 0.0665}
+{"id": "quality:350", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2156, "enc_s": 0.0, "dec_s": 0.0458}
+{"id": "quality:350", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 894, "enc_s": 0.0, "dec_s": 0.0311, "summ_in_tokens": 7092, "summ_out_tokens": 759, "summ_s": 35.5}
+{"id": "quality:1022", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 584, "enc_s": 0.2707, "dec_s": 0.0252}
+{"id": "quality:1022", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 586, "enc_s": 0.0, "dec_s": 0.0244}
+{"id": "quality:1022", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 586, "enc_s": 0.0, "dec_s": 0.0186}
+{"id": "quality:1022", "subset": "validation", "arm": "summary@512", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 452, "enc_s": 0.0, "dec_s": 0.0211, "summ_in_tokens": 7538, "summ_out_tokens": 375, "summ_s": 16.99}
+{"id": "quality:1022", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 1097, "enc_s": 0.2733, "dec_s": 0.0346}
+{"id": "quality:1022", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1098, "enc_s": 0.0, "dec_s": 0.0361}
+{"id": "quality:1022", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1098, "enc_s": 0.0, "dec_s": 0.0253}
+{"id": "quality:1022", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 2122, "enc_s": 0.2754, "dec_s": 0.066}
+{"id": "quality:1022", "subset": "validation", "arm": "text@2048", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 2122, "enc_s": 0.0, "dec_s": 0.0662}
+{"id": "quality:1022", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2122, "enc_s": 0.0, "dec_s": 0.0447}
+{"id": "quality:1022", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 598, "enc_s": 0.0, "dec_s": 0.0239, "summ_in_tokens": 7539, "summ_out_tokens": 521, "summ_s": 24.07}
+{"id": "quality:1604", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 613, "enc_s": 0.3374, "dec_s": 0.0262}
+{"id": "quality:1604", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 612, "enc_s": 0.0, "dec_s": 0.0253}
+{"id": "quality:1604", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 612, "enc_s": 0.0, "dec_s": 0.0183}
+{"id": "quality:1604", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 599, "enc_s": 0.0, "dec_s": 0.0241, "summ_in_tokens": 8819, "summ_out_tokens": 492, "summ_s": 23.47}
+{"id": "quality:1604", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1125, "enc_s": 0.3384, "dec_s": 0.0367}
+{"id": "quality:1604", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1125, "enc_s": 0.0, "dec_s": 0.0364}
+{"id": "quality:1604", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1125, "enc_s": 0.0, "dec_s": 0.0267}
+{"id": "quality:1604", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2151, "enc_s": 0.3412, "dec_s": 0.0668}
+{"id": "quality:1604", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2149, "enc_s": 0.0, "dec_s": 0.0671}
+{"id": "quality:1604", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2149, "enc_s": 0.0, "dec_s": 0.0459}
+{"id": "quality:1604", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2145, "enc_s": 0.0, "dec_s": 0.065, "summ_in_tokens": 8820, "summ_out_tokens": 2773, "summ_s": 126.15}
+{"id": "quality:1105", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 626, "enc_s": 0.3375, "dec_s": 0.026}
+{"id": "quality:1105", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 627, "enc_s": 0.0, "dec_s": 0.0251}
+{"id": "quality:1105", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 627, "enc_s": 0.0, "dec_s": 0.0194}
+{"id": "quality:1105", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 623, "enc_s": 0.0, "dec_s": 0.0249, "summ_in_tokens": 8360, "summ_out_tokens": 514, "summ_s": 23.13}
+{"id": "quality:1105", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1141, "enc_s": 0.3402, "dec_s": 0.0368}
+{"id": "quality:1105", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1139, "enc_s": 0.0, "dec_s": 0.037}
+{"id": "quality:1105", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1139, "enc_s": 0.0, "dec_s": 0.0266}
+{"id": "quality:1105", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2162, "enc_s": 0.3424, "dec_s": 0.0656}
+{"id": "quality:1105", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2162, "enc_s": 0.0, "dec_s": 0.0669}
+{"id": "quality:1105", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2162, "enc_s": 0.0, "dec_s": 0.0461}
+{"id": "quality:1105", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 976, "enc_s": 0.0, "dec_s": 0.0331, "summ_in_tokens": 8361, "summ_out_tokens": 835, "summ_s": 36.83}
+{"id": "quality:1231", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 601, "enc_s": 0.1303, "dec_s": 0.0238}
+{"id": "quality:1231", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 604, "enc_s": 0.0, "dec_s": 0.0247}
+{"id": "quality:1231", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 604, "enc_s": 0.0, "dec_s": 0.0182}
+{"id": "quality:1231", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 600, "enc_s": 0.0, "dec_s": 0.0238, "summ_in_tokens": 2650, "summ_out_tokens": 780, "summ_s": 33.56}
+{"id": "quality:1231", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1114, "enc_s": 0.1329, "dec_s": 0.0348}
+{"id": "quality:1231", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1116, "enc_s": 0.0, "dec_s": 0.0356}
+{"id": "quality:1231", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1116, "enc_s": 0.0, "dec_s": 0.0261}
+{"id": "quality:1231", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1391, "enc_s": 0.1328, "dec_s": 0.0435}
+{"id": "quality:1231", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2140, "enc_s": 0.0, "dec_s": 0.0663}
+{"id": "quality:1231", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2140, "enc_s": 0.0, "dec_s": 0.0455}
+{"id": "quality:1231", "subset": "validation", "arm": "summary@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2136, "enc_s": 0.0, "dec_s": 0.0646, "summ_in_tokens": 2651, "summ_out_tokens": 2930, "summ_s": 131.4}
+{"id": "quality:1229", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 620, "enc_s": 0.1283, "dec_s": 0.0248}
+{"id": "quality:1229", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 623, "enc_s": 0.0, "dec_s": 0.0239}
+{"id": "quality:1229", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 623, "enc_s": 0.0, "dec_s": 0.019}
+{"id": "quality:1229", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 619, "enc_s": 0.0, "dec_s": 0.0244, "summ_in_tokens": 2638, "summ_out_tokens": 540, "summ_s": 23.84}
+{"id": "quality:1229", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1133, "enc_s": 0.1315, "dec_s": 0.0361}
+{"id": "quality:1229", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1135, "enc_s": 0.0, "dec_s": 0.0363}
+{"id": "quality:1229", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1135, "enc_s": 0.0, "dec_s": 0.0256}
+{"id": "quality:1229", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1410, "enc_s": 0.1311, "dec_s": 0.0436}
+{"id": "quality:1229", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2159, "enc_s": 0.0, "dec_s": 0.0664}
+{"id": "quality:1229", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2159, "enc_s": 0.0, "dec_s": 0.0458}
+{"id": "quality:1229", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1004, "enc_s": 0.0, "dec_s": 0.0333, "summ_in_tokens": 2639, "summ_out_tokens": 913, "summ_s": 42.28}
+{"id": "quality:1010", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 622, "enc_s": 0.2717, "dec_s": 0.0244}
+{"id": "quality:1010", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 623, "enc_s": 0.0, "dec_s": 0.0247}
+{"id": "quality:1010", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 623, "enc_s": 0.0, "dec_s": 0.0188}
+{"id": "quality:1010", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 619, "enc_s": 0.0, "dec_s": 0.024, "summ_in_tokens": 6970, "summ_out_tokens": 533, "summ_s": 23.86}
+{"id": "quality:1010", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1135, "enc_s": 0.2716, "dec_s": 0.0355}
+{"id": "quality:1010", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1135, "enc_s": 0.0, "dec_s": 0.037}
+{"id": "quality:1010", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1135, "enc_s": 0.0, "dec_s": 0.0266}
+{"id": "quality:1010", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2159, "enc_s": 0.2744, "dec_s": 0.0653}
+{"id": "quality:1010", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2158, "enc_s": 0.0, "dec_s": 0.0667}
+{"id": "quality:1010", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2158, "enc_s": 0.0, "dec_s": 0.0458}
+{"id": "quality:1010", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 744, "enc_s": 0.0, "dec_s": 0.027, "summ_in_tokens": 6971, "summ_out_tokens": 625, "summ_s": 27.62}
+{"id": "quality:1563", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 611, "enc_s": 0.1302, "dec_s": 0.0239}
+{"id": "quality:1563", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 613, "enc_s": 0.0, "dec_s": 0.0243}
+{"id": "quality:1563", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 613, "enc_s": 0.0, "dec_s": 0.0185}
+{"id": "quality:1563", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 584, "enc_s": 0.0, "dec_s": 0.024, "summ_in_tokens": 2864, "summ_out_tokens": 475, "summ_s": 22.87}
+{"id": "quality:1563", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1123, "enc_s": 0.1293, "dec_s": 0.0362}
+{"id": "quality:1563", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1124, "enc_s": 0.0, "dec_s": 0.0359}
+{"id": "quality:1563", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1124, "enc_s": 0.0, "dec_s": 0.0263}
+{"id": "quality:1563", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1492, "enc_s": 0.1321, "dec_s": 0.0455}
+{"id": "quality:1563", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2149, "enc_s": 0.0, "dec_s": 0.0667}
+{"id": "quality:1563", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2149, "enc_s": 0.0, "dec_s": 0.0456}
+{"id": "quality:1563", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 948, "enc_s": 0.0, "dec_s": 0.0321, "summ_in_tokens": 2865, "summ_out_tokens": 831, "summ_s": 38.23}
+{"id": "quality:838", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 617, "enc_s": 0.3369, "dec_s": 0.026}
+{"id": "quality:838", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 618, "enc_s": 0.0, "dec_s": 0.0248}
+{"id": "quality:838", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 618, "enc_s": 0.0, "dec_s": 0.0188}
+{"id": "quality:838", "subset": "validation", "arm": "summary@512", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 418, "enc_s": 0.0, "dec_s": 0.0313, "summ_in_tokens": 8365, "summ_out_tokens": 306, "summ_s": 15.19}
+{"id": "quality:838", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1132, "enc_s": 0.34, "dec_s": 0.0377}
+{"id": "quality:838", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1130, "enc_s": 0.0, "dec_s": 0.0366}
+{"id": "quality:838", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1130, "enc_s": 0.0, "dec_s": 0.0267}
+{"id": "quality:838", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2153, "enc_s": 0.3423, "dec_s": 0.065}
+{"id": "quality:838", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2153, "enc_s": 0.0, "dec_s": 0.0663}
+{"id": "quality:838", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2153, "enc_s": 0.0, "dec_s": 0.0457}
+{"id": "quality:838", "subset": "validation", "arm": "summary@2048", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 1224, "enc_s": 0.0, "dec_s": 0.0388, "summ_in_tokens": 8366, "summ_out_tokens": 1090, "summ_s": 49.36}
+{"id": "quality:1937", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 580, "enc_s": 0.2674, "dec_s": 0.0244}
+{"id": "quality:1937", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 581, "enc_s": 0.0, "dec_s": 0.0241}
+{"id": "quality:1937", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 581, "enc_s": 0.0, "dec_s": 0.0188}
+{"id": "quality:1937", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 460, "enc_s": 0.0, "dec_s": 0.0219, "summ_in_tokens": 6890, "summ_out_tokens": 380, "summ_s": 16.73}
+{"id": "quality:1937", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1094, "enc_s": 0.2666, "dec_s": 0.0357}
+{"id": "quality:1937", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1093, "enc_s": 0.0, "dec_s": 0.0354}
+{"id": "quality:1937", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1093, "enc_s": 0.0, "dec_s": 0.0251}
+{"id": "quality:1937", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2118, "enc_s": 0.2723, "dec_s": 0.0652}
+{"id": "quality:1937", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2117, "enc_s": 0.0, "dec_s": 0.0655}
+{"id": "quality:1937", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2117, "enc_s": 0.0, "dec_s": 0.045}
+{"id": "quality:1937", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1119, "enc_s": 0.0, "dec_s": 0.036, "summ_in_tokens": 6891, "summ_out_tokens": 1015, "summ_s": 45.29}
+{"id": "quality:1076", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 615, "enc_s": 0.2712, "dec_s": 0.0249}
+{"id": "quality:1076", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0247}
+{"id": "quality:1076", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0189}
+{"id": "quality:1076", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 612, "enc_s": 0.0, "dec_s": 0.0243, "summ_in_tokens": 6876, "summ_out_tokens": 527, "summ_s": 23.19}
+{"id": "quality:1076", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 1127, "enc_s": 0.2702, "dec_s": 0.0358}
+{"id": "quality:1076", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1128, "enc_s": 0.0, "dec_s": 0.0361}
+{"id": "quality:1076", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1128, "enc_s": 0.0, "dec_s": 0.0264}
+{"id": "quality:1076", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 2153, "enc_s": 0.2763, "dec_s": 0.066}
+{"id": "quality:1076", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2151, "enc_s": 0.0, "dec_s": 0.0659}
+{"id": "quality:1076", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2151, "enc_s": 0.0, "dec_s": 0.0455}
+{"id": "quality:1076", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2148, "enc_s": 0.0, "dec_s": 0.0667, "summ_in_tokens": 6877, "summ_out_tokens": 2930, "summ_s": 133.08}
+{"id": "quality:513", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 622, "enc_s": 0.1289, "dec_s": 0.0245}
+{"id": "quality:513", "subset": "validation", "arm": "text@512", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 625, "enc_s": 0.0, "dec_s": 0.0236}
+{"id": "quality:513", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 625, "enc_s": 0.0, "dec_s": 0.0187}
+{"id": "quality:513", "subset": "validation", "arm": "summary@512", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 385, "enc_s": 0.0, "dec_s": 0.0193, "summ_in_tokens": 2844, "summ_out_tokens": 268, "summ_s": 12.97}
+{"id": "quality:513", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1134, "enc_s": 0.1306, "dec_s": 0.037}
+{"id": "quality:513", "subset": "validation", "arm": "text@1024", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 1137, "enc_s": 0.0, "dec_s": 0.0366}
+{"id": "quality:513", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 1137, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:513", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1531, "enc_s": 0.1297, "dec_s": 0.0459}
+{"id": "quality:513", "subset": "validation", "arm": "text@2048", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 2161, "enc_s": 0.0, "dec_s": 0.0659}
+{"id": "quality:513", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 2161, "enc_s": 0.0, "dec_s": 0.0449}
+{"id": "quality:513", "subset": "validation", "arm": "summary@2048", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 1684, "enc_s": 0.0, "dec_s": 0.0527, "summ_in_tokens": 2845, "summ_out_tokens": 1517, "summ_s": 68.7}
+{"id": "quality:279", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 607, "enc_s": 0.2715, "dec_s": 0.0252}
+{"id": "quality:279", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 609, "enc_s": 0.0, "dec_s": 0.0247}
+{"id": "quality:279", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 609, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:279", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 605, "enc_s": 0.0, "dec_s": 0.0241, "summ_in_tokens": 6283, "summ_out_tokens": 492, "summ_s": 22.16}
+{"id": "quality:279", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1121, "enc_s": 0.2715, "dec_s": 0.0356}
+{"id": "quality:279", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1121, "enc_s": 0.0, "dec_s": 0.0363}
+{"id": "quality:279", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1121, "enc_s": 0.0, "dec_s": 0.0262}
+{"id": "quality:279", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2145, "enc_s": 0.2745, "dec_s": 0.065}
+{"id": "quality:279", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2144, "enc_s": 0.0, "dec_s": 0.0672}
+{"id": "quality:279", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2144, "enc_s": 0.0, "dec_s": 0.0448}
+{"id": "quality:279", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 942, "enc_s": 0.0, "dec_s": 0.0318, "summ_in_tokens": 6284, "summ_out_tokens": 816, "summ_s": 36.98}
+{"id": "quality:1237", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 625, "enc_s": 0.1305, "dec_s": 0.024}
+{"id": "quality:1237", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 627, "enc_s": 0.0, "dec_s": 0.0243}
+{"id": "quality:1237", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 627, "enc_s": 0.0, "dec_s": 0.0192}
+{"id": "quality:1237", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 609, "enc_s": 0.0, "dec_s": 0.0242, "summ_in_tokens": 3736, "summ_out_tokens": 498, "summ_s": 23.83}
+{"id": "quality:1237", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1137, "enc_s": 0.1324, "dec_s": 0.0363}
+{"id": "quality:1237", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1139, "enc_s": 0.0, "dec_s": 0.0356}
+{"id": "quality:1237", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1139, "enc_s": 0.0, "dec_s": 0.0257}
+{"id": "quality:1237", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1968, "enc_s": 0.1334, "dec_s": 0.0584}
+{"id": "quality:1237", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2162, "enc_s": 0.0, "dec_s": 0.0664}
+{"id": "quality:1237", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2162, "enc_s": 0.0, "dec_s": 0.0458}
+{"id": "quality:1237", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2159, "enc_s": 0.0, "dec_s": 0.0658, "summ_in_tokens": 3737, "summ_out_tokens": 2930, "summ_s": 131.12}
+{"id": "quality:90", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 609, "enc_s": 0.2702, "dec_s": 0.024}
+{"id": "quality:90", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 608, "enc_s": 0.0, "dec_s": 0.0242}
+{"id": "quality:90", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 608, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:90", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 529, "enc_s": 0.0, "dec_s": 0.0229, "summ_in_tokens": 6416, "summ_out_tokens": 432, "summ_s": 20.47}
+{"id": "quality:90", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1120, "enc_s": 0.2693, "dec_s": 0.035}
+{"id": "quality:90", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1120, "enc_s": 0.0, "dec_s": 0.035}
+{"id": "quality:90", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1120, "enc_s": 0.0, "dec_s": 0.0259}
+{"id": "quality:90", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2143, "enc_s": 0.2736, "dec_s": 0.0654}
+{"id": "quality:90", "subset": "validation", "arm": "text@2048", "pred": "A", "gold": ["D"], "acc": 0.0, "prefix": 2144, "enc_s": 0.0, "dec_s": 0.0665}
+{"id": "quality:90", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2144, "enc_s": 0.0, "dec_s": 0.0457}
+{"id": "quality:90", "subset": "validation", "arm": "summary@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 612, "enc_s": 0.0, "dec_s": 0.0243, "summ_in_tokens": 6417, "summ_out_tokens": 510, "summ_s": 22.67}
+{"id": "quality:1694", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 616, "enc_s": 0.2704, "dec_s": 0.0246}
+{"id": "quality:1694", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0248}
+{"id": "quality:1694", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:1694", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 560, "enc_s": 0.0, "dec_s": 0.0234, "summ_in_tokens": 7885, "summ_out_tokens": 436, "summ_s": 19.45}
+{"id": "quality:1694", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1128, "enc_s": 0.2725, "dec_s": 0.0357}
+{"id": "quality:1694", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1127, "enc_s": 0.0, "dec_s": 0.0365}
+{"id": "quality:1694", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1127, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:1694", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2152, "enc_s": 0.2738, "dec_s": 0.0661}
+{"id": "quality:1694", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2152, "enc_s": 0.0, "dec_s": 0.0662}
+{"id": "quality:1694", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2152, "enc_s": 0.0, "dec_s": 0.0457}
+{"id": "quality:1694", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1334, "enc_s": 0.0, "dec_s": 0.0426, "summ_in_tokens": 7886, "summ_out_tokens": 1177, "summ_s": 53.24}
+{"id": "quality:1271", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 625, "enc_s": 0.1282, "dec_s": 0.0238}
+{"id": "quality:1271", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 627, "enc_s": 0.0, "dec_s": 0.0239}
+{"id": "quality:1271", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 627, "enc_s": 0.0, "dec_s": 0.019}
+{"id": "quality:1271", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 623, "enc_s": 0.0, "dec_s": 0.0245, "summ_in_tokens": 2609, "summ_out_tokens": 654, "summ_s": 29.16}
+{"id": "quality:1271", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1137, "enc_s": 0.132, "dec_s": 0.0357}
+{"id": "quality:1271", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1139, "enc_s": 0.0, "dec_s": 0.0364}
+{"id": "quality:1271", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1139, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:1271", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1417, "enc_s": 0.1301, "dec_s": 0.0439}
+{"id": "quality:1271", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2163, "enc_s": 0.0, "dec_s": 0.0668}
+{"id": "quality:1271", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2163, "enc_s": 0.0, "dec_s": 0.0459}
+{"id": "quality:1271", "subset": "validation", "arm": "summary@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1765, "enc_s": 0.0, "dec_s": 0.0545, "summ_in_tokens": 2610, "summ_out_tokens": 1591, "summ_s": 73.44}
+{"id": "quality:1841", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 586, "enc_s": 0.1292, "dec_s": 0.0233}
+{"id": "quality:1841", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 589, "enc_s": 0.0, "dec_s": 0.0231}
+{"id": "quality:1841", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 589, "enc_s": 0.0, "dec_s": 0.0185}
+{"id": "quality:1841", "subset": "validation", "arm": "summary@512", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 585, "enc_s": 0.0, "dec_s": 0.023, "summ_in_tokens": 3355, "summ_out_tokens": 503, "summ_s": 22.45}
+{"id": "quality:1841", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1098, "enc_s": 0.1319, "dec_s": 0.0354}
+{"id": "quality:1841", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1101, "enc_s": 0.0, "dec_s": 0.0353}
+{"id": "quality:1841", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1101, "enc_s": 0.0, "dec_s": 0.0259}
+{"id": "quality:1841", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1706, "enc_s": 0.1325, "dec_s": 0.0522}
+{"id": "quality:1841", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2125, "enc_s": 0.0, "dec_s": 0.0645}
+{"id": "quality:1841", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2125, "enc_s": 0.0, "dec_s": 0.0455}
+{"id": "quality:1841", "subset": "validation", "arm": "summary@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 2121, "enc_s": 0.0, "dec_s": 0.0651, "summ_in_tokens": 3356, "summ_out_tokens": 2536, "summ_s": 108.63}
+{"id": "quality:78", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 607, "enc_s": 0.2691, "dec_s": 0.0243}
+{"id": "quality:78", "subset": "validation", "arm": "text@512", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 605, "enc_s": 0.0, "dec_s": 0.0235}
+{"id": "quality:78", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 605, "enc_s": 0.0, "dec_s": 0.019}
+{"id": "quality:78", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 572, "enc_s": 0.0, "dec_s": 0.0235, "summ_in_tokens": 7001, "summ_out_tokens": 463, "summ_s": 21.37}
+{"id": "quality:78", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1118, "enc_s": 0.2703, "dec_s": 0.0352}
+{"id": "quality:78", "subset": "validation", "arm": "text@1024", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 1118, "enc_s": 0.0, "dec_s": 0.036}
+{"id": "quality:78", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1118, "enc_s": 0.0, "dec_s": 0.0263}
+{"id": "quality:78", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2141, "enc_s": 0.2734, "dec_s": 0.0649}
+{"id": "quality:78", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2142, "enc_s": 0.0, "dec_s": 0.067}
+{"id": "quality:78", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2142, "enc_s": 0.0, "dec_s": 0.0456}
+{"id": "quality:78", "subset": "validation", "arm": "summary@2048", "pred": "A", "gold": ["C"], "acc": 0.0, "prefix": 2138, "enc_s": 0.0, "dec_s": 0.0656, "summ_in_tokens": 7002, "summ_out_tokens": 2579, "summ_s": 107.49}
+{"id": "quality:1007", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["D"], "acc": 0.0, "prefix": 612, "enc_s": 0.2708, "dec_s": 0.0255}
+{"id": "quality:1007", "subset": "validation", "arm": "text@512", "pred": "A", "gold": ["D"], "acc": 0.0, "prefix": 611, "enc_s": 0.0, "dec_s": 0.0247}
+{"id": "quality:1007", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 611, "enc_s": 0.0, "dec_s": 0.0184}
+{"id": "quality:1007", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 608, "enc_s": 0.0, "dec_s": 0.0239, "summ_in_tokens": 7754, "summ_out_tokens": 531, "summ_s": 25.3}
+{"id": "quality:1007", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["D"], "acc": 0.0, "prefix": 1122, "enc_s": 0.2716, "dec_s": 0.0362}
+{"id": "quality:1007", "subset": "validation", "arm": "text@1024", "pred": "A", "gold": ["D"], "acc": 0.0, "prefix": 1124, "enc_s": 0.0, "dec_s": 0.0361}
+{"id": "quality:1007", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1124, "enc_s": 0.0, "dec_s": 0.0264}
+{"id": "quality:1007", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["D"], "acc": 0.0, "prefix": 2147, "enc_s": 0.2757, "dec_s": 0.0661}
+{"id": "quality:1007", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2147, "enc_s": 0.0, "dec_s": 0.0661}
+{"id": "quality:1007", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2147, "enc_s": 0.0, "dec_s": 0.0456}
+{"id": "quality:1007", "subset": "validation", "arm": "summary@2048", "pred": "A", "gold": ["D"], "acc": 0.0, "prefix": 744, "enc_s": 0.0, "dec_s": 0.0263, "summ_in_tokens": 7755, "summ_out_tokens": 624, "summ_s": 27.58}
+{"id": "quality:1646", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 617, "enc_s": 0.2701, "dec_s": 0.0246}
+{"id": "quality:1646", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 617, "enc_s": 0.0, "dec_s": 0.0243}
+{"id": "quality:1646", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 617, "enc_s": 0.0, "dec_s": 0.0193}
+{"id": "quality:1646", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 613, "enc_s": 0.0, "dec_s": 0.0244, "summ_in_tokens": 7272, "summ_out_tokens": 534, "summ_s": 24.46}
+{"id": "quality:1646", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1129, "enc_s": 0.2735, "dec_s": 0.0357}
+{"id": "quality:1646", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1129, "enc_s": 0.0, "dec_s": 0.0366}
+{"id": "quality:1646", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1129, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:1646", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 2151, "enc_s": 0.2742, "dec_s": 0.067}
+{"id": "quality:1646", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2152, "enc_s": 0.0, "dec_s": 0.066}
+{"id": "quality:1646", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2152, "enc_s": 0.0, "dec_s": 0.0459}
+{"id": "quality:1646", "subset": "validation", "arm": "summary@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 2149, "enc_s": 0.0, "dec_s": 0.0669, "summ_in_tokens": 7273, "summ_out_tokens": 2930, "summ_s": 114.55}
+{"id": "quality:234", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 634, "enc_s": 0.2698, "dec_s": 0.0261}
+{"id": "quality:234", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 636, "enc_s": 0.0, "dec_s": 0.0254}
+{"id": "quality:234", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 636, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:234", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 632, "enc_s": 0.0, "dec_s": 0.0237, "summ_in_tokens": 6295, "summ_out_tokens": 587, "summ_s": 27.33}
+{"id": "quality:234", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1148, "enc_s": 0.2726, "dec_s": 0.0359}
+{"id": "quality:234", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1148, "enc_s": 0.0, "dec_s": 0.037}
+{"id": "quality:234", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1148, "enc_s": 0.0, "dec_s": 0.0269}
+{"id": "quality:234", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2172, "enc_s": 0.2744, "dec_s": 0.0665}
+{"id": "quality:234", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2171, "enc_s": 0.0, "dec_s": 0.0665}
+{"id": "quality:234", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2171, "enc_s": 0.0, "dec_s": 0.0462}
+{"id": "quality:234", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2168, "enc_s": 0.0, "dec_s": 0.0666, "summ_in_tokens": 6296, "summ_out_tokens": 2930, "summ_s": 111.69}
+{"id": "quality:1973", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 674, "enc_s": 0.1996, "dec_s": 0.0261}
+{"id": "quality:1973", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 673, "enc_s": 0.0, "dec_s": 0.0251}
+{"id": "quality:1973", "subset": "validation", "arm": "base@512", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 673, "enc_s": 0.0, "dec_s": 0.0189}
+{"id": "quality:1973", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 669, "enc_s": 0.0, "dec_s": 0.0246, "summ_in_tokens": 4159, "summ_out_tokens": 774, "summ_s": 32.81}
+{"id": "quality:1973", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 1184, "enc_s": 0.1255, "dec_s": 0.0387}
+{"id": "quality:1973", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1185, "enc_s": 0.0, "dec_s": 0.0386}
+{"id": "quality:1973", "subset": "validation", "arm": "base@1024", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 1185, "enc_s": 0.0, "dec_s": 0.0277}
+{"id": "quality:1973", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 2208, "enc_s": 0.2062, "dec_s": 0.0677}
+{"id": "quality:1973", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2209, "enc_s": 0.0, "dec_s": 0.0657}
+{"id": "quality:1973", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2209, "enc_s": 0.0, "dec_s": 0.0468}
+{"id": "quality:1973", "subset": "validation", "arm": "summary@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1307, "enc_s": 0.0, "dec_s": 0.0411, "summ_in_tokens": 4160, "summ_out_tokens": 1089, "summ_s": 41.08}
+{"id": "quality:125", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 615, "enc_s": 0.2001, "dec_s": 0.0248}
+{"id": "quality:125", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0248}
+{"id": "quality:125", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0189}
+{"id": "quality:125", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 612, "enc_s": 0.0, "dec_s": 0.0244, "summ_in_tokens": 4399, "summ_out_tokens": 780, "summ_s": 28.51}
+{"id": "quality:125", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 1127, "enc_s": 0.2027, "dec_s": 0.0369}
+{"id": "quality:125", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1128, "enc_s": 0.0, "dec_s": 0.0363}
+{"id": "quality:125", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1128, "enc_s": 0.0, "dec_s": 0.0264}
+{"id": "quality:125", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 2151, "enc_s": 0.2056, "dec_s": 0.0659}
+{"id": "quality:125", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2152, "enc_s": 0.0, "dec_s": 0.0658}
+{"id": "quality:125", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2152, "enc_s": 0.0, "dec_s": 0.0456}
+{"id": "quality:125", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1328, "enc_s": 0.0, "dec_s": 0.0425, "summ_in_tokens": 4400, "summ_out_tokens": 1200, "summ_s": 43.58}
+{"id": "quality:868", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 602, "enc_s": 0.2721, "dec_s": 0.0257}
+{"id": "quality:868", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 603, "enc_s": 0.0, "dec_s": 0.0249}
+{"id": "quality:868", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 603, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:868", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 599, "enc_s": 0.0, "dec_s": 0.0243, "summ_in_tokens": 7271, "summ_out_tokens": 551, "summ_s": 19.49}
+{"id": "quality:868", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1116, "enc_s": 0.2734, "dec_s": 0.0356}
+{"id": "quality:868", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1115, "enc_s": 0.0, "dec_s": 0.0355}
+{"id": "quality:868", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1115, "enc_s": 0.0, "dec_s": 0.0263}
+{"id": "quality:868", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2139, "enc_s": 0.2725, "dec_s": 0.0643}
+{"id": "quality:868", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2138, "enc_s": 0.0, "dec_s": 0.0661}
+{"id": "quality:868", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2138, "enc_s": 0.0, "dec_s": 0.0457}
+{"id": "quality:868", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1489, "enc_s": 0.0, "dec_s": 0.0451, "summ_in_tokens": 7272, "summ_out_tokens": 1360, "summ_s": 50.08}
+{"id": "quality:932", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 589, "enc_s": 0.2012, "dec_s": 0.024}
+{"id": "quality:932", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 589, "enc_s": 0.0, "dec_s": 0.024}
+{"id": "quality:932", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 589, "enc_s": 0.0, "dec_s": 0.0184}
+{"id": "quality:932", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 484, "enc_s": 0.0, "dec_s": 0.0219, "summ_in_tokens": 3982, "summ_out_tokens": 384, "summ_s": 13.95}
+{"id": "quality:932", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1101, "enc_s": 0.204, "dec_s": 0.0354}
+{"id": "quality:932", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1101, "enc_s": 0.0, "dec_s": 0.0354}
+{"id": "quality:932", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1101, "enc_s": 0.0, "dec_s": 0.026}
+{"id": "quality:932", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2124, "enc_s": 0.205, "dec_s": 0.0651}
+{"id": "quality:932", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2126, "enc_s": 0.0, "dec_s": 0.0662}
+{"id": "quality:932", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2126, "enc_s": 0.0, "dec_s": 0.0453}
+{"id": "quality:932", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 463, "enc_s": 0.0, "dec_s": 0.0218, "summ_in_tokens": 3983, "summ_out_tokens": 364, "summ_s": 13.55}
+{"id": "quality:248", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 640, "enc_s": 0.2734, "dec_s": 0.026}
+{"id": "quality:248", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 641, "enc_s": 0.0, "dec_s": 0.0257}
+{"id": "quality:248", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 641, "enc_s": 0.0, "dec_s": 0.0197}
+{"id": "quality:248", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 617, "enc_s": 0.0, "dec_s": 0.0245, "summ_in_tokens": 6482, "summ_out_tokens": 475, "summ_s": 17.74}
+{"id": "quality:248", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1153, "enc_s": 0.271, "dec_s": 0.0378}
+{"id": "quality:248", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1153, "enc_s": 0.0, "dec_s": 0.0363}
+{"id": "quality:248", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1153, "enc_s": 0.0, "dec_s": 0.0276}
+{"id": "quality:248", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2178, "enc_s": 0.2769, "dec_s": 0.0675}
+{"id": "quality:248", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2176, "enc_s": 0.0, "dec_s": 0.0678}
+{"id": "quality:248", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2176, "enc_s": 0.0, "dec_s": 0.0461}
+{"id": "quality:248", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 986, "enc_s": 0.0, "dec_s": 0.0318, "summ_in_tokens": 6483, "summ_out_tokens": 821, "summ_s": 30.02}
+{"id": "quality:233", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 630, "enc_s": 0.27, "dec_s": 0.0241}
+{"id": "quality:233", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 632, "enc_s": 0.0, "dec_s": 0.0249}
+{"id": "quality:233", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 632, "enc_s": 0.0, "dec_s": 0.0192}
+{"id": "quality:233", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 628, "enc_s": 0.0, "dec_s": 0.0245, "summ_in_tokens": 6299, "summ_out_tokens": 564, "summ_s": 20.67}
+{"id": "quality:233", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1144, "enc_s": 0.2749, "dec_s": 0.0373}
+{"id": "quality:233", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1144, "enc_s": 0.0, "dec_s": 0.0371}
+{"id": "quality:233", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1144, "enc_s": 0.0, "dec_s": 0.0266}
+{"id": "quality:233", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2168, "enc_s": 0.2786, "dec_s": 0.0658}
+{"id": "quality:233", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2167, "enc_s": 0.0, "dec_s": 0.0665}
+{"id": "quality:233", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2167, "enc_s": 0.0, "dec_s": 0.0453}
+{"id": "quality:233", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 878, "enc_s": 0.0, "dec_s": 0.0311, "summ_in_tokens": 6300, "summ_out_tokens": 740, "summ_s": 27.6}
+{"id": "quality:525", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 656, "enc_s": 0.2727, "dec_s": 0.0257}
+{"id": "quality:525", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 657, "enc_s": 0.0, "dec_s": 0.0257}
+{"id": "quality:525", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 657, "enc_s": 0.0, "dec_s": 0.0189}
+{"id": "quality:525", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 623, "enc_s": 0.0, "dec_s": 0.0249, "summ_in_tokens": 6699, "summ_out_tokens": 473, "summ_s": 17.16}
+{"id": "quality:525", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1168, "enc_s": 0.2731, "dec_s": 0.0386}
+{"id": "quality:525", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1169, "enc_s": 0.0, "dec_s": 0.0378}
+{"id": "quality:525", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1169, "enc_s": 0.0, "dec_s": 0.0275}
+{"id": "quality:525", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2192, "enc_s": 0.2785, "dec_s": 0.0688}
+{"id": "quality:525", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2193, "enc_s": 0.0, "dec_s": 0.0685}
+{"id": "quality:525", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2193, "enc_s": 0.0, "dec_s": 0.047}
+{"id": "quality:525", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1673, "enc_s": 0.0, "dec_s": 0.0516, "summ_in_tokens": 6700, "summ_out_tokens": 1479, "summ_s": 52.61}
+{"id": "quality:1146", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 605, "enc_s": 0.2727, "dec_s": 0.0249}
+{"id": "quality:1146", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 604, "enc_s": 0.0, "dec_s": 0.025}
+{"id": "quality:1146", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 604, "enc_s": 0.0, "dec_s": 0.019}
+{"id": "quality:1146", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 600, "enc_s": 0.0, "dec_s": 0.0242, "summ_in_tokens": 7510, "summ_out_tokens": 564, "summ_s": 21.34}
+{"id": "quality:1146", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1115, "enc_s": 0.2722, "dec_s": 0.0355}
+{"id": "quality:1146", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1116, "enc_s": 0.0, "dec_s": 0.0368}
+{"id": "quality:1146", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1116, "enc_s": 0.0, "dec_s": 0.0264}
+{"id": "quality:1146", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2141, "enc_s": 0.275, "dec_s": 0.0652}
+{"id": "quality:1146", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2139, "enc_s": 0.0, "dec_s": 0.0662}
+{"id": "quality:1146", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2139, "enc_s": 0.0, "dec_s": 0.0456}
+{"id": "quality:1146", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2136, "enc_s": 0.0, "dec_s": 0.0662, "summ_in_tokens": 7511, "summ_out_tokens": 1962, "summ_s": 69.79}
+{"id": "quality:1111", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 628, "enc_s": 0.2752, "dec_s": 0.0255}
+{"id": "quality:1111", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 629, "enc_s": 0.0, "dec_s": 0.0243}
+{"id": "quality:1111", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 629, "enc_s": 0.0, "dec_s": 0.0193}
+{"id": "quality:1111", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 625, "enc_s": 0.0, "dec_s": 0.0247, "summ_in_tokens": 7282, "summ_out_tokens": 651, "summ_s": 23.46}
+{"id": "quality:1111", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1141, "enc_s": 0.2726, "dec_s": 0.0366}
+{"id": "quality:1111", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1141, "enc_s": 0.0, "dec_s": 0.0369}
+{"id": "quality:1111", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1141, "enc_s": 0.0, "dec_s": 0.0267}
+{"id": "quality:1111", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2166, "enc_s": 0.2764, "dec_s": 0.0666}
+{"id": "quality:1111", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2165, "enc_s": 0.0, "dec_s": 0.0675}
+{"id": "quality:1111", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2165, "enc_s": 0.0, "dec_s": 0.0459}
+{"id": "quality:1111", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1634, "enc_s": 0.0, "dec_s": 0.0507, "summ_in_tokens": 7283, "summ_out_tokens": 1508, "summ_s": 52.43}
+{"id": "quality:30", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 679, "enc_s": 0.2727, "dec_s": 0.026}
+{"id": "quality:30", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 680, "enc_s": 0.0, "dec_s": 0.0255}
+{"id": "quality:30", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 680, "enc_s": 0.0, "dec_s": 0.0193}
+{"id": "quality:30", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 667, "enc_s": 0.0, "dec_s": 0.025, "summ_in_tokens": 6823, "summ_out_tokens": 487, "summ_s": 18.11}
+{"id": "quality:30", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1190, "enc_s": 0.2745, "dec_s": 0.0385}
+{"id": "quality:30", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1192, "enc_s": 0.0, "dec_s": 0.0383}
+{"id": "quality:30", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1192, "enc_s": 0.0, "dec_s": 0.0278}
+{"id": "quality:30", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2214, "enc_s": 0.2771, "dec_s": 0.067}
+{"id": "quality:30", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2216, "enc_s": 0.0, "dec_s": 0.0684}
+{"id": "quality:30", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2216, "enc_s": 0.0, "dec_s": 0.0469}
+{"id": "quality:30", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2212, "enc_s": 0.0, "dec_s": 0.0678, "summ_in_tokens": 6824, "summ_out_tokens": 2374, "summ_s": 82.07}
+{"id": "quality:96", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 610, "enc_s": 0.2729, "dec_s": 0.0256}
+{"id": "quality:96", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 609, "enc_s": 0.0, "dec_s": 0.024}
+{"id": "quality:96", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 609, "enc_s": 0.0, "dec_s": 0.019}
+{"id": "quality:96", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 605, "enc_s": 0.0, "dec_s": 0.0244, "summ_in_tokens": 6412, "summ_out_tokens": 608, "summ_s": 20.65}
+{"id": "quality:96", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1121, "enc_s": 0.2688, "dec_s": 0.0353}
+{"id": "quality:96", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1121, "enc_s": 0.0, "dec_s": 0.0365}
+{"id": "quality:96", "subset": "validation", "arm": "base@1024", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1121, "enc_s": 0.0, "dec_s": 0.0255}
+{"id": "quality:96", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2144, "enc_s": 0.2752, "dec_s": 0.0653}
+{"id": "quality:96", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2145, "enc_s": 0.0, "dec_s": 0.0668}
+{"id": "quality:96", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2145, "enc_s": 0.0, "dec_s": 0.0459}
+{"id": "quality:96", "subset": "validation", "arm": "summary@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2141, "enc_s": 0.0, "dec_s": 0.0661, "summ_in_tokens": 6413, "summ_out_tokens": 2930, "summ_s": 102.44}
+{"id": "quality:1631", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 586, "enc_s": 0.3365, "dec_s": 0.0247}
+{"id": "quality:1631", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 585, "enc_s": 0.0, "dec_s": 0.0243}
+{"id": "quality:1631", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 585, "enc_s": 0.0, "dec_s": 0.0186}
+{"id": "quality:1631", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 579, "enc_s": 0.0, "dec_s": 0.0233, "summ_in_tokens": 8405, "summ_out_tokens": 487, "summ_s": 17.4}
+{"id": "quality:1631", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1099, "enc_s": 0.3397, "dec_s": 0.0364}
+{"id": "quality:1631", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1097, "enc_s": 0.0, "dec_s": 0.0362}
+{"id": "quality:1631", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1097, "enc_s": 0.0, "dec_s": 0.0259}
+{"id": "quality:1631", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2121, "enc_s": 0.3436, "dec_s": 0.0664}
+{"id": "quality:1631", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2121, "enc_s": 0.0, "dec_s": 0.0653}
+{"id": "quality:1631", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2121, "enc_s": 0.0, "dec_s": 0.0456}
+{"id": "quality:1631", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1088, "enc_s": 0.0, "dec_s": 0.0355, "summ_in_tokens": 8406, "summ_out_tokens": 976, "summ_s": 33.35}
+{"id": "quality:1366", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 603, "enc_s": 0.2726, "dec_s": 0.026}
+{"id": "quality:1366", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 605, "enc_s": 0.0, "dec_s": 0.0249}
+{"id": "quality:1366", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 605, "enc_s": 0.0, "dec_s": 0.0192}
+{"id": "quality:1366", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 601, "enc_s": 0.0, "dec_s": 0.0242, "summ_in_tokens": 7727, "summ_out_tokens": 668, "summ_s": 24.04}
+{"id": "quality:1366", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1116, "enc_s": 0.2741, "dec_s": 0.0357}
+{"id": "quality:1366", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1117, "enc_s": 0.0, "dec_s": 0.0366}
+{"id": "quality:1366", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1117, "enc_s": 0.0, "dec_s": 0.0262}
+{"id": "quality:1366", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2141, "enc_s": 0.2752, "dec_s": 0.0649}
+{"id": "quality:1366", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2141, "enc_s": 0.0, "dec_s": 0.0661}
+{"id": "quality:1366", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2141, "enc_s": 0.0, "dec_s": 0.0457}
+{"id": "quality:1366", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2137, "enc_s": 0.0, "dec_s": 0.0657, "summ_in_tokens": 7728, "summ_out_tokens": 2004, "summ_s": 70.43}
+{"id": "quality:1819", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 616, "enc_s": 0.2733, "dec_s": 0.0247}
+{"id": "quality:1819", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0239}
+{"id": "quality:1819", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:1819", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 539, "enc_s": 0.0, "dec_s": 0.0231, "summ_in_tokens": 7767, "summ_out_tokens": 416, "summ_s": 14.46}
+{"id": "quality:1819", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1128, "enc_s": 0.2716, "dec_s": 0.0354}
+{"id": "quality:1819", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1128, "enc_s": 0.0, "dec_s": 0.0365}
+{"id": "quality:1819", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1128, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:1819", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2152, "enc_s": 0.2783, "dec_s": 0.0657}
+{"id": "quality:1819", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2152, "enc_s": 0.0, "dec_s": 0.0654}
+{"id": "quality:1819", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2152, "enc_s": 0.0, "dec_s": 0.045}
+{"id": "quality:1819", "subset": "validation", "arm": "summary@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1180, "enc_s": 0.0, "dec_s": 0.0372, "summ_in_tokens": 7768, "summ_out_tokens": 1049, "summ_s": 36.12}
+{"id": "quality:1224", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 613, "enc_s": 0.1289, "dec_s": 0.024}
+{"id": "quality:1224", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.024}
+{"id": "quality:1224", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0189}
+{"id": "quality:1224", "subset": "validation", "arm": "summary@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 612, "enc_s": 0.0, "dec_s": 0.0243, "summ_in_tokens": 2670, "summ_out_tokens": 571, "summ_s": 19.78}
+{"id": "quality:1224", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1125, "enc_s": 0.1321, "dec_s": 0.0356}
+{"id": "quality:1224", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1128, "enc_s": 0.0, "dec_s": 0.0364}
+{"id": "quality:1224", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1128, "enc_s": 0.0, "dec_s": 0.0266}
+{"id": "quality:1224", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1426, "enc_s": 0.1332, "dec_s": 0.0439}
+{"id": "quality:1224", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2152, "enc_s": 0.0, "dec_s": 0.0658}
+{"id": "quality:1224", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2152, "enc_s": 0.0, "dec_s": 0.0456}
+{"id": "quality:1224", "subset": "validation", "arm": "summary@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1188, "enc_s": 0.0, "dec_s": 0.0378, "summ_in_tokens": 2671, "summ_out_tokens": 1069, "summ_s": 37.72}
+{"id": "quality:1539", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 620, "enc_s": 0.338, "dec_s": 0.027}
+{"id": "quality:1539", "subset": "validation", "arm": "text@512", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 619, "enc_s": 0.0, "dec_s": 0.0242}
+{"id": "quality:1539", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 619, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:1539", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 615, "enc_s": 0.0, "dec_s": 0.0243, "summ_in_tokens": 8411, "summ_out_tokens": 566, "summ_s": 20.04}
+{"id": "quality:1539", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1133, "enc_s": 0.3377, "dec_s": 0.0366}
+{"id": "quality:1539", "subset": "validation", "arm": "text@1024", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 1131, "enc_s": 0.0, "dec_s": 0.0365}
+{"id": "quality:1539", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1131, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:1539", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2155, "enc_s": 0.339, "dec_s": 0.0665}
+{"id": "quality:1539", "subset": "validation", "arm": "text@2048", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 2155, "enc_s": 0.0, "dec_s": 0.0671}
+{"id": "quality:1539", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2155, "enc_s": 0.0, "dec_s": 0.045}
+{"id": "quality:1539", "subset": "validation", "arm": "summary@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1152, "enc_s": 0.0, "dec_s": 0.0366, "summ_in_tokens": 8412, "summ_out_tokens": 1010, "summ_s": 34.79}
+{"id": "quality:439", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 610, "enc_s": 0.2675, "dec_s": 0.0251}
+{"id": "quality:439", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 610, "enc_s": 0.0, "dec_s": 0.0246}
+{"id": "quality:439", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 610, "enc_s": 0.0, "dec_s": 0.0189}
+{"id": "quality:439", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 606, "enc_s": 0.0, "dec_s": 0.0243, "summ_in_tokens": 6984, "summ_out_tokens": 527, "summ_s": 18.46}
+{"id": "quality:439", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1122, "enc_s": 0.2731, "dec_s": 0.0362}
+{"id": "quality:439", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1122, "enc_s": 0.0, "dec_s": 0.0362}
+{"id": "quality:439", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1122, "enc_s": 0.0, "dec_s": 0.0264}
+{"id": "quality:439", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2146, "enc_s": 0.2724, "dec_s": 0.0659}
+{"id": "quality:439", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2146, "enc_s": 0.0, "dec_s": 0.0663}
+{"id": "quality:439", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2146, "enc_s": 0.0, "dec_s": 0.0459}
+{"id": "quality:454", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 618, "enc_s": 0.2003, "dec_s": 0.0244}
+{"id": "quality:454", "subset": "validation", "arm": "text@512", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 619, "enc_s": 0.0, "dec_s": 0.0239}
+{"id": "quality:454", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 619, "enc_s": 0.0, "dec_s": 0.019}
+{"id": "quality:454", "subset": "validation", "arm": "summary@512", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 450, "enc_s": 0.0, "dec_s": 0.0214, "summ_in_tokens": 4535, "summ_out_tokens": 328, "summ_s": 13.23}
+{"id": "quality:454", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1129, "enc_s": 0.2046, "dec_s": 0.0373}
+{"id": "quality:454", "subset": "validation", "arm": "text@1024", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1131, "enc_s": 0.0, "dec_s": 0.0354}
+{"id": "quality:454", "subset": "validation", "arm": "base@1024", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1131, "enc_s": 0.0, "dec_s": 0.0262}
+{"id": "quality:454", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 2154, "enc_s": 0.2071, "dec_s": 0.0655}
+{"id": "quality:454", "subset": "validation", "arm": "text@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 2155, "enc_s": 0.0, "dec_s": 0.0669}
+{"id": "quality:454", "subset": "validation", "arm": "base@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 2155, "enc_s": 0.0, "dec_s": 0.0457}
+{"id": "quality:454", "subset": "validation", "arm": "summary@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1289, "enc_s": 0.0, "dec_s": 0.0407, "summ_in_tokens": 4536, "summ_out_tokens": 1136, "summ_s": 40.67}
+{"id": "quality:1167", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 611, "enc_s": 0.2695, "dec_s": 0.0256}
+{"id": "quality:1167", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 611, "enc_s": 0.0, "dec_s": 0.0239}
+{"id": "quality:1167", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 611, "enc_s": 0.0, "dec_s": 0.0187}
+{"id": "quality:1167", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 607, "enc_s": 0.0, "dec_s": 0.0239, "summ_in_tokens": 7821, "summ_out_tokens": 531, "summ_s": 19.68}
+{"id": "quality:1167", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 1123, "enc_s": 0.2698, "dec_s": 0.0362}
+{"id": "quality:1167", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1123, "enc_s": 0.0, "dec_s": 0.0353}
+{"id": "quality:1167", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1123, "enc_s": 0.0, "dec_s": 0.0256}
+{"id": "quality:1167", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 2145, "enc_s": 0.2732, "dec_s": 0.0651}
+{"id": "quality:1167", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2146, "enc_s": 0.0, "dec_s": 0.0659}
+{"id": "quality:1167", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2146, "enc_s": 0.0, "dec_s": 0.0458}
+{"id": "quality:1166", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 633, "enc_s": 0.2695, "dec_s": 0.0258}
+{"id": "quality:1166", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 633, "enc_s": 0.0, "dec_s": 0.0255}
+{"id": "quality:1166", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 633, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:1166", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 570, "enc_s": 0.0, "dec_s": 0.0239, "summ_in_tokens": 7818, "summ_out_tokens": 447, "summ_s": 16.13}
+{"id": "quality:1166", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1145, "enc_s": 0.2753, "dec_s": 0.0364}
+{"id": "quality:1166", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1145, "enc_s": 0.0, "dec_s": 0.0373}
+{"id": "quality:1166", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1145, "enc_s": 0.0, "dec_s": 0.0266}
+{"id": "quality:1166", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2167, "enc_s": 0.2751, "dec_s": 0.0655}
+{"id": "quality:1166", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2168, "enc_s": 0.0, "dec_s": 0.0666}
+{"id": "quality:1166", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2168, "enc_s": 0.0, "dec_s": 0.0461}
+{"id": "quality:1166", "subset": "validation", "arm": "summary@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 999, "enc_s": 0.0, "dec_s": 0.0329, "summ_in_tokens": 7819, "summ_out_tokens": 868, "summ_s": 30.22}
+{"id": "quality:1526", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 615, "enc_s": 0.13, "dec_s": 0.024}
+{"id": "quality:1526", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0245}
+{"id": "quality:1526", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 616, "enc_s": 0.0, "dec_s": 0.0181}
+{"id": "quality:1526", "subset": "validation", "arm": "summary@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 613, "enc_s": 0.0, "dec_s": 0.024, "summ_in_tokens": 3578, "summ_out_tokens": 636, "summ_s": 21.62}
+{"id": "quality:1526", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1126, "enc_s": 0.1315, "dec_s": 0.0361}
+{"id": "quality:1526", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1128, "enc_s": 0.0, "dec_s": 0.0371}
+{"id": "quality:1526", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1128, "enc_s": 0.0, "dec_s": 0.0264}
+{"id": "quality:1526", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1840, "enc_s": 0.135, "dec_s": 0.0556}
+{"id": "quality:1526", "subset": "validation", "arm": "text@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 2153, "enc_s": 0.0, "dec_s": 0.0667}
+{"id": "quality:1526", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2153, "enc_s": 0.0, "dec_s": 0.0457}
+{"id": "quality:641", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 625, "enc_s": 0.203, "dec_s": 0.0243}
+{"id": "quality:641", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 627, "enc_s": 0.0, "dec_s": 0.024}
+{"id": "quality:641", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 627, "enc_s": 0.0, "dec_s": 0.0183}
+{"id": "quality:641", "subset": "validation", "arm": "summary@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 623, "enc_s": 0.0, "dec_s": 0.0236, "summ_in_tokens": 4359, "summ_out_tokens": 780, "summ_s": 27.69}
+{"id": "quality:641", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1139, "enc_s": 0.202, "dec_s": 0.0361}
+{"id": "quality:641", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1139, "enc_s": 0.0, "dec_s": 0.0358}
+{"id": "quality:641", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1139, "enc_s": 0.0, "dec_s": 0.0268}
+{"id": "quality:641", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2161, "enc_s": 0.2081, "dec_s": 0.0664}
+{"id": "quality:641", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2163, "enc_s": 0.0, "dec_s": 0.067}
+{"id": "quality:641", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2163, "enc_s": 0.0, "dec_s": 0.0461}
+{"id": "quality:1345", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 613, "enc_s": 0.2701, "dec_s": 0.0249}
+{"id": "quality:1345", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 614, "enc_s": 0.0, "dec_s": 0.0241}
+{"id": "quality:1345", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 614, "enc_s": 0.0, "dec_s": 0.0192}
+{"id": "quality:1345", "subset": "validation", "arm": "summary@512", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 570, "enc_s": 0.0, "dec_s": 0.0237, "summ_in_tokens": 7077, "summ_out_tokens": 457, "summ_s": 16.93}
+{"id": "quality:1345", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1126, "enc_s": 0.2726, "dec_s": 0.0367}
+{"id": "quality:1345", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1126, "enc_s": 0.0, "dec_s": 0.0365}
+{"id": "quality:1345", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1126, "enc_s": 0.0, "dec_s": 0.0264}
+{"id": "quality:1345", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 2151, "enc_s": 0.2772, "dec_s": 0.066}
+{"id": "quality:1345", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2150, "enc_s": 0.0, "dec_s": 0.0661}
+{"id": "quality:1345", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2150, "enc_s": 0.0, "dec_s": 0.0458}
+{"id": "quality:1345", "subset": "validation", "arm": "summary@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 562, "enc_s": 0.0, "dec_s": 0.0237, "summ_in_tokens": 7078, "summ_out_tokens": 449, "summ_s": 16.04}
+{"id": "quality:760", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 603, "enc_s": 0.2726, "dec_s": 0.0249}
+{"id": "quality:760", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 602, "enc_s": 0.0, "dec_s": 0.0248}
+{"id": "quality:760", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 602, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:760", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1113, "enc_s": 0.2695, "dec_s": 0.0354}
+{"id": "quality:760", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1115, "enc_s": 0.0, "dec_s": 0.0362}
+{"id": "quality:760", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1115, "enc_s": 0.0, "dec_s": 0.0264}
+{"id": "quality:760", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2138, "enc_s": 0.2755, "dec_s": 0.067}
+{"id": "quality:760", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2139, "enc_s": 0.0, "dec_s": 0.0662}
+{"id": "quality:760", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2139, "enc_s": 0.0, "dec_s": 0.046}
+{"id": "quality:1311", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 622, "enc_s": 0.2732, "dec_s": 0.0246}
+{"id": "quality:1311", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 624, "enc_s": 0.0, "dec_s": 0.025}
+{"id": "quality:1311", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 624, "enc_s": 0.0, "dec_s": 0.0194}
+{"id": "quality:1311", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1135, "enc_s": 0.2716, "dec_s": 0.0358}
+{"id": "quality:1311", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1136, "enc_s": 0.0, "dec_s": 0.0369}
+{"id": "quality:1311", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1136, "enc_s": 0.0, "dec_s": 0.0267}
+{"id": "quality:1311", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2160, "enc_s": 0.2761, "dec_s": 0.0658}
+{"id": "quality:1311", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2160, "enc_s": 0.0, "dec_s": 0.067}
+{"id": "quality:1311", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2160, "enc_s": 0.0, "dec_s": 0.0462}
+{"id": "quality:2027", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 605, "enc_s": 0.1977, "dec_s": 0.0243}
+{"id": "quality:2027", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 606, "enc_s": 0.0, "dec_s": 0.0242}
+{"id": "quality:2027", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 606, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:2027", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1117, "enc_s": 0.2006, "dec_s": 0.0368}
+{"id": "quality:2027", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1118, "enc_s": 0.0, "dec_s": 0.0359}
+{"id": "quality:2027", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1118, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:2027", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2139, "enc_s": 0.2032, "dec_s": 0.0669}
+{"id": "quality:2027", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2142, "enc_s": 0.0, "dec_s": 0.0669}
+{"id": "quality:2027", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2142, "enc_s": 0.0, "dec_s": 0.0458}
+{"id": "quality:1774", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 592, "enc_s": 0.2018, "dec_s": 0.0242}
+{"id": "quality:1774", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 593, "enc_s": 0.0, "dec_s": 0.0246}
+{"id": "quality:1774", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 593, "enc_s": 0.0, "dec_s": 0.0188}
+{"id": "quality:1774", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1103, "enc_s": 0.2034, "dec_s": 0.0359}
+{"id": "quality:1774", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1105, "enc_s": 0.0, "dec_s": 0.036}
+{"id": "quality:1774", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1105, "enc_s": 0.0, "dec_s": 0.0262}
+{"id": "quality:1774", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2128, "enc_s": 0.2055, "dec_s": 0.0664}
+{"id": "quality:1774", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2129, "enc_s": 0.0, "dec_s": 0.0653}
+{"id": "quality:1774", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2129, "enc_s": 0.0, "dec_s": 0.0443}
+{"id": "quality:1874", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 631, "enc_s": 0.1304, "dec_s": 0.0246}
+{"id": "quality:1874", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 633, "enc_s": 0.0, "dec_s": 0.0248}
+{"id": "quality:1874", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 633, "enc_s": 0.0, "dec_s": 0.0183}
+{"id": "quality:1874", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1143, "enc_s": 0.1323, "dec_s": 0.0356}
+{"id": "quality:1874", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1145, "enc_s": 0.0, "dec_s": 0.0368}
+{"id": "quality:1874", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1145, "enc_s": 0.0, "dec_s": 0.0268}
+{"id": "quality:1874", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1765, "enc_s": 0.1323, "dec_s": 0.0544}
+{"id": "quality:1874", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2169, "enc_s": 0.0, "dec_s": 0.0664}
+{"id": "quality:1874", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2169, "enc_s": 0.0, "dec_s": 0.046}
+{"id": "quality:1767", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 636, "enc_s": 0.2709, "dec_s": 0.0253}
+{"id": "quality:1767", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 637, "enc_s": 0.0, "dec_s": 0.0253}
+{"id": "quality:1767", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 637, "enc_s": 0.0, "dec_s": 0.0193}
+{"id": "quality:1767", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 1150, "enc_s": 0.2721, "dec_s": 0.0369}
+{"id": "quality:1767", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 1149, "enc_s": 0.0, "dec_s": 0.037}
+{"id": "quality:1767", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1149, "enc_s": 0.0, "dec_s": 0.0271}
+{"id": "quality:1767", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 2174, "enc_s": 0.2769, "dec_s": 0.0657}
+{"id": "quality:1767", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 2173, "enc_s": 0.0, "dec_s": 0.0676}
+{"id": "quality:1767", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2173, "enc_s": 0.0, "dec_s": 0.0455}
+{"id": "quality:689", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 606, "enc_s": 0.2727, "dec_s": 0.0253}
+{"id": "quality:689", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 606, "enc_s": 0.0, "dec_s": 0.0244}
+{"id": "quality:689", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 606, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:689", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1119, "enc_s": 0.2724, "dec_s": 0.0357}
+{"id": "quality:689", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 1117, "enc_s": 0.0, "dec_s": 0.0365}
+{"id": "quality:689", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1117, "enc_s": 0.0, "dec_s": 0.0263}
+{"id": "quality:689", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2142, "enc_s": 0.2771, "dec_s": 0.0651}
+{"id": "quality:689", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 2142, "enc_s": 0.0, "dec_s": 0.066}
+{"id": "quality:689", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 2142, "enc_s": 0.0, "dec_s": 0.0447}
+{"id": "quality:1342", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 600, "enc_s": 0.2678, "dec_s": 0.024}
+{"id": "quality:1342", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 601, "enc_s": 0.0, "dec_s": 0.0246}
+{"id": "quality:1342", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 601, "enc_s": 0.0, "dec_s": 0.0189}
+{"id": "quality:1342", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1113, "enc_s": 0.2673, "dec_s": 0.0357}
+{"id": "quality:1342", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1113, "enc_s": 0.0, "dec_s": 0.0358}
+{"id": "quality:1342", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1113, "enc_s": 0.0, "dec_s": 0.0254}
+{"id": "quality:1342", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2138, "enc_s": 0.2725, "dec_s": 0.0654}
+{"id": "quality:1342", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2137, "enc_s": 0.0, "dec_s": 0.0659}
+{"id": "quality:1342", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2137, "enc_s": 0.0, "dec_s": 0.0454}
+{"id": "quality:9", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 671, "enc_s": 0.2693, "dec_s": 0.0267}
+{"id": "quality:9", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 668, "enc_s": 0.0, "dec_s": 0.0254}
+{"id": "quality:9", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 668, "enc_s": 0.0, "dec_s": 0.0197}
+{"id": "quality:9", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1180, "enc_s": 0.2679, "dec_s": 0.0379}
+{"id": "quality:9", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1180, "enc_s": 0.0, "dec_s": 0.037}
+{"id": "quality:9", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1180, "enc_s": 0.0, "dec_s": 0.0281}
+{"id": "quality:9", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2206, "enc_s": 0.2743, "dec_s": 0.0662}
+{"id": "quality:9", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2204, "enc_s": 0.0, "dec_s": 0.0681}
+{"id": "quality:9", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2204, "enc_s": 0.0, "dec_s": 0.0471}
+{"id": "quality:741", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 603, "enc_s": 0.2713, "dec_s": 0.0242}
+{"id": "quality:741", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 604, "enc_s": 0.0, "dec_s": 0.0247}
+{"id": "quality:741", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 604, "enc_s": 0.0, "dec_s": 0.019}
+{"id": "quality:741", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1116, "enc_s": 0.2714, "dec_s": 0.0352}
+{"id": "quality:741", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1116, "enc_s": 0.0, "dec_s": 0.0363}
+{"id": "quality:741", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 1116, "enc_s": 0.0, "dec_s": 0.0263}
+{"id": "quality:741", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2140, "enc_s": 0.2789, "dec_s": 0.0663}
+{"id": "quality:741", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2139, "enc_s": 0.0, "dec_s": 0.0667}
+{"id": "quality:741", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 2139, "enc_s": 0.0, "dec_s": 0.0458}
+{"id": "quality:312", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 648, "enc_s": 0.2687, "dec_s": 0.0252}
+{"id": "quality:312", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 647, "enc_s": 0.0, "dec_s": 0.0256}
+{"id": "quality:312", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 647, "enc_s": 0.0, "dec_s": 0.0195}
+{"id": "quality:312", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1160, "enc_s": 0.2724, "dec_s": 0.0383}
+{"id": "quality:312", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1159, "enc_s": 0.0, "dec_s": 0.0379}
+{"id": "quality:312", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1159, "enc_s": 0.0, "dec_s": 0.0276}
+{"id": "quality:312", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2182, "enc_s": 0.2774, "dec_s": 0.0667}
+{"id": "quality:312", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2182, "enc_s": 0.0, "dec_s": 0.0677}
+{"id": "quality:312", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2182, "enc_s": 0.0, "dec_s": 0.0465}
+{"id": "quality:976", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 600, "enc_s": 0.13, "dec_s": 0.0245}
+{"id": "quality:976", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 602, "enc_s": 0.0, "dec_s": 0.0233}
+{"id": "quality:976", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 602, "enc_s": 0.0, "dec_s": 0.0185}
+{"id": "quality:976", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1112, "enc_s": 0.1302, "dec_s": 0.0363}
+{"id": "quality:976", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1114, "enc_s": 0.0, "dec_s": 0.0348}
+{"id": "quality:976", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1114, "enc_s": 0.0, "dec_s": 0.0262}
+{"id": "quality:976", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1444, "enc_s": 0.1331, "dec_s": 0.0448}
+{"id": "quality:976", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2138, "enc_s": 0.0, "dec_s": 0.0667}
+{"id": "quality:976", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2138, "enc_s": 0.0, "dec_s": 0.0457}
+{"id": "quality:1943", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 580, "enc_s": 0.201, "dec_s": 0.024}
+{"id": "quality:1943", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 581, "enc_s": 0.0, "dec_s": 0.024}
+{"id": "quality:1943", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 581, "enc_s": 0.0, "dec_s": 0.0179}
+{"id": "quality:1943", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1091, "enc_s": 0.201, "dec_s": 0.0344}
+{"id": "quality:1943", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1093, "enc_s": 0.0, "dec_s": 0.0353}
+{"id": "quality:1943", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1093, "enc_s": 0.0, "dec_s": 0.0259}
+{"id": "quality:1943", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2116, "enc_s": 0.2065, "dec_s": 0.0647}
+{"id": "quality:1943", "subset": "validation", "arm": "text@2048", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 2117, "enc_s": 0.0, "dec_s": 0.0662}
+{"id": "quality:1943", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2117, "enc_s": 0.0, "dec_s": 0.0454}
+{"id": "quality:947", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 600, "enc_s": 0.1305, "dec_s": 0.0241}
+{"id": "quality:947", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 603, "enc_s": 0.0, "dec_s": 0.0242}
+{"id": "quality:947", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 603, "enc_s": 0.0, "dec_s": 0.0185}
+{"id": "quality:947", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1112, "enc_s": 0.1306, "dec_s": 0.0349}
+{"id": "quality:947", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1115, "enc_s": 0.0, "dec_s": 0.0365}
+{"id": "quality:947", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1115, "enc_s": 0.0, "dec_s": 0.0262}
+{"id": "quality:947", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1413, "enc_s": 0.1326, "dec_s": 0.0431}
+{"id": "quality:947", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2139, "enc_s": 0.0, "dec_s": 0.066}
+{"id": "quality:947", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2139, "enc_s": 0.0, "dec_s": 0.0457}
+{"id": "quality:840", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 587, "enc_s": 0.2718, "dec_s": 0.026}
+{"id": "quality:840", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 588, "enc_s": 0.0, "dec_s": 0.0238}
+{"id": "quality:840", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 588, "enc_s": 0.0, "dec_s": 0.0181}
+{"id": "quality:840", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1100, "enc_s": 0.2741, "dec_s": 0.0354}
+{"id": "quality:840", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1100, "enc_s": 0.0, "dec_s": 0.0347}
+{"id": "quality:840", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1100, "enc_s": 0.0, "dec_s": 0.0252}
+{"id": "quality:840", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2125, "enc_s": 0.2753, "dec_s": 0.0658}
+{"id": "quality:840", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 2124, "enc_s": 0.0, "dec_s": 0.0658}
+{"id": "quality:840", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2124, "enc_s": 0.0, "dec_s": 0.0457}
+{"id": "quality:1052", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 645, "enc_s": 0.2701, "dec_s": 0.0259}
+{"id": "quality:1052", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 646, "enc_s": 0.0, "dec_s": 0.0257}
+{"id": "quality:1052", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 646, "enc_s": 0.0, "dec_s": 0.0194}
+{"id": "quality:1052", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1159, "enc_s": 0.2735, "dec_s": 0.0372}
+{"id": "quality:1052", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1158, "enc_s": 0.0, "dec_s": 0.0381}
+{"id": "quality:1052", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1158, "enc_s": 0.0, "dec_s": 0.0269}
+{"id": "quality:1052", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2182, "enc_s": 0.2768, "dec_s": 0.0663}
+{"id": "quality:1052", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2182, "enc_s": 0.0, "dec_s": 0.0673}
+{"id": "quality:1052", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2182, "enc_s": 0.0, "dec_s": 0.0473}
+{"id": "quality:1207", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 625, "enc_s": 0.1995, "dec_s": 0.0254}
+{"id": "quality:1207", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 625, "enc_s": 0.0, "dec_s": 0.0243}
+{"id": "quality:1207", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 625, "enc_s": 0.0, "dec_s": 0.0183}
+{"id": "quality:1207", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1137, "enc_s": 0.2031, "dec_s": 0.0366}
+{"id": "quality:1207", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1137, "enc_s": 0.0, "dec_s": 0.0368}
+{"id": "quality:1207", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 1137, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:1207", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2160, "enc_s": 0.207, "dec_s": 0.0659}
+{"id": "quality:1207", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2162, "enc_s": 0.0, "dec_s": 0.0664}
+{"id": "quality:1207", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2162, "enc_s": 0.0, "dec_s": 0.046}
+{"id": "quality:1835", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 600, "enc_s": 0.1298, "dec_s": 0.0247}
+{"id": "quality:1835", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 602, "enc_s": 0.0, "dec_s": 0.0236}
+{"id": "quality:1835", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 602, "enc_s": 0.0, "dec_s": 0.0188}
+{"id": "quality:1835", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1112, "enc_s": 0.1322, "dec_s": 0.035}
+{"id": "quality:1835", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1114, "enc_s": 0.0, "dec_s": 0.0363}
+{"id": "quality:1835", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1114, "enc_s": 0.0, "dec_s": 0.0263}
+{"id": "quality:1835", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1512, "enc_s": 0.1322, "dec_s": 0.0461}
+{"id": "quality:1835", "subset": "validation", "arm": "text@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 2138, "enc_s": 0.0, "dec_s": 0.0665}
+{"id": "quality:1835", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2138, "enc_s": 0.0, "dec_s": 0.0455}
+{"id": "quality:1509", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 609, "enc_s": 0.3423, "dec_s": 0.0266}
+{"id": "quality:1509", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 608, "enc_s": 0.0, "dec_s": 0.025}
+{"id": "quality:1509", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 608, "enc_s": 0.0, "dec_s": 0.0189}
+{"id": "quality:1509", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 1121, "enc_s": 0.3414, "dec_s": 0.0365}
+{"id": "quality:1509", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 1121, "enc_s": 0.0, "dec_s": 0.0366}
+{"id": "quality:1509", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1121, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:1509", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["C"], "acc": 0.0, "prefix": 2147, "enc_s": 0.345, "dec_s": 0.0663}
+{"id": "quality:1509", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 2145, "enc_s": 0.0, "dec_s": 0.067}
+{"id": "quality:1509", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["C"], "acc": 0.0, "prefix": 2145, "enc_s": 0.0, "dec_s": 0.045}
+{"id": "quality:1751", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 581, "enc_s": 0.204, "dec_s": 0.025}
+{"id": "quality:1751", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 582, "enc_s": 0.0, "dec_s": 0.0237}
+{"id": "quality:1751", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 582, "enc_s": 0.0, "dec_s": 0.0188}
+{"id": "quality:1751", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1095, "enc_s": 0.2016, "dec_s": 0.0355}
+{"id": "quality:1751", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1094, "enc_s": 0.0, "dec_s": 0.0353}
+{"id": "quality:1751", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1094, "enc_s": 0.0, "dec_s": 0.026}
+{"id": "quality:1751", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2118, "enc_s": 0.2052, "dec_s": 0.0657}
+{"id": "quality:1751", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2118, "enc_s": 0.0, "dec_s": 0.0651}
+{"id": "quality:1751", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2118, "enc_s": 0.0, "dec_s": 0.0454}
+{"id": "quality:114", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 617, "enc_s": 0.2014, "dec_s": 0.0249}
+{"id": "quality:114", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 617, "enc_s": 0.0, "dec_s": 0.024}
+{"id": "quality:114", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 617, "enc_s": 0.0, "dec_s": 0.0192}
+{"id": "quality:114", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1128, "enc_s": 0.2018, "dec_s": 0.0358}
+{"id": "quality:114", "subset": "validation", "arm": "text@1024", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 1129, "enc_s": 0.0, "dec_s": 0.0368}
+{"id": "quality:114", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1129, "enc_s": 0.0, "dec_s": 0.0263}
+{"id": "quality:114", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2151, "enc_s": 0.2063, "dec_s": 0.0662}
+{"id": "quality:114", "subset": "validation", "arm": "text@2048", "pred": "A", "gold": ["A"], "acc": 1.0, "prefix": 2153, "enc_s": 0.0, "dec_s": 0.0662}
+{"id": "quality:114", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2153, "enc_s": 0.0, "dec_s": 0.0458}
+{"id": "quality:1472", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 643, "enc_s": 0.2707, "dec_s": 0.0253}
+{"id": "quality:1472", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 643, "enc_s": 0.0, "dec_s": 0.0256}
+{"id": "quality:1472", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 643, "enc_s": 0.0, "dec_s": 0.0193}
+{"id": "quality:1472", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1156, "enc_s": 0.2746, "dec_s": 0.0366}
+{"id": "quality:1472", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1155, "enc_s": 0.0, "dec_s": 0.038}
+{"id": "quality:1472", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1155, "enc_s": 0.0, "dec_s": 0.028}
+{"id": "quality:1472", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2178, "enc_s": 0.2776, "dec_s": 0.0667}
+{"id": "quality:1472", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2179, "enc_s": 0.0, "dec_s": 0.0675}
+{"id": "quality:1472", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2179, "enc_s": 0.0, "dec_s": 0.0467}
+{"id": "quality:1021", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 611, "enc_s": 0.2714, "dec_s": 0.0243}
+{"id": "quality:1021", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 613, "enc_s": 0.0, "dec_s": 0.0238}
+{"id": "quality:1021", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 613, "enc_s": 0.0, "dec_s": 0.0186}
+{"id": "quality:1021", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1124, "enc_s": 0.2722, "dec_s": 0.0359}
+{"id": "quality:1021", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1125, "enc_s": 0.0, "dec_s": 0.0362}
+{"id": "quality:1021", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1125, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:1021", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2149, "enc_s": 0.2776, "dec_s": 0.0662}
+{"id": "quality:1021", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2149, "enc_s": 0.0, "dec_s": 0.067}
+{"id": "quality:1021", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2149, "enc_s": 0.0, "dec_s": 0.0459}
+{"id": "quality:361", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 619, "enc_s": 0.2684, "dec_s": 0.0254}
+{"id": "quality:361", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 619, "enc_s": 0.0, "dec_s": 0.0243}
+{"id": "quality:361", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 619, "enc_s": 0.0, "dec_s": 0.0188}
+{"id": "quality:361", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1129, "enc_s": 0.272, "dec_s": 0.0369}
+{"id": "quality:361", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1131, "enc_s": 0.0, "dec_s": 0.0371}
+{"id": "quality:361", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1131, "enc_s": 0.0, "dec_s": 0.0266}
+{"id": "quality:361", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2155, "enc_s": 0.2776, "dec_s": 0.0661}
+{"id": "quality:361", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2155, "enc_s": 0.0, "dec_s": 0.0667}
+{"id": "quality:361", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2155, "enc_s": 0.0, "dec_s": 0.0458}
+{"id": "quality:1898", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 603, "enc_s": 0.1309, "dec_s": 0.0236}
+{"id": "quality:1898", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 606, "enc_s": 0.0, "dec_s": 0.0244}
+{"id": "quality:1898", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 606, "enc_s": 0.0, "dec_s": 0.0188}
+{"id": "quality:1898", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1115, "enc_s": 0.1323, "dec_s": 0.0354}
+{"id": "quality:1898", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1118, "enc_s": 0.0, "dec_s": 0.0361}
+{"id": "quality:1898", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1118, "enc_s": 0.0, "dec_s": 0.0263}
+{"id": "quality:1898", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2033, "enc_s": 0.1341, "dec_s": 0.0602}
+{"id": "quality:1898", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2142, "enc_s": 0.0, "dec_s": 0.0669}
+{"id": "quality:1898", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2142, "enc_s": 0.0, "dec_s": 0.0448}
+{"id": "quality:170", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 639, "enc_s": 0.1969, "dec_s": 0.0246}
+{"id": "quality:170", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 640, "enc_s": 0.0, "dec_s": 0.025}
+{"id": "quality:170", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 640, "enc_s": 0.0, "dec_s": 0.0188}
+{"id": "quality:170", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1151, "enc_s": 0.202, "dec_s": 0.0372}
+{"id": "quality:170", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1152, "enc_s": 0.0, "dec_s": 0.0365}
+{"id": "quality:170", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1152, "enc_s": 0.0, "dec_s": 0.0258}
+{"id": "quality:170", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2175, "enc_s": 0.2032, "dec_s": 0.0653}
+{"id": "quality:170", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2176, "enc_s": 0.0, "dec_s": 0.0666}
+{"id": "quality:170", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 2176, "enc_s": 0.0, "dec_s": 0.046}
+{"id": "quality:1824", "subset": "validation", "arm": "bgkit@512", "pred": "Dreeze", "gold": ["D"], "acc": 0.0, "prefix": 593, "enc_s": 0.13, "dec_s": 0.0371}
+{"id": "quality:1824", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 596, "enc_s": 0.0, "dec_s": 0.024}
+{"id": "quality:1824", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 596, "enc_s": 0.0, "dec_s": 0.019}
+{"id": "quality:1824", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["D"], "acc": 0.0, "prefix": 1106, "enc_s": 0.1315, "dec_s": 0.0349}
+{"id": "quality:1824", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1108, "enc_s": 0.0, "dec_s": 0.0348}
+{"id": "quality:1824", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1108, "enc_s": 0.0, "dec_s": 0.0261}
+{"id": "quality:1824", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["D"], "acc": 0.0, "prefix": 2013, "enc_s": 0.1341, "dec_s": 0.0603}
+{"id": "quality:1824", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2132, "enc_s": 0.0, "dec_s": 0.0654}
+{"id": "quality:1824", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2132, "enc_s": 0.0, "dec_s": 0.0456}
+{"id": "quality:393", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 590, "enc_s": 0.272, "dec_s": 0.0252}
+{"id": "quality:393", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 590, "enc_s": 0.0, "dec_s": 0.0236}
+{"id": "quality:393", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 590, "enc_s": 0.0, "dec_s": 0.0185}
+{"id": "quality:393", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1100, "enc_s": 0.2734, "dec_s": 0.0357}
+{"id": "quality:393", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1101, "enc_s": 0.0, "dec_s": 0.0356}
+{"id": "quality:393", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1101, "enc_s": 0.0, "dec_s": 0.0253}
+{"id": "quality:393", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 2124, "enc_s": 0.2758, "dec_s": 0.0645}
+{"id": "quality:393", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2126, "enc_s": 0.0, "dec_s": 0.0665}
+{"id": "quality:393", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2126, "enc_s": 0.0, "dec_s": 0.0445}
+{"id": "quality:612", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 602, "enc_s": 0.2705, "dec_s": 0.0239}
+{"id": "quality:612", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 601, "enc_s": 0.0, "dec_s": 0.0239}
+{"id": "quality:612", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 601, "enc_s": 0.0, "dec_s": 0.019}
+{"id": "quality:612", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["A"], "acc": 0.0, "prefix": 1113, "enc_s": 0.2691, "dec_s": 0.035}
+{"id": "quality:612", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1113, "enc_s": 0.0, "dec_s": 0.0358}
+{"id": "quality:612", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 1113, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:612", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2135, "enc_s": 0.2746, "dec_s": 0.0652}
+{"id": "quality:612", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2137, "enc_s": 0.0, "dec_s": 0.0664}
+{"id": "quality:612", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["A"], "acc": 0.0, "prefix": 2137, "enc_s": 0.0, "dec_s": 0.0456}
+{"id": "quality:146", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 609, "enc_s": 0.2695, "dec_s": 0.0244}
+{"id": "quality:146", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 609, "enc_s": 0.0, "dec_s": 0.0246}
+{"id": "quality:146", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 609, "enc_s": 0.0, "dec_s": 0.0182}
+{"id": "quality:146", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1122, "enc_s": 0.2706, "dec_s": 0.0355}
+{"id": "quality:146", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1122, "enc_s": 0.0, "dec_s": 0.0351}
+{"id": "quality:146", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1122, "enc_s": 0.0, "dec_s": 0.0263}
+{"id": "quality:146", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2146, "enc_s": 0.2751, "dec_s": 0.0652}
+{"id": "quality:146", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2146, "enc_s": 0.0, "dec_s": 0.0667}
+{"id": "quality:146", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2146, "enc_s": 0.0, "dec_s": 0.046}
+{"id": "quality:1964", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 616, "enc_s": 0.2678, "dec_s": 0.0243}
+{"id": "quality:1964", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 617, "enc_s": 0.0, "dec_s": 0.0249}
+{"id": "quality:1964", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 617, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:1964", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1130, "enc_s": 0.2733, "dec_s": 0.0364}
+{"id": "quality:1964", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1129, "enc_s": 0.0, "dec_s": 0.0365}
+{"id": "quality:1964", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1129, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:1964", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2153, "enc_s": 0.2736, "dec_s": 0.0666}
+{"id": "quality:1964", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2153, "enc_s": 0.0, "dec_s": 0.0669}
+{"id": "quality:1964", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2153, "enc_s": 0.0, "dec_s": 0.0465}
+{"id": "quality:447", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 597, "enc_s": 0.2699, "dec_s": 0.0242}
+{"id": "quality:447", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 597, "enc_s": 0.0, "dec_s": 0.0235}
+{"id": "quality:447", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 597, "enc_s": 0.0, "dec_s": 0.019}
+{"id": "quality:447", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 1108, "enc_s": 0.2733, "dec_s": 0.0349}
+{"id": "quality:447", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1108, "enc_s": 0.0, "dec_s": 0.0357}
+{"id": "quality:447", "subset": "validation", "arm": "base@1024", "pred": "B.", "gold": ["D"], "acc": 0.0, "prefix": 1108, "enc_s": 0.0, "dec_s": 0.0308}
+{"id": "quality:447", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2132, "enc_s": 0.2766, "dec_s": 0.0662}
+{"id": "quality:447", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2133, "enc_s": 0.0, "dec_s": 0.0662}
+{"id": "quality:447", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["D"], "acc": 1.0, "prefix": 2133, "enc_s": 0.0, "dec_s": 0.0449}
+{"id": "quality:1095", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 627, "enc_s": 0.268, "dec_s": 0.0253}
+{"id": "quality:1095", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 628, "enc_s": 0.0, "dec_s": 0.0249}
+{"id": "quality:1095", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 628, "enc_s": 0.0, "dec_s": 0.019}
+{"id": "quality:1095", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1139, "enc_s": 0.2688, "dec_s": 0.0373}
+{"id": "quality:1095", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 1139, "enc_s": 0.0, "dec_s": 0.0374}
+{"id": "quality:1095", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1139, "enc_s": 0.0, "dec_s": 0.0272}
+{"id": "quality:1095", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2162, "enc_s": 0.2721, "dec_s": 0.0653}
+{"id": "quality:1095", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2164, "enc_s": 0.0, "dec_s": 0.0664}
+{"id": "quality:1095", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2164, "enc_s": 0.0, "dec_s": 0.0461}
+{"id": "quality:1148", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 642, "enc_s": 0.2704, "dec_s": 0.0268}
+{"id": "quality:1148", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 641, "enc_s": 0.0, "dec_s": 0.0258}
+{"id": "quality:1148", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 641, "enc_s": 0.0, "dec_s": 0.0196}
+{"id": "quality:1148", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1152, "enc_s": 0.2741, "dec_s": 0.0363}
+{"id": "quality:1148", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1153, "enc_s": 0.0, "dec_s": 0.0384}
+{"id": "quality:1148", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1153, "enc_s": 0.0, "dec_s": 0.0275}
+{"id": "quality:1148", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2178, "enc_s": 0.2767, "dec_s": 0.0659}
+{"id": "quality:1148", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2176, "enc_s": 0.0, "dec_s": 0.0665}
+{"id": "quality:1148", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2176, "enc_s": 0.0, "dec_s": 0.0462}
+{"id": "quality:1476", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 634, "enc_s": 0.273, "dec_s": 0.0255}
+{"id": "quality:1476", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 634, "enc_s": 0.0, "dec_s": 0.0242}
+{"id": "quality:1476", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 634, "enc_s": 0.0, "dec_s": 0.0192}
+{"id": "quality:1476", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1147, "enc_s": 0.2732, "dec_s": 0.0358}
+{"id": "quality:1476", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1146, "enc_s": 0.0, "dec_s": 0.0358}
+{"id": "quality:1476", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1146, "enc_s": 0.0, "dec_s": 0.0267}
+{"id": "quality:1476", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2169, "enc_s": 0.2767, "dec_s": 0.0669}
+{"id": "quality:1476", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2170, "enc_s": 0.0, "dec_s": 0.0679}
+{"id": "quality:1476", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2170, "enc_s": 0.0, "dec_s": 0.0465}
+{"id": "quality:1561", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 627, "enc_s": 0.1268, "dec_s": 0.0244}
+{"id": "quality:1561", "subset": "validation", "arm": "text@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 629, "enc_s": 0.0, "dec_s": 0.0238}
+{"id": "quality:1561", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 629, "enc_s": 0.0, "dec_s": 0.0192}
+{"id": "quality:1561", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1139, "enc_s": 0.1299, "dec_s": 0.0364}
+{"id": "quality:1561", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1140, "enc_s": 0.0, "dec_s": 0.0367}
+{"id": "quality:1561", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1140, "enc_s": 0.0, "dec_s": 0.0265}
+{"id": "quality:1561", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 1508, "enc_s": 0.1317, "dec_s": 0.0459}
+{"id": "quality:1561", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2165, "enc_s": 0.0, "dec_s": 0.066}
+{"id": "quality:1561", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["C"], "acc": 1.0, "prefix": 2165, "enc_s": 0.0, "dec_s": 0.046}
+{"id": "quality:786", "subset": "validation", "arm": "bgkit@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 593, "enc_s": 0.27, "dec_s": 0.0246}
+{"id": "quality:786", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 592, "enc_s": 0.0, "dec_s": 0.0238}
+{"id": "quality:786", "subset": "validation", "arm": "base@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 592, "enc_s": 0.0, "dec_s": 0.0191}
+{"id": "quality:786", "subset": "validation", "arm": "bgkit@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1105, "enc_s": 0.2752, "dec_s": 0.0354}
+{"id": "quality:786", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1105, "enc_s": 0.0, "dec_s": 0.0361}
+{"id": "quality:786", "subset": "validation", "arm": "base@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1105, "enc_s": 0.0, "dec_s": 0.0261}
+{"id": "quality:786", "subset": "validation", "arm": "bgkit@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2129, "enc_s": 0.2771, "dec_s": 0.0661}
+{"id": "quality:786", "subset": "validation", "arm": "text@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2128, "enc_s": 0.0, "dec_s": 0.0664}
+{"id": "quality:786", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 2128, "enc_s": 0.0, "dec_s": 0.0456}
+{"id": "quality:504", "subset": "validation", "arm": "bgkit@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 638, "enc_s": 0.2678, "dec_s": 0.0254}
+{"id": "quality:504", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 639, "enc_s": 0.0, "dec_s": 0.0248}
+{"id": "quality:504", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 639, "enc_s": 0.0, "dec_s": 0.0192}
+{"id": "quality:504", "subset": "validation", "arm": "bgkit@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1149, "enc_s": 0.2715, "dec_s": 0.0372}
+{"id": "quality:504", "subset": "validation", "arm": "text@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1151, "enc_s": 0.0, "dec_s": 0.036}
+{"id": "quality:504", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 1151, "enc_s": 0.0, "dec_s": 0.0267}
+{"id": "quality:504", "subset": "validation", "arm": "bgkit@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2175, "enc_s": 0.2724, "dec_s": 0.0667}
+{"id": "quality:504", "subset": "validation", "arm": "text@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2175, "enc_s": 0.0, "dec_s": 0.0668}
+{"id": "quality:504", "subset": "validation", "arm": "base@2048", "pred": "D", "gold": ["A"], "acc": 0.0, "prefix": 2175, "enc_s": 0.0, "dec_s": 0.0462}
+{"id": "quality:1821", "subset": "validation", "arm": "bgkit@512", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 615, "enc_s": 0.1298, "dec_s": 0.0237}
+{"id": "quality:1821", "subset": "validation", "arm": "text@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 618, "enc_s": 0.0, "dec_s": 0.0235}
+{"id": "quality:1821", "subset": "validation", "arm": "base@512", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 618, "enc_s": 0.0, "dec_s": 0.019}
+{"id": "quality:1821", "subset": "validation", "arm": "bgkit@1024", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 1128, "enc_s": 0.1302, "dec_s": 0.0363}
+{"id": "quality:1821", "subset": "validation", "arm": "text@1024", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 1130, "enc_s": 0.0, "dec_s": 0.0367}
+{"id": "quality:1821", "subset": "validation", "arm": "base@1024", "pred": "D", "gold": ["B"], "acc": 0.0, "prefix": 1130, "enc_s": 0.0, "dec_s": 0.0264}
+{"id": "quality:1821", "subset": "validation", "arm": "bgkit@2048", "pred": "A", "gold": ["B"], "acc": 0.0, "prefix": 2035, "enc_s": 0.1331, "dec_s": 0.0608}
+{"id": "quality:1821", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["B"], "acc": 0.0, "prefix": 2154, "enc_s": 0.0, "dec_s": 0.0661}
+{"id": "quality:1821", "subset": "validation", "arm": "base@2048", "pred": "B", "gold": ["B"], "acc": 1.0, "prefix": 2154, "enc_s": 0.0, "dec_s": 0.0454}
+{"id": "quality:132", "subset": "validation", "arm": "bgkit@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 605, "enc_s": 0.2702, "dec_s": 0.0251}
+{"id": "quality:132", "subset": "validation", "arm": "text@512", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 607, "enc_s": 0.0, "dec_s": 0.0246}
+{"id": "quality:132", "subset": "validation", "arm": "base@512", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 607, "enc_s": 0.0, "dec_s": 0.0192}
+{"id": "quality:132", "subset": "validation", "arm": "bgkit@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1118, "enc_s": 0.2734, "dec_s": 0.037}
+{"id": "quality:132", "subset": "validation", "arm": "text@1024", "pred": "B", "gold": ["D"], "acc": 0.0, "prefix": 1118, "enc_s": 0.0, "dec_s": 0.0368}
+{"id": "quality:132", "subset": "validation", "arm": "base@1024", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 1118, "enc_s": 0.0, "dec_s": 0.0262}
+{"id": "quality:132", "subset": "validation", "arm": "bgkit@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2143, "enc_s": 0.277, "dec_s": 0.0659}
+{"id": "quality:132", "subset": "validation", "arm": "text@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2143, "enc_s": 0.0, "dec_s": 0.0661}
+{"id": "quality:132", "subset": "validation", "arm": "base@2048", "pred": "C", "gold": ["D"], "acc": 0.0, "prefix": 2143, "enc_s": 0.0, "dec_s": 0.0459}

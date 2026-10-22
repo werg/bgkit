@@ -1,0 +1,518 @@
+"""Tests for bgkit.inference.client using httpx MockTransport."""
+
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+
+from bgkit.inference.client import LlamaClient, _run_sync
+from bgkit.inference.config import InferenceConfig
+from bgkit.inference.models import DEFAULT_PROFILE, MODEL_PROFILES, ModelProfile
+
+
+def _make_completion_response(content: str = "Hello world") -> dict:
+    return {
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+
+
+def _ok_handler(request: httpx.Request) -> httpx.Response:
+    """Mock handler that returns a successful completion."""
+    if request.url.path == "/health":
+        return httpx.Response(200, json={"status": "ok"})
+    if request.url.path == "/v1/chat/completions":
+        body = json.loads(request.content)
+        prompt = body["messages"][-1]["content"]
+        return httpx.Response(200, json=_make_completion_response(f"Response to: {prompt}"))
+    return httpx.Response(404)
+
+
+def _make_client(handler, **config_kwargs) -> LlamaClient:
+    """Create a LlamaClient with a mock transport."""
+    config = InferenceConfig(base_url="http://test", **config_kwargs)
+    client = LlamaClient(config)
+    # Replace the async client with one using mock transport
+    client._async_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="http://test",
+        timeout=5.0,
+    )
+    return client
+
+
+# Convenience: a profile with thinking enabled (strips tags + sends kwargs)
+_THINKING_PROFILE = MODEL_PROFILES["GLM-4"]
+
+
+def test_generate_success():
+    client = _make_client(_ok_handler)
+    result = _run_sync(client.generate("What is Python?"))
+    assert result is not None
+    assert "Response to: What is Python?" in result
+
+
+def test_generate_with_system_prompt():
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            received["body"] = json.loads(request.content)
+            return httpx.Response(200, json=_make_completion_response("ok"))
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    _run_sync(client.generate("Hello", system="You are helpful"))
+    assert received["body"]["messages"][0] == {"role": "system", "content": "You are helpful"}
+    assert received["body"]["messages"][1] == {"role": "user", "content": "Hello"}
+
+
+def test_retry_on_503():
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        if request.url.path == "/v1/chat/completions":
+            call_count += 1
+            if call_count <= 2:
+                return httpx.Response(503, json={"error": "busy"})
+            return httpx.Response(200, json=_make_completion_response("finally"))
+        return httpx.Response(404)
+
+    client = _make_client(handler, max_retries=3, retry_base_delay=0.01)
+    result = _run_sync(client.generate("test"))
+    assert result == "finally"
+    assert call_count == 3
+
+
+def test_retry_on_429():
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        if request.url.path == "/v1/chat/completions":
+            call_count += 1
+            if call_count == 1:
+                return httpx.Response(429, json={"error": "rate limited"})
+            return httpx.Response(200, json=_make_completion_response("ok"))
+        return httpx.Response(404)
+
+    client = _make_client(handler, max_retries=3, retry_base_delay=0.01)
+    result = _run_sync(client.generate("test"))
+    assert result == "ok"
+    assert call_count == 2
+
+
+def test_returns_none_after_max_retries():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(503, json={"error": "busy"})
+        return httpx.Response(404)
+
+    client = _make_client(handler, max_retries=2, retry_base_delay=0.01)
+    result = _run_sync(client.generate("test"))
+    assert result is None
+
+
+def test_generate_batch():
+    client = _make_client(_ok_handler, max_concurrent=4)
+    results = _run_sync(client.generate_batch(["a", "b", "c"]))
+    assert len(results) == 3
+    assert all(r is not None and "Response to:" in r for r in results)
+
+
+def test_wait_ready_success():
+    client = _make_client(_ok_handler)
+    ready = _run_sync(client.wait_ready(timeout=5.0))
+    assert ready is True
+
+
+def test_wait_ready_timeout():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(503)
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    ready = _run_sync(client.wait_ready(timeout=0.5))
+    assert ready is False
+
+
+def test_warmup_idempotent():
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        if request.url.path == "/v1/chat/completions":
+            call_count += 1
+            return httpx.Response(200, json=_make_completion_response("warm"))
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    _run_sync(client.warmup())
+    _run_sync(client.warmup())
+    _run_sync(client.warmup())
+    assert call_count == 1
+
+
+def test_strips_thinking_blocks_with_profile():
+    """Profile with thinking_tag_pattern strips <think> blocks from output."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            content = "<think>\nLet me analyze this...\n</think>\nThis file handles authentication."
+            return httpx.Response(200, json=_make_completion_response(content))
+        return httpx.Response(404)
+
+    client = _make_client(handler, model_profile=_THINKING_PROFILE)
+    result = client.generate_sync("describe this")
+    assert result == "This file handles authentication."
+    assert "<think>" not in result
+
+
+def test_preserves_thinking_blocks_without_profile():
+    """Without a model profile, <think> blocks are preserved."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            content = "<think>\nLet me analyze this...\n</think>\nThis file handles authentication."
+            return httpx.Response(200, json=_make_completion_response(content))
+        return httpx.Response(404)
+
+    # No model_profile = default None = no stripping
+    client = _make_client(handler)
+    result = client.generate_sync("describe this")
+    assert "<think>" in result
+
+
+def test_profile_sends_chat_template_kwargs():
+    """Profile with chat_template_kwargs includes them in the request."""
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            received["body"] = json.loads(request.content)
+            return httpx.Response(200, json=_make_completion_response("ok"))
+        return httpx.Response(404)
+
+    client = _make_client(handler, model_profile=_THINKING_PROFILE)
+    _run_sync(client.generate("Hello"))
+    assert received["body"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_no_chat_template_kwargs_without_profile():
+    """Without a model profile, chat_template_kwargs is not included."""
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            received["body"] = json.loads(request.content)
+            return httpx.Response(200, json=_make_completion_response("ok"))
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    _run_sync(client.generate("Hello"))
+    assert "chat_template_kwargs" not in received["body"]
+
+
+def test_generate_sync():
+    client = _make_client(_ok_handler)
+    result = client.generate_sync("Hello sync")
+    assert result is not None
+    assert "Response to: Hello sync" in result
+
+
+def test_empty_choices_returns_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, json={"choices": []})
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    result = client.generate_sync("test")
+    assert result is None
+
+
+def test_reasoning_content_fallback():
+    """When content is null, reasoning_content is used (GPT-OSS behavior)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, json={
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "This is the actual response.",
+                    },
+                    "finish_reason": "stop",
+                }],
+            })
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    result = client.generate_sync("test")
+    assert result == "This is the actual response."
+
+
+def test_extra_body_sent_in_payload():
+    """ModelProfile extra_body fields (include_reasoning, reasoning_effort) are sent."""
+
+    captured_body = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            captured_body.update(json.loads(request.content))
+            return httpx.Response(200, json=_make_completion_response("ok"))
+        return httpx.Response(404)
+
+    profile = MODEL_PROFILES["GPT-OSS"]
+    client = _make_client(handler, model_profile=profile)
+    client.generate_sync("test")
+    assert captured_body.get("include_reasoning") is False
+    assert captured_body.get("reasoning_effort") == "low"
+
+
+def test_bad_request_context_overflow_raises():
+    """400 with n_prompt_tokens/n_ctx raises ContextOverflowError."""
+    from bgkit.inference.client import ContextOverflowError
+
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        if request.url.path == "/v1/chat/completions":
+            call_count += 1
+            return httpx.Response(400, json={
+                "error": {
+                    "code": 400,
+                    "message": "request (8000 tokens) exceeds context (4096 tokens)",
+                    "type": "exceed_context_size_error",
+                    "n_prompt_tokens": 8000,
+                    "n_ctx": 4096,
+                }
+            })
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    with pytest.raises(ContextOverflowError) as exc_info:
+        client.generate_sync("test")
+    assert exc_info.value.n_tokens == 8000
+    assert exc_info.value.n_ctx == 4096
+    assert call_count == 1  # no retries on 400
+
+
+def test_bad_request_without_overflow_type_returns_none():
+    """400 with token fields but wrong error type returns None, not ContextOverflowError."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(400, json={
+                "error": {
+                    "code": 400,
+                    "message": "some other error",
+                    "type": "invalid_request_error",
+                    "n_prompt_tokens": 100,
+                    "n_ctx": 4096,
+                }
+            })
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    result = client.generate_sync("test")
+    assert result is None
+
+
+def test_detect_model_returns_id():
+    """detect_model queries /v1/models and returns the model id."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={
+                "object": "list",
+                "data": [{"id": "Qwen3-0.6B-Q8_0.gguf", "object": "model"}],
+            })
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    model_id = client.detect_model_sync()
+    assert model_id == "Qwen3-0.6B-Q8_0.gguf"
+
+
+def test_detect_model_returns_none_on_error():
+    """detect_model returns None when the endpoint is unavailable."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    assert client.detect_model_sync() is None
+
+
+def test_apply_profile_updates_behavior():
+    """apply_profile switches thinking-tag stripping and chat_template_kwargs."""
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            received["body"] = json.loads(request.content)
+            content = "<think>\nhmm\n</think>\nActual answer."
+            return httpx.Response(200, json=_make_completion_response(content))
+        return httpx.Response(404)
+
+    # Start with no profile (default)
+    client = _make_client(handler)
+    result = client.generate_sync("test")
+    assert "<think>" in result
+    assert "chat_template_kwargs" not in received["body"]
+
+    # Apply a thinking profile
+    client.apply_profile(_THINKING_PROFILE)
+    result = client.generate_sync("test")
+    assert result == "Actual answer."
+    assert received["body"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+    # Apply default profile to revert
+    client.apply_profile(DEFAULT_PROFILE)
+    result = client.generate_sync("test")
+    assert "<think>" in result
+
+
+def test_vllm_context_overflow_raises():
+    """vLLM 400 with 'prompt is too long' raises ContextOverflowError."""
+    from bgkit.inference.client import ContextOverflowError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(400, json={
+                "error": {
+                    "message": "The model's maximum context length is 32768 tokens. "
+                    "However, your prompt is too long with 40000 tokens.",
+                    "type": "invalid_request_error",
+                }
+            })
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    with pytest.raises(ContextOverflowError):
+        client.generate_sync("test")
+
+
+def test_detect_backend_vllm():
+    """detect_backend returns 'vllm' when /version responds with version info."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "0.16.0"})
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    result = _run_sync(client.detect_backend())
+    assert result == "vllm"
+    assert client.is_vllm is True
+
+
+def test_detect_backend_llama():
+    """detect_backend returns 'llama' when /version returns 404."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    result = _run_sync(client.detect_backend())
+    assert result == "llama"
+    assert client.is_vllm is False
+
+
+def test_detect_backend_cached():
+    """detect_backend only probes once and caches the result."""
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        if request.url.path == "/version":
+            call_count += 1
+            return httpx.Response(200, json={"version": "0.16.0"})
+        return httpx.Response(404)
+
+    client = _make_client(handler)
+    _run_sync(client.detect_backend())
+    _run_sync(client.detect_backend())
+    assert call_count == 1
+
+
+def test_backend_type_overrides_auto_detection():
+    """Explicit backend_type='llama' is respected even if /version would say vllm."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json={"version": "0.16.0"})
+        return httpx.Response(404)
+
+    client = _make_client(handler, backend_type="llama")
+    assert client.is_vllm is False
+
+    client2 = _make_client(handler, backend_type="vllm")
+    assert client2.is_vllm is True
+
+
+def test_vllm_omits_chat_template_kwargs():
+    """When backend is vLLM, chat_template_kwargs is NOT sent in the request."""
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            received["body"] = json.loads(request.content)
+            return httpx.Response(200, json=_make_completion_response("ok"))
+        return httpx.Response(404)
+
+    client = _make_client(handler, model_profile=_THINKING_PROFILE, backend_type="vllm")
+    _run_sync(client.generate("Hello"))
+    assert "chat_template_kwargs" not in received["body"]
+
+
+def test_llama_sends_chat_template_kwargs():
+    """When backend is llama, chat_template_kwargs IS sent in the request."""
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            received["body"] = json.loads(request.content)
+            return httpx.Response(200, json=_make_completion_response("ok"))
+        return httpx.Response(404)
+
+    client = _make_client(handler, model_profile=_THINKING_PROFILE, backend_type="llama")
+    _run_sync(client.generate("Hello"))
+    assert received["body"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_generate_sync_thread_safety():
+    """Verify multiple threads can call generate_sync concurrently."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    client = _make_client(_ok_handler, max_concurrent=8)
+    prompts = [f"prompt-{i}" for i in range(20)]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(client.generate_sync, p): p for p in prompts}
+        results = {}
+        for f in as_completed(futures):
+            prompt = futures[f]
+            results[prompt] = f.result()
+
+    assert len(results) == 20
+    for prompt, result in results.items():
+        assert result is not None
+        assert f"Response to: {prompt}" in result

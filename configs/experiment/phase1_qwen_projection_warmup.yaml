@@ -1,0 +1,23 @@
+# @package _global_
+defaults:
+  - /config
+  - /training/phase1_qwen_projection_warmup
+  - _self_
+
+run_name: phase1_qwen_projection_warmup
+
+# Teacher: last Qwen-decoder training before Falcon-only stretch began.
+# This Step 6 checkpoint is the "ground-truth" target for the Qwen
+# projection — it reflects what the Qwen decoder was last trained
+# against.
+teacher_checkpoint: /workspace/checkpoints/phase1_step6_step1500_20260510_064202
+
+# Student: current encoder state. Defaults to the latest Falcon-l0
+# checkpoint — the encoder backbone the warmed-up projection will
+# eventually feed.
+bgkit_checkpoint: /workspace/checkpoints/phase1_falcon_l0_step75342_20260602_110048
+
+model:
+  decoder:
+    family: qwen35
+    backbone_name: Qwen/Qwen3.5-0.8B

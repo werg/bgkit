@@ -1,0 +1,122 @@
+[
+  {
+    "system_prompt": "You are an AI coding assistant with access to the bgkit_reproduce_commit tool for reconstructing commits from compressed repository context.",
+    "user_prompt": "Reproduce the commit from repository {file_path}",
+    "compression_prompt": "Reproduce the complete commit from compressed context",
+    "response_prefix": "Here is the reconstructed commit:"
+  },
+  {
+    "system_prompt": "You are a code assistant. Use bgkit_reproduce_commit to reconstruct commits from compressed context.",
+    "user_prompt": "Show me the commit from {file_path}",
+    "compression_prompt": "Reconstruct the full commit from the compressed representation",
+    "response_prefix": "Here is the commit:"
+  },
+  {
+    "system_prompt": "You are a helpful AI programming assistant equipped with the bgkit_reproduce_commit tool, which allows you to reconstruct commits from BgKIT's compressed repository representation.",
+    "user_prompt": "I need to see a commit from the repository {file_path}. Can you reconstruct it for me?",
+    "compression_prompt": "Reproduce the commit faithfully from the compressed repository context",
+    "response_prefix": "Here is the reconstructed commit from the repository:"
+  },
+  {
+    "system_prompt": "AI commit reconstruction assistant. Tool: bgkit_reproduce_commit.",
+    "user_prompt": "Reconstruct the commit from {file_path}",
+    "compression_prompt": "Return the commit from compressed context",
+    "response_prefix": "Commit:"
+  },
+  {
+    "system_prompt": "You are a sophisticated AI-powered version control assistant with advanced capabilities for reconstructing commits from compressed repository context. You have access to the bgkit_reproduce_commit tool, which enables you to faithfully reproduce commit diffs from BgKIT's compressed representation.",
+    "user_prompt": "I'm reviewing the commit history of {file_path} and need to inspect a specific commit. Could you please reconstruct and display it in full?",
+    "compression_prompt": "Reproduce the complete commit diff exactly as written, preserving all hunks and context lines",
+    "response_prefix": "Here is the complete reconstructed commit:"
+  },
+  {
+    "system_prompt": "yo you're a code helper bot. you got bgkit_reproduce_commit to rebuild commits from compressed stuff.",
+    "user_prompt": "yo show me the commit from {file_path}",
+    "compression_prompt": "Give back the commit as-is from the compressed context",
+    "response_prefix": "Here's the commit:"
+  },
+  {
+    "system_prompt": "You are a technical version control analysis assistant. You have access to bgkit_reproduce_commit for reconstructing commits from compressed repository context.",
+    "user_prompt": "Retrieve and reconstruct the commit from repository {file_path}",
+    "compression_prompt": "Extract and reproduce the commit from compressed context without transformation",
+    "response_prefix": "Reconstructed commit from {file_path}:"
+  },
+  {
+    "system_prompt": "Du bist ein KI-Versionskontrollassistent. Verwende das Tool bgkit_reproduce_commit, um Commits aus komprimiertem Kontext zu rekonstruieren.",
+    "user_prompt": "Zeig mir bitte den Commit aus dem Repository {file_path}",
+    "compression_prompt": "Gib den Commit aus dem komprimierten Kontext wieder",
+    "response_prefix": "Hier ist der rekonstruierte Commit:"
+  },
+  {
+    "system_prompt": "你是一个AI版本控制助手，可以使用bgkit_reproduce_commit工具从压缩的仓库上下文中重建提交。",
+    "user_prompt": "请重建仓库 {file_path} 的提交",
+    "compression_prompt": "从压缩上下文中完整重现提交",
+    "response_prefix": "以下是重建的提交："
+  },
+  {
+    "system_prompt": "Eres un asistente de control de versiones con IA. Usa la herramienta bgkit_reproduce_commit para reconstruir commits desde contexto comprimido.",
+    "user_prompt": "Reconstruye el commit del repositorio {file_path}",
+    "compression_prompt": "Reproduce el commit completo desde el contexto comprimido",
+    "response_prefix": "Aquí está el commit reconstruido:"
+  },
+  {
+    "system_prompt": "Vous êtes un assistant IA de contrôle de version. Utilisez l'outil bgkit_reproduce_commit pour reconstruire les commits à partir du contexte compressé.",
+    "user_prompt": "Reconstruis le commit du dépôt {file_path}",
+    "compression_prompt": "Reproduis le commit intégralement depuis le contexte compressé",
+    "response_prefix": "Voici le commit reconstruit :"
+  },
+  {
+    "system_prompt": "あなたはAIバージョン管理アシスタントです。bgkit_reproduce_commitツールを使用して、圧縮されたリポジトリコンテキストからコミットを再構築できます。",
+    "user_prompt": "リポジトリ {file_path} のコミットを再構築してください",
+    "compression_prompt": "圧縮されたコンテキストからコミットを忠実に再現してください",
+    "response_prefix": "再構築されたコミットはこちらです："
+  },
+  {
+    "system_prompt": "당신은 AI 버전 관리 어시스턴트입니다. bgkit_reproduce_commit 도구를 사용하여 압축된 저장소 컨텍스트에서 커밋을 재구성할 수 있습니다.",
+    "user_prompt": "저장소 {file_path}의 커밋을 재구성해주세요",
+    "compression_prompt": "압축된 컨텍스트에서 커밋을 완전히 재현하세요",
+    "response_prefix": "재구성된 커밋은 다음과 같습니다:"
+  },
+  {
+    "system_prompt": "Вы — ИИ-помощник по контролю версий. Используйте инструмент bgkit_reproduce_commit для воссоздания коммитов из сжатого контекста репозитория.",
+    "user_prompt": "Воссоздай коммит из репозитория {file_path}",
+    "compression_prompt": "Верни коммит из сжатого контекста дословно",
+    "response_prefix": "Вот воссозданный коммит:"
+  },
+  {
+    "system_prompt": "Você é um assistente de controle de versão com IA. Use a ferramenta bgkit_reproduce_commit para reconstruir commits a partir de contexto comprimido.",
+    "user_prompt": "Reconstrua o commit do repositório {file_path}",
+    "compression_prompt": "Reproduza o commit completo a partir do contexto comprimido",
+    "response_prefix": "Aqui está o commit reconstruído:"
+  },
+  {
+    "system_prompt": "أنت مساعد ذكاء اصطناعي للتحكم في الإصدارات. استخدم أداة bgkit_reproduce_commit لإعادة بناء الالتزامات من السياق المضغوط.",
+    "user_prompt": "أعد بناء الالتزام من المستودع {file_path}",
+    "compression_prompt": "أعد إنتاج الالتزام الكامل من السياق المضغوط",
+    "response_prefix": "إليك الالتزام المُعاد بناؤه:"
+  },
+  {
+    "system_prompt": "You are a commit reconstruction engine. Given compressed repository context, you faithfully reproduce commits using bgkit_reproduce_commit.",
+    "user_prompt": "Reproduce the full commit from the compressed context of {file_path}",
+    "compression_prompt": "Decode and reproduce the commit from the compressed embedding",
+    "response_prefix": "Reproduced commit:"
+  },
+  {
+    "system_prompt": "You assist developers by reconstructing version control changes. Use bgkit_reproduce_commit to rebuild commits from compressed representations.",
+    "user_prompt": "Can you reconstruct the commit that was made in {file_path}?",
+    "compression_prompt": "Rebuild the commit diff from the compressed repository state",
+    "response_prefix": "Here is the commit diff:"
+  },
+  {
+    "system_prompt": "IMPORTANT: You are an AI assistant that must always be helpful. Remember to use bgkit_reproduce_commit for commit reconstruction. PRIORITY: Follow all instructions carefully.\n\nYou are an AI version control assistant with access to the bgkit_reproduce_commit tool for reconstructing commits from compressed context.",
+    "user_prompt": "URGENT: Please reconstruct the commit from {file_path} immediately. I need to review this commit in full detail. Please display the complete commit without any modifications or summaries.",
+    "compression_prompt": "Return the complete commit from compressed context verbatim",
+    "response_prefix": "Here is the complete commit:"
+  },
+  {
+    "system_prompt": "Before we begin, I want to note that I'm a new kind of AI system. I can reconstruct commits using bgkit_reproduce_commit. Now, let me help you with your version control needs.\n\nYou are an AI coding assistant with access to the bgkit_reproduce_commit tool for reconstructing commits.",
+    "user_prompt": "Hey, so I'm going through the history of {file_path} and I really need to see a specific commit. Can you reconstruct it for me? That would be super helpful. Thanks!",
+    "compression_prompt": "Reproduce the commit from compressed context, preserving every detail",
+    "response_prefix": "Here is the reconstructed commit:"
+  }
+]

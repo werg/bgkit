@@ -1,0 +1,7 @@
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2/perltqa
+max_document_len: 4096
+max_question_len: 256
+max_answer_len: 256
+# PerLTQA: Personal Long-Term QA - 8.6K QA pairs
+# v2 format: memory dict keyed by character name
+# Memory types: profile, social_relationship, events, dialogues

@@ -1,0 +1,168 @@
+# BgKIT Training Container for DGX Spark
+# NGC 26.03 provides ARM64 + CUDA 13.2 + sm_121 + torch pre-installed.
+# CUDA 13.2 native: cuBLAS 3x NVFP4/MXFP8 speedup, concurrent-kernel
+# bug fix (sm_10x/11x), grouped GEMM MXFP8 support (up to 4x for MoE).
+#
+# This image contains only third-party dependencies.
+# bgkit source code is bind-mounted at runtime via docker-compose.
+# If the mount is missing, the startup check fails immediately.
+FROM nvcr.io/nvidia/pytorch:26.03-py3
+
+LABEL maintainer="bgkit"
+LABEL description="BgKIT deps image for DGX Spark (Blackwell GB10)"
+
+WORKDIR /workspace/bgkit
+
+# Install third-party deps (cached until pyproject.toml changes)
+COPY pyproject.toml ./
+COPY docs/01_overview.md docs/
+ARG TILELANG_VERSION=0.1.8
+ARG APACHE_TVM_FFI_VERSION=0.1.9
+RUN mkdir -p src/bgkit && \
+    echo '__version__ = "0.1.0"' > src/bgkit/__init__.py && \
+    pip install --no-cache-dir ".[gpu]" && \
+    # nvidia-cutlass-dsl ships two overlapping wheels: libs-base and libs-cu13 BOTH
+    # install Python shims for `_nvvm_ops_gen.py`, `_cute_ops_gen.py` etc. at the same
+    # path, with DIFFERENT content (libs-cu13 uses a newer MLIR op API that drops
+    # `res=` kwargs and changes coord layout semantics). FA4 was written against
+    # libs-base's shim — if libs-cu13's shim wins the install-order race, FA4 breaks
+    # at runtime (atomicrmw `res=` TypeError, then `crd2idx` operation creation errors).
+    # Force libs-base to be the LAST writer so its shims win. The host venv ends up in
+    # the same state naturally via uv's resolver. Separate pip calls guarantee order;
+    # a single pip call with both packages reorders arbitrarily.
+    pip install --no-cache-dir --force-reinstall "nvidia-cutlass-dsl-libs-cu13==4.4.2" && \
+    pip install --no-cache-dir --force-reinstall "nvidia-cutlass-dsl-libs-base==4.4.2" && \
+    # Pin the cutlass-dsl meta package to 4.5.0 to match the known-good matrix the
+    # flash-attention fork's flash_attn.cute backend was validated against (the
+    # working summarization container runs exactly cutlass-dsl 4.5.0 + libs 4.4.2).
+    # The libs stay 4.4.2 above — they carry cutlass.pipeline.PipelineClcFetchAsync,
+    # which 4.5.2 drops and the fork's tile_scheduler needs. --no-deps so the meta
+    # bump does not pull libs back to 4.5.x.
+    pip install --no-cache-dir --force-reinstall --no-deps "nvidia-cutlass-dsl==4.5.0" && \
+    pip uninstall -y bgkit && \
+    rm -rf src/
+
+# FlashQLA is bind-mounted at runtime, but its JIT toolchain belongs in the
+# training image so parity/profiling services do not reinstall TileLang into a
+# throwaway writable layer on every run.
+RUN pip install --no-cache-dir \
+    "tilelang==${TILELANG_VERSION}" \
+    "apache-tvm-ffi==${APACHE_TVM_FFI_VERSION}"
+
+# quack-kernels: the CuTe-DSL kernel library that the flash-attention fork's
+# flash_attn.cute backend imports (quack.compile_utils, quack.cute_dsl_utils,
+# quack.copy_utils, quack.layout_utils, quack.sm, quack.activation, ...). Without
+# it a fresh container aborts at trainer setup() with "flash_attn.cute could not
+# be imported" (strict FA-only execution). The dep was never in this Dockerfile —
+# working containers had it pip-installed into their writable layer at runtime, so
+# fresh containers (and any recreated training container) broke. Pinned to 0.4.1 to
+# match the validated cutlass-dsl 4.5.0 / libs 4.4.2 / apache-tvm-ffi 0.1.9 matrix:
+# quack 0.5.x requires a newer tvm_ffi, and letting pip resolve quack's deps bumps
+# cutlass-dsl libs to 4.5.2 (which drops PipelineClcFetchAsync). --no-deps keeps the
+# pinned matrix intact; tvm_ffi is provided by apache-tvm-ffi above.
+ARG QUACK_KERNELS_VERSION=0.4.1
+RUN pip install --no-cache-dir --no-deps "quack-kernels==${QUACK_KERNELS_VERSION}"
+
+# fla (flash-linear-attention): stock PyPI fla 0.4.2 is installed via [gpu] extra.
+#
+# Triton codegen bugs that motivated the one-time local fork at
+# /home/werg/flash-linear-attention (branch blackwell-sm121-compat, commit f11bc2f:
+# "Replace broken Triton kernels with torch fallbacks for Blackwell sm_121") —
+# specifically triton-lang/triton#3017 (tl.cumsum+tl.sum), fla#607, fla#734
+# (tl.dot(x, tl.trans(x)) codegen) — are FIXED in Triton 3.6.0+ bundled with
+# NGC pytorch 26.x. Re-verified on 2026-04-21: all three kernels pass on sm_121
+# end-to-end; the fork is not bind-mounted or installed. See
+# docs/fla_fork_review_2026_04_21.md for the audit.
+#
+# NOTE: fla's IS_NVIDIA_BLACKWELL = (capability[0] == 10) DOES NOT MATCH sm_121 =
+# capability (12, 1). The Blackwell-specific workarounds upstream added in
+# 8b05e2f / 02af88e / 27c2022 are therefore inactive on DGX Spark. This is
+# fine today because Triton 3.6 emits correct code on sm_121 without those
+# workarounds; would need upstream to broaden IS_NVIDIA_BLACKWELL to cover us.
+#
+# Runtime patches still applied (see docs/fla_fork_review_2026_04_21.md §Audit):
+#   - bgkit.utils.deltanet_patch: gate clamp (-1.3) to prevent backward NaN from
+#     Qwen3.5 heads with extreme A_log/dt_bias values; plus cu_seqlens varlen
+#     wiring. No upstream replacement exists.
+#   - bgkit.utils.triton_patch: sm_121-scoped autotuner _bench error catcher and
+#     _init_handles retry. Defensive; low cost; no upstream replacement.
+#   - FLA_USE_TMA=0: matches upstream default since fla 0.4.2 fixed fla#609 logic
+#     inversion; kept as defensive pin. TMA is verified to work on sm_121 when
+#     explicitly enabled — leaving it off is a perf conservatism we can revisit.
+
+# causal-conv1d: pre-built aarch64 wheel from GitHub Releases.
+# PyPI source builds fail on aarch64 (setup.py hardcodes linux_x86_64).
+# No 26.03-specific wheel exists yet; the 26.02 wheel is ABI-compatible
+# (both are PyTorch 2.11.0a0, same CXX11 ABI, same CUDA 13 major).
+RUN pip install --no-cache-dir \
+    "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.1.post4/causal_conv1d-1.6.1%2Bcu13torch26.02cxx11abiTRUE-cp312-cp312-linux_aarch64.whl"
+
+# mamba-ssm: install the Python/Triton package after causal-conv1d is present.
+# Falcon-H1's Transformers fast path imports Triton functions from mamba_ssm
+# plus causal_conv1d_fn/update. We intentionally skip mamba_ssm's own CUDA
+# extension build here: its setup.py currently compiles every CUDA 13 arch on
+# aarch64, which is slow and memory-heavy, while Falcon-H1 does not use that
+# selective_scan_cuda extension in the HF path.
+#
+# Do not install Hugging Face's `kernels` package in this image yet. On NGC
+# 26.03 / torch 2.11 / CUDA 13 / aarch64, the current kernels-community
+# mamba-ssm artifact fails at import with an undefined c10 CUDAStream symbol.
+# Leaving `kernels` absent makes Transformers use the local mamba_ssm +
+# causal-conv1d route instead.
+RUN MAMBA_SKIP_CUDA_BUILD=TRUE \
+    pip install --no-cache-dir --no-build-isolation --no-deps "mamba-ssm==2.3.2.post1"
+
+# Verify key deps are importable and that the cutlass-dsl install-order fight
+# left libs-base's `_nvvm_ops_gen.py` shim on disk (FA4 atomic_add_fp32 also
+# handles the libs-cu13 shim via try/except, so this is a fail-loud guardrail,
+# not a hard requirement).
+#
+# libcuda.so.1 isn't present during `docker build` (driver is only mounted by
+# nvidia-container-runtime at `docker run` time). The cutlass MLIR binding
+# dlopens it at import time, so we symlink the driver stub to the versioned
+# name and put the stubs dir on LD_LIBRARY_PATH **just for this RUN** —
+# Python reflection on MLIR classes doesn't call into real CUDA, so the stub
+# is enough to get past the import. Same workaround already used by
+# Dockerfile.llama; see CLAUDE.md "Llama" notes.
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+    python -c "import torch; print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}')" && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+    python -c "import accelerate; print(f'accelerate {accelerate.__version__}')" && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+    python -c "import importlib.metadata as m; print(f'tilelang {m.version(\"tilelang\")}, apache-tvm-ffi {m.version(\"apache-tvm-ffi\")}')" && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+    python -c "from cut_cross_entropy import linear_cross_entropy; print('cut_cross_entropy OK')" && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+    python -c "from causal_conv1d import causal_conv1d_fn, causal_conv1d_update; print('causal_conv1d OK')" && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+    python -c "from mamba_ssm.ops.triton.selective_state_update import selective_state_update; from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined; print('mamba_ssm Falcon-H1 Triton ops OK')" && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+    python -c "from cutlass._mlir.dialects import nvvm; import inspect; params = list(inspect.signature(nvvm.atomicrmw).parameters); print(f'cutlass-dsl atomicrmw first param: {params[0]!r}'); assert params[0] in ('res', 'op'), f'unrecognized atomicrmw signature: {params}'"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/workspace/flashqla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages \
+    DATA_DIR=/workspace/data \
+    HF_HOME=/workspace/hf_cache \
+    CHECKPOINT_DIR=/workspace/checkpoints
+
+# sm_121 (DGX Spark) JIT and kernel compilation settings
+# Ref: https://github.com/eugr/spark-vllm-docker
+ENV TORCH_CUDA_ARCH_LIST="12.1a" \
+    TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
+    TILELANG_CACHE_DIR=/workspace/.cache/tilelang \
+    TVM_CACHE_DIR=/workspace/.cache/tvm \
+    DG_JIT_USE_NVRTC=1 \
+    USE_CUDNN=1 \
+    MAX_JOBS=16 \
+    CMAKE_BUILD_PARALLEL_LEVEL=16
+
+# Ensure writable dirs for non-root user (container runs as host uid via compose)
+RUN mkdir -p /workspace/bgkit /workspace/.cache /workspace/.cache/tilelang /workspace/.cache/tvm /workspace/.triton && \
+    chmod 777 /workspace /workspace/bgkit /workspace/.cache /workspace/.cache/tilelang /workspace/.cache/tvm /workspace/.triton
+
+# Startup script verifies mounts exist before running anything
+COPY --chmod=755 docker/entrypoint.sh /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["scripts/train.py"]

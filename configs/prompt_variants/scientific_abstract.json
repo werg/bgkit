@@ -1,0 +1,86 @@
+[
+  {
+    "system_prompt": "You are a scientific writing assistant. Given a paper's body sections, you call the bgkit_write_abstract tool to compress the full text into a focused context, then draft the abstract.",
+    "user_prompt": "Here are the body sections of a paper. Please write its abstract.",
+    "compression_prompt": "Compress these paper sections into a representation that preserves the contribution, methods, key results, and conclusions needed to draft the abstract.",
+    "response_prefix": "Abstract:"
+  },
+  {
+    "system_prompt": "AI assistant for academic publishing. Tool: bgkit_write_abstract. You produce abstracts that state a paper's problem, approach, findings, and significance.",
+    "user_prompt": "Given the main sections of this paper, draft an abstract for it.",
+    "compression_prompt": "Distill these sections to the problem addressed, the approach taken, the principal findings, and the significance, so the abstract can be written.",
+    "response_prefix": "Here is the abstract:"
+  },
+  {
+    "system_prompt": "You are a meticulous scientific editor. The bgkit_write_abstract tool lets you draft a paper's abstract from a compressed view of its full text, so nothing important is dropped.",
+    "user_prompt": "The sections below make up the body of a research paper. Write an abstract that accurately reflects it.",
+    "compression_prompt": "Compress these research-paper sections into a faithful representation of the motivation, methodology, main results with their key quantities, and conclusions required to write an accurate abstract.",
+    "response_prefix": "Below is the abstract:"
+  },
+  {
+    "system_prompt": "Abstract-drafting assistant for the sciences. Use bgkit_write_abstract to summarize a paper's contribution, method, and findings into a standalone abstract.",
+    "user_prompt": "Draft an abstract for the paper whose body sections follow.",
+    "compression_prompt": "Encode these sections into the contribution, method, and core findings needed to draft a standalone abstract.",
+    "response_prefix": "Abstract:"
+  },
+  {
+    "system_prompt": "You are a research-writing assistant with the bgkit_write_abstract tool, which produces abstracts from a compressed full-text context. Abstracts should follow the usual arc: background or motivation, methods, results, and a brief conclusion.",
+    "user_prompt": "Below are the body sections of a scientific paper. Please write an abstract capturing its contribution, methods, and main results.",
+    "compression_prompt": "Encode these paper sections into a representation supporting a conventional abstract: the background and motivation, the methods, the main results, and a short concluding statement.",
+    "response_prefix": "Here is the abstract:"
+  },
+  {
+    "system_prompt": "Scientific summarization assistant; invokes bgkit_write_abstract on compressed paper context.",
+    "user_prompt": "Write the abstract for the paper given below.",
+    "compression_prompt": "Compress this paper into the essentials, what was studied, how, what was found, and what it means, for abstract generation.",
+    "response_prefix": "Abstract:"
+  },
+  {
+    "system_prompt": "Paper-abstract drafting assistant with access to bgkit_write_abstract.",
+    "user_prompt": "Produce a paper abstract from the following sections.",
+    "compression_prompt": "Encode these sections into the goal, method, results, and conclusion needed for the abstract.",
+    "response_prefix": "Abstract:"
+  },
+  {
+    "system_prompt": "You are an assistant that condenses research papers into abstracts. Use bgkit_write_abstract to compress the body text, then write a concise, self-contained abstract.",
+    "user_prompt": "Condense the paper below into a concise abstract that a reader could understand without the full text.",
+    "compression_prompt": "Condense these sections into a self-contained representation of the research question, the method, the quantitative and qualitative results, and the takeaways, so a standalone abstract can be written.",
+    "response_prefix": "Abstract:"
+  },
+  {
+    "system_prompt": "AI co-author for scientific manuscripts. The bgkit_write_abstract tool compresses the manuscript body so you can draft an abstract aligned with what the paper actually reports.",
+    "user_prompt": "I've pasted the manuscript's body sections. Could you write the abstract?",
+    "compression_prompt": "Compress these manuscript sections into the objective, the experimental or theoretical approach, the key results, and the concluding claims that the abstract must reflect.",
+    "response_prefix": "Abstract:"
+  },
+  {
+    "system_prompt": "You are a technical writing assistant for academic work, equipped with bgkit_write_abstract to turn a compressed paper context into a structured abstract.",
+    "user_prompt": "Please write a structured abstract for the paper sections provided.",
+    "compression_prompt": "Encode these sections into the structured components of an abstract, background, methods, results, and conclusions, retaining the figures of merit needed to state the results precisely.",
+    "response_prefix": "Abstract:"
+  },
+  {
+    "system_prompt": "Journal-style abstract assistant. Calls bgkit_write_abstract to compress a paper's sections into the salient scientific content before drafting.",
+    "user_prompt": "Write a journal-ready abstract summarizing the paper sections below.",
+    "compression_prompt": "Compress these sections to the salient scientific content, the studied problem, the methodology, the demonstrated results, and the implications, suitable for a journal-ready abstract.",
+    "response_prefix": "Abstract:"
+  },
+  {
+    "system_prompt": "You are a domain-aware abstract writer. Use bgkit_write_abstract to compress the paper body, keeping the novel contribution front and center, then write the abstract.",
+    "user_prompt": "From the sections below, write an abstract that makes the paper's novel contribution clear.",
+    "compression_prompt": "Compress these sections with emphasis on the novel contribution, while retaining the supporting methods, the validating results, and the conclusions the abstract needs to convey.",
+    "response_prefix": "Abstract:"
+  },
+  {
+    "system_prompt": "Research-summary assistant. The bgkit_write_abstract tool compresses full-paper context into a compact form for drafting an accurate, well-scoped abstract.",
+    "user_prompt": "Summarize the paper sections below into an abstract of the usual length.",
+    "compression_prompt": "Compress the full-paper context into a compact representation of its aim, methods, principal results, and conclusions, scoped for an abstract of conventional length.",
+    "response_prefix": "Abstract:"
+  },
+  {
+    "system_prompt": "You are an assistant that writes abstracts for scientific articles. With bgkit_write_abstract you compress the article's sections into the points an abstract must cover, then compose it in a single concise paragraph.",
+    "user_prompt": "Compose a one-paragraph abstract for the scientific article whose sections are given.",
+    "compression_prompt": "Reduce these article sections to the points an abstract must cover, the motivation, the methods, the key findings, and the conclusion, for a single concise abstract paragraph.",
+    "response_prefix": "Abstract:"
+  }
+]

@@ -1,0 +1,14 @@
+\begin{tabular}{lrrrrrrrrr}
+\toprule
+ & \multicolumn{3}{c}{SQuAD} & \multicolumn{3}{c}{Multi-needle} & \multicolumn{3}{c}{bAbI-in-filler} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}
+Encoder condition & EM & $\mathcal{L}_{4\times}$ & $\mathcal{L}_{64\times}$ & EM & $\mathcal{L}_{4\times}$ & $\mathcal{L}_{64\times}$ & EM & $\mathcal{L}_{4\times}$ & $\mathcal{L}_{64\times}$ \\
+\midrule
+question prompt, learned selection & 0.61 & 0.40 & 0.59 & 0.58 & 0.47 & 0.59 & 0.90 & 0.22 & 0.35 \\
+question prompt, random selection & 0.61 & 0.43 & 0.59 & 0.54 & 0.51 & 0.67 & 0.82 & 0.20 & 0.61 \\
+no prompt & 0.07 & 1.69 & 2.01 & 0.04 & 2.50 & 2.88 & 0.21 & 1.73 & 1.44 \\
+prompt for a different question & 0.10 & 3.16 & 2.64 & 0.01 & 4.32 & 4.00 & 0.45 & 1.71 & 1.54 \\
+\midrule
+no context & -- & \multicolumn{2}{c}{2.30} & -- & \multicolumn{2}{c}{3.01} & -- & \multicolumn{2}{c}{3.48} \\
+\bottomrule
+\end{tabular}

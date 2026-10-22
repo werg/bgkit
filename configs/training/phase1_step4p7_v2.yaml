@@ -1,0 +1,83 @@
+# Phase 1 Step 4.7 v2: bridge distillation with extended ratio range.
+#
+# Variant of Step 4.7 used to extend the bridge's training distribution
+# beyond the original [L0_ratio 0.45, 1.0] range to [0.13, 1.0]. Used
+# when Step 5's curriculum has revealed that the bridge is OOD at
+# ratios < 0.45 and the encoder's gap_zeroed shrinks faster than the
+# model can adapt as compression tightens.
+#
+# Setup: teacher = original phase1_step4p7 (good projection_block on
+# L0-only path); student = current phase1_step5 latest (preserves
+# decoder LoRA, L0/L1 heads, and most backbone training). Re-trains
+# bridge + last L0 block + first 2 L1 blocks + projection_block + norms
+# across the wider ratio range. Step 5 then resumes from the v2
+# output checkpoint with a slowed curriculum.
+#
+# See plans/bridge-distill-step.md for the v1 design and the discussion
+# in conversation around 2026-05-07 for the v2 motivation.
+phase: phase1_step4p7_v2
+optimizer: adamw
+max_steps: 5000
+lr: 1.0e-3
+warmup_steps: 100
+
+# Source: student = latest Step 5 checkpoint (preserves Step 5's training).
+bgkit_checkpoint: auto_phase1_step5
+
+# Teacher: original Step 4.7 (good projection on L0-only path).
+teacher_checkpoint: auto_phase1_step4p7
+
+# Distillation parameters.
+teacher_ratio: 0.20
+mse_weight: 1.0
+cos_weight: 1.0
+
+# Curriculum on the L0/L1 compression-load split.
+# Extended ratio range vs v1 (which ramped to frac_extras=0.31, L0~0.45).
+# v2 ramps to frac_extras=0.0 → L0 ratio = teacher_ratio = 0.20, the
+# tightest L0 split a 50/50 partition can produce. Combined with the
+# Path A (L0-only) loss this trains projection_block well at L0
+# ratio = 0.20, which is below Step 5's eventual stage1 target.
+curriculum_steps: 4500
+frac_extras_start: 1.0
+frac_extras_end: 0.0
+
+# Path selection (50/50 alternation between L0-only and L0->L1).
+path_a_prob: 0.5
+
+# Data (matches Step 5 distribution).
+data:
+  commit_encoding_dir: ${oc.env:DATA_DIR}/processed/commit_encoding
+  prompt_variants_dir: configs/prompt_variants
+  max_diff_tokens_per_file: 1024
+  max_files_per_commit: 4
+  max_message_tokens: 256
+
+max_batch_tokens: 4096
+gradient_accumulation_steps: 4
+min_sample_length: 256
+max_sample_length: 1500
+max_eval_samples: 1000
+
+eval_every: 1000
+save_every: 500   # smaller than v1 (1000) — bound hang-loss like Step 5
+
+use_liger: true
+use_liger_rmsnorm: false
+
+# Trainable scoping.
+unfreeze:
+  l0_last_blocks: 1
+  l1_first_blocks: 2
+  bridge: true
+  projection_block: true
+  l0_norm: true
+  l1_norm: true
+
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+early_stopping:
+  enabled: false

@@ -1,0 +1,29 @@
+{
+ "experiment": "bgkit2_p34_browse_overview_dropout",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step5999_20260921_051813_397690_run-bgkit2_p34_browse_overview_dropout",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/babilong_4k.jsonl",
+ "n": 198,
+ "budgets": [
+  512
+ ],
+ "slot_tokens": 2048,
+ "seconds": 155,
+ "summary": {
+  "text_full@full": {
+   "acc": 0.1515,
+   "prefix": 3701.4495,
+   "ctx_tokens": 3659.7828,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.4201
+  },
+  "base_full@full": {
+   "acc": 0.2121,
+   "prefix": 3701.4495,
+   "ctx_tokens": 3659.7828,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3366
+  }
+ }
+}

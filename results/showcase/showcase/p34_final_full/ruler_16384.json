@@ -1,0 +1,29 @@
+{
+ "experiment": "bgkit2_p34_browse_overview_dropout",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step5999_20260921_051813_397690_run-bgkit2_p34_browse_overview_dropout",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/ruler_16384.jsonl",
+ "n": 200,
+ "budgets": [
+  512
+ ],
+ "slot_tokens": 2048,
+ "seconds": 389,
+ "summary": {
+  "text_full@full": {
+   "acc": 0.43,
+   "prefix": 16044.545,
+   "ctx_tokens": 15983.015,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 1.0772
+  },
+  "base_full@full": {
+   "acc": 0.555,
+   "prefix": 16044.545,
+   "ctx_tokens": 15983.015,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.7861
+  }
+ }
+}

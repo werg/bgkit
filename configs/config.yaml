@@ -1,0 +1,76 @@
+# BgKIT top-level Hydra config
+defaults:
+  - model/bgkit
+  - model/decoder
+  - model/projection
+  - model/survivorship_head
+  - data/repos
+  - data/commits
+  - data/tasks
+  - data/corpus
+  - data/tokens
+  - compute/dgx_spark
+  - _self_
+  - override hydra/job_logging: default
+
+# Write Hydra outputs to /tmp so scripts work in read-only containers
+hydra:
+  run:
+    dir: /tmp/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: /tmp/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+seed: 42
+project_name: bgkit
+run_name: null  # auto-generated if null
+batch_size: 32
+checkpoint_dir: ${oc.env:CHECKPOINT_DIR}
+resume_checkpoint: null  # auto-resume latest
+archive_keep_last_n: 5  # cap HDD checkpoint archive per phase (was unbounded -> filled 3.6TB /mnt/external 2026-07-02). NVMe fast dir keeps 3; archive keeps 5.
+
+control_file: null  # optional path to live HP control JSON
+
+training:
+  # Default data paths for the compression / Falcon trainers. Individual
+  # training configs may override. fineweb_edu_v1/ is the 5B-token
+  # FineWeb-Edu ingest (2026-05-21) — switched off processed_v2 (code
+  # repos) because Phase 2 Stage A ablation showed BgKIT context was
+  # contributing ~nothing to answer quality on data the decoder had
+  # memorized. FineWeb-Edu is broader, ~2× the token count, and forces
+  # the encoder to actually carry information into the decoder.
+  data:
+    file_tokens_path: ${oc.env:DATA_DIR}/fineweb_edu_v1/tokens
+    falcon_companion_dir: ${oc.env:DATA_DIR}/fineweb_edu_v1/tokens_falcon_h1
+  # Shared decoder-training contract. Phases may override this only for named
+  # diagnostics or legacy baselines.
+  decoder_lora:
+    enabled: false
+    implementation: peft
+    r: 32
+    alpha: 64
+    dropout: 0.0
+    peft_fused_backward: true
+    peft_fuse_gate_up: true
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  freeze:
+    bgkit: false
+    decoder: false
+  decoder_gradient_checkpointing: false
+  decoder_layerwise_split:
+    mode: "0"
+    min_ratio: 3.0
+    min_prefix: 1536
+    packed_deltanet: false
+  decoder_ce_strict: true
+
+retry:
+  enabled: false
+  max_retries: 3
+  base_delay: 30.0
+  max_delay: 300.0
+
+wandb:
+  enabled: true
+  project: bgkit
+  entity: null
+  tags: []

@@ -1,0 +1,36 @@
+# @package _global_
+# Final diagnostic: ORIGINAL Step 6 trainer + Step 6 checkpoint +
+# OLD processed_v2/tokens data (the corpus Step 6 was actually trained on).
+# This should reproduce Step 6's known 0.85 eval/loss baseline within
+# ~100-500 steps, proving that:
+#   1. The Step 6 checkpoint isn't broken
+#   2. The Step 6 trainer config isn't broken
+#   3. The realign plateau at 4.4 on FineWeb-Edu is purely a
+#      data-distribution-shift problem
+defaults:
+  - /config
+  - /training/phase1_step6
+  - _self_
+
+run_name: phase1_step6_diagnostic_olddata
+
+step1_checkpoint: /workspace/checkpoints/phase1_step6_step1643_20260510_080636
+
+training:
+  phase: phase1_step6_diagnostic_olddata
+  max_steps: 1500
+  eval_every: 250
+  save_every: 1000
+  skip_head_temperature_calibration: true
+  objectives:
+    data_reconstruction: 1.0
+    description_generation: 0.0
+    structural_relational: 0.0
+    commit_reproduction: 0.0
+    query_conditioned: 0.0
+  data:
+    file_tokens_path: ${oc.env:DATA_DIR}/processed_v2/tokens
+
+data:
+  tokens:
+    input_dir: ${oc.env:DATA_DIR}/processed_v2/tokens

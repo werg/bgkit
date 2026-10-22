@@ -1,0 +1,109 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/babilong_4k.jsonl",
+ "n": 100,
+ "budgets": [
+  512,
+  1024,
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 119,
+ "summary": {
+  "bgkit@512": {
+   "acc": 0.79,
+   "prefix": 553.94,
+   "ctx_tokens": 3646.96,
+   "oom": 0.0,
+   "enc_s": 0.1361,
+   "dec_s": 0.0328
+  },
+  "text@512": {
+   "acc": 0.2,
+   "prefix": 556.16,
+   "ctx_tokens": 3646.96,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0682
+  },
+  "base@512": {
+   "acc": 0.16,
+   "prefix": 556.16,
+   "ctx_tokens": 3646.96,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.07
+  },
+  "summary@512": {
+   "acc": 0.31,
+   "prefix": 454.0,
+   "ctx_tokens": 3646.96,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.062,
+   "summ_in_tokens": 3674.74,
+   "summ_out_tokens": 564.64,
+   "summ_s": 70.7287
+  },
+  "bgkit@1024": {
+   "acc": 0.81,
+   "prefix": 1065.91,
+   "ctx_tokens": 3646.96,
+   "oom": 0.0,
+   "enc_s": 0.1303,
+   "dec_s": 0.0435
+  },
+  "text@1024": {
+   "acc": 0.26,
+   "prefix": 1068.09,
+   "ctx_tokens": 3646.96,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0766
+  },
+  "base@1024": {
+   "acc": 0.23,
+   "prefix": 1068.09,
+   "ctx_tokens": 3646.96,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0708
+  },
+  "summary@1024": {
+   "acc": 0.23,
+   "prefix": 840.78,
+   "ctx_tokens": 3646.96,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0667,
+   "summ_in_tokens": 3674.74,
+   "summ_out_tokens": 1101.36,
+   "summ_s": 136.4322
+  },
+  "bgkit@2048": {
+   "acc": 0.88,
+   "prefix": 1865.04,
+   "ctx_tokens": 3646.96,
+   "oom": 0.0,
+   "enc_s": 0.1326,
+   "dec_s": 0.0653
+  },
+  "text@2048": {
+   "acc": 0.33,
+   "prefix": 2092.21,
+   "ctx_tokens": 3646.96,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1054
+  },
+  "base@2048": {
+   "acc": 0.21,
+   "prefix": 2092.21,
+   "ctx_tokens": 3646.96,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0799
+  }
+ }
+}

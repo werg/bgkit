@@ -1,0 +1,1011 @@
+#!/usr/bin/env python3
+"""Batch description generation for repo files, modules, and repos.
+
+Dual-backend description generation using Claude CLI (haiku) and/or local
+llama-server instances. Produces per-repo JSONL files with file-level,
+module-level, and repo-level descriptions.
+
+Usage:
+    python scripts/generate_descriptions.py \
+        --repos-dir data/repos/ \
+        --output-dir data/descriptions/ \
+        --backend mixed \
+        --workers 12
+"""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import os
+import subprocess
+import sys
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path, PurePosixPath
+from threading import Lock, Semaphore
+
+import structlog
+
+from bgkit.data.repo_processing import extract_repo_snapshot
+from bgkit.inference import InferenceConfig, LlamaClient
+from bgkit.inference.models import resolve_profile
+
+logger = structlog.get_logger()
+
+# Rate-limit haiku calls
+_HAIKU_SEMAPHORE = Semaphore(10)
+
+# Maximum file content length to include in prompts (characters)
+MAX_CONTENT_CHARS = 8000
+
+# Maximum number of file descriptions to include in module/repo prompts
+MAX_FILE_DESCS_IN_PROMPT = 30
+
+# Maximum characters for embedded descriptions in module/repo prompts
+MAX_DESC_CHARS_IN_PROMPT = 200
+
+# Maximum files per repo (sort by path, take first N)
+MAX_FILES_PER_REPO = 1000
+
+# Prompt format version — increment when prompt builders change
+PROMPT_VERSION = 4
+
+# Inference clients (initialized by init_local_client)
+_client_primary: LlamaClient | None = None
+_client_fast: LlamaClient | None = None
+
+# Model IDs per tier, populated by init_local_client after auto-detection
+_tier_models: dict[str, str] = {}
+
+
+# Languages where a tiny model suffices (config, data, markup, scripting — low complexity)
+_TINY_LANGUAGES: frozenset[str] = frozenset({
+    "JSON", "YAML", "TOML", "XML", "Markdown", "reStructuredText",
+    "HTML", "CSS", "SQL", "Dockerfile", "Terraform", "Nix",
+    "Protocol Buffers", "CMake", "Gradle",
+    "Shell", "Batchfile", "PowerShell", "Makefile",
+    "INI", "Properties", "Dotenv",
+    "Plain Text", "CSV", "TSV",
+})
+
+# Path patterns that indicate easy-to-describe files (test, config, boilerplate, generated)
+_TINY_PATH_STEMS: frozenset[str] = frozenset({
+    "__init__", "setup", "conftest",
+})
+_TINY_PATH_NAMES: frozenset[str] = frozenset({
+    "setup.cfg", "pyproject.toml", "package.json", "package-lock.json",
+    "tsconfig.json", "tslint.json", ".eslintrc", ".eslintrc.json", ".eslintrc.js",
+    ".prettierrc", ".prettierrc.json", ".babelrc", ".editorconfig",
+    "requirements.txt", "Pipfile", "Pipfile.lock", "Cargo.lock", "go.sum",
+    "yarn.lock", "pnpm-lock.yaml", "composer.lock", "Gemfile.lock",
+    "LICENSE", "LICENSE.md", "LICENSE.txt", "LICENCE",
+    "CHANGELOG.md", "CHANGELOG", "CHANGES.md",
+    "Makefile", "Rakefile", "Justfile", "justfile",
+    "Dockerfile", ".dockerignore", ".gitignore", ".gitattributes",
+    ".env.example", ".env.sample", ".env.template",
+    "README.md", "README.rst", "README.txt", "README",
+})
+
+# Short files are trivial to describe regardless of language
+TINY_SIZE_THRESHOLD = 1500
+
+
+def _is_tiny_routable(path: str, language: str | None, size_bytes: int) -> bool:
+    """Return True if a file is simple enough for the tiny model."""
+    if size_bytes <= TINY_SIZE_THRESHOLD:
+        return True
+    if language and language in _TINY_LANGUAGES:
+        return True
+    name = path.rsplit("/", 1)[-1] if "/" in path else path
+    if name in _TINY_PATH_NAMES:
+        return True
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    if stem in _TINY_PATH_STEMS:
+        return True
+    # test files, migrations, generated code
+    if stem.startswith("test_") or stem.endswith("_test") or stem.endswith(".spec"):
+        return True
+    lower_path = path.lower()
+    if "/test/" in lower_path or "/tests/" in lower_path or "/spec/" in lower_path:
+        return True
+    if "/migrations/" in lower_path or ".generated." in lower_path:
+        return True
+    return name.endswith(".lock") or ".lock." in name
+
+
+# ---------------------------------------------------------------------------
+# Claude CLI (haiku) backend
+# ---------------------------------------------------------------------------
+
+def call_claude(prompt: str, max_retries: int = 3) -> str | None:
+    """Call Claude CLI and return the text response."""
+    for attempt in range(max_retries):
+        try:
+            _HAIKU_SEMAPHORE.acquire()
+            try:
+                result = subprocess.run(
+                    ["claude", "-p", "--model", "haiku", "--output-format", "json"],
+                    input=prompt,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            finally:
+                _HAIKU_SEMAPHORE.release()
+
+            if result.returncode != 0:
+                logger.warning(
+                    "claude_cli_error",
+                    attempt=attempt + 1,
+                    stderr=result.stderr[:200],
+                )
+                _backoff(attempt)
+                continue
+
+            response = json.loads(result.stdout)
+            if isinstance(response, dict) and "result" in response:
+                return response["result"]
+            if isinstance(response, dict) and "content" in response:
+                content = response["content"]
+                if isinstance(content, list) and content:
+                    return content[0].get("text", "")
+                return str(content)
+            return result.stdout
+
+        except subprocess.TimeoutExpired:
+            logger.warning("claude_cli_timeout", attempt=attempt + 1)
+            _backoff(attempt)
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            logger.warning("claude_parse_error", attempt=attempt + 1, error=str(e))
+            _backoff(attempt)
+
+    return None
+
+
+def _backoff(attempt: int) -> None:
+    """Exponential backoff: 2^attempt seconds."""
+    time.sleep(min(2 ** attempt, 30))
+
+
+# ---------------------------------------------------------------------------
+# Local llama-server backend
+# ---------------------------------------------------------------------------
+
+def _make_client(
+    base_url: str,
+    max_concurrent: int,
+    readiness_timeout: float,
+    label: str,
+) -> LlamaClient:
+    """Create, verify, and auto-configure a single LlamaClient.
+
+    After the server is healthy, probes /version to detect whether the backend
+    is vLLM or llama-server, then queries /v1/models to detect the loaded model
+    and resolves the appropriate ModelProfile (thinking-tag stripping, etc.).
+    """
+    config = InferenceConfig(
+        base_url=base_url,
+        max_concurrent=max_concurrent,
+    )
+    client = LlamaClient(config)
+    logger.info("waiting_for_server", label=label, url=base_url)
+    if not client.wait_ready_sync(timeout=readiness_timeout):
+        print(
+            f"ERROR: inference server ({label}) at {base_url} not ready "
+            f"after {readiness_timeout}s. Start with: make vllm-server",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Detect backend type (vLLM vs llama-server) so the client knows
+    # whether to send chat_template_kwargs in request bodies.
+    client.detect_backend_sync()
+
+    # Auto-detect model and apply the correct profile
+    model_id = client.detect_model_sync()
+    if not model_id:
+        print(
+            f"ERROR: could not detect model from server ({label}) at {base_url}. "
+            f"Is /v1/models endpoint available?",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    profile = resolve_profile(model_id)
+    client.apply_profile(profile)
+    client.config.model_name = model_id
+    _tier_models[label] = model_id
+    logger.info(
+        "server_ready", label=label, model=model_id,
+        profile=profile.name, backend=client.config.backend_type,
+        detected=client._detected_backend,
+    )
+
+    client.warmup_sync()
+    return client
+
+
+def init_local_client(
+    url_primary: str | None = None,
+    url_fast: str | None = None,
+    readiness_timeout: float = 300.0,
+) -> None:
+    """Initialize primary and fast inference clients and verify readiness.
+
+    Both model servers must be running. Exits if either is unreachable.
+    Start with: make vllm-server (or make llama-server for legacy).
+    """
+    global _client_primary, _client_fast
+
+    def _concurrent_env(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, default))
+        except ValueError:
+            return default
+
+    concurrent_primary = _concurrent_env("VLLM_CONCURRENT_PRIMARY", 32)
+    concurrent_fast = _concurrent_env("VLLM_CONCURRENT_FAST", 64)
+
+    # Env var fallback chain: VLLM_URL → LLAMA_URL → LLAMA_URL_SMALL → default
+    resolved_primary = (
+        url_primary
+        or os.environ.get("VLLM_URL")
+        or os.environ.get("LLAMA_URL")
+        or os.environ.get("LLAMA_URL_SMALL")
+        or "http://localhost:8090"
+    )
+    resolved_fast = (
+        url_fast
+        or os.environ.get("VLLM_URL_FAST")
+        or os.environ.get("LLAMA_URL_TINY")
+        or "http://localhost:8091"
+    )
+
+    _client_primary = _make_client(
+        resolved_primary, concurrent_primary, readiness_timeout, "primary"
+    )
+    _client_fast = _make_client(
+        resolved_fast, concurrent_fast, readiness_timeout, "fast"
+    )
+
+
+def init_atlas_client(
+    url: str | None = None,
+    readiness_timeout: float = 300.0,
+) -> None:
+    """Initialize a single Atlas inference client used for all tiers.
+
+    Atlas (avarok/atlas-gb10) is a single-server backend fast enough to handle
+    all file complexity levels.  Start with: make atlas-server
+    """
+    global _client_primary, _client_fast
+
+    try:
+        concurrent = int(os.environ.get("ATLAS_CONCURRENT", 4))
+    except ValueError:
+        concurrent = 4
+
+    resolved = (
+        url
+        or os.environ.get("ATLAS_URL")
+        or f"http://localhost:{os.environ.get('ATLAS_PORT', '8888')}"
+    )
+
+    client = _make_client(resolved, concurrent, readiness_timeout, "primary")
+    # Both tiers served by the same Atlas instance.
+    _tier_models["fast"] = _tier_models["primary"]
+    _client_primary = client
+    _client_fast = client
+
+
+def _pick_tier(
+    file_path: str = "",
+    language: str | None = None,
+    size_bytes: int = 0,
+) -> str:
+    """Return the tier label for a file: 'fast' or 'primary'."""
+    if file_path and _is_tiny_routable(file_path, language, size_bytes):
+        return "fast"
+    return "primary"
+
+
+def _model_for_backend(backend_label: str) -> str:
+    """Return the model ID for a backend label like 'local-tiny'."""
+    tier = backend_label.removeprefix("local-")
+    return _tier_models.get(tier, "")
+
+
+def _client_for_tier(tier: str) -> LlamaClient:
+    """Return the LlamaClient for the given tier."""
+    if tier == "fast":
+        return _client_fast
+    return _client_primary
+
+
+def call_local(
+    prompt: str,
+    max_new_tokens: int = 512,
+    file_path: str = "",
+    language: str | None = None,
+    size_bytes: int = 0,
+) -> tuple[str | None, str]:
+    """Generate a description using the appropriate server tier.
+
+    Returns (description, backend_label).
+    """
+    from bgkit.inference.client import ContextOverflowError
+
+    tier = _pick_tier(file_path, language, size_bytes)
+    client = _client_for_tier(tier)
+    try:
+        return (client.generate_sync(prompt, max_tokens=max_new_tokens), f"local-{tier}")
+    except ContextOverflowError:
+        if tier != "fast":
+            return (None, f"local-{tier}")
+        # Fast model has smaller context; fall back to primary.
+        logger.info("context_overflow_fallback", from_tier="fast", to_tier="primary")
+        try:
+            result = _client_primary.generate_sync(prompt, max_tokens=max_new_tokens)
+            return (result, "local-primary")
+        except ContextOverflowError:
+            return (None, "local-fast")
+
+
+def call_local_batch(
+    prompts: list[str],
+    tiers: list[str] | None = None,
+    max_new_tokens: int = 512,
+) -> list[tuple[str | None, str]]:
+    """Generate descriptions for multiple prompts with tier-based routing.
+
+    Each prompt is routed to its tier's model. All three models' semaphores
+    independently control their own concurrency.
+    Returns list of (description, backend_label) tuples.
+    """
+    if tiers is None:
+        tiers = ["primary"] * len(prompts)
+
+    import asyncio
+
+    from bgkit.inference.client import ContextOverflowError
+
+    async def _generate_routed() -> list[tuple[str | None, str]]:
+        async def _one(prompt: str, tier: str) -> tuple[str | None, str]:
+            client = _client_for_tier(tier)
+            try:
+                result = await client.generate(prompt, max_tokens=max_new_tokens)
+            except ContextOverflowError:
+                if tier != "fast":
+                    return (None, f"local-{tier}")
+                # Fast model has smaller context; fall back to primary.
+                logger.info(
+                    "context_overflow_fallback", from_tier="fast", to_tier="primary"
+                )
+                try:
+                    result = await _client_primary.generate(
+                        prompt, max_tokens=max_new_tokens
+                    )
+                except ContextOverflowError:
+                    return (None, "local-fast")
+                return (result, "local-primary")
+            return (result, f"local-{tier}")
+
+        return await asyncio.gather(
+            *[_one(p, t) for p, t in zip(prompts, tiers, strict=True)]
+        )
+
+    from bgkit.inference.client import _run_sync
+
+    return _run_sync(_generate_routed())
+
+
+# ---------------------------------------------------------------------------
+# Backend dispatcher
+# ---------------------------------------------------------------------------
+
+_CYCLE_LOCK = Lock()
+
+
+def generate_description(
+    prompt: str,
+    backend: str,
+    backend_cycle: itertools.cycle | None = None,
+    file_path: str = "",
+    language: str | None = None,
+    size_bytes: int = 0,
+) -> tuple[str | None, str]:
+    """Generate a description using the specified backend.
+
+    Returns (description_text, backend_used).
+    """
+    if backend == "mixed" and backend_cycle is not None:
+        with _CYCLE_LOCK:
+            chosen = next(backend_cycle)
+    else:
+        chosen = backend
+
+    if chosen == "haiku":
+        result = call_claude(prompt)
+        return (result, "haiku")
+    elif chosen in ("local", "atlas"):
+        return call_local(
+            prompt, file_path=file_path,
+            language=language, size_bytes=size_bytes,
+        )
+    else:
+        return (None, chosen)
+
+
+# ---------------------------------------------------------------------------
+# Prompt builders
+# ---------------------------------------------------------------------------
+
+def build_file_prompt(file_path: str, content: str, language: str | None) -> str:
+    """Build a prompt asking for a file-level description."""
+    if len(content) > MAX_CONTENT_CHARS:
+        content = content[:MAX_CONTENT_CHARS] + "\n... (truncated)"
+
+    lang_note = f" ({language})" if language else ""
+    return (
+        f"File: {file_path}{lang_note}\n\n"
+        f"```\n{content}\n```\n\n"
+        f"Write a single dense paragraph describing this file. "
+        f"Include: what it does, the names of key exports (classes, functions, constants), "
+        f"and what it imports or depends on. "
+        f"Omit any category that doesn't apply. "
+        f"No headers, bullet points, or labels — just a compact paragraph "
+        f"where every word carries information. Use actual identifier names from the code."
+    )
+
+
+def _truncate_desc(desc: str) -> str:
+    """Truncate a description for embedding in module/repo prompts."""
+    if len(desc) <= MAX_DESC_CHARS_IN_PROMPT:
+        return desc
+    return desc[:MAX_DESC_CHARS_IN_PROMPT] + "..."
+
+
+def build_module_prompt(
+    module_path: str,
+    file_descriptions: list[dict],
+    skeleton_text: str | None = None,
+) -> str:
+    """Build a prompt asking for a module-level description."""
+    parts = [f"Module: {module_path}\n\nFiles:\n"]
+
+    for fd in file_descriptions[:MAX_FILE_DESCS_IN_PROMPT]:
+        parts.append(f"- {fd['file_path']}: {_truncate_desc(fd['description'])}")
+
+    if skeleton_text:
+        parts.append(f"\nSkeleton:\n{skeleton_text}")
+
+    parts.append(
+        "\nWrite a single dense paragraph describing this module. "
+        "Include: what it provides, its public API (by name), "
+        "how its files relate to each other, and what external packages it depends on. "
+        "No headers or bullet points — just a compact paragraph."
+    )
+    return "\n".join(parts)
+
+
+def build_repo_prompt(
+    repo_path: str,
+    module_descriptions: list[dict],
+    file_descriptions: list[dict],
+) -> str:
+    """Build a prompt asking for a repo-level description."""
+    parts = [f"Project: {repo_path}\n\n"]
+
+    if module_descriptions:
+        parts.append("Modules:")
+        for md in module_descriptions[:MAX_FILE_DESCS_IN_PROMPT]:
+            parts.append(f"- {md['module_path']}: {_truncate_desc(md['description'])}")
+        parts.append("")
+
+    if file_descriptions:
+        parts.append("Key files:")
+        for fd in file_descriptions[:MAX_FILE_DESCS_IN_PROMPT]:
+            parts.append(f"- {fd['file_path']}: {_truncate_desc(fd['description'])}")
+        parts.append("")
+
+    parts.append(
+        "Write a single dense paragraph describing this project. "
+        "Include: what it does, its architecture (monorepo, client-server, library, CLI, etc.), "
+        "key technologies and frameworks, and main entry points. "
+        "No headers or bullet points — just a compact paragraph."
+    )
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Repo-level processing
+# ---------------------------------------------------------------------------
+
+def collect_repo_paths(
+    repos_dir: Path,
+    max_repos: int | None = None,
+    shuffle_seed: int | None = None,
+) -> list[Path]:
+    """Collect all repo paths, optionally shuffled to avoid alphabetical bias."""
+    from bgkit.utils.git_utils import collect_repo_paths as _collect
+
+    return _collect(repos_dir, max_repos=max_repos, shuffle_seed=shuffle_seed)
+
+
+def _load_structural_skeletons(structural_dir: Path, rel_key: str) -> dict[str, str]:
+    """Load skeleton texts from structural JSONL if available.
+
+    Returns a dict mapping module_path -> skeleton text.
+    """
+    jsonl_path = structural_dir / f"{rel_key}.jsonl"
+    skeletons: dict[str, str] = {}
+    if not jsonl_path.exists():
+        return skeletons
+
+    try:
+        with open(jsonl_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                mod_text = rec.get("module_summary_text", "")
+                if mod_text:
+                    skeletons[rec.get("file_path", "")] = mod_text
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    return skeletons
+
+
+def _load_partial(partial_file: Path) -> tuple[list[dict], set[str], set[str]]:
+    """Load records from a partial JSONL file.
+
+    Returns (records, done_file_paths, done_module_paths).
+    """
+    records: list[dict] = []
+    done_files: set[str] = set()
+    done_modules: set[str] = set()
+    if not partial_file.exists():
+        return records, done_files, done_modules
+    for line in partial_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        records.append(rec)
+        if rec.get("scope") == "file":
+            done_files.add(rec["file_path"])
+        elif rec.get("scope") == "module":
+            done_modules.add(rec["module_path"])
+    return records, done_files, done_modules
+
+
+def _append_records(partial_file: Path, new_records: list[dict]) -> None:
+    """Append records to the partial JSONL file (flush immediately)."""
+    if not new_records:
+        return
+    with open(partial_file, "a", encoding="utf-8") as f:
+        for rec in new_records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def process_single_repo(
+    repo_path: Path,
+    output_dir: Path,
+    backend: str,
+    scope: str,
+    structural_dir: Path | None,
+    backend_cycle: itertools.cycle | None,
+) -> dict:
+    """Process a single repo and write descriptions JSONL.
+
+    Uses incremental persistence via .partial.jsonl files so that work
+    survives server crashes. On completion, the partial file is atomically
+    renamed to .jsonl.
+
+    Returns stats dict.
+    """
+    owner = repo_path.parent.name
+    repo_name = repo_path.name
+    rel_key = f"{owner}/{repo_name}"
+
+    output_file = output_dir / f"{rel_key}.jsonl"
+    partial_file = output_file.with_suffix(".partial.jsonl")
+
+    # Skip if already done
+    if output_file.exists():
+        return {"repo": rel_key, "status": "skipped"}
+
+    try:
+        # Resume from partial if it exists
+        records, done_file_paths, done_module_paths = _load_partial(partial_file)
+        resumed = bool(records)
+        if resumed:
+            logger.info(
+                "resuming_partial", repo=rel_key,
+                done_files=len(done_file_paths), done_modules=len(done_module_paths),
+            )
+
+        snapshot = extract_repo_snapshot(str(repo_path))
+
+        logger.info(
+            "repo_snapshot", repo=rel_key, files=snapshot.total_files,
+            skipped_binary=snapshot.skipped_binary,
+            skipped_large=snapshot.skipped_large,
+            skipped_pattern=snapshot.skipped_pattern,
+            skipped_minified=snapshot.skipped_minified,
+        )
+
+        if not snapshot.files:
+            return {"repo": rel_key, "status": "empty"}
+
+        # Cap file count per repo for deterministic, bounded processing
+        if len(snapshot.files) > MAX_FILES_PER_REPO:
+            logger.warning(
+                "repo_truncated", repo=rel_key,
+                total=len(snapshot.files), kept=MAX_FILES_PER_REPO,
+            )
+            snapshot.files = snapshot.files[:MAX_FILES_PER_REPO]
+
+        commit_sha = snapshot.commit_sha
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Load structural skeletons if available
+        module_skeletons: dict[str, str] = {}
+        if structural_dir is not None:
+            module_skeletons = _load_structural_skeletons(structural_dir, rel_key)
+
+        # --- File-level descriptions ---
+        # Include previously-saved file descriptions for downstream module/repo prompts
+        file_descriptions: list[dict] = [
+            r for r in records if r.get("scope") == "file"
+        ]
+
+        if scope in ("file", "all"):
+            # Build prompts only for files not yet described
+            file_prompts = [
+                (fr, build_file_prompt(fr.path, fr.content, fr.language))
+                for fr in snapshot.files
+                if fr.path not in done_file_paths
+            ]
+
+            if file_prompts:
+                new_file_recs: list[dict] = []
+
+                if backend == "local":
+                    # Batch: all prompts sent concurrently, routed by tier
+                    file_tiers = [
+                        _pick_tier(fr.path, fr.language, fr.size_bytes)
+                        for fr, _ in file_prompts
+                    ]
+                    results = call_local_batch(
+                        [p for _, p in file_prompts],
+                        tiers=file_tiers,
+                    )
+                    for (fr, _prompt), (desc, backend_label) in zip(
+                        file_prompts, results, strict=True
+                    ):
+                        if not desc:
+                            logger.warning(
+                                "file_description_failed", file_path=fr.path,
+                                content_chars=len(fr.content), repo=rel_key,
+                            )
+                        else:
+                            rec = {
+                                "scope": "file",
+                                "file_path": fr.path,
+                                "commit_sha": commit_sha,
+                                "description": desc,
+                                "language": fr.language or "",
+                                "backend": backend_label,
+                                "model": _model_for_backend(backend_label),
+                                "prompt_version": PROMPT_VERSION,
+                            }
+                            new_file_recs.append(rec)
+                else:
+                    # Sequential: haiku/mixed backends use per-request dispatch
+                    for fr, prompt in file_prompts:
+                        desc, used_backend = generate_description(
+                            prompt, backend, backend_cycle,
+                            file_path=fr.path,
+                            language=fr.language,
+                            size_bytes=fr.size_bytes,
+                        )
+                        if desc is None:
+                            logger.warning(
+                                "file_description_failed", file_path=fr.path,
+                                content_chars=len(fr.content), repo=rel_key,
+                            )
+                        elif desc:
+                            rec = {
+                                "scope": "file",
+                                "file_path": fr.path,
+                                "commit_sha": commit_sha,
+                                "description": desc,
+                                "language": fr.language or "",
+                                "backend": used_backend,
+                                "model": _model_for_backend(used_backend),
+                                "prompt_version": PROMPT_VERSION,
+                            }
+                            new_file_recs.append(rec)
+
+                # Persist new file descriptions immediately
+                _append_records(partial_file, new_file_recs)
+                records.extend(new_file_recs)
+                file_descriptions.extend(new_file_recs)
+
+        # --- Module-level descriptions ---
+        module_descriptions: list[dict] = [
+            r for r in records if r.get("scope") == "module"
+        ]
+
+        if scope in ("module", "all"):
+            # Group files by parent directory
+            modules: dict[str, list[dict]] = {}
+            # Use file_descriptions if we have them, otherwise build minimal ones
+            descs_for_modules = file_descriptions
+            if not descs_for_modules:
+                # Create simple file descriptions for module prompts
+                descs_for_modules = [
+                    {
+                        "file_path": fr.path,
+                        "description": f"{fr.language or 'text'} file, {fr.size_bytes} bytes",
+                    }
+                    for fr in snapshot.files
+                ]
+
+            for fd in descs_for_modules:
+                parent = str(PurePosixPath(fd["file_path"]).parent)
+                if parent and parent != ".":
+                    modules.setdefault(parent, []).append(fd)
+
+            new_module_recs: list[dict] = []
+            for mod_path, mod_files in sorted(modules.items()):
+                if mod_path in done_module_paths:
+                    continue
+                skeleton_text = module_skeletons.get(mod_path)
+                prompt = build_module_prompt(mod_path, mod_files, skeleton_text)
+                desc, used_backend = generate_description(
+                    prompt, backend, backend_cycle
+                )
+                if desc:
+                    # Detect primary language in module
+                    langs = [
+                        f.get("language", "") for f in mod_files if f.get("language")
+                    ]
+                    primary_lang = max(set(langs), key=langs.count) if langs else ""
+
+                    rec = {
+                        "scope": "module",
+                        "module_path": mod_path,
+                        "commit_sha": commit_sha,
+                        "description": desc,
+                        "language": primary_lang,
+                        "backend": used_backend,
+                        "model": _model_for_backend(used_backend),
+                        "prompt_version": PROMPT_VERSION,
+                    }
+                    new_module_recs.append(rec)
+                    module_descriptions.append(rec)
+
+            # Persist new module descriptions
+            _append_records(partial_file, new_module_recs)
+            records.extend(new_module_recs)
+
+        # --- Repo-level description ---
+        has_repo_desc = any(r.get("scope") == "repo" for r in records)
+        if scope in ("repo", "all") and not has_repo_desc:
+            # Use module descriptions if available, else file descriptions
+            descs_for_repo = file_descriptions
+            if not descs_for_repo:
+                descs_for_repo = [
+                    {
+                        "file_path": fr.path,
+                        "description": f"{fr.language or 'text'} file, {fr.size_bytes} bytes",
+                    }
+                    for fr in snapshot.files[:MAX_FILE_DESCS_IN_PROMPT]
+                ]
+
+            prompt = build_repo_prompt(rel_key, module_descriptions, descs_for_repo)
+            desc, used_backend = generate_description(
+                prompt, backend, backend_cycle
+            )
+            if desc:
+                rec = {
+                    "scope": "repo",
+                    "commit_sha": commit_sha,
+                    "description": desc,
+                    "backend": used_backend,
+                    "model": _model_for_backend(used_backend),
+                    "prompt_version": PROMPT_VERSION,
+                }
+                _append_records(partial_file, [rec])
+                records.append(rec)
+
+        if not records:
+            return {"repo": rel_key, "status": "no_descriptions"}
+
+        # All scopes done — atomic rename partial → final
+        os.rename(str(partial_file), str(output_file))
+
+        return {
+            "repo": rel_key,
+            "status": "ok",
+            "file_descs": sum(1 for r in records if r["scope"] == "file"),
+            "module_descs": sum(1 for r in records if r["scope"] == "module"),
+            "repo_descs": sum(1 for r in records if r["scope"] == "repo"),
+        }
+
+    except Exception:
+        tb = traceback.format_exc()
+        return {"repo": rel_key, "status": "error", "error": tb}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate file/module/repo descriptions using Claude and/or llama-server."
+    )
+    from bgkit.env import get_data_dir
+    _data = get_data_dir(must_exist=False)
+    parser.add_argument(
+        "--repos-dir", type=Path, default=_data / "repos",
+        help="Directory containing owner/repo/ subdirectories",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=_data / "descriptions",
+        help="Output directory for per-repo JSONL files",
+    )
+    parser.add_argument(
+        "--backend", type=str, choices=["haiku", "local", "atlas", "mixed"], default="mixed",
+        help="Description generation backend (default: mixed). Use 'atlas' for Atlas single-server.",
+    )
+    parser.add_argument(
+        "--server-url-primary", type=str, default=None,
+        help="URL for the primary model server (default: VLLM_URL env or http://localhost:8090)",
+    )
+    parser.add_argument(
+        "--server-url-fast", type=str, default=None,
+        help="URL for the fast model server (default: VLLM_URL_FAST env or http://localhost:8091)",
+    )
+    parser.add_argument(
+        "--server-url-atlas", type=str, default=None,
+        help="URL for Atlas inference server (default: ATLAS_URL env or http://localhost:8888)",
+    )
+    # Deprecated aliases (kept for backwards compatibility)
+    parser.add_argument("--llama-url-large", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--llama-url-small", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--llama-url-tiny", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--structural-dir", type=Path, default=None,
+        help="Directory with structural JSONL files (optional, improves module/repo prompts)",
+    )
+    parser.add_argument(
+        "--scope", type=str, choices=["file", "module", "repo", "all"], default="all",
+        help="Which description scopes to generate (default: all)",
+    )
+    parser.add_argument(
+        "--max-repos", type=int, default=None,
+        help="Process at most this many repos",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=12,
+        help="Number of parallel workers (default: 12)",
+    )
+    parser.add_argument(
+        "--shuffle-seed", type=int, default=42,
+        help="Seed for shuffling repo order (avoids alphabetical bias on partial runs)",
+    )
+    args = parser.parse_args()
+
+    structlog.configure(
+        processors=[
+            structlog.dev.ConsoleRenderer(),
+        ],
+        wrapper_class=structlog.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
+    )
+
+    if not args.repos_dir.is_dir():
+        print(f"ERROR: {args.repos_dir} is not a directory", file=sys.stderr)
+        sys.exit(1)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize inference clients if needed
+    if args.backend in ("local", "mixed"):
+        # Handle deprecated --llama-url-* aliases
+        url_primary = args.server_url_primary
+        url_fast = args.server_url_fast
+        if args.llama_url_large and not url_primary:
+            logger.warning("deprecated_arg", arg="--llama-url-large", use="--server-url-primary")
+            url_primary = args.llama_url_large
+        if args.llama_url_small and not url_primary:
+            logger.warning("deprecated_arg", arg="--llama-url-small", use="--server-url-primary")
+            url_primary = args.llama_url_small
+        if args.llama_url_tiny and not url_fast:
+            logger.warning("deprecated_arg", arg="--llama-url-tiny", use="--server-url-fast")
+            url_fast = args.llama_url_tiny
+        init_local_client(url_primary=url_primary, url_fast=url_fast)
+    elif args.backend == "atlas":
+        init_atlas_client(url=args.server_url_atlas)
+
+    # Set up backend cycle for mixed mode
+    backend_cycle: itertools.cycle | None = None
+    if args.backend == "mixed":
+        backend_cycle = itertools.cycle(["haiku", "local"])
+
+    repo_paths = collect_repo_paths(args.repos_dir, args.max_repos, shuffle_seed=args.shuffle_seed)
+    logger.info("collected_repos", count=len(repo_paths))
+
+    total_ok = 0
+    total_skipped = 0
+    total_errors = 0
+    total_file_descs = 0
+    total_module_descs = 0
+    total_repo_descs = 0
+
+    # Use ThreadPoolExecutor since the work is I/O-bound (HTTP calls to llama-server)
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(
+                process_single_repo,
+                rp,
+                args.output_dir,
+                args.backend,
+                args.scope,
+                args.structural_dir,
+                backend_cycle,
+            ): rp
+            for rp in repo_paths
+        }
+
+        for i, future in enumerate(as_completed(futures)):
+            result = future.result()
+            status = result["status"]
+
+            if status == "ok":
+                total_ok += 1
+                total_file_descs += result.get("file_descs", 0)
+                total_module_descs += result.get("module_descs", 0)
+                total_repo_descs += result.get("repo_descs", 0)
+            elif status == "skipped":
+                total_skipped += 1
+            elif status == "error":
+                total_errors += 1
+                logger.error(
+                    "repo_failed", repo=result["repo"],
+                    error=result.get("error", "")[:200],
+                )
+
+            if (i + 1) % 50 == 0 or (i + 1) == len(repo_paths):
+                logger.info(
+                    "progress",
+                    done=i + 1,
+                    total=len(repo_paths),
+                    ok=total_ok,
+                    skipped=total_skipped,
+                    errors=total_errors,
+                )
+
+    logger.info(
+        "generation_complete",
+        repos_processed=total_ok,
+        repos_skipped=total_skipped,
+        repos_errored=total_errors,
+        file_descriptions=total_file_descs,
+        module_descriptions=total_module_descs,
+        repo_descriptions=total_repo_descs,
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,70 @@
+# Phase 2 (recursive L1): L1->L1 bridge distillation.
+#
+# Trains ONLY the encoder-internal L1->L1 bridge (encoder.l1l1_bridge — the
+# analog of l0.auto_repro_head, the L0->L1 bridge). DECODER-AGNOSTIC: no
+# decoder is loaded; projection_blocks are never consulted.
+#
+# Two objectives, computed jointly per microbatch and SUMMED, both backprop
+# only into the L1->L1 bridge (+ optional L1 norm / last L1 block):
+#   A (identity):            teacher = L0(r_l0)->bridge_l0 ; student feeds it to
+#                            L1(r=1, all-survive)->l1l1_bridge.  Sweeps r_l0.
+#   B (compression-matching): teacher = L0(r_target)->bridge_l0 [L0 compresses] ;
+#                            student = L0(r=1)->bridge_l0 -> L1(r_target, forced
+#                            mask = L0(r_target) mask) -> l1l1_bridge.  Sweeps r_target.
+# See src/bgkit/training/phase2/l1l1_distill.py for the design.
+phase: phase2_kb_l1l1
+optimizer: adamw
+max_steps: 3000
+lr: 1.0e-3
+warmup_steps: 100
+
+# Start checkpoint: phase2_kb_step1194 (lacks l1l1_bridge.* keys -> the bridge
+# is clone-init'd from l0.auto_repro_head at load). The trainer reads
+# bgkit_checkpoint at the TOP level (like the Phase 1 steps), so it is set in
+# the experiment wrapper (configs/experiment/phase2_kb_l1l1_distill.yaml), NOT
+# here under the `training` group.
+
+# Anchor loss weights (MSE + cosine + log-norm), reused from ProjectionRepair.
+anchor_weight: 1.0
+cos_weight: 1.0
+norm_weight: 0.1
+# Relative weight of the two summed objectives.
+objective_a_weight: 1.0
+objective_b_weight: 1.0
+
+# Ratio sweeps. ratio_selection: "sweep" runs every ratio per microbatch
+# (faithful to the per-microbatch sweep); "sample" runs one ratio per
+# objective per microbatch (cheaper; flip here if memory is tight).
+objective_a_l0_ratios: [1.0, 0.5, 0.1, 0.05, 0.02]
+objective_b_ratios: [0.5, 0.1, 0.05, 0.02]
+ratio_selection: sample  # bootstrap: faster steps; 3000 steps give ample stochastic ratio coverage. Flip to "sweep" for a fuller per-step signal if memory/time allow.
+
+min_per_sample: 4
+
+# Trainable scoping. The bridge is ALWAYS trainable; these optionally also
+# unfreeze L1's final norm / last L1 backbone block.
+unfreeze:
+  l1_norm: false
+  l1_last_blocks: 0
+
+# Data: NL token corpus (L0-encodable content; no QA labels). Inherits
+# data.tokens.input_dir from the root config (fineweb_edu_v1/tokens).
+max_batch_tokens: 8192
+gradient_accumulation_steps: 4
+min_sample_length: 256
+max_sample_length: 2000
+max_eval_samples: 500
+
+eval_every: 500
+save_every: 1000
+
+use_liger: true
+use_liger_rmsnorm: false
+
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+early_stopping:
+  enabled: false

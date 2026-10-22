@@ -1,0 +1,109 @@
+# @package _global_
+# P19b (redesigned 2026-09-08 with the user): STAGE C — the compression descent
+# with the DECODER FULLY FROZEN and all learning on the encoder side.
+# Stage A (P19a6: frozen encoder, plain MLP, RMS-only contract) makes the reps
+# reproduce the decoder's token embeddings at ratio 1.0, so there is nothing
+# to hold for: a decoder adapter trained at 1.0 could only absorb our task
+# distribution (P8's floor collapse). Descent from step 0: ceiling 1.0 → 0.25
+# over 4000 steps, floor 0.95 → 1/128 over 8000, two ratios per step.
+# Trainable: projection MLP + contextual projection block (identity at init)
+# + selection head (warm from P18 step 4000, teacher-attention listwise loss
+# — the FROZEN decoder's own attention is the target). Objectives: the frozen
+# decoder's CE on the spliced reps + KD toward the same frozen decoder on the
+# FULL TEXT (an encoder-side target: the decoder's own full-context
+# behaviour) + anchor 0.3 → 0.05. Stage D (P19d) later opens a lower-layer
+# decoder LoRA from a compressed checkpoint of this run.
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_p19b_frozen_decoder_descent
+
+training:
+  max_steps: 20000
+  gradient_checkpointing_encoder: false   # retry with the capture leak fixed (both OOMs were leak + recompute)
+  gradient_checkpointing_decoder: false   # user 2026-09-08: peaks of 50-67 GB against the 73 GB cap are accepted
+  eval_every: 1000   # user 2026-09-08: eval every 1k (each eval ~8 min at 256 rows/family)
+  save_every: 500
+  checkpoint_pruning:
+    metric: eval/x4/reconstruct/loss
+  bgkit2:
+    model:
+      init_encoder_from: /workspace/checkpoints/bgkit2_step2000_20260908_092105_011082_run-bgkit2_p19a6_frozen_mlp_rms
+      init_head_from: /workspace/checkpoints/bgkit2_step4000_20260907_132222_377937_run-bgkit2_p18_teacher_attn_selection
+      train_backbone_layers: []
+      interface_rms_only: true
+      projection_block: true
+      projection_input_skip: false
+      encoder_lora:
+        enabled: false
+      interface_momentum: 0.1
+      interface_row_norm: false
+      interface_prenorm: true
+      interface_match_moments: true
+      rep_token_residual: false
+      rep_token_residual_only: false
+      lora:
+        enabled: false
+    data:
+      task_stores:
+        - /workspace/bgkit2_data/tasks/qa_squad.parquet
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa.parquet
+        - /workspace/bgkit2_data/tasks/qa_triviaqa.parquet
+        - /workspace/bgkit2_data/tasks/file_overview.parquet
+        - /workspace/bgkit2_data/tasks/compaction_v2.parquet
+      task_weights: [0.2, 0.2, 0.15, 0.3, 0.15]
+      task_mix: 0.5
+      task_max_ctx_tokens: 2048
+      task_max_prefix_tokens: 1536
+      # Eval noise (2026-09-08): gen SQuAD EM moved 5/48 -> 0/48 between evals.
+      # The eval rows are the FIRST N of each store's eval split, so a larger
+      # N is a superset of the earlier set (comparable on the shared rows).
+      task_eval_samples: 256
+      task_gen_samples: 96
+      batch_size: 12
+      length_bucket_window: 32   # user 2026-09-08: length-aware batching (sort 32-batch windows by length hint)
+    ratio:
+      r_max_start: 1.0
+      r_max: 0.25
+      r_start: 0.95
+      r_end: 0.0078125
+      ceiling_steps: 6000   # user 2026-09-08: descend slower (was 4000)
+      hold_steps: 0
+      # ADAPTIVE floor (user, 2026-09-08): steps per doubling grow like
+      # 1/sqrt(r) (first doubling ~670 steps, 64x->128x ~5200 if mastered on
+      # time) and the rate is eased by clamp(target_gap / gap, 0.1, 1) with
+      # gap = reconstruct loss at the CURRENT FLOOR minus full text, read at
+      # every eval. Never stops, never rises. descent_steps is unused here.
+      adaptive: true
+      rate_log2_per_step: 1.0e-3   # user 2026-09-08: descend slower (was 1.5e-3; first doubling ~1000 steps at mastery 1)
+      rate_power: 0.5
+      mult_min: 0.1
+      mastery_family: reconstruct
+      mastery_target_gap: 0.2   # user 2026-09-08: ease earlier (was 0.3)
+      descent_steps: 8000
+      p_random_selection: 0.1
+      ratios_per_step: 1   # 2 doubled every decoder pass; multi-ratio coverage comes from sampling across steps
+    anchor:
+      weight: 0.3
+      floor: 0.05
+      steps: 8000
+      decorrelation_weight: 0.0
+      within_doc_diversity_weight: 0.0
+    kd:
+      weight: 2.0        # user 2026-09-08: KD on 10% of steps, weight raised a bit
+      kd_every: 10       # the teacher pass is a full frozen-decoder forward (~a fifth of the step)
+      temperature: 1.0
+      ce_weight: 1.0
+      selection_weight: 1.0
+      selection_temperature: 1.0
+      selection_signal: utility_grad   # the old lineage's signal: dL/dh at the hook layer over ALL positions, zero extra passes
+      selection_every: 1
+      head_scale_anchor_weight: 0.01   # old lineage: z-scored losses leave the raw scale gradient-free (129 -> 8431 in 30 steps)
+      head_scale_target: 1.0
+      teacher_checkpoint: null   # the frozen decoder itself on full text is the teacher
+    optim:
+      lr_head: 5.0e-5
+      lr_projection: 1.0e-4
+      lr_projection_block: 5.0e-5

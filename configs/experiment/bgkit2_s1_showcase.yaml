@@ -1,0 +1,241 @@
+# @package _global_
+# S1 — the integrated SHOWCASE run (2026-09-21 sprint, plans/showcase_sprint_2026_09_21.md). ONE model
+# for every bgkit capability: agentic tool use with compressed tool results + promptable digests
+# (external trajectories retrofitted by a Qwen3.6 hindsight sub-agent), browse over the cached repo
+# tree (frozen at P33/P34), long-term conversational memory (dated-session haystacks; recall + teacher QA
+# in LongMemEval types, two framings), long documents (ChatQA2 long SFT, benchmark stories excluded),
+# the existing KB/QA/compaction families, and replay incl. LONG raw reading (the adapter had lost
+# 4k-16k plain reading vs the base). From P34's final adapter, frozen encoder. Benchmarks are read at
+# 10k/20k/30k by scripts/bgkit2_bench.py (never trained on).
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_s1_showcase
+# Never auto-resume (the resolver falls back to the HDD archive by run_name).
+resume_checkpoint: /workspace/checkpoints/bgkit2_step5000_20260922_080350_562485_run-bgkit2_s1_showcase   # explicit: resumed with the shortened interstitial eval
+
+training:
+  max_steps: 30000
+  gradient_checkpointing_encoder: false   # user 2026-09-09: cap rows instead of recomputing; ceiling raised to 0.85
+  gradient_checkpointing_decoder: false   # user 2026-09-08: peaks of 50-67 GB against the 73 GB cap are accepted
+  eval_every: 10000   # the interstitial eval took >1 h at batch 1; the showcase sweeps at 10k/20k/30k are the real measurement
+  save_every: 1000
+  checkpoint_pruning:
+    metric: eval/task/qa_multineedle/gen_x64/exact_match
+    lower_is_better: false
+  bgkit2:
+    model:
+      repro_head: true
+      init_encoder_from: /workspace/checkpoints/bgkit2_step2999_20260917_045219_656536_run-bgkit2_m3_tree_nav_nobridge   # M3's final checkpoint (the trained tree encoder), filled at launch
+      init_head_from: /workspace/checkpoints/bgkit2_step2999_20260917_045219_656536_run-bgkit2_m3_tree_nav_nobridge
+      init_decoder_from: /workspace/checkpoints/bgkit2_step5999_20260921_051813_397690_run-bgkit2_p34_browse_overview_dropout   # P34 final (browse + overview dropout)
+      train_backbone_layers: []          # Stage D: the encoder is FROZEN (optim.freeze_encoder below)
+      interface_rms_only: true
+      prompt_separator: true
+      projection_block: true
+      projection_input_skip: false
+      encoder_lora:
+        enabled: false
+      interface_momentum: 0.1
+      interface_row_norm: false
+      interface_prenorm: true
+      interface_match_moments: true
+      rep_token_residual: false
+      rep_token_residual_only: false
+      lora:
+        enabled: true
+        rank: 32
+        alpha: 64
+        layers: [0, 1, 2, 3, 4, 5, 6, 7]
+        rep_gated: false   # OPEN decoder: the delta applies everywhere; the replay stream (kd.replay_*) holds the base
+    data:
+      train_stores:
+        - /workspace/bgkit2_data/corpus/fineweb_train
+        - /workspace/bgkit2_data/corpus/code_train
+        - /workspace/bgkit2_data/corpus/books_v2_train   # PG-19 chunks (data revision)
+        - /workspace/bgkit2_data/corpus/dialogue_v2_train   # the replay conversations as plain transcripts (data revision)
+      train_weights: [0.45, 0.30, 0.15, 0.10]
+      eval_stores:
+        - /workspace/bgkit2_data/corpus/fineweb_eval
+        - /workspace/bgkit2_data/corpus/code_eval
+        - /workspace/bgkit2_data/corpus/books_v2_eval
+        - /workspace/bgkit2_data/corpus/dialogue_v2_eval
+      task_stores:
+        - /workspace/bgkit2_data/tasks/agent_tool_slots_v7.arrow   # browse walks + overview dropout
+        - /workspace/bgkit2_data/tasks/tool_slots_synth_v2_mapped.arrow   # external agent trajectories, Qwen3.6 HINDSIGHT focus prompts per tool result
+        - /workspace/bgkit2_data/tasks/tool_digest_ext_v3.arrow   # promptable summaries: raw tool result in the slot -> hindsight digest
+        - /workspace/bgkit2_data/tasks/tool_digest_v2.arrow
+        - /workspace/bgkit2_data/tasks/memory_recall_v1.arrow   # dated-session haystacks 10k-96k tokens, summarize a session
+        - /workspace/bgkit2_data/tasks/memory_qa_v1_pairs.arrow   # teacher QA in LongMemEval types, two-person framing
+        - /workspace/bgkit2_data/tasks/memory_qa_v1_user_assistant.arrow   # teacher QA, LongMemEval framing (first person)
+        - /workspace/bgkit2_data/tasks/chatqa2_narrativeqa.arrow   # ChatQA2 NarrativeQA_131072 (<=64k), benchmark-test stories excluded
+        - /workspace/bgkit2_data/tasks/chatqa2_long_sft.arrow   # ChatQA2 long_sft single-turn, Document[k] -> slots
+        - /workspace/bgkit2_data/tasks/qa_squad.arrow
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa.arrow
+        - /workspace/bgkit2_data/tasks/qa_triviaqa.arrow
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa_distractor.arrow
+        - /workspace/bgkit2_data/tasks/qa_multineedle.arrow
+        - /workspace/bgkit2_data/tasks/qa_multineedle_long_fam.arrow
+        - /workspace/bgkit2_data/tasks/qa_squad_article_v2.arrow
+        - /workspace/bgkit2_data/tasks/qa_quality_mcq.arrow
+        - /workspace/bgkit2_data/tasks/qa_narrativeqa.arrow
+        - /workspace/bgkit2_data/tasks/babi_filler_v3.arrow
+        - /workspace/bgkit2_data/tasks/compaction_v2.arrow
+        - /workspace/bgkit2_data/tasks/compaction_chunks_5src_100k.arrow
+        - /workspace/bgkit2_data/tasks/compaction_chunks_long_5src_fam.arrow
+        - /workspace/bgkit2_data/tasks/repo_qa_file_v3.arrow
+        - /workspace/bgkit2_data/tasks/repo_localisation_v3.arrow
+        - /workspace/bgkit2_data/tasks/repo_overview_v1.arrow
+        - /workspace/bgkit2_data/tasks/file_overview.arrow
+        - /workspace/bgkit2_data/tasks/chat_replay_v2.arrow   # REPLAY chat
+        - /workspace/bgkit2_data/tasks/read_replay_v2.arrow   # REPLAY raw reading <=7k
+        - /workspace/bgkit2_data/tasks/read_replay_long_v1.arrow   # REPLAY raw reading 4k-16k (adapter lost long plain reading vs base)
+      task_weights: [0.1257, 0.0838, 0.0524, 0.0105, 0.0524, 0.0628, 0.0628, 0.0628, 0.0628, 0.0314, 0.0157, 0.0105, 0.0209, 0.0209, 0.0209, 0.0209, 0.0105, 0.0105, 0.0209, 0.0105, 0.0209, 0.0209, 0.0157, 0.0157, 0.0105, 0.0105, 0.0628, 0.0314, 0.0419]   # S1 mix (sums to 1)
+      task_mix: 0.5
+      task_max_target_tokens: 640   # chunk targets (p50 677 at the 768 cap); QA targets are short anyway
+      framing_diversity: true
+      framing_p_system: 0.3
+      framing_p_no_prompt: 0.1
+      task_eval_heldout_samples: 64
+      heldout_stores: [qa_squad, qa_multineedle, compaction_chunks_5src_100k]
+      task_gen_factors: [64]   # 16x generation at the pauses
+      task_gen_families: [qa_squad, qa_hotpotqa, qa_triviaqa, qa_multineedle, qa_multineedle_long, babi_filler, qa_squad_article, qa_quality, qa_narrativeqa, qa_hotpotqa_distractor]   # no generation on free-form stores in the trainer eval
+      train_eval_skip_stores: [babilong, qa_squad_heldout, qa_multineedle_heldout, compaction_chunks_5src_100k_heldout, memory_recall_v1, memory_qa_v1_pairs, memory_qa_v1_user_assistant, chatqa2_narrativeqa, chatqa2_long_sft, read_replay_long_v1]   # S1: the long families (100k-token histories, 16-slot books) drove the host to 4.3 GB in the eval (full-text arm); the showcase benchmarks measure them   # scored at the pauses instead
+      eval_batch_max_tokens: 8000   # S1 shares the machine with the user's run (2026-09-22): smaller eval batches
+      alt_prompt_stores: [qa_multineedle, qa_multineedle_long, qa_squad, qa_triviaqa, babi_filler_v3, qa_squad_article_v2, qa_quality_v2, qa_narrativeqa, repo_qa_file_v2]
+      eval_only_stores:
+        - /workspace/bgkit2_data/tasks/babilong.arrow   # external long-context needle benchmark (eval only)
+      max_batch_tokens: 5000   # S1 co-exists with the user's run: smaller microbatches (was 7000)
+      eval_batch_size: 1
+      num_workers: 1   # each worker holds decoded rows of the long stores in RAM
+      task_eval_factors: [16, 64]   # shortened 2026-09-22 (user: shorten the interstitial eval); no x1 arm at 8k (8k reps in the slot = the eval memory peak; host hit 3 GB available at 16:33Z)
+      task_max_ctx_tokens: 8192
+      task_max_prefix_tokens: 4096
+      # Stage D: every 4th step is a batch of repo TREES (root encoding -> path)
+      repo_tree_store: /workspace/bgkit2_data/tasks/repo_tree_v6.parquet
+      repo_tree_max_files: 400
+      repo_tree_file_tokens: 131072   # WHOLE files (user 2026-09-20): long files compress harder, none is cut
+      repo_tree_every: -1   # EVAL-ONLY trees (0 would mean a tree-only run). No bare tree batches: they taught the agent to answer without tools (P31); the walk is trained INSIDE the agent episodes (browse slots)
+      repo_tree_root_cache: /workspace/checkpoints/tree_caches/repo_tree_v6.nodes   # <store>.roots.safetensors from bgkit2_cache_repo_trees.py
+      task_max_prefix_tokens_by_store:
+        # Built to 7000 tokens on purpose (p90 4,572): 11.2% of its rows exceed the
+        # global 4096 cap, i.e. exactly the long reading anchors the store exists to
+        # provide. Raising the global cap would lengthen every other store's decoder
+        # sequences instead.
+        read_replay_v2: 7168   # agentic prefixes p50 2.6k tokens (tool_slots); longer rows hop
+        tool_slots_synth_v2_mapped: 6144   # retrofitted agent histories: 35% exceed 4096 (remap --max-prefix-tokens 6144 drops 5%)
+        read_replay_long_v1: 9216   # co-existing with the user's run: the longest raw-reading rows (decoder + KD base pass) hop
+      # Eval noise (2026-09-08): gen SQuAD EM moved 5/48 -> 0/48 between evals.
+      # The eval rows are the FIRST N of each store's eval split, so a larger
+      # N is a superset of the earlier set (comparable on the shared rows).
+      eval_samples: 48   # shortened 2026-09-22
+      task_eval_samples: 32   # shortened 2026-09-22 (per store; the benchmarks measure at scale)
+      task_gen_samples: 32   # shortened 2026-09-22; (was 288) generation eval is the eval-time memory peak
+      batch_size: 12
+      length_bucket_window: 32   # user 2026-09-08: length-aware batching (sort 32-batch windows by length hint)
+    ratio:
+      r_max_start: 0.25   # band top stays at 4x
+      r_max: 0.25   # no ceiling descent
+      r_start: 0.01619485193348709   # := P19j floor at its handover (as P20)
+      r_end: 0.0078125
+      ceiling_steps: 0
+      hold_steps: 0
+      # ADAPTIVE floor (user, 2026-09-08): steps per doubling grow like
+      # 1/sqrt(r) (first doubling ~670 steps, 64x->128x ~5200 if mastered on
+      # time) and the rate is eased by clamp(target_gap / gap, 0.1, 1) with
+      # gap = reconstruct loss at the CURRENT FLOOR minus full text, read at
+      # every eval. Never stops, never rises. descent_steps is unused here.
+      adaptive: true
+      rate_log2_per_step: 2.0e-3
+      rate_power: 0.5
+      mult_min: 0.25   # ≥ 2000 steps per doubling at the hard end
+      band_top_prob: 0.4   # 40% of steps at 4-8x: gen x4 EM fell to 0.03 under plain log-uniform (P19k@1000)
+      band_top_lo: 0.125
+      family_rep_budget:
+        babi_filler: [32, 256]
+        # These two keys name the long stores' OWN family, which they only have
+        # since 2026-09-15: the stores used to carry the SHORT store's family
+        # ("qa_multineedle" / "compaction_chunks"), so both budgets silently did
+        # nothing in P20-P24. For the 8k chunk store that was not cosmetic — with
+        # no band and no budget it took the global step ratio, which lands in
+        # [0.125, 0.25] on 40% of steps (band_top_prob), i.e. 1,024-2,048 reps for
+        # an 8,192-token document, the exact waste the budget was written to stop.
+        # Fixed in the DATA (scripts/bgkit2_relabel_family.py -> *_fam files).
+        qa_multineedle_long: [32, 256]
+        compaction_chunks_long_5src: [64, 512]
+        qa_squad_article: [32, 256]
+        qa_quality: [32, 256]
+        tool_slots: [16, 192]   # per slot (each tool result is its own encoder row)
+        agent_tool_slots: [16, 192]
+        repo_qa_file: [32, 256]
+        repo_localisation: [32, 256]
+        tool_digest: [16, 192]   # same regime as a tool slot: the row IS one tool result
+        memory_recall: [8, 64]      # per SESSION slot (median 56 sessions/history -> ~1.7k decoder positions)
+        memory_qa: [8, 64]
+        memory_qa_ua: [8, 64]
+        chatqa2_narrativeqa: [32, 256]   # per 4k-token slot, up to 16 slots
+        chatqa2_long_sft: [32, 256]
+      family_bands:
+        qa_multineedle: [0.0078125, 0.03125]   # 32-128x: the needle union exceeds the budget
+        qa_multineedle_long: [0.0078125, 0.03125]
+      mastery_family: reconstruct
+      mastery_target_gap: 0.2   # user 2026-09-08: ease earlier (was 0.3)
+      descent_steps: 8000
+      p_random_selection: 0.1
+      ratios_per_step: 1   # 2 doubled every decoder pass; multi-ratio coverage comes from sampling across steps
+    multilevel:
+      ratio_leaf: 0.125
+      ratio_node: 0.25
+      max_depth: 6
+      leaf_chunk: 16
+      leaf_window: 4096      # files longer than this are encoded in windows -> ONE leaf
+      leaf_max_reps: 512     # = ratio_leaf x 4096: a leaf never exceeds what a cut file had; longer files compress harder
+      walk: true             # tree eval = the PATH WALK (step + full-walk exact), held-out vs train slice
+      grad_levels: 0
+      bridge: identity                  # ablation: identity +11.00 vs repro +11.05 at 3000 — a tie; the simpler pipeline wins
+    anchor:
+      weight: 0.0
+      floor: 0.0
+      phase_out_steps: 0   # P19f already phased the anchor out
+      steps: 1
+      decorrelation_weight: 0.0
+      within_doc_diversity_weight: 0.0
+    kd:
+      weight: 1.0        # stage D: KD to the frozen base every step — the guard on the adapter
+      kd_every: 1
+      temperature: 1.0
+      prompt_contrast_weight: 2.0
+      prompt_contrast_margin: 1.0
+      prompt_contrast_max_tokens: 4096   # (was 6144) two encoder + four decoder graphs in one pass
+      prompt_contrast_paired: true
+      ce_weight: 1.0       # P19e showed KD-only is capped at the base teacher (x4 rose 1.88 -> 2.58, gen EM 0.03): CE carries the gold signal
+      selection_weight: 0.2   # a nudge (user 2026-09-10)
+      selection_temperature: 1.0
+      selection_signal: attention   # teacher attention (P18's signal), query-conditioned by construction
+      teacher_gold_window: true   # oracle-window KD on babi_filler rows (their gold spans also become the selection target)
+      per_row_ce: true   # every row weighs the same, however long its document or short its answer
+      replay_family: chat_replay
+      replay_kl_weight: 1.0
+      replay_ce_weight: 0.2
+      family_loss_weight:
+        babi_filler: 1.5
+        qa_multineedle_long: 1.5
+        compaction_chunks_long_5src: 1.5
+        qa_squad_article: 1.5
+        qa_quality: 1.5
+      selection_chunk: 1
+      selection_max_ctx_tokens: 4096   # the eager (H, T, T) pass skips the 8k rows
+      selection_every: 2
+      head_scale_anchor_weight: 0.01   # old lineage: z-scored losses leave the raw scale gradient-free (129 -> 8431 in 30 steps)
+      head_scale_target: 1.0
+      teacher_checkpoint: /workspace/checkpoints/bgkit2_step4000_20260909_033056_638835_run-bgkit2_p19g_fulltext_lora   # matched full-text LoRA (rep-gated), the honest teacher
+    optim:
+      freeze_encoder: true               # encoder tree OUT of the optimizer — the memory constraint of the design
+      lr_backbone: 2.0e-5   # the whole backbone (old lineage rate)
+      lr_lora: 5.0e-5   # continuing P24's adapter
+      encoder_freeze_steps: 0   # decoder-first: the fresh reader adapts to P22's reps before the encoder moves (user 2026-09-13: 'slight projection realignment')
+      lr_head: 5.0e-5
+      lr_projection: 1.0e-4
+      lr_projection_block: 5.0e-5

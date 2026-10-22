@@ -1,0 +1,15 @@
+# @package _global_
+# Experiment preset: Phase 1 Step 5 commit encoding (two-level L0+L1).
+#
+# Default Step 5 trains the full Qwen decoder without LoRA.
+defaults:
+  - /config
+  - /training/phase1_step5
+  - _self_
+
+run_name: phase1_step5
+step1_checkpoint: auto
+
+training:
+  decoder_ce_impl: cce
+  decoder_ce_strict: true

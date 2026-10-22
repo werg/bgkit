@@ -1,0 +1,61 @@
+# @package _global_
+# M1 — Stage A of the multi-level encoder (plans/multilevel_encoder_2026_09_16.md).
+#
+# Pre-warms encoder.repro, the projection from the encoder's OUTPUT back into
+# the encoder's OWN INPUT space. A multi-level tree feeds one level's survivors
+# into the next, and the backbone was trained on token embeddings, so without
+# this the second level reads a distribution it has never seen. This is bgkit1's
+# joint-block pretrain of auto_repro_head (src/bgkit/training/joint_block_trainer.py)
+# ported to the single-backbone bgkit2 encoder.
+#
+# ONLY encoder.repro trains: backbone, head, projection, interface and the whole
+# decoder are frozen (optim.train_only_repro). The optimizer therefore holds one
+# small MLP, which is the memory point of the multi-level plan — the encoder tree
+# must eventually stay out of the optimizer entirely.
+#
+# Warm-starts the encoder from P26's final checkpoint so the survivors being
+# bridged are the ones the real model produces, not a fresh encoder's.
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_m1_repro_prewarm
+
+training:
+  max_steps: 3000
+  gradient_checkpointing_encoder: false
+  gradient_checkpointing_decoder: false
+  eval_every: 500
+  save_every: 500
+  checkpoint_pruning:
+    metric: eval/loss
+    lower_is_better: true
+  bgkit2:
+    model:
+      init_encoder_from: /workspace/checkpoints/eval_keep/bgkit2_step23999_20260916_100251_611179_run-bgkit2_p26_agentic_distill
+      init_head_from: /workspace/checkpoints/eval_keep/bgkit2_step23999_20260916_100251_611179_run-bgkit2_p26_agentic_distill
+      repro_head: true
+      train_backbone_layers: []      # frozen; only repro learns
+      # Must MATCH P26's encoder exactly or the warm start loads into a
+      # different model (first attempt failed with prompt_separator and
+      # projection_block.* unexpected).
+      interface_rms_only: true
+      prompt_separator: true
+      projection_block: true
+      projection_input_skip: false
+      interface_momentum: 0.1
+      interface_row_norm: false
+      interface_prenorm: true
+      interface_match_moments: true
+    optim:
+      train_only_repro: true
+      lr_repro: 3.0e-4
+    anchor:
+      repro_weight: 1.0
+      weight: 0.0                    # the DECODER-facing anchor is not this run's objective
+      floor: 0.0
+    kd:
+      ce_weight: 0.0                 # no decoder objective at all: this is encoder-only
+      weight: 0.0                    # KD off (KDCfg.weight, not kd_weight)
+      selection_weight: 0.0

@@ -1,0 +1,48 @@
+# @package _global_
+# P4: rung 0 warm, FULL encoder trainable. P2 and P3 established that a
+# trainable decoder (LoRA at 1e-4 or 2e-5, cold or warm-started) learns the
+# answer priors and the reps collapse within 1000 steps (rep gain -> 0).
+# The frozen decoder (P1) is the only regime that has read the reps (+2.3
+# nats). P4 keeps the decoder frozen and gives the ENCODER the capacity:
+# all 16 backbone layers at 1e-5, warm-started from P1 step 2000, with the
+# anti-collapse terms. Question: does encoder capacity lift generative
+# quality when the decoder cannot cheat?
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_p4_rung0_fullenc
+
+training:
+  max_steps: 20000
+  bgkit2:
+    model:
+      init_encoder_from: /workspace/checkpoints/bgkit2_step2000_20260904_022950_685175_run-bgkit2_p1_prompted
+      train_backbone_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      interface_momentum: 0.3
+      lora:
+        enabled: false
+    data:
+      task_stores:
+        - /workspace/bgkit2_data/tasks/qa_squad.parquet
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa.parquet
+        - /workspace/bgkit2_data/tasks/qa_triviaqa.parquet
+        - /workspace/bgkit2_data/tasks/file_overview.parquet
+        - /workspace/bgkit2_data/tasks/compaction_v2.parquet
+      task_weights: [0.2, 0.2, 0.15, 0.3, 0.15]
+      task_mix: 0.5
+      task_max_ctx_tokens: 2048
+      task_max_prefix_tokens: 1536
+    ratio:
+      r_max_start: 0.5
+      ceiling_steps: 1000
+    anchor:
+      weight: 0.5
+      floor: 0.3
+      steps: 2000
+      decorrelation_weight: 1.0
+    optim:
+      lr_backbone: 1.0e-5
+      lr_head: 5.0e-5
+      lr_projection: 1.0e-4

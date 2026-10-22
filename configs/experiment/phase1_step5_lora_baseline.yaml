@@ -1,0 +1,18 @@
+# @package _global_
+# Legacy Step 5 LoRA adapter baseline for A/B profiling.
+#
+# Keep this preset explicit so the normal Step 5 launch path can train the full
+# decoder without LoRA.
+defaults:
+  - /config
+  - /training/phase1_step5
+  - _self_
+
+run_name: phase1_step5_lora_baseline
+step1_checkpoint: auto
+
+training:
+  decoder_lora:
+    enabled: true
+  freeze:
+    decoder: false

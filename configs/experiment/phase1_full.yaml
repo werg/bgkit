@@ -1,0 +1,10 @@
+# @package _global_
+# Full experiment preset: Phase 1 (all steps)
+defaults:
+  - /config
+  - /training/phase1_step6
+  - _self_
+
+run_name: phase1_full
+
+step1_checkpoint: auto

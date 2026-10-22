@@ -1,0 +1,241 @@
+# Phase 1 Step 3: Reconstruction with compression curriculum (post Step 2.5)
+#
+# Re-introduces compression gently on top of the Step 2.5 projection
+# repair. The Step 2.5 run re-anchors the encoder's projection output to
+# the decoder's token-embedding manifold; Step 3 then retrains a fresh
+# decoder (LoRA) + the full encoder against the content-reproduction
+# objective, ramping the target ratio 0.95 → 0.10 over 1k steps.
+#
+# The decoder from Step 1/2/2.5 is intentionally discarded
+# (``load_decoder_from_bgkit_checkpoint: false``). That decoder was
+# adapted against off-manifold projections; with the manifold fixed in
+# 2.5, we want a fresh decoder that learns against the repaired
+# projection under the new curriculum instead of carrying the earlier
+# adaptation forward.
+#
+# Cold-start head: the pre-distilled ``head_base_l0`` sidecar is loaded
+# from Step 1's offline ICE distillation; moment-match keeps the head's
+# distribution shape anchored and the utility-gradient BCE trains it
+# online from the decoder CE gradient captured at ``content_hidden``.
+phase: phase1_step3
+optimizer: muon
+max_steps: 15000
+lr: 2.0e-4               # base LR (encoder gets this)
+decoder_lr: 1.0e-5        # decoder LoRA LR (low — LoRA concentrates gradients)
+encoder_lr: 2.0e-4        # encoder LR (higher — pruned encoder needs to adapt)
+warmup_steps: 500
+# 2026-04-26 v2: dropped to 0. Checkpoint includes optimizer state
+# (Muon momentum + AdamW state), so a resumed step at full lr is
+# equivalent to one more step of the original run — no need to ramp.
+# (Earlier 50-step value was a half-measure; 200-step original default
+# was conservative against optimizer-state corruption that doesn't
+# happen in practice on clean resume.)
+resume_warmup_steps: 0
+# Packed-attention migration (Wave 4, 2026-04-20 sweep + wall-clock
+# investigation 2026-04-21):
+# Reverted to 32768/grad_accum=2 — the pre-migration baseline used the
+# SAME values (not 8192/grad_accum=8 as the baseline README stated; see
+# commit ce3afb2^:configs/training/phase1_step3.yaml). At 65536/grad_accum=1
+# tail microbatches (8 samples × L≈4096) hit 35 s/step wall-clock due to
+# decoder attention cost on the [prefix|survivors|suffix] sequence (~2×
+# content length). 32768/grad_accum=2 keeps effective batch at 65k tokens
+# while flattening the right-tail latency distribution.
+# See docs/wall_clock_investigation_2026_04_21.md for the full tokens/FLOPs
+# analysis.
+#
+# 2026-04-22: Halved from 32768/grad_accum=2 to 16384/grad_accum=4 after
+# fresh-decoder Step 3 (post-is_causal fix in 94bec17) hit allocator OOM
+# at 32768. Effective batch (tokens/optimizer-step) unchanged: 16384×4 = 65536.
+# 2026-04-26: dropped 16384 → 8192 to ease memory pressure (cuda_max_reserved
+# was sustained at the 84.9 GB cap, sustaining allocator-fragmentation cost).
+# Effective batch size kept constant by doubling grad_accum_steps 4 → 8 (total
+# 65536 tokens/step unchanged). DeltaNet kernel cost ~ sum(L_i^2), so smaller
+# microbatches are also faster per step on this workload.
+max_batch_tokens: 8192
+max_batch_tokens_eval: 16384
+gradient_accumulation_steps: 8
+cuda_empty_cache_every_step: true  # Step 3 has known allocator-pressure tails; override compute default.
+min_sample_length: 256       # filter trivially-short samples (license headers, .gitignore, tiny configs); short samples explode packing density and tank step rate
+gradient_checkpointing: true
+# Step 3 is an explicit exception to the compute default. The 2026-04-26
+# live test saw ckpt-off spike activation memory badly enough to allocator-
+# thrash on long samples.
+# 2026-04-26 v4: tried "selective" (skip 18 DeltaNet layers, keep 6
+# FullAttention) — DeltaNet's chunk-level recurrent state is much larger
+# than estimated; cuda_max_allocated jumped to 71 GB (vs 10 GB full
+# ckpt-on) and reserved hit the cap. Reverted; full ckpt-on is the safe
+# winner at ~14 s/step. See docs/dgx_spark_perf_playbook.md.
+max_eval_samples: 500
+eval_every: 500
+save_every: 500
+# Per-microbatch diagnostic metrics (base_norm, head_logit_std,
+# floor_trigger_rate, theta) each force a GPU→CPU sync. Gate them on
+# every 50th step — cheap loss/target metrics still emit every step.
+diagnostic_metrics_every_n_steps: 50
+
+# Discard the decoder carried through from Step 1/2/2.5 — see module
+# docstring. The encoder (incl. the repaired projection_block) IS
+# loaded from the bgkit_checkpoint; only the decoder state_dict is
+# skipped, falling back to a fresh HF Qwen3.5-0.8B.
+load_decoder_from_bgkit_checkpoint: false
+
+# Optional sidecar with pre-distilled head_base_l0 weights. Produced by
+# scripts/pretrain_survivorship_head.py. When set, online BCE warmup is
+# NOT needed (set ice_distillation.l0.enabled: false below).
+survivorship_head_sidecar: /workspace/checkpoints/survivorship_head_base_l0_20260416_132842/head_base_l0.pt
+
+# Everything unfrozen from step 0 — no curriculum phases
+train_projection_block: true
+projection_only_steps: 0
+projection_lr: null
+encoder_unfreeze_step: 0
+bidi_warmup_steps: 0       # already bidirectional from step 2
+
+# Compression active from step 0
+compression_introduction_step: 0
+
+# Cold-start curriculum: ratio anneals 0.95 → 0.10 over 1k steps. The
+# decoder is fresh, so starting at near-identity (0.95) gives it a few
+# hundred steps to learn on lightly-compressed inputs before the head
+# has to commit to aggressive selection.
+target_ratio_start: 0.95
+# Terminal ratio set to 0.08 (down from 0.10) to match Step 4's operating
+# point and eliminate the discontinuity where Step 4 immediately applies
+# a harder compression regime than Step 3 trained for. Keeping compression
+# consistent across the handoff avoids a cold-start in the head + decoder
+# at Step 4 onset. See docs/wall_clock_investigation_2026_04_21.md.
+target_ratio_end: 0.08
+target_ratio_ramp_steps: 1000
+# Train the threshold curve over a *range* of requested ratios instead of
+# only the current curriculum floor. Most batches sample uniformly from a
+# window that travels with the floor:
+# [target_ratio_floor, target_ratio_floor + target_ratio_sampling_window_above].
+# A minority hit the controller's anchor grid directly so the rest of the
+# curve still gets calibrated as the floor moves.
+sample_target_ratio_during_training: true
+target_ratio_sampling_window_above: 0.10
+# 2026-04-26: anchor sampling now picks from the full anchor grid
+# regardless of the window (was previously filtered to window-eligible
+# anchors → no-op when window narrow). Dropped from 0.30 → 0.05 since each
+# anchor draw is now an off-curriculum probe that creates a temporary
+# decoder shape change. 5% → roughly one in 20 microbatches probes a
+# random anchor for wide-range θ(r) calibration.
+target_ratio_anchor_sampling_prob: 0.05
+
+# Liger kernels: SwiGLU + RoPE + fused linear-CE are enabled. LigerRMSNorm
+# is pinned OFF due to a silent backward-pass corruption on Qwen3.5 in
+# liger-kernel 0.7.x. Symptom: loss ~1.6 at step 0 → ~13 (LM prior) by
+# step 10 at near-zero LR, grad_norm ~500, no NaN. Neither the
+# in_place=False fix to LigerRMSNorm nor disabling LigerCE resolves it.
+# LigerRMSNorm's casting_mode="llama" default doesn't match Qwen3.5's
+# RMSNorm math. Re-enable only after upstream ships an
+# `apply_liger_kernel_to_qwen3_5` with Qwen-specific RMSNorm handling
+# (Liger issue #1119) or after a targeted version-downgrade test.
+use_liger: true
+use_liger_rmsnorm: false
+
+# Survivorship head losses, per level.
+survivorship:
+  # L0: base is pre-distilled offline; utility-gradient BCE trains it
+  # online from the decoder-CE gradient captured at content_hidden.
+  #
+  # Moment-match provides a permanent corpus-wide shape anchor on
+  # base_raw so the head can't drift into degenerate distribution
+  # shapes during utility-grad training. The start_step=500 gives the
+  # encoder time to warm up before moment-match applies pressure;
+  # weight 0.05 keeps the gradient subordinate to decoder CE.
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    # 2026-04-26: bumped 0.3 → 0.45 to make up for the period of restart
+    # experimentation in which lr was repeatedly stuck in resume_warmup
+    # ramps. Live-tunable via control.json
+    # (handler in DecoderInitTrainer._handle_utility_grad_loss_weight).
+    utility_grad_loss_weight: 0.45
+    moment_match_weight: 0.05
+    moment_match_start_step: 500
+    # Minimum-survivors floor loss: relative squared hinge on soft
+    # survivor count, using a larger-tau sigmoid so gradient flows
+    # through tanh saturation. Push the head off "confidently silent"
+    # for samples that currently get zero survivors.
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+
+  # L1: no ICE anchor; utility-grad BCE drives, decisiveness breaks symmetry.
+  # (Step 3 doesn't activate L1 — included for forward compatibility.)
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+
+# ICE distillation: disabled at runtime because head_base_l0 is pre-
+# distilled via the sidecar. The only remaining runtime link to ICE is
+# the reference moments (loaded as two floats — no ICE model on device).
+ice_distillation:
+  checkpoint_path: /workspace/checkpoints/ice_step89999_20260306_213825
+  input_dim: 1024
+  hidden_dim: 192
+  num_layers: 3
+  kernel_size: 5
+  l0:
+    enabled: false                   # sidecar replaces online BCE
+    bce_warmup_weight: 0.0
+    bce_warmup_steps: 0
+    teacher_ratio: 0.10
+  l1:
+    enabled: false
+
+# Pre-computed reference moments for the moment_match loss. The probe
+# script writes a JSON with {skew, excess_kurt, n_positions}.
+moment_match_reference:
+  l0:
+    path: ${oc.env:DATA_DIR}/diagnostics/ice_reference_moments.json
+  l1:
+    path: null                       # unused at L1
+
+# Default decoder contract: full decoder training, no adapter-only shortcut.
+decoder_lora:
+  enabled: false
+  implementation: peft
+  r: 32
+  alpha: 64
+  dropout: 0.0
+  peft_fused_backward: true
+  peft_fuse_gate_up: true
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+# Do NOT freeze top layer — LoRA handles parameter efficiency
+freeze_top_layer: false
+lr_scale_bottom: 1.0
+
+# Resume the prior wandb run when the checkpoint has a wandb_run_id and
+# we're actually continuing (is_resuming=True). Gives continuous graphs
+# across restarts instead of forking a new run on every bounce. A cold
+# start (no resume checkpoint) still creates a new run.
+reset_wandb: false
+
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+early_stopping:
+  enabled: false
+qa_ratio: 0.0
+eval:
+  # Gen-eval is observability (does the decoder produce coherent output
+  # from survivors?); it is NOT a training-correctness signal. Small
+  # sample counts and short generations are sufficient to spot major
+  # regressions and are cheap enough to run regularly.
+  generation_samples: 10
+  generation_max_new_tokens: 256
+  # Re-enabled (2026-04-21): the DeltaNet gen-eval crash (cu_seq_lens_q/k
+  # shape mismatch in generation mode) was fixed in commit 4ab9063.
+  generation_eval_every: 4

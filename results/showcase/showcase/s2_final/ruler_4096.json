@@ -1,0 +1,87 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/ruler_4096.jsonl",
+ "n": 100,
+ "budgets": [
+  512,
+  1024,
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 142,
+ "summary": {
+  "bgkit@512": {
+   "acc": 0.2,
+   "prefix": 574.4,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.1422,
+   "dec_s": 0.0763
+  },
+  "text@512": {
+   "acc": 0.09,
+   "prefix": 576.39,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1076
+  },
+  "base@512": {
+   "acc": 0.07,
+   "prefix": 576.39,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0913
+  },
+  "bgkit@1024": {
+   "acc": 0.2,
+   "prefix": 1086.3,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.1357,
+   "dec_s": 0.0901
+  },
+  "text@1024": {
+   "acc": 0.15,
+   "prefix": 1088.2,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1145
+  },
+  "base@1024": {
+   "acc": 0.11,
+   "prefix": 1088.2,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0948
+  },
+  "bgkit@2048": {
+   "acc": 0.17,
+   "prefix": 1893.09,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.138,
+   "dec_s": 0.1171
+  },
+  "text@2048": {
+   "acc": 0.22,
+   "prefix": 2112.35,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1495
+  },
+  "base@2048": {
+   "acc": 0.24,
+   "prefix": 2112.35,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1129
+  }
+ }
+}

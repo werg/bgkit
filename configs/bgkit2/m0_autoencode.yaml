@@ -1,0 +1,83 @@
+# M0: minimal system from pristine weights. plans/reset_2026_09_03.md §6.
+#
+# Gate (stated before the run): on held-out text, generative reconstruction
+# BLEU > 0.9 at 4x and > 0.6 at 16x; lm_health/delta within 5% of the base
+# NLL; probe/top1_raw >= 0.90 at 16x (the old base measured 0.898).
+#
+# Stage 0a (this file): decoder entirely frozen AND encoder backbone frozen.
+# Only the survivorship head, the survive embedding and the projection
+# learn (~4.5M params). The backbone opens later, layer-listed, once the
+# projection alone has been shown to (or shown not to) carry reconstruction;
+# the decoder opens at rung 1 via model.lora.enabled.
+
+model:
+  encoder_id: LiquidAI/LFM2.5-Encoder-350M
+  decoder_id: LiquidAI/LFM2.5-350M-Base
+  head_layer: 6            # of 16: layers 0-5 score, 6-15 consolidate under the survive signal
+  train_backbone_layers: []  # frozen backbone; e.g. [12, 13, 14, 15] opens the top four
+  selection: learned
+  interface_momentum: 0.1
+  lora:
+    enabled: false
+
+data:
+  # Container paths (compose mounts bgkit-data-nvme/bgkit2 at /workspace/bgkit2_data).
+  train_stores:
+    - /workspace/bgkit2_data/corpus/fineweb_train
+    - /workspace/bgkit2_data/corpus/code_train
+  train_weights: [0.6, 0.4]
+  eval_stores:
+    - /workspace/bgkit2_data/corpus/fineweb_eval
+    - /workspace/bgkit2_data/corpus/code_eval
+  ctx_min: 64
+  ctx_max: 1024
+  cont_min: 32
+  cont_max: 256
+  p_continue: 0.5
+  batch_size: 16
+  num_workers: 4
+  eval_samples: 256
+  eval_batch_size: 16
+  gen_samples: 48
+  gen_max_new_tokens: 320
+  probe_ratio: 0.0625
+
+ratio:
+  r_max_start: 1.0       # start with NO compression: align the projected space first
+  ceiling_steps: 2000    # the ceiling descends 1x -> 4x over 2k steps
+  r_max: 0.25
+  r_start: 0.25
+  r_end: 0.0078125       # 1/128
+  descent_steps: 8000    # the floor descends 4x -> 128x over the first 8k steps, never rises
+  p_random_selection: 0.1
+
+anchor:
+  weight: 1.0            # embed-anchor (Step 2.5 lesson): rep_i -> embed(token_i), MSE + cosine
+  floor: 0.0
+  steps: 4000            # decays to 0 so survivors can carry more than their own token
+
+optim:
+  lr_backbone: 2.0e-5     # only used for layers listed in train_backbone_layers
+  lr_head: 1.0e-4
+  lr_projection: 2.0e-4
+  lr_lora: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 500
+  max_steps: 20000
+  grad_clip: 1.0
+  grad_accum: 1
+
+run:
+  name: m0_stage0a_frozen
+  out_dir: /workspace/checkpoints/bgkit2
+  seed: 0
+  dtype: bfloat16
+  device: cuda
+  log_every: 10
+  eval_every: 1000
+  save_every: 1000
+  keep_last: 3
+  gradient_checkpointing: true
+  resume: true
+  wandb: true
+  wandb_project: bgkit2

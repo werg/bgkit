@@ -1,0 +1,73 @@
+# @package _global_
+# P19a4 (2026-09-08): P19a2 (all 16 encoder layers open under the anchor,
+# ratio 1.0, decoder frozen) + an INPUT-EMBEDDING SKIP: each survivor's own
+# encoder input embedding enters the projection through a zero-initialised
+# linear map (model.projection_input_skip). Why: the frozen MLM backbone
+# discards token identity (linear bound cos ~0.63) while its input embeddings
+# map to the decoder's at cos 0.82 / NN 0.99; a decoder-initialised encoder
+# (old Phase 1) had this identity in its residual stream by construction.
+# Warm from P19a2 step 1000 (cos 0.74, x1 reconstruct 2.47); gate A unchanged.
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_p19a4_input_skip
+
+training:
+  max_steps: 8000
+  eval_every: 500
+  save_every: 500
+  warmup_steps: 300
+  checkpoint_pruning:
+    metric: eval/x1/reconstruct/loss
+  bgkit2:
+    model:
+      init_encoder_from: /workspace/checkpoints/bgkit2_step1000_20260908_005738_812663_run-bgkit2_p19a2_backbone_align
+      train_backbone_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      projection_input_skip: true
+      encoder_lora:
+        enabled: false
+      interface_momentum: 0.1
+      interface_row_norm: false
+      interface_prenorm: true
+      interface_match_moments: true
+      rep_token_residual: false
+      rep_token_residual_only: false
+      lora:
+        enabled: false
+    data:
+      task_stores:
+        - /workspace/bgkit2_data/tasks/qa_squad.parquet
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa.parquet
+        - /workspace/bgkit2_data/tasks/qa_triviaqa.parquet
+        - /workspace/bgkit2_data/tasks/file_overview.parquet
+        - /workspace/bgkit2_data/tasks/compaction_v2.parquet
+      task_weights: [0.2, 0.2, 0.15, 0.3, 0.15]
+      task_mix: 0.5
+      task_max_ctx_tokens: 2048
+      task_max_prefix_tokens: 1536
+      batch_size: 12
+    ratio:
+      r_max_start: 1.0
+      r_max: 1.0
+      r_start: 1.0
+      r_end: 1.0
+      descent_steps: 0
+      ceiling_steps: 0
+      hold_steps: 0
+      p_random_selection: 0.0
+    anchor:
+      weight: 1.0
+      floor: 1.0
+      steps: 1
+      decorrelation_weight: 0.0
+      within_doc_diversity_weight: 0.0
+    kd:
+      weight: 0.0
+      ce_weight: 0.0
+      selection_weight: 0.0
+      teacher_checkpoint: null
+    optim:
+      lr_backbone: 5.0e-5
+      lr_projection: 3.0e-4

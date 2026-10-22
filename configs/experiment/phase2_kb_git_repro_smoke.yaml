@@ -1,0 +1,22 @@
+# @package _global_
+# Experiment preset: Phase 2 git_commit_repro PER-REPO full-backprop SMOKE.
+# 8-step wall-time / memory probe of KRKBTrainer with
+# recursive_l1_tree.full_backprop_per_repo: true on the worst-case-inclusive
+# git_commit_repro_smoke subset. Run the moment the per-repo trainer fix lands
+# (the review's M1/M2 check). NOT for real training.
+defaults:
+  - /config
+  - /training/phase2_kb_git_repro_smoke
+  - _self_
+
+run_name: phase2_kb_git_repro_smoke
+resume_checkpoint: null
+
+# Seed chosen so RepoGroupedBatchSampler's epoch-0 shuffle front-loads the 3
+# worst-case repos to positions 4/5/7 — all consumed inside the first 2
+# optimizer steps (grad_accum 4) — so the 8-step probe is GUARANTEED to hit the
+# M1/M2 large-window load (HackTricks 1539 file-samples, Chalarangelo 503
+# commits/955 file-samples, iCSS 509 commits). Default seed 42 buries them at
+# positions 71/96/109 (never reached in 8 steps). Re-derive if the subset
+# changes (search for a seed minimizing max worst-case shuffle position).
+seed: 947

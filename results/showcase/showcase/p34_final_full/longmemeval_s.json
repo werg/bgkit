@@ -1,0 +1,12 @@
+{
+ "experiment": "bgkit2_p34_browse_overview_dropout",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step5999_20260921_051813_397690_run-bgkit2_p34_browse_overview_dropout",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/longmemeval_s.jsonl",
+ "n": 200,
+ "budgets": [
+  512
+ ],
+ "slot_tokens": 2048,
+ "seconds": 29,
+ "summary": {}
+}

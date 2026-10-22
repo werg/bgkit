@@ -1,0 +1,117 @@
+# @package _global_
+# P19g (2026-09-08): the MATCHED FULL-TEXT LoRA — P19f's exact recipe (same
+# P19b start, same rep-gated lower-8 LoRA r32, same stores and framing
+# diversity) but kd.full_text_student: the decoder adapter trains on the
+# context's own token embeddings in the rep slot; no encoder forward, no KD,
+# no anchor, no selection. Two roles: (1) the honest CEILING for the
+# rep-gated design — P19f's reps beat the plain-text arm on QA at step 1000
+# (captured 1.3-1.45) because encoder+adapter carry task processing the
+# untrained plain-text path lacks; (2) the KD teacher (kd.teacher_checkpoint)
+# for the next rep run, replacing the base that capped P19e.
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_p19g_fulltext_lora
+
+training:
+  max_steps: 20000
+  gradient_checkpointing_encoder: false   # retry with the capture leak fixed (both OOMs were leak + recompute)
+  gradient_checkpointing_decoder: false   # user 2026-09-08: peaks of 50-67 GB against the 73 GB cap are accepted
+  eval_every: 1000   # user 2026-09-08: eval every 1k (each eval ~8 min at 256 rows/family)
+  save_every: 500
+  checkpoint_pruning:
+    metric: eval/x4/reconstruct/loss
+  bgkit2:
+    model:
+      init_encoder_from: /workspace/checkpoints/bgkit2_step2328_20260908_140033_105185_run-bgkit2_p19b_frozen_decoder_descent
+      init_head_from: /workspace/checkpoints/bgkit2_step2328_20260908_140033_105185_run-bgkit2_p19b_frozen_decoder_descent
+      train_backbone_layers: []
+      interface_rms_only: true
+      projection_block: true
+      projection_input_skip: false
+      encoder_lora:
+        enabled: false
+      interface_momentum: 0.1
+      interface_row_norm: false
+      interface_prenorm: true
+      interface_match_moments: true
+      rep_token_residual: false
+      rep_token_residual_only: false
+      lora:
+        enabled: true
+        rank: 32
+        alpha: 64
+        layers: [0, 1, 2, 3, 4, 5, 6, 7]
+        rep_gated: true   # delta at rep positions only: noctx / full-text / plain-text arms == the base by construction
+    data:
+      task_stores:
+        - /workspace/bgkit2_data/tasks/qa_squad.parquet
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa.parquet
+        - /workspace/bgkit2_data/tasks/qa_triviaqa.parquet
+        - /workspace/bgkit2_data/tasks/file_overview.parquet
+        - /workspace/bgkit2_data/tasks/compaction_v2.parquet
+        - /workspace/bgkit2_data/tasks/compaction_chunks_5src_100k.arrow   # Arrow IPC (zero-copy mmap); 100k rows balanced over SWE-Zero / nebius / Open-SWE-Traces / OpenResearcher / AgentTrove
+      task_weights: [0.15, 0.15, 0.1, 0.25, 0.1, 0.25]
+      task_mix: 0.5
+      task_max_target_tokens: 640   # chunk targets (p50 677 at the 768 cap); QA targets are short anyway
+      framing_diversity: true
+      framing_p_system: 0.3
+      framing_p_no_prompt: 0.1
+      task_eval_heldout_samples: 128   # MUST match P19f (same eval rows) — the ceiling is compared row-for-row
+      task_max_ctx_tokens: 2048
+      task_max_prefix_tokens: 1536
+      # Eval noise (2026-09-08): gen SQuAD EM moved 5/48 -> 0/48 between evals.
+      # The eval rows are the FIRST N of each store's eval split, so a larger
+      # N is a superset of the earlier set (comparable on the shared rows).
+      task_eval_samples: 256
+      task_gen_samples: 96
+      batch_size: 12
+      length_bucket_window: 32   # user 2026-09-08: length-aware batching (sort 32-batch windows by length hint)
+    ratio:
+      r_max_start: 0.5850641266030571   # := P19b ceiling at handover (step 2328)
+      r_max: 0.25
+      r_start: 0.43171077196286   # := P19b floor at handover (step 2328)
+      r_end: 0.0078125
+      ceiling_steps: 3672   # remaining P19b timer (6000 - 2328)
+      hold_steps: 0
+      # ADAPTIVE floor (user, 2026-09-08): steps per doubling grow like
+      # 1/sqrt(r) (first doubling ~670 steps, 64x->128x ~5200 if mastered on
+      # time) and the rate is eased by clamp(target_gap / gap, 0.1, 1) with
+      # gap = reconstruct loss at the CURRENT FLOOR minus full text, read at
+      # every eval. Never stops, never rises. descent_steps is unused here.
+      adaptive: true
+      rate_log2_per_step: 1.0e-3   # user 2026-09-08: descend slower (was 1.5e-3; first doubling ~1000 steps at mastery 1)
+      rate_power: 0.5
+      mult_min: 0.1
+      mastery_family: reconstruct
+      mastery_target_gap: 0.2   # user 2026-09-08: ease earlier (was 0.3)
+      descent_steps: 8000
+      p_random_selection: 0.1
+      ratios_per_step: 1   # 2 doubled every decoder pass; multi-ratio coverage comes from sampling across steps
+    anchor:
+      weight: 0.05
+      floor: 0.0
+      phase_out_steps: 1000   # user: phase the embed anchor out once the decoder adapts
+      steps: 1
+      decorrelation_weight: 0.0
+      within_doc_diversity_weight: 0.0
+    kd:
+      weight: 0.0        # P19g: no KD (the base is a worse teacher than full text)
+      full_text_student: true
+      kd_every: 1
+      temperature: 1.0
+      ce_weight: 1.0       # P19e showed KD-only is capped at the base teacher (x4 rose 1.88 -> 2.58, gen EM 0.03): CE carries the gold signal
+      selection_weight: 0.0   # P19g: no encoder forward
+      selection_temperature: 1.0
+      selection_signal: utility_grad   # the old lineage's signal: dL/dh at the hook layer over ALL positions, zero extra passes
+      selection_every: 1
+      head_scale_anchor_weight: 0.01   # old lineage: z-scored losses leave the raw scale gradient-free (129 -> 8431 in 30 steps)
+      head_scale_target: 1.0
+      teacher_checkpoint: null   # the adapter-OFF base decoder on full text is the teacher
+    optim:
+      lr_lora: 2.0e-5
+      lr_head: 5.0e-5
+      lr_projection: 1.0e-4
+      lr_projection_block: 5.0e-5

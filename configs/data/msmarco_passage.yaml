@@ -1,0 +1,7 @@
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2/msmarco_passage
+max_document_len: 512
+max_question_len: 128
+max_answer_len: 256
+# MS MARCO Passage Ranking: 8.8M passages, 809K queries
+# Relevance judgments: is_selected flag per passage
+# Query-aware batching: relevant docs + sampled distractors

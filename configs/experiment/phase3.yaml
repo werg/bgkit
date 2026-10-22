@@ -1,0 +1,13 @@
+# @package _global_
+# Experiment preset: Phase 3 SWE-bench distillation
+defaults:
+  - /config
+  - /training/phase3
+  - _self_
+
+run_name: phase3
+
+data:
+  trajectory_dir: ${oc.env:DATA_DIR}/trajectories
+  max_trajectory_tokens: 32768
+  max_issue_tokens: 2048

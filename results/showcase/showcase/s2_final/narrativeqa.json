@@ -1,0 +1,114 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/narrativeqa.jsonl",
+ "n": 60,
+ "budgets": [
+  2048,
+  4096,
+  8192
+ ],
+ "slot_tokens": 2048,
+ "seconds": 485,
+ "summary": {
+  "bgkit@2048": {
+   "em": 0.1,
+   "f1": 0.2037,
+   "contains": 0.1167,
+   "prefix": 2127.9833,
+   "ctx_tokens": 58642.0333,
+   "oom": 0.0,
+   "enc_s": 1.8806,
+   "dec_s": 0.0975,
+   "judge_acc": 0.1667
+  },
+  "text@2048": {
+   "em": 0.0,
+   "f1": 0.1003,
+   "contains": 0.0333,
+   "prefix": 2098.5667,
+   "ctx_tokens": 58642.0333,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1462,
+   "judge_acc": 0.0667
+  },
+  "base@2048": {
+   "em": 0.0,
+   "f1": 0.0806,
+   "contains": 0.0333,
+   "prefix": 2098.5667,
+   "ctx_tokens": 58642.0333,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1438,
+   "judge_acc": 0.05
+  },
+  "bgkit@4096": {
+   "em": 0.1167,
+   "f1": 0.194,
+   "contains": 0.1333,
+   "prefix": 4126.1833,
+   "ctx_tokens": 58642.0333,
+   "oom": 0.0,
+   "enc_s": 1.8679,
+   "dec_s": 0.1616,
+   "judge_acc": 0.1667
+  },
+  "text@4096": {
+   "em": 0.0,
+   "f1": 0.1288,
+   "contains": 0.1,
+   "prefix": 4146.4667,
+   "ctx_tokens": 58642.0333,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2159,
+   "judge_acc": 0.1
+  },
+  "base@4096": {
+   "em": 0.0,
+   "f1": 0.0877,
+   "contains": 0.0667,
+   "prefix": 4146.4667,
+   "ctx_tokens": 58642.0333,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.196,
+   "judge_acc": 0.1
+  },
+  "bgkit@8192": {
+   "em": 0.1,
+   "f1": 0.1871,
+   "contains": 0.1167,
+   "prefix": 7867.7,
+   "ctx_tokens": 58642.0333,
+   "oom": 0.0,
+   "enc_s": 1.882,
+   "dec_s": 0.3017,
+   "judge_acc": 0.15
+  },
+  "text@8192": {
+   "em": 0.0,
+   "f1": 0.1176,
+   "contains": 0.0833,
+   "prefix": 8153.75,
+   "ctx_tokens": 58642.0333,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3661,
+   "judge_acc": 0.1167
+  },
+  "base@8192": {
+   "em": 0.0,
+   "f1": 0.0884,
+   "contains": 0.0333,
+   "prefix": 8153.75,
+   "ctx_tokens": 58642.0333,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3051,
+   "judge_acc": 0.0833
+  }
+ }
+}

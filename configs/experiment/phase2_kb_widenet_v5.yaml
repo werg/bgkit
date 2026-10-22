@@ -1,0 +1,108 @@
+# @package _global_
+# v5: the FIRST REAL widenet run. v1→v4 trained on ZERO survivor reps: the flat
+# writers tagged their retrieval turn `is_head`, which routed every splice to
+# the shared-tree head drill (no infrastructure for flat datasets → zero
+# vector) and the encoder never ran (theta_l0 frozen, l1_buckets_per_step=0,
+# 82,500/82,500 forwards out-of-band). Diagnosed 2026-08-22; fixed in
+# flat_phase2_writer (plain leaf drill {ids, query}) + trainer/decoder
+# contract guards. Therefore v5 restarts from the UNTAINTED summarization
+# base (phase1_checkpoint from phase2_kb_stage_a.yaml; no stage_a overlay —
+# v4's decoder drifted on question-only input, its encoder is untouched).
+#
+# Also adds gold-span relevance supervision (the pinpointing lever).
+# Requires data-v2 (generators emit `gold_span_json` = answer token span
+# inside the article; lognav gets error-centered windows; turns are plain
+# leaf drills). The trainer pushes span positions to survive at L0 AND L1
+# (`survivorship.span_relevance_weight`), and logs `l0_span_survival` /
+# `l1_span_survival` = fraction of answer-span tokens actually selected —
+# the direct observable for "did the needle survive".
+# Gate: generative needle-EM (scripts/analyze_generative_eval.py).
+defaults:
+  - /config
+  - /training/phase2_kb_stage_a
+  - _self_
+
+# v5b: cold restart after the selection-mode fix (the v5 rescue saves at steps
+# 9/15/31/43 trained on 0%->100%-retention splices and are discarded).
+run_name: phase2_kb_widenet_v5b
+
+training:
+  # Memory-driven scheduler ON with host defaults. On DGX unified memory the
+  # caching allocator's reserved pool IS host memory (v5b step 0: 94 GB
+  # reserved vs 12 GB allocated, host available 18-21 GB), so the adaptive
+  # flush tier is load-bearing. Mode flips are governed by
+  # KRKBTrainer._dynamic_ckpt_allowed_modes() == {full} (the outer
+  # non-reentrant level checkpoint cannot recompute under megatron/off), so
+  # the step-49 downshift crash class is closed at the trainer, not per run.
+  dynamic_ckpt:
+    enabled: true
+    flush_when_free_below_gb: 30
+  eval_every: 250
+  save_every: 500
+  warmup_steps: 200
+  # Liveness probe at every eval: a second teacher-forced pass with the
+  # survivor reps ZEROED, reported under eval/ablation/zeroed/*. The gap
+  # (eval/loss vs eval/ablation/zeroed/loss) is the direct "reps are
+  # load-bearing" number — ~0 would have exposed v1→v4 at the first eval.
+  eval_ablation_modes: [zeroed]
+  # Generalization-gap probe: the same teacher-forced pass over 64 fixed
+  # train samples, keyed eval_train/... (per dataset + family). Separates
+  # "held-out generalization" from "eval-path defect" per decoder family.
+  eval_train_subset_samples: 64
+  # Per-phase wall-clock profile in the step metrics (time/prep,
+  # time/drill_encode, time/assemble, time/decode_fwd, time/aux,
+  # time/backward, time/util). GPU-synced splits; negligible at ~30 s/step.
+  # Live-tunable (control.json `profile_timing`).
+  profile_timing: true
+
+  datasets:
+    - lognav
+    - fileneedle
+    - grepset
+    - swerecall
+  max_samples_per_dataset_default: 100000
+
+  l0_retention:
+    lognav: 0.10
+    fileneedle: 0.10
+    grepset: 0.10
+    swerecall: 0.10
+  l1_retention: 0.15
+
+  qwen_decoder_prob: 0.80
+
+  survivorship:
+    survivorship_aux: true
+    span_relevance_weight: 0.5
+    # Under exact_topk the dual-ascent θ step is skipped, so nothing pushes
+    # NON-span tokens down: by step 500 the L0 head scored ~half of all
+    # tokens at the ceiling (decisiveness 0.5) with the span among them →
+    # span survival at the chance rate despite span loss ≈ 0.02. The
+    # aggregate ratio loss supplies the negative pressure toward the target
+    # rate (mean survive prob → ratio); combined with the span term it
+    # separates span from rest. NOTE: KRKBTrainer's inline aux path reads the
+    # TOP-LEVEL `survivorship.ratio_loss_weight` (default 0.1, applied to
+    # both levels; live-tunable) — the per-level `l0/l1.ratio_loss_weight`
+    # keys in phase2_kb_stage_a.yaml are NOT consumed by it (follow-up:
+    # unify). Was effectively 0.1 until step ~505; raised to 0.5 live.
+    ratio_loss_weight: 0.5
+    # Single-document wide-net tasks: the needle is INSIDE the one retrieved
+    # article. Gold-vs-distractor relevance was a KR-era concept and would
+    # quadruple the live-L0 cost on 10–40K-token log windows.
+    n_distractors: 0
+  # Deterministic retention at BOTH levels (ceil(N*ratio) >= 1). Threshold
+  # mode is unusable here: on the untrained base L0 keeps 0.0-0.3%
+  # ("confidently silent"), and under the aux losses the saturated head flips
+  # to ~100% within ~40 steps (50-78K-token decodes, 77 s/step, host memory
+  # at the freeze line). The legacy `recursive_l1_tree.selection_mode_l1`
+  # was only parsed when the recursive tree was enabled -> silently ignored.
+  selection_mode:
+    l0: exact_topk
+    l1: exact_topk
+
+  # Cold start from the summarization base (phase1_checkpoint in
+  # phase2_kb_stage_a.yaml). NO stage_a_checkpoint: every earlier widenet
+  # checkpoint is tainted (decoder trained on zero reps).
+  # Bounded horizon: this is the first run where the encoder actually runs on
+  # these inputs; wall-clock per step is unknown. Extend via control.json.
+  max_steps: 4000

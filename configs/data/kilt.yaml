@@ -1,0 +1,20 @@
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2/kilt
+max_document_len: 8192
+max_question_len: 256
+max_answer_len: 512
+# KILT: 5.9M Wikipedia articles, 11 downstream tasks
+# Tasks: NQ, HotPotQA, FEVER, ZSRE, T-REx, WoW, ELI5, AY2, WNED, CWEB, TriviaQA
+# Provenance-aware scoring: wikipedia_id tracks source articles
+# Multi-task sampling with configurable per-task weights
+task_weights:
+  nq: 1.0
+  hotpotqa: 1.0
+  fever: 1.0
+  zsre: 0.5
+  trex: 0.5
+  wow: 1.0
+  eli5: 1.0
+  aidayago2: 0.5
+  wned: 0.5
+  cweb: 0.5
+  triviaqa: 1.0

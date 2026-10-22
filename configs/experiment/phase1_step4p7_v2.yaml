@@ -1,0 +1,11 @@
+# @package _global_
+# Experiment preset: Phase 1 Step 4.7-v2 bridge distillation (extended ratio).
+defaults:
+  - /config
+  - /training/phase1_step4p7_v2
+  - _self_
+
+run_name: phase1_step4p7_v2
+bgkit_checkpoint: auto_phase1_step5
+teacher_checkpoint: auto_phase1_step4p7
+resume_checkpoint: null

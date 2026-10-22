@@ -1,0 +1,8 @@
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2/git_history
+max_document_len: 16384
+max_question_len: 256
+max_answer_len: 512
+# Git history KR: commit chains from 10K+ repos
+# L0 per commit (message + diff + file context)
+# L1 over chains of 5-50 commits
+# Question types: factual_recall, rationale, diff_grounded, cross_commit, temporal, state_recall

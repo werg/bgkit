@@ -1,0 +1,16 @@
+# @package _global_
+# Experiment preset: Phase 1 Step 3 reconstruction (post Step 2.5 repair)
+defaults:
+  - /config
+  - /training/phase1_step3
+  - _self_
+
+run_name: phase1_step3
+
+# Load pruned encoder (and projection-repaired) from the best Step 2.5
+# checkpoint, falling back to Step 2 if no 2.5 checkpoint is registered.
+# See DecoderInitTrainer._resolve_bgkit_checkpoint. The decoder state in
+# that checkpoint is skipped at load time
+# (training.load_decoder_from_bgkit_checkpoint=false) — Step 3 starts
+# from a fresh HF base decoder.
+bgkit_checkpoint: auto

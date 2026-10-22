@@ -1,0 +1,24 @@
+# @package _global_
+# blob_sft v1 — first Family-A compaction run (2026-08-24 build).
+# Continues from the v6 wide-net final checkpoint (decoder already reads
+# splices; encoder trained under exact_topk + span supervision) and teaches
+# the COMPACTION reading of blobs: history replaced by <bgkit_blob> blocks,
+# CE on the continuation turn, recall probes as the load-bearing-detail gate.
+# Eval split: REPO-level holdout (10% of repos by crc32 bucket) over the full
+# shard list — train and eval are repo-disjoint by construction.
+defaults:
+  - /config
+  - /training/blob_sft
+  - _self_
+
+run_name: blob_sft_v1
+
+training:
+  init_checkpoint: /workspace/checkpoints_fast/phase2_kb_step2629_20260824_002147_192565_run-phase2_kb_widenet_v6
+  data:
+    train_shards:
+      - /workspace/capability_packaging/trajectories_ext/swe_zero/data/train-000??-of-00064.parquet
+    repo_holdout_fraction: 0.10
+  # 64 shards × 200 rows × 4 draws ≈ 51K samples (≈90% train / 10% eval).
+  max_rows_per_shard: 200
+  max_steps: 2000

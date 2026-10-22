@@ -1,0 +1,109 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/quality.jsonl",
+ "n": 100,
+ "budgets": [
+  512,
+  1024,
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 116,
+ "summary": {
+  "bgkit@512": {
+   "acc": 0.36,
+   "prefix": 615.54,
+   "ctx_tokens": 5999.78,
+   "oom": 0.0,
+   "enc_s": 0.2408,
+   "dec_s": 0.0252
+  },
+  "text@512": {
+   "acc": 0.31,
+   "prefix": 616.34,
+   "ctx_tokens": 5999.78,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0245
+  },
+  "base@512": {
+   "acc": 0.25,
+   "prefix": 616.34,
+   "ctx_tokens": 5999.78,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0189
+  },
+  "summary@512": {
+   "acc": 0.4167,
+   "prefix": 585.8,
+   "ctx_tokens": 5972.6167,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0239,
+   "summ_in_tokens": 5941.6333,
+   "summ_out_tokens": 524.0167,
+   "summ_s": 30.151
+  },
+  "bgkit@1024": {
+   "acc": 0.36,
+   "prefix": 1127.67,
+   "ctx_tokens": 5999.78,
+   "oom": 0.0,
+   "enc_s": 0.2345,
+   "dec_s": 0.0361
+  },
+  "text@1024": {
+   "acc": 0.33,
+   "prefix": 1128.32,
+   "ctx_tokens": 5999.78,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0364
+  },
+  "base@1024": {
+   "acc": 0.27,
+   "prefix": 1128.32,
+   "ctx_tokens": 5999.78,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0265
+  },
+  "bgkit@2048": {
+   "acc": 0.37,
+   "prefix": 2029.02,
+   "ctx_tokens": 5999.78,
+   "oom": 0.0,
+   "enc_s": 0.2381,
+   "dec_s": 0.0621
+  },
+  "text@2048": {
+   "acc": 0.34,
+   "prefix": 2152.26,
+   "ctx_tokens": 5999.78,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0665
+  },
+  "base@2048": {
+   "acc": 0.26,
+   "prefix": 2152.26,
+   "ctx_tokens": 5999.78,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0457
+  },
+  "summary@2048": {
+   "acc": 0.4464,
+   "prefix": 1409.2143,
+   "ctx_tokens": 5984.5714,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0449,
+   "summ_in_tokens": 5960.9286,
+   "summ_out_tokens": 1420.1429,
+   "summ_s": 73.3943
+  }
+ }
+}

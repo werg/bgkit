@@ -1,0 +1,45 @@
+phase: phase1_falcon_dense_seed
+optimizer: adamw
+# Pure projection-block training over a pre-computed cache of encoder.l0
+# survivor embeddings (see scripts/build_dense_seed_cache.py). No encoder
+# forward in the loop; each step is forward+backward through ~19M params
+# of the projection block, so we can afford many fast steps with small
+# batches.
+max_steps: 6000
+lr: 5.0e-4
+projection_lr: 5.0e-4
+warmup_steps: 100
+# Token budget here is in *survivor* counts (the cache's natural cost unit).
+# Average ~97 survivors / chunk, so 2048 ~= 21 chunks / batch.
+max_batch_tokens: 2048
+max_batch_tokens_eval: 4096
+gradient_accumulation_steps: 1
+max_eval_samples: 1000
+eval_every: 200
+save_every: 500
+
+# adapt_encoder is irrelevant here (encoder isn't loaded for training); keep
+# the key so old launchers don't blow up.
+adapt_encoder: false
+
+data:
+  # Output of scripts/build_dense_seed_cache.py — switched 2026-05-22 from
+  # processed/ (code) to fineweb_edu_v1 (5B-token FineWeb-Edu subset) as
+  # part of the Phase 2 ablation-driven pivot off code-corpus pretraining.
+  cache_dir: ${oc.env:DATA_DIR}/fineweb_edu_v1/falcon_dense_seed_cache
+
+anchor_weight: 1.0
+cos_weight: 0.5
+norm_weight: 0.2
+
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+
+model:
+  decoder:
+    family: falcon_h1
+    backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+    hidden_dim: 512

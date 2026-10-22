@@ -1,0 +1,39 @@
+# @package _global_
+# Diagnostic: identical realign trainer + warmstart ckpt, but with the
+# OLD pre-FineWeb-Edu training data (processed_v2/tokens, the corpus the
+# Qwen Phase 1 chain was actually trained on). Lets us test whether the
+# realign plateau at 4.4 is caused by the data distribution shift
+# (FineWeb-Edu prose vs code repos) or by something the trainer is doing
+# wrong. Per user's framing 2026-06-03:
+#   - if this run lands at low eval/loss → data distribution is the
+#     dominant cause (or chat template / tokenization / overfitting)
+#   - if this run also plateaus near 4.4 → the trainer itself is broken
+defaults:
+  - /config
+  - /training/phase1_qwen_realign
+  - _self_
+
+run_name: phase1_qwen_realign_olddata
+
+# Same merged warmstart as the main realign — encoder from the wide-range
+# projection warmup + decoder from Step 6 step1643 (LoRA-merged Qwen).
+step1_checkpoint: /workspace/checkpoints/phase1_qwen_realign_warmstart_20260603
+
+model:
+  decoder:
+    family: qwen35
+    backbone_name: Qwen/Qwen3.5-0.8B
+
+# Swap data source: processed_v2/tokens is the corpus Step 1-6 trained on.
+data:
+  tokens:
+    input_dir: ${oc.env:DATA_DIR}/processed_v2/tokens
+
+training:
+  phase: phase1_qwen_realign_olddata
+  data:
+    file_tokens_path: ${oc.env:DATA_DIR}/processed_v2/tokens
+    # CRITICAL: the global default points at fineweb_edu_v1/tokens_falcon_h1;
+    # mixing with processed_v2/tokens gives a row-count mismatch and silently
+    # filters every sample. Pair the companion with its own primary.
+    falcon_companion_dir: ${oc.env:DATA_DIR}/processed_v2/tokens_falcon_h1

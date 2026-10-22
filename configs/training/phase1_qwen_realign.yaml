@@ -1,0 +1,154 @@
+phase: phase1_qwen_realign
+optimizer: muon
+muon_ns_steps: 1
+# Qwen3.5-0.8B realignment: pure-Qwen run that catches the Qwen decoder up
+# to where the encoder currently is, after a long Falcon-H1-only training
+# stretch. Encoder + projection resume from the latest Falcon-l0 checkpoint
+# (the encoder is shared across decoder families); the Qwen decoder loads
+# pristine from HF since no Qwen-trained checkpoint exists for this
+# encoder state.
+#
+# Goals:
+#   1. Get the Qwen decoder fluent on the current encoder's survivor
+#      distribution. The encoder already does the hard compression work.
+#   2. Let the encoder shed any Falcon-specific drift (the Qwen
+#      reconstruction loss pulls the projection block + final encoder
+#      layers slightly back toward a less Falcon-shaped embedding space).
+#
+# Not a learning run for the encoder backbone — encoder LR is small.
+# 2026-06-03 v3: extended run + gentle curriculum. Starting at ratio
+# 0.9 (~no compression, near-full context) gives the Qwen decoder an
+# easy reconstruction task while it learns to read the Falcon-trained
+# encoder's survivors. Ramp slowly toward 0.10 over the full run so
+# compression tightens only after the decoder has stable footing.
+max_steps: 25000
+# Qwen0.8B realign starts at ratio 0.55 (vs Step 6's 0.10), so the
+# decoder sees ~5x more survivor tokens per microbatch → 47 GB peak
+# allocated, 85 GB pool reserved, host swap pressure. Halving the batch
+# budget brings per-microbatch decoder load roughly in line with Step 6.
+gradient_checkpointing: false
+lr: 5.0e-5
+encoder_lr: 1.5e-5
+decoder_lr: 8.0e-5
+warmup_steps: 200
+bidi_warmup_steps: 0
+max_batch_tokens: 1500
+gradient_accumulation_steps: 16
+min_sample_length: 256
+max_sample_length: 800
+max_eval_samples: 500
+eval_every: 1000
+save_every: 2000
+max_grad_norm: 5.0
+
+# Forced mask off (inherited operating point from l0)
+use_forced_survivor_mask_l0: false
+
+sampler:
+  cost_multiplier: 1.0
+  eval_cost_multiplier: 1.0
+
+objectives:
+  data_reconstruction: 1.0
+
+# Steep, brief curriculum. We start mid-ramp (0.55 — easier than the
+# encoder's current operating point of ~0.14) so the Qwen decoder has
+# a gentle on-ramp; descend back down toward the encoder's natural
+# operating range.
+target_ratio_start: 0.9
+target_ratio_end: 0.10
+target_ratio_ramp_steps: 20000
+sample_target_ratio_during_training: true
+target_ratio_sampling_mode: window
+target_ratio_sampling_window_above: 0.05
+target_ratio_anchor_sampling_prob: 0.0
+l1_introduction_step: 999999999
+
+survivorship:
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.05
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+    forced_survivor_bce_weight: 0.0
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    utility_grad_loss_weight: 0.0
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.0
+
+ice_distillation:
+  l0:
+    enabled: false
+  l1:
+    enabled: false
+
+moment_match_reference:
+  l0:
+    path: ${oc.env:DATA_DIR}/diagnostics/ice_reference_moments.json
+  l1:
+    path: null
+
+decoder_lora:
+  # LoRA tried 2026-06-02, did not give measurable speedup over full
+  # fine-tune for this Qwen-decoder-from-scratch realignment workload
+  # (memory pressure dominated step time, not optimizer-state size).
+  enabled: false
+
+# 2026-06-03: corrected. The warmstart checkpoint we now resume from
+# bundles the warmed-projection encoder (from
+# phase1_qwen_projection_warmup_step1499) with the Step 6 Qwen decoder
+# (phase1_step6_step1643, decoder_merged.pt — LoRA-merged canonical
+# Qwen3.5-0.8B). Architecture matches, so the decoder loads cleanly
+# and brings the Step-6-era reconstruction skill into realign.
+load_decoder_from_bgkit_checkpoint: true
+
+# Preserve the projection-warmup's head_tanh_temperature exactly. The
+# warmup (phase1_qwen_projection_warmup) trained the qwen35 projection
+# against a teacher-projection target distribution under specific T
+# values. Recalibrating T at realign setup shifts which positions the
+# head selects, so the projection sees a shifted input distribution
+# and the warmup alignment is washed out — observed 2026-06-03 as an
+# eval/loss plateau at 4.4 after ~1500 steps. With this flag on,
+# CompressionTrainer.setup() preserves the loaded checkpoint's T.
+skip_head_temperature_calibration: true
+
+freeze:
+  bgkit: false
+  decoder: false
+
+data:
+  prompt_variants_dir: configs/prompt_variants
+  # FineWeb-Edu is English prose, not code. The default file_read_repro
+  # variants frame the task as "AI coding assistant reading file with
+  # bgkit_read_file" — wildly OOD for prose. Use the document-oriented
+  # bank instead. (2026-06-03 diagnostic: with code variants, realign
+  # plateaued at eval/loss 4.4 on FineWeb; switching the data to
+  # processed_v2 dropped to 4.40 by step 100 already, confirming the
+  # template was the dominant blocker on prose.)
+  variant_bank_overrides:
+    file_read_repro: document_verbatim_repro
+  tokens:
+    max_seq_len: 8192
+  # File tokens come from training.data.file_tokens_path
+  # (fineweb_edu_v1/tokens). No falcon_companion_dir needed — Qwen
+  # decoder uses the same Qwen tokenization as the encoder input.
+
+model:
+  decoder:
+    family: qwen35
+    backbone_name: Qwen/Qwen3.5-0.8B
+  # 6-anchor threshold-controller cap (inherited from the Falcon stages
+  # since the encoder is resumed from a Falcon-trained checkpoint).
+  threshold_controller:
+    anchor_ratios: [0.02, 0.04, 0.08, 0.16, 0.32, 0.60]
+    ratio_space: log
+    lr: 0.05
+    momentum: 0.0
+    clamp: 1.5
+    kernel_bandwidth: 0.5

@@ -1,0 +1,50 @@
+# @package _global_
+# BABILong CONTROL arm — separates "cannot read prose reps" from "cannot find
+# the needle" (2026-08-25). The 16k/32k arms scored 0.00 on every cell, and
+# that single number cannot distinguish three very different failures:
+# selection never keeps the fact, compression destroys it, or the decoder
+# cannot read reps of prose at all.
+#
+# This arm removes the first two. Retention is 1.0 at BOTH levels — every
+# content token becomes a rep, no selection, no compression — over the SHORT
+# cells, where 0k is nothing but the bAbI facts themselves (~38 tokens, two
+# sentences). If the model still cannot answer here, the problem is reading
+# prose reps, which no amount of prose TRAINING DATA would fix on its own.
+# If it answers here and fails at 16k, the deficit is selection/compression
+# and babilong_style training is the right response.
+#
+# Reference (stock Qwen3.5-0.8B, plain text, 100 samples):
+#   qa1 0k 0.55 | 1k 0.43 | 4k 0.53      qa2 0k 0.44 | 1k 0.46 | 4k 0.23
+#
+# The zeroed ablation runs alongside: with no compression, the gap between
+# live and zeroed reps IS the information the splice carries.
+defaults:
+  - /experiment/babilong_bgkit_67x
+  - _self_
+
+run_name: babilong_bgkit_ctrl
+
+training:
+  datasets:
+    - babilong_qa1_0k
+    - babilong_qa1_1k
+    - babilong_qa1_4k
+    - babilong_qa2_0k
+    - babilong_qa2_1k
+    - babilong_qa2_4k
+
+  # NO COMPRESSION: keep every content token at both levels.
+  l0_retention:
+    babilong_qa1_0k: 1.0
+    babilong_qa1_1k: 1.0
+    babilong_qa1_4k: 1.0
+    babilong_qa2_0k: 1.0
+    babilong_qa2_1k: 1.0
+    babilong_qa2_4k: 1.0
+  l1_retention: 1.0
+
+  # The teacher-forced pass carries the answer-level signal; run the zeroed
+  # arm with it, since at ratio 1.0 the live-vs-zeroed gap is exactly the
+  # information the splice delivers.
+  eval_ablation_modes: [zeroed]
+  max_eval_samples: 600

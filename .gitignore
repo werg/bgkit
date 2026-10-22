@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+
+# Data and checkpoints (large files, root-level only)
+/data/
+/checkpoints/
+/.checkpoints-smoke/
+/outputs/
+/wandb/
+/logs/
+
+# Local build/dependency scratch directories
+/.local-debs/
+/.local-python-dev/
+/third_party/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# uv
+.uv/
+
+# Claude Code per-agent worktrees + scheduler lock (local only)
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+
+# Internal working material (kept locally, not published)
+/CLAUDE.md
+/.claude/
+/plans/
+/docs/
+/qa_document_collections_training_report.md
+/results/showcase/RESULTS.md
+/results/showcase/report_v2.html
+/results/showcase/teacher_bench/
+/results/showcase/candtree_s2/
+/results/showcase/showcase/s1b_final/
+/results/showcase/showcase/p34_final/

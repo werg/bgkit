@@ -1,0 +1,149 @@
+# DGX Spark compute configuration
+# Blackwell GB10, 128GB unified memory, sm_121, 273 GB/s bandwidth
+device: cuda
+# Mixed precision -- BF16 default (MXFP8/MXFP4 not supported on sm_121)
+mixed_precision: bf16
+# Gradient checkpointing across BgKIT encoder levels and the 0.8B decoder.
+# Default off on DGX Spark: recompute is a wall-clock cost, and phases should
+# opt in only when their measured activation footprint needs it. The shared
+# helper still supports "selective" for explicitly measured experiments.
+gradient_checkpointing: false
+# Per-step ``torch.cuda.empty_cache`` is off by default on GB10. It was
+# historically used as a fragmentation guard, but Step 5 profiling on
+# 2026-05-07 showed it costing ~0.5-1.0s/step while measured peaks stayed
+# below 27 GiB. Phases with known allocator pressure can override
+# ``training.cuda_empty_cache_every_step: true`` locally.
+cuda_empty_cache_every_step: false
+# Conservative defaults -- must be profiled on actual hardware
+# max_seq_len: 8192 pre-2026-04-19. Lowered to 4096 because decoder
+# splice under target_ratio≈0.9 balloons single-sample seq to 15K
+# tokens and wedges unified memory into page-thrash.
+max_seq_len: 4096
+microbatch_size: 1
+gradient_accumulation_steps: 8
+# Effective batch size = microbatch * gradient_accumulation = 8
+# Optimizer: default to plain AdamW. Individual experiments override to
+# `muon` (phase 1) or keep `adamw` (phase 2/3). `adamw8bit` requires
+# bitsandbytes with a matching CUDA binary (cuda132.so is not shipped in
+# bnb 0.49.2 — use `adamw`/`muon` until bnb 0.50+).
+optimizer: adamw
+optimizer_kwargs:
+  lr: 1.0e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+# Gradient clipping
+max_grad_norm: 1.0
+# Attention: `auto` resolves to BgKIT's FA4-aware backend when FA4 is
+# importable (bgkit.utils.attention_backend). MHA head_dim up to 256 works
+# via our flash-attention fork's sm_120 tile/atom fixes. GQA is handled by
+# repeat-interleaving K/V heads (native FA4 sm_120 GQA still produces wrong
+# gradients). See docs/memory for the full story.
+attention_implementation: auto
+# Optional per-decoder override. Falcon-H1 uses normal batched attention rather
+# than BgKIT packed-varlen attention, so its "auto" path can prefer FA2 while
+# leaving encoder attention on BgKIT FA4.
+decoder_attention_implementation: auto
+# Decoder LM loss: Apple Cut Cross Entropy is the default on GB10. In the
+# training image it is installed and measured faster/lower-memory than the
+# previous chunked CE path; if the optional package is missing, BgKIT falls
+# back to chunked CE unless strict benchmarking is requested.
+decoder_ce_impl: cce
+# Dataloader
+num_workers: 0  # fork workers cause CoW memory exhaustion on unified memory
+pin_memory: false  # unified memory, pinning not applicable
+# Unified-memory accounting. Training, evaluation, generation, and
+# checkpoint save all claim from one 128 GB pool; without a contract
+# between them the first subsystem to overshoot triggers Linux swap.
+# These are hardware-level caps, not phase-level — every training run on
+# this box gets them; override in a phase config only if the phase has
+# a genuinely unusual footprint.
+memory:
+  # Polling cadence for the global safety rail + wandb mem/* curves.
+  log_every_steps: 10
+  # Hard floor on system-wide used GB. Hit → emergency checkpoint +
+  # SystemExit. Leaves headroom for save_checkpoint + ssh. 0 disables.
+  # 2026-05-08: bumped 110 → 114 to align with mem_limit=115g + cuda
+  # fraction 0.87 (113.7 GB CUDA). Old 110 fired before CUDA cap was
+  # reached on megatron mode (which keeps reserved pool ~76+ GB).
+  system_abort_gb: 114
+  # Memory-driven adaptive memory management.
+  #
+  # Signal: ``torch.cuda.mem_get_info()[0] / 1e9`` = free GB the CUDA
+  # allocator can still claim from the host. Stating thresholds as "free
+  # room remaining" makes the policy:
+  #   * adaptive to total host memory (same config works on a 64 GB or
+  #     a 200 GB box without tuning),
+  #   * consistent with the abort semantics (abort = no room left),
+  #   * tight — the policy only acts when room is genuinely scarce, not
+  #     when reserved happens to grow during normal operation.
+  #
+  # Two-tier response, both keyed off the same signal:
+  #   1. Adaptive cache flush — fires only when free is low AND there's
+  #      slack worth recovering (``reserved − allocated > flush_min_slack_gb``).
+  #      The slack guard prevents the wasted-sync case where the pool is
+  #      fully in-use and ``empty_cache()`` would return nothing.
+  #   2. Mode flip — expensive, requires trainer to register managed
+  #      models via ``_dynamic_ckpt_managed_models()``. Upshift on first
+  #      breach (no hysteresis); downshift after window-MIN free stays
+  #      above ``target_threshold + downshift_margin_gb`` for
+  #      ``min_steps_in_mode`` steps.
+  #
+  # Default on host-wide. Trainers that haven't registered managed models
+  # get only the adaptive flush. Explicit per-phase disable via
+  # ``training.dynamic_ckpt.enabled: false``.
+  dynamic_ckpt:
+    enabled: true
+    window: 50                                 # sliding window of cuda_free readings
+    # Mode-flip thresholds (free GB below which we upshift).
+    megatron_upshift_when_free_below_gb: 15.0  # off → megatron
+    full_upshift_when_free_below_gb: 8.0       # megatron → full
+    # Hysteresis: window-MIN free must exceed (threshold + margin) before
+    # downshifting, so a transient dip won't immediately upshift again.
+    downshift_margin_gb: 5.0
+    min_steps_in_mode: 50
+    # Adaptive cache-flush thresholds. Tight by design: flush only when
+    # free room is genuinely low AND there's slack worth recovering.
+    # The slack guard alone handles back-to-back-flush prevention (after
+    # a flush, slack drops to ~0 and the next step won't flush). No
+    # cooldown — cooldown blocked productive flushes during transient
+    # post-eval pressure (observed 2026-05-08).
+    flush_when_free_below_gb: 20.0   # flush only when free < this
+    flush_min_slack_gb: 3.0          # AND slack (reserved − allocated) > this
+  # Per-scope CUDA peak caps for memory_budget_scope (phase-boundary
+  # enforcement; complements the periodic poll above).  Calibrated from
+  # the 2026-04-20 Phase 1 Step 3 run (cuda_max_allocated ~14 GB at
+  # training baseline; save is mostly host-side pickle and hardly
+  # touches CUDA).  ~1.5× the observed / estimated peak leaves headroom
+  # for the ratio-annealing curriculum's growing splice without making
+  # the cap so loose that a real regression slips past.  A cap trip is a
+  # legible error; bump by 5 GB and re-run if a new regime hits it
+  # legitimately.  ``null`` disables enforcement for that scope.
+  scope_budgets:
+    # Wave 4 retune (2026-04-20): eval caps raised to accommodate the
+    # packed eval budget (phase1_step3.max_batch_tokens_eval = 131072,
+    # 2× training). Eval has no backward so it packs bigger for the
+    # same CUDA peak. Gen eval caps lowered: sequential B=1 per-sample
+    # generation peaks well below batched.
+    # 2026-04-22: budget semantics switched from absolute-peak to delta-peak.
+    # Caps now measure how much new memory a scope allocates above its entry
+    # baseline, not the absolute CUDA peak. Old absolute caps blamed scopes
+    # for pre-existing resident state (e.g., gen_eval entering with 30 GB
+    # of training state trivially tripped a 15 GB absolute cap even when it
+    # allocated ~0.24 GB of new memory).
+    evaluate_gb: 80           # packed eval at 2× training budget, no backward.
+                              # 2026-07-31: 64→80 for the query-conditioned whole-path
+                              # drill — eval re-encodes every trajectory node per sample
+                              # (train big-repo peak hit 67 GB absolute), so the eval
+                              # delta can exceed 64. 80 delta -> ~90 GB absolute, under
+                              # the 97 GB (0.80-fraction) guard + 113.7 GB global CUDA cap.
+                              # Takes effect on next restart (config loaded at startup).
+                              # 2026-07-30: raised 40→64 for the git-repro
+                              # recursive-L1 run at 0.30 retention — eval encodes
+                              # the shared tree + base/zeroed ablation at 6× the
+                              # 0.05-era content, delta-peak 41 GB tripped the old
+                              # 40 GB cap (CUDA peak 50.7 GB, well under the 113.7
+                              # GB global cap; host had 117 GB available — the
+                              # 103 GB "system" was reclaimable dataset mmap). 64
+                              # gives headroom for larger eval repos at 0.30.
+    gen_eval_gb: 15           # sequential B=1 generation + KV cache delta
+    save_checkpoint_gb: 15    # LoRA merge_and_unload clones decoder transiently; delta ~2 GB

@@ -1,0 +1,142 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/hotpot.jsonl",
+ "n": 100,
+ "budgets": [
+  256,
+  512,
+  1024
+ ],
+ "slot_tokens": 2048,
+ "seconds": 89,
+ "summary": {
+  "bgkit@256": {
+   "em": 0.47,
+   "f1": 0.5818,
+   "contains": 0.48,
+   "prefix": 310.96,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.056,
+   "dec_s": 0.0397,
+   "judge_acc": 0.64
+  },
+  "text@256": {
+   "em": 0.2,
+   "f1": 0.2302,
+   "contains": 0.21,
+   "prefix": 315.14,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0529,
+   "judge_acc": 0.23
+  },
+  "base@256": {
+   "em": 0.08,
+   "f1": 0.1698,
+   "contains": 0.25,
+   "prefix": 315.14,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0729,
+   "judge_acc": 0.25
+  },
+  "summary@256": {
+   "em": 0.4,
+   "f1": 0.5036,
+   "contains": 0.45,
+   "prefix": 287.18,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0475,
+   "summ_in_tokens": 1576.94,
+   "summ_out_tokens": 282.29,
+   "summ_s": 77.1782,
+   "judge_acc": 0.55
+  },
+  "bgkit@512": {
+   "em": 0.47,
+   "f1": 0.5692,
+   "contains": 0.48,
+   "prefix": 557.81,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0489,
+   "dec_s": 0.0446,
+   "judge_acc": 0.62
+  },
+  "text@512": {
+   "em": 0.23,
+   "f1": 0.3009,
+   "contains": 0.28,
+   "prefix": 568.51,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0632,
+   "judge_acc": 0.35
+  },
+  "base@512": {
+   "em": 0.08,
+   "f1": 0.1613,
+   "contains": 0.25,
+   "prefix": 568.51,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0893,
+   "judge_acc": 0.27
+  },
+  "summary@512": {
+   "em": 0.34,
+   "f1": 0.4416,
+   "contains": 0.45,
+   "prefix": 506.76,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0589,
+   "summ_in_tokens": 1576.94,
+   "summ_out_tokens": 614.19,
+   "summ_s": 165.7386,
+   "judge_acc": 0.53
+  },
+  "bgkit@1024": {
+   "em": 0.46,
+   "f1": 0.5612,
+   "contains": 0.47,
+   "prefix": 762.53,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0493,
+   "dec_s": 0.0505,
+   "judge_acc": 0.6
+  },
+  "text@1024": {
+   "em": 0.21,
+   "f1": 0.3074,
+   "contains": 0.31,
+   "prefix": 1061.86,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0861,
+   "judge_acc": 0.37
+  },
+  "base@1024": {
+   "em": 0.08,
+   "f1": 0.2147,
+   "contains": 0.34,
+   "prefix": 1061.86,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.0947,
+   "judge_acc": 0.39
+  }
+ }
+}

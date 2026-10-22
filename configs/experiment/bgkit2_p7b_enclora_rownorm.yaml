@@ -1,0 +1,63 @@
+# @package _global_
+# P7b: P7 + a HARD per-row interface rescale + LoRA lr 5e-5 + non-finite-
+# gradient skip. P7 (EMA interface, lr 1e-4) ran the emitted norm to 2.4x the
+# reference, shared fraction 0.86, pre-clip grad norm 1353 and died on NaN at
+# step 475 -- the EMA contract is soft and the encoder outran it.
+# P7: encoder-side capacity under a FIXED floor. Absolute ladder from P6:
+# SQuAD no-context 2.46 / reps 2.36 / full text 1.15 — the reps arm has sat
+# at ~2.2-2.4 nats in every run regardless of decoder regime; the gap to
+# full text is the encoder's. Full-layer backbone training diverged (P4);
+# here LoRA adapters on every encoder layer bound the drift, the decoder
+# stays FROZEN so the no-context floor (4.5) is fixed and rep gain is
+# interpretable, and KD from the full-text teacher (same frozen decoder)
+# gives the encoder a context-dependent target. Warm from P1 step 2000.
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_p7b_enclora_rownorm
+
+training:
+  max_steps: 20000
+  bgkit2:
+    model:
+      init_encoder_from: /workspace/checkpoints/bgkit2_step2000_20260904_022950_685175_run-bgkit2_p1_prompted
+      train_backbone_layers: []
+      encoder_lora:
+        enabled: true
+        rank: 32
+        alpha: 64
+        layers: []
+      interface_momentum: 0.3
+      interface_row_norm: true
+      lora:
+        enabled: false
+    data:
+      task_stores:
+        - /workspace/bgkit2_data/tasks/qa_squad.parquet
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa.parquet
+        - /workspace/bgkit2_data/tasks/qa_triviaqa.parquet
+        - /workspace/bgkit2_data/tasks/file_overview.parquet
+        - /workspace/bgkit2_data/tasks/compaction_v2.parquet
+      task_weights: [0.2, 0.2, 0.15, 0.3, 0.15]
+      task_mix: 0.5
+      task_max_ctx_tokens: 2048
+      task_max_prefix_tokens: 1536
+      batch_size: 12
+    ratio:
+      r_max_start: 0.5
+      ceiling_steps: 1000
+    anchor:
+      weight: 0.5
+      floor: 0.3
+      steps: 2000
+      decorrelation_weight: 1.0
+    kd:
+      weight: 1.0
+      temperature: 1.0
+      ce_weight: 1.0
+    optim:
+      lr_backbone: 5.0e-5     # the encoder LoRA group (1e-4 exploded at step 475)
+      lr_head: 5.0e-5
+      lr_projection: 1.0e-4

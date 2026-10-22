@@ -1,0 +1,26 @@
+# @package _global_
+defaults:
+  - /config
+  - /training/phase1_falcon_dense_seed
+  - _self_
+
+run_name: phase1_falcon_dense_seed
+bgkit_checkpoint: auto
+
+# Cache-based dense_seed: no encoder forward in the loop, so we can run small
+# batches with workers absorbing the cache reads.
+compute:
+  num_workers: 2
+  pin_memory: false
+
+model:
+  # projection_num_layers stays at the default 1. Deepening to 3 layers
+  # was tried and added ~37M params + Adam state; the resulting memory
+  # footprint pushed forced_adapt past the 70% CUDA cap at the same
+  # training step every time. AND cos_sim plateaued at the same 0.52
+  # level — the ceiling is data-determined (forced pair targets +
+  # tokenizer-alignment heuristics), not projection-capacity-determined.
+  decoder:
+    family: falcon_h1
+    backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+    hidden_dim: 512

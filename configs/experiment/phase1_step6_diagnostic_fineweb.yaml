@@ -1,0 +1,59 @@
+# @package _global_
+# Diagnostic: ORIGINAL Step 6 trainer config + Step 6 checkpoint (most
+# recent pre-Falcon Qwen pair, encoder + decoder + projection +
+# threshold state all together) + NEW FineWeb-Edu data.
+#
+# Companion to phase1_qwen_realign_olddata (realign trainer + warmstart
+# ckpt + OLD processed/tokens). Together they isolate which factor
+# causes the realign plateau at 4.4:
+#
+#   step6+old-data (= original training, baseline):  expected eval/loss ~0.85
+#   step6+new-data (THIS RUN):                       reveals data-shift cost
+#   realign+old-data:                                reveals trainer-vs-baseline cost
+#   realign+new-data (current main run):             observed plateau 4.4
+#
+# Simplifications vs original Step 6 config:
+#   - objectives reduced to data_reconstruction only (FineWeb-Edu doesn't
+#     have commit_reproduction / description_generation / structural_relational
+#     / query_conditioned data sources)
+#   - shorter run (max_steps=2000, eval every 500) for fast diagnostic feedback
+#   - skip head_tanh_temperature_calibration (preserve step6's calibrated T)
+defaults:
+  - /config
+  - /training/phase1_step6
+  - _self_
+
+run_name: phase1_step6_diagnostic_fineweb
+
+# Step 6's most-trained Qwen ckpt (encoder + decoder + projection +
+# optimizer state, all paired and known-working at eval/loss ~0.85
+# on processed/tokens data).
+step1_checkpoint: /workspace/checkpoints/phase1_step6_step1643_20260510_080636
+
+# Diagnostic length: 2000 steps is enough to see whether trajectory
+# matches a healthy continuation or a plateau.
+training:
+  # Unique phase name so auto-resume can't latch onto the original
+  # phase1_step6 checkpoints (they have LoRA-wrapped decoder.pt and the
+  # auto-resume path at compression.py:3318 doesn't prefer
+  # decoder_merged like the main step1_checkpoint load does — would
+  # crash on LoRA→non-LoRA shape mismatch).
+  phase: phase1_step6_diagnostic_fineweb
+  max_steps: 2000
+  eval_every: 500
+  save_every: 1000
+  skip_head_temperature_calibration: true
+  # Single-objective so we don't need the commit/description/structural/qa
+  # data sources that don't exist for FineWeb-Edu.
+  objectives:
+    data_reconstruction: 1.0
+    description_generation: 0.0
+    structural_relational: 0.0
+    commit_reproduction: 0.0
+    query_conditioned: 0.0
+  data:
+    file_tokens_path: ${oc.env:DATA_DIR}/fineweb_edu_v1/tokens
+
+data:
+  tokens:
+    input_dir: ${oc.env:DATA_DIR}/fineweb_edu_v1/tokens

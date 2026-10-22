@@ -1,0 +1,73 @@
+# @package _global_
+# v7-ratio6x: the RETENTION data point the oracle verdict left open
+# (2026-08-24). The oracle_span ablation proved the verbatim-extraction
+# failure at 67× is a READ-OUT limit (guaranteed span survival at both
+# levels changed generations but not needle EM), with one caveat: retention
+# itself has NEVER been tested with live reps — the v3a "6× changes
+# nothing" verdict came from a zero-rep run and is void. This run answers
+# it: continue from the v6 final checkpoint at ~6× (L0 0.35 × L1 0.5) for
+# 1,000 steps so the decoder adapts to the denser rep distribution, then
+# read the generative needle-EM gate (free-running eval every 250 steps).
+# Doubles as the second point of the ratio-vs-quality Pareto curve.
+# Everything else is v6: z-scored exact_topk both levels, per-level aux,
+# ratio 0.5 / span 2.0, Qwen-only, no skip rolls.
+# NOTE bring-up: at 6× the decode sequences are ~3-4× longer than v6's —
+# run scripts/diag_flat_splice_counts.py +experiment=phase2_kb_widenet_v7_ratio6x
+# +diag.n_samples=8 first and watch s/step + host-available early.
+defaults:
+  - /config
+  - /training/phase2_kb_stage_a
+  - _self_
+
+run_name: phase2_kb_widenet_v7_ratio6x
+
+training:
+  dynamic_ckpt:
+    enabled: true
+    flush_when_free_below_gb: 30
+  eval_every: 250
+  save_every: 500
+  warmup_steps: 100
+  eval_ablation_modes: [zeroed]
+  eval_train_subset_samples: 64
+  eval_free_running_samples: 64
+  eval_free_running_max_new_tokens: 512
+  eval_free_running_max_tool_calls: 4
+  profile_timing: true
+  grad_norm_groups_every: 25
+
+  datasets:
+    - lognav
+    - fileneedle
+    - grepset
+    - swerecall
+  max_samples_per_dataset_default: 100000
+
+  # ~6×: 0.35 × 0.5 = 0.175 of content tokens reach the decoder as reps.
+  l0_retention:
+    lognav: 0.35
+    fileneedle: 0.35
+    grepset: 0.35
+    swerecall: 0.35
+  l1_retention: 0.5
+
+  qwen_decoder_prob: 1.0
+  training_time_ablation:
+    p_skip_bgkit: 0.0
+    p_skip_topic: 0.0
+    p_noise_bgkit: 0.0
+
+  survivorship:
+    survivorship_aux: true
+    span_relevance_weight: 2.0
+    ratio_loss_weight: 0.5
+    n_distractors: 0
+  selection_mode:
+    l0: exact_topk
+    l1: exact_topk
+
+  # Continue from the v6 final state (weights only; fresh step counter) —
+  # the decoder that already reads 67× reps adapts to the 6× distribution.
+  stage_a_checkpoint: /workspace/checkpoints_fast/phase2_kb_step2629_20260824_002147_192565_run-phase2_kb_widenet_v6
+
+  max_steps: 1000

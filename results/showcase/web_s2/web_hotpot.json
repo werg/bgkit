@@ -1,0 +1,132 @@
+{
+ "bench": "web_hotpot",
+ "label": "web_hotpot",
+ "web_find": "encoded",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/web/web_hotpot.jsonl",
+ "n": 100,
+ "student_url": "http://localhost:8097",
+ "decoder_token_budget": 40000,
+ "context_budget": 6144,
+ "max_turns": 12,
+ "full_text_results": "match",
+ "ratios": {
+  "read": 8,
+  "search": 16,
+  "docs": 16,
+  "bash": 16,
+  "overview": 32,
+  "compaction": 32,
+  "web_search": 4,
+  "web_open": 16,
+  "web_find": 4,
+  "zoom": 4
+ },
+ "search_k": 5,
+ "max_page_chars": 40000,
+ "snippet_words": 100,
+ "compaction_mode": "cons",
+ "slot_max_tokens": 8192,
+ "summary": {
+  "bgkit": {
+   "n": 100,
+   "errors": 0,
+   "em": 0.16,
+   "f1": 0.2406,
+   "answered": 0.88,
+   "turns": 2.68,
+   "decoder_tokens": 2439.18,
+   "encoder_tokens": 832.27,
+   "encoder_tokens_unique": 585.44,
+   "tool_result_tokens": 588.49,
+   "tokens_saved": 439.34,
+   "truncated_results": 0.0,
+   "n_search": 1.03,
+   "n_open": 0.13,
+   "n_find": 0.0,
+   "gold_opened_any": 0.0,
+   "gold_opened_all": 0.0,
+   "gold_opened_frac": 0.0,
+   "gold_searched_any": 0.88,
+   "gold_title_opened_any": 0.0,
+   "wall_s": 2.3667,
+   "answered_any": 0.93,
+   "answer_form": {
+    "answer": 88,
+    "bare": 5,
+    "none": 7
+   },
+   "stop": {
+    "final": 94,
+    "max_turns": 2,
+    "loop": 4
+   },
+   "loops": 4,
+   "by_subset": {
+    "bridge/hard": {
+     "n": 73,
+     "em": 0.0959,
+     "f1": 0.2064,
+     "gold_opened_any": 0.0
+    },
+    "comparison/hard": {
+     "n": 27,
+     "em": 0.3333,
+     "f1": 0.3333,
+     "gold_opened_any": 0.0
+    }
+   },
+   "judge_acc": 0.27
+  },
+  "full_text": {
+   "n": 100,
+   "errors": 0,
+   "em": 0.11,
+   "f1": 0.1173,
+   "answered": 0.48,
+   "turns": 6.06,
+   "decoder_tokens": 6547.75,
+   "encoder_tokens": 0.0,
+   "encoder_tokens_unique": 0.0,
+   "tool_result_tokens": 194.84,
+   "tokens_saved": 134.55,
+   "truncated_results": 1.83,
+   "n_search": 1.21,
+   "n_open": 1.15,
+   "n_find": 0.0,
+   "gold_opened_any": 0.29,
+   "gold_opened_all": 0.01,
+   "gold_opened_frac": 0.15,
+   "gold_searched_any": 0.88,
+   "gold_title_opened_any": 0.29,
+   "wall_s": 5.2431,
+   "answered_any": 0.49,
+   "answer_form": {
+    "none": 51,
+    "answer": 48,
+    "bare": 1
+   },
+   "stop": {
+    "final": 53,
+    "loop": 43,
+    "max_turns": 2,
+    "empty": 2
+   },
+   "loops": 43,
+   "by_subset": {
+    "bridge/hard": {
+     "n": 73,
+     "em": 0.0959,
+     "f1": 0.1059,
+     "gold_opened_any": 0.2466
+    },
+    "comparison/hard": {
+     "n": 27,
+     "em": 0.1481,
+     "f1": 0.1481,
+     "gold_opened_any": 0.4074
+    }
+   },
+   "judge_acc": 0.14
+  }
+ }
+}

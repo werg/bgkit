@@ -1,0 +1,13 @@
+# @package _global_
+# Experiment preset: Phase 2 recursive-L1 (L1->L1) bridge distillation.
+defaults:
+  - /config
+  - /training/phase2_kb_l1l1_distill
+  - _self_
+
+run_name: phase2_kb_l1l1_distill
+resume_checkpoint: null
+# Top-level (the trainer reads self.cfg.bgkit_checkpoint, like Phase 1 steps).
+# Pinned to phase2_kb_step1194 (lacks l1l1_bridge.* -> bridge clone-init'd from
+# l0.auto_repro_head). Override to 'auto' to resolve the latest phase2_kb ckpt.
+bgkit_checkpoint: /workspace/checkpoints/phase2_kb_step1194_20260629_034248

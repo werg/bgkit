@@ -1,0 +1,366 @@
+# @package _global_
+# Wide-net v12 -- THE TASK REFACTOR.
+#
+# v10 and v11 established the split cleanly: the REPRESENTATION is solved and
+# replicated (reps identify their own document at 0.820 and 0.867, against a
+# base of 0.914 and a pre-contract v8 at chance 0.008), while UTILIZATION is
+# zero (overall fraction captured -0.082; the reps leave the model marginally
+# worse than zeroing them). The task is demonstrably possible -- full_text
+# beats zeroed by +0.139 to +0.339 on every family -- so the decoder can use a
+# document when handed one. It just does not use these.
+#
+# WHY THE TASKS, NOT THE TRAINING. Measured guessability on the shipped data:
+#
+#     family        unique ans   top-20 covers   question-echo   cross-doc
+#     lognav             48.5%          52.5%           0.066       0.025
+#     grepset            94.3%          11.2%           0.142       0.051
+#     fileneedle         98.1%           6.7%           0.227       0.012
+#     reconstruct       100.0%           4.9%           0.117       0.012
+#
+# fileneedle's zeroed arm scored 0.241 against its own echo floor of 0.227 --
+# the no-document model was echoing the prompt, and the reps lifting it to
+# 0.318 is the ONLY positive rep_gain measured in the whole investigation
+# (+0.077 F1 generative, n=18). lognav, whose top 20 answers cover half its
+# eval split, was the most negative at -0.056. The ordering is suggestive.
+#
+# CHANGES:
+#   + xref   NEW. Anchored cross-reference QA: 97.7% unique answers, top-20
+#            cover 18.0%, echo 0.043, cross-doc 0.044, answers ~15 chars. A
+#            floor 5x below fileneedle's and answers short enough to survive
+#            5% retention -- it escapes the short-guessable / long-
+#            unreproducible tension rather than trading one horn for the
+#            other. See bgkit/data/xref_qa.py.
+#   - lognav REMOVED. Half its eval is answerable from 20 memorised strings,
+#            its severity qtype draws from a 9-element enum, and three answers
+#            cover 100% of several question forms. It cannot support a
+#            rep_gain reading and it measured the most negative one.
+#     others kept: fileneedle (the one positive signal), grepset (cleanest of
+#            the originals), reconstruct (the only family forcing
+#            whole-document retention, and its ceiling arm is informative even
+#            when its own gate is not cleared).
+#
+# WHAT TO WATCH, in order:
+#   1. eval/kb/free_running/xref/answer_token_f1 against a floor of 0.027.
+#      Measured on the BUILT data (485 eval rows): question-echo 0.027,
+#      cross-doc 0.004, and the HIGHER governs. 8.4x below fileneedle's
+#      0.227 and 4.3x below reconstruct's 0.117. Answers are 99.0%
+#      unique and the top 20 cover 5.2%.
+#      Read route_exact FIRST -- a family whose routing has not converged has
+#      its F1 capped for reasons unrelated to the reps (v11 step 250:
+#      route 0.389, F1 0.0088, and the F1 was measuring routing).
+#   2. Generative rep_gain per dataset from the post-run sweep. The only
+#      honest rep_gain for anything with a long answer.
+#   3. The probe. Expected to PASS again; two runs have now held ~90%+ of the
+#      base. If it fails, something regressed in the contract, not the tasks.
+
+defaults:
+  - /config
+  - /training/phase2_kb_stage_a
+  - _self_
+
+run_name: phase2_kb_widenet_v12_xref
+
+model:
+  encoder:
+    # THE isolated variable. See bgkit/models/interface_norm.py.
+    interface_norm: true
+    # FIXED, not learnable. The first launch of this arm ran with a learnable
+    # gain and shift and was killed at step 65: the emitted norm ratio climbed
+    # 1.30 -> 6.52 monotonically while shared_frac went 0.26 -> 0.94. A
+    # trainable shift IS a corpus-constant, re-added after the very
+    # standardisation that removed one, and a trainable gain restores the free
+    # scale direction the contract exists to close -- so the affine reopens
+    # both muting routes, which is exactly what the run showed. The decoder's
+    # own input projection can absorb a fixed per-channel scaling, so nothing
+    # expressive is lost by pinning it.
+    interface_affine: false
+    # 0.1, not 0.01. The same 65 steps saw l0_base_raw_std go 0.32 -> 1.96, so
+    # a reference with a ~100-update half-life is stale by the time it is used
+    # and the standardiser divides by a number that is too small, inflating the
+    # output on its own. Match the momentum to how fast the upstream moves.
+    interface_momentum: 0.1
+
+training:
+  dynamic_ckpt:
+    enabled: true
+    flush_when_free_below_gb: 30
+  # Dense language-health sampling is the whole point of the run.
+  eval_every: 250
+  save_every: 250
+  warmup_steps: 200
+  # In-run lm_health is OFF (it kills the run — see stage_a). The timeline
+  # is read OFFLINE from the step-50 checkpoints instead.
+  lm_health_samples: 0
+  # Keep the eval cheap so a 50-step cadence is affordable; the headline
+  # metric here is lm_health, not task quality.
+  max_eval_samples: 128
+  eval_free_running_samples: 64
+  # rep_gain REQUIRES the zeroed arm. eval/rep_gain/* is the headline "is the
+  # model actually USING the encoded information" metric, and with this list
+  # empty it silently never computes — which is how the capability decayed
+  # unnoticed for months (base 2.03-2.95 nats -> 0.004 with nothing reporting).
+  eval_ablation_modes: [zeroed]
+  # GENERALIZATION GAP. This is THE instrument for "is it overfitting" — the
+  # same teacher-forced pass over a fixed slice of TRAINING samples, so
+  # eval/train_subset/loss vs eval/loss is a like-for-like comparison. It was 0,
+  # i.e. off, for this entire run, which is why the question could only be
+  # answered indirectly. Note the pooled train_step loss is NOT a substitute:
+  # it now includes the replay tail, which the eval passes exclude, so the two
+  # are no longer measuring the same thing.
+  eval_train_subset_samples: 128
+  profile_timing: true
+
+  # swerecall REMOVED (2026-08-28). It was 7808 of 19691 train rows — 40% of
+  # every epoch — and its questions NAME the answer: the gold basename appears
+  # verbatim in 71.3% of eval rows, there are only 9 repos, and 46.4% of
+  # answers are reconstructible from (basename in question) + one of the 10
+  # commonest directories. Its measured zeroed-reps EM of 0.517 matches that
+  # 46.4% guess rate, and it is the ONLY dataset where reps HURT (oracle-forced
+  # 0.224 vs zeroed 0.517). So for two fifths of training the gradient rewarded
+  # answering from the question and IGNORING the spliced reps — on the very
+  # objective meant to teach using them. Regenerate it to ask for something the
+  # question does not name before reinstating.
+  datasets:
+    # lognav REMOVED: top-20 answers cover 52.5% of its eval split and its
+    # severity qtype is a 9-element enum. It cannot support a rep_gain reading.
+    - fileneedle
+    - grepset
+    - reconstruct
+    # THE new variable. See bgkit/data/xref_qa.py.
+    - xref
+  max_samples_per_dataset_default: 100000
+
+  # TOOL-CALL LOSS WEIGHT (2026-08-28). Measured: 57% of loss-bearing tokens
+  # are the bgkit tool call, and that call is a COPY task — flat_trajectory_row
+  # writes the doc id into the scope description and the query is the question
+  # verbatim, so those tokens need no reps. Answer share of loss tokens:
+  # lognav 55.5%, grepset 33.2%, fileneedle 23.3% (pooled 42.9%). The model
+  # duly learns the copy (route_exact 0.92-0.98) while answer EM sits at 0.17:
+  # the gradient was mostly teaching the rep-INDEPENDENT half. Down-weight
+  # rather than mask, because routing is a real requirement and is already
+  # near-saturated — 0.2 keeps it while concentrating gradient on the answer.
+  tool_call_loss_weight: 0.2
+
+  # REPLAY AUX (2026-08-29) — the one lever left standing.
+  #
+  # Weight-delta across the lineage settled what actually changed between the
+  # base (rep_gain 2.03-2.95 nats) and Phase 2 (rep_gain ~0.01):
+  #     l1.backbone              0.0000
+  #     l0.backbone              0.0001
+  #     projection_blocks.qwen35 0.0039   (output_norm.weight BIT-IDENTICAL)
+  #     DECODER qwen35           0.0120   (uniform across every layer)
+  # The reps being produced today are, to four decimals, the reps that earned
+  # 2-3 nats. Nothing about the representation drifted. Only the reader did.
+  #
+  # That kills the two candidate fixes at once: a projection anchor repairs a
+  # drift that did not happen (norm_ratio 188 and cos_near 0.156 are the BASE's
+  # operating point, inherited), and selection is dead for a third independent
+  # reason — the heads are the ONLY encoder part Phase 2 moves at all
+  # (l0.head 17%) and moving them that far changed rep_gain not at all, matching
+  # random-selection == trained-selection and the top-k margin loss reaching
+  # 0.0008 with no rep_gain effect.
+  #
+  # What is left is the objective. Continue the gold document from a short
+  # verbatim cue, with the document present ONLY as spliced reps. The LM prior
+  # can produce plausible continuations — which is exactly what the zeroed arm
+  # controls for — but CE falls only if the reps are read. This is the base's
+  # own training task and the base is 1.2% away in weight space, so it is a
+  # recovery, not learning from scratch.
+  #
+  # Cost, stated plainly: ~40 supervised replay positions join ~90 answer/tool
+  # positions in the per-sample normaliser, so answer gradient per step drops
+  # roughly 45%. That is the intended trade — the answer task is currently
+  # being solved WITHOUT the reps, so diluting it to restore rep-reading is the
+  # point. Read eval/rep_gain/nats and eval/rep_gain/exact_match.
+  replay_loss_weight: 0.5
+  replay_window_tokens: 48
+  # LOCATOR = INDEX (2026-08-29, third form). Both earlier locators carried
+  # content and leaked to the LM prior, each measured on its own eval:
+  #   mode=cue    step 1500: gap 0.0229 against replay CE 1.077 — 98% of the
+  #               continuation came from the prior, because a short cue out of
+  #               templated log/grep text nearly determines the next 48 tokens.
+  #   mode=start  step 1750: replay CE HALVED to 0.588 while the gap barely
+  #               moved (0.0293). The halving is a property of the TARGET, not
+  #               of learning: document openings are boilerplate (licence
+  #               headers, imports, log preambles), so position 0 is the most
+  #               guessable place in the document to ask about.
+  # mode=chunk asks for chunk <i>: the marker names WHICH chunk and nothing
+  # about what is in it, so the prior can supply only "text of this kind at
+  # roughly this depth" and the content exists solely in the spliced reps.
+  # cue_tokens is unused in this mode; every target token is supervised.
+  #
+  # Read eval/replay/gap against BOTH priors above. If it stays ~0.03 while
+  # replay CE falls again, the leak is not in the locator and the objective
+  # itself is not the lever.
+  replay_mode: chunk
+  replay_cue_tokens: 0
+  # 24 was too few to separate 0.0229 from 0.0293 — those differ by less than
+  # the noise at that n. Doubled; the probe is two decodes per sample and runs
+  # once per eval.
+  replay_eval_samples: 48
+
+  # RETENTION CURRICULUM (2026-08-28). Previously 0.10 x 0.15 fixed from step
+  # 0, i.e. ~1.5% of tokens survive to the decoder. For a 12-token verbatim
+  # answer in a 2k-token document a PERFECT selector must spend ~40% of its
+  # whole budget on the answer span, which is plausibly below the level where
+  # the span loss carries usable signal — one explanation for L1 sitting at
+  # +0.138 sd (chance is +0.000, L0 reaches +0.517) for thousands of steps.
+  # Start loose so the signal exists, then descend. Monotonic decrease only.
+  l0_retention:
+    fileneedle: {start: 0.35, end: 0.10, ramp_steps: 1000}
+    grepset:    {start: 0.35, end: 0.10, ramp_steps: 1000}
+    # xref answers are ~15 chars and anchored, so they need locating rather
+    # than bulk reproduction; the standard ramp applies.
+    xref:       {start: 0.35, end: 0.10, ramp_steps: 1000}
+    # NOT the same ramp as the others any more. v10 used 0.35->0.10, which
+    # composes with the global L1 0.50->0.15 to ~1.5% effective retention --
+    # and reproducing a verbatim span from 1.5% of a document is not a test
+    # of whether the reps carry content, it is a test of nothing.
+    #
+    # The START is unchanged from v10 at 0.35, and that is a memory
+    # constraint, not a preference. Effective retention is L0 x L1 and both
+    # descend, so the PEAK is at step 0: the first v11 launch tried
+    # 0.60 -> 0.30 and died at step 5 with CUDA OOM at 73.3 GB against a
+    # 72.98 GB cap, in the decoder SwiGLU forward -- L1 attention is
+    # quadratic in survivor count, and 0.60 x 0.50 = 30% effective nearly
+    # doubled v10's 17.5% peak.
+    #
+    # Only the FLOOR moves, which is the half that mattered: 0.35 -> 0.30
+    # composes to 17.5% at the start (v10's proven-safe peak) and 4.5% at
+    # the end instead of 1.5%. The descent still happens, carried by the
+    # global L1 ramp 0.50 -> 0.15. At 4.5% a 2000-token document leaves ~90
+    # survivor vectors for a ~35-token answer; v10 left ~30 for ~75 tokens.
+    # FLAT at 0.30, and the descent is carried entirely by the global L1 ramp
+    # (0.50 -> 0.15), giving ~15% effective at the start and ~4.5% at the end.
+    #
+    # CORRECTED, and the correction matters more than the original claim. I
+    # said 0.30 "puts the peak below the level v10 survived 1000 steps at".
+    # It does not: at 0.30 the run reached 72.1 GB by step 30, ABOVE v10's
+    # 71.6 GB lifetime maximum, having read 67.5 GB at step 0. The peak is
+    # essentially insensitive to retention across 0.30-0.35 and is driven by
+    # batch composition, so the second restart bought nothing and the causal
+    # story I attached to it was wrong.
+    #
+    # What IS supported: the first launch at 0.60 -- a 1.7x jump, not a 0.05
+    # one -- OOM'd at step 5. Large retention changes move memory; small ones
+    # are lost in per-batch variance.
+    #
+    # The real constraint is the container's own mem_limit of 80g, which is
+    # what "72.98 GiB allowed" in the OOM referred to. Raising it would trade
+    # a clean container OOM for a HOST OOM, which on this unified-memory box
+    # kills unprotected processes instead of raising an error -- so it stays.
+    # Watch the heartbeat's peakGB; past ~76 GB this run needs intervention.
+    #
+    # Nothing is lost. The start was never what made v10 unlearnable; its END
+    # was, at 0.10 x 0.15 = 1.5% effective. 4.5% is 3x that, and the start
+    # moving 17.5% -> 15% is immaterial to a curriculum whose job is to
+    # descend.
+    reconstruct: 0.30
+  l1_retention: {start: 0.50, end: 0.15, ramp_steps: 1000}
+  selection_mode:
+    l0: exact_topk
+    l1: exact_topk
+
+  # MICROBATCH TAIL CAP. Not a diagnosis -- a bound. v11 reached 74.5 GB by
+  # step 70 against an 80g container cap, where v10 maxed at 71.6 GB over its
+  # whole 1000 steps. Three explanations were tested and all three refuted:
+  # reconstruct's retention (v11's is LOWER), the co-resident GPU job
+  # (cuda_max_allocated is process-local), and microbatch packing (both runs
+  # pack to avg_samples_per_microbatch=3.55 on a 52000-token budget, measured
+  # identical).
+  #
+  # So the cause is unknown, and this caps the TAIL rather than explaining the
+  # mean: a microbatch of many small samples runs that many sequential decoder
+  # backwards, and bounding the count bounds the peak whatever made the
+  # microbatch heavy. Stage B has used 8 for the same reason; 4 is tighter
+  # because live L0 is heavier than Stage B's cached path. Costs a few percent
+  # in step time from the extra splits.
+  max_microbatch_samples: 4
+
+  qwen_decoder_prob: 1.0
+  training_time_ablation:
+    p_skip_bgkit: 0.0
+    p_skip_topic: 0.0
+    p_noise_bgkit: 0.0
+
+  # THE isolated variable.
+  freeze_decoder_embeddings: false
+
+  survivorship:
+    survivorship_aux: true
+    span_relevance_weight: 2.0
+    # CONTRASTIVE span supervision (2026-08-28). The positive-only span loss is
+    # satisfiable WITHOUT reading the question: the union of all questions'
+    # answer spans per document is 0.4-3.1% while the L0 budget is 10%, so
+    # "keep every answer-looking position" satisfies every question at once and
+    # query-blind generic saliency is OPTIMAL. Measured: survivor-set Jaccard
+    # own-vs-foreign query 0.967, answer accuracy unchanged under the wrong
+    # question, random selection == trained selection. This term pushes DOWN
+    # the same document's OTHER answers so budget allocation depends on WHICH
+    # question is asked. Data supports it: 77-92% of rows have 2.9-4.3
+    # non-overlapping negatives.
+    # SOFT form DISABLED — measured ineffective, not merely weak. It
+    # supervises sigmoid(z - theta) while survival is decided by hard
+    # exact_topk on the z-score, so at v8 step 700 the loss had fallen
+    # 0.76 -> 0.43 while survivor Jaccard (own vs FOREIGN query) went
+    # 0.967 -> 0.991. It trained honestly against the wrong quantity.
+    span_contrastive_weight: 0.0
+    # TOP-K MARGIN form: hinge pushing the other questions' spans below the
+    # k-th largest score, which IS the survival cutoff, so progress on the
+    # loss is progress on selection by construction. Cutoff detached, or the
+    # model could drag it down to meet the negatives instead of demoting them.
+    span_margin_weight: 1.0
+    span_margin: 0.5
+    # PROJECTION EMBED-ANCHOR — the Step-2.5 repair, as a Phase-2 auxiliary.
+    # Measured on the Phase-2 checkpoint: reps at 188x the token-embedding norm
+    # with cos-to-nearest-embedding 0.156 against a -0.029 random floor, i.e.
+    # huge and nearly ORTHOGONAL to the manifold the decoder reads. Handing the
+    # decoder the answer's own token embeddings through the SAME splice scores
+    # 0.63 while real reps score 0.258 against a 0.253 floor; rescaling to the
+    # embedding norm does NOT help (0.256), so the binding defect is DIRECTION.
+    # Until this is fixed no selection or query-conditioning work can matter,
+    # because the decoder cannot read the representation at all.
+    # DISABLED 2026-08-28 — the term is INERT and was dominating the objective.
+    # Evidence: proj_embed_anchor_loss sat at 25.1-25.3 without decreasing over
+    # 20 steps while contributing 0.5*25.3 = 12.7 against a main loss of 0.69
+    # (18.3x), and grad_norm/projection stayed at 0.6209 — identical to the
+    # pre-anchor measurement. A loss that swamps the objective while making no
+    # progress on its own metric is not training anything.
+    #
+    # Cause: _run_l1_batch runs its level forwards under an OUTER non-reentrant
+    # torch.utils.checkpoint, so the `projected` tensor captured into
+    # _pending_proj_anchor OUTSIDE that region carries no usable graph. Same
+    # class as the documented CheckpointError 58-vs-55 note.
+    #
+    # Re-implement at the SPLICE site instead, where gradient demonstrably
+    # flows (decoder gradient reaches the encoder: l0/l1_content_grad_norm
+    # 0.062/0.0149). Until then this must not run: an 18x-dominant inert loss
+    # can only starve the real objective.
+    proj_anchor_weight: 0.0
+    ratio_loss_weight: 0.5
+    n_distractors: 0
+    # MANDATORY under exact_topk (2026-08-27). Every loss reaching the head is
+    # defined on the per-document z-score, which is invariant to the head's
+    # output scale — so the scale is a gradient-free direction, and Adam
+    # amplifies numerical noise on such a direction into lr-sized steps. The
+    # raw utility-grad BCE used to anchor the scale by accident; once that was
+    # standardized (33d15f1), l1_base_raw_std ran 129 -> 8431 in 30 steps.
+    # Ordering is owned by the z-scored losses, scale by this term. L0 already
+    # had an anchor via moment_match_weight, which is why only L1 ran away.
+    # CONTROL ARM (2026-08-27): both 2026-08-27 head changes DISABLED, so
+    # this is the historical behaviour resumed from the same step1022
+    # checkpoint as the treatment arm. Capability fell EM 0.250 -> 0.17 and
+    # route_exact 0.938 -> 0.44 between step 1005 and 1250, and BOTH runs
+    # across that window carried the changes — so they are the leading
+    # suspect and this isolates them.
+    standardize_utility_grad: false
+    l0:
+      head_scale_anchor_weight: 0.0
+    l1:
+      head_scale_anchor_weight: 0.0
+
+  # 1000 clears every observed collapse point with margin: v9 went under rank
+  # 2 by step 100, v5b by 836. A run holding rank through 1000 has passed
+  # through all of them. Extend via control.json if it is worth continuing --
+  # this is a verdict run, not a production run.
+  max_steps: 1000

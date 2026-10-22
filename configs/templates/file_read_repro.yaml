@@ -1,0 +1,21 @@
+name: file_read_repro
+description: >
+  Agentic conversation where user asks to read a file via bgkit,
+  the tool is called, and the assistant reproduces the file contents.
+injections:
+  file_path:
+    description: "Path to the file being read"
+    in_fields: [user_prompt, response_prefix]
+  language:
+    description: "Programming language for the code fence"
+    in_fields: []  # used only in structural assembly (code fence), not reformulated
+fields:
+  system_prompt: >
+    You are an AI coding assistant with access to the bgkit_read_file
+    tool for reading file contents.
+  user_prompt: >
+    Read the file `{file_path}`
+  compression_prompt: >
+    Return the file contents verbatim
+  response_prefix: >
+    Here are the contents of `{file_path}`:

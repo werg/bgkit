@@ -1,0 +1,89 @@
+# P1 "prompted, rung 0": INSTRUCT decoder LFM2.5-350M with its own chat
+# template, compression prompts on the encoder, and the first two prompted
+# task families (SQuAD passage QA, repo file overviews in chat and tool-call
+# framings) mixed 50/50 with the autoencode/continue stream. Decoder and
+# encoder backbone frozen (head + projection learn); the ladder opens LoRA /
+# top backbone layers when the reps are load-bearing but weak.
+model:
+  encoder_id: LiquidAI/LFM2.5-Encoder-350M
+  decoder_id: LiquidAI/LFM2.5-350M
+  head_layer: 6
+  train_backbone_layers: []
+  selection: learned
+  interface_momentum: 0.1
+  lora:
+    enabled: false
+
+data:
+  train_stores:
+    - /workspace/bgkit2_data/corpus/fineweb_train
+    - /workspace/bgkit2_data/corpus/code_train
+  train_weights: [0.6, 0.4]
+  eval_stores:
+    - /workspace/bgkit2_data/corpus/fineweb_eval
+    - /workspace/bgkit2_data/corpus/code_eval
+  prompt_style: chat
+  compression_prompts: true
+  # Prompted task families mixed with the autoencode/continue stream.
+  task_stores:
+    - /workspace/bgkit2_data/tasks/qa_squad.parquet
+    - /workspace/bgkit2_data/tasks/file_overview.parquet
+  task_weights: [0.4, 0.6]
+  task_mix: 0.5
+  task_max_ctx_tokens: 2048
+  task_max_target_tokens: 384
+  task_eval_samples: 128
+  task_gen_samples: 64
+  task_gen_max_new_tokens: 96
+  ctx_min: 64
+  ctx_max: 1024
+  cont_min: 32
+  cont_max: 256
+  p_continue: 0.5
+  batch_size: 16
+  num_workers: 4
+  eval_samples: 256
+  eval_batch_size: 16
+  gen_samples: 48
+  gen_max_new_tokens: 320
+  probe_ratio: 0.0625
+
+ratio:
+  r_max_start: 1.0
+  ceiling_steps: 2000
+  r_max: 0.25
+  r_start: 0.25
+  r_end: 0.0078125
+  descent_steps: 8000
+  p_random_selection: 0.1
+
+anchor:
+  weight: 1.0
+  floor: 0.0
+  steps: 4000
+
+optim:
+  lr_backbone: 2.0e-5
+  lr_head: 1.0e-4
+  lr_projection: 2.0e-4
+  lr_lora: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 500
+  max_steps: 20000
+  grad_clip: 1.0
+  grad_accum: 1
+
+run:
+  name: p1_prompted_frozen
+  out_dir: /workspace/checkpoints/bgkit2
+  seed: 0
+  dtype: bfloat16
+  device: cuda
+  log_every: 10
+  eval_every: 1000
+  save_every: 1000
+  keep_last: 3
+  gradient_checkpointing: true
+  resume: true
+  wandb: true
+  wandb_project: bgkit2

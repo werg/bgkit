@@ -1,0 +1,40 @@
+\begin{tabular}{llrrrr|r}
+\toprule
+Benchmark ($n$) & Budget & bgkit & text & base & summary & \shortstack{base,\\full context} \\
+\midrule
+BABILong 16k (100) & 1,024 & \textbf{0.74} & 0.12 & 0.08 & -- & 0.18 \\
+\quad 15.4k tokens & 2,048 & \textbf{0.76} & 0.19 & 0.13 & -- &  \\
+ & 4,096 & \textbf{0.74} & 0.22 & 0.13 & -- &  \\
+\midrule
+BABILong 4k (100) & 512 & \textbf{0.79} & 0.20 & 0.16 & 0.31 & 0.27 \\
+\quad 3.6k tokens & 1,024 & \textbf{0.81} & 0.26 & 0.23 & 0.23 &  \\
+ & 2,048 & \textbf{0.88} & 0.33 & 0.21 & -- &  \\
+\midrule
+RULER 4k (100) & 512 & \textbf{0.20} & 0.09 & 0.07 & -- & 0.58 \\
+\quad 3.7k tokens & 1,024 & \textbf{0.20} & 0.15 & 0.11 & -- &  \\
+ & 2,048 & 0.17 & 0.22 & \textbf{0.24} & -- &  \\
+\midrule
+QuALITY (100) & 512 & 0.36 & 0.31 & 0.25 & \textbf{0.42} & 0.31 \\
+\quad 6.0k tokens & 1,024 & \textbf{0.36} & 0.33 & 0.27 & -- &  \\
+ & 2,048 & 0.37 & 0.34 & 0.26 & \textbf{0.45} &  \\
+\midrule
+NarrativeQA (60) & 2,048 & \textbf{0.17} & 0.07 & 0.05 & -- & -- \\
+\quad 58.6k tokens & 4,096 & \textbf{0.17} & 0.10 & 0.10 & -- &  \\
+ & 8,192 & \textbf{0.15} & 0.12 & 0.08 & -- &  \\
+\midrule
+HotpotQA (100) & 256 & \textbf{0.64} & 0.23 & 0.25 & 0.55 & 0.45 \\
+\quad 1.4k tokens & 512 & \textbf{0.62} & 0.35 & 0.27 & 0.53 &  \\
+ & 1,024 & \textbf{0.60} & 0.37 & 0.39 & -- &  \\
+\midrule
+MuSiQue (100) & 512 & 0.30 & 0.08 & 0.08 & \textbf{0.42} & 0.13 \\
+\quad 2.5k tokens & 1,024 & 0.31 & 0.08 & 0.10 & \textbf{0.40} &  \\
+ & 2,048 & \textbf{0.33} & 0.16 & 0.10 & -- &  \\
+\midrule
+LongMemEval-S (60) & 2,048 & \textbf{0.30} & 0.18 & 0.10 & -- & -- \\
+\quad 110.7k tokens & 4,096 & \textbf{0.23} & 0.15 & 0.05 & -- &  \\
+ & 8,192 & \textbf{0.20} & 0.15 & 0.02 & -- &  \\
+\midrule
+LoCoMo (100) & 1,024 & \textbf{0.28} & 0.09 & 0.08 & -- & 0.19 \\
+\quad 18.8k tokens & 2,048 & \textbf{0.28} & 0.16 & 0.13 & -- &  \\
+\bottomrule
+\end{tabular}

@@ -1,0 +1,84 @@
+# @package _global_
+# babilong_v1: teach the wide net long-prose semantic fact recall, the
+# capability BABILong measures (2026-08-25).
+#
+# The zero-shot BABILong arm evaluates a net trained only on code/log
+# retrieval (fileneedle / lognav / grepset / swerecall). This run adds the
+# `babilong_style` family — bAbI TRAIN facts buried in FineWeb-Edu prose,
+# with exact gold spans on the supporting sentence — while keeping the four
+# wide-net datasets in the mix so the code capability is not traded away.
+# The caps balance the mix rather than letting 100k code samples bury 3k
+# prose ones.
+#
+# Retention is v6's 67x and the run continues from v6's final checkpoint:
+# the decoder already reads reps at that density, so this trains the
+# SELECTION side on a new content distribution rather than re-teaching the
+# read-out. 67x is also where the headline claim lives — a 32k context
+# reaching the decoder in ~470 positions, 8x fewer than truncate-4k.
+#
+# Span supervision is the point of this family, hence span_relevance_weight
+# above the v6 default: the gold span is exact here (we inserted the
+# sentence), unlike the offset-matched spans of the code datasets.
+defaults:
+  - /config
+  - /training/phase2_kb_stage_a
+  - _self_
+
+run_name: phase2_kb_babilong_v1
+
+training:
+  dynamic_ckpt:
+    enabled: true
+    flush_when_free_below_gb: 30
+  eval_every: 250
+  save_every: 500
+  warmup_steps: 100
+  eval_ablation_modes: [zeroed]
+  eval_train_subset_samples: 64
+  eval_free_running_samples: 64
+  eval_free_running_max_new_tokens: 256
+  eval_free_running_max_tool_calls: 2
+  profile_timing: true
+  grad_norm_groups_every: 25
+
+  datasets:
+    - babilong_style
+    - lognav
+    - fileneedle
+    - grepset
+    - swerecall
+  max_samples_per_dataset:
+    babilong_style: 3200
+    lognav: 800
+    fileneedle: 800
+    grepset: 800
+    swerecall: 800
+  max_samples_per_dataset_default: 800
+
+  # 0.10 * 0.15 = 0.015 of content tokens reach the decoder (v6's ratio).
+  l0_retention:
+    babilong_style: 0.10
+    lognav: 0.10
+    fileneedle: 0.10
+    grepset: 0.10
+    swerecall: 0.10
+  l1_retention: 0.15
+  selection_mode:
+    l0: exact_topk
+    l1: exact_topk
+
+  qwen_decoder_prob: 1.0
+  training_time_ablation:
+    p_skip_bgkit: 0.0
+    p_skip_topic: 0.0
+    p_noise_bgkit: 0.0
+
+  survivorship:
+    survivorship_aux: true
+    span_relevance_weight: 3.0
+    ratio_loss_weight: 0.5
+    n_distractors: 0
+
+  stage_a_checkpoint: /workspace/checkpoints_fast/phase2_kb_step2629_20260824_002147_192565_run-phase2_kb_widenet_v6
+
+  max_steps: 2000

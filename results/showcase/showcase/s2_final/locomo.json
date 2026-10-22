@@ -1,0 +1,102 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/locomo.jsonl",
+ "n": 100,
+ "budgets": [
+  1024,
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 339,
+ "summary": {
+  "bgkit@1024": {
+   "em": 0.11,
+   "f1": 0.2385,
+   "contains": 0.16,
+   "prefix": 1107.14,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 0.7391,
+   "dec_s": 0.0902,
+   "judge_acc": 0.28
+  },
+  "text@1024": {
+   "em": 0.02,
+   "f1": 0.1103,
+   "contains": 0.04,
+   "prefix": 1093.14,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1248,
+   "judge_acc": 0.09
+  },
+  "base@1024": {
+   "em": 0.01,
+   "f1": 0.0836,
+   "contains": 0.02,
+   "prefix": 1093.14,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1182,
+   "judge_acc": 0.08
+  },
+  "agent_memory@agent": {
+   "em": 0.01,
+   "f1": 0.049,
+   "contains": 0.02,
+   "oom": 0.0,
+   "answered": 0.45,
+   "turns": 3.93,
+   "n_read": 0.6,
+   "n_search": 0.67,
+   "decoder_tokens": 5678.0,
+   "encoder_tokens_nominal": 19508.02,
+   "encoder_tokens_computed": 2592.94,
+   "index_tokens": 18813.95,
+   "index_reps": 306.84,
+   "read_tokens": 450.94,
+   "search_tokens": 243.13,
+   "cache_hits": 103.67,
+   "enc_s": 0.1215,
+   "dec_s": 0.8124,
+   "prefix": 1513.06,
+   "judge_acc": 0.06
+  },
+  "bgkit@2048": {
+   "em": 0.09,
+   "f1": 0.2294,
+   "contains": 0.16,
+   "prefix": 2130.28,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 0.7357,
+   "dec_s": 0.1226,
+   "judge_acc": 0.28
+  },
+  "text@2048": {
+   "em": 0.02,
+   "f1": 0.1371,
+   "contains": 0.07,
+   "prefix": 2117.1,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1617,
+   "judge_acc": 0.16
+  },
+  "base@2048": {
+   "em": 0.01,
+   "f1": 0.112,
+   "contains": 0.03,
+   "prefix": 2117.1,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1472,
+   "judge_acc": 0.13
+  }
+ }
+}

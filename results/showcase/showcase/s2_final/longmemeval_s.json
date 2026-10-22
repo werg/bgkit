@@ -1,0 +1,136 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/longmemeval_s.jsonl",
+ "n": 60,
+ "budgets": [
+  2048,
+  4096,
+  8192
+ ],
+ "slot_tokens": 2048,
+ "seconds": 1604,
+ "summary": {
+  "bgkit@2048": {
+   "em": 0.1833,
+   "f1": 0.2979,
+   "contains": 0.2167,
+   "prefix": 2252.25,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 5.1211,
+   "dec_s": 0.1083,
+   "judge_acc": 0.3
+  },
+  "text@2048": {
+   "em": 0.0333,
+   "f1": 0.174,
+   "contains": 0.1,
+   "prefix": 2144.85,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1675,
+   "judge_acc": 0.1833
+  },
+  "base@2048": {
+   "em": 0.0,
+   "f1": 0.1269,
+   "contains": 0.0833,
+   "prefix": 2144.85,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1784,
+   "judge_acc": 0.1
+  },
+  "agent_memory@agent": {
+   "em": 0.0333,
+   "f1": 0.057,
+   "contains": 0.0333,
+   "oom": 0.0,
+   "answered": 0.6667,
+   "turns": 3.55,
+   "n_read": 0.8,
+   "n_search": 0.0,
+   "decoder_tokens": 9705.3,
+   "encoder_tokens_nominal": 112367.05,
+   "encoder_tokens_computed": 112366.75,
+   "index_tokens": 110679.7333,
+   "index_reps": 1013.0833,
+   "read_tokens": 1687.3167,
+   "search_tokens": 0.0,
+   "cache_hits": 129.3,
+   "enc_s": 6.7307,
+   "dec_s": 0.8638,
+   "prefix": 2849.8333,
+   "judge_acc": 0.05
+  },
+  "bgkit@4096": {
+   "em": 0.1333,
+   "f1": 0.2539,
+   "contains": 0.15,
+   "prefix": 4295.3667,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 4.8978,
+   "dec_s": 0.1692,
+   "judge_acc": 0.2333
+  },
+  "text@4096": {
+   "em": 0.0,
+   "f1": 0.1471,
+   "contains": 0.0833,
+   "prefix": 4192.7833,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.247,
+   "judge_acc": 0.15
+  },
+  "base@4096": {
+   "em": 0.0,
+   "f1": 0.1368,
+   "contains": 0.0833,
+   "prefix": 4192.7833,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2334,
+   "judge_acc": 0.05
+  },
+  "bgkit@8192": {
+   "em": 0.1167,
+   "f1": 0.2476,
+   "contains": 0.1667,
+   "prefix": 8387.3167,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 4.988,
+   "dec_s": 0.314,
+   "judge_acc": 0.2
+  },
+  "text@8192": {
+   "em": 0.0,
+   "f1": 0.1566,
+   "contains": 0.0833,
+   "prefix": 8288.8667,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.4197,
+   "judge_acc": 0.15
+  },
+  "base@8192": {
+   "em": 0.0,
+   "f1": 0.0881,
+   "contains": 0.0333,
+   "prefix": 8288.8667,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.36,
+   "judge_acc": 0.0167
+  }
+ }
+}

@@ -1,0 +1,1696 @@
+x-gpu-common: &gpu-common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  # Run as host user so files written to bind mounts (checkpoints, HF cache)
+  # are owned by the host user, not root.
+  user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+  # Hard memory cap: DGX Spark has 128 GB unified (CPU+GPU share one pool). A
+  # runaway CUDA alloc OOM-kills host processes (including the Claude Code
+  # harness). The cap bounds the container; anything above this limit gets
+  # container-scoped OOM'd rather than taking down the host. 80 GB leaves
+  # ~48 GB headroom for the OS, harness, and any concurrent Docker services.
+  # Added 2026-04-20 after an unsupervised profiler run crashed the host.
+  mem_limit: 80g
+  memswap_limit: 80g
+  # Stop grace period: the emergency-save handler serializes encoder + decoder
+  # + optimizer state on SIGTERM. For a 500M-param Muon-trained model on
+  # the external spinning-disk checkpoint dir, that's 20-60 s. Docker
+  # Compose's default 10 s is not enough — SIGKILL lands mid-save and the
+  # emergency checkpoint is lost. Raised to 180 s on 2026-04-21 after a
+  # phase1_step3 stop at step ~4250 lost ~250 steps because the save
+  # didn't finish before SIGKILL.
+  # 600s (was 180s): a graceful stop triggers an emergency checkpoint save, and
+  # checkpointing.save_checkpoint now fsyncs before returning. A large ckpt
+  # (summarization: ~15 GB / ~9 GB bf16) fsynced to the slow USB HDD
+  # (/mnt/external, ~27 MB/s) can exceed 180s, so docker SIGKILLs mid-fsync and
+  # the emergency save is lost (safe — atomic rename → falls back to the last
+  # periodic checkpoint — but wasteful). 600s lets it complete.
+  stop_grace_period: 600s
+  # DataLoader workers hand tensors to the main process through torch's
+  # file_descriptor sharing strategy: one open fd per tensor in flight. Docker's
+  # default soft nofile (1024) ran out at step ~375 of bgkit2_8b_a (2026-09-25),
+  # whose two-tokenizer batches carry one decoder-side id tensor per tool slot.
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 524288
+  # Auto-recover on crash: if training exits with a non-zero status (OOM,
+  # CUDA error, kernel panic), Docker restarts the container. The trainer
+  # always resumes from the latest registered checkpoint via
+  # `bgkit_checkpoint: auto`, so a single restart loses at most
+  # save_every (500) steps. ``unless-stopped`` (vs ``on-failure``) means
+  # the container doesn't restart if WE bring it down deliberately
+  # (``compose stop``), only if it crashes.
+  restart: unless-stopped
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  environment:
+    - HOME=/workspace
+    - HYDRA_FULL_ERROR=1
+    # Triton autotuner crash on sm_121 is handled by bgkit.utils.triton_patch
+    # Persist torch.compile cache across container restarts
+    - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+    # Triton autotune cache. Default is ~/.triton/cache (= /workspace/.triton
+    # under HOME=/workspace), which is in the container's writable layer and
+    # gets wiped by ``docker compose rm``. Point it at the bind-mounted
+    # CHECKPOINT_DIR so the autotune.json files persist across container
+    # removal — meaning each (kernel, shape) signature is autotuned ONCE
+    # ever, not once per container life. Eliminates the ~50-step JIT-warmup
+    # tail after each restart. (PR #798's `fla/configs/` mechanism is the
+    # static, ship-with-fork variant; this is the live, grow-during-training
+    # variant. They coexist.)
+    - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+    # NVMe fast checkpoint dir: trainers write checkpoints here (fast fsync, no
+    # spinning-disk dirty-page spike), then async-copy to the HDD archive
+    # (${CHECKPOINT_DIR}). Backed by a host bind-mount on NVMe (see volumes), so
+    # it survives container restarts and resume can prefer the NVMe copy.
+    - BGKIT_FAST_CHECKPOINT_DIR=/workspace/checkpoints_fast
+    # Use shipped GB10 FLA configs before falling back to Triton autotune.
+    # This keeps the conservative GDR h/dhu BV=16 defaults from adding
+    # repeated autotune stalls on future training restarts.
+    - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
+    # Keep Blackwell's fused GDR backward path explicit in every training
+    # service. Real Step 5 fixed-batch profiling is faster and lower-peak-memory
+    # with saved GDR intermediates off, so default to recompute unless an A/B run
+    # explicitly overrides it.
+    - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-0}
+    - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
+    - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
+    - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
+    - FLA_GDR_FUSE_DQKG_WY=${FLA_GDR_FUSE_DQKG_WY:-1}
+    - FLA_GDR_FUSE_GATE_BWD=${FLA_GDR_FUSE_GATE_BWD:-1}
+    # TileLang/TVM caches for FlashQLA JIT kernels. The image provides the
+    # toolchain; these dirs keep compiled artifacts out of the container layer.
+    - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+    - TVM_CACHE_DIR=/workspace/.cache/tvm
+    # FLA is the default GatedDeltaNet backend on sm_121. It carries the
+    # local Blackwell compatibility and GDR backward optimizations. Set
+    # BGKIT_GDN_BACKEND=flashqla for explicit FlashQLA testing, or =auto to
+    # prefer FlashQLA when it becomes faster and falls back cleanly.
+    - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+    - BGKIT_MEM_BREAKDOWN=${BGKIT_MEM_BREAKDOWN:-0}
+    # Cap the phase2_kb setup-time trajectory coverage scan to a bounded random
+    # sample per split (the full O(n) parse is pathological at 1.87M+ samples,
+    # e.g. git_commit_repro / Stage B). Only triggers when a split exceeds the
+    # cap; smaller datasets still full-scan. Unset/<=0 = full scan.
+    - BGKIT_COVERAGE_SCAN_MAX_SAMPLES=${BGKIT_COVERAGE_SCAN_MAX_SAMPLES:-2000}
+    # Apple Cut Cross Entropy is the GB10 default for decoder LM loss:
+    # measured 2026-05-07 at seq2048 as ~7% lower total step time and
+    # ~2.8 GiB lower peak memory than BgKIT chunked CE. Set =chunked for
+    # fallback/bisecting; missing CCE package falls back safely.
+    - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
+    # Local mamba-ssm fork: skip GB10/sm_121 Triton autotune configs that
+    # repeatedly exceed the 101 KB shared-memory cap on Falcon-H1 shapes.
+    - MAMBA_SM121_SAFE_AUTOTUNE=${MAMBA_SM121_SAFE_AUTOTUNE:-1}
+    # Prefer measured Falcon-H1 GB10 configs in the local mamba fork. Set to 0
+    # to restore full Triton autotune for A/B runs.
+    - MAMBA_SM121_STATIC_CONFIGS=${MAMBA_SM121_STATIC_CONFIGS:-1}
+    # BgKIT-owned Falcon-H1 training fast path in the local mamba fork. Skips
+    # generic stride guards and pins the teacher-forced Mamba2 contract.
+    - MAMBA_FALCON_SM121_FASTPATH=${MAMBA_FALCON_SM121_FASTPATH:-1}
+    # Falcon-H1 Tiny trainable decoder defaults. These are the measured-fast
+    # real-training settings from the Falcon L0 optimization pass: keep the
+    # patch active, use packed QKV and packed gate/up MLP params, use the
+    # BgKIT-owned trainable MLP/Mamba backward boundaries, save the Mamba
+    # intermediates that avoid slower recompute, and keep rejected attention /
+    # wider layer-loop probes off unless an explicit A/B run overrides them.
+    - BGKIT_FALCON_H1_PATCH=${BGKIT_FALCON_H1_PATCH:-1}
+    - BGKIT_FALCON_H1_PACKED_MAMBA_SEQIDX=${BGKIT_FALCON_H1_PACKED_MAMBA_SEQIDX:-1}
+    - BGKIT_FALCON_H1_PACKED_QKV=${BGKIT_FALCON_H1_PACKED_QKV:-1}
+    - BGKIT_FALCON_H1_ATTENTION_CAT_QKV=${BGKIT_FALCON_H1_ATTENTION_CAT_QKV:-0}
+    - BGKIT_FALCON_H1_DIRECT_FLASH_ATTN=${BGKIT_FALCON_H1_DIRECT_FLASH_ATTN:-0}
+    - BGKIT_FALCON_H1_DIRECT_FA4_ATTN=${BGKIT_FALCON_H1_DIRECT_FA4_ATTN:-0}
+    - BGKIT_FALCON_H1_DIRECT_HF_FLASH_ATTN=${BGKIT_FALCON_H1_DIRECT_HF_FLASH_ATTN:-0}
+    - BGKIT_FALCON_H1_DIRECT_SDPA=${BGKIT_FALCON_H1_DIRECT_SDPA:-0}
+    - BGKIT_FALCON_H1_PACKED_MLP=${BGKIT_FALCON_H1_PACKED_MLP:-1}
+    - BGKIT_FALCON_H1_MLP_CAT_GATE_UP=${BGKIT_FALCON_H1_MLP_CAT_GATE_UP:-0}
+    - BGKIT_FALCON_H1_TRAINABLE_MLP_AUTOGRAD=${BGKIT_FALCON_H1_TRAINABLE_MLP_AUTOGRAD:-1}
+    - BGKIT_FALCON_H1_SPECIALIZED_MAMBA=${BGKIT_FALCON_H1_SPECIALIZED_MAMBA:-1}
+    - BGKIT_FALCON_H1_MAMBA_INPROJ_AUTOGRAD=${BGKIT_FALCON_H1_MAMBA_INPROJ_AUTOGRAD:-1}
+    - BGKIT_FALCON_H1_MAMBA_SAVE_OUT=${BGKIT_FALCON_H1_MAMBA_SAVE_OUT:-1}
+    - BGKIT_FALCON_H1_MAMBA_SAVE_CONV=${BGKIT_FALCON_H1_MAMBA_SAVE_CONV:-1}
+    - BGKIT_FALCON_H1_MAMBA_SAVE_SCAN=${BGKIT_FALCON_H1_MAMBA_SAVE_SCAN:-1}
+    - BGKIT_FALCON_H1_MAMBA_SCAN_CHECKPOINT=${BGKIT_FALCON_H1_MAMBA_SCAN_CHECKPOINT:-0}
+    - BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL=${BGKIT_FALCON_H1_MAMBA_SKIP_D_IN_DX_KERNEL:-1}
+    - BGKIT_FALCON_H1_FUSED_INPUT_PROJ=${BGKIT_FALCON_H1_FUSED_INPUT_PROJ:-0}
+    - BGKIT_FALCON_H1_FUSED_LAYER_LOOP=${BGKIT_FALCON_H1_FUSED_LAYER_LOOP:-0}
+    # PYTHONPATH override: prepend local kernel forks so ad-hoc Docker runs
+    # exercise the same in-situ code we are tuning. The mamba fork is first
+    # because Falcon-H1 imports pure-Python/Triton mamba_ssm ops from there;
+    # causal-conv1d remains the binary wheel from the image. Must include the
+    # Dockerfile's existing entries because compose `environment` replaces,
+    # not augments, the image ENV. Entrypoint may further prepend the FA native
+    # cache repo.
+    - PYTHONPATH=/workspace/mamba-falcon-sm121:/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+    # Last-resort host-memory guard, armed in EVERY python process by
+    # src/sitecustomize.py: exit 137 when MemAvailable stays under this many GB.
+    # CUDA allocations on unified memory are not counted by mem_limit; an
+    # unguarded probe took the host into a swap loop on 2026-09-17.
+    - BGKIT_HOST_MEM_GUARD_GB=${BGKIT_HOST_MEM_GUARD_GB:-10}
+    # Triton kernel dump (off by default; opt-in via host env to capture
+    # PTX/SASS for TMA / cp.async.bulk verification on Blackwell sm_121).
+    # See plans/ for the perf investigation context.
+    - TRITON_KERNEL_DUMP=${TRITON_KERNEL_DUMP:-0}
+    - TRITON_DUMP_DIR=${TRITON_DUMP_DIR:-/workspace/.cache/triton-dump}
+    # Unified memory tuning for DGX Spark's single 128 GB pool:
+    #   - expandable_segments:True  — grow allocations incrementally instead
+    #     of pre-reserving huge contiguous blocks (otherwise PyTorch would
+    #     push other processes into swap on shared memory).
+    #   - garbage_collection_threshold:0.8  — return freed memory to OS
+    #     when the caching allocator exceeds 80% of reservations, rather
+    #     than hoarding it. Critical on unified memory where hoarded CUDA
+    #     blocks directly reduce system RAM for the CPU.
+    #   - max_split_size_mb:512  — cap the largest split the allocator
+    #     will hand back to a single alloc request. Limits fragmentation
+    #     from mixed-size allocations (variable batch shapes in our case).
+    # Added 2026-04-18 after Step 3 stalled at step 2351 with 119 GB of
+    # unified memory consumed (~45 MB/step accumulated) — likely a mix of
+    # genuine leaks and allocator fragmentation on the variable-shape
+    # batches from TokenBudgetBatchSampler.
+    - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+    # sm_121 stream-capture interaction: load_binary on a new kernel variant
+    # inside a captured stream throws CUDA error 800 ("operation not permitted
+    # when stream is capturing"). Disable inductor CUDA graphs to prevent
+    # captures from being active when fla compiles new kernel variants.
+    - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+    - TORCH_COMPILE_DISABLE=1
+    # TMA on sm_121: re-disabled 2026-06-07. It was re-enabled 2026-04-21
+    # for the Blackwell bulk-async speedup on DeltaNet (3 of 4 Qwen3.5
+    # layers), but it is the documented trigger the comment warned about:
+    # phase1_summarization_round_robin crash-looped because the FLA
+    # Gated-DeltaNet forward kernel (chunk_gated_delta_rule_fwd_kernel_h_
+    # blockdim64) DEADLOCKS on its first launch after the CUDA caching
+    # allocator is flushed (empty_cache at a checkpoint/eval boundary) —
+    # 6 of 7 watchdog hard-exits, ~every 6 h. The step watchdog catches it
+    # at 300 s and restarts, so it limped forward but lost ~8 min/cycle and
+    # left wandb looking dead. TMA-off removes the deadlock surface; the
+    # global_scratch allocator (the NullAllocator-deadlock fix, see the
+    # fla mount comment below) stays registered with TMA off, so we keep
+    # that protection. Perf cost: loses the bulk-async DeltaNet transfer
+    # speedup. Re-enable to A/B once the FLA fork handles empty_cache +
+    # TMA descriptors safely on sm_121. See docs/fla_fork_review_2026_04_21.md
+    # and the 2026-06-07 checkpoint-boundary hang diagnosis.
+    - FLA_USE_TMA=0
+    # Build FlashAttention's native CUDA backend inside the container when the
+    # mounted host checkout doesn't provide a container-compatible binary.
+    - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=1
+    # BGKIT_ALLOW_PEER_CUDA is deliberately NOT a template default. Unified
+    # memory on DGX Spark is shared CPU+GPU (128 GB total); two GPU jobs
+    # racing for CUDA can OOM the host without warning. The startup guard
+    # refuses to start when peer CUDA usage would push us past the host
+    # safety ceiling — enable ``BGKIT_ALLOW_PEER_CUDA=1`` per-invocation
+    # (e.g. via shell env or .env) only when you've deliberately chosen to
+    # coexist with another GPU job and accept the auto-shrunk fraction.
+    # Default 0 (refuse). Same pattern for BGKIT_CUDA_MEM_FRACTION (0.65).
+    - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+    - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.65}
+    # FA4 SM12x extension toggle. Default unset = entrypoint's auto-build
+    # logic decides (set to 1 if extension imports cleanly). Override via
+    # shell env to 0 to disable (e.g. when the extension's reshape logic
+    # mishandles unusual head/kv-head configs in projection_block).
+    - FLASH_ATTENTION_SM12X_USE_EXTENSION=${FLASH_ATTENTION_SM12X_USE_EXTENSION:-}
+    # Optional Luce Qwen3.5 megakernel bootstrap. Default off because the CUDA
+    # extension is experimental for BgKIT and expensive to build; enable for
+    # smoke/benchmark runs with BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL=1.
+    - BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL=${BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL:-0}
+    # FA4 fork rebuild parallelism. entrypoint.sh sets MAX_JOBS=2 inline,
+    # but ninja can ignore that under some pip versions and default to
+    # nproc — `flash_bwd_hdim*_bf16_sm80.cu` jobs are ~3-5 GB RSS each, so
+    # 16 parallel nvccs SIGKILLs on a 115 GB cap. Force here to override.
+    - MAX_JOBS=${MAX_JOBS:-2}
+    - NVCC_THREADS=${NVCC_THREADS:-1}
+    # Step watchdog timeout (seconds). 60s is too tight for first-step JIT
+    # compile + autotune after a restart AND for trainers running with
+    # ``num_workers=0`` on /mnt/external (spinning disk) where cold mmap
+    # page faults on first batches take tens of seconds. 300s still
+    # catches real hangs while leaving room for warm-up I/O.
+    - BGKIT_STEP_TIMEOUT=${BGKIT_STEP_TIMEOUT:-300.0}
+  # DataLoader workers (num_workers > 0) exchange tensors with the main
+  # process via shared memory. Docker's default 64 MB /dev/shm fills
+  # quickly when batches are large (cached dense_seed batches are ~10 MB
+  # of bf16 embeddings each), producing "Resource temporarily unavailable"
+  # errors. 8 GB is plenty for any current training service.
+  shm_size: "8gb"
+  volumes:
+    - ${DATA_DIR}:/workspace/data
+    # NVMe overlay for FineWeb-Edu hot data (tokens + Falcon companion).
+    # The HDD copy in ${DATA_DIR}/fineweb_edu_v1 is the canonical version;
+    # this bind mount overlays the tokens/ + tokens_falcon_h1/ subpaths
+    # with NVMe-resident copies so dataloader workers don't bottleneck on
+    # the spinning disk (~30 MB/s, 165ms IO wait → 0% GPU utilization).
+    # Migrated 2026-05-23 when forced_adapt was running at 26.5 s/step on
+    # HDD; expected ~3-5 s/step on NVMe.
+    - /home/werg/bgkit-data-nvme/fineweb_edu_v1/tokens:/workspace/data/fineweb_edu_v1/tokens
+    - /home/werg/bgkit-data-nvme/fineweb_edu_v1/tokens_falcon_h1:/workspace/data/fineweb_edu_v1/tokens_falcon_h1
+    # Commit-encoding datasets for Qwen3.5 Steps 4.7 / 5 / 6 (small,
+    # ~5.3 GB total). FineWeb-Edu has no commit analog so these stay on
+    # the code corpus; NVMe overlay just avoids HDD bottleneck when
+    # those stages run.
+    - /home/werg/bgkit-data-nvme/processed/commit_encoding:/workspace/data/processed/commit_encoding
+    - /home/werg/bgkit-data-nvme/processed/commit_reproduction:/workspace/data/processed/commit_reproduction
+    - /home/werg/bgkit-data-nvme/mmap/descriptions:/workspace/data/mmap/descriptions
+    # Summarization corpora (multi_news + arxiv) NVMe overlay (2026-06-08).
+    # phase1_summarization_round_robin streams these every step with
+    # num_workers; on the HDD they bottlenecked the ~37 s/step shared base and
+    # contended with the 15 GB checkpoint writes. Canonical copy stays on the
+    # HDD ${DATA_DIR}; these overlay only the training subpaths.
+    - /home/werg/bgkit-data-nvme/multi_news_v1/processed_qwen_target:/workspace/data/multi_news_v1/processed_qwen_target
+    - /home/werg/bgkit-data-nvme/multi_news_v1/processed:/workspace/data/multi_news_v1/processed
+    - /home/werg/bgkit-data-nvme/arxiv_v1/processed_qwen_target:/workspace/data/arxiv_v1/processed_qwen_target
+    - /home/werg/bgkit-data-nvme/arxiv_v1/processed:/workspace/data/arxiv_v1/processed
+    # git_commit_repro recursive-L1 full-backprop hot data NVMe overlay (2026-06-30):
+    # the 23 GB paged .arrow + 3.1 GB token store random-paging off the HDD
+    # (sda 99% util, ~19 MB/s, GPU starved ~54%) — canonical copies stay on the HDD.
+    # (the git_commit_repro.arrow overlay was removed 2026-09-20 with the Phase-2 trajectory data;
+    #  a bind mount whose source file is gone makes Docker create a root-owned directory in its place)
+    - /home/werg/bgkit-data-nvme/mmap/phase2/git_commit_repro:/workspace/data/mmap/phase2/git_commit_repro
+    - /home/werg/bgkit-data-nvme/browse_trees/git_commit_repro.parquet:/workspace/data/browse_trees/git_commit_repro.parquet
+    - ${HF_HOME:-~/.cache/huggingface}:/workspace/hf_cache
+    - ${CHECKPOINT_DIR}:/workspace/checkpoints
+    # NVMe fast-checkpoint staging (host NVMe). Recent checkpoints land here
+    # first for fast saves; a background daemon archives them to the HDD
+    # (${CHECKPOINT_DIR}) and keeps only the last few here.
+    - /home/werg/bgkit-ckpt-fast:/workspace/checkpoints_fast
+    # Capability-packaging staging (benchmarks, trajectory corpora, LogHub,
+    # base-checkpoint copy) on NVMe — read-only for evals/baselines.
+    - /home/werg/bgkit-data-nvme/capability_packaging:/workspace/capability_packaging:ro
+    # bgkit2 reset lineage (2026-09-03): LFM2.5 token stores + eval reports.
+    - /home/werg/bgkit-data-nvme/bgkit2:/workspace/bgkit2_data
+    # Source code — the ONLY way bgkit code enters the container.
+    # Image has deps only; no bgkit in dist-packages.
+    - ../src:/workspace/bgkit/src:ro
+    - ../configs:/workspace/bgkit/configs:ro
+    - ../scripts:/workspace/bgkit/scripts:ro
+    # Local FlashAttention checkout: mounted read-only and preferred via PYTHONPATH.
+    - ../../flash-attention:/workspace/flash-attention:ro
+    # Local mamba-ssm fork overlay for Falcon-H1 kernel work. The image still
+    # installs mamba-ssm for package metadata and any compiled optional pieces,
+    # but Python/Triton sources resolve from this checkout first.
+    - ../../mamba-falcon-sm121:/workspace/mamba-falcon-sm121:ro
+    # Local flash-linear-attention fork (branch blackwell-sm121-compat):
+    # broadens IS_NVIDIA_BLACKWELL gate to capability >= 10 (covers sm_121
+    # / DGX Spark) and registers the global_scratch allocator on Blackwell
+    # even when FLA_USE_TMA=0, preventing NullAllocator deadlocks on
+    # autotuned DeltaNet kernels (3 of 4 Qwen3.5 layers). Cherry-picked
+    # from upstream 8b05e2f. Pure-Python — preferred via PYTHONPATH below
+    # so it shadows the pip-installed fla 0.4.2 in dist-packages.
+    - ../../flash-linear-attention:/workspace/fla:ro
+    # Local FlashQLA checkout (QwenLM/FlashQLA):
+    # default GDN backend. Mounted read-only for normal runs; kernels are
+    # JIT-compiled by TileLang from the training image.
+    - ../../FlashQLA:/workspace/flashqla:ro
+    # Local Luce megakernel checkout (Luce-Org/lucebox-hub/megakernel):
+    # experimental Qwen3.5-0.8B B=1 inference backend. entrypoint.sh copies
+    # this read-only mount into a writable checkpoint cache before building.
+    - ../../lucebox-hub/megakernel:/workspace/luce_megakernel:ro
+    # Wandb authenticates via netrc (machine api.wandb.ai).
+    - ~/.netrc:/workspace/.netrc:ro
+    # Persist torch.compile (inductor) and Triton kernel caches across restarts
+    - bgkit-compile-cache:/workspace/.cache/torchinductor
+    - bgkit-triton-cache:/workspace/.triton
+    - bgkit-tilelang-cache:/workspace/.cache/tilelang
+    - bgkit-tvm-cache:/workspace/.cache/tvm
+
+x-llama-common: &llama-common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile.llama
+  user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  restart: unless-stopped
+  volumes:
+    - ${DATA_DIR}/models:/models:ro
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 30
+    start_period: 120s
+
+x-vllm-common: &vllm-common
+  ipc: host
+  shm_size: "64gb"
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+  restart: unless-stopped
+  volumes:
+    - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 60
+    start_period: 300s
+
+services:
+  train:
+    <<: *gpu-common
+    command: ["scripts/train.py"]
+
+  train-joint-block:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=joint_block_pretrain"]
+
+  train-phase1-step1:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step1"]
+
+  train-phase1-step2:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step2"]
+
+  train-phase1-step3:
+    <<: *gpu-common
+    # Auto-resume to the latest on-disk Step 3 checkpoint via the
+    # registry. Compromised pre-2026-04-22 Step 3 checkpoints (trained
+    # under a bidirectional decoder due to the FA4 is_causal default
+    # bug) are archived under compromised_fa4_causal_bug/ so auto-resume
+    # only sees the post-fix step_500+ saves.
+    command: ["scripts/train.py", "+experiment=phase1_step3"]
+
+  train-phase1-step4:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step4"]
+
+  # Offline ICE → head_base_l0 distillation. Writes a sidecar checkpoint
+  # to $CHECKPOINT_DIR/survivorship_head_base_l0_<ts>/head_base_l0.pt
+  # which phase1_step4.yaml references via survivorship_head_sidecar.
+  pretrain-survivorship-head:
+    <<: *gpu-common
+    command: [
+      "scripts/pretrain_survivorship_head.py",
+      "--step2-checkpoint", "/workspace/checkpoints/phase1_step2_step19500_20260323_113116",
+      "--ice-checkpoint", "/workspace/checkpoints/ice_step89999_20260306_213825",
+      "--data-dir", "/workspace/data/mmap/structural",
+      "--output-dir", "/workspace/checkpoints",
+      "--teacher-ratio", "0.10",
+      "--max-steps", "3000",
+      "--max-batch-tokens", "16384",
+      "--lr", "1e-3",
+      "--num-workers", "2",
+    ]
+
+  train-phase1-step5:
+    <<: *gpu-common
+    # Bumped 100g -> 115g on 2026-05-07 after long-tail OOM with
+    # gradient_checkpointing=false. Leaves ~13g for the host OS + Claude
+    # Code harness on 128 GB unified memory; still bounded so a runaway
+    # CUDA alloc gets container-OOM'd rather than host-OOM-killing the
+    # harness.
+    mem_limit: 115g
+    memswap_limit: 115g
+    command: ["scripts/train.py", "+experiment=phase1_step5"]
+
+  # Phase 1 Step 4.7: bridge distillation. Teacher = frozen Step 4 L0-only
+  # encoder; student = full L0->L1 with bridge + last L0 block + first 2 L1
+  # blocks + projection_block trainable. See plans/bridge-distill-step.md.
+  # The default `BGKIT_GDN_BACKEND=fla` from gpu-common uses the optimized
+  # local FLA path on sm_121. Export `BGKIT_GDN_BACKEND=flashqla` in the
+  # shell before `docker compose up` only when testing the FlashQLA backend.
+  train-phase1-step4p7:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step4p7"]
+
+  # Phase 1 Step 4.7-v2: bridge re-distillation with extended ratio range.
+  # Teacher = original phase1_step4p7 (good projection on L0-only path);
+  # student = current phase1_step5 latest (preserves decoder LoRA, heads,
+  # most backbone training). Used to extend the bridge's training
+  # distribution to L0 ratio ~0.20 so Step 5 can operate at tighter
+  # compression without the bridge going OOD. Same image + 100g cap as
+  # Step 5 (decoder LoRA forward through projection_block needs the
+  # extra headroom).
+  train-phase1-step4p7-v2:
+    <<: *gpu-common
+    mem_limit: 100g
+    memswap_limit: 100g
+    command: ["scripts/train.py", "+experiment=phase1_step4p7_v2"]
+
+  # Phase 1 Step 4.7-v3: extends v2's bridge training to teacher_ratio=0.10
+  # (v2 used 0.20). Teacher and student both load from v2's output;
+  # student trains its bridge + last L0 block + first 2 L1 blocks +
+  # projection_block to handle the new tighter ratio range. Together
+  # v2+v3 give the bridge full coverage of Step 5's operating range.
+  train-phase1-step4p7-v3:
+    <<: *gpu-common
+    mem_limit: 100g
+    memswap_limit: 100g
+    command: ["scripts/train.py", "+experiment=phase1_step4p7_v3"]
+
+  train-phase1-step6:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step6", "++training.reset_wandb=true"]
+
+  # One-time pre-compute of encoder.l0 survivor embeddings for the dense_seed
+  # phase. Runs the frozen encoder forward across a subsample of chunks (default
+  # 30K, override with --max-chunks N) and writes a static cache to
+  # ${DATA_DIR}/processed/falcon_dense_seed_cache/. The downstream
+  # train-falcon-dense-seed service consumes this cache and runs projection-only
+  # training (no encoder forward in the loop), ~50x faster than the live
+  # encoder path. Restart policy is ``no`` because cache build is a one-shot.
+  build-falcon-dense-seed-cache:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/build_dense_seed_cache.py"]
+
+  train-falcon-dense-seed:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_falcon_dense_seed"]
+
+  train-falcon-forced-adapt:
+    <<: *gpu-common
+    # NOTE: do NOT add `environment:` block here — it would shadow
+    # gpu-common's entire env (wandb creds, triton cache paths, etc).
+    # Override BGKIT_CUDA_MEM_FRACTION via shell env when launching
+    # (gpu-common already reads it: `${BGKIT_CUDA_MEM_FRACTION:-0.65}`).
+    # FineWeb-Edu forced_adapt benefits from 0.80 + max_batch_tokens=2048
+    # + max_sample_length=768.
+    command: ["scripts/train.py", "+experiment=phase1_falcon_forced_adapt"]
+
+  # Phase C: end-to-end alignment at no compression. Encoder.l0 + projection
+  # + decoder all train; target_ratio=1.0 holds compression off so the
+  # decoder learns to reconstruct from the uncompressed projection output
+  # before any compression curriculum kicks in.
+  train-falcon-l0-align:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_falcon_l0_align"]
+
+  train-falcon-l0:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_falcon_l0"]
+
+  train-falcon-l1:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_falcon_l1"]
+
+  # Qwen3.5-0.8B realignment stage: catches the Qwen decoder up to the
+  # encoder state after a long Falcon-only training stretch. Resumes
+  # encoder + projection from the latest phase1_falcon_l0 checkpoint;
+  # Qwen decoder loads pristine from HF.
+  train-qwen-realign:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_qwen_realign"]
+
+  # Diagnostic: same realign trainer + warmstart, OLD data (processed/tokens).
+  # If this lands at low loss → realign's plateau is data-shift driven; if
+  # also high → trainer itself is broken. See configs/experiment/phase1_qwen_realign_olddata.yaml
+  train-qwen-realign-olddata:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_qwen_realign_olddata"]
+
+  # Diagnostic: ORIGINAL Step 6 trainer/config + Step 6 ckpt + NEW FineWeb
+  # data. Reveals data-shift cost vs encoder-pairing cost.
+  train-step6-diagnostic-fineweb:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step6_diagnostic_fineweb"]
+
+  # Final diagnostic: Step 6 trainer + Step 6 ckpt + OLD processed/tokens.
+  # Should reproduce ~0.85 baseline, proving ckpt+trainer aren't broken
+  # and the realign plateau on FineWeb is purely data-shift cost.
+  train-step6-diagnostic-olddata:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step6_diagnostic_olddata"]
+
+  # Decisive: realign trainer + Step 6's PAIRED encoder+decoder (no
+  # warmstart merge) + processed_v2 data. Tests whether the realign
+  # plateau at 4.40 is caused by the warmstart's broken encoder/decoder
+  # pairing — should descend fast toward Step 6's baseline if so.
+  train-qwen-realign-paired-baseline:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_qwen_realign_paired_baseline"]
+
+  train-qwen-projection-warmup:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_qwen_projection_warmup"]
+
+  # Round-robin Qwen+Falcon decoder summarization training.
+  # Both decoders loaded simultaneously; encoder + both projection_blocks
+  # + both decoders co-evolve under per-microbatch decoder routing.
+  # Override gpu-common's 80g mem_limit to 115g — two decoders + two-level
+  # encoder + Muon optimizer state pushes past 80g even at small batches.
+  # ALSO set BGKIT_CUDA_MEM_FRACTION=0.85 in your shell env (or .env)
+  # before launching this service — the gpu-common template defaults to
+  # 0.65 (== ~79 GB cap on 121 GB Spark) which is too low here.
+  train-summarization-round-robin:
+    <<: *gpu-common
+    # 111g (was 115g): reserve ~10g of the 121g unified pool for the host so a
+    # container memory spike triggers cgroup-local reclaim of its own ~26g of
+    # reclaimable mmap page cache instead of a GLOBAL oom that kills user-session
+    # processes incl. the Claude harness (2026-06-09). The genuine training
+    # working set is only ~45g (16g CPU anon + 29g GPU); the trimmed 4g is
+    # reclaimable dataset page cache, so this costs ~0 training perf. NOTE: GPU
+    # allocations are only partially cgroup-charged, so this is partial
+    # protection — do NOT run a second GPU job in this container concurrently.
+    mem_limit: 111g
+    memswap_limit: 111g
+    # pin_memory=false: page-locked dataloader buffers can't be served from the
+    # ~49g reclaimable page cache, so they need truly-free RAM (~9g) and trigger
+    # global OOMs that killed the shell/Claude session (memory.events oom_kill,
+    # 2026-06-08). Plain pageable buffers let the kernel manage them against the
+    # cache. num_workers stays 6 (NVMe throughput); the pin was the culprit.
+    command: ["scripts/train.py", "+experiment=phase1_summarization_round_robin", "++compute.num_workers=6", "++compute.pin_memory=false"]
+
+  # Docker-native Falcon-H1 kernel harness. This is the reusable check for
+  # mamba-ssm fork overlays and attention fallback guards; override args by
+  # passing the script path plus flags to `docker compose run --rm ...`.
+  benchmark-falcon-h1-kernels:
+    <<: *gpu-common
+    restart: "no"
+    command:
+      [
+        "scripts/benchmark_falcon_h1_kernels.py",
+        "--shape",
+        "smoke",
+        "--modes",
+        "train,prefill,decode",
+        "--batch-size",
+        "1",
+        "--seq-len",
+        "128",
+        "--warmup",
+        "1",
+        "--iters",
+        "3",
+      ]
+
+  benchmark-falcon-h1-cache-sweep:
+    <<: *gpu-common
+    restart: "no"
+    command:
+      [
+        "scripts/benchmark_falcon_h1_kernels.py",
+        "--shape",
+        "smoke",
+        "--modes",
+        "prefill,decode",
+        "--batch-sizes",
+        "1,2",
+        "--seq-lens",
+        "32,128,512",
+        "--warmup",
+        "1",
+        "--iters",
+        "3",
+      ]
+
+  benchmark-falcon-h1-attention:
+    <<: *gpu-common
+    restart: "no"
+    command:
+      [
+        "scripts/benchmark_falcon_h1_kernels.py",
+        "--shape",
+        "smoke",
+        "--modes",
+        "attention",
+        "--batch-sizes",
+        "1,2",
+        "--seq-lens",
+        "128,512",
+        "--warmup",
+        "1",
+        "--iters",
+        "3",
+      ]
+
+  profile-falcon-h1-training:
+    <<: *gpu-common
+    restart: "no"
+    command:
+      [
+        "scripts/profile_training_step.py",
+        "+experiment=phase1_falcon_l0",
+        "++step1_checkpoint=null",
+        "++training.decoder_lora.enabled=false",
+        "+profile.warmup_steps=1",
+        "+profile.steps=2",
+        "+profile.topk=40",
+        "+profile.fixed_batches=true",
+        "+profile.repeat_first_fixed_step=true",
+        "+profile.capture_profiler=false",
+      ]
+
+  # Phase 1 Step 2.5: projection-only embed-anchor repair. Loads Step 2
+  # checkpoint, freezes compressor + decoder, re-trains only the
+  # projection block so its output lands on decoder.embed_tokens
+  # manifold. See scripts/analyze_embedding_deviation.py for the
+  # motivating diagnostic.
+  train-phase1-step2p5:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase1_step2p5"]
+
+  train-phase2-kb-stage-a:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase2_kb_stage_a"]
+
+  train-phase2-kb-stage-b:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase2_kb_stage_b"]
+
+  # Capability-packaging Family B first run (lognav log-needle QA), Stage-A
+  # recipe from the summarization step-51945 base. restart: "no" for the
+  # bring-up phase so an early crash stays visible; flip to unless-stopped
+  # once stable.
+  train-phase2-kb-lognav:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_lognav"]
+
+  # Family B v2: lognav + fileneedle mix continuing from the lognav v1 final
+  # state, with survivorship aux ON + exact-topk L1 selection.
+  train-phase2-kb-widenet-v2:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v2"]
+
+  # Ratio-ladder stage v3a (~6x), continuing from v2 final.
+  train-phase2-kb-widenet-v3a:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v3a"]
+
+  # Four-dataset mix (lognav+fileneedle+grepset+swerecall) from v3a state.
+  train-phase2-kb-widenet-v4:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v4"]
+
+  # v5: gold-span relevance supervision on the 4-dataset mix, from v4 final.
+  train-phase2-kb-widenet-v5:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v5"]
+
+  # v6: clean wide-net baseline from step 0 with the final selection operator
+  # (z-scored exact_topk), per-level aux weights, Qwen-only (2026-08-22).
+  train-phase2-kb-widenet-v6:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v6"]
+
+  # v7-ratio6x: 1,000-step retention data point at ~6× (L0 0.35 × L1 0.5)
+  # continuing from the v6 final ckpt — the live-reps retention test the
+  # void v3a verdict never ran, and the 2nd Pareto point (2026-08-24).
+  train-phase2-kb-widenet-v7-ratio6x:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v7_ratio6x"]
+
+  # LR-fix probe: v6's config from the base for 400 steps with lm_health on
+  # every eval — the controlled test of the per-group-LR defect (26fc012).
+  train-phase2-kb-widenet-lrprobe:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_lrprobe"]
+
+  # Isolation arm: lrprobe with the embedding freeze OFF, to separate the
+  # per-group-LR fix from the freeze.
+  train-phase2-kb-widenet-lrprobe-nofreeze:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_lrprobe_nofreeze"]
+
+  train-phase2-kb-widenet-control-armb:
+    <<: *gpu-common
+    restart: "no"
+    # EXPLICIT resume is required. Dropping it did NOT auto-resume from this
+    # run's own checkpoints — it cold-started from the Phase-1 summarization
+    # base (step51945), silently discarding 1258 steps. Auto-resume did not
+    # match the new run_name. Point it at the latest control_armb checkpoint
+    # and UPDATE THIS PATH when resuming further.
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_control_armb",
+      "+resume_checkpoint=/workspace/checkpoints/phase2_kb_step1258_20260827_193854_503259_run-phase2_kb_widenet_control_armb"]
+
+  # v8: swerecall dropped (40% of rows, answers named in the question) plus a
+  # retention curriculum on both levels. Fresh run from the Phase-1 base — no
+  # resume pin, so it must NOT inherit control_armb's state.
+  train-phase2-kb-widenet-v8:
+    <<: *gpu-common
+    restart: "no"
+    # EXPLICIT resume pin — v8 now has checkpoints and auto-resume does NOT
+    # match on run_name (it cold-started control_armb from the Phase-1 base and
+    # discarded 1258 steps). UPDATE THIS PATH when resuming from a later step.
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v8",
+      "+resume_checkpoint=/workspace/checkpoints/phase2_kb_step2827_20260829_203241_421138_run-phase2_kb_widenet_v8"]
+
+  # Wide-net v9: the decoder-interface contract arm. COLD START from the
+  # Phase-1 base -- auto-resume is run-scoped by run_name, and this run has no
+  # checkpoints, so it starts where the encoder's reps still identify their own
+  # document (per-document effective rank 12.97). Do NOT add a resume pin.
+  train-phase2-kb-widenet-v9-interface:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v9_interface"]
+
+  # Wide-net v10: the information-forcing arm. v9 + the `reconstruct` family,
+  # cold start from the Phase-1 base. Auto-resume is run-scoped and this run
+  # has no checkpoints; do NOT add a resume pin.
+  train-phase2-kb-widenet-v10-reconstruct:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v10_reconstruct"]
+
+  # Wide-net v11: reconstruction made learnable (shorter spans + its own L0
+  # retention curriculum). Cold start from the Phase-1 base; no resume pin.
+  train-phase2-kb-widenet-v11-reconstruct-learnable:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py",
+      "+experiment=phase2_kb_widenet_v11_reconstruct_learnable"]
+
+  # Wide-net v12: the task refactor. xref replaces lognav; the curriculum
+  # ramp now matches max_steps so it actually completes. Cold start from the
+  # Phase-1 base; no resume pin.
+  # ---------------------------------------------------------------------
+  # bgkit2 — the reset lineage (plans/reset_2026_09_03.md). LFM2.5 encoder +
+  # frozen LFM2.5 decoder; no DeltaNet/FLA/FlashQLA involved, so the GDN
+  # backend env is irrelevant here (the entrypoint still validates it).
+  # ---------------------------------------------------------------------
+  # bgkit2 on BaseTrainer via scripts/train.py (CUDA fraction cap, memory
+  # guard, watchdog, registry, live config). THE launch path from 2026-09-04;
+  # (the standalone bgkit2_train.py launcher was deleted 2026-09-08: it had drifted.)
+  train-bgkit2-p1:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p1_prompted"]
+
+  train-bgkit2-p8:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p8_declora_kd_on_p7c"]
+
+  train-bgkit2-p9:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p9_enclora_prenorm"]
+
+  train-bgkit2-p10:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p10_toplayers_prenorm"]
+
+  train-bgkit2-p11:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p11_fullenc_prenorm"]
+
+  train-bgkit2-p12:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p12_joint_kdonly"]
+
+  train-bgkit2-p13:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p13_ftteacher_kdonly"]
+
+  train-bgkit2-p14:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p14_moments_ftteacher"]
+
+  train-bgkit2-p15:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p15_token_residual"]
+
+  train-bgkit2-p15b:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p15b_token_pruning"]
+
+  train-bgkit2-p15c:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p15c_token_residual_floor"]
+
+  train-bgkit2-p15d:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p15d_random_pruning"]
+
+  train-bgkit2-p16:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p16_tokens_plus_slots"]
+
+  train-bgkit2-p17:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p17_learned_pruning"]
+
+  train-bgkit2-p18:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p18_teacher_attn_selection"]
+
+  train-bgkit2-p18d:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p18d_random_control"]
+
+  train-bgkit2-p18n:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p18n_no_prompt"]
+
+  train-bgkit2-p19a:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19a_projection_pretrain"]
+
+  train-bgkit2-p19b:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19b_hold_then_descend"]
+
+  train-bgkit2-p19d:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19d_decoder_lora"]
+
+  train-bgkit2-p19e:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19e_kd_only"]
+
+  train-bgkit2-p19f:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19f_chunks_diverse"]
+
+  train-bgkit2-p19g:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19g_fulltext_lora"]
+
+  train-bgkit2-p19h:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19h_descend_teacher"]
+
+  train-bgkit2-p19i:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19i_needle"]
+
+  train-bgkit2-p19j:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19j_wideband"]
+
+  train-bgkit2-p19k:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19k_encoder_prompt"]
+
+  train-bgkit2-p19l:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19l_prompt_contrast"]
+
+  train-bgkit2-p19m:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19m_symmetric_contrast"]
+
+  train-bgkit2-p19n:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19n_paired_contrast"]
+
+  train-bgkit2-p19o:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19o_prompt_route"]
+
+  train-bgkit2-p19p:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19p_vanilla_contrast"]
+
+  train-bgkit2-p19q:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19q_attn_selection"]
+
+  train-bgkit2-p20:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p20_clean_recipe"]
+
+  train-bgkit2-p21:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p21_long_context"]
+
+  train-bgkit2-p22:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p22_long_horizon"]
+
+  train-bgkit2-p24:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p24_open_decoder"]
+
+  train-bgkit2-p26:
+    <<: *gpu-common
+    restart: "no"
+    # NOTE: do NOT add an `environment:` key here — it REPLACES the gpu-common
+    # anchor's list instead of extending it, and the container then starts
+    # without PYTHONPATH / FLASH_ATTENTION_* / BGKIT_* and dies in entrypoint.sh
+    # ("FLASH_ATTENTION_SM12X_USE_EXTENSION: unbound variable", 2026-09-15).
+    # Per-run allocator changes go in .env (BGKIT_CUDA_MEM_FRACTION).
+    command: ["scripts/train.py", "+experiment=bgkit2_p26_agentic_distill"]
+
+  train-bgkit2-m1:
+    <<: *gpu-common
+    restart: "no"
+    # Stage A of the multi-level encoder: pre-warm encoder.repro alone.
+    # No `environment:` key here — it would REPLACE the gpu-common anchor's
+    # list and the container dies in entrypoint.sh (see train-bgkit2-p26).
+    # Pinned to P26's image: the Dockerfile is unchanged, and a new service name
+    # otherwise triggers a cold rebuild under its own tag (a 30-minute network
+    # pull, and drift from the image the measured runs actually used).
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_m1_repro_prewarm"]
+
+  train-bgkit2-m2:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_m2_bridge_distill"]
+
+  train-bgkit2-m2b:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_m2b_bridge_distill_grouped"]
+
+  train-bgkit2-m3:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_m3_tree_nav"]
+
+  train-bgkit2-m3-nobridge:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_m3_tree_nav_nobridge"]
+
+  train-bgkit2-p28:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_p28_stage_d"]
+
+  train-bgkit2-p29:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_p29_stage_d_unfrozen"]
+
+  train-bgkit2-p30:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_p30_stage_d_whole_repo"]
+
+  train-bgkit2-m4:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_m4_tree_nav_whole_repo"]
+
+  train-bgkit2-p31:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_p31_stage_d_whole_repo_bigq"]
+
+  train-bgkit2-p32:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_p32_agentic_overview"]
+
+  train-bgkit2-p33:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_p33_agentic_browse"]
+
+  train-bgkit2-p34:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_p34_browse_overview_dropout"]
+
+  train-bgkit2-w3:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_w3_prompted_readout"]
+
+  train-bgkit2-w3b:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_w3b_prompted_readout_tight"]
+
+  train-bgkit2-s1:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_s1_showcase"]
+
+  # S1b: S1 with the encoder adapter (optim.encoder_mode adapter). NOT launched
+  # by default -- fill resume_checkpoint / init_* in the experiment first.
+  train-bgkit2-s1b:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_s1b_showcase_encoder"]
+
+  # S2 showcase (2026-09-23): S1b recipe + agentic (LFM trajectories with overview), web research,
+  # two-stage memory; initialised from S1b's final checkpoint (configs/experiment/bgkit2_s2_showcase.yaml).
+  train-bgkit2-s2:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_s2_showcase"]
+
+  # 8B-A (decoder scale-up, plans/decoder_scaleup_8b_2026_09_25.md): LFM2.5-8B-A1B decoder, frozen S2 encoder.
+  train-bgkit2-8b-a:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_8b_a"]
+
+  # S1b memory probe: a few training steps on the largest rows (guarded).
+  probe-bgkit2-s1b-memory:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/bgkit2_probe_s1b_memory.py", "--experiment", "bgkit2_s1b_showcase_encoder"]
+
+  train-bgkit2-w1:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_w1_path_walk"]
+
+  train-bgkit2-w2:
+    <<: *gpu-common
+    restart: "no"
+    image: docker-train-bgkit2-p26:latest
+    command: ["scripts/train.py", "+experiment=bgkit2_w2_path_walk_all_repos"]
+
+  train-bgkit2-p27:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p27_agentic_distill"]
+
+  train-bgkit2-p19a2:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19a2_backbone_align"]
+
+  train-bgkit2-p19a3:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19a3_lastblock_projblock"]
+
+  train-bgkit2-p19a4:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19a4_input_skip"]
+
+  train-bgkit2-p19a5:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19a5_rms_interface"]
+
+  train-bgkit2-p19a6:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p19a6_frozen_mlp_rms"]
+
+  # BenchPress evaluation of a bgkit2 checkpoint (their data/templates/metrics).
+  # Override the command's args with `docker compose run --rm eval-bgkit2-benchpress
+  # scripts/bgkit2_eval_benchpress.py --checkpoint ... --out ...`.
+  eval-bgkit2-benchpress:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/bgkit2_eval_benchpress.py", "--help"]
+
+  # Student model server for the agent harness (scripts/bgkit2_eval_agent.py):
+  #   CK=eval_keep/<ckpt> EXP=bgkit2_p24_open_decoder docker compose -f docker/docker-compose.yaml up -d serve-bgkit2-student
+  serve-bgkit2-student:
+    <<: *gpu-common
+    restart: "no"
+    mem_limit: 40g
+    memswap_limit: 40g
+    ports:
+      - "8097:8097"
+    command: ["scripts/bgkit2_student_server.py", "--checkpoint", "/workspace/checkpoints/${CK:-eval_keep/missing}", "--experiment", "${EXP:-bgkit2_p24_open_decoder}", "--port", "8097", "--tree-root-cache", "${TREE_ROOT_CACHE:-}"]
+
+  # P2 rung 1: LoRA on the decoder's lower layers + top-4 encoder layers,
+  # all five task stores. Launch only after P1 is stopped.
+  train-bgkit2-p2:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p2_rung1"]
+
+  # P3 anti-collapse: P2 + anchor floor + decorrelation penalty + faster
+  # interface EMA. Launch only after P2 is stopped.
+  train-bgkit2-p3:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p3_anticollapse"]
+
+  # P4 rung 0 warm, full encoder trainable, frozen decoder.
+  train-bgkit2-p4:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p4_rung0_fullenc"]
+
+  # P5 rung 1 + KD from the full-text teacher.
+  train-bgkit2-p5:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p5_rung1_kd"]
+
+  # P6: frozen encoder backbone + decoder LoRA + KD (the decoder isolated).
+  train-bgkit2-p6:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p6_frozenenc_lora_kd"]
+
+  # P7: encoder LoRA (all layers) + frozen decoder + KD from the full-text teacher.
+  train-bgkit2-p7:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p7_enclora_frozendec_kd"]
+
+  # P7b: P7 + hard row-norm interface + LoRA 5e-5 + non-finite skip.
+  train-bgkit2-p7b:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p7b_enclora_rownorm"]
+
+  # P7c: P7b + within-document diversity penalty + anchor floor 0.5.
+  train-bgkit2-p7c:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p7c_diversity"]
+
+  smoke-bgkit2-p1:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=bgkit2_p1_prompted",
+              "run_name=bgkit2_p1_smoke", "training.max_steps=20",
+              "training.warmup_steps=5", "training.eval_every=20",
+              "training.save_every=20", "training.bgkit2.data.eval_samples=24",
+              "training.bgkit2.data.gen_samples=8",
+              "training.bgkit2.data.task_eval_samples=16",
+              "training.bgkit2.data.task_gen_samples=8", "wandb.enabled=false"]
+
+  train-phase2-kb-widenet-v12-xref:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_widenet_v12_xref"]
+
+  # Long-prose semantic fact recall (babilong_style) alongside the code
+  # wide-net datasets; the zero-shot BABILong arm scored 0.00 on every cell
+  # (2026-08-25), teacher-forced and free-running alike.
+  train-phase2-kb-babilong-v1:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_babilong_v1"]
+
+  # Family-A blob compaction SFT (lean trainer over SWE-Zero trajectories;
+  # capability-packaging §4, built 2026-08-24).
+  train-blob-sft-v1:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=blob_sft_v1"]
+
+  # 8-step wall-time / memory SMOKE of the per-repo full-backprop trainer (the
+  # review's M1/M2 check) on the worst-case-inclusive git_commit_repro_smoke
+  # subset. restart: "no" so the probe runs once and exits (not a real run).
+  train-phase2-kb-git-repro-smoke:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_git_repro_smoke"]
+
+  # The real git-commit-repro full-backprop curriculum run. Wide-open config
+  # (max_file_samples_per_repo null + live-tunable via control.json; both
+  # dynamic-ckpt safeguards wired; round-robin decoders). restart: "no" so an
+  # early crash stays crashed (informative for babysitting); flip to
+  # on-failure once the run is stable past the first big windows.
+  train-phase2-kb-git-repro-fullbackprop:
+    <<: *gpu-common
+    restart: "no"
+    command: ["scripts/train.py", "+experiment=phase2_kb_git_repro_fullbackprop"]
+
+  # Recursive-L1 (L1->L1) bridge distillation. Clone of train-phase2-kb-stage-a
+  # (gpu-common) with the command overridden. Trains ONLY encoder.l1l1_bridge;
+  # decoder-agnostic (no decoder loaded).
+  train-phase2-kb-l1l1-distill:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase2_kb_l1l1_distill"]
+
+  train-phase2-kb-stage-a-falcon:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase2_kb_stage_a_falcon"]
+
+  train-phase2-kb-stage-b-falcon:
+    <<: *gpu-common
+    command: ["scripts/train.py", "+experiment=phase2_kb_stage_b_falcon"]
+
+  # Packed-attention memory profiler for Phase 1 Step 3. Hard memory cap
+  # prevents the unified-memory OOM from cascading to the host (DGX Spark
+  # shares 128 GB between CPU + GPU). Previous unbounded profiler run
+  # (2026-04-20) crashed the harness; cap is NON-negotiable.
+  # Invoke via:
+  #   docker compose -f docker/docker-compose.yaml run --rm profile-phase1-step3
+  profile-phase1-step3:
+    <<: *gpu-common
+    mem_limit: 80g
+    memswap_limit: 80g
+    command: [
+      "scripts/profile_packed_memory.py",
+      "+experiment=phase1_step3",
+    ]
+
+  profile-phase1-step5:
+    <<: *gpu-common
+    mem_limit: 80g
+    memswap_limit: 80g
+    command: [
+      "scripts/profile_packed_memory.py",
+      "+experiment=phase1_step5",
+    ]
+
+  profile-phase1-step6:
+    <<: *gpu-common
+    mem_limit: 80g
+    memswap_limit: 80g
+    command: [
+      "scripts/profile_packed_memory.py",
+      "+experiment=phase1_step6",
+    ]
+
+  # Phase 2 KB-scale memory profiler.  Hard memory cap (80g) prevents
+  # unified-memory OOM from cascading to the host, same as Phase 1.
+  # Invoke via:
+  #   docker compose -f docker/docker-compose.yaml run --rm profile-phase2-kb-stage-a
+  profile-phase2-kb-stage-a:
+    <<: *gpu-common
+    mem_limit: 80g
+    memswap_limit: 80g
+    command: [
+      "scripts/profile_packed_memory_phase2.py",
+      "+experiment=phase2_kb_stage_a",
+    ]
+
+  profile-phase2-kb-stage-b:
+    <<: *gpu-common
+    mem_limit: 80g
+    memswap_limit: 80g
+    command: [
+      "scripts/profile_packed_memory_phase2.py",
+      "+experiment=phase2_kb_stage_b",
+    ]
+
+  # Interactive GPU shell with FlashQLA/FLA/FA4 on PYTHONPATH. FlashQLA is
+  # still edited from the host checkout; the mount is read-only here so ad hoc
+  # container commands cannot dirty kernel sources by accident.
+  shell-flashqla:
+    <<: *gpu-common
+    mem_limit: 40g
+    memswap_limit: 40g
+    restart: "no"
+    stdin_open: true
+    tty: true
+    environment:
+      - HOME=/workspace
+      - HYDRA_FULL_ERROR=1
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
+      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-0}
+      - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
+      - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
+      - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
+      - FLA_GDR_FUSE_DQKG_WY=${FLA_GDR_FUSE_DQKG_WY:-1}
+      - FLA_GDR_FUSE_GATE_BWD=${FLA_GDR_FUSE_GATE_BWD:-1}
+      - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+      - TVM_CACHE_DIR=/workspace/.cache/tvm
+      - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+      - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+      - TORCH_COMPILE_DISABLE=1
+      - FLA_USE_TMA=1
+      - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
+      - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+      - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+      - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
+    command: ["bash"]
+
+  # Environment smoke test for the FlashQLA toolchain. This does not run the
+  # kernels; it reports CUDA/TileLang/FLA/FlashQLA import status and classifies
+  # the known Hopper-only import gate separately from missing dependencies.
+  smoke-flashqla:
+    <<: *gpu-common
+    mem_limit: 20g
+    memswap_limit: 20g
+    restart: "no"
+    environment:
+      - HOME=/workspace
+      - HYDRA_FULL_ERROR=1
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
+      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-0}
+      - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
+      - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
+      - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
+      - FLA_GDR_FUSE_DQKG_WY=${FLA_GDR_FUSE_DQKG_WY:-1}
+      - FLA_GDR_FUSE_GATE_BWD=${FLA_GDR_FUSE_GATE_BWD:-1}
+      - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+      - TVM_CACHE_DIR=/workspace/.cache/tvm
+      - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+      - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+      - TORCH_COMPILE_DISABLE=1
+      - FLA_USE_TMA=1
+      - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
+      - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+      - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.10}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+      - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
+    command: ["scripts/flashqla_env_smoke.py"]
+
+  # Build/import smoke test for the optional Luce Qwen3.5 megakernel backend.
+  # This enables only the Luce bootstrap and skips FlashAttention bootstrap so
+  # the service is focused on extension build/import health.
+  smoke-luce-megakernel:
+    <<: *gpu-common
+    mem_limit: 40g
+    memswap_limit: 40g
+    restart: "no"
+    environment:
+      - HOME=/workspace
+      - HYDRA_FULL_ERROR=1
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+      - TVM_CACHE_DIR=/workspace/.cache/tvm
+      - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+      - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+      - TORCH_COMPILE_DISABLE=1
+      - FLA_USE_TMA=1
+      - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
+      - BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL=1
+      - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+      - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+      - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
+      - MAX_JOBS=${MAX_JOBS:-2}
+      - NVCC_THREADS=${NVCC_THREADS:-1}
+    command: ["scripts/luce_megakernel_env_smoke.py"]
+
+  # Forward parity for the BgKIT-adapted Luce megakernel. Loads Qwen3.5 once,
+  # packs the same state dict into Luce, and compares token embedding prefill
+  # plus short survivor-splice generation against ReconstructionDecoder.
+  parity-luce-megakernel:
+    <<: *gpu-common
+    mem_limit: 70g
+    memswap_limit: 70g
+    restart: "no"
+    environment:
+      - HOME=/workspace
+      - HYDRA_FULL_ERROR=1
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+      - TVM_CACHE_DIR=/workspace/.cache/tvm
+      - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+      - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+      - TORCH_COMPILE_DISABLE=1
+      - FLA_USE_TMA=1
+      - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=1
+      - BGKIT_BOOTSTRAP_LUCE_MEGAKERNEL=1
+      - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+      - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.45}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+      - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
+      - MAX_JOBS=${MAX_JOBS:-2}
+      - NVCC_THREADS=${NVCC_THREADS:-1}
+    command:
+      [
+        "scripts/test_luce_megakernel_parity.py",
+        "--mode",
+        "all",
+        "--quiet",
+        "--decode-steps",
+        "4",
+        "--max-new-tokens",
+        "2",
+      ]
+
+  # FlashQLA parity smoke test. Runs scripts/test_flashqla_parity.py inside
+  # the training image with the baked TileLang toolchain and FlashQLA/FLA bind
+  # mounts. Hard memory cap (40g) so a runaway JIT compile cannot OOM the host.
+  parity-flashqla:
+    <<: *gpu-common
+    mem_limit: 40g
+    memswap_limit: 40g
+    restart: "no"
+    environment:
+      - HOME=/workspace
+      - HYDRA_FULL_ERROR=1
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
+      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-0}
+      - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
+      - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
+      - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
+      - FLA_GDR_FUSE_DQKG_WY=${FLA_GDR_FUSE_DQKG_WY:-1}
+      - FLA_GDR_FUSE_GATE_BWD=${FLA_GDR_FUSE_GATE_BWD:-1}
+      - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+      - TVM_CACHE_DIR=/workspace/.cache/tvm
+      - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+      - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+      - TORCH_COMPILE_DISABLE=1
+      - FLA_USE_TMA=1
+      - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
+      - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+      - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+      - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
+    command: ["scripts/test_flashqla_parity.py"]
+
+  # Lightweight backend timing harness for FLA vs FlashQLA after the sm_121
+  # kernels exist. Until then it fails with the same classified FlashQLA import
+  # or launch error as the parity service.
+  profile-flashqla:
+    <<: *gpu-common
+    mem_limit: 40g
+    memswap_limit: 40g
+    restart: "no"
+    environment:
+      - HOME=/workspace
+      - HYDRA_FULL_ERROR=1
+      - TORCHINDUCTOR_CACHE_DIR=/workspace/.cache/torchinductor
+      - TRITON_CACHE_DIR=/workspace/checkpoints/.triton-cache
+      - FLA_CACHE_MODE=${FLA_CACHE_MODE:-full}
+      - FLA_GDR_SAVE_INTERMEDIATES=${FLA_GDR_SAVE_INTERMEDIATES:-0}
+      - FLA_GDR_SAVE_LOCAL_ATTENTION=${FLA_GDR_SAVE_LOCAL_ATTENTION:-1}
+      - FLA_GDR_RECOMPUTE_WY_DW=${FLA_GDR_RECOMPUTE_WY_DW:-1}
+      - FLA_GDR_FUSE_WY_DG_CUMSUM=${FLA_GDR_FUSE_WY_DG_CUMSUM:-1}
+      - FLA_GDR_FUSE_DQKG_WY=${FLA_GDR_FUSE_DQKG_WY:-1}
+      - FLA_GDR_FUSE_GATE_BWD=${FLA_GDR_FUSE_GATE_BWD:-1}
+      - TILELANG_CACHE_DIR=/workspace/.cache/tilelang
+      - TVM_CACHE_DIR=/workspace/.cache/tvm
+      - PYTHONPATH=/workspace/flashqla:/workspace/fla:/workspace/flash-attention:/workspace/bgkit/src:/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:512
+      - TORCHINDUCTOR_DISABLE_CUDAGRAPHS=1
+      - TORCH_COMPILE_DISABLE=1
+      - FLA_USE_TMA=1
+      - BGKIT_BOOTSTRAP_FLASH_ATTN_NATIVE=0
+      - BGKIT_ALLOW_PEER_CUDA=${BGKIT_ALLOW_PEER_CUDA:-0}
+      - BGKIT_CUDA_MEM_FRACTION=${BGKIT_CUDA_MEM_FRACTION:-0.20}
+      - BGKIT_GDN_BACKEND=${BGKIT_GDN_BACKEND:-fla}
+      - BGKIT_DECODER_CE_IMPL=${BGKIT_DECODER_CE_IMPL:-cce}
+    command: ["scripts/profile_flashqla_backend.py", "--backend", "both"]
+
+  preprocess:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.data
+    volumes:
+      - ${DATA_DIR}:/workspace/data
+    command: ["scripts/process_repos.py"]
+
+  llama-large:
+    <<: *llama-common
+    ports:
+      - "${LLAMA_PORT_LARGE:-8080}:8080"
+    command: >-
+      --model /models/${LLAMA_MODEL_LARGE:-LFM2-8B-A1B-Q4_K_M.gguf}
+      --host 0.0.0.0 --port 8080
+      --ctx-size ${LLAMA_CTX_LARGE:-32768}
+      --n-gpu-layers 999
+      --parallel ${LLAMA_PARALLEL_LARGE:-2}
+      --flash-attn on --no-mmap --jinja
+
+  llama-small:
+    <<: *llama-common
+    ports:
+      - "${LLAMA_PORT_SMALL:-8081}:8080"
+    command: >-
+      --model /models/${LLAMA_MODEL_SMALL:-LFM2.5-1.2B-Instruct-Q8_0.gguf}
+      --host 0.0.0.0 --port 8080
+      --ctx-size ${LLAMA_CTX_SMALL:-65536}
+      --n-gpu-layers 999
+      --parallel ${LLAMA_PARALLEL_SMALL:-2}
+      --flash-attn on --no-mmap --jinja
+
+  llama-tiny:
+    <<: *llama-common
+    ports:
+      - "${LLAMA_PORT_TINY:-8082}:8080"
+    command: >-
+      --model /models/${LLAMA_MODEL_TINY:-Qwen3-0.6B-Q8_0.gguf}
+      --host 0.0.0.0 --port 8080
+      --ctx-size ${LLAMA_CTX_TINY:-65536}
+      --n-gpu-layers 999
+      --parallel ${LLAMA_PARALLEL_TINY:-8}
+      --flash-attn on --no-mmap --jinja
+
+  # --- vLLM inference (primary + fast) ---
+
+  vllm-primary:
+    <<: *vllm-common
+    image: "${VLLM_IMAGE_PRIMARY:-vllm-mxfp4-spark:latest}"
+    ports:
+      - "${VLLM_PORT_PRIMARY:-8090}:8000"
+    environment:
+      NVIDIA_DISABLE_REQUIRE: "1"
+      TIKTOKEN_ENCODINGS_BASE: /workspace/vllm/tiktoken_encodings
+      VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: "1"
+    command: >-
+      vllm serve ${VLLM_MODEL_PRIMARY:-openai/gpt-oss-20b}
+      --quantization mxfp4
+      --mxfp4-backend CUTLASS
+      --mxfp4-layers moe,qkv,o,lm_head
+      --gpu-memory-utilization ${VLLM_GPU_UTIL_PRIMARY:-0.45}
+      --max-model-len 32768
+      --enable-prefix-caching
+      --max-num-batched-tokens 8192
+      --kv-cache-dtype fp8
+      --attention-backend FLASHINFER
+      --load-format fastsafetensors
+      --enforce-eager
+
+  vllm-fast:
+    <<: *vllm-common
+    image: "${VLLM_IMAGE_FAST:-vllm-node:latest}"
+    ports:
+      - "${VLLM_PORT_FAST:-8091}:8000"
+    environment:
+      NVIDIA_DISABLE_REQUIRE: "1"
+    command: >-
+      vllm serve ${VLLM_MODEL_FAST:-Qwen/Qwen3.5-0.8B}
+      --gpu-memory-utilization ${VLLM_GPU_UTIL_FAST:-0.10}
+      --max-model-len ${VLLM_MAX_MODEL_LEN_FAST:-32768}
+      --enable-prefix-caching
+      --enable-chunked-prefill
+
+  # --- Atlas inference (single-server, replaces vllm primary+fast) ---
+  # Switch model via ATLAS_MODEL env var or by using the named presets below.
+  # Uses network_mode: host per Atlas requirements (shared GPU memory access).
+  atlas:
+    image: "${ATLAS_IMAGE:-avarok/atlas-gb10:latest}"
+    network_mode: host
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    volumes:
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:${ATLAS_PORT:-8888}/v1/models"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 300s
+    command: >-
+      serve ${ATLAS_MODEL:-bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4A16}
+      --port ${ATLAS_PORT:-8888}
+      --kv-cache-dtype turbo4
+      --max-batch-size 8
+
+  # Pure-attention MoE — batching scales linearly; target for description generation.
+  atlas-gemma:
+    image: "${ATLAS_IMAGE:-avarok/atlas-gb10:latest}"
+    network_mode: host
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: "no"
+    volumes:
+      - ${HF_HOME:-~/.cache/huggingface}:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:${ATLAS_PORT:-8888}/v1/models"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 300s
+    command: >-
+      serve bg-digitalservices/Gemma-4-26B-A4B-it-NVFP4A16
+      --port ${ATLAS_PORT:-8888}
+      --kv-cache-dtype turbo4
+      --max-batch-size 8
+
+volumes:
+  bgkit-compile-cache:
+  bgkit-triton-cache:
+  bgkit-tilelang-cache:
+  bgkit-tvm-cache:

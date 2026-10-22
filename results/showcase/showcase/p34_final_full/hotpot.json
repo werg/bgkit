@@ -1,0 +1,35 @@
+{
+ "experiment": "bgkit2_p34_browse_overview_dropout",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step5999_20260921_051813_397690_run-bgkit2_p34_browse_overview_dropout",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/hotpot.jsonl",
+ "n": 200,
+ "budgets": [
+  512
+ ],
+ "slot_tokens": 2048,
+ "seconds": 126,
+ "summary": {
+  "text_full@full": {
+   "em": 0.21,
+   "f1": 0.3201,
+   "contains": 0.305,
+   "prefix": 1483.645,
+   "ctx_tokens": 1427.97,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2696,
+   "judge_acc": 0.395
+  },
+  "base_full@full": {
+   "em": 0.065,
+   "f1": 0.2356,
+   "contains": 0.36,
+   "prefix": 1483.645,
+   "ctx_tokens": 1427.97,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3482,
+   "judge_acc": 0.45
+  }
+ }
+}

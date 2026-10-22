@@ -1,0 +1,189 @@
+# Phase 2 KB — PATH-SELECTIVE recursive-L1 navigation over the BIG knowledge
+# trees (KILT Wikipedia / PubMedQA / NarrativeQA).
+#
+# WHAT THIS RUNS
+#   The next training task after the git_commit_repro full-backprop bootstrap.
+#   Unlike git-repro (small per-repo trees, full_backprop_per_repo), this is the
+#   CACHED L1-TREE / PATH-SELECTIVE mode for the large semantic trees that cannot
+#   be re-encoded live every step:
+#     - Each browse turn splices a DENSE node-rep. The LIVE search path is
+#       re-encoded WITH gradient (query-conditioned); off-path browse-tree
+#       siblings are read DETACHED from the query-agnostic L1-tree cache built
+#       offline by scripts/precompute_l1_tree.py.
+#     - full_backprop is FALSE/absent -> KRKBTrainer takes the cached-tree
+#       branch (kr_kb_trainer.py: rec_cfg.full_backprop falsy -> SurvivorBlockCache
+#       at recursive_l1_tree.cache_dir). This is the memory win: only the on-path
+#       subtree carries a live graph.
+#
+#   L0 is CACHED (live_l0: false), same as Stage B — survivors come from the L0
+#   cache built by scripts/precompute_l0_subset.py. L1 + decoder train; L1 reads
+#   off-path node reps from the L1-tree cache.
+#
+# DISPATCH: phase: phase2_kb -> KRKBTrainer (scripts/train.py).
+#
+# GPU PREREQUISITE (document only — DO NOT run from CPU):
+#   Build the query-agnostic L1-tree cache for EACH big tree from the git-repro
+#   bootstrap checkpoint (carries the trained encoder.l1l1_bridge), the L0 cache,
+#   and the (now-hierarchical) browse trees. Per dataset:
+#
+#     for DS in kilt_wikipedia pubmedqa narrativeqa; do
+#       python scripts/precompute_l1_tree.py \
+#         --dataset $DS \
+#         --browse-tree $DATA_DIR/browse_trees/$DS.parquet \
+#         --l0-cache-dir $DATA_DIR/l0_cache_kb \
+#         --phase1-checkpoint <git_commit_repro full-backprop run output>  # TBD, see phase1_checkpoint below \
+#         --output-dir $DATA_DIR/l1_tree_cache_kb \
+#         --retention-json configs/phase2_kb/l1_tree_retention.json \
+#         --encoder-name Qwen/Qwen3.5-0.8B-Base --hidden-dim 1024
+#     done
+#
+#   The cache is QUERY-AGNOSTIC and reusable across runs; it pins the source
+#   L0-cache hash + l1l1_bridge weights hash in cache_manifest.json so a stale
+#   tree (rebuilt L0 cache / retrained bridge) is detected. KILT is large
+#   (~290k tree nodes) — budget GPU-hours; pubmedqa (~230k) and narrativeqa
+#   (~33k) are smaller. This is a GPU job; do not run alongside the live trainer
+#   (single-GPU host).
+phase: phase2_kb
+stage: B                       # cached-L0 semantics (live_l0: false)
+optimizer: adamw
+max_steps: 60000
+warmup_steps: 1000
+lr: 1.0e-4
+decoder_lr: 5.0e-5
+l1_lr: 2.0e-4
+eval_every: 1000
+save_every: 5000
+
+# batch_size baseline — path-selective re-encodes only the on-path subtree live,
+# so per-step cost is the on-path L1 encode + decoder forward over cached
+# survivors. PROFILE before raising (cached-L0 + cached-off-path-tree path).
+batch_size: 4
+
+# BIG trees only — these have real multi-level hierarchies (verified 2026-06-29:
+# pubmedqa MeSH max_depth=14, kilt_wikipedia DBpedia max_depth=16, narrativeqa
+# per-book; all is_flat()=False), so browse navigation is meaningful and the
+# L1-tree cache pays off. Flat datasets (newsqa/msmarco/searchqa/memory) emit
+# no browse turns and belong in the non-recursive Stage B run.
+datasets:
+  - kilt_wikipedia
+  - pubmedqa
+  - narrativeqa
+
+# Cached L0 (Stage B semantics): NO live-L0 forward. Survivors come from the L0
+# cache built by precompute_l0_subset.py with the prompt-fit/Stage-A checkpoint.
+live_l0: false
+l0_cache_dir: ${oc.env:DATA_DIR}/l0_cache_kb
+mmap_dir: ${oc.env:DATA_DIR}/mmap/phase2
+
+# ── Recursive-L1 PATH-SELECTIVE (cached L1-tree) ────────────────────────────
+# enabled + full_backprop ABSENT/false => cached-tree path-selective mode.
+# Off-path node reps are read DETACHED from the SurvivorBlockCache at cache_dir;
+# only the live search path carries gradient. Requires the L1-tree cache to
+# exist for EVERY dataset above (see the precompute command in the header).
+recursive_l1_tree:
+  enabled: true
+  full_backprop: false                              # explicit: cached L1-tree, NOT live full-tree
+  cache_dir: ${oc.env:DATA_DIR}/l1_tree_cache_kb
+  l1_retention: 0.15                                # on-path L1 retention for the live search nodes
+
+l0_retention:
+  kilt_wikipedia: 0.05
+  pubmedqa: 0.20
+  narrativeqa: 0.20
+
+# L1 retention for the final per-article retrieval (non-pinned positions).
+# Pinned article-ID tokens always survive. 0.15 keeps L1 doing real compression.
+l1_retention: 0.15
+
+l0_retention_jitter:
+  enabled: false
+  mode: jitter
+  jitter_abs: 0.01
+  jitter_rel: 0.10
+  anchor_sampling_prob: 0.30
+
+l1_retention_jitter:
+  enabled: true
+  mode: jitter
+  jitter_abs: 0.01
+  jitter_rel: 0.10
+  anchor_sampling_prob: 0.30
+
+lora:
+  l0_rank: 32
+  l1_rank: 32
+  alpha: 64
+  dropout: 0.0
+
+# Survivorship aux losses DISABLED — default-OFF for phase2_kb and intentionally
+# kept off (selection is the least-important signal; reps are distributed and
+# the pre-trained head already selects decent candidates). Set explicitly for
+# clarity. Only the main reconstruction loss + dual-ascent θ control stay on.
+survivorship:
+  survivorship_aux: false
+  relevance_loss_weight: 0.05
+  relevance_gold_boost: 1.5
+  relevance_distractor_damp: 0.5
+  n_distractors: 3
+  ratio_loss_weight: 0.1
+  decisiveness_loss_weight: 0.05
+  l0:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.0
+    utility_grad_loss_weight: 0.0
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.0          # L0 frozen/cached — no gradient to push
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+  l1:
+    ratio_loss_weight: 0.0
+    decisiveness_loss_weight: 0.05
+    utility_grad_loss_weight: 0.3
+    moment_match_weight: 0.0
+    min_survivors_loss_weight: 0.05
+    min_survivors_floor_ratio: 0.02
+    min_survivors_absolute_min: 1
+    min_survivors_tau: 0.3
+
+ice_distillation:
+  l0:
+    enabled: false            # L0 cached/frozen
+  l1:
+    enabled: false
+
+moment_match_reference:
+  l0:
+    path: null
+  l1:
+    path: null
+
+# ── Encoder source: the git_commit_repro full-backprop run OUTPUT ───────────
+# TBD: output of the git_commit_repro full-backprop run (configs/training/
+# phase2_kb_git_repro_fullbackprop.yaml — that run has NOT happened yet). Its
+# best checkpoint carries the trained L0 + L1 + the distilled encoder.l1l1_bridge
+# (the recursive L1->L1 bridge this mode depends on) AND the co-trained
+# round-robin decoders (decoder_qwen.pt + decoder_falcon.pt). Point both this
+# key AND the precompute_l1_tree --phase1-checkpoint at that directory once it
+# exists.
+phase1_checkpoint: /workspace/checkpoints/phase2_kb_git_repro_fullbackprop_best   # TBD: git_commit_repro full-backprop run output
+
+# ── Decoder: ROUND-ROBIN both families (Qwen-0.8B + Falcon-H1-90M) ──────────
+# Both decoders resident; one family picked per batch. Loaded warm from the
+# git-repro checkpoint dir (which co-trained both). qwen_decoder_prob biases the
+# split toward the cheaper Falcon (Qwen-0.8B is ~9x Falcon-90M).
+round_robin: true
+qwen_decoder_prob: 0.3
+decoder_qwen:
+  family: qwen35
+  backbone_name: Qwen/Qwen3.5-0.8B
+decoder_falcon:
+  family: falcon_h1
+  backbone_name: tiiuae/Falcon-H1-Tiny-90M-Instruct
+
+checkpoint_pruning:
+  enabled: true
+  keep_best: 3
+  keep_latest: 2
+  metric: eval/loss
+  lower_is_better: true

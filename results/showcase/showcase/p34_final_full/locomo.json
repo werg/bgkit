@@ -1,0 +1,35 @@
+{
+ "experiment": "bgkit2_p34_browse_overview_dropout",
+ "checkpoint": "/workspace/checkpoints/bgkit2_step5999_20260921_051813_397690_run-bgkit2_p34_browse_overview_dropout",
+ "items": "/workspace/bgkit2_data/benchmarks/showcase/locomo.jsonl",
+ "n": 200,
+ "budgets": [
+  512
+ ],
+ "slot_tokens": 2048,
+ "seconds": 334,
+ "summary": {
+  "text_full@full": {
+   "em": 0.015,
+   "f1": 0.1238,
+   "contains": 0.1,
+   "prefix": 19201.415,
+   "ctx_tokens": 19143.375,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.9151,
+   "judge_acc": 0.17
+  },
+  "base_full@full": {
+   "em": 0.005,
+   "f1": 0.1105,
+   "contains": 0.11,
+   "prefix": 19201.415,
+   "ctx_tokens": 19143.375,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.6865,
+   "judge_acc": 0.18
+  }
+ }
+}

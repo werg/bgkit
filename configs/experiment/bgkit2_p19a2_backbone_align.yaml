@@ -1,0 +1,73 @@
+# @package _global_
+# P19a2 (2026-09-08): stage A with the ENCODER BACKBONE TRAINABLE under the
+# anchor only, still at ratio 1.0 with the decoder frozen. P19a (frozen
+# backbone) plateaued at rep/cos_to_token ~0.54 and x1 == noctx; a CPU probe
+# on its step-500 checkpoint showed why: a closed-form linear map from the
+# frozen encoder's final states reaches only cos 0.62-0.65 held-out (NN token
+# identity 0.67) while the encoder's own INPUT embeddings map to the decoder's
+# at cos 0.82 / NN 0.99 — the MLM backbone discards token identity in its
+# contextual states. Phase 1 trained its encoder at ratio 1.0; so does this.
+# Warm-starts projection + head from P19a step 500 (the frozen-backbone bound made the 1000 eval redundant). Gate A unchanged.
+defaults:
+  - /config
+  - /training/bgkit2
+  - _self_
+
+run_name: bgkit2_p19a2_backbone_align
+
+training:
+  max_steps: 8000
+  eval_every: 500
+  save_every: 500
+  warmup_steps: 300
+  checkpoint_pruning:
+    metric: eval/x1/reconstruct/loss
+  bgkit2:
+    model:
+      init_encoder_from: /workspace/checkpoints/bgkit2_step500_20260907_225709_666467_run-bgkit2_p19a_projection_pretrain
+      train_backbone_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+      encoder_lora:
+        enabled: false
+      interface_momentum: 0.1
+      interface_row_norm: false
+      interface_prenorm: true
+      interface_match_moments: true
+      rep_token_residual: false
+      rep_token_residual_only: false
+      lora:
+        enabled: false
+    data:
+      task_stores:
+        - /workspace/bgkit2_data/tasks/qa_squad.parquet
+        - /workspace/bgkit2_data/tasks/qa_hotpotqa.parquet
+        - /workspace/bgkit2_data/tasks/qa_triviaqa.parquet
+        - /workspace/bgkit2_data/tasks/file_overview.parquet
+        - /workspace/bgkit2_data/tasks/compaction_v2.parquet
+      task_weights: [0.2, 0.2, 0.15, 0.3, 0.15]
+      task_mix: 0.5
+      task_max_ctx_tokens: 2048
+      task_max_prefix_tokens: 1536
+      batch_size: 12
+    ratio:
+      r_max_start: 1.0
+      r_max: 1.0
+      r_start: 1.0
+      r_end: 1.0
+      descent_steps: 0
+      ceiling_steps: 0
+      hold_steps: 0
+      p_random_selection: 0.0
+    anchor:
+      weight: 1.0
+      floor: 1.0
+      steps: 1
+      decorrelation_weight: 0.0
+      within_doc_diversity_weight: 0.0
+    kd:
+      weight: 0.0
+      ce_weight: 0.0
+      selection_weight: 0.0
+      teacher_checkpoint: null
+    optim:
+      lr_backbone: 5.0e-5
+      lr_projection: 3.0e-4
