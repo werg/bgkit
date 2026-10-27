@@ -25,7 +25,8 @@
 \maketitle
 
 \begin{abstract}
-\bgkit{} gives a language model a common interface for reading compressed context. A small
+\bgkit{} (background knowledge interaction transformer) gives a language model a common interface
+for reading compressed context. A small
 bidirectional encoder reads a source under a prompt describing the information need and produces a
 chosen number of vectors in the decoder's input embedding space, which the decoder reads in slots
 alongside ordinary text; the same interface carries documents, tool results, conversation histories
@@ -50,7 +51,9 @@ to the cost of each forward pass. Vision--language models handle a similar probl
 encoder turns many pixels into a few vectors, which are projected into the language model's
 token-embedding space and read like tokens \citep{alayrac2022flamingo,liu2023llava}.
 
-\bgkit{} applies the same principle to text. An encoder reads a text together with a prompt that states what the
+\bgkit{}, the \emph{background knowledge interaction transformer}, applies the same principle to
+text: background knowledge is processed in interaction with the reader's need before it enters the
+decoder's context, rather than placed there verbatim. An encoder reads a text together with a prompt that states what the
 reader needs from it, for example \emph{``answer: who founded the company?''} or \emph{``lines 80--140
 of \texttt{io.py}: where is the buffer flushed?''}, and emits a short sequence of vectors in the
 decoder's input embedding space. The decoder reads them in a slot in place of the text

@@ -1,6 +1,7 @@
 # bgkit
 
-bgkit gives a language model access to more text than fits in its context budget. A bidirectional
+bgkit (background knowledge interaction transformer) gives a language model access to more text
+than fits in its context budget. A bidirectional
 encoder reads a text together with a prompt that states what the reader needs, compresses it by a
 chosen ratio, and projects the result into the decoder's input embedding space. The decoder reads
 these vectors in place of the text's tokens, in a slot among ordinary tokens; one input can hold
