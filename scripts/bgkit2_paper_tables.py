@@ -252,7 +252,7 @@ def budget_figure() -> str:
     return "\n".join([
         r"\begin{tikzpicture}",
         r"\begin{groupplot}[group style={group size=3 by 3, horizontal sep=12mm, vertical sep=14mm},",
-        r"  width=0.36\linewidth, height=0.3\linewidth, xmode=log, log basis x=2, ymin=0,",
+        r"  width=0.345\linewidth, height=0.3\linewidth, xmode=log, log basis x=2, ymin=0,",
         r"  title style={font=\small}, tick label style={font=\scriptsize},",
         r"  every axis plot/.append style={mark size=1.5pt},",
         r"  yticklabel style={/pgf/number format/fixed, /pgf/number format/precision=2}]",

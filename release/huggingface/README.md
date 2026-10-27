@@ -79,7 +79,7 @@ accuracy; *text* is the same decoder reading the text truncated to the budget):
 
 | Benchmark | Context | Budget | bgkit | text | original decoder, full context |
 |---|---|---|---|---|---|
-| BABILong (qa1–3) | 15.4k tokens | 1,024 | 0.74 | 0.12 | 0.18 |
+| BABILong (qa1, qa2) | 15.4k tokens | 1,024 | 0.74 | 0.12 | 0.18 |
 | HotpotQA | 1.4k | 256 | 0.64 | 0.23 | 0.45 |
 | MuSiQue | 2.5k | 2,048 | 0.33 | 0.16 | 0.13 |
 | LoCoMo | 18.8k | 1,024 | 0.28 | 0.09 | 0.19 |

@@ -8,7 +8,7 @@
 \usepackage{placeins}
 \usepackage{xcolor}
 \usepackage{tikz}
-\usetikzlibrary{positioning,arrows.meta}
+\usetikzlibrary{positioning,arrows.meta,calc}
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.18}
 \usepgfplotslibrary{groupplots}
@@ -25,22 +25,21 @@
 \maketitle
 
 \begin{abstract}
-We present \bgkit{}, which extends a language model's effective context by reading compressed text
-through its input embedding layer. A bidirectional encoder conditions on a prompt describing the
-reader's information need, compresses the text at a chosen ratio, and projects the result into the
-decoder's embedding space, where it occupies a slot in place of the original tokens. Slots interleave
-freely with text and carry documents, tool results, conversation histories and repository overviews.
-We train a 350M-parameter encoder--decoder pair on a single GPU and evaluate it on nine long-context
-benchmarks at fixed decoder budgets, against truncation, BM25 retrieval, LongLLMLingua and
-question-focused summaries from a 35B model. The compressed context significantly outperforms
-truncated text in 16 of 26 settings and LongLLMLingua in 13 of 22, and exceeds BM25 on tasks that
-require integrating facts across the context, often with a quarter of the positions. With the decoder
-held fixed, it also surpasses the full uncompressed context on BABILong, HotpotQA and LoCoMo. Controls
-attribute the gain to the encoder's prompt-conditioned representations rather than to token
-selection: at identical positions, the selected tokens score far lower (0.26 against 0.74 on BABILong
-16k). Exact strings are not retained (RULER). At 110k tokens the decoder needs about 50$\times$ less
-memory beyond its weights and decodes 4$\times$ faster, while the encoder costs roughly one
-full-context prefill.
+\bgkit{} gives a language model a common interface for reading compressed context. A small
+bidirectional encoder reads a source under a prompt describing the information need and produces a
+chosen number of vectors in the decoder's input embedding space, which the decoder reads in slots
+alongside ordinary text; the same interface carries documents, tool results, conversation histories
+and persistent repository overviews. With a 350M-parameter encoder and decoder trained on a single
+GPU, the encoder's vectors prove far more useful than the tokens at the very positions they occupy:
+at identical retained positions they score 0.74 against 0.26 on BABILong 16k, 0.64 against 0.31 on
+HotpotQA and 0.30 against 0.07 on LongMemEval-S. With the decoder held fixed, the compressed context
+also surpasses the full, uncompressed text on BABILong, HotpotQA and LoCoMo. On nine long-context
+benchmarks at fixed decoder budgets it significantly outperforms truncation in 16 of 26 settings and
+LongLLMLingua in 13 of 22, and exceeds BM25 retrieval where answers integrate facts spread across the
+context, in several cases with a quarter of BM25's positions; question-focused summaries from a 35B
+model remain stronger on some multi-hop questions, and exact strings are not retained (RULER). At
+110k tokens the decoder needs about 50$\times$ less memory beyond its weights and decodes 4$\times$
+faster, while encoding costs roughly one full-context prefill.
 \end{abstract}
 
 \section{Introduction}
@@ -65,20 +64,18 @@ kind of ambient awareness beyond the context window.
 
 The paper makes three contributions:
 \begin{itemize}
-\item \textbf{A method} (Sections~\ref{sec:method}--\ref{sec:training}): the encoder, projection and
-  slot interface, the training recipe, and an agent harness in which every tool result arrives
-  compressed.
-\item \textbf{Measurements of context savings} (Sections~\ref{sec:sweep}--\ref{sec:cost}): nine
-  long-context benchmarks at a fixed decoder budget, against four text-side ways of fitting a context
-  into the same budget and against the original decoder reading the whole context; the budget a
-  text method needs to match the compressed context; the effect of the compression ratio; and the
-  end-to-end cost.
-\item \textbf{What the compressed context carries} (Section~\ref{sec:vectors}): at the encoder's own
-  kept positions, its vectors against the tokens at those positions, and encodings made with and
-  without the question.
+\item \textbf{A practical interface} (Sections~\ref{sec:method}--\ref{sec:training}): prompt-conditioned
+  context vectors with a budget chosen per slot, any number of slots mixed with text, and one set of
+  weights serving documents, tool results, histories and hierarchical overviews; with its training
+  recipe and an agent harness in which every tool result arrives compressed.
+\item \textbf{An empirical insight} (Sections~\ref{sec:sweep}--\ref{sec:vectors}): at the encoder's
+  own retained positions its vectors are far more useful than the tokens there, and with the decoder
+  held fixed the compressed context can surpass the full text; we measure this against truncation,
+  BM25 retrieval, LongLLMLingua and summaries on nine benchmarks, with paired intervals.
+\item \textbf{Costs and a reusable implementation} (Sections~\ref{sec:ratio}--\ref{sec:agents}): the
+  effect of the compression ratio, end-to-end cost, an agent on SWE-bench Lite, web research and
+  conversational memory, and released weights with standalone inference code.
 \end{itemize}
-Section~\ref{sec:agents} runs an agent that reads only compressed context on SWE-bench Lite bug
-localisation, web research and conversational memory.
 
 \begin{figure}[t]
 \centering
@@ -93,10 +90,21 @@ localisation, web research and conversational memory.
   \draw[ar] (in) -- (enc);
   \draw[ar] (enc) -- (proj);
   \draw[ar] (proj) -- node[above, font=\footnotesize] {reps} (dec);
+  % one decoder input: ordinary text interleaved with slots of different sources and budgets
+  \begin{scope}[yshift=-21mm, node distance=1.2mm,
+      txt/.style={draw, rounded corners=1.5pt, fill=gray!8, align=center, font=\scriptsize, minimum height=12mm, inner sep=2pt},
+      slot/.style={draw, rounded corners=1.5pt, fill=orange!12, align=center, font=\scriptsize, minimum height=12mm, inner sep=2pt}]
+    \node[txt, text width=15mm] (t1) {instruction\\(text)};
+    \node[slot, text width=21mm, right=of t1] (s1) {repository overview\\\textit{generic prompt}\\$\approx$300 vectors};
+    \node[slot, text width=23mm, right=of s1] (s2) {file read \texttt{io.py}\\\textit{``where is the buffer flushed?''}\\8$\times$};
+    \node[slot, text width=19mm, right=of s2] (s3) {test output\\\textit{``which test fails?''}\\16$\times$};
+    \node[txt, text width=16mm, right=of s3] (t2) {current\\question (text)};
+  \end{scope}
+  \node[font=\footnotesize, anchor=south west] at ($(t1.north west)+(0,0.5mm)$) {one decoder input:};
 \end{tikzpicture}
-\caption{The \bgkit{} interface. An encoder reads a text under a prompt and emits $k$ vectors
-(``reps'') in the decoder's embedding space. The decoder reads them in a slot among ordinary tokens;
-one input can contain many slots.}
+\caption{The \bgkit{} interface. Top: an encoder reads a text under a prompt and emits $k$ vectors
+(``reps'') in the decoder's embedding space. Bottom: the decoder reads them in slots among ordinary
+tokens; each slot has its own source, prompt and budget, and one input can hold any number of them.}
 \label{fig:arch}
 \end{figure}
 
@@ -108,16 +116,19 @@ The encoder is LFM2.5-Encoder-350M, a 16-layer bidirectional model with hidden s
 is a prompt, a separator and the text to encode, so every text position can attend to the prompt.
 
 \paragraph{Compression.}
-After the middle layer, a scoring head ranks the text positions, and the top $k=\lceil rN\rceil$ of
-the $N$ positions are kept for a compression ratio $r$. The remaining layers still run over the
-whole sequence, so each retained position can aggregate information from the entire text. The final
-hidden states at the kept positions form the encoding. The ratio is a free parameter at inference
+After layer 6 of 16, a scoring head ranks the text positions, and the top $k=\lceil rN\rceil$ of
+the $N$ positions are kept for a compression ratio $r$. A learned \emph{survival marker} is added to
+the hidden state at each kept position, so the remaining layers know which positions will be passed
+on. These layers still run over the whole sequence, so each retained position can aggregate
+information from the entire text. The final hidden states at the kept positions form the encoding.
+Long texts are cut into chunks of up to 2{,}048 tokens, each encoded under the same prompt into its own
+slot. The ratio is a free parameter at inference
 time: the same weights produce 4$\times$, 16$\times$ or 128$\times$ encodings.
 
 \paragraph{Projection.}
 A projection stage (an attention layer over the kept positions followed by an MLP) maps the encoding
-into the decoder's input embedding space. A normalisation layer then matches the per-channel
-statistics of the decoder's token embeddings. It was introduced after earlier versions exhibited
+into the decoder's input embedding space, and each output vector is rescaled to a fixed norm, the
+mean row norm of the decoder's token embeddings. Earlier versions without a fixed interface exhibited
 representational collapse: the projected vectors converged on a shared direction while retaining a
 plausible norm.
 
@@ -226,7 +237,7 @@ plain text may be weaker than the original decoder's. The three question-aware t
 LongLLMLingua, summary) were therefore read by both decoders, and each cell reports the better of
 the two; the \emph{text} and \emph{base} columns report truncated text under each decoder.
 
-BABILong \citep{kuratov2024babilong} (tasks qa1--qa3), RULER \citep{hsieh2024ruler} and QuALITY
+BABILong \citep{kuratov2024babilong} (tasks qa1 and qa2: 66 and 34 items per length), RULER \citep{hsieh2024ruler} and QuALITY
 \citep{pang2022quality} are scored by accuracy. NarrativeQA \citep{kocisky2018narrativeqa}, HotpotQA
 \citep{yang2018hotpotqa}, MuSiQue \citep{trivedi2022musique}, LongMemEval \citep{wu2025longmemeval}
 and LoCoMo \citep{maharana2024locomo} are scored by an LLM judge (Qwen3.6-35B-A3B with
@@ -247,6 +258,7 @@ under 2$\times$ to about 54$\times$.
 \begin{table}[p]
 \centering
 \small
+\setlength{\tabcolsep}{4.5pt}
 \input{tables/sweep.tex}
 \caption{Accuracy by benchmark and budget (decoder positions available to the context); the second
 line of each benchmark gives its mean context length. BABILong, RULER and QuALITY: accuracy; the
@@ -291,18 +303,20 @@ positions) and on RULER, comparably on HotpotQA and QuALITY, and lower on BABILo
 
 \paragraph{Effective budget.}
 Table~\ref{tab:efficiency} compares the compressed context at each benchmark's smallest budget with
-the best text method at the largest, four times as many positions (twice for LoCoMo). With a quarter of
-the positions, the compressed context scores significantly higher on BABILong, HotpotQA and MuSiQue
-(for example 0.79 in 512 positions against 0.38 for BM25 in 2{,}048 on BABILong 4k), comparably on
-QuALITY, NarrativeQA, LongMemEval-S and LoCoMo, and lower on RULER.
+the best text arm run at the largest, four times as many positions (twice for LoCoMo). With a quarter
+of the positions, the compressed context scores significantly higher on BABILong, HotpotQA and
+MuSiQue (for example 0.79 in 512 positions against 0.38 for BM25 in 2{,}048 on BABILong 4k),
+comparably on QuALITY, NarrativeQA, LongMemEval-S and LoCoMo, and lower on RULER. The comparison is
+limited to the arms run at the larger budget: summaries exist there only for QuALITY, and on MuSiQue
+they already score higher at smaller budgets (0.43 at 512 positions; Table~\ref{tab:sweep}).
 
 \begin{table}[!ht]
 \centering
 \small
 \resizebox{\linewidth}{!}{\input{tables/efficiency.tex}}
-\caption{The compressed context at a benchmark's smallest budget against the best text-only arm
-(truncated text under either decoder, BM25, LongLLMLingua or summary, each with its better decoder) at
-the largest budget. Positions: how many times more decoder positions the text arm has. Difference:
+\caption{The compressed context at a benchmark's smallest budget against the best text-only arm run
+at the largest budget (truncated text under either decoder, BM25, LongLLMLingua, or a summary where one was generated at
+that budget, each with its better decoder). Positions: how many times more decoder positions the text arm has. Difference:
 mean paired difference with 95\% bootstrap interval; bold where it excludes zero.}
 \label{tab:efficiency}
 \end{table}
@@ -339,6 +353,90 @@ and the compressed context 0.17--0.20: arbitrary strings are not preserved at th
 methods that return the matching passage verbatim are better suited to such lookups. The agent harness accordingly reads
 search hits at only 4$\times$.
 
+
+\section{What the compressed context carries}
+\label{sec:vectors}
+
+The encoder performs two functions: it selects which positions to retain, and it computes a
+representation at each retained position after the remaining layers have attended over the full text
+and the prompt. Two measurements disentangle them.
+
+\paragraph{Vectors against the tokens they sit on.}
+In the \emph{kept tokens} arm the encoder runs exactly as in the \bgkit{} arm, with the same question
+as prompt and the same budget, but the decoder receives the token embeddings at the kept positions,
+in document order, instead of the encoder's vectors (Table~\ref{tab:format}). The positions and
+their number are identical; only what occupies them differs. The vectors score significantly higher
+on seven of nine benchmarks: 0.74 against 0.26 on BABILong 16k, 0.64 against 0.31 on HotpotQA, 0.30
+against 0.07 on LongMemEval-S; QuALITY and NarrativeQA are within noise. The kept tokens on their
+own score in the range of LongLLMLingua's question-aware token pruning at the same budget (higher on
+BABILong, lower on the two memory benchmarks). The
+advantage of the compressed context therefore resides primarily in the representations: a vector at
+a retained position encodes information from discarded text, which no selection of tokens can. Together
+with the survival marker, which tells the later layers which positions will be passed on, this
+suggests that the kept positions act as places where the encoder gathers information for the reader;
+the random-selection result below is consistent with some freedom in where that information is
+placed. We offer this as an interpretation of the measurements, not as a mechanistic account.
+
+\begin{table}[!ht]
+\centering
+\small
+\resizebox{\linewidth}{!}{\input{tables/format.tex}}
+\caption{Same selection, different contents, at each benchmark's smallest budget. Vectors: the
+\bgkit{} arm. Tokens: the token embeddings at the same kept positions (better of the two decoders).
+Difference: vectors minus tokens, mean paired difference with 95\% bootstrap interval; bold where it
+excludes zero. LongLLMLingua and text (truncated, trained decoder) at the same budget for scale.}
+\label{tab:format}
+\end{table}
+
+\paragraph{A worked example.}
+Figure~\ref{fig:example} shows one BABILong item. The selection keeps all three facts about Sandra
+verbatim, in order, among the 1{,}027 positions kept from 14{,}793 tokens. Given those tokens, both
+decoders answer with an earlier location; given the encoder's vectors at the same positions, the
+decoder answers correctly. The difference is thus not which facts survive selection but what the
+vectors encode about them, here the order of Sandra's movements.
+
+\begin{figure}[!ht]
+\centering
+\small
+\fbox{\begin{minipage}{0.92\linewidth}
+\textbf{Question:} Where is Sandra? \hfill \textbf{Answer:} garden\\[3pt]
+\textbf{Context:} 14{,}793 tokens of book text with bAbI facts inserted; compressed 14$\times$ into
+1{,}027 positions in eight slots, with the question as the encoder prompt.\\[3pt]
+\textbf{Facts about Sandra, in order, and the kept tokens within them:}\\
+\hspace*{1em}``Sandra travelled to the bedroom.'' \hfill all 6 tokens kept\\
+\hspace*{1em}``Sandra went to the kitchen.'' \hfill all 6 tokens kept\\
+\hspace*{1em}``Sandra journeyed to the garden.'' \hfill all 7 tokens kept\\[3pt]
+\textbf{Kept tokens} (trained or original decoder): ``Sandra is in the kitchen.''\\
+\textbf{Encoder vectors} at the same positions: ``garden''\\
+\textbf{Whole text}, same decoder: ``Sandra is in the garden.'' \quad \textbf{BM25}, 1{,}024 positions: ``Sandra is in the kitchen.''
+\end{minipage}}
+\caption{One BABILong 16k item (\texttt{babilong:16k:qa1:38}). Kept tokens and the facts' positions
+from \texttt{scripts/bgkit2\_example\_kept.py}; answers from the benchmark runs.}
+\label{fig:example}
+\end{figure}
+
+\paragraph{The prompt and the selection.}
+Table~\ref{tab:ablation} varies how the encoding is produced, on the items and checkpoint of
+Table~\ref{tab:ratio}. Encoding without the question lowers exact match from 0.58--0.90 to 0.04--0.21.
+With the prompt for a different question about the same document, the loss on the correct answer
+exceeds the no-context loss on SQuAD (3.16 against 2.30 at 4$\times$) and multi-needle (4.32 against
+3.01). Replacing the learned position selection with random positions of the same number changes
+exact match little on SQuAD (0.61 in both) and lowers it on multi-needle (0.54 against 0.58) and
+bAbI-in-filler (0.82 against 0.90). The content of the representations is thus determined chiefly by the
+conditioning prompt, and only secondarily by the choice of positions. The encoding is specific to its prompt: one made
+under one question can be reused for another only when the prompt does not depend on the question, as
+for the repository overview and the memory index.
+
+\begin{table}[!ht]
+\centering
+\small
+\resizebox{\linewidth}{!}{\input{tables/ablation.tex}}
+\caption{Encoder conditions, same items and checkpoint as Table~\ref{tab:ratio}. EM: exact match of
+generated answers at 64$\times$. $\mathcal{L}$: decoder loss on the gold answer (nats per token) at
+4$\times$ and 64$\times$; lower is better. ``No context'' is the decoder's loss with the context
+removed.}
+\label{tab:ablation}
+\end{table}
 
 \section{Compression ratio}
 \label{sec:ratio}
@@ -389,59 +487,6 @@ FLOPs, $2 \times \text{parameters} \times \text{tokens}$ over encoder and decode
 \label{tab:cost}
 \end{table}
 
-\section{What the compressed context carries}
-\label{sec:vectors}
-
-The encoder performs two functions: it selects which positions to retain, and it computes a
-representation at each retained position after the remaining layers have attended over the full text
-and the prompt. Two measurements disentangle them.
-
-\paragraph{Vectors against the tokens they sit on.}
-In the \emph{kept tokens} arm the encoder runs exactly as in the \bgkit{} arm, with the same question
-as prompt and the same budget, but the decoder receives the token embeddings at the kept positions,
-in document order, instead of the encoder's vectors (Table~\ref{tab:format}). The positions and
-their number are identical; only what occupies them differs. The vectors score significantly higher
-on seven of nine benchmarks: 0.74 against 0.26 on BABILong 16k, 0.64 against 0.31 on HotpotQA, 0.30
-against 0.07 on LongMemEval-S; QuALITY and NarrativeQA are within noise. The kept tokens on their
-own score in the range of LongLLMLingua's question-aware token pruning at the same budget (higher on
-BABILong, lower on the two memory benchmarks). The
-advantage of the compressed context therefore resides primarily in the representations: a vector at
-a retained position encodes information from discarded text, which no selection of tokens can.
-
-\begin{table}[!ht]
-\centering
-\small
-\resizebox{\linewidth}{!}{\input{tables/format.tex}}
-\caption{Same selection, different contents, at each benchmark's smallest budget. Vectors: the
-\bgkit{} arm. Tokens: the token embeddings at the same kept positions (better of the two decoders).
-Difference: vectors minus tokens, mean paired difference with 95\% bootstrap interval; bold where it
-excludes zero. LongLLMLingua and text (truncated, trained decoder) at the same budget for scale.}
-\label{tab:format}
-\end{table}
-
-\paragraph{The prompt and the selection.}
-Table~\ref{tab:ablation} varies how the encoding is produced, on the items and checkpoint of
-Table~\ref{tab:ratio}. Encoding without the question lowers exact match from 0.58--0.90 to 0.04--0.21.
-With the prompt for a different question about the same document, the loss on the correct answer
-exceeds the no-context loss on SQuAD (3.16 against 2.30 at 4$\times$) and multi-needle (4.32 against
-3.01). Replacing the learned position selection with random positions of the same number changes
-exact match little on SQuAD (0.61 in both) and lowers it on multi-needle (0.54 against 0.58) and
-bAbI-in-filler (0.82 against 0.90). The content of the representations is thus determined chiefly by the
-conditioning prompt, and only secondarily by the choice of positions. The encoding is specific to its prompt: one made
-under one question can be reused for another only when the prompt does not depend on the question, as
-for the repository overview and the memory index.
-
-\begin{table}[!ht]
-\centering
-\small
-\resizebox{\linewidth}{!}{\input{tables/ablation.tex}}
-\caption{Encoder conditions, same items and checkpoint as Table~\ref{tab:ratio}. EM: exact match of
-generated answers at 64$\times$. $\mathcal{L}$: decoder loss on the gold answer (nats per token) at
-4$\times$ and 64$\times$; lower is better. ``No context'' is the decoder's loss with the context
-removed.}
-\label{tab:ablation}
-\end{table}
-
 \section{Agentic tasks}
 \label{sec:agents}
 
@@ -458,7 +503,9 @@ overview, a few hundred vectors standing for the whole tree, in its context, the
 answer in 59\% of episodes instead of 22\%, never ends in a loop (70\% without it), and uses 13.9k
 instead of 19.5k decoder tokens. It names a file edited by the reference patch in 14 of 186 episodes
 (7.5\%; 95\% interval about 4.5--12\%), against 1 for the text agent with the same overview. The
-agent made no \texttt{browse} calls, so this measures the root overview alone.
+agent made no \texttt{browse} calls, so this measures the root overview alone. The overview changes
+how the agent works: with a compact view of the whole repository in context it commits to an answer
+and stops repeating itself, while choosing the right file remains hard for a 350M policy.
 
 \begin{table}[!ht]
 \centering
@@ -526,26 +573,38 @@ dropping tokens, either independently of the question \citep{jiang2023llmlingua,
 or conditioned on it \citep{jiang2024longllmlingua}. Question-focused abstractive compression of
 retrieved documents \citep{xu2024recomp} corresponds to our summary baseline. Vision--language models
 connect separately trained encoders to language models through projections into the embedding space
-\citep{alayrac2022flamingo,liu2023llava}. \bgkit{} combines a prompt-conditioned bidirectional encoder
-with the decoder's embedding layer, applies it hierarchically to repositories and histories, and uses
-it as the channel through which an agent receives all tool output.
+\citep{alayrac2022flamingo,liu2023llava}. Closest to \bgkit{} is recent soft compression for retrieval-augmented generation: COCOM compresses
+passages into a few context embeddings at adjustable rates \citep{rau2025cocom}, OSCAR compresses
+retrieved documents online and conditioned on the query \citep{louis2025oscar}, and SeleCom replaces
+full compression with a query-conditioned selector that keeps only query-relevant information
+\citep{liu2026selecom}. \bgkit{} shares the idea of query-conditioned vectors read through the
+generator's embedding space; its particular design is the selection of content positions that are
+marked and then further contextualised over the whole text, a budget chosen per slot at inference
+time with a single checkpoint, and one interface for documents, tool output, conversation histories
+and hierarchical repository overviews, through which an agent receives all tool output.
 
 \section{Conclusion}
 
-\bgkit{} compresses text into representations that a decoder reads through its embedding layer,
-conditioned on a prompt that specifies the reader's information need. With a 350M encoder and a 350M
-decoder, a budget of a few thousand positions affords access to contexts of tens to over a hundred
-thousand tokens. At equal budget the compressed context outperforms truncation and token pruning on
-most benchmarks, and BM25 retrieval on tasks that integrate facts distributed across the context,
-often with a quarter of the positions; with the decoder held fixed it also surpasses the full context
-on several of them. It does not retain exact strings, where retrieval remains preferable. Controls
-show that the gain resides in the encoder's prompt-conditioned representations rather than in token
-selection. The same interface allows an agent to receive every tool result in compressed form and to
-keep a repository overview or memory index in context as persistent background; our evidence for this
-use is limited to a 350M agent (Section~\ref{sec:agents}). Because the encoder's cost is independent
-of the decoder's size, the case for this design strengthens with larger decoders. Natural next steps
-are pairing a small encoder with a much larger decoder, a decoder trained on text at the same budget
-as a matched baseline, encodings reusable across questions, and combining retrieval with compression.
+\bgkit{} gives a language model a common interface for reading compressed context: an encoder,
+conditioned on a prompt that specifies the information need, produces a chosen number of vectors that
+the decoder reads in slots alongside ordinary text. With a 350M encoder and a 350M decoder, these
+vectors are far more useful than the tokens at the positions they occupy, and with the decoder held
+fixed the compressed context can surpass the full text. At equal budget it outperforms truncation and
+token pruning on most benchmarks, and BM25 retrieval on tasks that integrate facts distributed across
+the context; it does not retain exact strings, where retrieval remains preferable.
+
+We see the work as a progression. \emph{Demonstrated now}: useful question-conditioned representations
+under a small decoder budget, with substantially lower decoder memory and decoding time.
+\emph{Available as a building block}: one interface for documents, tool results, histories and
+hierarchical overviews, with which an agent can keep a repository overview or memory index in context
+as persistent background; our evidence for this use is a 350M agent (Section~\ref{sec:agents}).
+\emph{Next}: background context that survives changing questions, with focused re-reading when
+details are needed. Because slots mix freely with text, the exact-string weakness suggests a direct
+extension: compressed context accompanied by a small amount of verbatim evidence for identifiers,
+numbers and quotations. Because the encoder's cost is independent of the decoder's size, the case for
+the design strengthens with larger decoders; pairing the small encoder with a much stronger decoder on
+a realistic reading or tool workflow is the most informative next experiment, alongside a decoder
+trained on text at the same budget as a matched baseline.
 
 \bibliographystyle{plainnat}
 \bibliography{references}
