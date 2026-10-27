@@ -1,0 +1,39 @@
+{
+ "experiment": "bgkit2_p19g_fulltext_lora",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step4066_20260909_033356_033464_run-bgkit2_p19g_fulltext_lora",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/babilong_16k.jsonl",
+ "n": 100,
+ "budgets": [
+  1024,
+  2048,
+  4096
+ ],
+ "slot_tokens": 2048,
+ "seconds": 62,
+ "summary": {
+  "textslot@1024": {
+   "acc": 0.02,
+   "prefix": 1068.16,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1191
+  },
+  "textslot@2048": {
+   "acc": 0.07,
+   "prefix": 2092.2,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1441
+  },
+  "textslot@4096": {
+   "acc": 0.1,
+   "prefix": 4140.11,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2401
+  }
+ }
+}

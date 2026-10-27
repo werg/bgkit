@@ -1,0 +1,93 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/musique.jsonl",
+ "n": 100,
+ "budgets": [
+  512,
+  1024,
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 238,
+ "summary": {
+  "lingua@512": {
+   "em": 0.03,
+   "f1": 0.073,
+   "contains": 0.06,
+   "prefix": 531.77,
+   "ctx_tokens": 2454.36,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3196,
+   "summ_in_tokens": 2455.14,
+   "summ_out_tokens": 0.0,
+   "summ_s": 2.6298
+  },
+  "base_lingua@512": {
+   "em": 0.0,
+   "f1": 0.0472,
+   "contains": 0.04,
+   "prefix": 531.77,
+   "ctx_tokens": 2454.36,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3511,
+   "summ_in_tokens": 2455.14,
+   "summ_out_tokens": 0.0,
+   "summ_s": 2.6298
+  },
+  "lingua@1024": {
+   "em": 0.01,
+   "f1": 0.0643,
+   "contains": 0.1,
+   "prefix": 1018.1,
+   "ctx_tokens": 2454.36,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3343,
+   "summ_in_tokens": 2455.14,
+   "summ_out_tokens": 0.0,
+   "summ_s": 3.0892
+  },
+  "base_lingua@1024": {
+   "em": 0.01,
+   "f1": 0.0701,
+   "contains": 0.09,
+   "prefix": 1018.1,
+   "ctx_tokens": 2454.36,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3961,
+   "summ_in_tokens": 2455.14,
+   "summ_out_tokens": 0.0,
+   "summ_s": 3.0892
+  },
+  "lingua@2048": {
+   "em": 0.01,
+   "f1": 0.0734,
+   "contains": 0.14,
+   "prefix": 1905.43,
+   "ctx_tokens": 2454.36,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.4954,
+   "summ_in_tokens": 2455.14,
+   "summ_out_tokens": 0.0,
+   "summ_s": 3.8571
+  },
+  "base_lingua@2048": {
+   "em": 0.01,
+   "f1": 0.057,
+   "contains": 0.09,
+   "prefix": 1905.43,
+   "ctx_tokens": 2454.36,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.4507,
+   "summ_in_tokens": 2455.14,
+   "summ_out_tokens": 0.0,
+   "summ_s": 3.8571
+  }
+ }
+}

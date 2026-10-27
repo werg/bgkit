@@ -1,0 +1,66 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/locomo.jsonl",
+ "n": 100,
+ "budgets": [
+  1024,
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 61,
+ "summary": {
+  "lingua@1024": {
+   "em": 0.02,
+   "f1": 0.128,
+   "contains": 0.06,
+   "prefix": 1024.39,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1445,
+   "summ_in_tokens": 18839.54,
+   "summ_out_tokens": 0.0,
+   "summ_s": 8.4902
+  },
+  "base_lingua@1024": {
+   "em": 0.01,
+   "f1": 0.1189,
+   "contains": 0.08,
+   "prefix": 1024.39,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1214,
+   "summ_in_tokens": 18839.54,
+   "summ_out_tokens": 0.0,
+   "summ_s": 8.4902
+  },
+  "lingua@2048": {
+   "em": 0.04,
+   "f1": 0.1463,
+   "contains": 0.09,
+   "prefix": 1988.94,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1596,
+   "summ_in_tokens": 18839.54,
+   "summ_out_tokens": 0.0,
+   "summ_s": 9.3725
+  },
+  "base_lingua@2048": {
+   "em": 0.0,
+   "f1": 0.1468,
+   "contains": 0.1,
+   "prefix": 1988.94,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1484,
+   "summ_in_tokens": 18839.54,
+   "summ_out_tokens": 0.0,
+   "summ_s": 9.3725
+  }
+ }
+}

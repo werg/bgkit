@@ -1,0 +1,39 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/narrativeqa.jsonl",
+ "n": 60,
+ "budgets": [
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 30,
+ "summary": {
+  "lingua@2048": {
+   "em": 0.0,
+   "f1": 0.1144,
+   "contains": 0.05,
+   "prefix": 1958.45,
+   "ctx_tokens": 58642.0333,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2184,
+   "summ_in_tokens": 58642.0333,
+   "summ_out_tokens": 0.0,
+   "summ_s": 18.99
+  },
+  "base_lingua@2048": {
+   "em": 0.0,
+   "f1": 0.0947,
+   "contains": 0.0667,
+   "prefix": 1958.45,
+   "ctx_tokens": 58642.0333,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1697,
+   "summ_in_tokens": 58642.0333,
+   "summ_out_tokens": 0.0,
+   "summ_s": 18.99
+  }
+ }
+}

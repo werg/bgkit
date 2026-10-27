@@ -9,6 +9,9 @@
 \usepackage{xcolor}
 \usepackage{tikz}
 \usetikzlibrary{positioning,arrows.meta}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepgfplotslibrary{groupplots}
 \usepackage[hidelinks]{hyperref}
 \usepackage[numbers,sort&compress]{natbib}
 
@@ -28,18 +31,24 @@ it by a chosen ratio, and projects the result into the decoder's input embedding
 decoder reads it in place of the text's tokens. Any number of such compressed slots can be mixed with
 ordinary text, and the same interface carries documents, tool results, conversation histories and
 repositories. We train a 350M-parameter encoder with a 350M-parameter decoder on a single workstation
-GPU and evaluate the system at a fixed number of decoder positions. With 2{,}048 positions the decoder
-answers questions over 59k-token stories and 111k-token conversation histories, which it would
-otherwise have to read in full or truncate to 2{,}048 tokens. In 25 of 26 settings across nine long-context benchmarks the compressed context
-scores at least as high as the same decoder reading the text truncated to the same budget, for example
-0.74 against 0.12 on BABILong with 15k-token contexts in 1{,}024 positions. On HotpotQA it also scores
-above question-focused summaries written by a 35B-parameter model (0.64 against 0.55). On MuSiQue and
-LoCoMo, which were not used in training, it scores above the original decoder reading the entire
-context (0.30--0.33 against 0.13, and 0.28 against 0.19). Within a model, raising the compression from
-4$\times$ to 64$\times$ costs little. Exact strings are not preserved: on RULER the full context
-scores 0.58 and the compressed context 0.20. An agent that receives every tool result in compressed
-form runs SWE-bench Lite localisation and web-research episodes end to end, with fewer decoder tokens
-than when it reads text.
+GPU and evaluate at a fixed number of decoder positions on nine long-context benchmarks, against
+truncated text, BM25 retrieval, LongLLMLingua and question-focused summaries written by a 35B model.
+With 2{,}048 positions the decoder answers questions over 59k-token stories and 111k-token
+conversation histories. The compressed context scores significantly above truncated text in 16 of 26
+settings and above LongLLMLingua in 13 of 22, and is never significantly below either outside RULER.
+Where an answer combines facts spread through the context (BABILong, HotpotQA, MuSiQue) it is also
+above BM25, and in 512 positions it scores higher on BABILong than any text method given 2{,}048
+(0.79 against at most 0.38). With the same decoder weights, the compressed context also scores above
+the entire untruncated text on BABILong, HotpotQA and LoCoMo (for example 0.64 against 0.36 on
+HotpotQA in about a fifth of the positions): on these tasks, reading through the encoder adds accuracy, not
+only reach. The gain comes from the encoder's vectors, not only
+from which positions it keeps: at the same kept positions, the tokens themselves score far lower
+(0.26 against 0.74 on BABILong 16k), and an encoding made without the question loses most of its
+value. Exact strings are not preserved: on RULER's needle tasks, BM25 and summaries score higher. Over a
+110k-token context the decoder needs 0.1~GB instead of 5.0~GB of memory beyond its weights and decodes
+four times faster per token; the encoder pass costs about as much compute as a full-context prefill. An
+agent that receives every tool result in compressed form runs SWE-bench Lite localisation and
+web-research episodes end to end with fewer decoder tokens than when it reads text.
 \end{abstract}
 
 \section{Introduction}
@@ -57,21 +66,27 @@ decoder's input embedding space. The decoder reads them in a slot in place of th
 (Figure~\ref{fig:arch}). The compression ratio is chosen per slot at inference time, and an input can
 hold any number of slots alongside ordinary text. Because the slots are vectors in the decoder's own
 embedding space, the encoder can also read its own output, which lets it summarise directory trees and
-long histories hierarchically.
+long histories hierarchically. An encoding made under a question-independent prompt can also stay in
+context: a standing, compressed view of a repository, a memory or a long history, available to the
+model without spending its context window on the raw text. \bgkit{} is meant as a building block for
+this kind of ambient awareness beyond the context window.
 
 The paper makes three contributions:
 \begin{itemize}
 \item \textbf{A method} (Sections~\ref{sec:method}--\ref{sec:training}): the encoder, projection and
   slot interface, the training recipe, and an agent harness in which every tool result arrives
   compressed.
-\item \textbf{Measurements of context savings} (Sections~\ref{sec:sweep}--\ref{sec:ratio}): on nine
-  long-context benchmarks at a fixed decoder budget, compared with truncated text, question-focused
-  summaries from a much larger model, and the original decoder reading the whole context; and the
-  loss on held-out answers as the compression ratio grows.
-\item \textbf{An agent that reads only compressed context} (Section~\ref{sec:agents}): SWE-bench Lite
-  bug localisation, web research and conversational memory.
+\item \textbf{Measurements of context savings} (Sections~\ref{sec:sweep}--\ref{sec:cost}): nine
+  long-context benchmarks at a fixed decoder budget, against four text-side ways of fitting a context
+  into the same budget and against the original decoder reading the whole context; the budget a
+  text method needs to match the compressed context; the effect of the compression ratio; and the
+  end-to-end cost.
+\item \textbf{What the compressed context carries} (Section~\ref{sec:vectors}): at the encoder's own
+  kept positions, its vectors against the tokens at those positions, and encodings made with and
+  without the question.
 \end{itemize}
-Section~\ref{sec:ablation} reports which parts of the encoder the results depend on.
+Section~\ref{sec:agents} runs an agent that reads only compressed context on SWE-bench Lite bug
+localisation, web research and conversational memory.
 
 \begin{figure}[t]
 \centering
@@ -202,21 +217,32 @@ occupy. The arms are:
 \item[bgkit] The context is compressed to fit the budget, with the question as the encoder prompt.
 \item[text] The same trained decoder reads the context as text, middle-truncated to the budget.
 \item[base] The original decoder (adapter off) reads the same truncated text.
-\item[summary] Qwen3.6-35B-A3B writes a question-focused summary at the budget, which the trained
-  decoder reads as text. For HotpotQA the summariser reads about 1{,}600 tokens and generates about
-  280 per item. This arm was run for some budgets only.
+\item[BM25] Retrieval at the budget: the context is cut into passages of at most 128 tokens, the
+  passages are ranked against the question with BM25, and the best ones are kept up to the budget,
+  in document order.
+\item[LongLLMLingua] Question-aware token pruning \citep{jiang2024longllmlingua} to the budget, with
+  the method's recommended settings and Qwen3-1.7B as the scoring model (five times the size of our
+  encoder); the result is cut to the budget in the decoder's tokens.
+\item[summary] Qwen3.6-35B-A3B writes a question-focused summary at the budget (map-reduce over
+  12k-token chunks for longer contexts).
 \item[base, full context] The original decoder reads the whole context without truncation. This arm
   is not budget-matched.
 \end{description}
-The trained decoder was trained to read compressed slots, not to answer from text, so the \emph{text}
-arm uses it outside its training distribution. The encoder sees the question and truncation does not;
-the \emph{summary} arm is the question-aware text baseline.
+The trained decoder was trained to read compressed slots, not to answer from text, so it may read
+text worse than the original decoder does. The three question-aware text baselines (BM25,
+LongLLMLingua, summary) were therefore read by both decoders, and each cell reports the better of
+the two; the \emph{text} and \emph{base} columns report truncated text under each decoder.
 
 BABILong \citep{kuratov2024babilong} (tasks qa1--qa3), RULER \citep{hsieh2024ruler} and QuALITY
 \citep{pang2022quality} are scored by accuracy. NarrativeQA \citep{kocisky2018narrativeqa}, HotpotQA
 \citep{yang2018hotpotqa}, MuSiQue \citep{trivedi2022musique}, LongMemEval \citep{wu2025longmemeval}
-and LoCoMo \citep{maharana2024locomo} are scored by an LLM judge (Qwen3.6-35B-A3B). Cells have 60--100
-items, so an accuracy near 0.5 carries a 95\% interval of about $\pm0.1$.
+and LoCoMo \citep{maharana2024locomo} are scored by an LLM judge (Qwen3.6-35B-A3B with
+LongMemEval's yes/no judging prompt; a 4-bit GGUF build for the arms of the original sweep and an NVFP4
+build for the baselines added later; an FP8 build agreed with the original on 99\% of 1{,}500 sweep
+verdicts). All arms are scored on the same items. Cells have 60--100 items;
+we compare arms by the mean per-item difference with a 95\% paired-bootstrap interval (10{,}000
+resamples), given for every cell in Appendix~\ref{app:stats}, and call a difference significant when
+the interval excludes zero.
 
 \section{Long contexts at a fixed budget}
 \label{sec:sweep}
@@ -231,45 +257,93 @@ under 2$\times$ to about 54$\times$.
 \input{tables/sweep.tex}
 \caption{Accuracy by benchmark and budget (decoder positions available to the context); the second
 line of each benchmark gives its mean context length. BABILong, RULER and QuALITY: accuracy; the
-others: LLM-judge accuracy. Bold: best budget-matched arm. Summaries were generated for a subset of
-budgets (QuALITY summaries for 60 and 56 items). The last column is the original decoder reading the
-whole, untruncated context on the same items and is not budget-matched; it was not run for
-LongMemEval-S (contexts above the 32k-token limit of our full-context runs) and has too few shared
-items for NarrativeQA.}
+others: LLM-judge accuracy. Text: the trained decoder reading middle-truncated text; base: the
+original decoder reading it. BM25, LongLLMLingua and summary: the better of the two decoders.
+LongLLMLingua was run at one budget for NarrativeQA and LongMemEval-S; summaries exist for the
+budgets shown (QuALITY: 60 and 56 items). Bold: best budget-matched arm. The last column is the
+original decoder reading the whole, untruncated context on the same items and is not budget-matched;
+it was not run for LongMemEval-S (contexts above the 32k-token limit of our full-context runs) and has
+too few shared items for NarrativeQA.}
 \label{tab:sweep}
 \end{table}
 
-\paragraph{Against truncated text.}
-In 25 of 26 benchmark--budget cells the compressed context scores at least as high as the same
-decoder reading truncated text; the exception is RULER at 2{,}048 positions. The largest margins are
-on contexts much longer than the budget: BABILong 16k (0.74--0.76 against 0.12--0.22), LoCoMo (0.28
-against 0.09--0.16), and NarrativeQA (0.15--0.17 against 0.07--0.12, on stories averaging 59k
-tokens).
+\begin{figure}[p]
+\centering
+\input{tables/budget_fig.tex}
+\caption{Score against budget (decoder positions for the context, log scale) for the arms of
+Table~\ref{tab:sweep}. Text baselines are read by the better of the two decoders. Dashed: the
+original decoder reading the whole context (not budget-matched).}
+\label{fig:budget}
+\end{figure}
 
-\paragraph{Against a larger model's summaries.}
-On HotpotQA the compressed context scores above question-focused summaries written by
-Qwen3.6-35B-A3B at both budgets where both were run (0.64 against 0.55 at 256 positions, 0.62 against
-0.53 at 512). The summaries score higher on MuSiQue (0.40--0.42 against 0.30--0.31) and QuALITY
-(0.42--0.45 against 0.36--0.37); BABILong 4k is split. The encoder needs one forward pass of a 350M
-model; each summary is generated token by token by a mixture-of-experts model with 3B active
-parameters.
+\paragraph{Benchmarks not used in training.}
+MuSiQue, RULER, LongMemEval and LoCoMo were used only for evaluation. On MuSiQue the compressed
+context scores 0.30--0.33, against 0.08--0.16 for truncated text, 0.17--0.19 for BM25 and 0.13 for the
+original decoder reading the entire context. On LoCoMo it scores 0.28, against 0.09--0.16 for truncated
+text and 0.19 for the entire context, and on LongMemEval-S (111k tokens per history) 0.20--0.30 against
+0.15--0.18 for truncated text. On these two memory benchmarks BM25 retrieval scores about as high
+(0.27--0.34; no difference is significant). RULER is the exception, discussed below.
 
-\paragraph{Against the full context.}
-On MuSiQue and LoCoMo, which were not used in training, the compressed context scores above the
-original decoder reading the entire context: 0.30--0.33 against 0.13, and 0.28 against 0.19. The
-same holds on BABILong (0.74 against 0.18) and HotpotQA (0.64 against 0.45), whose task formats were
-in training. Part of these margins therefore comes from training on reading tasks rather than from
-compression itself; what they show about compression is that the compressed context retains what
-these questions need.
+\paragraph{Against text baselines at the same budget.}
+Appendix~\ref{app:stats} gives the paired difference for every cell. The compressed context scores
+significantly above truncated text in 16 of 26 cells and above LongLLMLingua in 13 of 22, and is
+significantly below either only on RULER (LongLLMLingua at 2{,}048 positions). Against BM25 it is
+significantly above on BABILong (by 0.29--0.50), HotpotQA (0.14--0.25) and MuSiQue (0.11--0.15),
+within noise on QuALITY, NarrativeQA, LongMemEval-S and LoCoMo, and below on RULER. The questions
+where it leads are those whose answer combines facts spread through the context: bAbI's chains of
+movements, and multi-hop questions over several paragraphs. Question-focused summaries written by the
+35B model, whose generation costs far more than one pass of the 350M encoder, score higher on MuSiQue
+(0.43 against 0.30--0.31, significant at 512 positions) and on RULER, about as high on HotpotQA and
+QuALITY, and lower on BABILong 4k (0.25--0.32 against 0.79--0.81).
+
+\paragraph{Effective budget.}
+Table~\ref{tab:efficiency} compares the compressed context at each benchmark's smallest budget with
+the best text method at the largest, four times as many positions (twice for LoCoMo). With a quarter of
+the positions, the compressed context scores significantly higher on BABILong, HotpotQA and MuSiQue
+(for example 0.79 in 512 positions against 0.38 for BM25 in 2{,}048 on BABILong 4k), about as high on
+QuALITY, NarrativeQA, LongMemEval-S and LoCoMo, and lower on RULER.
+
+\begin{table}[!ht]
+\centering
+\small
+\resizebox{\linewidth}{!}{\input{tables/efficiency.tex}}
+\caption{The compressed context at a benchmark's smallest budget against the best text-only arm
+(truncated text under either decoder, BM25, LongLLMLingua or summary, each with its better decoder) at
+the largest budget. Positions: how many times more decoder positions the text arm has. Difference:
+mean paired difference with 95\% bootstrap interval; bold where it excludes zero.}
+\label{tab:efficiency}
+\end{table}
+
+\paragraph{Against the whole context.}
+Table~\ref{tab:full} compares the compressed context with the whole, untruncated text, read once by the
+same trained decoder, so that only the form of the input differs, and once by the original decoder.
+With the same weights, the compressed context scores significantly higher on BABILong (0.74--0.79
+against 0.37--0.44), HotpotQA (0.64 against 0.36) and LoCoMo, which was not used in training (0.28
+against 0.17); it scores about as high on MuSiQue (0.30 against 0.20, interval including zero) and
+QuALITY, and lower on RULER (0.20 against 0.45). Against the original decoder reading the whole
+context it is higher on BABILong, HotpotQA (0.64 against 0.45) and MuSiQue (0.30 against 0.13).
+On questions that combine facts from across a text, the decoder thus gets more out of the prompted
+encoding than out of the text itself, while reading a fraction of the positions. Two caveats: the
+trained decoder's adapter was trained on slots rather than text, which may handicap its reading of
+text, and the task formats of BABILong and HotpotQA were in training (for the original decoder, part
+of the margin comes from that training rather than from compression).
+
+\begin{table}[!ht]
+\centering
+\small
+\resizebox{\linewidth}{!}{\input{tables/full.tex}}
+\caption{The compressed context at each benchmark's smallest budget against the whole, untruncated
+context read by the same trained decoder and by the original decoder (benchmarks whose contexts fit
+the 32k-token limit of the full-context runs). Differences: mean paired difference with 95\%
+bootstrap interval; bold where it excludes zero.}
+\label{tab:full}
+\end{table}
 
 \paragraph{Exact strings.}
-RULER's needle tasks, also not used in training, ask for exact keys and numbers. Here the full
-context scores 0.58 and the compressed context 0.17--0.20: arbitrary strings are not preserved at these
-ratios. The agent harness accordingly reads search hits at only 4$\times$.
-
-\paragraph{Conversation histories.}
-On LongMemEval-S (111k tokens per history) the compressed context scores 0.20--0.30 against
-0.15--0.18 for truncated text, with the highest score at the smallest budget.
+RULER's needle tasks ask for exact keys and numbers. The full context scores 0.58, BM25 0.42--0.54
+and the compressed context 0.17--0.20: arbitrary strings are not preserved at these ratios, and a
+method that returns the matching passage verbatim does better. The agent harness accordingly reads
+search hits at only 4$\times$.
 
 
 \section{Compression ratio}
@@ -289,6 +363,89 @@ about 4$\times$ to 15$\times$, and NarrativeQA 0.15--0.17 from about 7$\times$ t
 \caption{Decoder loss on the gold answer (nats per token) by compression ratio: held-out items of
 three training task families (96 each), earlier checkpoint, question as the encoder prompt.}
 \label{tab:ratio}
+\end{table}
+
+\section{Cost}
+\label{sec:cost}
+
+Table~\ref{tab:cost} measures one question over a long context with the released model (bf16, one
+GPU, medians of three runs after a warm-up): the original decoder prefilling the whole context, against
+the encoder pass over the context in 2{,}048-token chunks followed by a decoder prefill over the slots.
+The decoder's own cost falls with the number of positions it reads. At 110k tokens, the memory the
+decoder needs beyond its weights drops from 5.0~GB to 0.1~GB, and each generated token takes 12--13~ms
+instead of 53~ms. The encoder pass is not free: with an encoder as large as the decoder, its forward
+FLOPs over the context about equal those of the full-context prefill, so time to the first token is
+similar up to 64k tokens and lower at 110k (5.3--5.7~s against 8.9~s), where the decoder's attention
+over the full context grows faster than the chunked encoder. The encoder's cost does not depend on the
+decoder, so with a larger decoder the prefill saving would grow in proportion to its size; we did not
+measure that pairing. An encoding is specific to its question (Section~\ref{sec:vectors}), so each new
+question needs a new encoder pass, whereas a full-context prefill can be cached and reused across
+questions.
+
+\begin{table}[!ht]
+\centering
+\small
+\resizebox{\linewidth}{!}{\input{tables/cost.tex}}
+\caption{Cost of one question over a context of the given length (tokens; text from a LongMemEval-S
+history), released model in bf16 on one NVIDIA GB10 GPU that was shared with another job; medians of
+three runs. bgkit, $B$: the context compressed to about $B$ decoder positions (at 110k tokens and
+$B=1{,}024$ the 64$\times$ compression cap gives 1{,}820). First token: encoder plus prefill. ms per
+token: greedy decoding with the KV cache. Memory: peak CUDA memory beyond the weights. TFLOP: forward
+FLOPs, $2 \times \text{parameters} \times \text{tokens}$ over encoder and decoder.}
+\label{tab:cost}
+\end{table}
+
+\section{What the compressed context carries}
+\label{sec:vectors}
+
+The encoder does two things: it chooses which positions to keep, and it computes a vector at each kept
+position after the remaining layers have attended over the whole text and the prompt. Two
+measurements separate these.
+
+\paragraph{Vectors against the tokens they sit on.}
+In the \emph{kept tokens} arm the encoder runs exactly as in the \bgkit{} arm, with the same question
+as prompt and the same budget, but the decoder receives the token embeddings at the kept positions,
+in document order, instead of the encoder's vectors (Table~\ref{tab:format}). The positions and
+their number are identical; only what occupies them differs. The vectors score significantly higher
+on seven of nine benchmarks: 0.74 against 0.26 on BABILong 16k, 0.64 against 0.31 on HotpotQA, 0.30
+against 0.07 on LongMemEval-S; QuALITY and NarrativeQA are within noise. The kept tokens on their
+own score in the range of LongLLMLingua's question-aware token pruning at the same budget (higher on
+BABILong, lower on the two memory benchmarks). Most of the
+compressed context's advantage therefore lies in the vectors: a vector at a kept position carries
+information from text that was not kept, which a selection of tokens cannot.
+
+\begin{table}[!ht]
+\centering
+\small
+\resizebox{\linewidth}{!}{\input{tables/format.tex}}
+\caption{Same selection, different contents, at each benchmark's smallest budget. Vectors: the
+\bgkit{} arm. Tokens: the token embeddings at the same kept positions (better of the two decoders).
+Difference: vectors minus tokens, mean paired difference with 95\% bootstrap interval; bold where it
+excludes zero. LongLLMLingua and text (truncated, trained decoder) at the same budget for scale.}
+\label{tab:format}
+\end{table}
+
+\paragraph{The prompt and the selection.}
+Table~\ref{tab:ablation} varies how the encoding is produced, on the items and checkpoint of
+Table~\ref{tab:ratio}. Encoding without the question lowers exact match from 0.58--0.90 to 0.04--0.21.
+With the prompt for a different question about the same document, the loss on the correct answer
+exceeds the no-context loss on SQuAD (3.16 against 2.30 at 4$\times$) and multi-needle (4.32 against
+3.01). Replacing the learned position selection with random positions of the same number changes
+exact match little on SQuAD (0.61 in both) and lowers it on multi-needle (0.54 against 0.58) and
+bAbI-in-filler (0.82 against 0.90). What the vectors carry thus depends mainly on the prompt they were
+computed under, and less on which positions hold them. The encoding is specific to its prompt: one made
+under one question can be reused for another only when the prompt does not depend on the question, as
+for the repository overview and the memory index.
+
+\begin{table}[!ht]
+\centering
+\small
+\resizebox{\linewidth}{!}{\input{tables/ablation.tex}}
+\caption{Encoder conditions, same items and checkpoint as Table~\ref{tab:ratio}. EM: exact match of
+generated answers at 64$\times$. $\mathcal{L}$: decoder loss on the gold answer (nats per token) at
+4$\times$ and 64$\times$; lower is better. ``No context'' is the decoder's loss with the context
+removed.}
+\label{tab:ablation}
 \end{table}
 
 \section{Agentic tasks}
@@ -342,44 +499,24 @@ compressed under a generic prompt and re-reads sessions under its own focus. It 
 of \input{tables/memory_agent.tex}\unskip, against 0.30 and 0.28 when every session is compressed under
 the question (Table~\ref{tab:sweep}).
 
-\section{What the encoding depends on}
-\label{sec:ablation}
-
-Table~\ref{tab:ablation} varies how the encoding is produced, on the items and checkpoint of
-Table~\ref{tab:ratio}. Replacing the learned position selection with random positions of the same
-number changes exact match little on SQuAD (0.61 in both) and lowers it on multi-needle (0.54 against
-0.58) and bAbI-in-filler (0.82 against 0.90). Removing the prompt lowers exact match to 0.04--0.21.
-With the prompt for a different question about the same document, the loss on the correct answer
-exceeds the no-context loss on SQuAD (3.16 against 2.30 at 4$\times$) and multi-needle (4.32 against
-3.01). The encoding is therefore specific to its prompt: an encoding made under one question can be
-reused for another only when the prompt does not depend on the question, as for the repository
-overview and the memory index.
-
-\begin{table}[!ht]
-\centering
-\small
-\resizebox{\linewidth}{!}{\input{tables/ablation.tex}}
-\caption{Encoder conditions, same items and checkpoint as Table~\ref{tab:ratio}. EM: exact match of
-generated answers at 64$\times$. $\mathcal{L}$: decoder loss on the gold answer (nats per token) at
-4$\times$ and 64$\times$; lower is better. ``No context'' is the decoder's loss with the context
-removed.}
-\label{tab:ablation}
-\end{table}
-
 \section{Limitations}
 
 \begin{itemize}
-\item \textbf{Baselines.} The text arms use a decoder trained on compressed slots, not on text. A
-  decoder fine-tuned on the same data with text contexts at the same budget, and question-aware token
-  pruning \citep{jiang2024longllmlingua}, were not run.
+\item \textbf{Baselines.} No decoder was trained on the same data with text contexts at the same
+  budget; text baselines are read by the slot-trained decoder or the original one, whichever scores
+  higher. An adapter from an earlier, shorter run (4{,}000 steps on a different mix of reading and
+  agent data) trained to read text placed in the slot scores significantly below the compressed
+  context in 20 of 26 cells and above it in none, but it is not a matched baseline. LongLLMLingua used
+  a 1.7B scoring model, and was run at one budget on the two longest benchmarks.
 \item \textbf{Task overlap.} The task formats of BABILong, HotpotQA, QuALITY and NarrativeQA are in
   training (their training splits, or bAbI's generator for BABILong). MuSiQue, RULER, LongMemEval and
   LoCoMo were not trained on.
 \item \textbf{Scale and sample size.} Encoder and decoder have 350M parameters each, evaluation cells
   have 60--186 items, and the agentic results rest on small counts. We ran one seed.
 \item \textbf{Encoder cost.} An encoding made under a question serves that question, so each new
-  question needs a new encoder pass over the text. The savings reported here are in decoder
-  positions; we did not measure end-to-end cost.
+  question needs a new encoder pass over the text. With equal-sized encoder and decoder, that pass
+  costs about as much compute as a full-context prefill (Section~\ref{sec:cost}); the savings are in
+  decoder positions, memory and per-token decoding time.
 \item \textbf{Exact strings.} Arbitrary keys and numbers are lost at these ratios (RULER).
 \item \textbf{Training history.} The evaluated model ends a chain of warm-started development runs,
   and the recipe has not been reproduced from scratch.
@@ -404,13 +541,38 @@ it as the channel through which an agent receives all tool output.
 \bgkit{} compresses text into vectors that a decoder reads through its embedding layer, under a prompt
 that states what the reader needs. With a 350M encoder and a 350M decoder, a budget of a few thousand
 positions gives the decoder access to contexts of tens to over a hundred thousand tokens. At equal
-budget the compressed context scores above truncated text on almost all of the benchmarks we tested,
-retains what multi-hop and conversational-memory questions need, and loses exact strings. The same
-interface lets an agent work with every tool result in compressed form. Next steps are the baselines
-listed above, encodings that can be reused across questions, and pairing a small encoder with a much
-larger decoder.
+budget the compressed context scores above truncated text and token pruning on most of the benchmarks
+we tested, and above BM25 retrieval where answers combine facts spread through the context, often with
+a quarter of the positions; it loses exact strings, where retrieval does better. At the encoder's own
+kept positions its vectors carry far more than the tokens there, and what they carry depends on the
+prompt. The same interface lets an agent work with every tool result in compressed form, and keep a
+repository overview or a memory index in context as standing background. Our evidence for that use
+is limited to a 350M agent (Section~\ref{sec:agents}). The case for it grows with the decoder, since
+the encoder's cost does not depend on the decoder's size; pairing a small encoder with a much larger
+decoder is the natural next step. Next steps are
+a decoder trained on text at the same budget as a matched baseline, encodings that can be reused across
+questions, and combining retrieval with compression.
 
 \bibliographystyle{plainnat}
 \bibliography{references}
+
+\appendix
+\section{Paired differences}
+\label{app:stats}
+
+Table~\ref{tab:stats} gives, for every benchmark and budget of Table~\ref{tab:sweep}, the mean
+per-item difference between \bgkit{} and each other arm with its 95\% paired-bootstrap interval
+(10{,}000 resamples). Text baselines use the better of the two decoders, as in
+Table~\ref{tab:sweep}.
+
+\begin{table}[ht]
+\centering
+\scriptsize
+\resizebox{\linewidth}{!}{\input{tables/stats.tex}}
+\caption{\bgkit{} minus each arm: mean per-item difference and 95\% paired-bootstrap interval. Bold:
+the interval excludes zero. Full context: the original decoder reading the whole context (not
+budget-matched), on the items shared with the sweep.}
+\label{tab:stats}
+\end{table}
 
 \end{document}

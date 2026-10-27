@@ -1,0 +1,17 @@
+\begin{tabular}{lrrrlrrc}
+\toprule
+ & \multicolumn{2}{c}{bgkit} & \multicolumn{3}{c}{best text-only arm} & & \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-6}
+Benchmark & budget & score & budget & arm & score & positions & difference \\
+\midrule
+BABILong 16k & 1,024 & 0.74 & 4,096 & BM25 & 0.45 & 4$\times$ & \textbf{$+0.29$ \scriptsize[$+0.17$, $+0.41$]} \\
+BABILong 4k & 512 & 0.79 & 2,048 & BM25 & 0.38 & 4$\times$ & \textbf{$+0.41$ \scriptsize[$+0.29$, $+0.53$]} \\
+RULER 4k & 512 & 0.20 & 2,048 & BM25 & 0.54 & 4$\times$ & \textbf{$-0.34$ \scriptsize[$-0.44$, $-0.24$]} \\
+QuALITY & 512 & 0.36 & 2,048 & summary & 0.48 & 4$\times$ & $-0.09$ \scriptsize[$-0.18$, $+0.00$] \\
+NarrativeQA & 2,048 & 0.17 & 8,192 & BM25 & 0.13 & 4$\times$ & $+0.03$ \scriptsize[$-0.08$, $+0.15$] \\
+HotpotQA & 256 & 0.64 & 1,024 & BM25 & 0.46 & 4$\times$ & \textbf{$+0.18$ \scriptsize[$+0.07$, $+0.29$]} \\
+MuSiQue & 512 & 0.30 & 2,048 & BM25 & 0.18 & 4$\times$ & \textbf{$+0.12$ \scriptsize[$+0.01$, $+0.23$]} \\
+LongMemEval-S & 2,048 & 0.30 & 8,192 & BM25 & 0.27 & 4$\times$ & $+0.03$ \scriptsize[$-0.08$, $+0.15$] \\
+LoCoMo & 1,024 & 0.28 & 2,048 & BM25 & 0.30 & 2$\times$ & $-0.02$ \scriptsize[$-0.12$, $+0.08$] \\
+\bottomrule
+\end{tabular}

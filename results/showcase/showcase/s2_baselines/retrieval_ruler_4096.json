@@ -1,0 +1,63 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/ruler_4096.jsonl",
+ "n": 100,
+ "budgets": [
+  512,
+  1024,
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 165,
+ "summary": {
+  "retrieval@512": {
+   "acc": 0.42,
+   "prefix": 496.43,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2427
+  },
+  "base_retrieval@512": {
+   "acc": 0.42,
+   "prefix": 496.43,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2263
+  },
+  "retrieval@1024": {
+   "acc": 0.42,
+   "prefix": 1005.38,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2449
+  },
+  "base_retrieval@1024": {
+   "acc": 0.49,
+   "prefix": 1005.38,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2585
+  },
+  "retrieval@2048": {
+   "acc": 0.45,
+   "prefix": 2014.89,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3245
+  },
+  "base_retrieval@2048": {
+   "acc": 0.54,
+   "prefix": 2014.89,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2765
+  }
+ }
+}

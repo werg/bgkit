@@ -1,0 +1,23 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/hotpot.jsonl",
+ "n": 100,
+ "budgets": [
+  1024
+ ],
+ "slot_tokens": 2048,
+ "seconds": 37,
+ "summary": {
+  "text_full@full": {
+   "em": 0.2,
+   "f1": 0.2876,
+   "contains": 0.29,
+   "prefix": 1496.28,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3637
+  }
+ }
+}

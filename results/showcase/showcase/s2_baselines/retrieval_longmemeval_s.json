@@ -1,0 +1,75 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/longmemeval_s.jsonl",
+ "n": 60,
+ "budgets": [
+  2048,
+  4096,
+  8192
+ ],
+ "slot_tokens": 2048,
+ "seconds": 290,
+ "summary": {
+  "retrieval@2048": {
+   "em": 0.0667,
+   "f1": 0.2478,
+   "contains": 0.2667,
+   "prefix": 2118.7,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3623
+  },
+  "base_retrieval@2048": {
+   "em": 0.0,
+   "f1": 0.1704,
+   "contains": 0.25,
+   "prefix": 2118.7,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3873
+  },
+  "retrieval@4096": {
+   "em": 0.0,
+   "f1": 0.209,
+   "contains": 0.25,
+   "prefix": 4150.7,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.5196
+  },
+  "base_retrieval@4096": {
+   "em": 0.0,
+   "f1": 0.0996,
+   "contains": 0.1333,
+   "prefix": 4150.7,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.5241
+  },
+  "retrieval@8192": {
+   "em": 0.0,
+   "f1": 0.1984,
+   "contains": 0.2333,
+   "prefix": 8213.45,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.8386
+  },
+  "base_retrieval@8192": {
+   "em": 0.0167,
+   "f1": 0.0999,
+   "contains": 0.1667,
+   "prefix": 8213.45,
+   "ctx_tokens": 110684.2833,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.7487
+  }
+ }
+}

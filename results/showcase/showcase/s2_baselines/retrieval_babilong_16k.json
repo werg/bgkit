@@ -1,0 +1,63 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/babilong_16k.jsonl",
+ "n": 100,
+ "budgets": [
+  1024,
+  2048,
+  4096
+ ],
+ "slot_tokens": 2048,
+ "seconds": 124,
+ "summary": {
+  "retrieval@1024": {
+   "acc": 0.4,
+   "prefix": 993.19,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1535
+  },
+  "base_retrieval@1024": {
+   "acc": 0.31,
+   "prefix": 993.19,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1026
+  },
+  "retrieval@2048": {
+   "acc": 0.43,
+   "prefix": 2014.94,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.166
+  },
+  "base_retrieval@2048": {
+   "acc": 0.29,
+   "prefix": 2014.94,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1292
+  },
+  "retrieval@4096": {
+   "acc": 0.45,
+   "prefix": 4051.98,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2546
+  },
+  "base_retrieval@4096": {
+   "acc": 0.25,
+   "prefix": 4051.98,
+   "ctx_tokens": 15444.53,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1872
+  }
+ }
+}

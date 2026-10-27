@@ -1,0 +1,54 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/locomo.jsonl",
+ "n": 100,
+ "budgets": [
+  1024,
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 723,
+ "summary": {
+  "bgkit_tokens@1024": {
+   "em": 0.02,
+   "f1": 0.1014,
+   "contains": 0.06,
+   "prefix": 1107.14,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 1.4855,
+   "dec_s": 0.2526
+  },
+  "base_bgkit_tokens@1024": {
+   "em": 0.0,
+   "f1": 0.0864,
+   "contains": 0.01,
+   "prefix": 1107.14,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 1.4479,
+   "dec_s": 0.3
+  },
+  "bgkit_tokens@2048": {
+   "em": 0.02,
+   "f1": 0.1219,
+   "contains": 0.05,
+   "prefix": 2130.28,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 1.5039,
+   "dec_s": 0.3352
+  },
+  "base_bgkit_tokens@2048": {
+   "em": 0.0,
+   "f1": 0.0971,
+   "contains": 0.05,
+   "prefix": 2130.28,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 1.5124,
+   "dec_s": 0.3487
+  }
+ }
+}

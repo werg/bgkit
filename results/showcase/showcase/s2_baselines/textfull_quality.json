@@ -1,0 +1,21 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/quality.jsonl",
+ "n": 100,
+ "budgets": [
+  1024
+ ],
+ "slot_tokens": 2048,
+ "seconds": 61,
+ "summary": {
+  "text_full@full": {
+   "acc": 0.34,
+   "prefix": 6100.23,
+   "ctx_tokens": 5999.78,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.5895
+  }
+ }
+}

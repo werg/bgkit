@@ -1,0 +1,39 @@
+{
+ "experiment": "bgkit2_p19g_fulltext_lora",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step4066_20260909_033356_033464_run-bgkit2_p19g_fulltext_lora",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/ruler_4096.jsonl",
+ "n": 100,
+ "budgets": [
+  512,
+  1024,
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 96,
+ "summary": {
+  "textslot@512": {
+   "acc": 0.08,
+   "prefix": 576.7,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2782
+  },
+  "textslot@1024": {
+   "acc": 0.12,
+   "prefix": 1088.51,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2942
+  },
+  "textslot@2048": {
+   "acc": 0.24,
+   "prefix": 2112.66,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3565
+  }
+ }
+}

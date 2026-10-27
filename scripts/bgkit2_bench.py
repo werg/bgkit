@@ -14,6 +14,17 @@ Input: jsonl from scripts/bgkit2_bench_prep.py (segments + question + answers). 
           written to ~the budget (scripts/bgkit2_bench_summaries.py, --summaries <jsonl>): the
           prompted-text-compression competitor. Its cost (summariser tokens + seconds) is
           reported beside the reader's
+  retrieval / base_retrieval  BM25 retrieval at the budget: the context cut into passages of
+          <= --passage-tokens tokens, ranked against the question (and options), the best
+          passages kept up to the budget and read as text in document order
+  textslot  the context's own token embeddings, middle-truncated to the budget, in the slot (the
+          rep-gated adapter of a ``kd.full_text_student`` checkpoint reads them there: the decoder
+          trained on text contexts at the same interface)
+  bgkit_tokens / base_bgkit_tokens  the bgkit arm's own selection (same encoder pass, prompt and budget), but the slot
+          holds the decoder's token embeddings at the kept positions instead of the encoder's
+          vectors: separates what the vectors carry from which tokens they sit on
+  <name> / base_<name>  plain text precomputed per (item, budget) by another compressor
+          (--precomputed name=path, same jsonl schema as the summaries; e.g. LongLLMLingua)
   agent_memory  memory benches only (LongMemEval, LoCoMo), budget-independent (``@agent``): the
           two-stage memory AGENT (bgkit2.agent.memory_eval) -- every session one index slot under
           the generic MEMORY_INDEX_PROMPT, the question in the opening turn, and the student
@@ -145,6 +156,34 @@ def truncate_middle(tok, text: str, budget: int) -> tuple[str, int]:
         return text, len(ids)
     h = budget // 2
     return tok.decode(ids[:h]) + "\n[...]\n" + tok.decode(ids[-(budget - h):]), budget
+
+
+_WORD = re.compile(r"\w+")
+
+
+def bm25_select(tok, segments: list[str], query: str, budget: int, passage_tokens: int) -> tuple[str, int]:
+    """The budget filled with the passages that score best against the query under BM25, kept in
+    document order. Passages: each segment split into pieces of <= passage_tokens tokens."""
+    from rank_bm25 import BM25Okapi
+
+    passages: list[tuple[str, int]] = []
+    for seg in segments:
+        ids = tok(seg, add_special_tokens=False)["input_ids"]
+        for i in range(0, max(len(ids), 1), passage_tokens):
+            piece = ids[i : i + passage_tokens]
+            if piece:
+                passages.append((tok.decode(piece), len(piece)))
+    if sum(n for _, n in passages) <= budget:
+        return "\n\n".join(t for t, _ in passages), sum(n for _, n in passages)
+    bm = BM25Okapi([_WORD.findall(t.lower()) or ["_"] for t, _ in passages])
+    scores = bm.get_scores(_WORD.findall(query.lower()))
+    keep, used = [], 0
+    for j in sorted(range(len(passages)), key=lambda j: -scores[j]):
+        if used + passages[j][1] + 2 > budget:
+            continue
+        keep.append(j)
+        used += passages[j][1] + 2
+    return "\n\n".join(passages[j][0] for j in sorted(keep)), used
 
 
 # ---------------------------------------------------------------- arms
@@ -305,6 +344,81 @@ def gen_text(student, messages, max_new: int) -> dict:
             "dec_s": time.perf_counter() - t0}
 
 
+@torch.no_grad()
+def gen_textslot(student, messages, text_ids: list[int], max_new: int) -> dict:
+    """The context's decoder token embeddings in the slot (``kd.full_text_student``'s layout)."""
+    segs = student.renderer.render_slots(json.dumps(messages), None, student._think_arg())
+    assert len(segs) == 2, len(segs)
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    dec = student.decoder
+    ids = torch.tensor(text_ids, dtype=torch.long, device=dec.embed_tokens.weight.device)
+    with student.core.autocast():
+        reps = dec.embed(ids)[None]
+        mask = torch.ones(reps.shape[:2], dtype=torch.bool, device=reps.device)
+        batch = dec.build_batch([segs[0]], reps, mask, [segs[1]], pad_side="left",
+                                loss_on_suffix=False, decoder_space=True)
+        gen = dec.generate(batch, max_new_tokens=student._budget(max_new),
+                           eos_token_id=student.renderer.eos_id)
+    torch.cuda.synchronize()
+    return {"text": student.decode_answer(gen[0].tolist()),
+            "prefix": int(batch.inputs_embeds.shape[1]), "reps": 0, "enc_s": 0.0,
+            "dec_s": time.perf_counter() - t0}
+
+
+@torch.no_grad()
+def gen_kept_tokens(student, messages, contexts, prompts, n_reps, max_new, enc_batch: int) -> dict:
+    """``gen_slots`` with each slot's encoder vectors replaced by the decoder's embeddings of the
+    tokens at the kept positions (in document order)."""
+    from bgkit2.agent.student import slot_ratio
+
+    segs = student.renderer.render_slots(json.dumps(messages), None, student._think_arg())
+    k = len(segs) - 1
+    dec = student.decoder
+    parts = []
+    torch.cuda.synchronize()
+    t_enc = time.perf_counter()
+    for i in range(0, k, enc_batch):
+        ctx = [student._encode_text_slot(c) for c in contexts[i : i + enc_batch]]
+        pr = [student.renderer.encode_ctx(p) for p in prompts[i : i + enc_batch]]
+        lmax, pmax = max(c.shape[0] for c in ctx), max(p.shape[0] for p in pr)
+        ids = torch.zeros(len(ctx), lmax, dtype=torch.long)
+        mask = torch.zeros_like(ids)
+        pid = torch.zeros(len(ctx), pmax, dtype=torch.long)
+        pmask = torch.zeros_like(pid)
+        ratios = torch.zeros(len(ctx))
+        for j, (c, q) in enumerate(zip(ctx, pr, strict=True)):
+            ids[j, : c.shape[0]], mask[j, : c.shape[0]] = c, 1
+            pid[j, pmax - q.shape[0] :], pmask[j, pmax - q.shape[0] :] = q, 1
+            ratios[j] = slot_ratio(int(n_reps[i + j]), int(c.shape[0]))
+        ids_d = ids.to(student.device)
+        with student.core.autocast():
+            out = student.encoder(ids_d, mask.to(student.device), ratio=ratios.to(student.device),
+                                  prompt_ids=pid.to(student.device),
+                                  prompt_mask=pmask.to(student.device))
+        for j in range(len(ctx)):
+            pos = out.positions[j][out.rep_mask[j]].sort().values
+            tok_ids = ids_d[j].gather(0, pos)
+            with student.core.autocast():
+                e = dec.embed(tok_ids)
+            parts.append((e, torch.ones(e.shape[0], dtype=torch.bool, device=e.device)))
+    torch.cuda.synchronize()
+    enc_s = time.perf_counter() - t_enc
+    t_dec = time.perf_counter()
+    with student.core.autocast():
+        batch = dec.build_batch([segs[0]], parts[0][0][None], parts[0][1][None], [segs[-1]],
+                                pad_side="left", loss_on_suffix=False,
+                                extra=[[parts[j] for j in range(1, k)]],
+                                mid_ids=[list(segs[1:-1])], decoder_space=True)
+        gen = dec.generate(batch, max_new_tokens=student._budget(max_new),
+                           eos_token_id=student.renderer.eos_id)
+    torch.cuda.synchronize()
+    return {"text": student.decode_answer(gen[0].tolist()),
+            "prefix": int(batch.inputs_embeds.shape[1]),
+            "reps": int(sum(p[0].shape[0] for p in parts)),
+            "enc_s": enc_s, "dec_s": time.perf_counter() - t_dec}
+
+
 AGENT_MEANS = ("turns", "n_read", "n_search", "decoder_tokens", "encoder_tokens_nominal",
                "encoder_tokens_computed", "index_tokens", "index_reps", "read_tokens",
                "search_tokens", "cache_hits", "enc_s", "dec_s", "prefix")
@@ -352,6 +466,10 @@ def main() -> None:
     ap.add_argument("--full-max-tokens", type=int, default=32768,
                     help="text_full/base_full only when the whole context fits")
     ap.add_argument("--summaries", default="", help="jsonl from bgkit2_bench_summaries.py")
+    ap.add_argument("--precomputed", action="append", default=[],
+                    help="name=path: plain-text contexts per (id, budget) from another compressor; "
+                         "arms <name> and base_<name>")
+    ap.add_argument("--passage-tokens", type=int, default=128, help="retrieval arm passage size")
     ap.add_argument("--agent-max-turns", type=int, default=6, help="agent_memory turn cap")
     ap.add_argument("--agent-max-new-tokens", type=int, default=160)
     ap.add_argument("--thinking", action="store_true",
@@ -381,11 +499,15 @@ def main() -> None:
     if args.n:
         items = items[: args.n]
     budgets = [int(b) for b in args.budgets.split(",")]
-    summ: dict[tuple[str, int], dict] = {}
-    if args.summaries:
-        for ln in open(args.summaries):
+    # precomputed plain-text contexts: name -> (id, budget) -> {summary, in_tokens, ...}
+    pre: dict[str, dict[tuple[str, int], dict]] = {}
+    sources = ([f"summary={args.summaries}"] if args.summaries else []) + list(args.precomputed)
+    for spec in sources:
+        name, path = spec.split("=", 1)
+        pre[name] = {}
+        for ln in open(path):
             d = json.loads(ln)
-            summ[(d["id"], int(d["budget"]))] = d
+            pre[name][(d["id"], int(d["budget"]))] = d
     arms = [a for a in args.arms.split(",") if a]
     agg: dict[str, dict[str, list[float]]] = {}
     agent_cache = SlotRepCache(student, args.enc_batch, args.agent_cache_reps)
@@ -415,20 +537,36 @@ def main() -> None:
                     key = f"{a}@full"
                     if total_dec > args.full_max_tokens:
                         continue
-                if a in ("summary", "base_summary") and (it["id"], b) not in summ:
+                src = a.removeprefix("base_")
+                if src in pre and (it["id"], b) not in pre[src]:
                     continue
                 try:
-                    if a == "bgkit":
+                    if a in ("bgkit", "bgkit_tokens", "base_bgkit_tokens"):
                         ratio = min(max(total / b, 1.0), args.max_ratio)
                         n_reps = [max(4, round(ln / ratio)) for ln in lens]
                         msgs = frame(it, "\n".join([SPLICE_SENTINEL] * len(chunks)))
-                        out = gen_slots(student, msgs, chunks, [it["question"]] * len(chunks),
-                                        n_reps, max_new, args.enc_batch)
+                        gen = gen_slots if a == "bgkit" else gen_kept_tokens
+                        call = (student, msgs, chunks, [it["question"]] * len(chunks), n_reps,
+                                max_new, args.enc_batch)
+                        if a == "base_bgkit_tokens":
+                            # the original decoder reads; the encoder (its own weights) still selects
+                            with student.decoder.disable_adapter():
+                                out = gen(*call)
+                        else:
+                            out = gen(*call)
+                    elif a == "textslot":
+                        text, _n = truncate_middle(tok, full_text, b)
+                        out = gen_textslot(student, frame(it, SPLICE_SENTINEL),
+                                           tok(text, add_special_tokens=False)["input_ids"], max_new)
                     else:
                         if a in ("text_full", "base_full"):
                             text = full_text
-                        elif a in ("summary", "base_summary"):
-                            text = summ[(it["id"], b)]["summary"]
+                        elif src in pre:
+                            text = pre[src][(it["id"], b)]["summary"]
+                        elif src == "retrieval":
+                            text, _n = bm25_select(tok, it["segments"],
+                                                   question_text(it).removeprefix("Question: "),
+                                                   b, args.passage_tokens)
                         else:
                             text, _n = truncate_middle(tok, full_text, b)
                         msgs = frame(it, text)
@@ -444,8 +582,8 @@ def main() -> None:
                 sc = score(it, out["text"])
                 d = agg.setdefault(key, {})
                 extra_cost = {}
-                if a in ("summary", "base_summary"):
-                    sd = summ[(it["id"], b)]
+                if src in pre:
+                    sd = pre[src][(it["id"], b)]
                     extra_cost = {"summ_in_tokens": sd.get("in_tokens", 0),
                                   "summ_out_tokens": sd.get("out_tokens", 0),
                                   "summ_s": sd.get("seconds", 0.0)}

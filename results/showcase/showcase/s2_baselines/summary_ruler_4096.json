@@ -1,0 +1,59 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/ruler_4096.jsonl",
+ "n": 100,
+ "budgets": [
+  512,
+  1024,
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 106,
+ "summary": {
+  "summary@512": {
+   "acc": 0.32,
+   "prefix": 434.14,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2733,
+   "summ_in_tokens": 4004.83,
+   "summ_out_tokens": 495.16,
+   "summ_s": 64.1323
+  },
+  "base_summary@512": {
+   "acc": 0.41,
+   "prefix": 434.14,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2455,
+   "summ_in_tokens": 4004.83,
+   "summ_out_tokens": 495.16,
+   "summ_s": 64.1323
+  },
+  "summary@1024": {
+   "acc": 0.31,
+   "prefix": 768.72,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2696,
+   "summ_in_tokens": 4004.83,
+   "summ_out_tokens": 1000.76,
+   "summ_s": 128.5138
+  },
+  "base_summary@1024": {
+   "acc": 0.34,
+   "prefix": 768.72,
+   "ctx_tokens": 3673.9,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2514,
+   "summ_in_tokens": 4004.83,
+   "summ_out_tokens": 1000.76,
+   "summ_s": 128.5138
+  }
+ }
+}

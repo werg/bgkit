@@ -1,0 +1,45 @@
+{
+ "experiment": "bgkit2_p19g_fulltext_lora",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step4066_20260909_033356_033464_run-bgkit2_p19g_fulltext_lora",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/hotpot.jsonl",
+ "n": 100,
+ "budgets": [
+  256,
+  512,
+  1024
+ ],
+ "slot_tokens": 2048,
+ "seconds": 39,
+ "summary": {
+  "textslot@256": {
+   "em": 0.22,
+   "f1": 0.2487,
+   "contains": 0.23,
+   "prefix": 315.14,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1209
+  },
+  "textslot@512": {
+   "em": 0.2,
+   "f1": 0.2827,
+   "contains": 0.21,
+   "prefix": 568.51,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1095
+  },
+  "textslot@1024": {
+   "em": 0.28,
+   "f1": 0.3741,
+   "contains": 0.3,
+   "prefix": 1061.86,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1416
+  }
+ }
+}

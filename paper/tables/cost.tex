@@ -1,0 +1,25 @@
+\begin{tabular}{llrrrrrrr}
+\toprule
+Context & Arm & \shortstack{Decoder\\positions} & \shortstack{Encoder\\s} & \shortstack{Prefill\\s} & \shortstack{First\\token s} & \shortstack{ms per\\token} & \shortstack{Memory\\GB} & TFLOP \\
+\midrule
+4,096 & full context & 4,143 & -- & 0.08 & 0.08 & 5.6 & 0.19 & 3 \\
+ & bgkit, 1,024 & 1,072 & 0.10 & 0.02 & 0.11 & 5.4 & 0.09 & 4 \\
+ & bgkit, 2,048 & 2,096 & 0.10 & 0.04 & 0.13 & 5.6 & 0.11 & 5 \\
+\midrule
+16,384 & full context & 16,431 & -- & 0.39 & 0.39 & 7.6 & 0.74 & 12 \\
+ & bgkit, 1,024 & 1,078 & 0.38 & 0.02 & 0.39 & 5.4 & 0.09 & 13 \\
+ & bgkit, 2,048 & 2,102 & 0.84 & 0.08 & 0.92 & 12.3 & 0.11 & 14 \\
+\midrule
+32,768 & full context & 32,815 & -- & 1.89 & 1.89 & 23.4 & 1.48 & 23 \\
+ & bgkit, 1,024 & 1,086 & 1.72 & 0.04 & 1.76 & 12.1 & 0.09 & 26 \\
+ & bgkit, 2,048 & 2,110 & 0.77 & 0.04 & 0.81 & 5.6 & 0.11 & 26 \\
+\midrule
+65,536 & full context & 65,583 & -- & 3.12 & 3.12 & 36.0 & 2.96 & 46 \\
+ & bgkit, 1,024 & 1,102 & 3.33 & 0.04 & 3.38 & 11.9 & 0.09 & 51 \\
+ & bgkit, 2,048 & 2,126 & 3.38 & 0.09 & 3.46 & 12.5 & 0.11 & 51 \\
+\midrule
+110,000 & full context & 110,047 & -- & 8.87 & 8.87 & 52.8 & 4.96 & 78 \\
+ & bgkit, 1,024 & 1,820 & 5.23 & 0.07 & 5.30 & 12.3 & 0.09 & 85 \\
+ & bgkit, 2,048 & 2,142 & 5.65 & 0.09 & 5.74 & 12.7 & 0.11 & 85 \\
+\bottomrule
+\end{tabular}

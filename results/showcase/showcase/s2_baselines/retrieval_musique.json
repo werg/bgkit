@@ -1,0 +1,75 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/musique.jsonl",
+ "n": 100,
+ "budgets": [
+  512,
+  1024,
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 202,
+ "summary": {
+  "retrieval@512": {
+   "em": 0.04,
+   "f1": 0.1037,
+   "contains": 0.13,
+   "prefix": 554.96,
+   "ctx_tokens": 2454.36,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2603
+  },
+  "base_retrieval@512": {
+   "em": 0.0,
+   "f1": 0.071,
+   "contains": 0.15,
+   "prefix": 554.96,
+   "ctx_tokens": 2454.36,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.269
+  },
+  "retrieval@1024": {
+   "em": 0.04,
+   "f1": 0.1119,
+   "contains": 0.14,
+   "prefix": 1061.91,
+   "ctx_tokens": 2454.36,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3024
+  },
+  "base_retrieval@1024": {
+   "em": 0.01,
+   "f1": 0.0637,
+   "contains": 0.09,
+   "prefix": 1061.91,
+   "ctx_tokens": 2454.36,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3293
+  },
+  "retrieval@2048": {
+   "em": 0.03,
+   "f1": 0.1046,
+   "contains": 0.17,
+   "prefix": 2008.91,
+   "ctx_tokens": 2454.36,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3995
+  },
+  "base_retrieval@2048": {
+   "em": 0.01,
+   "f1": 0.0525,
+   "contains": 0.09,
+   "prefix": 2008.91,
+   "ctx_tokens": 2454.36,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.3916
+  }
+ }
+}

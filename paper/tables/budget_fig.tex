@@ -1,0 +1,78 @@
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=3 by 3, horizontal sep=12mm, vertical sep=14mm},
+  width=0.36\linewidth, height=0.3\linewidth, xmode=log, log basis x=2, ymin=0,
+  title style={font=\small}, tick label style={font=\scriptsize},
+  every axis plot/.append style={mark size=1.5pt},
+  yticklabel style={/pgf/number format/fixed, /pgf/number format/precision=2}]
+\nextgroupplot[legend to name=budgetlegend, legend columns=3, legend style={font=\footnotesize, draw=none}, title={BABILong 16k}, xtick={1024,2048,4096}, xticklabels={1k,2k,4k}]
+\addlegendimage{blue!70!black, mark=*, thick}
+\addlegendentry{bgkit}
+\addlegendimage{gray, mark=o}
+\addlegendentry{truncated text}
+\addlegendimage{orange!80!black, mark=triangle*}
+\addlegendentry{BM25}
+\addlegendimage{teal, mark=diamond*}
+\addlegendentry{LongLLMLingua}
+\addlegendimage{purple!70, mark=square*}
+\addlegendentry{summary (35B)}
+\addlegendimage{black, dashed}
+\addlegendentry{original decoder, full context}
+\addplot[blue!70!black, mark=*, thick, forget plot] coordinates {(1024,0.740) (2048,0.760) (4096,0.740)};
+\addplot[gray, mark=o, forget plot] coordinates {(1024,0.120) (2048,0.190) (4096,0.220)};
+\addplot[orange!80!black, mark=triangle*, forget plot] coordinates {(1024,0.400) (2048,0.430) (4096,0.450)};
+\addplot[teal, mark=diamond*, forget plot] coordinates {(1024,0.090) (2048,0.150) (4096,0.270)};
+\addplot[black, dashed, forget plot, domain=1024:4096, samples=2] {0.180};
+\nextgroupplot[title={BABILong 4k}, xtick={512,1024,2048}, xticklabels={512,1k,2k}]
+\addplot[blue!70!black, mark=*, thick, forget plot] coordinates {(512,0.790) (1024,0.810) (2048,0.880)};
+\addplot[gray, mark=o, forget plot] coordinates {(512,0.200) (1024,0.260) (2048,0.330)};
+\addplot[orange!80!black, mark=triangle*, forget plot] coordinates {(512,0.390) (1024,0.420) (2048,0.380)};
+\addplot[teal, mark=diamond*, forget plot] coordinates {(512,0.130) (1024,0.210) (2048,0.310)};
+\addplot[purple!70, mark=square*, forget plot] coordinates {(512,0.320) (1024,0.250)};
+\addplot[black, dashed, forget plot, domain=512:2048, samples=2] {0.270};
+\nextgroupplot[title={RULER 4k}, xtick={512,1024,2048}, xticklabels={512,1k,2k}]
+\addplot[blue!70!black, mark=*, thick, forget plot] coordinates {(512,0.200) (1024,0.200) (2048,0.170)};
+\addplot[gray, mark=o, forget plot] coordinates {(512,0.090) (1024,0.150) (2048,0.220)};
+\addplot[orange!80!black, mark=triangle*, forget plot] coordinates {(512,0.420) (1024,0.490) (2048,0.540)};
+\addplot[teal, mark=diamond*, forget plot] coordinates {(512,0.020) (1024,0.180) (2048,0.390)};
+\addplot[purple!70, mark=square*, forget plot] coordinates {(512,0.410) (1024,0.340)};
+\addplot[black, dashed, forget plot, domain=512:2048, samples=2] {0.580};
+\nextgroupplot[title={QuALITY}, xtick={512,1024,2048}, xticklabels={512,1k,2k}]
+\addplot[blue!70!black, mark=*, thick, forget plot] coordinates {(512,0.360) (1024,0.360) (2048,0.370)};
+\addplot[gray, mark=o, forget plot] coordinates {(512,0.310) (1024,0.330) (2048,0.340)};
+\addplot[orange!80!black, mark=triangle*, forget plot] coordinates {(512,0.370) (1024,0.330) (2048,0.330)};
+\addplot[teal, mark=diamond*, forget plot] coordinates {(512,0.300) (1024,0.280) (2048,0.370)};
+\addplot[purple!70, mark=square*, forget plot] coordinates {(512,0.400) (2048,0.482)};
+\addplot[black, dashed, forget plot, domain=512:2048, samples=2] {0.310};
+\nextgroupplot[title={NarrativeQA}, xtick={2048,4096,8192}, xticklabels={2k,4k,8k}]
+\addplot[blue!70!black, mark=*, thick, forget plot] coordinates {(2048,0.167) (4096,0.167) (8192,0.150)};
+\addplot[gray, mark=o, forget plot] coordinates {(2048,0.067) (4096,0.100) (8192,0.117)};
+\addplot[orange!80!black, mark=triangle*, forget plot] coordinates {(2048,0.133) (4096,0.150) (8192,0.133)};
+\addplot[teal, mark=diamond*, forget plot] coordinates {(2048,0.117)};
+\nextgroupplot[title={HotpotQA}, xtick={256,512,1024}, xticklabels={256,512,1k}]
+\addplot[blue!70!black, mark=*, thick, forget plot] coordinates {(256,0.640) (512,0.620) (1024,0.600)};
+\addplot[gray, mark=o, forget plot] coordinates {(256,0.230) (512,0.350) (1024,0.370)};
+\addplot[orange!80!black, mark=triangle*, forget plot] coordinates {(256,0.390) (512,0.460) (1024,0.460)};
+\addplot[teal, mark=diamond*, forget plot] coordinates {(256,0.360) (512,0.340) (1024,0.410)};
+\addplot[purple!70, mark=square*, forget plot] coordinates {(256,0.570) (512,0.530)};
+\addplot[black, dashed, forget plot, domain=256:1024, samples=2] {0.450};
+\nextgroupplot[title={MuSiQue}, xtick={512,1024,2048}, xticklabels={512,1k,2k}]
+\addplot[blue!70!black, mark=*, thick, forget plot] coordinates {(512,0.300) (1024,0.310) (2048,0.330)};
+\addplot[gray, mark=o, forget plot] coordinates {(512,0.080) (1024,0.080) (2048,0.160)};
+\addplot[orange!80!black, mark=triangle*, forget plot] coordinates {(512,0.190) (1024,0.170) (2048,0.180)};
+\addplot[teal, mark=diamond*, forget plot] coordinates {(512,0.100) (1024,0.150) (2048,0.170)};
+\addplot[purple!70, mark=square*, forget plot] coordinates {(512,0.430) (1024,0.430)};
+\addplot[black, dashed, forget plot, domain=512:2048, samples=2] {0.130};
+\nextgroupplot[title={LongMemEval-S}, xtick={2048,4096,8192}, xticklabels={2k,4k,8k}]
+\addplot[blue!70!black, mark=*, thick, forget plot] coordinates {(2048,0.300) (4096,0.233) (8192,0.200)};
+\addplot[gray, mark=o, forget plot] coordinates {(2048,0.183) (4096,0.150) (8192,0.150)};
+\addplot[orange!80!black, mark=triangle*, forget plot] coordinates {(2048,0.317) (4096,0.333) (8192,0.267)};
+\addplot[teal, mark=diamond*, forget plot] coordinates {(2048,0.267)};
+\nextgroupplot[title={LoCoMo}, xtick={1024,2048}, xticklabels={1k,2k}]
+\addplot[blue!70!black, mark=*, thick, forget plot] coordinates {(1024,0.280) (2048,0.280)};
+\addplot[gray, mark=o, forget plot] coordinates {(1024,0.090) (2048,0.160)};
+\addplot[orange!80!black, mark=triangle*, forget plot] coordinates {(1024,0.340) (2048,0.300)};
+\addplot[teal, mark=diamond*, forget plot] coordinates {(1024,0.180) (2048,0.240)};
+\addplot[black, dashed, forget plot, domain=1024:2048, samples=2] {0.190};
+\end{groupplot}
+\end{tikzpicture}
+\par\smallskip\ref{budgetlegend}

@@ -30,12 +30,16 @@ API, the slot format and the limitations.
 
 ## Results in brief
 
-At a fixed number of decoder positions for the context, the compressed context scores at least as
-high as the same decoder reading truncated text in 25 of 26 settings across nine long-context
-benchmarks, e.g. BABILong 0.74 against 0.12 with 15k-token contexts in 1,024 positions. On MuSiQue
-and LoCoMo, which were not used in training, it scores above the original decoder reading the
-entire context. Exact strings are not preserved (RULER). Details, baselines and limitations are in
-the paper.
+At a fixed number of decoder positions for the context, on nine long-context benchmarks, the compressed
+context scores significantly above the same decoder reading truncated text in 16 of 26 settings and
+above LongLLMLingua in 13 of 22. It is above BM25 retrieval where answers combine facts spread through
+the context (BABILong, HotpotQA, MuSiQue), e.g. BABILong 0.79 in 512 positions against at most 0.38
+for any text method in 2,048. At the encoder's own kept positions, its vectors score far above the
+tokens there (0.74 against 0.26 on BABILong 16k). With the same decoder weights, the compressed context also scores above the
+entire untruncated text on BABILong, HotpotQA and LoCoMo (e.g. HotpotQA 0.64 against 0.36). Exact strings are not preserved (RULER, where BM25
+does better). Over a 110k-token context the decoder needs 0.1 GB instead of 5.0 GB beyond its weights;
+the encoder pass costs about as much compute as a full-context prefill. Details, baselines and
+limitations are in the paper.
 
 ## Repository layout
 

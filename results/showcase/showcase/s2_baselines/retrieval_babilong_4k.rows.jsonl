@@ -1,0 +1,600 @@
+{"id": "babilong:4k:qa1:33", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 428, "enc_s": 0.0, "dec_s": 2.0525}
+{"id": "babilong:4k:qa1:33", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in Goshen, Conn., where she found a friend.", "gold": ["kitchen"], "acc": 0.0, "prefix": 428, "enc_s": 0.0, "dec_s": 0.2578}
+{"id": "babilong:4k:qa1:33", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 944, "enc_s": 0.0, "dec_s": 0.2672}
+{"id": "babilong:4k:qa1:33", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in Cambridge.", "gold": ["kitchen"], "acc": 0.0, "prefix": 944, "enc_s": 0.0, "dec_s": 0.1482}
+{"id": "babilong:4k:qa1:33", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1976, "enc_s": 0.0, "dec_s": 0.2596}
+{"id": "babilong:4k:qa1:33", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in Shalersville.", "gold": ["kitchen"], "acc": 0.0, "prefix": 1976, "enc_s": 0.0, "dec_s": 0.2321}
+{"id": "babilong:4k:qa1:25", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 430, "enc_s": 0.0, "dec_s": 0.1398}
+{"id": "babilong:4k:qa1:25", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 430, "enc_s": 0.0, "dec_s": 0.1253}
+{"id": "babilong:4k:qa1:25", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 946, "enc_s": 0.0, "dec_s": 0.1611}
+{"id": "babilong:4k:qa1:25", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary is in the hallway.", "gold": ["garden"], "acc": 0.0, "prefix": 946, "enc_s": 0.0, "dec_s": 0.1427}
+{"id": "babilong:4k:qa1:25", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 1978, "enc_s": 0.0, "dec_s": 0.227}
+{"id": "babilong:4k:qa1:25", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in the hallway.", "gold": ["garden"], "acc": 0.0, "prefix": 1978, "enc_s": 0.0, "dec_s": 0.1845}
+{"id": "babilong:4k:qa1:99", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 541, "enc_s": 0.0, "dec_s": 0.1684}
+{"id": "babilong:4k:qa1:99", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 541, "enc_s": 0.0, "dec_s": 0.1443}
+{"id": "babilong:4k:qa1:99", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is a woman who is a botanist.", "gold": ["garden"], "acc": 0.0, "prefix": 942, "enc_s": 0.0, "dec_s": 0.2373}
+{"id": "babilong:4k:qa1:99", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "66", "gold": ["garden"], "acc": 0.0, "prefix": 942, "enc_s": 0.0, "dec_s": 0.0698}
+{"id": "babilong:4k:qa1:99", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is a woman.", "gold": ["garden"], "acc": 0.0, "prefix": 1973, "enc_s": 0.0, "dec_s": 0.2287}
+{"id": "babilong:4k:qa1:99", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "66", "gold": ["garden"], "acc": 0.0, "prefix": 1973, "enc_s": 0.0, "dec_s": 0.1088}
+{"id": "babilong:4k:qa1:84", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John Balfour", "gold": ["bathroom"], "acc": 0.0, "prefix": 491, "enc_s": 0.0, "dec_s": 0.1196}
+{"id": "babilong:4k:qa1:84", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "John is in Kinloch.", "gold": ["bathroom"], "acc": 0.0, "prefix": 491, "enc_s": 0.0, "dec_s": 0.1281}
+{"id": "babilong:4k:qa1:84", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1006, "enc_s": 0.0, "dec_s": 0.163}
+{"id": "babilong:4k:qa1:84", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 1006, "enc_s": 0.0, "dec_s": 0.1481}
+{"id": "babilong:4k:qa1:84", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2036, "enc_s": 0.0, "dec_s": 0.2315}
+{"id": "babilong:4k:qa1:84", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2036, "enc_s": 0.0, "dec_s": 0.1887}
+{"id": "babilong:4k:qa1:78", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 507, "enc_s": 0.0, "dec_s": 0.1635}
+{"id": "babilong:4k:qa1:78", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 507, "enc_s": 0.0, "dec_s": 0.1507}
+{"id": "babilong:4k:qa1:78", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 1023, "enc_s": 0.0, "dec_s": 0.1849}
+{"id": "babilong:4k:qa1:78", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is traveling to the hallway.", "gold": ["office"], "acc": 0.0, "prefix": 1023, "enc_s": 0.0, "dec_s": 0.1798}
+{"id": "babilong:4k:qa1:78", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 2053, "enc_s": 0.0, "dec_s": 0.2559}
+{"id": "babilong:4k:qa1:78", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is traveling to the hallway.", "gold": ["office"], "acc": 0.0, "prefix": 2053, "enc_s": 0.0, "dec_s": 0.2252}
+{"id": "babilong:4k:qa1:81", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel", "gold": ["hallway"], "acc": 0.0, "prefix": 480, "enc_s": 0.0, "dec_s": 0.069}
+{"id": "babilong:4k:qa1:81", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel went back to the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 480, "enc_s": 0.0, "dec_s": 0.1485}
+{"id": "babilong:4k:qa1:81", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is in the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 996, "enc_s": 0.0, "dec_s": 0.1693}
+{"id": "babilong:4k:qa1:81", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel goes back to the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 996, "enc_s": 0.0, "dec_s": 0.1633}
+{"id": "babilong:4k:qa1:81", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel goes back to the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 2028, "enc_s": 0.0, "dec_s": 0.2515}
+{"id": "babilong:4k:qa1:81", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel goes back to the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 2028, "enc_s": 0.0, "dec_s": 0.2023}
+{"id": "babilong:4k:qa1:21", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 488, "enc_s": 0.0, "dec_s": 0.1469}
+{"id": "babilong:4k:qa1:21", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary travelled to the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 488, "enc_s": 0.0, "dec_s": 0.1335}
+{"id": "babilong:4k:qa1:21", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1004, "enc_s": 0.0, "dec_s": 0.1683}
+{"id": "babilong:4k:qa1:21", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary travelled to the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1004, "enc_s": 0.0, "dec_s": 0.1451}
+{"id": "babilong:4k:qa1:21", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2034, "enc_s": 0.0, "dec_s": 0.233}
+{"id": "babilong:4k:qa1:21", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is traveling to the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2034, "enc_s": 0.0, "dec_s": 0.1997}
+{"id": "babilong:4k:qa1:93", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 463, "enc_s": 0.0, "dec_s": 0.1384}
+{"id": "babilong:4k:qa1:93", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 463, "enc_s": 0.0, "dec_s": 0.1251}
+{"id": "babilong:4k:qa1:93", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 979, "enc_s": 0.0, "dec_s": 0.1642}
+{"id": "babilong:4k:qa1:93", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel is staying at Land's End.", "gold": ["kitchen"], "acc": 0.0, "prefix": 979, "enc_s": 0.0, "dec_s": 0.1829}
+{"id": "babilong:4k:qa1:93", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 2010, "enc_s": 0.0, "dec_s": 0.2581}
+{"id": "babilong:4k:qa1:93", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is staying at Land's End.", "gold": ["kitchen"], "acc": 0.0, "prefix": 2010, "enc_s": 0.0, "dec_s": 0.2267}
+{"id": "babilong:4k:qa1:82", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel is in the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 426, "enc_s": 0.0, "dec_s": 0.1427}
+{"id": "babilong:4k:qa1:82", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel is in the office.", "gold": ["hallway"], "acc": 0.0, "prefix": 426, "enc_s": 0.0, "dec_s": 0.1285}
+{"id": "babilong:4k:qa1:82", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is in the office.", "gold": ["hallway"], "acc": 0.0, "prefix": 941, "enc_s": 0.0, "dec_s": 0.1636}
+{"id": "babilong:4k:qa1:82", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel is in the office.", "gold": ["hallway"], "acc": 0.0, "prefix": 941, "enc_s": 0.0, "dec_s": 0.1457}
+{"id": "babilong:4k:qa1:82", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel is at home.", "gold": ["hallway"], "acc": 0.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.2281}
+{"id": "babilong:4k:qa1:82", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is in Westminster Hall.", "gold": ["hallway"], "acc": 0.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.1943}
+{"id": "babilong:4k:qa1:1", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 494, "enc_s": 0.0, "dec_s": 0.1675}
+{"id": "babilong:4k:qa1:1", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the hall.", "gold": ["kitchen"], "acc": 0.0, "prefix": 494, "enc_s": 0.0, "dec_s": 0.1489}
+{"id": "babilong:4k:qa1:1", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1010, "enc_s": 0.0, "dec_s": 0.1943}
+{"id": "babilong:4k:qa1:1", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the hallway.", "gold": ["kitchen"], "acc": 0.0, "prefix": 1010, "enc_s": 0.0, "dec_s": 0.1744}
+{"id": "babilong:4k:qa1:1", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 2042, "enc_s": 0.0, "dec_s": 0.2472}
+{"id": "babilong:4k:qa1:1", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the bathroom.", "gold": ["kitchen"], "acc": 0.0, "prefix": 2042, "enc_s": 0.0, "dec_s": 0.2042}
+{"id": "babilong:4k:qa1:22", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 485, "enc_s": 0.0, "dec_s": 0.142}
+{"id": "babilong:4k:qa1:22", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "John is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 485, "enc_s": 0.0, "dec_s": 0.1306}
+{"id": "babilong:4k:qa1:22", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1000, "enc_s": 0.0, "dec_s": 0.1739}
+{"id": "babilong:4k:qa1:22", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John is in the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1000, "enc_s": 0.0, "dec_s": 0.1593}
+{"id": "babilong:4k:qa1:22", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2031, "enc_s": 0.0, "dec_s": 0.2357}
+{"id": "babilong:4k:qa1:22", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is in the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2031, "enc_s": 0.0, "dec_s": 0.189}
+{"id": "babilong:4k:qa1:0", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 465, "enc_s": 0.0, "dec_s": 0.14}
+{"id": "babilong:4k:qa1:0", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 465, "enc_s": 0.0, "dec_s": 0.1342}
+{"id": "babilong:4k:qa1:0", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 981, "enc_s": 0.0, "dec_s": 0.1696}
+{"id": "babilong:4k:qa1:0", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary journeys to the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 981, "enc_s": 0.0, "dec_s": 0.1486}
+{"id": "babilong:4k:qa1:0", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 2013, "enc_s": 0.0, "dec_s": 0.2358}
+{"id": "babilong:4k:qa1:0", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 2013, "enc_s": 0.0, "dec_s": 0.1996}
+{"id": "babilong:4k:qa1:61", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 476, "enc_s": 0.0, "dec_s": 0.1649}
+{"id": "babilong:4k:qa1:61", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra went to the garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 476, "enc_s": 0.0, "dec_s": 0.1529}
+{"id": "babilong:4k:qa1:61", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 991, "enc_s": 0.0, "dec_s": 0.1996}
+{"id": "babilong:4k:qa1:61", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra goes to the garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 991, "enc_s": 0.0, "dec_s": 0.1706}
+{"id": "babilong:4k:qa1:61", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 2023, "enc_s": 0.0, "dec_s": 0.2556}
+{"id": "babilong:4k:qa1:61", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 2023, "enc_s": 0.0, "dec_s": 0.2034}
+{"id": "babilong:4k:qa1:73", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel is a man who travels to the office.", "gold": ["office"], "acc": 1.0, "prefix": 425, "enc_s": 0.0, "dec_s": 0.2044}
+{"id": "babilong:4k:qa1:73", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 425, "enc_s": 0.0, "dec_s": 0.1399}
+{"id": "babilong:4k:qa1:73", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 940, "enc_s": 0.0, "dec_s": 0.1742}
+{"id": "babilong:4k:qa1:73", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 940, "enc_s": 0.0, "dec_s": 0.1504}
+{"id": "babilong:4k:qa1:73", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.2471}
+{"id": "babilong:4k:qa1:73", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.1985}
+{"id": "babilong:4k:qa1:24", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 494, "enc_s": 0.0, "dec_s": 0.1436}
+{"id": "babilong:4k:qa1:24", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 494, "enc_s": 0.0, "dec_s": 0.1415}
+{"id": "babilong:4k:qa1:24", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1009, "enc_s": 0.0, "dec_s": 0.1826}
+{"id": "babilong:4k:qa1:24", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1009, "enc_s": 0.0, "dec_s": 0.1472}
+{"id": "babilong:4k:qa1:24", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2039, "enc_s": 0.0, "dec_s": 0.2523}
+{"id": "babilong:4k:qa1:24", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2039, "enc_s": 0.0, "dec_s": 0.1967}
+{"id": "babilong:4k:qa1:49", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 528, "enc_s": 0.0, "dec_s": 0.1734}
+{"id": "babilong:4k:qa1:49", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra went back to the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 528, "enc_s": 0.0, "dec_s": 0.1657}
+{"id": "babilong:4k:qa1:49", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the parlor.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1044, "enc_s": 0.0, "dec_s": 0.2173}
+{"id": "babilong:4k:qa1:49", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra went back to the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1044, "enc_s": 0.0, "dec_s": 0.1818}
+{"id": "babilong:4k:qa1:49", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the parlor.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1971, "enc_s": 0.0, "dec_s": 0.2744}
+{"id": "babilong:4k:qa1:49", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1971, "enc_s": 0.0, "dec_s": 0.2013}
+{"id": "babilong:4k:qa1:26", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 470, "enc_s": 0.0, "dec_s": 0.1384}
+{"id": "babilong:4k:qa1:26", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel is going to the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 470, "enc_s": 0.0, "dec_s": 0.1447}
+{"id": "babilong:4k:qa1:26", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 986, "enc_s": 0.0, "dec_s": 0.1678}
+{"id": "babilong:4k:qa1:26", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel goes to the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 986, "enc_s": 0.0, "dec_s": 0.1483}
+{"id": "babilong:4k:qa1:26", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2017, "enc_s": 0.0, "dec_s": 0.2364}
+{"id": "babilong:4k:qa1:26", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2017, "enc_s": 0.0, "dec_s": 0.1976}
+{"id": "babilong:4k:qa1:44", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel is in the bedroom.", "gold": ["office"], "acc": 0.0, "prefix": 469, "enc_s": 0.0, "dec_s": 0.1537}
+{"id": "babilong:4k:qa1:44", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel is in the bedroom.", "gold": ["office"], "acc": 0.0, "prefix": 469, "enc_s": 0.0, "dec_s": 0.1387}
+{"id": "babilong:4k:qa1:44", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 985, "enc_s": 0.0, "dec_s": 0.1725}
+{"id": "babilong:4k:qa1:44", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel is in the bedroom.", "gold": ["office"], "acc": 0.0, "prefix": 985, "enc_s": 0.0, "dec_s": 0.147}
+{"id": "babilong:4k:qa1:44", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 2015, "enc_s": 0.0, "dec_s": 0.2436}
+{"id": "babilong:4k:qa1:44", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 2015, "enc_s": 0.0, "dec_s": 0.1928}
+{"id": "babilong:4k:qa1:76", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the station.", "gold": ["hallway"], "acc": 0.0, "prefix": 444, "enc_s": 0.0, "dec_s": 0.1499}
+{"id": "babilong:4k:qa1:76", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary is in the station.", "gold": ["hallway"], "acc": 0.0, "prefix": 444, "enc_s": 0.0, "dec_s": 0.1323}
+{"id": "babilong:4k:qa1:76", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 960, "enc_s": 0.0, "dec_s": 0.1678}
+{"id": "babilong:4k:qa1:76", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary goes to the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 960, "enc_s": 0.0, "dec_s": 0.155}
+{"id": "babilong:4k:qa1:76", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the rose-scented room.", "gold": ["hallway"], "acc": 0.0, "prefix": 1991, "enc_s": 0.0, "dec_s": 0.3049}
+{"id": "babilong:4k:qa1:76", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in the kitchen.", "gold": ["hallway"], "acc": 0.0, "prefix": 1991, "enc_s": 0.0, "dec_s": 0.2093}
+{"id": "babilong:4k:qa1:79", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 471, "enc_s": 0.0, "dec_s": 0.1503}
+{"id": "babilong:4k:qa1:79", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "John went back to the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 471, "enc_s": 0.0, "dec_s": 0.1497}
+{"id": "babilong:4k:qa1:79", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 987, "enc_s": 0.0, "dec_s": 0.1698}
+{"id": "babilong:4k:qa1:79", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John is going back to the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 987, "enc_s": 0.0, "dec_s": 0.1754}
+{"id": "babilong:4k:qa1:79", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 2019, "enc_s": 0.0, "dec_s": 0.2395}
+{"id": "babilong:4k:qa1:79", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is left.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2019, "enc_s": 0.0, "dec_s": 0.1701}
+{"id": "babilong:4k:qa1:47", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 490, "enc_s": 0.0, "dec_s": 0.1685}
+{"id": "babilong:4k:qa1:47", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the garden.", "gold": ["bedroom"], "acc": 0.0, "prefix": 490, "enc_s": 0.0, "dec_s": 0.154}
+{"id": "babilong:4k:qa1:47", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1006, "enc_s": 0.0, "dec_s": 0.2115}
+{"id": "babilong:4k:qa1:47", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the garden.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1006, "enc_s": 0.0, "dec_s": 0.1577}
+{"id": "babilong:4k:qa1:47", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2038, "enc_s": 0.0, "dec_s": 0.2582}
+{"id": "babilong:4k:qa1:47", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2038, "enc_s": 0.0, "dec_s": 0.2076}
+{"id": "babilong:4k:qa1:2", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 426, "enc_s": 0.0, "dec_s": 0.1477}
+{"id": "babilong:4k:qa1:2", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary journeys to the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 426, "enc_s": 0.0, "dec_s": 0.133}
+{"id": "babilong:4k:qa1:2", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 942, "enc_s": 0.0, "dec_s": 0.1709}
+{"id": "babilong:4k:qa1:2", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 942, "enc_s": 0.0, "dec_s": 0.1461}
+{"id": "babilong:4k:qa1:2", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1973, "enc_s": 0.0, "dec_s": 0.2349}
+{"id": "babilong:4k:qa1:2", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1973, "enc_s": 0.0, "dec_s": 0.1921}
+{"id": "babilong:4k:qa1:51", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 504, "enc_s": 0.0, "dec_s": 0.169}
+{"id": "babilong:4k:qa1:51", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 504, "enc_s": 0.0, "dec_s": 0.1509}
+{"id": "babilong:4k:qa1:51", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1020, "enc_s": 0.0, "dec_s": 0.1845}
+{"id": "babilong:4k:qa1:51", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1020, "enc_s": 0.0, "dec_s": 0.1595}
+{"id": "babilong:4k:qa1:51", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2051, "enc_s": 0.0, "dec_s": 0.2446}
+{"id": "babilong:4k:qa1:51", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2051, "enc_s": 0.0, "dec_s": 0.2018}
+{"id": "babilong:4k:qa1:38", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 522, "enc_s": 0.0, "dec_s": 0.1553}
+{"id": "babilong:4k:qa1:38", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the bedroom.", "gold": ["garden"], "acc": 0.0, "prefix": 522, "enc_s": 0.0, "dec_s": 0.1468}
+{"id": "babilong:4k:qa1:38", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 1038, "enc_s": 0.0, "dec_s": 0.1924}
+{"id": "babilong:4k:qa1:38", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 1038, "enc_s": 0.0, "dec_s": 0.1627}
+{"id": "babilong:4k:qa1:38", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 2068, "enc_s": 0.0, "dec_s": 0.2523}
+{"id": "babilong:4k:qa1:38", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in Alicante.", "gold": ["garden"], "acc": 0.0, "prefix": 2068, "enc_s": 0.0, "dec_s": 0.1998}
+{"id": "babilong:4k:qa1:14", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 432, "enc_s": 0.0, "dec_s": 0.1517}
+{"id": "babilong:4k:qa1:14", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 432, "enc_s": 0.0, "dec_s": 0.14}
+{"id": "babilong:4k:qa1:14", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 947, "enc_s": 0.0, "dec_s": 0.1758}
+{"id": "babilong:4k:qa1:14", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 947, "enc_s": 0.0, "dec_s": 0.155}
+{"id": "babilong:4k:qa1:14", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1978, "enc_s": 0.0, "dec_s": 0.2421}
+{"id": "babilong:4k:qa1:14", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1978, "enc_s": 0.0, "dec_s": 0.196}
+{"id": "babilong:4k:qa1:48", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 474, "enc_s": 0.0, "dec_s": 0.1362}
+{"id": "babilong:4k:qa1:48", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 474, "enc_s": 0.0, "dec_s": 0.1246}
+{"id": "babilong:4k:qa1:48", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 988, "enc_s": 0.0, "dec_s": 0.1617}
+{"id": "babilong:4k:qa1:48", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 988, "enc_s": 0.0, "dec_s": 0.1438}
+{"id": "babilong:4k:qa1:48", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 2016, "enc_s": 0.0, "dec_s": 0.2257}
+{"id": "babilong:4k:qa1:48", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 2016, "enc_s": 0.0, "dec_s": 0.1832}
+{"id": "babilong:4k:qa1:10", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 518, "enc_s": 0.0, "dec_s": 0.1374}
+{"id": "babilong:4k:qa1:10", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel is located in the little town of Kirksville, Mo.", "gold": ["office"], "acc": 0.0, "prefix": 518, "enc_s": 0.0, "dec_s": 0.2436}
+{"id": "babilong:4k:qa1:10", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 1034, "enc_s": 0.0, "dec_s": 0.1748}
+{"id": "babilong:4k:qa1:10", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel is located in the little town of Kirksville, Mo.", "gold": ["office"], "acc": 0.0, "prefix": 1034, "enc_s": 0.0, "dec_s": 0.2623}
+{"id": "babilong:4k:qa1:10", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 2065, "enc_s": 0.0, "dec_s": 0.2438}
+{"id": "babilong:4k:qa1:10", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is located in Kirksville, Mo.", "gold": ["office"], "acc": 0.0, "prefix": 2065, "enc_s": 0.0, "dec_s": 0.2547}
+{"id": "babilong:4k:qa1:32", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is a wide and weighty horse on short legs which carried long hair in attendance.", "gold": ["office"], "acc": 0.0, "prefix": 471, "enc_s": 0.0, "dec_s": 0.327}
+{"id": "babilong:4k:qa1:32", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 471, "enc_s": 0.0, "dec_s": 0.1251}
+{"id": "babilong:4k:qa1:32", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is a wide and weighty horse on short legs which carried long hair in attendance.", "gold": ["office"], "acc": 0.0, "prefix": 987, "enc_s": 0.0, "dec_s": 0.3467}
+{"id": "babilong:4k:qa1:32", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary went back to the office.", "gold": ["office"], "acc": 1.0, "prefix": 987, "enc_s": 0.0, "dec_s": 0.1636}
+{"id": "babilong:4k:qa1:32", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is a wide and weighty horse on short legs which carried long hair in attendance.", "gold": ["office"], "acc": 0.0, "prefix": 2018, "enc_s": 0.0, "dec_s": 0.4178}
+{"id": "babilong:4k:qa1:32", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in England.", "gold": ["office"], "acc": 0.0, "prefix": 2018, "enc_s": 0.0, "dec_s": 0.1687}
+{"id": "babilong:4k:qa1:16", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 442, "enc_s": 0.0, "dec_s": 0.1524}
+{"id": "babilong:4k:qa1:16", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 442, "enc_s": 0.0, "dec_s": 0.1402}
+{"id": "babilong:4k:qa1:16", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 957, "enc_s": 0.0, "dec_s": 0.1752}
+{"id": "babilong:4k:qa1:16", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 957, "enc_s": 0.0, "dec_s": 0.159}
+{"id": "babilong:4k:qa1:16", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1989, "enc_s": 0.0, "dec_s": 0.2474}
+{"id": "babilong:4k:qa1:16", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra went to the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1989, "enc_s": 0.0, "dec_s": 0.2024}
+{"id": "babilong:4k:qa1:94", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel", "gold": ["bedroom"], "acc": 0.0, "prefix": 451, "enc_s": 0.0, "dec_s": 0.0653}
+{"id": "babilong:4k:qa1:94", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Maassluis", "gold": ["bedroom"], "acc": 0.0, "prefix": 451, "enc_s": 0.0, "dec_s": 0.0978}
+{"id": "babilong:4k:qa1:94", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 967, "enc_s": 0.0, "dec_s": 0.1621}
+{"id": "babilong:4k:qa1:94", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel is going to the kitchen peeling the potatoes.", "gold": ["bedroom"], "acc": 0.0, "prefix": 967, "enc_s": 0.0, "dec_s": 0.2161}
+{"id": "babilong:4k:qa1:94", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1999, "enc_s": 0.0, "dec_s": 0.2252}
+{"id": "babilong:4k:qa1:94", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is in the kitchen peeling the potatoes.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1999, "enc_s": 0.0, "dec_s": 0.2443}
+{"id": "babilong:4k:qa1:65", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 433, "enc_s": 0.0, "dec_s": 0.1517}
+{"id": "babilong:4k:qa1:65", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 433, "enc_s": 0.0, "dec_s": 0.1397}
+{"id": "babilong:4k:qa1:65", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 946, "enc_s": 0.0, "dec_s": 0.1736}
+{"id": "babilong:4k:qa1:65", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 946, "enc_s": 0.0, "dec_s": 0.1549}
+{"id": "babilong:4k:qa1:65", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the bedroom.", "gold": ["garden"], "acc": 0.0, "prefix": 1975, "enc_s": 0.0, "dec_s": 0.2391}
+{"id": "babilong:4k:qa1:65", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 1975, "enc_s": 0.0, "dec_s": 0.1958}
+{"id": "babilong:4k:qa1:69", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the garden.", "gold": ["bathroom"], "acc": 0.0, "prefix": 495, "enc_s": 0.0, "dec_s": 0.1537}
+{"id": "babilong:4k:qa1:69", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the Wilderness Tavern.", "gold": ["bathroom"], "acc": 0.0, "prefix": 495, "enc_s": 0.0, "dec_s": 0.1744}
+{"id": "babilong:4k:qa1:69", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the garden.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1011, "enc_s": 0.0, "dec_s": 0.1796}
+{"id": "babilong:4k:qa1:69", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the garden.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1011, "enc_s": 0.0, "dec_s": 0.1582}
+{"id": "babilong:4k:qa1:69", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the garden.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2043, "enc_s": 0.0, "dec_s": 0.2552}
+{"id": "babilong:4k:qa1:69", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the garden.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2043, "enc_s": 0.0, "dec_s": 0.2108}
+{"id": "babilong:4k:qa1:42", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the garden.", "gold": ["office"], "acc": 0.0, "prefix": 525, "enc_s": 0.0, "dec_s": 0.1385}
+{"id": "babilong:4k:qa1:42", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary goes to the garden.", "gold": ["office"], "acc": 0.0, "prefix": 525, "enc_s": 0.0, "dec_s": 0.1282}
+{"id": "babilong:4k:qa1:42", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the garden.", "gold": ["office"], "acc": 0.0, "prefix": 1040, "enc_s": 0.0, "dec_s": 0.1698}
+{"id": "babilong:4k:qa1:42", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary goes to the garden.", "gold": ["office"], "acc": 0.0, "prefix": 1040, "enc_s": 0.0, "dec_s": 0.151}
+{"id": "babilong:4k:qa1:42", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the garden.", "gold": ["office"], "acc": 0.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.2384}
+{"id": "babilong:4k:qa1:42", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in the garden.", "gold": ["office"], "acc": 0.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.186}
+{"id": "babilong:4k:qa1:59", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 509, "enc_s": 0.0, "dec_s": 0.1522}
+{"id": "babilong:4k:qa1:59", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 509, "enc_s": 0.0, "dec_s": 0.1415}
+{"id": "babilong:4k:qa1:59", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1024, "enc_s": 0.0, "dec_s": 0.1792}
+{"id": "babilong:4k:qa1:59", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1024, "enc_s": 0.0, "dec_s": 0.1607}
+{"id": "babilong:4k:qa1:59", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2055, "enc_s": 0.0, "dec_s": 0.2593}
+{"id": "babilong:4k:qa1:59", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2055, "enc_s": 0.0, "dec_s": 0.1024}
+{"id": "babilong:4k:qa1:88", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 472, "enc_s": 0.0, "dec_s": 0.0553}
+{"id": "babilong:4k:qa1:88", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "France", "gold": ["office"], "acc": 0.0, "prefix": 472, "enc_s": 0.0, "dec_s": 0.0172}
+{"id": "babilong:4k:qa1:88", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 987, "enc_s": 0.0, "dec_s": 0.0663}
+{"id": "babilong:4k:qa1:88", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary went to the office.", "gold": ["office"], "acc": 1.0, "prefix": 987, "enc_s": 0.0, "dec_s": 0.0516}
+{"id": "babilong:4k:qa1:88", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 2019, "enc_s": 0.0, "dec_s": 0.0952}
+{"id": "babilong:4k:qa1:88", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary goes to the office.", "gold": ["office"], "acc": 1.0, "prefix": 2019, "enc_s": 0.0, "dec_s": 0.0697}
+{"id": "babilong:4k:qa1:98", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 432, "enc_s": 0.0, "dec_s": 0.0562}
+{"id": "babilong:4k:qa1:98", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "John is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 432, "enc_s": 0.0, "dec_s": 0.0452}
+{"id": "babilong:4k:qa1:98", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 947, "enc_s": 0.0, "dec_s": 0.067}
+{"id": "babilong:4k:qa1:98", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John went to the office.", "gold": ["office"], "acc": 1.0, "prefix": 947, "enc_s": 0.0, "dec_s": 0.0526}
+{"id": "babilong:4k:qa1:98", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the bathroom.", "gold": ["office"], "acc": 0.0, "prefix": 1978, "enc_s": 0.0, "dec_s": 0.0974}
+{"id": "babilong:4k:qa1:98", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is in the bathroom.", "gold": ["office"], "acc": 0.0, "prefix": 1978, "enc_s": 0.0, "dec_s": 0.0797}
+{"id": "babilong:4k:qa1:66", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel is in the parlors of the Columbian Hotel.", "gold": ["office"], "acc": 0.0, "prefix": 547, "enc_s": 0.0, "dec_s": 0.2412}
+{"id": "babilong:4k:qa1:66", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel is in the parlors of the Columbian Hotel.", "gold": ["office"], "acc": 0.0, "prefix": 547, "enc_s": 0.0, "dec_s": 0.2201}
+{"id": "babilong:4k:qa1:66", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is at the Columbian Hotel.", "gold": ["office"], "acc": 0.0, "prefix": 941, "enc_s": 0.0, "dec_s": 0.1981}
+{"id": "babilong:4k:qa1:66", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel is going to the office.", "gold": ["office"], "acc": 1.0, "prefix": 941, "enc_s": 0.0, "dec_s": 0.1582}
+{"id": "babilong:4k:qa1:66", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel is married to Abbie Clark.", "gold": ["office"], "acc": 0.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.2426}
+{"id": "babilong:4k:qa1:66", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is in the Congregational church.", "gold": ["office"], "acc": 0.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.2268}
+{"id": "babilong:4k:qa1:91", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel", "gold": ["bedroom"], "acc": 0.0, "prefix": 535, "enc_s": 0.0, "dec_s": 0.0629}
+{"id": "babilong:4k:qa1:91", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel went to the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 535, "enc_s": 0.0, "dec_s": 0.1268}
+{"id": "babilong:4k:qa1:91", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel went to the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1051, "enc_s": 0.0, "dec_s": 0.1655}
+{"id": "babilong:4k:qa1:91", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1051, "enc_s": 0.0, "dec_s": 0.1487}
+{"id": "babilong:4k:qa1:91", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel went to the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1953, "enc_s": 0.0, "dec_s": 0.2283}
+{"id": "babilong:4k:qa1:91", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1953, "enc_s": 0.0, "dec_s": 0.1838}
+{"id": "babilong:4k:qa1:57", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John is in the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 455, "enc_s": 0.0, "dec_s": 0.1377}
+{"id": "babilong:4k:qa1:57", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "John is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 455, "enc_s": 0.0, "dec_s": 0.1296}
+{"id": "babilong:4k:qa1:57", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 971, "enc_s": 0.0, "dec_s": 0.1659}
+{"id": "babilong:4k:qa1:57", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 971, "enc_s": 0.0, "dec_s": 0.1438}
+{"id": "babilong:4k:qa1:57", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 2002, "enc_s": 0.0, "dec_s": 0.2331}
+{"id": "babilong:4k:qa1:57", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is in the bedroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 2002, "enc_s": 0.0, "dec_s": 0.1855}
+{"id": "babilong:4k:qa1:29", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 471, "enc_s": 0.0, "dec_s": 0.1557}
+{"id": "babilong:4k:qa1:29", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra went to the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 471, "enc_s": 0.0, "dec_s": 0.1403}
+{"id": "babilong:4k:qa1:29", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is a woman.", "gold": ["garden"], "acc": 0.0, "prefix": 987, "enc_s": 0.0, "dec_s": 0.1664}
+{"id": "babilong:4k:qa1:29", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra went to the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 987, "enc_s": 0.0, "dec_s": 0.1625}
+{"id": "babilong:4k:qa1:29", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is a woman.", "gold": ["garden"], "acc": 0.0, "prefix": 2019, "enc_s": 0.0, "dec_s": 0.2341}
+{"id": "babilong:4k:qa1:29", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 2019, "enc_s": 0.0, "dec_s": 0.1959}
+{"id": "babilong:4k:qa1:20", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the bedroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 464, "enc_s": 0.0, "dec_s": 0.1554}
+{"id": "babilong:4k:qa1:20", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the bedroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 464, "enc_s": 0.0, "dec_s": 0.1483}
+{"id": "babilong:4k:qa1:20", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the bedroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 980, "enc_s": 0.0, "dec_s": 0.1767}
+{"id": "babilong:4k:qa1:20", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the bedroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 980, "enc_s": 0.0, "dec_s": 0.1586}
+{"id": "babilong:4k:qa1:20", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the bedroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 2012, "enc_s": 0.0, "dec_s": 0.2451}
+{"id": "babilong:4k:qa1:20", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the bedroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 2012, "enc_s": 0.0, "dec_s": 0.1997}
+{"id": "babilong:4k:qa1:87", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John is in the garden.", "gold": ["bedroom"], "acc": 0.0, "prefix": 445, "enc_s": 0.0, "dec_s": 0.1356}
+{"id": "babilong:4k:qa1:87", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "John is going back to the garden.", "gold": ["bedroom"], "acc": 0.0, "prefix": 445, "enc_s": 0.0, "dec_s": 0.1548}
+{"id": "babilong:4k:qa1:87", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 960, "enc_s": 0.0, "dec_s": 0.1629}
+{"id": "babilong:4k:qa1:87", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John is going to the garden.", "gold": ["bedroom"], "acc": 0.0, "prefix": 960, "enc_s": 0.0, "dec_s": 0.1568}
+{"id": "babilong:4k:qa1:87", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1991, "enc_s": 0.0, "dec_s": 0.236}
+{"id": "babilong:4k:qa1:87", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is in the village store.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1991, "enc_s": 0.0, "dec_s": 0.1987}
+{"id": "babilong:4k:qa1:34", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the office.", "gold": ["garden"], "acc": 0.0, "prefix": 489, "enc_s": 0.0, "dec_s": 0.1653}
+{"id": "babilong:4k:qa1:34", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the office.", "gold": ["garden"], "acc": 0.0, "prefix": 489, "enc_s": 0.0, "dec_s": 0.1434}
+{"id": "babilong:4k:qa1:34", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 1005, "enc_s": 0.0, "dec_s": 0.179}
+{"id": "babilong:4k:qa1:34", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the summer-house over the river.", "gold": ["garden"], "acc": 0.0, "prefix": 1005, "enc_s": 0.0, "dec_s": 0.218}
+{"id": "babilong:4k:qa1:34", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 2037, "enc_s": 0.0, "dec_s": 0.2493}
+{"id": "babilong:4k:qa1:34", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the summer-house over the river.", "gold": ["garden"], "acc": 0.0, "prefix": 2037, "enc_s": 0.0, "dec_s": 0.2613}
+{"id": "babilong:4k:qa1:60", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 426, "enc_s": 0.0, "dec_s": 0.1394}
+{"id": "babilong:4k:qa1:60", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel went back to the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 426, "enc_s": 0.0, "dec_s": 0.1431}
+{"id": "babilong:4k:qa1:60", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 941, "enc_s": 0.0, "dec_s": 0.1649}
+{"id": "babilong:4k:qa1:60", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 941, "enc_s": 0.0, "dec_s": 0.1418}
+{"id": "babilong:4k:qa1:60", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel is sitting in a bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.2404}
+{"id": "babilong:4k:qa1:60", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is seated.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.1522}
+{"id": "babilong:4k:qa1:31", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 478, "enc_s": 0.0, "dec_s": 0.1402}
+{"id": "babilong:4k:qa1:31", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 478, "enc_s": 0.0, "dec_s": 0.127}
+{"id": "babilong:4k:qa1:31", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 994, "enc_s": 0.0, "dec_s": 0.1636}
+{"id": "babilong:4k:qa1:31", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 994, "enc_s": 0.0, "dec_s": 0.1466}
+{"id": "babilong:4k:qa1:31", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 2026, "enc_s": 0.0, "dec_s": 0.229}
+{"id": "babilong:4k:qa1:31", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 2026, "enc_s": 0.0, "dec_s": 0.1887}
+{"id": "babilong:4k:qa1:13", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 426, "enc_s": 0.0, "dec_s": 0.1535}
+{"id": "babilong:4k:qa1:13", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 426, "enc_s": 0.0, "dec_s": 0.1411}
+{"id": "babilong:4k:qa1:13", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 942, "enc_s": 0.0, "dec_s": 0.1755}
+{"id": "babilong:4k:qa1:13", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 942, "enc_s": 0.0, "dec_s": 0.1576}
+{"id": "babilong:4k:qa1:13", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1973, "enc_s": 0.0, "dec_s": 0.2405}
+{"id": "babilong:4k:qa1:13", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1973, "enc_s": 0.0, "dec_s": 0.2052}
+{"id": "babilong:4k:qa1:63", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 426, "enc_s": 0.0, "dec_s": 0.1371}
+{"id": "babilong:4k:qa1:63", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "John is in Cambridge.", "gold": ["garden"], "acc": 0.0, "prefix": 426, "enc_s": 0.0, "dec_s": 0.1101}
+{"id": "babilong:4k:qa1:63", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 941, "enc_s": 0.0, "dec_s": 0.1146}
+{"id": "babilong:4k:qa1:63", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John is in Washington.", "gold": ["garden"], "acc": 0.0, "prefix": 941, "enc_s": 0.0, "dec_s": 0.1116}
+{"id": "babilong:4k:qa1:63", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 1970, "enc_s": 0.0, "dec_s": 0.2087}
+{"id": "babilong:4k:qa1:63", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is in Washington.", "gold": ["garden"], "acc": 0.0, "prefix": 1970, "enc_s": 0.0, "dec_s": 0.1505}
+{"id": "babilong:4k:qa1:3", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John is in the garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 500, "enc_s": 0.0, "dec_s": 0.1304}
+{"id": "babilong:4k:qa1:3", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "John is journeying to the garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 500, "enc_s": 0.0, "dec_s": 0.1358}
+{"id": "babilong:4k:qa1:3", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1016, "enc_s": 0.0, "dec_s": 0.1533}
+{"id": "babilong:4k:qa1:3", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1016, "enc_s": 0.0, "dec_s": 0.1211}
+{"id": "babilong:4k:qa1:3", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 2047, "enc_s": 0.0, "dec_s": 0.2025}
+{"id": "babilong:4k:qa1:3", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is in the hallway.", "gold": ["kitchen"], "acc": 0.0, "prefix": 2047, "enc_s": 0.0, "dec_s": 0.1455}
+{"id": "babilong:4k:qa1:56", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 449, "enc_s": 0.0, "dec_s": 0.1461}
+{"id": "babilong:4k:qa1:56", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the bedroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 449, "enc_s": 0.0, "dec_s": 0.1351}
+{"id": "babilong:4k:qa1:56", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 965, "enc_s": 0.0, "dec_s": 0.1788}
+{"id": "babilong:4k:qa1:56", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["hallway"], "acc": 0.0, "prefix": 965, "enc_s": 0.0, "dec_s": 0.1523}
+{"id": "babilong:4k:qa1:56", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 1995, "enc_s": 0.0, "dec_s": 0.2489}
+{"id": "babilong:4k:qa1:56", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the bathroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 1995, "enc_s": 0.0, "dec_s": 0.1973}
+{"id": "babilong:4k:qa1:86", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 484, "enc_s": 0.0, "dec_s": 0.1366}
+{"id": "babilong:4k:qa1:86", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "John is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 484, "enc_s": 0.0, "dec_s": 0.1274}
+{"id": "babilong:4k:qa1:86", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 999, "enc_s": 0.0, "dec_s": 0.164}
+{"id": "babilong:4k:qa1:86", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 999, "enc_s": 0.0, "dec_s": 0.1484}
+{"id": "babilong:4k:qa1:86", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 2030, "enc_s": 0.0, "dec_s": 0.2279}
+{"id": "babilong:4k:qa1:86", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 2030, "enc_s": 0.0, "dec_s": 0.1873}
+{"id": "babilong:4k:qa1:45", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 425, "enc_s": 0.0, "dec_s": 0.1408}
+{"id": "babilong:4k:qa1:45", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 425, "enc_s": 0.0, "dec_s": 0.132}
+{"id": "babilong:4k:qa1:45", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 939, "enc_s": 0.0, "dec_s": 0.1678}
+{"id": "babilong:4k:qa1:45", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 939, "enc_s": 0.0, "dec_s": 0.1459}
+{"id": "babilong:4k:qa1:45", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 1970, "enc_s": 0.0, "dec_s": 0.2283}
+{"id": "babilong:4k:qa1:45", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 1970, "enc_s": 0.0, "dec_s": 0.185}
+{"id": "babilong:4k:qa1:62", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 489, "enc_s": 0.0, "dec_s": 0.1511}
+{"id": "babilong:4k:qa1:62", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 489, "enc_s": 0.0, "dec_s": 0.1319}
+{"id": "babilong:4k:qa1:62", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1005, "enc_s": 0.0, "dec_s": 0.1702}
+{"id": "babilong:4k:qa1:62", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1005, "enc_s": 0.0, "dec_s": 0.1459}
+{"id": "babilong:4k:qa1:62", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2036, "enc_s": 0.0, "dec_s": 0.2359}
+{"id": "babilong:4k:qa1:62", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2036, "enc_s": 0.0, "dec_s": 0.1929}
+{"id": "babilong:4k:qa1:58", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 541, "enc_s": 0.0, "dec_s": 0.1471}
+{"id": "babilong:4k:qa1:58", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary is in the village of Inverkip.", "gold": ["bedroom"], "acc": 0.0, "prefix": 541, "enc_s": 0.0, "dec_s": 0.193}
+{"id": "babilong:4k:qa1:58", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 942, "enc_s": 0.0, "dec_s": 0.167}
+{"id": "babilong:4k:qa1:58", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary is in the bedroom of Inverkip.", "gold": ["bedroom"], "acc": 1.0, "prefix": 942, "enc_s": 0.0, "dec_s": 0.202}
+{"id": "babilong:4k:qa1:58", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.2258}
+{"id": "babilong:4k:qa1:58", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.1818}
+{"id": "babilong:4k:qa1:23", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 479, "enc_s": 0.0, "dec_s": 0.1371}
+{"id": "babilong:4k:qa1:23", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 479, "enc_s": 0.0, "dec_s": 0.128}
+{"id": "babilong:4k:qa1:23", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 993, "enc_s": 0.0, "dec_s": 0.1671}
+{"id": "babilong:4k:qa1:23", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 993, "enc_s": 0.0, "dec_s": 0.1488}
+{"id": "babilong:4k:qa1:23", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2025, "enc_s": 0.0, "dec_s": 0.2315}
+{"id": "babilong:4k:qa1:23", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2025, "enc_s": 0.0, "dec_s": 0.1867}
+{"id": "babilong:4k:qa1:92", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John is a farmer in Kentucky.", "gold": ["hallway"], "acc": 0.0, "prefix": 466, "enc_s": 0.0, "dec_s": 0.1509}
+{"id": "babilong:4k:qa1:92", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sensible", "gold": ["hallway"], "acc": 0.0, "prefix": 466, "enc_s": 0.0, "dec_s": 0.0661}
+{"id": "babilong:4k:qa1:92", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is a farmer in Kentucky and a subscriber for", "gold": ["hallway"], "acc": 0.0, "prefix": 982, "enc_s": 0.0, "dec_s": 0.2243}
+{"id": "babilong:4k:qa1:92", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John is in Norfolk.", "gold": ["hallway"], "acc": 0.0, "prefix": 982, "enc_s": 0.0, "dec_s": 0.1296}
+{"id": "babilong:4k:qa1:92", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the bathroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 2014, "enc_s": 0.0, "dec_s": 0.2261}
+{"id": "babilong:4k:qa1:92", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is in the Shire of Peterborough.", "gold": ["hallway"], "acc": 0.0, "prefix": 2014, "enc_s": 0.0, "dec_s": 0.2486}
+{"id": "babilong:4k:qa1:40", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 492, "enc_s": 0.0, "dec_s": 0.1377}
+{"id": "babilong:4k:qa1:40", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 492, "enc_s": 0.0, "dec_s": 0.1291}
+{"id": "babilong:4k:qa1:40", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1008, "enc_s": 0.0, "dec_s": 0.1653}
+{"id": "babilong:4k:qa1:40", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary is in the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1008, "enc_s": 0.0, "dec_s": 0.1473}
+{"id": "babilong:4k:qa1:40", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2039, "enc_s": 0.0, "dec_s": 0.2316}
+{"id": "babilong:4k:qa1:40", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2039, "enc_s": 0.0, "dec_s": 0.1864}
+{"id": "babilong:4k:qa1:36", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 475, "enc_s": 0.0, "dec_s": 0.1526}
+{"id": "babilong:4k:qa1:36", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is a Conservator of Forests in Oude.", "gold": ["kitchen"], "acc": 0.0, "prefix": 475, "enc_s": 0.0, "dec_s": 0.2286}
+{"id": "babilong:4k:qa1:36", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 991, "enc_s": 0.0, "dec_s": 0.1765}
+{"id": "babilong:4k:qa1:36", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 991, "enc_s": 0.0, "dec_s": 0.1584}
+{"id": "babilong:4k:qa1:36", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 2022, "enc_s": 0.0, "dec_s": 0.2457}
+{"id": "babilong:4k:qa1:36", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in Forfar, Forwick.", "gold": ["kitchen"], "acc": 0.0, "prefix": 2022, "enc_s": 0.0, "dec_s": 0.2476}
+{"id": "babilong:4k:qa1:67", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 518, "enc_s": 0.0, "dec_s": 0.1403}
+{"id": "babilong:4k:qa1:67", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 518, "enc_s": 0.0, "dec_s": 0.1309}
+{"id": "babilong:4k:qa1:67", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1034, "enc_s": 0.0, "dec_s": 0.1665}
+{"id": "babilong:4k:qa1:67", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 1034, "enc_s": 0.0, "dec_s": 0.1495}
+{"id": "babilong:4k:qa1:67", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary went to the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2066, "enc_s": 0.0, "dec_s": 0.2436}
+{"id": "babilong:4k:qa1:67", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2066, "enc_s": 0.0, "dec_s": 0.1944}
+{"id": "babilong:4k:qa1:71", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Daniel is in the bathroom.", "gold": ["kitchen"], "acc": 0.0, "prefix": 445, "enc_s": 0.0, "dec_s": 0.136}
+{"id": "babilong:4k:qa1:71", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Daniel is in a garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 445, "enc_s": 0.0, "dec_s": 0.1255}
+{"id": "babilong:4k:qa1:71", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Daniel is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 961, "enc_s": 0.0, "dec_s": 0.1612}
+{"id": "babilong:4k:qa1:71", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Daniel is described as a \"young, generous child.\"", "gold": ["kitchen"], "acc": 0.0, "prefix": 961, "enc_s": 0.0, "dec_s": 0.2307}
+{"id": "babilong:4k:qa1:71", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Daniel is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1991, "enc_s": 0.0, "dec_s": 0.2278}
+{"id": "babilong:4k:qa1:71", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Daniel is described as being in the mountains of Leitrim of the Lakes.", "gold": ["kitchen"], "acc": 0.0, "prefix": 1991, "enc_s": 0.0, "dec_s": 0.3142}
+{"id": "babilong:4k:qa1:80", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 445, "enc_s": 0.0, "dec_s": 0.1389}
+{"id": "babilong:4k:qa1:80", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "John is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 445, "enc_s": 0.0, "dec_s": 0.1281}
+{"id": "babilong:4k:qa1:80", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 961, "enc_s": 0.0, "dec_s": 0.1605}
+{"id": "babilong:4k:qa1:80", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 961, "enc_s": 0.0, "dec_s": 0.1428}
+{"id": "babilong:4k:qa1:80", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 1993, "enc_s": 0.0, "dec_s": 0.2246}
+{"id": "babilong:4k:qa1:80", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 1993, "enc_s": 0.0, "dec_s": 0.1851}
+{"id": "babilong:4k:qa1:43", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Mary is in the house.", "gold": ["bedroom"], "acc": 0.0, "prefix": 518, "enc_s": 0.0, "dec_s": 0.1386}
+{"id": "babilong:4k:qa1:43", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Mary is in Oude.", "gold": ["bedroom"], "acc": 0.0, "prefix": 518, "enc_s": 0.0, "dec_s": 0.1284}
+{"id": "babilong:4k:qa1:43", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1033, "enc_s": 0.0, "dec_s": 0.1651}
+{"id": "babilong:4k:qa1:43", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Mary is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1033, "enc_s": 0.0, "dec_s": 0.144}
+{"id": "babilong:4k:qa1:43", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Mary is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2065, "enc_s": 0.0, "dec_s": 0.2344}
+{"id": "babilong:4k:qa1:43", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Mary is in the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2065, "enc_s": 0.0, "dec_s": 0.1876}
+{"id": "babilong:4k:qa1:52", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 520, "enc_s": 0.0, "dec_s": 0.1376}
+{"id": "babilong:4k:qa1:52", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "John is back to the office.", "gold": ["office"], "acc": 1.0, "prefix": 520, "enc_s": 0.0, "dec_s": 0.1407}
+{"id": "babilong:4k:qa1:52", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 1036, "enc_s": 0.0, "dec_s": 0.1645}
+{"id": "babilong:4k:qa1:52", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John is back to the office.", "gold": ["office"], "acc": 1.0, "prefix": 1036, "enc_s": 0.0, "dec_s": 0.1629}
+{"id": "babilong:4k:qa1:52", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 2067, "enc_s": 0.0, "dec_s": 0.2291}
+{"id": "babilong:4k:qa1:52", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is back to the office.", "gold": ["office"], "acc": 1.0, "prefix": 2067, "enc_s": 0.0, "dec_s": 0.2001}
+{"id": "babilong:4k:qa1:35", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 539, "enc_s": 0.0, "dec_s": 0.1514}
+{"id": "babilong:4k:qa1:35", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 539, "enc_s": 0.0, "dec_s": 0.1398}
+{"id": "babilong:4k:qa1:35", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1055, "enc_s": 0.0, "dec_s": 0.1895}
+{"id": "babilong:4k:qa1:35", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1055, "enc_s": 0.0, "dec_s": 0.1685}
+{"id": "babilong:4k:qa1:35", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in Whitehall.", "gold": ["kitchen"], "acc": 0.0, "prefix": 1958, "enc_s": 0.0, "dec_s": 0.2372}
+{"id": "babilong:4k:qa1:35", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is at Whitehall.", "gold": ["kitchen"], "acc": 0.0, "prefix": 1958, "enc_s": 0.0, "dec_s": 0.1976}
+{"id": "babilong:4k:qa1:39", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 518, "enc_s": 0.0, "dec_s": 0.1573}
+{"id": "babilong:4k:qa1:39", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "D", "gold": ["bathroom"], "acc": 0.0, "prefix": 518, "enc_s": 0.0, "dec_s": 0.0576}
+{"id": "babilong:4k:qa1:39", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1034, "enc_s": 0.0, "dec_s": 0.1866}
+{"id": "babilong:4k:qa1:39", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra went to the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 1034, "enc_s": 0.0, "dec_s": 0.1656}
+{"id": "babilong:4k:qa1:39", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2064, "enc_s": 0.0, "dec_s": 0.2481}
+{"id": "babilong:4k:qa1:39", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is in Kansas and Nebraska.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2064, "enc_s": 0.0, "dec_s": 0.216}
+{"id": "babilong:4k:qa1:75", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "John is in the village.", "gold": ["office"], "acc": 0.0, "prefix": 513, "enc_s": 0.0, "dec_s": 0.1367}
+{"id": "babilong:4k:qa1:75", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "John is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 513, "enc_s": 0.0, "dec_s": 0.1265}
+{"id": "babilong:4k:qa1:75", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "John is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 1029, "enc_s": 0.0, "dec_s": 0.1652}
+{"id": "babilong:4k:qa1:75", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "John is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 1029, "enc_s": 0.0, "dec_s": 0.1448}
+{"id": "babilong:4k:qa1:75", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "John is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 2061, "enc_s": 0.0, "dec_s": 0.2488}
+{"id": "babilong:4k:qa1:75", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "John is in the office.", "gold": ["office"], "acc": 1.0, "prefix": 2061, "enc_s": 0.0, "dec_s": 0.1899}
+{"id": "babilong:4k:qa1:18", "subset": "4k/qa1", "arm": "retrieval@512", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 426, "enc_s": 0.0, "dec_s": 0.1529}
+{"id": "babilong:4k:qa1:18", "subset": "4k/qa1", "arm": "base_retrieval@512", "pred": "Sandra is traveling to the hallway.", "gold": ["kitchen"], "acc": 0.0, "prefix": 426, "enc_s": 0.0, "dec_s": 0.1554}
+{"id": "babilong:4k:qa1:18", "subset": "4k/qa1", "arm": "retrieval@1024", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 942, "enc_s": 0.0, "dec_s": 0.1752}
+{"id": "babilong:4k:qa1:18", "subset": "4k/qa1", "arm": "base_retrieval@1024", "pred": "Sandra is traveling to the hacienda of X-Kanchacan.", "gold": ["kitchen"], "acc": 0.0, "prefix": 942, "enc_s": 0.0, "dec_s": 0.2597}
+{"id": "babilong:4k:qa1:18", "subset": "4k/qa1", "arm": "retrieval@2048", "pred": "Sandra is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.2399}
+{"id": "babilong:4k:qa1:18", "subset": "4k/qa1", "arm": "base_retrieval@2048", "pred": "Sandra is journeying to the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1972, "enc_s": 0.0, "dec_s": 0.2302}
+{"id": "babilong:4k:qa2:28", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in the kitchen.", "gold": ["hallway"], "acc": 0.0, "prefix": 427, "enc_s": 0.0, "dec_s": 0.1486}
+{"id": "babilong:4k:qa2:28", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The apple is there.", "gold": ["hallway"], "acc": 0.0, "prefix": 427, "enc_s": 0.0, "dec_s": 0.1119}
+{"id": "babilong:4k:qa2:28", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the kitchen.", "gold": ["hallway"], "acc": 0.0, "prefix": 943, "enc_s": 0.0, "dec_s": 0.1744}
+{"id": "babilong:4k:qa2:28", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The apple is in the apple tree.", "gold": ["hallway"], "acc": 0.0, "prefix": 943, "enc_s": 0.0, "dec_s": 0.1709}
+{"id": "babilong:4k:qa2:28", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the sea-anemone.", "gold": ["hallway"], "acc": 0.0, "prefix": 1971, "enc_s": 0.0, "dec_s": 0.2915}
+{"id": "babilong:4k:qa2:28", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is in the apple tree.", "gold": ["hallway"], "acc": 0.0, "prefix": 1971, "enc_s": 0.0, "dec_s": 0.2146}
+{"id": "babilong:4k:qa2:4", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in the bedroom.", "gold": ["kitchen"], "acc": 0.0, "prefix": 492, "enc_s": 0.0, "dec_s": 0.1529}
+{"id": "babilong:4k:qa2:4", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The apple is in the outer gallery of the lighthouse.", "gold": ["kitchen"], "acc": 0.0, "prefix": 492, "enc_s": 0.0, "dec_s": 0.2138}
+{"id": "babilong:4k:qa2:4", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 1008, "enc_s": 0.0, "dec_s": 0.1789}
+{"id": "babilong:4k:qa2:4", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The apple is in the bedroom.", "gold": ["kitchen"], "acc": 0.0, "prefix": 1008, "enc_s": 0.0, "dec_s": 0.1572}
+{"id": "babilong:4k:qa2:4", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 2040, "enc_s": 0.0, "dec_s": 0.2478}
+{"id": "babilong:4k:qa2:4", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is in the garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 2040, "enc_s": 0.0, "dec_s": 0.2104}
+{"id": "babilong:4k:qa2:41", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The football is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 503, "enc_s": 0.0, "dec_s": 0.1509}
+{"id": "babilong:4k:qa2:41", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The football is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 503, "enc_s": 0.0, "dec_s": 0.1389}
+{"id": "babilong:4k:qa2:41", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The football is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 1019, "enc_s": 0.0, "dec_s": 0.1834}
+{"id": "babilong:4k:qa2:41", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The football is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 1019, "enc_s": 0.0, "dec_s": 0.163}
+{"id": "babilong:4k:qa2:41", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The football is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 2050, "enc_s": 0.0, "dec_s": 0.2624}
+{"id": "babilong:4k:qa2:41", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The football is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 2050, "enc_s": 0.0, "dec_s": 0.2018}
+{"id": "babilong:4k:qa2:48", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The football is in the garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 488, "enc_s": 0.0, "dec_s": 0.1519}
+{"id": "babilong:4k:qa2:48", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The provided context does not specify where the football is. It is possible that the relevant information was not included. If you have a document that contains this detail,", "gold": ["kitchen"], "acc": 0.0, "prefix": 488, "enc_s": 0.0, "dec_s": 0.4925}
+{"id": "babilong:4k:qa2:48", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The football is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1004, "enc_s": 0.0, "dec_s": 0.1791}
+{"id": "babilong:4k:qa2:48", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The football is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1004, "enc_s": 0.0, "dec_s": 0.1602}
+{"id": "babilong:4k:qa2:48", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "Mary discarded the football.", "gold": ["kitchen"], "acc": 0.0, "prefix": 2035, "enc_s": 0.0, "dec_s": 0.2191}
+{"id": "babilong:4k:qa2:48", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The football is discarded by Margit.", "gold": ["kitchen"], "acc": 0.0, "prefix": 2035, "enc_s": 0.0, "dec_s": 0.2167}
+{"id": "babilong:4k:qa2:91", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The football is in the room.", "gold": ["bathroom"], "acc": 0.0, "prefix": 440, "enc_s": 0.0, "dec_s": 0.1477}
+{"id": "babilong:4k:qa2:91", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The football is most likely in Sandra's room.", "gold": ["bathroom"], "acc": 0.0, "prefix": 440, "enc_s": 0.0, "dec_s": 0.1832}
+{"id": "babilong:4k:qa2:91", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The football is in the room.", "gold": ["bathroom"], "acc": 0.0, "prefix": 956, "enc_s": 0.0, "dec_s": 0.1764}
+{"id": "babilong:4k:qa2:91", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The football is in the garden.", "gold": ["bathroom"], "acc": 0.0, "prefix": 956, "enc_s": 0.0, "dec_s": 0.1574}
+{"id": "babilong:4k:qa2:91", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The football is in the bedroom.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1987, "enc_s": 0.0, "dec_s": 0.2408}
+{"id": "babilong:4k:qa2:91", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The football is in the possession of the pigeon.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1987, "enc_s": 0.0, "dec_s": 0.2585}
+{"id": "babilong:4k:qa2:90", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in the shed.", "gold": ["bedroom"], "acc": 0.0, "prefix": 482, "enc_s": 0.0, "dec_s": 0.1526}
+{"id": "babilong:4k:qa2:90", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The apple is in the Portuguese Nunnery.", "gold": ["bedroom"], "acc": 0.0, "prefix": 482, "enc_s": 0.0, "dec_s": 0.1847}
+{"id": "babilong:4k:qa2:90", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 998, "enc_s": 0.0, "dec_s": 0.1768}
+{"id": "babilong:4k:qa2:90", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The apple is in the Portuguese Nunnery.", "gold": ["bedroom"], "acc": 0.0, "prefix": 998, "enc_s": 0.0, "dec_s": 0.2025}
+{"id": "babilong:4k:qa2:90", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the kitchen.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2030, "enc_s": 0.0, "dec_s": 0.2443}
+{"id": "babilong:4k:qa2:90", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is in the bathroom.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2030, "enc_s": 0.0, "dec_s": 0.2006}
+{"id": "babilong:4k:qa2:65", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The milk is in the mouth.", "gold": ["hallway"], "acc": 0.0, "prefix": 471, "enc_s": 0.0, "dec_s": 0.1569}
+{"id": "babilong:4k:qa2:65", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The milk is in the skin of one person.", "gold": ["hallway"], "acc": 0.0, "prefix": 471, "enc_s": 0.0, "dec_s": 0.1839}
+{"id": "babilong:4k:qa2:65", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The milk is in the kitchen.", "gold": ["hallway"], "acc": 0.0, "prefix": 986, "enc_s": 0.0, "dec_s": 0.1762}
+{"id": "babilong:4k:qa2:65", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The milk is put down in the kitchen.", "gold": ["hallway"], "acc": 0.0, "prefix": 986, "enc_s": 0.0, "dec_s": 0.1872}
+{"id": "babilong:4k:qa2:65", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The milk is in the kitchen.", "gold": ["hallway"], "acc": 0.0, "prefix": 2018, "enc_s": 0.0, "dec_s": 0.2435}
+{"id": "babilong:4k:qa2:65", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The milk is put down in the kitchen.", "gold": ["hallway"], "acc": 0.0, "prefix": 2018, "enc_s": 0.0, "dec_s": 0.2372}
+{"id": "babilong:4k:qa2:30", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in the bathroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 427, "enc_s": 0.0, "dec_s": 0.1525}
+{"id": "babilong:4k:qa2:30", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The apple is in the bathroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 427, "enc_s": 0.0, "dec_s": 0.141}
+{"id": "babilong:4k:qa2:30", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the bathroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 943, "enc_s": 0.0, "dec_s": 0.1761}
+{"id": "babilong:4k:qa2:30", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The apple is on the table.", "gold": ["hallway"], "acc": 0.0, "prefix": 943, "enc_s": 0.0, "dec_s": 0.163}
+{"id": "babilong:4k:qa2:30", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 1969, "enc_s": 0.0, "dec_s": 0.2558}
+{"id": "babilong:4k:qa2:30", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is located in the bathroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 1969, "enc_s": 0.0, "dec_s": 0.2179}
+{"id": "babilong:4k:qa2:13", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The football is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 493, "enc_s": 0.0, "dec_s": 0.1551}
+{"id": "babilong:4k:qa2:13", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The football is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 493, "enc_s": 0.0, "dec_s": 0.1403}
+{"id": "babilong:4k:qa2:13", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The football is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1008, "enc_s": 0.0, "dec_s": 0.1767}
+{"id": "babilong:4k:qa2:13", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The football is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1008, "enc_s": 0.0, "dec_s": 0.164}
+{"id": "babilong:4k:qa2:13", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The football is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 2039, "enc_s": 0.0, "dec_s": 0.2609}
+{"id": "babilong:4k:qa2:13", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The football is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 2039, "enc_s": 0.0, "dec_s": 0.2051}
+{"id": "babilong:4k:qa2:64", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The milk is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 540, "enc_s": 0.0, "dec_s": 0.1519}
+{"id": "babilong:4k:qa2:64", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The milk is there.", "gold": ["bathroom"], "acc": 0.0, "prefix": 540, "enc_s": 0.0, "dec_s": 0.1137}
+{"id": "babilong:4k:qa2:64", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The milk is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1055, "enc_s": 0.0, "dec_s": 0.181}
+{"id": "babilong:4k:qa2:64", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The milk is in the food.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1055, "enc_s": 0.0, "dec_s": 0.1598}
+{"id": "babilong:4k:qa2:64", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The milk is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1958, "enc_s": 0.0, "dec_s": 0.2378}
+{"id": "babilong:4k:qa2:64", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The milk is in the food.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1958, "enc_s": 0.0, "dec_s": 0.2014}
+{"id": "babilong:4k:qa2:15", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 493, "enc_s": 0.0, "dec_s": 0.1573}
+{"id": "babilong:4k:qa2:15", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The apple is in the granaries and store-rooms.", "gold": ["garden"], "acc": 0.0, "prefix": 493, "enc_s": 0.0, "dec_s": 0.2198}
+{"id": "babilong:4k:qa2:15", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 1009, "enc_s": 0.0, "dec_s": 0.1795}
+{"id": "babilong:4k:qa2:15", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The apple is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 1009, "enc_s": 0.0, "dec_s": 0.1584}
+{"id": "babilong:4k:qa2:15", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 2039, "enc_s": 0.0, "dec_s": 0.2459}
+{"id": "babilong:4k:qa2:15", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is in Sandra's kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 2039, "enc_s": 0.0, "dec_s": 0.2152}
+{"id": "babilong:4k:qa2:88", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in Mary's hands.", "gold": ["hallway"], "acc": 0.0, "prefix": 476, "enc_s": 0.0, "dec_s": 0.1671}
+{"id": "babilong:4k:qa2:88", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "Mary", "gold": ["hallway"], "acc": 0.0, "prefix": 476, "enc_s": 0.0, "dec_s": 0.054}
+{"id": "babilong:4k:qa2:88", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 992, "enc_s": 0.0, "dec_s": 0.1796}
+{"id": "babilong:4k:qa2:88", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "Mary", "gold": ["hallway"], "acc": 0.0, "prefix": 992, "enc_s": 0.0, "dec_s": 0.0703}
+{"id": "babilong:4k:qa2:88", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 2024, "enc_s": 0.0, "dec_s": 0.2441}
+{"id": "babilong:4k:qa2:88", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is in the hallway.", "gold": ["hallway"], "acc": 1.0, "prefix": 2024, "enc_s": 0.0, "dec_s": 0.2007}
+{"id": "babilong:4k:qa2:6", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The milk is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 496, "enc_s": 0.0, "dec_s": 0.1533}
+{"id": "babilong:4k:qa2:6", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The milk is grabbed there.", "gold": ["kitchen"], "acc": 0.0, "prefix": 496, "enc_s": 0.0, "dec_s": 0.1297}
+{"id": "babilong:4k:qa2:6", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The milk is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 1011, "enc_s": 0.0, "dec_s": 0.1795}
+{"id": "babilong:4k:qa2:6", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The milk is grabbed by John.", "gold": ["kitchen"], "acc": 0.0, "prefix": 1011, "enc_s": 0.0, "dec_s": 0.1591}
+{"id": "babilong:4k:qa2:6", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The milk is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 2043, "enc_s": 0.0, "dec_s": 0.2458}
+{"id": "babilong:4k:qa2:6", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The milk is grabbed by John.", "gold": ["kitchen"], "acc": 0.0, "prefix": 2043, "enc_s": 0.0, "dec_s": 0.2017}
+{"id": "babilong:4k:qa2:67", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The football is in the pantry.", "gold": ["garden"], "acc": 0.0, "prefix": 505, "enc_s": 0.0, "dec_s": 0.1675}
+{"id": "babilong:4k:qa2:67", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The football is in the pantry.", "gold": ["garden"], "acc": 0.0, "prefix": 505, "enc_s": 0.0, "dec_s": 0.1599}
+{"id": "babilong:4k:qa2:67", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The football is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 1020, "enc_s": 0.0, "dec_s": 0.186}
+{"id": "babilong:4k:qa2:67", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The football is in the pantry.", "gold": ["garden"], "acc": 0.0, "prefix": 1020, "enc_s": 0.0, "dec_s": 0.1857}
+{"id": "babilong:4k:qa2:67", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The football is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 2052, "enc_s": 0.0, "dec_s": 0.2436}
+{"id": "babilong:4k:qa2:67", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The football is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 2052, "enc_s": 0.0, "dec_s": 0.2027}
+{"id": "babilong:4k:qa2:75", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The milk is in the pot.", "gold": ["office"], "acc": 0.0, "prefix": 523, "enc_s": 0.0, "dec_s": 0.1576}
+{"id": "babilong:4k:qa2:75", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The milk is in the pot.", "gold": ["office"], "acc": 0.0, "prefix": 523, "enc_s": 0.0, "dec_s": 0.1479}
+{"id": "babilong:4k:qa2:75", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The milk is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 1039, "enc_s": 0.0, "dec_s": 0.1967}
+{"id": "babilong:4k:qa2:75", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The milk is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 1039, "enc_s": 0.0, "dec_s": 0.1629}
+{"id": "babilong:4k:qa2:75", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The milk is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 2071, "enc_s": 0.0, "dec_s": 0.2445}
+{"id": "babilong:4k:qa2:75", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The milk is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 2071, "enc_s": 0.0, "dec_s": 0.2025}
+{"id": "babilong:4k:qa2:3", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in the barn.", "gold": ["bedroom"], "acc": 0.0, "prefix": 472, "enc_s": 0.0, "dec_s": 0.1618}
+{"id": "babilong:4k:qa2:3", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The apple is in Winton.", "gold": ["bedroom"], "acc": 0.0, "prefix": 472, "enc_s": 0.0, "dec_s": 0.1479}
+{"id": "babilong:4k:qa2:3", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the barn.", "gold": ["bedroom"], "acc": 0.0, "prefix": 988, "enc_s": 0.0, "dec_s": 0.1851}
+{"id": "babilong:4k:qa2:3", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The apple is in the barn.", "gold": ["bedroom"], "acc": 0.0, "prefix": 988, "enc_s": 0.0, "dec_s": 0.1613}
+{"id": "babilong:4k:qa2:3", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the garden.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2020, "enc_s": 0.0, "dec_s": 0.2454}
+{"id": "babilong:4k:qa2:3", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is in the barn.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2020, "enc_s": 0.0, "dec_s": 0.2003}
+{"id": "babilong:4k:qa2:97", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The milk is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 472, "enc_s": 0.0, "dec_s": 0.1523}
+{"id": "babilong:4k:qa2:97", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The milk is left there.", "gold": ["office"], "acc": 0.0, "prefix": 472, "enc_s": 0.0, "dec_s": 0.1313}
+{"id": "babilong:4k:qa2:97", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The milk is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 988, "enc_s": 0.0, "dec_s": 0.1812}
+{"id": "babilong:4k:qa2:97", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The milk is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 988, "enc_s": 0.0, "dec_s": 0.1594}
+{"id": "babilong:4k:qa2:97", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The milk is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 2019, "enc_s": 0.0, "dec_s": 0.2515}
+{"id": "babilong:4k:qa2:97", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The milk is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 2019, "enc_s": 0.0, "dec_s": 0.2037}
+{"id": "babilong:4k:qa2:40", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The football is in the old man's den.", "gold": ["bathroom"], "acc": 0.0, "prefix": 476, "enc_s": 0.0, "dec_s": 0.1986}
+{"id": "babilong:4k:qa2:40", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The football is at the saloon.", "gold": ["bathroom"], "acc": 0.0, "prefix": 476, "enc_s": 0.0, "dec_s": 0.1557}
+{"id": "babilong:4k:qa2:40", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The football is in the trailer.", "gold": ["bathroom"], "acc": 0.0, "prefix": 990, "enc_s": 0.0, "dec_s": 0.177}
+{"id": "babilong:4k:qa2:40", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The football is in the trailer.", "gold": ["bathroom"], "acc": 0.0, "prefix": 990, "enc_s": 0.0, "dec_s": 0.1577}
+{"id": "babilong:4k:qa2:40", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The football is in the trailer.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2022, "enc_s": 0.0, "dec_s": 0.2412}
+{"id": "babilong:4k:qa2:40", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The football is at the saloon.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2022, "enc_s": 0.0, "dec_s": 0.215}
+{"id": "babilong:4k:qa2:29", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in the small mountain lake.", "gold": ["hallway"], "acc": 0.0, "prefix": 479, "enc_s": 0.0, "dec_s": 0.1827}
+{"id": "babilong:4k:qa2:29", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The apple is in the placid little mountain lake.", "gold": ["hallway"], "acc": 0.0, "prefix": 479, "enc_s": 0.0, "dec_s": 0.1997}
+{"id": "babilong:4k:qa2:29", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 993, "enc_s": 0.0, "dec_s": 0.1813}
+{"id": "babilong:4k:qa2:29", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The apple is in the garden.", "gold": ["hallway"], "acc": 0.0, "prefix": 993, "enc_s": 0.0, "dec_s": 0.1591}
+{"id": "babilong:4k:qa2:29", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the bathroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 2024, "enc_s": 0.0, "dec_s": 0.2457}
+{"id": "babilong:4k:qa2:29", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is at the bathroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 2024, "enc_s": 0.0, "dec_s": 0.201}
+{"id": "babilong:4k:qa2:12", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in the Minster box.", "gold": ["bathroom"], "acc": 0.0, "prefix": 539, "enc_s": 0.0, "dec_s": 0.1841}
+{"id": "babilong:4k:qa2:12", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The apple is in the bedroom.", "gold": ["bathroom"], "acc": 0.0, "prefix": 539, "enc_s": 0.0, "dec_s": 0.1447}
+{"id": "babilong:4k:qa2:12", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1055, "enc_s": 0.0, "dec_s": 0.1814}
+{"id": "babilong:4k:qa2:12", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The apple is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1055, "enc_s": 0.0, "dec_s": 0.161}
+{"id": "babilong:4k:qa2:12", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1975, "enc_s": 0.0, "dec_s": 0.2453}
+{"id": "babilong:4k:qa2:12", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is in the Minster box.", "gold": ["bathroom"], "acc": 0.0, "prefix": 1975, "enc_s": 0.0, "dec_s": 0.2351}
+{"id": "babilong:4k:qa2:62", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The football is in the bathroom.", "gold": ["garden"], "acc": 0.0, "prefix": 480, "enc_s": 0.0, "dec_s": 0.1623}
+{"id": "babilong:4k:qa2:62", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The football is in the football field.", "gold": ["garden"], "acc": 0.0, "prefix": 480, "enc_s": 0.0, "dec_s": 0.1569}
+{"id": "babilong:4k:qa2:62", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The football is in the Zouaves.", "gold": ["garden"], "acc": 0.0, "prefix": 996, "enc_s": 0.0, "dec_s": 0.2133}
+{"id": "babilong:4k:qa2:62", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The football is in the football there.", "gold": ["garden"], "acc": 0.0, "prefix": 996, "enc_s": 0.0, "dec_s": 0.1822}
+{"id": "babilong:4k:qa2:62", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The football is in the Porth Hern.", "gold": ["garden"], "acc": 0.0, "prefix": 2028, "enc_s": 0.0, "dec_s": 0.2876}
+{"id": "babilong:4k:qa2:62", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The football is located at Porth Hern.", "gold": ["garden"], "acc": 0.0, "prefix": 2028, "enc_s": 0.0, "dec_s": 0.2395}
+{"id": "babilong:4k:qa2:25", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The football is in the plain coffin.", "gold": ["garden"], "acc": 0.0, "prefix": 454, "enc_s": 0.0, "dec_s": 0.1849}
+{"id": "babilong:4k:qa2:25", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The football is in the plain coffin.", "gold": ["garden"], "acc": 0.0, "prefix": 454, "enc_s": 0.0, "dec_s": 0.1757}
+{"id": "babilong:4k:qa2:25", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The football is in the water.", "gold": ["garden"], "acc": 0.0, "prefix": 970, "enc_s": 0.0, "dec_s": 0.1886}
+{"id": "babilong:4k:qa2:25", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The football is in a watering-place.", "gold": ["garden"], "acc": 0.0, "prefix": 970, "enc_s": 0.0, "dec_s": 0.1792}
+{"id": "babilong:4k:qa2:25", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The football is in the water.", "gold": ["garden"], "acc": 0.0, "prefix": 2002, "enc_s": 0.0, "dec_s": 0.2578}
+{"id": "babilong:4k:qa2:25", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The football is in the bathroom.", "gold": ["garden"], "acc": 0.0, "prefix": 2002, "enc_s": 0.0, "dec_s": 0.0775}
+{"id": "babilong:4k:qa2:96", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The milk is in the barn-chamber.", "gold": ["garden"], "acc": 0.0, "prefix": 471, "enc_s": 0.0, "dec_s": 0.0791}
+{"id": "babilong:4k:qa2:96", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The milk is left there.", "gold": ["garden"], "acc": 0.0, "prefix": 471, "enc_s": 0.0, "dec_s": 0.0459}
+{"id": "babilong:4k:qa2:96", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The milk is in the barn-chamber.", "gold": ["garden"], "acc": 0.0, "prefix": 987, "enc_s": 0.0, "dec_s": 0.0893}
+{"id": "babilong:4k:qa2:96", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The milk is in the barn-chamber.", "gold": ["garden"], "acc": 0.0, "prefix": 987, "enc_s": 0.0, "dec_s": 0.0671}
+{"id": "babilong:4k:qa2:96", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The milk is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 2019, "enc_s": 0.0, "dec_s": 0.1056}
+{"id": "babilong:4k:qa2:96", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The milk is in the barn-chamber.", "gold": ["garden"], "acc": 0.0, "prefix": 2019, "enc_s": 0.0, "dec_s": 0.0899}
+{"id": "babilong:4k:qa2:1", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The milk is in the bedroom.", "gold": ["garden"], "acc": 0.0, "prefix": 496, "enc_s": 0.0, "dec_s": 0.0643}
+{"id": "babilong:4k:qa2:1", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "Rose-colour", "gold": ["garden"], "acc": 0.0, "prefix": 496, "enc_s": 0.0, "dec_s": 0.0344}
+{"id": "babilong:4k:qa2:1", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The milk is in the Royal Red of living blood.", "gold": ["garden"], "acc": 0.0, "prefix": 1012, "enc_s": 0.0, "dec_s": 0.1016}
+{"id": "babilong:4k:qa2:1", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The milk is in the bedroom.", "gold": ["garden"], "acc": 0.0, "prefix": 1012, "enc_s": 0.0, "dec_s": 0.0578}
+{"id": "babilong:4k:qa2:1", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The milk is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 2044, "enc_s": 0.0, "dec_s": 0.1053}
+{"id": "babilong:4k:qa2:1", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The milk is in the garden.", "gold": ["garden"], "acc": 1.0, "prefix": 2044, "enc_s": 0.0, "dec_s": 0.0776}
+{"id": "babilong:4k:qa2:33", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The football is in the warehouse.", "gold": ["kitchen"], "acc": 0.0, "prefix": 490, "enc_s": 0.0, "dec_s": 0.0646}
+{"id": "babilong:4k:qa2:33", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The football is in the warehouse.", "gold": ["kitchen"], "acc": 0.0, "prefix": 490, "enc_s": 0.0, "dec_s": 0.0502}
+{"id": "babilong:4k:qa2:33", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The football is in the garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 1006, "enc_s": 0.0, "dec_s": 0.0915}
+{"id": "babilong:4k:qa2:33", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The football is in the garden.", "gold": ["kitchen"], "acc": 0.0, "prefix": 1006, "enc_s": 0.0, "dec_s": 0.1349}
+{"id": "babilong:4k:qa2:33", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The football is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 2038, "enc_s": 0.0, "dec_s": 0.2437}
+{"id": "babilong:4k:qa2:33", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The football is in the hand of John.", "gold": ["kitchen"], "acc": 0.0, "prefix": 2038, "enc_s": 0.0, "dec_s": 0.2282}
+{"id": "babilong:4k:qa2:66", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The football is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 496, "enc_s": 0.0, "dec_s": 0.1192}
+{"id": "babilong:4k:qa2:66", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The football is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 496, "enc_s": 0.0, "dec_s": 0.0537}
+{"id": "babilong:4k:qa2:66", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The football is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1012, "enc_s": 0.0, "dec_s": 0.1593}
+{"id": "babilong:4k:qa2:66", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The football is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 1012, "enc_s": 0.0, "dec_s": 0.1591}
+{"id": "babilong:4k:qa2:66", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The football is in the bedroom.", "gold": ["bedroom"], "acc": 1.0, "prefix": 2043, "enc_s": 0.0, "dec_s": 0.2464}
+{"id": "babilong:4k:qa2:66", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The football is in the hallway.", "gold": ["bedroom"], "acc": 0.0, "prefix": 2043, "enc_s": 0.0, "dec_s": 0.2046}
+{"id": "babilong:4k:qa2:32", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in the bathroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 437, "enc_s": 0.0, "dec_s": 0.1576}
+{"id": "babilong:4k:qa2:32", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The apple is in the bathroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 437, "enc_s": 0.0, "dec_s": 0.1425}
+{"id": "babilong:4k:qa2:32", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the kitchen.", "gold": ["hallway"], "acc": 0.0, "prefix": 953, "enc_s": 0.0, "dec_s": 0.1835}
+{"id": "babilong:4k:qa2:32", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The apple is in the bathroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 953, "enc_s": 0.0, "dec_s": 0.1533}
+{"id": "babilong:4k:qa2:32", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the kitchen.", "gold": ["hallway"], "acc": 0.0, "prefix": 1983, "enc_s": 0.0, "dec_s": 0.2477}
+{"id": "babilong:4k:qa2:32", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is in the bathroom.", "gold": ["hallway"], "acc": 0.0, "prefix": 1983, "enc_s": 0.0, "dec_s": 0.1974}
+{"id": "babilong:4k:qa2:19", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The milk is in the kitchen.", "gold": ["garden"], "acc": 0.0, "prefix": 478, "enc_s": 0.0, "dec_s": 0.158}
+{"id": "babilong:4k:qa2:19", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The milk is in Sandra's basket.", "gold": ["garden"], "acc": 0.0, "prefix": 478, "enc_s": 0.0, "dec_s": 0.1559}
+{"id": "babilong:4k:qa2:19", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The milk is in the little country store where Stephen is quartered.", "gold": ["garden"], "acc": 0.0, "prefix": 994, "enc_s": 0.0, "dec_s": 0.2851}
+{"id": "babilong:4k:qa2:19", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The milk is in a little country store where Stephen is quartered.", "gold": ["garden"], "acc": 0.0, "prefix": 994, "enc_s": 0.0, "dec_s": 0.2618}
+{"id": "babilong:4k:qa2:19", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The milk is in the milk jar.", "gold": ["garden"], "acc": 0.0, "prefix": 2026, "enc_s": 0.0, "dec_s": 0.2702}
+{"id": "babilong:4k:qa2:19", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The milk is in the milk there.", "gold": ["garden"], "acc": 0.0, "prefix": 2026, "enc_s": 0.0, "dec_s": 0.2162}
+{"id": "babilong:4k:qa2:38", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The milk is in Mary's kitchen.", "gold": ["bathroom"], "acc": 0.0, "prefix": 476, "enc_s": 0.0, "dec_s": 0.167}
+{"id": "babilong:4k:qa2:38", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The milk is in Mary's possession.", "gold": ["bathroom"], "acc": 0.0, "prefix": 476, "enc_s": 0.0, "dec_s": 0.1602}
+{"id": "babilong:4k:qa2:38", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "Mary", "gold": ["bathroom"], "acc": 0.0, "prefix": 992, "enc_s": 0.0, "dec_s": 0.0856}
+{"id": "babilong:4k:qa2:38", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The milk is grabbed by Mary.", "gold": ["bathroom"], "acc": 0.0, "prefix": 992, "enc_s": 0.0, "dec_s": 0.1626}
+{"id": "babilong:4k:qa2:38", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The milk is in the milk cabinet.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2023, "enc_s": 0.0, "dec_s": 0.2609}
+{"id": "babilong:4k:qa2:38", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The milk is grabbed by Mary.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2023, "enc_s": 0.0, "dec_s": 0.2224}
+{"id": "babilong:4k:qa2:81", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in the middle of the fire.", "gold": ["kitchen"], "acc": 0.0, "prefix": 482, "enc_s": 0.0, "dec_s": 0.2438}
+{"id": "babilong:4k:qa2:81", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The apple is in the cosy fire.", "gold": ["kitchen"], "acc": 0.0, "prefix": 482, "enc_s": 0.0, "dec_s": 0.1804}
+{"id": "babilong:4k:qa2:81", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the field where two or three cows cropped their supper of damp grass round one of those green hillocks seen in every Cornish pasture", "gold": ["kitchen"], "acc": 0.0, "prefix": 998, "enc_s": 0.0, "dec_s": 0.562}
+{"id": "babilong:4k:qa2:81", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The apple is in the kitchen.", "gold": ["kitchen"], "acc": 1.0, "prefix": 998, "enc_s": 0.0, "dec_s": 0.1644}
+{"id": "babilong:4k:qa2:81", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the field where two or three cows cropped their supper of damp grass round one of those green hillocks seen in every Cornish pasture", "gold": ["kitchen"], "acc": 0.0, "prefix": 2030, "enc_s": 0.0, "dec_s": 0.5601}
+{"id": "babilong:4k:qa2:81", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is in the field where two or three cows cropped their supper of damp grass round one of those green hillocks seen in every Cornish pasture", "gold": ["kitchen"], "acc": 0.0, "prefix": 2030, "enc_s": 0.0, "dec_s": 0.5154}
+{"id": "babilong:4k:qa2:53", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The milk is in the cave.", "gold": ["hallway"], "acc": 0.0, "prefix": 498, "enc_s": 0.0, "dec_s": 0.1214}
+{"id": "babilong:4k:qa2:53", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The milk is in the cave.", "gold": ["hallway"], "acc": 0.0, "prefix": 498, "enc_s": 0.0, "dec_s": 0.0575}
+{"id": "babilong:4k:qa2:53", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The milk is in the cave.", "gold": ["hallway"], "acc": 0.0, "prefix": 1013, "enc_s": 0.0, "dec_s": 0.0801}
+{"id": "babilong:4k:qa2:53", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The milk is found in the cave.", "gold": ["hallway"], "acc": 0.0, "prefix": 1013, "enc_s": 0.0, "dec_s": 0.0665}
+{"id": "babilong:4k:qa2:53", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The milk is in the cave.", "gold": ["hallway"], "acc": 0.0, "prefix": 2045, "enc_s": 0.0, "dec_s": 0.1302}
+{"id": "babilong:4k:qa2:53", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The milk is discarded by Sandra.", "gold": ["hallway"], "acc": 0.0, "prefix": 2045, "enc_s": 0.0, "dec_s": 0.2106}
+{"id": "babilong:4k:qa2:61", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in the left-hand side of the photograph.", "gold": ["bathroom"], "acc": 0.0, "prefix": 480, "enc_s": 0.0, "dec_s": 0.2328}
+{"id": "babilong:4k:qa2:61", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The apple is in the picture.", "gold": ["bathroom"], "acc": 0.0, "prefix": 480, "enc_s": 0.0, "dec_s": 0.1499}
+{"id": "babilong:4k:qa2:61", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the left-hand side of the picture.", "gold": ["bathroom"], "acc": 0.0, "prefix": 996, "enc_s": 0.0, "dec_s": 0.2666}
+{"id": "babilong:4k:qa2:61", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The apple is in the left photograph.", "gold": ["bathroom"], "acc": 0.0, "prefix": 996, "enc_s": 0.0, "dec_s": 0.1816}
+{"id": "babilong:4k:qa2:61", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the bedroom.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2026, "enc_s": 0.0, "dec_s": 0.2573}
+{"id": "babilong:4k:qa2:61", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is in the bedroom.", "gold": ["bathroom"], "acc": 0.0, "prefix": 2026, "enc_s": 0.0, "dec_s": 0.2079}
+{"id": "babilong:4k:qa2:20", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The apple is in Mary's lap.", "gold": ["office"], "acc": 0.0, "prefix": 477, "enc_s": 0.0, "dec_s": 0.1762}
+{"id": "babilong:4k:qa2:20", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "The apple is in a nice story book.", "gold": ["office"], "acc": 0.0, "prefix": 477, "enc_s": 0.0, "dec_s": 0.1793}
+{"id": "babilong:4k:qa2:20", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The apple is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 993, "enc_s": 0.0, "dec_s": 0.1978}
+{"id": "babilong:4k:qa2:20", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The apple is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 993, "enc_s": 0.0, "dec_s": 0.1725}
+{"id": "babilong:4k:qa2:20", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The apple is in the kitchen.", "gold": ["office"], "acc": 0.0, "prefix": 2025, "enc_s": 0.0, "dec_s": 0.2523}
+{"id": "babilong:4k:qa2:20", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The apple is in the milk.", "gold": ["office"], "acc": 0.0, "prefix": 2025, "enc_s": 0.0, "dec_s": 0.1853}
+{"id": "babilong:4k:qa2:23", "subset": "4k/qa2", "arm": "retrieval@512", "pred": "The milk is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 495, "enc_s": 0.0, "dec_s": 0.1381}
+{"id": "babilong:4k:qa2:23", "subset": "4k/qa2", "arm": "base_retrieval@512", "pred": "Mellicent", "gold": ["bathroom"], "acc": 0.0, "prefix": 495, "enc_s": 0.0, "dec_s": 0.0872}
+{"id": "babilong:4k:qa2:23", "subset": "4k/qa2", "arm": "retrieval@1024", "pred": "The milk is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 1011, "enc_s": 0.0, "dec_s": 0.0814}
+{"id": "babilong:4k:qa2:23", "subset": "4k/qa2", "arm": "base_retrieval@1024", "pred": "The milk is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 1011, "enc_s": 0.0, "dec_s": 0.0618}
+{"id": "babilong:4k:qa2:23", "subset": "4k/qa2", "arm": "retrieval@2048", "pred": "The milk is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 2043, "enc_s": 0.0, "dec_s": 0.108}
+{"id": "babilong:4k:qa2:23", "subset": "4k/qa2", "arm": "base_retrieval@2048", "pred": "The milk is in the bathroom.", "gold": ["bathroom"], "acc": 1.0, "prefix": 2043, "enc_s": 0.0, "dec_s": 0.0777}

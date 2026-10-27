@@ -1,0 +1,75 @@
+{
+ "experiment": "bgkit2_s2_showcase",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step19999_20260925_103158_274684_run-bgkit2_s2_showcase",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/hotpot.jsonl",
+ "n": 100,
+ "budgets": [
+  256,
+  512,
+  1024
+ ],
+ "slot_tokens": 2048,
+ "seconds": 122,
+ "summary": {
+  "retrieval@256": {
+   "em": 0.31,
+   "f1": 0.3768,
+   "contains": 0.32,
+   "prefix": 295.41,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1301
+  },
+  "base_retrieval@256": {
+   "em": 0.17,
+   "f1": 0.2806,
+   "contains": 0.35,
+   "prefix": 295.41,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1928
+  },
+  "retrieval@512": {
+   "em": 0.31,
+   "f1": 0.38,
+   "contains": 0.34,
+   "prefix": 545.42,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.1436
+  },
+  "base_retrieval@512": {
+   "em": 0.16,
+   "f1": 0.2603,
+   "contains": 0.38,
+   "prefix": 545.42,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2289
+  },
+  "retrieval@1024": {
+   "em": 0.23,
+   "f1": 0.3113,
+   "contains": 0.32,
+   "prefix": 1035.64,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2055
+  },
+  "base_retrieval@1024": {
+   "em": 0.07,
+   "f1": 0.2099,
+   "contains": 0.4,
+   "prefix": 1035.64,
+   "ctx_tokens": 1440.25,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2687
+  }
+ }
+}

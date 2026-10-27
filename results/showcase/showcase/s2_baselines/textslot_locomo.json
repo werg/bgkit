@@ -1,0 +1,34 @@
+{
+ "experiment": "bgkit2_p19g_fulltext_lora",
+ "checkpoint": "/mnt/external/bgkit-checkpoints/bgkit2_step4066_20260909_033356_033464_run-bgkit2_p19g_fulltext_lora",
+ "items": "/home/werg/bgkit-data-nvme/bgkit2/benchmarks/showcase/locomo.jsonl",
+ "n": 100,
+ "budgets": [
+  1024,
+  2048
+ ],
+ "slot_tokens": 2048,
+ "seconds": 86,
+ "summary": {
+  "textslot@1024": {
+   "em": 0.03,
+   "f1": 0.0896,
+   "contains": 0.03,
+   "prefix": 1093.14,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.2959
+  },
+  "textslot@2048": {
+   "em": 0.04,
+   "f1": 0.0823,
+   "contains": 0.04,
+   "prefix": 2117.1,
+   "ctx_tokens": 18828.89,
+   "oom": 0.0,
+   "enc_s": 0.0,
+   "dec_s": 0.4732
+  }
+ }
+}
