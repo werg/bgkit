@@ -18,7 +18,8 @@
 \newcommand{\bgkit}{\textsc{bgkit}}
 
 \title{\bgkit: Reading Compressed Context through\\a Language Model's Embedding Layer}
-\author{Gabriel Pickard}
+\author{Gabriel Pickard\\[4pt]{\small Code: \url{https://github.com/werg/bgkit}}\\
+{\small Model: \url{https://huggingface.co/gabrielpickard/bgkit-350m}}}
 \date{October 2026}
 
 \begin{document}
@@ -49,7 +50,7 @@ A language model can condition only on what fits in its context window. Retrieve
 output, earlier conversation and source code compete for the same positions, and every position adds
 to the cost of each forward pass. Vision--language models handle a similar problem for images: a separate
 encoder turns many pixels into a few vectors, which are projected into the language model's
-token-embedding space and read like tokens \citep{alayrac2022flamingo,liu2023llava}.
+token-embedding space and read like tokens \citep{liu2023llava}.
 
 \bgkit{}, the \emph{background knowledge interaction transformer}, applies the same principle to
 text: background knowledge is processed in interaction with the reader's need before it enters the
@@ -373,8 +374,8 @@ on seven of nine benchmarks: 0.74 against 0.26 on BABILong 16k, 0.64 against 0.3
 against 0.07 on LongMemEval-S; QuALITY and NarrativeQA are within noise. The kept tokens on their
 own score in the range of LongLLMLingua's question-aware token pruning at the same budget (higher on
 BABILong, lower on the two memory benchmarks). The
-advantage of the compressed context therefore resides primarily in the representations: a vector at
-a retained position encodes information from discarded text, which no selection of tokens can. Together
+advantage extends beyond selecting useful positions: the contextual representations at those
+positions make the selected evidence more useful to the decoder. Together
 with the survival marker, which tells the later layers which positions will be passed on, this
 suggests that the kept positions act as places where the encoder gathers information for the reader;
 the random-selection result below is consistent with some freedom in where that information is
@@ -395,8 +396,8 @@ excludes zero. LongLLMLingua and text (truncated, trained decoder) at the same b
 Figure~\ref{fig:example} shows one BABILong item. The selection keeps all three facts about Sandra
 verbatim, in order, among the 1{,}027 positions kept from 14{,}793 tokens. Given those tokens, both
 decoders answer with an earlier location; given the encoder's vectors at the same positions, the
-decoder answers correctly. The difference is thus not which facts survive selection but what the
-vectors encode about them, here the order of Sandra's movements.
+decoder answers correctly. The relevant evidence is present in both inputs; the encoder's
+representations make it usable.
 
 \begin{figure}[!ht]
 \centering
@@ -575,8 +576,8 @@ slots for a frozen decoder \citep{ge2024icae}; a single retrieval embedding proj
 dropping tokens, either independently of the question \citep{jiang2023llmlingua,pan2024llmlingua2}
 or conditioned on it \citep{jiang2024longllmlingua}. Question-focused abstractive compression of
 retrieved documents \citep{xu2024recomp} corresponds to our summary baseline. Vision--language models
-connect separately trained encoders to language models through projections into the embedding space
-\citep{alayrac2022flamingo,liu2023llava}. Closest to \bgkit{} is recent soft compression for retrieval-augmented generation: COCOM compresses
+such as LLaVA connect separately trained encoders to language models through projections into the embedding space
+\citep{liu2023llava}. Closest to \bgkit{} is recent soft compression for retrieval-augmented generation: COCOM compresses
 passages into a few context embeddings at adjustable rates \citep{rau2025cocom}, OSCAR compresses
 retrieved documents online and conditioned on the query \citep{louis2025oscar}, and SeleCom replaces
 full compression with a query-conditioned selector that keeps only query-relevant information
